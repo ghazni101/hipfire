@@ -245,7 +245,7 @@ still fails by 2.6×.
 spend further hipfire time on XDNA2 for pp2048 IU4. A later IRON hero
 kernel that actually holds ≥15 TOPS at these shapes could reopen K1;
 until then the idea stays in the deferred/rejected bucket
-(`docs/plans/2026-09-15-halo-gap-plan.md`).
+(the 2026-09-15 Halo gap plan (internal)).
 
 ## 7. Log template (screen §3.3)
 

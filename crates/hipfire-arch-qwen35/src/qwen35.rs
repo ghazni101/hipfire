@@ -24,8 +24,7 @@ pub use batch::{
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
-    dense_tp_rank_layouts, local_dense_tp_config, offload_residency_report,
-    offload_topology_refusal, validate_dense_tp, DenseTpRankLayout,
+    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
     DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
     Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
     Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,
@@ -43,7 +42,7 @@ pub use forward::{
     Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
+    host_mapped_expert_accounting, load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
     load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
     EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };

@@ -9,7 +9,6 @@
 //! `all`.
 
 use std::fmt::Write as _;
-use std::sync::LazyLock;
 
 /// One trunk projection family (a bit of [`Qwen4TrunkMask::bits`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,19 +239,117 @@ impl Qwen4TrunkMask {
     }
 }
 
-fn parse_env(name: &str) -> Result<Qwen4TrunkMask, String> {
-    match hipfire_config::developer_var(name) {
-        Ok(raw) => Qwen4TrunkMask::parse(&raw).map_err(|e| format!("{name}={raw:?}: {e}")),
-        Err(_) => Ok(Qwen4TrunkMask::default()),
+/// The explicit environment override of the trunk route.
+pub const TRUNK_IU4_ENV: &str = "HIPFIRE_QWEN4_TRUNK_IU4";
+
+/// Top-level key of the HFQ metadata envelope that names a trunk default the
+/// artifact's bake tooling vouches for (a string, see [`TrunkIu4Default`]).
+pub const TRUNK_IU4_DEFAULT_KEY: &str = "qwen4_trunk_iu4_default";
+
+/// A trunk route default that an artifact opts into through its embedded
+/// [`TRUNK_IU4_DEFAULT_KEY`] marker. Only the bake tooling writes the marker;
+/// an unmarked artifact keeps the route off unless
+/// [`TRUNK_IU4_ENV`] selects a mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrunkIu4Default {
+    /// `gfx1151-zab-v1`: the GDN Z, alpha and beta projections (the `zab`
+    /// fold) on exact gfx1151.
+    Gfx1151ZabV1,
+}
+
+impl TrunkIu4Default {
+    /// The marker value this default is written and read as.
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Gfx1151ZabV1 => "gfx1151-zab-v1",
+        }
+    }
+
+    /// The marker's default, or `None` for a value this build does not know.
+    pub fn from_marker(marker: &str) -> Option<Self> {
+        [Self::Gfx1151ZabV1]
+            .into_iter()
+            .find(|default| default.marker() == marker)
+    }
+
+    /// The one exact architecture this default applies on.
+    pub const fn arch(self) -> &'static str {
+        match self {
+            Self::Gfx1151ZabV1 => "gfx1151",
+        }
+    }
+
+    /// The mask this default selects, in the [`TRUNK_IU4_ENV`] grammar.
+    pub const fn mask_spec(self) -> &'static str {
+        match self {
+            Self::Gfx1151ZabV1 => "gdn.z,gdn.a,gdn.b",
+        }
     }
 }
 
-static TRUNK_IU4_MASK: LazyLock<Result<Qwen4TrunkMask, String>> =
-    LazyLock::new(|| parse_env("HIPFIRE_QWEN4_TRUNK_IU4"));
+/// Where the effective mask of a load came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrunkIu4MaskSource {
+    /// [`TRUNK_IU4_ENV`] was set (any value, `0` and empty included).
+    Env,
+    /// No env override; the artifact's marker selected its default on its
+    /// exact architecture.
+    ArtifactDefault(TrunkIu4Default),
+    /// No env override and no applicable artifact default: the route is off.
+    Off,
+}
 
-/// `HIPFIRE_QWEN4_TRUNK_IU4` parsed once; the error names the bad token.
-pub fn qwen4_trunk_iu4_mask() -> Result<&'static Qwen4TrunkMask, &'static str> {
-    TRUNK_IU4_MASK.as_ref().map_err(String::as_str)
+/// The effective mask of one load plus its provenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4TrunkIu4Route {
+    pub mask: Qwen4TrunkMask,
+    pub source: TrunkIu4MaskSource,
+}
+
+impl Qwen4TrunkMask {
+    /// Resolve the trunk mask of one artifact load. `env` is the raw
+    /// [`TRUNK_IU4_ENV`] value (`None` = unset); `arch` the exact device
+    /// architecture; `artifact` the artifact's embedded default marker.
+    ///
+    /// An explicit env value always wins and keeps the [`Qwen4TrunkMask::parse`]
+    /// grammar (`0` / empty = no projection, which also switches a marked
+    /// artifact's default off); a bad value is an error whatever the
+    /// artifact. With the variable unset, a marked artifact takes its default
+    /// mask only on the default's exact architecture; every other artifact
+    /// and architecture stays off.
+    pub fn resolve_iu4(
+        env: Option<&str>,
+        arch: &str,
+        artifact: Option<TrunkIu4Default>,
+    ) -> Result<Qwen4TrunkIu4Route, String> {
+        match (env, artifact) {
+            (Some(raw), _) => Ok(Qwen4TrunkIu4Route {
+                mask: Self::parse(raw).map_err(|e| format!("{TRUNK_IU4_ENV}={raw:?}: {e}"))?,
+                source: TrunkIu4MaskSource::Env,
+            }),
+            (None, Some(default)) if default.arch() == arch => Ok(Qwen4TrunkIu4Route {
+                mask: Self::parse(default.mask_spec())
+                    .map_err(|e| format!("trunk default {}: {e}", default.marker()))?,
+                source: TrunkIu4MaskSource::ArtifactDefault(default),
+            }),
+            (None, _) => Ok(Qwen4TrunkIu4Route {
+                mask: Self::default(),
+                source: TrunkIu4MaskSource::Off,
+            }),
+        }
+    }
+}
+
+/// [`Qwen4TrunkMask::resolve_iu4`] over the process's [`TRUNK_IU4_ENV`].
+pub fn qwen4_trunk_iu4_route(
+    arch: &str,
+    artifact: Option<TrunkIu4Default>,
+) -> Result<Qwen4TrunkIu4Route, String> {
+    Qwen4TrunkMask::resolve_iu4(
+        hipfire_config::developer_var(TRUNK_IU4_ENV).ok().as_deref(),
+        arch,
+        artifact,
+    )
 }
 
 #[cfg(test)]
@@ -354,6 +451,94 @@ mod tests {
         ] {
             let error = Qwen4TrunkMask::parse(raw).unwrap().check_layers(trunk).unwrap_err();
             assert!(error.contains(&format!("`{token}`")), "{raw}: {error}");
+        }
+    }
+
+    const ZAB: Option<TrunkIu4Default> = Some(TrunkIu4Default::Gfx1151ZabV1);
+    const ZAB_BITS: u16 =
+        TrunkFamily::GdnZ.bit() | TrunkFamily::GdnA.bit() | TrunkFamily::GdnB.bit();
+
+    fn route(env: Option<&str>, arch: &str, artifact: Option<TrunkIu4Default>) -> Qwen4TrunkIu4Route {
+        Qwen4TrunkMask::resolve_iu4(env, arch, artifact).unwrap()
+    }
+
+    #[test]
+    fn zab_marker_round_trips_and_names_the_s11_map() {
+        let zab = TrunkIu4Default::Gfx1151ZabV1;
+        assert_eq!(zab.marker(), "gfx1151-zab-v1");
+        assert_eq!(TrunkIu4Default::from_marker("gfx1151-zab-v1"), Some(zab));
+        for other in ["", "gfx1151-zab-v2", "GFX1151-ZAB-V1", "gfx1151", "zab"] {
+            assert_eq!(TrunkIu4Default::from_marker(other), None, "{other:?}");
+        }
+        assert_eq!(TRUNK_IU4_DEFAULT_KEY, "qwen4_trunk_iu4_default");
+        let mask = Qwen4TrunkMask::parse(zab.mask_spec()).unwrap();
+        for layer in [0, 1, 3, 47] {
+            assert_eq!(mask.bits(layer), ZAB_BITS, "layer {layer}");
+        }
+        assert_eq!(mask.canonical(), "gdn.z,gdn.a,gdn.b");
+    }
+
+    #[test]
+    fn marked_artifact_defaults_to_zab_on_exact_gfx1151_only() {
+        let on = route(None, "gfx1151", ZAB);
+        assert_eq!(on.source, TrunkIu4MaskSource::ArtifactDefault(TrunkIu4Default::Gfx1151ZabV1));
+        assert!(!on.mask.is_empty());
+        assert_eq!(on.mask.bits(9), ZAB_BITS);
+        for arch in ["gfx1201", "gfx1100", "gfx1150", "gfx11", "gfx1151x", "GFX1151", "gfx942", ""] {
+            let off = route(None, arch, ZAB);
+            assert_eq!(off.source, TrunkIu4MaskSource::Off, "{arch:?}");
+            assert!(off.mask.is_empty(), "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn unmarked_artifacts_stay_off_on_every_arch() {
+        for arch in ["gfx1151", "gfx1201", "gfx1100", "gfx942", ""] {
+            let off = route(None, arch, None);
+            assert_eq!(off.source, TrunkIu4MaskSource::Off, "{arch:?}");
+            assert!(off.mask.is_empty(), "{arch:?}");
+            assert_eq!(off.mask.bits(0), 0);
+        }
+    }
+
+    #[test]
+    fn explicit_env_wins_over_the_artifact_default() {
+        // `0` and empty disable A4 even on a marked artifact on gfx1151.
+        for raw in ["0", "", "  "] {
+            let off = route(Some(raw), "gfx1151", ZAB);
+            assert_eq!(off.source, TrunkIu4MaskSource::Env, "{raw:?}");
+            assert!(off.mask.is_empty(), "{raw:?}");
+        }
+        // Any other value replaces the default wholesale (existing grammar).
+        let all = route(Some("1"), "gfx1151", ZAB);
+        assert_eq!(all.source, TrunkIu4MaskSource::Env);
+        assert_eq!(all.mask.bits(5), TRUNK_ALL_BITS);
+        let one = route(Some("gdn.qkv@7"), "gfx1151", ZAB);
+        assert_eq!(one.mask.bits(7), TrunkFamily::GdnQkv.bit());
+        assert_eq!(one.mask.bits(8), 0);
+        // The mask grammar is not arch gated here: the arch gate lives in
+        // `Gpu::qwen4_trunk_iu4_requested`, exactly as for an unmarked artifact.
+        let other = route(Some("1"), "gfx1201", ZAB);
+        assert_eq!(other.source, TrunkIu4MaskSource::Env);
+        assert_eq!(other.mask.bits(0), TRUNK_ALL_BITS);
+    }
+
+    #[test]
+    fn env_behaves_as_before_for_unmarked_artifacts() {
+        assert!(route(Some("0"), "gfx1151", None).mask.is_empty());
+        assert_eq!(route(Some("all"), "gfx1151", None).mask.bits(0), TRUNK_ALL_BITS);
+        assert_eq!(route(Some("1"), "gfx1100", None).source, TrunkIu4MaskSource::Env);
+        assert_eq!(route(Some("gdn"), "gfx1151", None).mask.bits(3), TRUNK_GDN_BITS);
+    }
+
+    #[test]
+    fn bad_env_is_an_error_for_marked_and_unmarked_artifacts() {
+        for artifact in [None, ZAB] {
+            for arch in ["gfx1151", "gfx1201"] {
+                let error = Qwen4TrunkMask::resolve_iu4(Some("gdn,qsa.x"), arch, artifact).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_TRUNK_IU4"), "{error}");
+                assert!(error.contains("`qsa.x`"), "{error}");
+            }
         }
     }
 }

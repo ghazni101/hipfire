@@ -56,10 +56,10 @@ const GUARD_BYTE: u8 = 0xA5;
 /// Largest column count of one launch.
 pub const RESIDUAL_XBATCH_MAX: usize = 8;
 /// Output rows per workgroup; must equal
-/// `hipfire_isa::kernels::pm_decode::gemv_hfq4g256_residual_xbatch_mq4v2::ROWS_PER_WORKGROUP`
+/// `peacemaker_isa::kernels::pm_decode::gemv_hfq4g256_residual_xbatch_mq4v2::ROWS_PER_WORKGROUP`
 /// the object was built with. Grid = `ceil(m / rows)`.
 pub const RESIDUAL_XBATCH_ROWS: usize = 4;
-/// The PM code object, linked by `hipfire-isa emit --kernel
+/// The PM code object, linked by `peacemaker-isa emit --kernel
 /// pm_decode_gemv_hfq4g256_residual_xbatch_mq4v2`.
 const RESIDUAL_XBATCH_CO: &[u8] =
     include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_xbatch_mq4v2.co");

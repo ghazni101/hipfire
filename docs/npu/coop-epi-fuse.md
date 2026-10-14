@@ -1,14 +1,16 @@
 # Co-op epilogue fold: removing the gate_up / down NPU-column tail (Halo, IEF15 N0)
 
-CoopEpiFuse, 2026-10-03, branch `npu/coop-epi-fuse` (on `npu/coop-down27` e6450c4; see `docs/coop-down27.md`).
+> **Historical research note: superseded by the 0.4.2 serving route.** This file records a killed co-op prototype (epilogue fold for the dense 27B gate_up/down NPU columns; verdict in section 6) from the 2026-10 NPU research cycle. It is not current guidance, and any figure in it is a dated fixture-bound measurement or an explicitly labelled historical estimate, not a product claim. The shipped 0.4.2 NPU route is the Flash-Next gfx1151 trunk input projection described in [npu-trunk.md](npu-trunk.md): `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` (default `auto`, effectively `off` on every architecture except gfx1151), calibration schema 4, BF16-direct only. There is **no I32 serving contract** (no int32 partial, combine or fold exists in the product route). The out-projection program exists but is **not wired** into serving; `qsa.o` and the GDN o-projection are **not shipped**. Environment-variable names and flag syntax below are historical proposals or experiment switches, not supported configuration.
+
+2026-10-03, research branch `npu/coop-epi-fuse` (on `npu/coop-down27` e6450c4; see [coop-down27.md](coop-down27.md)).
 Model `qwen3.8-27b.mq4-xts` (sha256 `3e38ccba…f6f8ae`), L2 / L42 real weights. Inputs (md5): `L2.mlp.a4.bin` 4444070c…,
 `L2.down.a4.bin` ed787a32…, `L42.down.a4.bin` 67d7d41e…. Binary `coop27` md5 6a64289b… (5e0ba76),
 `ief_fold_gfx1151.co` md5 484200c1…. Windows: `tools/npu/steps/wf{1,2,3}.txt` (GPU only), `wc{1,2}.txt` (co-op). Logs are in
-`logs/coopepi/` (copied from hipx `~/pm-wave/coopepi/logs/`). Labels: **M** measured, **E** estimate.
+`logs/coopepi/` (copied from the measurement host). Labels: **M** measured, **E** estimate.
 
 ## 1. What was built (no hipfire edits; everything vendored into `crates/npu-tools/native/coop27/`)
-* **The incumbent in PM text.** `v2b_pm_gfx1151.s` is `hipfire-isa emit --kernel iu4_v2b --epi all --arch gfx1151` from
-  wt-land-041m 9aef0a35f. Peacemaker assembles it to an ELF byte-identical to the one inside the vendored
+* **The incumbent in PM text.** `v2b_pm_gfx1151.s` is `peacemaker-isa emit --kernel iu4_v2b --epi all --arch gfx1151` from
+  the 0.4.1 hipfire beta checkout at 9aef0a35f. Peacemaker assembles it to an ELF byte-identical to the one inside the vendored
   `.hxaco` (M, `cmp`).
 * **PM twins, the fold** (`native/build.sh`). `ief_gu_fold` and `ief_add_fold` are the incumbent gate_up SiLU and down ADD
   entries instruction for instruction, from the entry label to their end label. Their code bytes equal the incumbent's
@@ -102,7 +104,7 @@ size. Shipping it would cost:
 The arithmetic for a GO:
 * The NPU is still 30.5 ms busy for 3 commands (α 1.06–1.15 from its DDR traffic). The fold cannot hide work that needs
   the WGPs.
-* The levers are the blocked-residency NPU tiling (`docs/coop-down27.md` §7, E −0.6 ms/layer more), plus a twin whose
+* The levers are the blocked-residency NPU tiling ([coop-down27.md](coop-down27.md) §7, E −0.6 ms/layer more), plus a twin whose
   helper fits beside a GEMM workgroup. That needs fewer GEMM VGPRs, or the NPU-column SiLU written as part of the
   GEMM's own 8-group epilogue for neighbour columns, which does not exist in the incumbent emitter.
 * Together E ≈ −1.3 ms/layer (−1.2 %/step), still far below +10 %.

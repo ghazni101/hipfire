@@ -1,32 +1,47 @@
-# NPU (XDNA2 / AIE2P) on Strix Halo — railgun::npu + PM-npu bring-up
+# NPU (XDNA2 / AIE2P) on Strix Halo — railgun::npu + peacemaker-npu bring-up
 
-Owner: NpuOwner2 (from NpuProbe, 2026-10-02 09:00 UTC). Repo: hiptrx `/home/kaden/qcal/npu` (git `main`); hipx
-runs from clean git worktrees `~/qcal/npu-wt/<sha>` cloned from hiptrx (no rsync). Logs: hipx `~/qcal/npu-logs/`,
-copied to `logs/`. Milestones M1–M4 below follow the 2026-10-02 assignment (M1 hello completion, M2 single-core
+> **Lifecycle: historical evidence log (2026-10-02 onward), not a current-behavior
+> reference.** This file records bring-up windows, probes and dated measurements on one
+> Strix Halo test host. Every number is bound to the date, commit, shape and fixture it
+> names; none is a current performance claim or a serving admission. Statuses such as
+> "PASS", "KILL", "not run" and "Fast core still failing" describe that day and are
+> frequently superseded by later entries below. Designs measured here that were killed
+> or never wired (int32 epilogue / `I32` partials with a GPU fold, out-projection
+> programs, co-op epilogue folds, the GPU↔NPU co-op ring) are **not** shipped serving
+> paths. The 0.4.2 Flash-Next gfx1151 NPU trunk route is input projections only,
+> calibration schema 4, BF16-direct only (no I32 contract), default `auto`; for the
+> current route, schema and `HIPFIRE_QWEN4_NPU_TRUNK` / `fusions.npu_trunk` /
+> `fusions.npu_trunk_calibration` behaviour see [`npu-trunk.md`](npu-trunk.md) and
+> the root `CHANGELOG.md`. Logs referenced as `logs/…` live in the original NPU
+> workspace and are not part of this repository.
+
+Written 2026-10-02 onward by the NPU bring-up workstream. The NPU workspace repository (git `main`) was built on a
+build host; the Halo test host ran from clean git worktrees cloned from it (no rsync). Raw window logs were collected
+under `logs/` of that workspace (not copied into this repository). Milestones M1–M4 below follow the 2026-10-02 assignment (M1 hello completion, M2 single-core
 GEMM on hardware, M3 multi-core GEMM at expert shapes, M4 GPU+NPU concurrency).
 
-Status: **no GO/NO-GO verdict** — per the user directive, none is given until our own int8 kernel runs.
+Status as of 2026-10-02 09:00 UTC (historical): **no GO/NO-GO verdict** — per the project directive of that date, none is given until our own int8 kernel runs.
 No vendor compiler/runtime was used to measure the NPU.
 
-## Phase 0 — host inventory (hipx, read-only)
+## Phase 0 — host inventory (Halo test host, read-only)
 
 | item | value |
 |---|---|
 | kernel | 7.0.0-38-generic, `amdxdna` in-tree (`drivers/accel/amdxdna`, DRM driver 0.7.0) |
-| device | `0000:c0:00.1` `1022:17f0` rev `0x11`, `vbnv=RyzenAI-npu5`, PCIe link 16 GT/s x16 (internal) |
+| device | `<npu-bdf>` `1022:17f0` rev `0x11`, `vbnv=RyzenAI-npu5`, PCIe link 16 GT/s x16 (internal) |
 | firmware | `amdnpu/17f0_11/npu_7.sbin` loaded at boot; sysfs `fw_version=1.1.2.65` |
-| node | `/dev/accel/accel0` `crw-rw---- root:render` (kaden ∈ render) |
+| node | `/dev/accel/accel0` `crw-rw---- root:render` (the test user is in group `render`) |
 | XRT | Debian `libxrt*` 2.21.75 + `xrt-smi` installed (not used by our path) |
 | IOMMU | `iommu=pt` on the kernel cmdline; default domain Passthrough; NPU iommu group 37 type `identity` |
 | geometry | 8 columns (xrt-smi platform); rows: shim 0, mem tile 1, core 2..5 (QUERY_AIE_METADATA below) |
-| memlock | ssh sessions get RLIMIT_MEMLOCK 8 MiB despite `/etc/security/limits.d/{90-kaden-memlock,99-amdxdna}.conf` = unlimited; our wrapper raises it per process with `prlimit` (not a host change) |
+| memlock | ssh sessions get RLIMIT_MEMLOCK 8 MiB despite `/etc/security/limits.d/{90-memlock,99-amdxdna}.conf` = unlimited; our wrapper raises it per process with `prlimit` (not a host change) |
 
 Fabric clock control (standard amdgpu sysfs, kernel docs for `power_dpm_force_performance_level` / `pp_dpm_fclk`): for each amdgpu device
 with `pp_dpm_fclk`, write `manual` to `power_dpm_force_performance_level`, write the top level index to
 `pp_dpm_fclk`, then poll up to 30 s until the read-back shows `manual` and exactly one `*` on the top
 line; `release` writes `auto`. Our `tools/npu/npu-window.sh` applies the same method to the Strix Halo iGPU
-only (`0000:bf:00.0`, fclk levels 400…2000 MHz), refuses to start unless it owns the exclusive
-`hipx-lock.sh timing` hold and the incoming level is `auto`, and always restores `auto`. The pin / verify /
+only (fclk levels 400…2000 MHz), refuses to start unless it owns the exclusive
+host timing-lock hold and the incoming level is `auto`, and always restores `auto`. The pin / verify /
 restore code is `crates/railgun/src/npu/fclk.rs` (`npu-tools fclk pin|status|restore`, called by the script); concurrent
 GPU+NPU binaries (`npu-coop`, `npu-tools m4`) refuse to start unless the pin is held (`NPU_FCLK_GUARD`).
 
@@ -78,7 +93,7 @@ SMU metrics (current decoder `npu-tools soc-metrics`, read-only `gpu_metrics` v3
 
 ### M3 — 32-core int8 GEMM at Flash-Next expert shapes — **PASS on hardware with the Serial core** (2026-10-02 15:42 UTC); Fast (VLIW) core still failing
 
-Shapes (from `/home/kaden/qcal/release-0.4.0/qwen4/parent/config.json`: hidden 2560, moe_intermediate 640,
+Shapes (from the Flash-Next parent model `config.json`: hidden 2560, moe_intermediate 640,
 512 experts, top-10): gate_up = [M×2560]·[2560×1280], down = [M×640]·[640×2560]. (The assignment's
 "hidden 4096-class" is 2560 in this config.)
 
@@ -86,11 +101,11 @@ Offline (all gates pass on `main`):
 
 | piece | result |
 |---|---|
-| slice C hazard model (`isa/sched.rs`, NpuSched) folded `d3c3cc1` | 1387 vendor ELFs / 461 311 bundles: zero physical hazards |
-| slice E exact PDI/TXN interpreter (NpuSim) folded `00a7d86` | hello + single-core design CPU-exact from the exact submitted bytes |
-| core kernel `kernels/gemm_core.rs` (NpuSched) v2 `9c90adb` | 128×64 output tile per core, C resident in core memory, K streamed in 64-chunks; 4-accumulator VLIW wavefront (AIE2P has only dm0..dm4) + zero-overhead loop; **1067 issue cycles per later K64 chunk for 1024 VMACs (0.96 VMAC/issue), 1070 for chunk 0**; zero decoded physical hazards (kc=40, tiles=24); CPU-exact in the timed core simulator (kc 1/2/10/40 × tiles 1/2/3); 14 048 B program |
+| slice C hazard model (`isa/sched.rs`, scheduler-checker slice) folded `d3c3cc1` | 1387 vendor ELFs / 461 311 bundles: zero physical hazards |
+| slice E exact PDI/TXN interpreter (simulator slice) folded `00a7d86` | hello + single-core design CPU-exact from the exact submitted bytes |
+| core kernel `kernels/gemm_core.rs` (scheduler-checker slice) v2 `9c90adb` | 128×64 output tile per core, C resident in core memory, K streamed in 64-chunks; 4-accumulator VLIW wavefront (AIE2P has only dm0..dm4) + zero-overhead loop; **1067 issue cycles per later K64 chunk for 1024 VMACs (0.96 VMAC/issue), 1070 for chunk 0**; zero decoded physical hazards (kc=40, tiles=24); CPU-exact in the timed core simulator (kc 1/2/10/40 × tiles 1/2/3); 14 048 B program |
 | array deployment `kernels/gemm_array.rs` (ArrayDesign) | vendor whole-array topology (A broadcast per core row from memtile r, B broadcast per column, C joined in each column's memtile → shim); host-prepacked 8×8 blocks; 3 args; PDI 477 600 B, TXN 38 112 B |
-| whole-array simulator (NpuSim) folded `c5ca1dd` | executes the exact array PDI+TXN: 512×512×64/256, 512×2560×640, 512×1280×2560, 1024×1280×2560 CPU-exact |
+| whole-array simulator (simulator slice) folded `c5ca1dd` | executes the exact array PDI+TXN: 512×512×64/256, 512×2560×640, 512×1280×2560, 1024×1280×2560 CPU-exact |
 
 Hardware run 1 (batch `array-fe6c711`, 12:29 UTC, kernel v1): **FAILED** — `npu-gemm 512 512 64 --array` and
 `512 512 256`: syncobj wait ETIME after 30 s, C buffer untouched (all words still the 0xA5 poison), kernel log
@@ -117,7 +132,7 @@ Measured state, identical on every core of V2/V3/V5:
 | memtile / shim | every C input channel starved on its first BD — no C word left the cores |
 
 So data delivery, routes for A/B, and the computation all ran on silicon; the C drain never starts because
-C-full is never observed by the core DMA. The simulator and a source/TableGen audit (NpuSched: no register
+C-full is never observed by the core DMA. The simulator and a source/TableGen audit (scheduler-checker slice: no register
 clobbers, branch delay slots and ZOL constraints met, raw BM stores, no SRS) do not explain it — **root cause
 not yet proven**. V1 additionally violates the AIE2P memtile rule that cardinal South↔North pass-through must keep
 the lane (aie-rt `xaie_ss_aieml.c` PortVerify; V1 used South0→North4) and logged a stream-switch parity-error
@@ -199,11 +214,11 @@ down M=4096 2 129 920 cycles → at the measured 1.80 GHz 17.6 / 11.3 useful TOP
 Prepared M4 orchestration (current port: `npu-tools m4`; the ≤240 s hold approval was historical; MemAvailable ≥ 16 GiB check): one Flash-Next
 load, 1 warm + 3 GPU-alone pp8192, NPU loop (`npu-gemm … --array --loop S`, first submit verified before
 the GPU starts) + 3 concurrent pp8192, NPU loop alone, unload; SMU DRAM/NPU bandwidth sampled at 20 ms with
-phase marks. Reference (halo-moe-bytes `plain1`, Oct 1): pp8192 5632–5855 ms per prefill after warm-up.
+phase marks. Reference (earlier Halo MoE-bytes run `plain1`, Oct 1; not in this repository): pp8192 5632–5855 ms per prefill after warm-up.
 
-**Handoff (NpuOwner3, 2026-10-02 ~18:10 UTC).** Window 6 is queued on hipx through a Tier-4 queue gate
-(`~/qcal/npu-logs/gate-b3f5c55.sh`: queues the hold only when ≤ 4 Halo holds wait, rechecking every 10 min;
-output `~/qcal/npu-logs/m3-b3f5c55.log`, worktree `~/qcal/npu-wt/b3f5c55`, binary sha256 `fab4d77b…ecf8`).
+**Handoff (2026-10-02 ~18:10 UTC).** Window 6 was queued on the test host through a queue gate
+(a script that queued the hold only when ≤ 4 Halo holds waited, rechecking every 10 min;
+output `logs/m3-b3f5c55.log`, binary sha256 `fab4d77b…ecf8`).
 It runs `tools/npu/npu-m3-shapes.sh` with `NPU_M3_CORE=FastSlowCtl`: V2 FastSlowCtl and Fast (JNZ back edge),
 V5 FastSlowCtl, then the V6 expert shapes (M = 512/4096, 3 submits each). If FastSlowCtl is exact there:
 make its control code the only `Fast` (delete the variant), then run M4 with
@@ -211,56 +226,56 @@ make its control code the only `Fast` (delete the variant), then run M4 with
 `NPU_M4_ALONE_CMD="… --loop 10 …"` under one ≤ 240 s hold (`NPU_WINDOW_TIMEOUT=240`). Next throughput step
 (user target ~50 TOPS): the A-bound dataflow (A 8 KiB/chunk on one 4 B/cycle stream = 2048 cycles against
 1067 compute cycles) is being redesigned (vertical A sharing through neighbour memory, plan in progress by
-NpuOwner3.ASplitPlan → `local://npu-asplit-plan.md`), plus a second memtile→shim C channel.
+the A-split plan, a workspace-local note not in this repository), plus a second memtile→shim C channel.
 
 ## Obstacles (not kills)
 
 1. Timing-lock contention: fold gates have priority; NPU windows waited 35 min to 2 h 20 min.
-2. ssh sessions on hipx get an 8 MiB memlock limit; handled per process with `prlimit`.
+2. ssh sessions on the test host get an 8 MiB memlock limit; handled per process with `prlimit`.
 3. The token-route requirement wasn't stated in anything we read; it was found on hardware.
 4. Exec bit lost on scp cost two windows (fixed with chmod + preflight).
 5. The whole-array deployment (and every bisect variant) does not complete on hardware: cores finish but C-full is never seen by the core DMA (M3); root cause unproven, kernel log silent.
-6. `pm-npu` test `vendor_decode_oracle_roundtrip` cannot run here: the oracle `/tmp/aie2p-llvm-objdump` lost
-   `libLLVM.so` (environment, oracle only); all other pm-npu / pm-npu-sim gates pass.
+6. `peacemaker-npu` test `vendor_decode_oracle_roundtrip` cannot run here: the oracle `/tmp/aie2p-llvm-objdump` lost
+   `libLLVM.so` (environment, oracle only); all other peacemaker-npu / peacemaker-npu-sim gates pass.
 
 Host changes: **none** (no driver, firmware, IOMMU, kernel-parameter or persistent limit change; no reboot).
 
 ## Handoff for M3 (multi-core int8 GEMM at expert shapes) and M4 (GPU+NPU concurrency)
 
-**State.** npu repo `main` (hiptrx `/home/kaden/qcal/npu`) holds railgun::npu, pm-npu (encoder, decoder,
+**State.** The NPU workspace repo `main` holds railgun::npu, peacemaker-npu (encoder, decoder,
 VLIW packer, CDO/PDI/TXN, DMA/route, `kernels/gemm_i8.rs` incl. single-core `design()` and the 8×4
-`ArrayPlan` staging), pm-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
-Folded since: NpuSched (`d3c3cc1`), NpuSim exact-PDI/TXN + whole-array sim (`00a7d86`, `c5ca1dd`), gemm_core v2
+`ArrayPlan` staging), peacemaker-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
+Folded since: scheduler-checker slice (`d3c3cc1`), simulator slice exact-PDI/TXN + whole-array sim (`00a7d86`, `c5ca1dd`), gemm_core v2
 (`646a1fb`), gemm_array + bisect variants (`9232c8a`). Open branches: `npu/m3-kernel` e96b835 (Serial/LockOnly
 core variants, gated), `npu/m3-array` 7e83786 (bisect2 READY, merged e96b835 + main 5f05360: `--core Fast|Serial|LockOnly`, `--dump-status` on success and failure incl. single-core, Rust status decoder, V1 same-lane fix, `tools/npu/npu-bisect2.sh`; not yet merged to main or run on hardware). Vendor corpus:
-`ref/vendor-artifacts/cache/` (gitignored).
+a local vendor-artifact cache (gitignored, not in this repository).
 
 **Next window (bisect2, < 60 s):** gemm_i8 64³ with status dump (decoder reference); V2 with LockOnly, Serial,
 Fast; V5 with LockOnly, Serial. LockOnly passing ⇒ lock/DMA contract fine, kernel at fault (Serial passing ⇒
 VLIW/ZOL schedule); LockOnly failing ⇒ C-full lock/DMA encoding. Then M3 expert shapes (`npu-gemm M 1280 2560
 --array --reuse-ctx`, `M 2560 640`), then M4 (current port: `npu-tools m4`; historical 240 s approval; MemAvailable ≥ 16 G).
 
-**How to run on hipx (rules: free ≥ 40 G only for >4 G jobs; one ≤ 90 s window per exclusive hold; no host changes).**
-1. Commit on hiptrx; on hipx: `cd ~/qcal/npu.git && git fetch hiptrx:/home/kaden/qcal/npu main:main && git worktree add --detach ~/qcal/npu-wt/<sha> <sha>`; check `git status --porcelain` is empty.
-2. Build on hiptrx (same glibc 2.43) and scp only `target/release/{npu-hello,npu-gemm,npu-tools}` (plus any other binary the batch runs) into the worktree's `target/release/` (record sha256 both sides) — the build lock queue on hipx is long; `npu-window.sh` refuses (exit 7) without `npu-tools`.
+**How to run on the test host (rules: free ≥ 40 G only for >4 G jobs; one ≤ 90 s window per exclusive hold; no host changes).**
+1. Commit on the build host; on the test host fetch `main` into a bare mirror and `git worktree add --detach <worktree>/<sha> <sha>`; check `git status --porcelain` is empty.
+2. Build on the build host (same glibc 2.43) and scp only `target/release/{npu-hello,npu-gemm,npu-tools}` (plus any other binary the batch runs) into the worktree's `target/release/` (record sha256 both sides) — the build lock queue on the test host is long; `npu-window.sh` refuses (exit 7) without `npu-tools`.
 3. Launch detached so the lock wait survives the client:
-   `(setsid nohup ~/pm-wave/hipx-lock.sh timing -- env NPU_WINDOW_LOG=$HOME/qcal/npu-logs/npu-window.log NPU_WINDOW_TIMEOUT=90 ./tools/npu-window.sh ./tools/npu-batch.sh > ~/qcal/npu-logs/batch-<sha>.log 2>&1 < /dev/null &)`
+   `(setsid nohup <timing-lock-wrapper> timing -- env NPU_WINDOW_LOG=logs/npu-window.log NPU_WINDOW_TIMEOUT=90 ./tools/npu-window.sh ./tools/npu-batch.sh > logs/batch-<sha>.log 2>&1 < /dev/null &)`
    then wait on `end rc=` in that log with a background waiter. Never `pkill -f` with a pattern that also matches your own ssh command line (it kills the session).
 
 **Gate order for M3.** (a) `npu-gemm 64 64 64` CPU-exact on hardware (queued in batch `18eda6b`).
 (b) Single-core shapes up to the kernel's limits (K 64..256, M,N multiples of 8) CPU-exact.
 (c) Replace the nop-padded microkernel with a software-pipelined VLIW body (`isa/bundle.rs` packing,
-NpuSched latencies; the vendor matmul ELFs show the loads of iteration i+1 overlapping VMAC of i).
+scheduler-checker slice latencies; the vendor matmul ELFs show the loads of iteration i+1 overlapping VMAC of i).
 (d) Multi-core: 4 core rows × 8 columns via mem-tile broadcast of B / split of A (`ArrayPlan`), shim
 DMA 3-D BDs (`dma.rs`). Expert shapes: gate_up N=1280, K=2560; down N=2560, K=640; M = 128…4096.
 Each needs ≤ 5 DDR-patched args (firmware translates only bo0..bo4) or arg_plus offsets into one buffer.
 (e) Report useful TOPS = 2·M·N·K / submit→completion time, against an exact CPU result, per shape.
 
-**M4 plan.** GPU side: `~/pm-wave/halo-moe-bytes/run.sh plain <id>` (Flash-Next pp8192, daemon
-`~/pm-wave/hyper-halo/bin`, model `/home/kaden/fold-flash-next/models/qwen3.8-flash-next.mq4`, ~125 GB:
+**M4 plan.** GPU side: a workspace-local MoE-bytes runner (Flash-Next pp8192, daemon
+from a local build, Flash-Next MQ4 model, ~125 GB:
 check `free -g` ≥ 40 G first; `pmc` mode gives FETCH_SIZE/WRITE_SIZE for DRAM bytes). Run 3× GPU-alone
 and 3× with the NPU looping the best M3 kernel in a second process, inside ONE pinned window each
-(the pp8192 run is longer than 90 s → ask Main for a longer exclusive hold; the pin must cover the
+(the pp8192 run is longer than 90 s → request a longer exclusive hold; the pin must cover the
 whole overlap). Verdict GO only if NPU useful ops added > GPU ops lost (GPU slowdown × GPU useful ops).
 
 **Open questions.** Which clock drives the AIE array (MP-NPU 1267 MHz vs H-clock 1800 MHz)?
@@ -268,7 +283,7 @@ Does the firmware accept a partition smaller than 8 columns (num_tiles < 32) so 
 Does reusing one context across submits work for designs whose cores loop forever (avoids the
 ~ms context-creation cost per run; prior raw-dispatch measured ~100 µs warm submit on vendor PDIs)?
 
-## 2026-10-02 21:01 UTC — V8 on silicon (npu main 773e1e4, hipx log ~/qcal/npu-logs/v8b-773e1e4-2101.log)
+## 2026-10-02 21:01 UTC — V8 on silicon (npu main 773e1e4, log logs/v8b-773e1e4-2101.log)
 One npu-window hold (≤90 s, fclk pinned then restored to auto).
 
 | Variant / control | Shape | Result | Busy TOPS | Wall TOPS |
@@ -287,7 +302,7 @@ Takeaways:
 - The Fast core (JNZ back-edge fix 8cccd8b) is still wrong on silicon in both V6 and V8. i32 hangs; int8 completes with ~48% wrong words. This is a separate bug from the ZOL one.
 - Wall vs busy gap on down (11.5 vs 18.9): per-submit host overhead at the smaller shape.
 
-### 21:02 UTC: shape sweep, V8 FastSlowCtl int8, 2 s verified loops (hipx ~/qcal/npu-logs/sweep-773e1e4.log)
+### 21:02 UTC: shape sweep, V8 FastSlowCtl int8, 2 s verified loops (logs/sweep-773e1e4.log)
 | M×N×K | busy TOPS | wall TOPS | ms per submit (busy) |
 |---|---:|---:|---:|
 | 4096×1280×640 | 13.2 | 8.5 | 0.507 |
@@ -304,8 +319,8 @@ Derived (arithmetic on the rows above):
 - **K slope.** About 23–24 TOPS on the padded work, plus a fixed ~0.23 ms per submit at M=4096, N=1280 that scales with output size (C drain / per-wave setup). The model predicted 41 TOPS for this control, so the core/stream rate, not host overhead, binds at ~40% of peak.
 - **Wall vs busy** narrows with bigger submits (20.2 / 25.4 at N=2560), so host overhead is secondary at expert shapes.
 
-## 2026-10-02 21:17–21:27 UTC — NpuLead5: Fast core fixed (branch-target alignment), K-slope = DDR traffic, K=5120 (npu main 1f3dd24)
-Two npu-window holds (≤90 s each, fclk pinned then restored to auto). Logs on hipx: `~/qcal/npu-logs/probe1-aaa165d.log`
+## 2026-10-02 21:17–21:27 UTC — Fast core fixed (branch-target alignment), K-slope = DDR traffic, K=5120 (npu main 1f3dd24)
+Two npu-window holds (≤90 s each, fclk pinned then restored to auto). Logs: `logs/probe1-aaa165d.log`
 (bw sweep, Fast-control bisect, K-slope probes) and `probe2-1f3dd24.log` (after the fix). Busy TOPS = useful ops / summed
 submit→completion time; wall includes host overhead; peak 59.0 TOPS at the measured 1.80 GHz.
 
@@ -352,7 +367,7 @@ limit; npu-gemm panicked before printing). Raised to `MAX_KC = 160` (K ≤ 10240
 (512×512×5120 Fast/Slow) and exact on silicon (row above).
 
 ## 2026-10-02 21:43 UTC — V9 (resident B) on silicon: exact, gate_up 22.7 / down 21.6 TOPS (npu main 8a8d88e)
-One hold (log hipx `~/qcal/npu-logs/probe3-8a8d88e.log`). V9 = V8 with each N-wave's B tile resident in the column memtile
+One hold (log `logs/probe3-8a8d88e.log`). V9 = V8 with each N-wave's B tile resident in the column memtile
 and replayed for all M-waves (nw-outer wave order; replay BDs toggle the two B slots through the BD iteration field;
 compact int8 C). DDR read per submit: gate_up 60 → 33.75 MiB, down 25.3 → 14.1 MiB.
 
@@ -376,8 +391,8 @@ broadcast couples all cores of a row lane, and only two A/B slots per core). Nex
 in progress) and deeper core-side buffering. Down is close to its DMA floor (its int8 C alone is 10 MiB per submit).
 
 ## 2026-10-02 21:46 UTC — GPU→NPU zero-copy via dma-buf: SUPPORTED (exact on silicon; npu main 817a9cd) — **AMENDED 2026-10-03 02:45 UTC: only bytes written BEFORE the export alias; see "Amendment: HIP VMM dma-buf export does not live-alias"**
-Question from Main (M4 prep): can `amdxdna` import a dma-buf exported from a HIP allocation on the Halo iGPU so the NPU
-reads GPU-written activations in place? Source chain (full citations in `docs/gemm_i8.md`, "GPU→NPU dma-buf"):
+Question (M4 prep): can `amdxdna` import a dma-buf exported from a HIP allocation on the Halo iGPU so the NPU
+reads GPU-written activations in place? Source chain (full citations in `docs/npu/gemm_i8.md`, "GPU→NPU dma-buf"):
 amdxdna has a PRIME import (`amdxdna_pci_drv.c:249` → `amdxdna_gem.c:644-677`, imported object = `AMDXDNA_BO_SHMEM` with
 the attachment's SG table); its device address is the host VA after an mmap of the imported GEM object (identity/SVA,
 `amdxdna_gem.h:74-77`, HMM registration `amdxdna_gem.c:248-249,342-346`), and `EXEC_CMD` takes it like any argument BO.
@@ -387,7 +402,7 @@ On the exporter side amdgpu refuses to keep VRAM BOs for a non-P2P importer and 
 The in-place path is a **HIP VMM host-backed physical allocation** (`hipMemCreate` pinned, location Host, mapped
 GPU-accessible) exported with `hipMemGetHandleForAddressRange` → `Device::import_dmabuf` (`railgun::npu`).
 
-Hardware window (hipx log `~/qcal/npu-logs/probe4-817a9cd.log`): `npu-gemm --a-from-hip` allocates the packed A in that
+Hardware window (log `logs/probe4-817a9cd.log`): `npu-gemm --a-from-hip` allocates the packed A in that
 memory, the **GPU writes it** (`hipMemcpyHtoD` + `hipDeviceSynchronize`), exports the dma-buf, the NPU imports it as arg0
 (B and C are normal BOs), and every checked submit is compared with the CPU result:
 
@@ -401,11 +416,11 @@ memory, the **GPU writes it** (`hipMemcpyHtoD` + `hipDeviceSynchronize`), export
 
 Verdict: **supported, zero-copy**, provided the producer allocates with HIP VMM host memory (not `hipMalloc`). Not
 measured: GPU kernel write bandwidth into that host-VMM buffer vs VRAM-carve-out memory. Disclosure: during
-implementation a subagent ran a HIP allocate/copy/export smoke on hiptrx's local GPU (not hipx, no NPU access) against
+implementation a helper ran a HIP allocate/copy/export smoke on the build host's local GPU (not the NPU test host, no NPU access) against
 its instructions.
 
 ## 2026-10-02 21:56–22:08 UTC — core bank layout (+11%), AIE2P rule gate, wall ≈ busy (npu main d8f0314)
-Windows: hipx `~/qcal/npu-logs/probe5-02f7cbd.log` (layout sweep) and `probe6-d8f0314.log` (new defaults).
+Windows: `logs/probe5-02f7cbd.log` (layout sweep) and `probe6-d8f0314.log` (new defaults).
 
 **Core data-memory banks.** AIE-ML data memory = 8 single-port 8 KiB banks, even/odd interleaved at 16 B into four
 16 KiB double banks, round-robin arbitration among core / neighbour core / DMA (AM020 "AIE-ML Memory Module", UG1603;
@@ -422,7 +437,7 @@ B (0x4000..), so every B load and C load collided. Four maps were tried on silic
 The wavefront issues 1070 cycles per chunk; ~290 stall cycles remain (both pair cores read the same A banks; DMA writes
 share banks with core reads).
 
-**AIE2P rule gate (`crates/pm-npu/src/isa/rules.rs`, asked by Main).** `Program::finish` now rejects, with the rule and pc:
+**AIE2P rule gate (`crates/peacemaker-npu/src/isa/rules.rs`, asked in review).** `Program::finish` now rejects, with the rule and pc:
 unaligned branch targets (unless the 16-byte line before the target is whole NOP bundles — the form FastSlowCtl and
 the single-core `gemm_i8` ran exact with), any `ls`/`le`/`lc` write (hardware ZOL never looped on silicon), lock requests
 < 4 bundles apart, and branches/DONE/locks or landing targets inside the 5 delay slots. One violating unit test per rule;
@@ -444,7 +459,7 @@ for DRAM):
 | V9 nocompute probe | gate_up / down | 31.21 / 25.19 eq. | | | DDR | timing only |
 
 ## 2026-10-02 22:11 UTC — V10 (A per M-wave + all of B resident): exact, not faster for down (npu main 78b96f3)
-Hold log hipx `~/qcal/npu-logs/probe7-78b96f3.log`. V10 reads A and B from DDR once per submit (down: 4.06 MiB read vs
+Hold log `logs/probe7-78b96f3.log`. V10 reads A and B from DDR once per submit (down: 4.06 MiB read vs
 V9's 14.1 MiB). Exact everywhere (512²×64, 1536×1024×192 three submits on one context, 1024×4096×64 NW=8, loops).
 
 | variant | shape | busy TOPS | wall TOPS | binding limit | exactness |
@@ -463,7 +478,7 @@ wave (arithmetic on two measurements, not a model). V9 stays the best down desig
 
 ## 2026-10-02 22:12–22:14 UTC — M4: NPU GEMM loop concurrent with GPU pp8192 (one ≤240 s hold; npu main 3dbe227)
 M4 orchestration (then Python, current port: `npu-tools m4`; one Flash-Next load, fclk pinned, MemAvailable 28 GB ≥ 16 GB), NPU = V9 Fast int8 gate_up
-4096×1280×2560 `--loop 25` concurrent / `--loop 10` alone. Logs hipx `~/qcal/npu-logs/m4-3dbe227.log` and `m4-3dbe227/`.
+4096×1280×2560 `--loop 25` concurrent / `--loop 10` alone. Logs `logs/m4-3dbe227.log` and `m4-3dbe227/`.
 
 | phase | GPU pp8192 ms (3 runs) | GPU mean | NPU busy TOPS | NPU wall TOPS | NPU exactness |
 |---|---|---:|---:|---:|---|
@@ -476,9 +491,9 @@ the NPU delivered 22.16 TOPS × 18.4 s ≈ 408 int8 TOP. The trade is net positi
 408 / 1.69 ≈ 241 TOPS, far above anything the iGPU sustains on this workload [INFERENCE: GPU useful prefill TOPS not measured
 here]. **GO** by the plan's criterion; the NPU itself loses 13% (25.6 → 22.2) to the shared fabric.
 
-## 2026-10-02 23:14 UTC — Levers Window 1: same-day baselines, E0b no-compute kc sweep, zero-code E0a (npu levers 61cb611)
-One hold, 21 s, every exact step `mismatches=0` (first+final of each loop), no kernel-log lines. Log hipx
-`~/qcal/npu-logs/levers-w1-61cb611.log` (copy `logs/levers/`). Plan: `docs/levers-joint.md` §7.
+## 2026-10-02 23:14 UTC — Levers window 1: same-day baselines, E0b no-compute kc sweep, zero-code E0a (npu levers 61cb611)
+One hold, 21 s, every exact step `mismatches=0` (first+final of each loop), no kernel-log lines. Log
+`logs/levers-w1-61cb611.log` (copy `logs/levers/`). Plan: `docs/npu/levers-joint.md` §7.
 
 | run | busy TOPS | wall TOPS | µs/submit | exactness |
 |---|---:|---:|---:|---|
@@ -499,9 +514,9 @@ One hold, 21 s, every exact step `mismatches=0` (first+final of each loop), no k
 | 640 (10) | 534.0 | 396.8 | 6.86 | 259.5 | 456.0 | 361.1 | 4.75 | 266.2 |
 
 Readings (arithmetic on the rows): (1) **a fixed ≈215 µs per submit** independent of M and kc (both variants within
-6 µs for kc ≤ 2). It is 20% of gate_up's 1073 µs and 38% of down's 562 µs. NpuRailgun's no-op bench (hipx
+6 µs for kc ≤ 2). It is 20% of gate_up's 1073 µs and 38% of down's 562 µs. The railgun slice's no-op bench (test host
 `railgun-small-3dcfe06.log`) splits it: no-op EXEC_CMD round trip 59 µs single / ~20 µs chained, V9 512×512×64
-214 µs single / 167 µs chained → ~150 µs is execution of our ~50 KB dynamic TXN. Lean TXN is owned by NpuRailgun.
+214 µs single / 167 µs chained → ~150 µs is execution of our ~50 KB dynamic TXN. Lean TXN is owned by the railgun slice.
 (2) At kc ≤ 2 the per-wave cost (4.5–4.7 µs) equals the 256 KiB C write at 55–56 GB/s. (3) The one-formula fit
 `T = T0 + W·F + W·kc·c` has residuals up to ±22k cycles (12 µs): per-wave cost is not additive in kc (V9 per-wave grows
 4.67 → 6.86 µs, V10 stays 4.5–4.75 µs); it is not used as a hardware law. (4) V9 gate_up no-compute minus 215 µs is
@@ -518,7 +533,7 @@ Mechanism: the upper core of each pair walks its own O half with the row-0 curso
 row-1 cursor, C row cursors swapped to match (same C bytes). Simulator: pair core exact (all layouts, both controls and
 epilogues, kc 1/2/3/40), whole-array V8/V9/V10 exact incl. gate_up/down shapes and three-submit same-context runs; bank
 model peer-A collisions 1024 → 0, compute-only split/shared stall slots 512/748 → 0/236 (model). Silicon window (34 s,
-all exact, log hipx `~/qcal/npu-logs/levers-w2-c88a6fb.log`, interleaved base/swap):
+all exact, log `logs/levers-w2-c88a6fb.log`, interleaved base/swap):
 
 | run | base busy / wall | swap busy / wall |
 |---|---|---|
@@ -534,10 +549,10 @@ Verdict: slope ≥ 1330 with swap and no exact wall win beyond same-window varia
 the 1067-cycle issue schedule are **not** same-cycle peer-A bank collisions, contrary to the bank model's attribution.
 
 ## 2026-10-02 23:36 UTC — Lever 3: memtile A ring depth KILLED, V10 prefix-ready B kept dark (npu levers df94050)
-Simulator first (`crates/pm-npu/tests/levers3.rs`, 19 tests: exact C, unchanged inputs, exact per-channel traffic, Fast and
+Simulator first (`crates/peacemaker-npu/tests/levers3.rs`, 19 tests: exact C, unchanged inputs, exact per-channel traffic, Fast and
 Slow, three-seed same-context runs with odd/even `kc*waves` and non-multiple-of-D chunk counts, 88-chunk prefix boundary);
 default V9/V10 bytes pinned by the new `golden_bytes.rs` (38 rows generated before the edit, green after). One hold, 42 s,
-all 50 checked submits exact (first + final of every loop), log hipx `~/qcal/npu-logs/levers-w3-df94050.log`.
+all 50 checked submits exact (first + final of every loop), log `logs/levers-w3-df94050.log`.
 
 | run (two interleaved passes) | gate_up busy / wall | down busy / wall | no-compute µs gate_up / down | repeat slope gate_up |
 |---|---|---|---|---:|
@@ -552,11 +567,11 @@ all 50 checked submits exact (first + final of every loop), log hipx `~/qcal/npu
   spread (24.19–25.49 across W2/W3), and the compute slope is unchanged. Down gains ~1% wall, below the gate. Code removed.
 * **3B (V10 prefix-ready B): passes.** +4.5% wall / +5.0% busy over same-window V10 (gate ≥ 3%), no-compute −2.6%, and it
   beats the same-window best V9 down by 1.0% wall (min 23.13 > V9 max 22.99). Kept behind `--variant V10 --b-prefix`
-  (`design_v10_prefix`) for Main to fold; defaults unchanged.
+  (`design_v10_prefix`) for integration; defaults unchanged.
 * Repeat probes in 0.4 s loops produced two anomalous points (V9 depth-2 `repeat=4` 3801 µs/submit vs ~3140 expected;
   V10 prefix `repeat=3` 1413 µs vs ~1150), so the V9 depth-2 slope uses repeat 2→3; the prefix slope was re-taken below.
 
-**3B confirmation, 23:38 UTC** (npu levers b60716d, log hipx `~/qcal/npu-logs/levers-w4-b60716d.log`, 42 s, all 27 checked
+**3B confirmation, 23:38 UTC** (npu levers b60716d, log `logs/levers-w4-b60716d.log`, 42 s, all 27 checked
 submits exact). Four interleaved passes, 1.5 s loops, down 4096×2560×640:
 
 | down variant | median busy / wall TOPS | wall per pass | repeat 2 / 3 / 4 µs/submit (2 s loops) | cycles per accumulate chunk |
@@ -567,15 +582,15 @@ submits exact). Four interleaved passes, 1.5 s loops, down 4096×2560×640:
 
 Prefix: +1.3% wall over V9 (every prefix pass above every V9 pass), +5.1% over V10; fit residuals ≤ 6 µs. **The gain is
 in the startup intercept** (B no longer waits for the whole segment; repeat=2 831 vs 866 µs), not in chunk compute. Lean
-TXN (NpuRailgun) and the persistent ring attack the same per-submit intercept, so 3B's margin over V9 must be re-measured
+TXN (railgun slice) and the persistent ring attack the same per-submit intercept, so 3B's margin over V9 must be re-measured
 once lean TXN lands.
 
 ## 2026-10-02 23:44 UTC — Shipped-shape baselines: Flash-Next routed experts at M = 64…512 (npu levers 805559f)
-From now on every lever verdict carries the shapes we would ship (Main/user directive, 23:44 UTC): Flash-Next routed experts
+From now on every lever verdict carries the shapes we would ship (project directive, 23:44 UTC): Flash-Next routed experts
 at M = 64/128/160/256/512 (160 = 8192·10/512 average rows, `fn-halo-2500.md:35`) and the dense Qwen3.8-27B IU4 GEMMs at
-M = 8192 (from NpuDense27b, `release-0.4.1/iu4-roofline/tops.md:23-32`). The M = 4096 rows above remain for continuity.
+M = 8192 (from the dense-27B study, `docs/npu/dense27b.md` §1). The M = 4096 rows above remain for continuity.
 One hold, 34 s, all 52 checked submits exact (simulator-exact first: `v9_exact_expert_rows_m160`,
-`v10_exact_expert_down_m160`, `prefix_exact_expert_down_m160`). Log hipx `~/qcal/npu-logs/levers-w5-805559f.log`.
+`v10_exact_expert_down_m160`, `prefix_exact_expert_down_m160`). Log `logs/levers-w5-805559f.log`.
 One GEMM per submit, 1 s loops, busy TOPS (µs per submit; wall within 0.5% of busy):
 
 | M | gate_up ×1280×2560, V9 | down ×2560×640, V9 | down, V10 | down, V10 `--b-prefix` |
@@ -590,12 +605,12 @@ Readings: every variant is nearly flat at 280–360 µs per submit across M = 64
 per-submit intercept (≈215 µs TXN + submit, plus one wave's fill and drain) is ≥ 75% of the time; no core or memtile lever
 moves these rows. 3B is mixed here (−7 to −9% at M = 160/256, +3 to +7% elsewhere), so its M = 4096 win does not carry to
 the shipped expert shapes. Dense 27B: every shape has K ≥ 5120 (kc ≥ 80), outside V9 (`kc ≤ 54`) and V10
-(`kc·(2+NW) ≤ 112`), so levers 2/3A/3B have no dense row; NpuDense27b's V8 baselines are 26.9–27.5 busy TOPS at M = 4096
-slices (its log `npu-agents/dense27b/logs/dense27b/w1-be0be55.log`).
+(`kc·(2+NW) ≤ 112`), so levers 2/3A/3B have no dense row; the dense-27B study's V8 baselines are 26.9–27.5 busy TOPS at M = 4096
+slices (its log `logs/dense27b/w1-be0be55.log`).
 
 ## 2026-10-02 23:20–23:57 UTC — railgun for the NPU: prepared / chained submit, lean TXN, persistent work ring (npu railgun 3dcfe06…4cdc078)
-Design note: `docs/npu/railgun-npu.md`. Code: `railgun::npu` (`Prepared`, `Chain`, `tape`), `crates/pm-npu/src/kernels/gemm_array_lean.rs`
-(lean TXN), `crates/pm-npu/src/kernels/ring.rs` (persistent ring P1), benches `npu-railgun` / `npu-ring`. Every silicon window
+Design note: `docs/npu/railgun-npu.md`. Code: `railgun::npu` (`Prepared`, `Chain`, `tape`), `crates/peacemaker-npu/src/kernels/gemm_array_lean.rs`
+(lean TXN), `crates/peacemaker-npu/src/kernels/ring.rs` (persistent ring P1), benches `npu-railgun` / `npu-ring`. Every silicon window
 below was followed by a clean V9 health window (exact, 24.9–25.7 TOPS, empty kernel log). All results exact.
 
 **Per-submit overhead split** (no-op = TXN with one WRITE32, same hwctx and arg BOs; `railgun-small-3dcfe06.log`): a
@@ -604,7 +619,7 @@ A V9 512²×64 GEMM (≈1 µs of compute) costs 214 µs single and 167 µs chain
 executing the 51 KB full TXN; the lean TXN (11–14 KB) cuts that to ≈50 µs.
 
 **Measured table** (V9 Fast int8; a step = 8 GEMMs; overhead = step time at a ≈1–2 µs-compute shape, 512²×64 for full
-TXN / 512²×128 for lean; TOPS at G = 8 per step; logs hipx `~/qcal/npu-logs/`):
+TXN / 512²×128 for lean; TOPS at G = 8 per step; logs `logs/`):
 
 | mode | per-step overhead (8 GEMMs) | gate_up 4096×1280×2560 busy / wall TOPS | down 4096×2560×640 busy / wall TOPS | exactness | log |
 |---|---:|---|---|---|---|
@@ -634,14 +649,14 @@ patch caught by the fresh-encode diff AND by the output check; ring skipped done
 reported, other 7 present); stale seq patch (0/16 words patched, no new done lines); ring overrun refused by the host
 guard (and deadlocks the MASKPOLL in the simulator); tape stale key (cache miss + `check_replay` mismatch, nothing
 submitted); hash collision (unit test). Simulator gates: `ring` 11, `lean` 8, `array` 59, `golden_bytes`, `levers3`,
-pm-npu 97 + oracle, railgun::npu 18.
+peacemaker-npu 97 + oracle, railgun::npu 18.
 
 ## 2026-10-03 00:15–00:16 UTC — railgun grouped expert launch: one TXN per E experts (npu railgun 9b3ec13 / 8058f2c)
-`crates/pm-npu/src/kernels/experts.rs` (`grouped_v9`): one START_CU whose TXN runs E experts of one projection back to back on
+`crates/peacemaker-npu/src/kernels/experts.rs` (`grouped_v9`): one START_CU whose TXN runs E experts of one projection back to back on
 one V9 PDI (one ConfigKey: every M ≤ 512 is one 512-row wave, so the design is identical for all experts): expert 0 the
 full body, experts 1..E−1 the lean body, each with its own A/B/C arena patches (distinct weights per expert). Optional
 single ring poll/done around the whole group (sim-proven; silicon runs below are ring=off). Simulator: 14 `experts` gates
-(per-expert exact + byte-equal eager, end state == all-full group). Silicon (hipx `experts-gate_up-9b3ec13.log`,
+(per-expert exact + byte-equal eager, end state == all-full group). Silicon (`logs/experts-gate_up-9b3ec13.log`,
 `experts-down-8058f2c.log`; health after both clean): every expert's C byte-equal to its eager full-TXN oracle on the
 first and last round (`--verify-every` on the sanity run), all 32 runs PASS; E=64 is a 935 KB TXN and runs fine.
 
@@ -657,12 +672,12 @@ first and last round (`--verify-every` on the sanity run), all 32 runs PASS; E=6
 Per expert the time is flat in M: V9 computes the full 512-row wave for every expert (at M = 160 that is 3.2× padding).
 Versus the shipped-M eager baseline of the levers window (gate_up M=160 368 µs = 2.85 TOPS, down 288 µs = 1.82 TOPS,
 `levers-w5-805559f.log`) grouping is 1.8× (gate_up) / 2.5× (down) per expert. Next lever: a smaller-M wave (G80's
-256-row waves; contract handed to NpuLevers.Lever4).
+256-row waves; contract handed to the G80 lever slice).
 
 ## 2026-10-03 00:18 UTC — lean TXN for V10 and V10 `--b-prefix` (npu railgun 087dd68)
 Lean derivation extended to the prefix design (finite fill / guarded-replay groups requeued in order, BD 36 when MW > 1,
 group iteration `current` cleared; sim: 27 lean gates incl. every `levers3` prefix shape and four omission negatives).
-Silicon (hipx `railgun-prefix-087dd68.log`, health after clean), G = 8 prepared, full TXN first then lean with every
+Silicon (`logs/railgun-prefix-087dd68.log`, health after clean), G = 8 prepared, full TXN first then lean with every
 GEMM of every step poisoned and verified (96/96 and 1600/1600 per run):
 
 | design | down 4096×2560×640 µs/GEMM full → lean | lean busy TOPS | 160×2560×640 µs/GEMM full → lean | lean TXN |
@@ -672,10 +687,10 @@ GEMM of every step poisoned and verified (96/96 and 1600/1600 per run):
 | **V10 `--b-prefix`** | 511 → **412** | **32.56** | 239 → 131 | 8,816 / 15,824 B |
 
 ## 2026-10-03 01:02 UTC — Lever 4 (G80, 256×1280 wave, 128×80 core tile): EXACT, faster at every gate_up shape (npu levers 60c2648)
-Paper gates `docs/g80-feasibility.md`; simulator `crates/pm-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
+Paper gates `docs/npu/g80-feasibility.md`; simulator `crates/peacemaker-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
 odd/even resubmits, full/lean interleaves, grouped E=3), golden_bytes / levers3 / lean / ring green. Declared risky, approved by
-Main, run alone: 34 s, all 36 checked submits exact (first + final of every loop), V9 health check after (25.39 / 25.04, exact),
-rc=0, accel0 present. Log hipx `~/qcal/npu-logs/levers-w6-60c2648.log`. Single GEMM per submit, busy / wall TOPS (µs/submit):
+run alone: 34 s, all 36 checked submits exact (first + final of every loop), V9 health check after (25.39 / 25.04, exact),
+rc=0, accel0 present. Log `logs/levers-w6-60c2648.log`. Single GEMM per submit, busy / wall TOPS (µs/submit):
 
 | gate_up M×1280×2560 | V9 | G80 | G80 vs V9 |
 |---|---|---|---|
@@ -694,10 +709,10 @@ Kept dark behind `--variant G80` / `npu-experts --design G80`; defaults unchange
 
 ## 2026-10-03 02:08 UTC — coop-w1: grouped G80 vs grouped V9 experts with lean tails (npu coop bd3ac0e)
 Declared new design (two-wave G80 group for M = 512: `design_g80(512, ..)` passed to `experts::grouped` with
-`wave_m = 512`; simulator `g80.rs` 4 new two-wave gates, 55/55), approved by Main, run alone: 36 s, 33/33 runs PASS, every
+`wave_m = 512`; simulator `g80.rs` 4 new two-wave gates, 55/55), approved for a solo hold, run alone: 36 s, 33/33 runs PASS, every
 expert's C byte-equal to its eager full-TXN oracle on the first and last round (every round in the two `--verify-every`
 sanity runs), CPU sample exact; V9 health check after 25.24 / 24.91 TOPS exact, rc=0, kernel log empty. One-wave cells ran
-first, the two-wave M = 512 cells only after all passed. Log hipx `~/qcal/npu-logs/coop-w1b-bd3ac0e.log`
+first, the two-wave M = 512 cells only after all passed. Log `logs/coop-w1b-bd3ac0e.log`
 (`logs/coop/`). gate_up 1280×2560, µs per expert (useful TOPS), V9 → G80:
 
 | E | M=64 | M=128 | M=160 | M=256 | M=512 (G80 two waves) |
@@ -710,14 +725,14 @@ G80 is 36–40 % faster per expert at M ≤ 256 (one 256-row wave instead of V9'
 M (intercept-bound) at ~124 µs per grouped expert. Kept dark behind `npu-experts --design G80`; defaults unchanged.
 
 ## 2026-10-03 02:42–02:45 UTC — coop-w2: GPU-driven persistent ring, CPU-free GPU → NPU → GPU (npu coop 0fe69f9, bab5276)
-PM-native gfx1151 kernels (`crates/npu-tools/native/coop_ring_gfx1151.s`, peacemaker from wt-land-041m; `npu_tools::coop_gpu`):
+PM-native gfx1151 kernels (`crates/npu-tools/native/coop_ring_gfx1151.s`, PM source from the 0.4.1 beta snapshot; `npu_tools::coop_gpu`):
 `coop_copy` (the GPU writes A into the slot arena / reads C out), `coop_publish` (seq store `glc slc dlc` + `vscnt 0`, the
 WRITE_DATA-with-confirm equivalent, then a done-line poll with a realtime stamp before every load). The whole round's GPU
 stream is queued before the wait; the NPU side is the unchanged `persistent_v9_lean` / `empty_persistent`; the CPU only
 arms / re-arms (`patch_seq`) and verifies. Shared ring / A / C memory: anonymous host pages pinned by amdxdna as a userptr
 BO (`Device::userptr_bo`, `amdxdna_gem.c:594-639`) and `hipHostRegister`ed for the GPU (see the amendment below for why
 not a HIP VMM export). Declared new design, approved, run alone; both windows rc=0, kernel log empty, no CPU rescue, V9
-health 25.33 / 25.02 and 25.36 / 25.00 TOPS exact. Logs hipx `~/qcal/npu-logs/coop-w2-{0fe69f9,bab5276}.log` (`logs/coop/`);
+health 25.33 / 25.02 and 25.36 / 25.00 TOPS exact. Logs `logs/coop-w2-{0fe69f9,bab5276}.log` (`logs/coop/`);
 numbers below are 0fe69f9, bab5276 reproduces them within 0.2 µs / 1 %. GPU realtime 99.81 MHz
 (`hipDeviceAttributeWallClockRate`):
 
@@ -738,21 +753,21 @@ bytes written **before** `hipMemGetHandleForAddressRange` exported the allocatio
 mapping). Measured on Halo (no NPU command in these checks): for a HIP VMM host allocation, pinned or uncached, 64 KiB to
 16 MiB, bytes written before the export are seen through the amdxdna import; after the import, GPU writes (HtoD and
 GPU-kernel stores) are **not** seen through the dma-buf (import mapping or direct dma-buf mmap), writes through the dma-buf
-are **not** seen by the GPU (DtoH and GPU-kernel loads), and a second export still shows the pre-export bytes. Logs hipx
-`~/qcal/npu-logs/coop-w2-{2df862e,c6193a6,45aef0b}.log` (`logs/coop/`). [INFERENCE] the dma-buf pages and the GPU's VA
+are **not** seen by the GPU (DtoH and GPU-kernel loads), and a second export still shows the pre-export bytes. Logs
+`logs/coop-w2-{2df862e,c6193a6,45aef0b}.log` (`logs/coop/`). [INFERENCE] the dma-buf pages and the GPU's VA
 mapping diverge after the export/import; the driver/ROCr mechanism is not identified (`amdgpu_amdkfd_gpuvm_export_dmabuf`
 exports the KFD BO itself and `amdgpu_dma_buf_map` maps its TT pages, so the split is not in those two functions).
 
 Consequences:
 * **Invalid:** "zero-copy GPU producer in place" — a GPU kernel writing into an exported HIP VMM buffer after the NPU
   imported it, or reading NPU results from it (the co-op case). `docs/npu/railgun-npu.md` §3.1 / §4 named that transport for
-  the ring; corrected there to the userptr transport. `docs/levers-joint.md` §2 lever 5 / §4 H inherited the claim.
+  the ring; corrected there to the userptr transport. `docs/npu/levers-joint.md` §2 lever 5 / §4 H inherited the claim.
 * **Intact as measured (write-once-before-export, NPU-only afterwards):** probe4-817a9cd (`--a-from-hip` V8/V9 exact);
-  probe7-78b96f3 V10 `--a-from-hip`; NpuMemPath2's vmm-host / vmm-host-uncached DMA bandwidth sweeps, safe AXI sweeps and
+  probe7-78b96f3 V10 `--a-from-hip`; the memory-path slice's vmm-host / vmm-host-uncached DMA bandwidth sweeps, safe AXI sweeps and
   V9 no-compute / full-exact threshold runs (the NPU read/wrote the dma-buf's pages and verified through the import's
   mapping; bandwidth to those system pages is unaffected; the separately measured GPU bandwidth on the HIP VA is also
   intact). What these do **not** show is that the GPU and the NPU share one live buffer.
-* **Unaffected:** NpuDense27b's own windows (w1 partials, m4 derate) use native NPU BOs, not `--a-from-hip`
+* **Unaffected:** the dense-27B study's own windows (w1 partials, m4 derate) use native NPU BOs, not `--a-from-hip`
   (`tools/npu/npu-dense27b-{w1,m4}.sh`); M4 uses native BOs.
 * **Replacement transport (measured, live in both directions):** anonymous host pages pinned by amdxdna (userptr BO) and
   `hipHostRegister`ed for the GPU. Permanent gate `npu-coop --mode alias` (first step of `tools/npu/npu-coop-w2.sh`, no NPU
@@ -761,17 +776,17 @@ Consequences:
   cpu→gpu, gpu→cpu and npu-map==cpu MISMATCH → detected.
 
 ## Levers table (levers-joint §7 order; busy/wall TOPS at the expert shapes, exact unless noted)
-| lever | gate_up busy / wall | down busy / wall | exactness | kill verdict | log (hipx `~/qcal/npu-logs/`) |
+| lever | gate_up busy / wall | down busy / wall | exactness | kill verdict | log (`logs/`) |
 |---|---|---|---|---|---|
 | baseline V9 (W1) | 25.03 / 24.85 | 23.87 / 23.37 | exact | — | `levers-w1-61cb611.log` |
 | baseline V10 down (W1) | — | 23.01 / 22.51 | exact | — | `levers-w1-61cb611.log` |
-| E0b fit | — | — | timing only | fixed ≈215 µs/submit (→ NpuRailgun lean TXN) | `levers-w1-61cb611.log` |
+| E0b fit | — | — | timing only | fixed ≈215 µs/submit (→ railgun-slice lean TXN) | `levers-w1-61cb611.log` |
 | E0a (zero-code, V10 no-compute) | — | — | timing only | memtile→core ≥ 4.8 B/cycle/channel, not binding | `levers-w1-61cb611.log` |
 | 2: Upper A/C half-order swap | 25.50 / 25.26, 25.55 / 25.31 | 23.74 / 23.06, 23.77 / 23.07 | exact | **killed**: slope 1345 (V9) / 1369 (V8) ≥ 1330, no wall win | `levers-w2-c88a6fb.log` |
 | 3A: V9 memtile A ring depth 8 / 16 | 25.73 / 25.40, 25.66 / 25.33 (d8) | 24.12 / 23.17, 24.10 / 23.17 (d16) | exact | **killed**: no-compute 858 → 866 / 871 µs, wall within baseline spread | `levers-w3-df94050.log` |
 | 3B: V10 down prefix-ready B | — | **24.12 / 23.46** (median of 4; V9 23.82 / 23.16) | exact | **pass** (+1.3% wall vs V9, +5.1% vs V10; gain is startup intercept); merged behind `--b-prefix` | `levers-w3-df94050.log`, `levers-w4-b60716d.log` |
 | shipped experts, M = 160 (W5) | V9 2.90 / 2.90 | V9 1.87 / 1.87, 1.75 / 1.75; prefix 1.61 / 1.60, 1.63 / 1.63 | exact | 3B **no win** at expert M (intercept-bound, ~280–360 µs/submit) | `levers-w5-805559f.log` |
-| 3B under lean TXN (NpuRailgun, `npu-railgun --lean`, G=8 prepared, npu/railgun 087dd68) | — | prefix 412 µs = 32.56 TOPS; V9 419 µs = 32.0; V10 433 µs = 31.0 | exact | margin holds under lean: +1.7% vs V9, +5.1% vs V10 | `railgun-prefix-087dd68.log` (measured by NpuRailgun) |
+| 3B under lean TXN (railgun slice, `npu-railgun --lean`, G=8 prepared, npu/railgun 087dd68) | — | prefix 412 µs = 32.56 TOPS; V9 419 µs = 32.0; V10 433 µs = 31.0 | exact | margin holds under lean: +1.7% vs V9, +5.1% vs V10 | `railgun-prefix-087dd68.log` (measured by the railgun slice) |
 | 4: G80 gate_up 256×1280 wave | **28.68 / 28.37, 28.75 / 28.42** (V9 25.51 / 25.27, 25.26 / 25.02); M=160 3.59 / 3.58 (V9 2.91) | — (gate_up only) | exact | **pass**: +13% wall at M=4096, +10–24% at expert M=64–512; slope 1776 cycles / 1280 VMAC; dark behind `--variant G80` | `levers-w6-60c2648.log` |
 
 ## Final table (best exact variant per expert shape, measured)
@@ -784,7 +799,7 @@ Consequences:
 | start of session (V8 FastSlowCtl) | gate_up / down | 19.7 / 18.9 | 16.0 / 11.5 | 33% / 32% | DDR traffic |
 
 Open: ≥50 TOPS not reached. Remaining limits, measured: fixed ≈215 µs per submit (TXN execution ~150 µs + submit round trip;
-NpuRailgun lean TXN / persistent ring); core chunk compute ~1323–1337 cycles vs 1067 issue, with the stall **not** caused by
+railgun-slice lean TXN / persistent ring); core chunk compute ~1323–1337 cycles vs 1067 issue, with the stall **not** caused by
 same-cycle peer-A bank collisions (lever 2) nor by memtile A depth (lever 3A); gate_up no-compute at the ~55 GB/s DDR
 read plateau; down's 10 MiB int8 C write per submit. Lever 4 (G80 wide gate_up geometry) in simulator feasibility.
 
@@ -800,7 +815,7 @@ The `npu/axi-wip` cutover retains the software default AXI tuple
 `(burst, AxCACHE, AxQoS) = (3, 2, 0)`. AIE2P (not AIE2PS) has burst in BD
 word 4 bits 31:30, cache in word 5 bits 27:24, and QoS in bits 23:20.
 Burst encodings 0/1/2/3 mean 64/128/256/512 bytes:
-`ref/aie-rt/driver/src/global/xaie2pgbl_params.h:16347-16394`,
+aie-rt `driver/src/global/xaie2pgbl_params.h:16347-16394`,
 `driver/src/dma/xaie_dma_aie2p.c:40-51`, `xaie_dma.c:765-782`;
 [AIE2p target model](https://github.com/Xilinx/mlir-aie/blob/main/lib/Dialect/AIE/IR/AIETargetModel.cpp#L1744-L1758).
 `ArrayDesign::set_shim_axi` changes every shim BD in the submitted TXN
@@ -857,23 +872,23 @@ at least 26 GiB, then restored `auto`.
   byte 0: `0x00cd0cd0` vs `0xb0000000`. The log does not establish a
   contiguous damaged region. **All write bandwidth from this window is
   invalid as an exact result**, including 54.400 GB/s and mixed
-  33.741+33.741. Log: hipx
-  `~/qcal/npu-logs/mempath2-3e36d9a-sweep-native.log`.
+  33.741+33.741. Log:
+  `logs/mempath2-3e36d9a-sweep-native.log`.
 * Native V9 DMA-only gate_up/down default: 30.625/25.090 TOPS-equivalent
   (read/write 40.375/7.178 and 27.564/19.601 GB/s). Burst 0/1/2 and cache
   0/3 completed; their paired V9 512²×128 three-submit checks were all
   CPU-exact. Timing-only submits are **not** GEMM exactness, despite the
   old summary's misleading `verify: ... exact` label (now corrected).
-  Log: `~/qcal/npu-logs/mempath2-3e36d9a-v9-native.log`.
+  Log: `logs/mempath2-3e36d9a-v9-native.log`.
 * **AxQoS 15 wedged the NPU fabric.** First gate_up submit timed out,
   zero C bytes changed, and one firmware status query timed out. A later,
   distinct default-QoS host-VMM scenario failed device-open `GET_INFO`
   with errno 22; kernel `aie2_smu_exec: smu cmd 4 failed, 0xff`,
   `aie2_smu_init: Access power failed, ret -22`, and resume failed -22.
   Logs above plus `...-v9-vmm-host-default.log`; preserved dump:
-  `~/qcal/npu-logs/mempath2-3e36d9a-qos15-status.bin`.
-  Main halted NPU use and externally rebooted hipx at 22:54:48 UTC.
-  Main's first post-recovery health window was exact V8 FastSlowCtl
+  `logs/mempath2-3e36d9a-qos15-status.bin`.
+  NPU use was halted and the test host was rebooted externally at 22:54:48 UTC.
+  The first post-recovery health window was exact V8 FastSlowCtl
   512² and gate_up, 19.88 busy/16.17 wall TOPS. This agent performed no
   reboot, reload, or kernel/host policy change.
 * The corrected emitter rejects nonzero QoS/nonvendor cache by default;
@@ -895,7 +910,7 @@ at least 26 GiB, then restored `auto`.
 GPU reference (1 GiB, 20 launches, best rate; read XOR checksum and full
 write pattern checked outside timing):
 
-| GPU backing | Read GB/s | Write GB/s | Verification | hipx log under `~/qcal/npu-logs/` |
+| GPU backing | Read GB/s | Write GB/s | Verification | log under `logs/` |
 |---|---:|---:|---|---|
 | VRAM carve-out | 240.77 | 222.23 | read checksum / write exact | `mempath2-3e36d9a-gpu-vram-isolated.log` |
 | HIP VMM Host pinned | 241.22 | 222.49 | read checksum / write exact | `mempath2-3e36d9a-gpu-host-isolated.log` |
@@ -905,7 +920,7 @@ Initial GPU launch failed because the gfx1151-only fatbin was registered
 against every visible GPU, including unrelated gfx1100. The diagnostic
 explicitly requested gfx1100 (`...-gpu-diagnostic.log`). Isolating Halo
 with process-start `HIP_VISIBLE_DEVICES=1` fixed it; no code-object ABI
-change was needed. The selected device was gfx1151, PCI `0000:bf:00.0`.
+change was needed. The selected device was gfx1151.
 
 Repair integration gate: **213 release tests passed**, workspace release
 build and runner/build-script syntax checks passed. Fresh post-guard
@@ -954,7 +969,7 @@ Channels are per column, as in the original bandwidth probe.
 | 8 | 2/0 | 1 | 43.612/0.000 | 42.445/0.000 | 44.539/0.000 |
 | 8 | 2/0 | 64 | 55.579/0.000 | 55.567/0.000 | 55.467/0.000 |
 
-Logs: `~/qcal/npu-logs/mempath2-5721bd9-sweep-{native,vmm-host,vmm-host-uncached}.log`
+Logs: `logs/mempath2-5721bd9-sweep-{native,vmm-host,vmm-host-uncached}.log`
 (19 cases each). Peak read: **55.579 / 55.719 / 56.235 GB/s**; peak write:
 **55.280 / 54.208 / 55.860 GB/s**. Backing did not raise the plateau.
 
@@ -1008,12 +1023,12 @@ M4 was exercised by running the actual Rust program with scripted external
 daemon/producer/sampler processes, including error cleanup; the full model
 was not rerun after the port. Its historical ≤240 s exception does not permit
 new >90 s windows. The inherited cache-drop side effect was preserved but not
-invoked on hipx under the no-host-change rule.
+invoked on the test host under the no-host-change rule.
 
 GPU kernels are PM-native gfx1151 assembly and ELF, loaded by Rust through
 shared lazy HIP module/VMM ABI; no hipcc, LLVM assembler or vendor NPU runtime.
-Regeneration uses only permitted PM source
-`/home/kaden/ClaudeCode/warpfront/wt-land-041m` at beta `5b4664e3b`, locked Cargo
+Regeneration uses only the permitted PM source
+(hipfire beta snapshot `5b4664e3b`), locked Cargo
 output outside that tree, then `PEACEMAKER=... crates/npu-tools/native/build-gpu-bw.sh`.
 Emission repeated byte-identically; M7 lifted both kernels exactly with zero
 obligations. All three backing modes passed target read/write launches; old
@@ -1021,8 +1036,8 @@ HIP source and hipcc build script are removed.
 
 A delegated helper performed an unauthorized local Navi48 allocation/event/
 export smoke (no kernel launch), despite its offline-only assignment. This
-was reported to Main and is not target acceptance evidence. Subsequent GPU/NPU
-hardware work is restricted to locked hipx windows.
+was reported and is not target acceptance evidence. Subsequent GPU/NPU
+hardware work is restricted to locked test-host windows.
 
 ### Additional concurrency probe — simulator-exact before silicon
 
@@ -1032,7 +1047,7 @@ powers of two, read/write/mixed. Channels spread column-first over eight columns
 Q tasks have independent BDs and DDR ranges; only final task returns completion.
 Mixed N16/Q4 uses all sixteen shim BDs/column.
 
-Primary limits: `ref/aie-rt/driver/src/global/xaie2pgbl_reginit.c` AIE2P
+Primary limits: aie-rt `driver/src/global/xaie2pgbl_reginit.c` AIE2P
 `StartQSizeMax=4`, `NumBds=16`. Legacy bandwidth and all default GEMM designs
 are unchanged. New simulator coverage: all 45 N/Q/direction geometries at
 4 KiB, poisoned resubmits, exact channel/DRAM counts, global-source wrapping
@@ -1049,33 +1064,35 @@ applicable: additions do not alter any default GEMM emitter or legacy BW design.
 
 ### Source verdict: memory backing and no-migration VRAM import
 
+Citations below are to the Linux 7.0 kernel source (`drivers/accel/amdxdna/`, `drivers/dma-buf/`, `drivers/gpu/drm/amd/amdgpu/`); the local reference checkout they were read from is not part of this repository.
+
 **No, this unmodified importer cannot retain the GPU VRAM carve-out backing.**
-[`amdxdna_gem.c:644–677`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/amdxdna_gem.c)
+`amdxdna_gem.c:644–677`
 uses plain `dma_buf_attach`, imports a SHMEM SG table, and marks the object
 SHMEM. Plain attach supplies no importer operations, so peer2peer remains
-false ([`dma-buf.c:1033–1040,1069–1072`](ref/linux-7.0/linux-source-7.0.0/drivers/dma-buf/dma-buf.c)).
+false (`dma-buf.c:1033–1040,1069–1072`).
 The exporter removes VRAM eligibility for non-peer attachments, chooses GTT
 unless peer2peer is allowed, and maps TT pages; the VRAM mapping branch is
-separate ([`amdgpu_dma_buf.c:137–143,192–232`](ref/linux-7.0/linux-source-7.0.0/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c)).
+separate (`amdgpu_dma_buf.c:137–143,192–232`).
 Thus successful `hipMalloc` import is not proof of a no-copy VRAM path.
 
 Native SHMEM and imported Host VMM still use the same NPU address mechanism:
 PASID mode chooses `mem.userptr`, not a special amdgpu fabric route
-([`amdxdna_gem.h:74–77`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/amdxdna_gem.h)).
+(`amdxdna_gem.h:74–77`).
 Default `force_iova` is false
-([`amdxdna_iommu.c:13–15,137–139`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/amdxdna_iommu.c)).
+(`amdxdna_iommu.c:13–15,137–139`).
 Uncached Host is a real HIP allocation mode, not a relabeled native BO;
 both its GPU access and NPU import were exercised.
 
 No numeric ~55 GB/s software clamp was found in the reviewed clock/QoS path:
-[`aie2_ctx.c:461–466`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/aie2_ctx.c)
+`aie2_ctx.c:461–466`
 copies `dma_bandwidth`, but the solver uses GOPs/fps/latency and chooses maximum
 DPM when those QoS inputs are absent
-([`aie2_solver.c:50–73,100–133`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/aie2_solver.c)).
+(`aie2_solver.c:50–73,100–133`).
 NPU5 uses the NPU4 table and setter
-([`npu5_regs.c:65–68,95–96`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/npu5_regs.c));
+(`npu5_regs.c:65–68,95–96`);
 that table tops out at HCLK 1800 MHz
-([`npu4_regs.c:79–88`](ref/amdxdna/linux-source-7.0.0/drivers/accel/amdxdna/npu4_regs.c)).
+(`npu4_regs.c:79–88`).
 This is a bounded source review, not proof that no firmware/fabric limit exists.
 
 **Proposal only; no driver/module/host changes applied:** a genuine no-migration
@@ -1088,7 +1105,7 @@ before timing. There is no measured claim that this would improve NPU bandwidth.
 
 ## 2026-10-02 23:55–2026-10-03 00:03 UTC — PM-native GPU target acceptance
 
-Clean Git snapshot `cfeec35`; gfx1151 PCI `0000:bf:00.0`, 20 reported CUs.
+Clean Git snapshot `cfeec35`; gfx1151, 20 reported CUs.
 Each operation streams 1 GiB for 20 timed launches. Read verifies per-thread
 four-lane XOR checksums (collision-capable); write verifies all bytes before
 timing and after final fresh poison. Every check passed; all three ≤90 s
@@ -1100,7 +1117,7 @@ windows ended rc=0 with no kernel log errors and fabric policy restored.
 | VMM Host pinned | 238.68 | 237.47 | 221.84 | 219.23 |
 | VMM Host uncached | 238.79 | 237.94 | 226.20 | 220.79 |
 
-Logs: `~/qcal/npu-logs/mempath2-cfeec35-gpu-{vram,vmm-host,vmm-host-uncached}.log`.
+Logs: `logs/mempath2-cfeec35-gpu-{vram,vmm-host,vmm-host-uncached}.log`.
 This reproduces the earlier HIP reference bandwidth with PM-native code
 objects and a Rust launcher. GPU bandwidth near 240 GB/s while all accessible
 NPU backing modes plateau near 55 GB/s rules out a universal LPDDR bandwidth
@@ -1124,7 +1141,7 @@ or absence of every software/firmware restriction.
 Tables are best warm decimal GB/s. Columns are BD KiB; N is active
 channels/direction, Q tasks/channel. Mixed cells are **per direction**:
 read and write bytes/rates are equal by construction; total is twice the cell.
-Raw logs: `~/qcal/npu-logs/mempath2-cfeec35-concurrency-native-{read,write,mixed}.log`.
+Raw logs: `logs/mempath2-cfeec35-concurrency-native-{read,write,mixed}.log`.
 
 ### Read concurrency matrix
 
@@ -1218,11 +1235,11 @@ addressing change, not a HIP allocation switch. No host/driver change was made.
 
 ### Final Rust live-metrics smoke
 
-Clean Git snapshot `8dcb230`, locked hipx window 00:26:49–00:26:58 UTC:
+Clean Git snapshot `8dcb230`, locked test-host window 00:26:49–00:26:58 UTC:
 `npu-tools soc-metrics --once` read the real Halo metrics table and emitted
 the expected 22-column numeric row, including fabric 2000 MHz and idle NPU
 clocks/counters. rc=0, no kernel log errors, fabric restored to auto.
-Log: `~/qcal/npu-logs/mempath2-8dcb230-metrics.log`. The redundant metrics
+Log: `logs/mempath2-8dcb230-metrics.log`. The redundant metrics
 argument-vector allocation was removed without changing either CLI mode.
 
 ## 2026-10-03 06:52 UTC — fabric-clock guard smoke (npu `0e082b7`)
@@ -1242,11 +1259,11 @@ Under `auto`, `pp_dpm_fclk` may also show the `*` on the top level (every `auto`
 read the same morning showed no `*`), so the guard requires `manual` as well as the single top `*`.
 
 ## 2026-10-03 — co-op epilogue fold, gate_up / down NPU-column tail (npu coop-epi-fuse 5e0ba76)
-Details: `docs/coop-epi-fuse.md`. PM twins of the incumbent V2B gate_up SiLU / down ADD (code bytes equal to the
+Details: `docs/npu/coop-epi-fuse.md`. PM twins of the incumbent V2B gate_up SiLU / down ADD (code bytes equal to the
 vendored incumbent up to dealloc+endpgm) plus a flag-gated, work-claimed NPU-column epilogue; merged wide tails as the
 alternative. GPU-only windows WF1–WF3, co-op windows WC1–WC2: 3 fresh processes per point, the 3 tails ABBA in-process,
 all exact (GPU columns 0 mismatches, NPU h == SiLU-DAG(oracle g,u), C == oracle), V9 health exact after each, rc=0.
 Delta vs GPU-alone, ms/layer: gate_up J=3 fold −0.89/−0.67/−0.68 (sep −0.39/−0.46/−0.36); J=2 fold −0.14/−0.29/+0.41;
 J=1 fold +0.36/+0.18/+0.27; down n=1024 wide +1.10/+1.03/+1.07 (L42 +1.01), fold +1.30/+1.27/+1.30. The fold removes
 the 2.77 ms tail but the window grows ~2.4 ms (one workgroup per WGP). Step E: gate_up −0.6…−0.8 %, down +1.0 %.
-**KILL** wiring gate_up co-op as an opt-in hipfire route. Logs `logs/coopepi/` (hipx `~/pm-wave/coopepi/logs/`).
+**KILL** wiring gate_up co-op as an opt-in hipfire route. Logs `logs/coopepi/` (workspace-local).

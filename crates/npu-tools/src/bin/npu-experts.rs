@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-experts: silicon harness for the grouped experts submission (`pm_npu::kernels::experts::grouped_v9` for `--design V9`,
-//! `pm_npu::kernels::experts::grouped` over a one- or two-wave G80 design for `--design G80`).
+//! npu-experts: silicon harness for the grouped experts submission (`peacemaker_npu::kernels::experts::grouped_v9` for `--design V9`,
+//! `peacemaker_npu::kernels::experts::grouped` over a one- or two-wave G80 design for `--design G80`).
 //!
 //! usage: npu-experts [--design V9|G80] --proj gate_up|down --m M --experts E [--ring] [--secs S | --rounds R]
 //!                    [--timeout-ms T] [--verify-every] [--insts-only]
@@ -59,11 +59,11 @@
 //! (`cpu_direct_exact=a/b`, b = verified rounds x CPU-checked experts), the CPU coverage (`cpu_experts=k/E`) and the
 //! CPU-vs-eager-oracle count, and `RESULT: PASS|FAIL`. `us_per_group` is the mean timed-region time per round,
 //! `useful_tops` = `E * 2*M*N*K / us_per_group`. Exit status: 0 pass, 1 fail, 2 bad usage or a shape the design rejects.
-use pm_npu::kernels::experts::{grouped, grouped_v9, ExpertPlan, GroupedDesign};
-use pm_npu::kernels::gemm_array::V8_DEFAULT_EPILOGUE;
-use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::gemm_g80::design_g80;
-use pm_npu::kernels::ring::{patch_seq, PatchKind, RingLayout, DONE_MAGIC};
+use peacemaker_npu::kernels::experts::{grouped, grouped_v9, ExpertPlan, GroupedDesign};
+use peacemaker_npu::kernels::gemm_array::V8_DEFAULT_EPILOGUE;
+use peacemaker_npu::kernels::gemm_core::Control;
+use peacemaker_npu::kernels::gemm_g80::design_g80;
+use peacemaker_npu::kernels::ring::{patch_seq, PatchKind, RingLayout, DONE_MAGIC};
 use railgun::npu::{clflush, Bo, Device, HwCtx, Prepared, ERT_STATE_COMPLETED};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};

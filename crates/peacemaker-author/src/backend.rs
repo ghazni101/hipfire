@@ -6,7 +6,7 @@
 //! slots a store touches, which transitions a barrier carries, when a store
 //! is drained); a backend turns each request into instructions and runs the
 //! value-level checks behind it (wait ledger, LDS slot machine, hazards,
-//! loop fixpoint). `hipfire-isa`'s `Builder` is the production backend;
+//! loop fixpoint). `peacemaker-isa`'s `Builder` is the production backend;
 //! `crate::trace::Trace` is a small reference backend for tests.
 //!
 //! Every entry point that changes backend state takes an [`Auth`]. Only the

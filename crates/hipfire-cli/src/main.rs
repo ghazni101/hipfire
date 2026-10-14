@@ -21,9 +21,10 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
-    Sidecar,
+    Sidecar, TrunkOverlayPin, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use saddle_core::kv::KvBackend;
@@ -51,6 +52,7 @@ use std::{
 mod bench_concurrency;
 mod bench_power;
 mod kernel_pack;
+mod npu_trunk;
 mod ple;
 mod serve;
 mod setup;
@@ -120,6 +122,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// Measure this host's GPU share for a split offload step.
+    OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
     /// Print build, source-checkout, and installed-daemon identity.
@@ -152,6 +156,8 @@ pub(crate) enum Commands {
     Restart(ServeArgs),
     /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
     Ple(ple::PleArgs),
+    /// Write a keyed NPU trunk calibration from offline measurement inputs.
+    CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -716,6 +722,29 @@ impl BenchArgs {
 }
 
 #[derive(Args, Debug)]
+struct OffloadBenchArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short = 'j', long)]
+    json: bool,
+    /// Measure one format instead of the default matrix: a quant name (`mq4`,
+    /// `mq4g256v2`, …) or a `.hfq` wire quant_type number.
+    #[arg(long, value_name = "NAME|QT")]
+    format: Option<String>,
+    /// Activation width to measure at (default: the 9B trunk's hidden size).
+    #[arg(long, value_name = "N")]
+    k: Option<usize>,
+    /// Weight megabytes per format.
+    #[arg(long, value_name = "MB")]
+    buffer_mb: Option<usize>,
+    /// Timed reps per engine; the median is reported.
+    #[arg(long, value_name = "N")]
+    reps: Option<usize>,
+    /// Persist the recommended share (the median over the largest measurements).
+    #[arg(long)]
+    write: bool,
+}
+
+#[derive(Args, Debug)]
 struct ProfileArgs {
     model: Option<String>,
     #[arg(long)]
@@ -828,7 +857,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
     /// Serve the embedded chat UI at /ui on the serve listener.
     #[arg(long)]
@@ -917,10 +946,12 @@ fn run() -> Result<()> {
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
         Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
+        Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
@@ -1917,6 +1948,16 @@ pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<
 }
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+    pull_with_overlay_pins(paths, args, TRUNK_OVERLAY_PINS)
+}
+
+/// [`pull_command`] with an explicit trunk-overlay pin table (production passes
+/// [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn pull_with_overlay_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -2005,31 +2046,20 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("Qwen3", entry.qwen3.as_ref()),
         ("VAE", entry.vae.as_ref()),
     ] {
-        let Some(sidecar) = sidecar else {
-            continue;
-        };
-        let destination = paths.models.join(&sidecar.file);
-        if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
-                eprintln!("  {label} sidecar already present: {}", sidecar.file);
-                continue;
-            }
-            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
-        } else if destination.exists() && args.force {
-            // force always refreshes
+        if let Some(sidecar) = sidecar {
+            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
         }
-        eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
-        let url = artifact_url(entry, &sidecar.file);
-        if let Err(error) = download_verified(
-            &url,
-            &destination,
-            sidecar.sha256.as_deref(),
-            sidecar.size_bytes,
-            true,
-        ) {
-            eprintln!("  warning: {label} sidecar unavailable: {error:#}");
-        }
+    }
+    // The trunk overlay is not a registry field: the client carries its pin,
+    // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+        fetch_registry_sidecar(
+            "Trunk overlay",
+            overlay.repo,
+            &overlay.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
@@ -2054,16 +2084,39 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fetch one optional registry sidecar into `models`: an existing valid file is
+/// kept, a stale one (or any under `force`) is refreshed through
+/// [`download_verified`]. A failed download only warns; the base stays usable.
+fn fetch_registry_sidecar(label: &str, repo: &str, sidecar: &Sidecar, models: &Path, force: bool) {
+    let destination = models.join(&sidecar.file);
+    if destination.exists() && !force {
+        if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+            eprintln!("  {label} sidecar already present: {}", sidecar.file);
+            return;
+        }
+        eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+    }
+    eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
+    if let Err(error) = download_verified(
+        &artifact_url_in(repo, &sidecar.file),
+        &destination,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
+        true,
+    ) {
+        eprintln!("  warning: {label} sidecar unavailable: {error:#}");
+    }
+}
+
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+    artifact_url_in(&entry.repo, file)
+}
+
+fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!(
-        "{}/{}/resolve/main/{}",
-        base.trim_end_matches('/'),
-        entry.repo,
-        file
-    )
+    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
 }
 
 #[cfg(test)]
@@ -2217,13 +2270,24 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// shared: several registry entries can name the same `dflash.file` (e.g.
 /// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
 /// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
-/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// still on disk leaves those siblings without their paired draft under `dflash_mode=auto`
 /// or refusing to load under `on`, so the sidecar is kept — with one stderr
 /// line — whenever any OTHER entry declaring the same file still has its own
 /// target file present in the models dir. The `vision` tower sidecar follows
 /// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
 /// `qwen3.8-27b-vision.hfq`).
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    rm_with_overlay_pins(paths, registry, TRUNK_OVERLAY_PINS, args)
+}
+
+/// [`rm_with_registry`] with an explicit trunk-overlay pin table (production
+/// passes [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn rm_with_overlay_pins(
+    paths: &Paths,
+    registry: &RegistryV1,
+    overlay_pins: &[TrunkOverlayPin],
+    args: RmArgs,
+) -> Result<()> {
     let resolved = registry_entry_for_path(paths, registry, &args.model);
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
@@ -2264,6 +2328,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .map(|sidecar| paths.models.join(&sidecar.file))
             .filter(|path| path.is_file()),
         );
+        if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+            let overlay_path = paths.models.join(&overlay.sidecar.file);
+            if overlay_path.is_file() {
+                targets.insert(overlay_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2406,6 +2476,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
+    // A trunk overlay rides with its base: the pinned overlay file (also
+    // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
+    let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
+    if overlay.is_file() {
+        targets.insert(overlay);
+    }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -2779,6 +2855,166 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         );
     }
     let _ = engine.unload();
+    Ok(())
+}
+
+/// PIDs named by a live `~/.hipfire/daemon*.pid`.
+///
+/// Advisory by construction: it cannot prevent a daemon started mid-benchmark, but
+/// it stops the common case (a serve instance already running), which would make
+/// both engine rates meaningless. A real fix would move the measurement behind the
+/// daemon protocol, which is deliberately not done here.
+fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
+    let mut live = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&paths.root) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("daemon") || !name.ends_with(".pid") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pid) = raw.trim().parse::<i32>() else {
+            continue;
+        };
+        // Safety: signal 0 only probes for existence and permission.
+        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+            live.push(pid);
+        }
+    }
+    live.sort_unstable();
+    live.dedup();
+    live
+}
+
+/// The share `offload-bench` recommends from a measurement matrix.
+///
+/// The recommendation comes from the largest measurements: a real spilled
+/// projection is MBs of weight bytes, and the matrix's smallest entry is where the
+/// copies and the launch overhead distort the balance most. Every format is
+/// measured over the same `buffer_mb` by construction, so "the largest" is usually
+/// the whole matrix — a *set* — and the **median** share over it is the honest
+/// single number (a singleton when `--format` pinned one format). Split out from
+/// the command so the tie behavior is pinned by a test rather than by
+/// `max_by_key`'s iteration order, which silently picked whichever format came
+/// last.
+fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
+    let largest = reports.iter().map(|r| r.bytes).max()?;
+    let biggest: Vec<&CalibrationReport> =
+        reports.iter().filter(|r| r.bytes == largest).collect();
+    let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
+    shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let label = if biggest.len() == 1 {
+        biggest[0].format.clone()
+    } else {
+        format!("the {} largest measured formats", biggest.len())
+    };
+    Some((label, shares[shares.len() / 2]))
+}
+
+/// `hipfire offload-bench`: measure this host's GPU share for a split offload step
+/// (`memory.offload_exec=passback`, `memory.offload_passback_share`).
+///
+/// A raw device benchmark — no model, no daemon — so it refuses while a daemon pid
+/// file names a live process.
+fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
+    let live = live_daemon_pids(paths);
+    if !live.is_empty() {
+        bail!(
+            "a hipfire daemon is live (pid {}); stop it first (`hipfire stop`) — offload-bench \
+             measures the device directly, and a concurrent daemon makes both engine rates \
+             meaningless",
+            live.iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut gpu = rdna_compute::Gpu::init()
+        .map_err(|e| anyhow!("offload-bench needs a GPU: {} [code {}]", e.message, e.code))?;
+    let opts = CalibrateOptions {
+        format: args.format.clone(),
+        k: args.k,
+        buffer_mb: args
+            .buffer_mb
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_BUFFER_MB),
+        reps: args
+            .reps
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
+    };
+    let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
+    let recommended = recommended_share(&reports);
+    if args.json {
+        let rows: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "format": r.format,
+                    "m": r.m,
+                    "k": r.k,
+                    "bytes": r.bytes,
+                    "cpu_bytes_per_s": r.cpu_bytes_per_s,
+                    "gpu_bytes_per_s": r.gpu_bytes_per_s,
+                    "share": r.share,
+                    "predicted_speedup": r.predicted_speedup,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "arch": gpu.arch,
+                "recommended": recommended
+                    .as_ref()
+                    .map(|(format, share)| serde_json::json!({ "format": format, "share": share })),
+                "formats": rows,
+            }))?
+        );
+    } else {
+        println!(
+            "arch {} — GPU share for a split offload step (memory.offload_exec=passback)",
+            gpu.arch
+        );
+        println!(
+            "{:<12} {:>8} {:>6} {:>8} {:>12} {:>12} {:>7} {:>9}",
+            "format", "m", "k", "MiB", "cpu GB/s", "gpu GB/s", "share", "speedup"
+        );
+        for r in &reports {
+            println!(
+                "{:<12} {:>8} {:>6} {:>8.1} {:>12.1} {:>12.1} {:>7.3} {:>8.2}x",
+                r.format,
+                r.m,
+                r.k,
+                r.bytes as f64 / (1 << 20) as f64,
+                r.cpu_bytes_per_s / 1e9,
+                r.gpu_bytes_per_s / 1e9,
+                r.share,
+                r.predicted_speedup,
+            );
+        }
+        if let Some((format, share)) = recommended.as_ref() {
+            println!();
+            println!("recommended for {format}: memory.offload_passback_share = {share:.3}");
+        }
+    }
+    if args.write {
+        let Some((_, share)) = recommended.as_ref() else {
+            bail!("offload-bench: nothing measured, nothing to write");
+        };
+        let mut loaded = load_global(&paths.config)?;
+        loaded
+            .layer
+            .set_cli("memory.offload_passback_share", &format!("{share:.3}"))?;
+        write_global_toml(&paths.config, &loaded.layer)?;
+        println!(
+            "wrote memory.offload_passback_share = {share:.3} to {}",
+            paths.config.config_toml.display()
+        );
+    }
     Ok(())
 }
 
@@ -3877,8 +4113,8 @@ fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
-/// Clap value parser for `bench --max-seq`: the `memory.max_seq` schema field
-/// parses and bounds it, so the flag and the config key accept the same values.
+/// Clap value parser for `--max-seq`: the `memory.max_seq` schema field parses
+/// and bounds it, so serve/bench flags and the config key accept the same values.
 fn parse_max_seq_arg(raw: &str) -> std::result::Result<u64, String> {
     match field("memory.max_seq")
         .expect("schema field")
@@ -4067,7 +4303,12 @@ pub(crate) fn load_params(
             _ => serde_json::json!("auto"),
         },
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
-        "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
+        // `auto` or an explicit 1-10 (schema-validated); the daemon/loader
+        // resolves `auto` per model arch and GPU.
+        "mtp_k": match config_value(resolved, "speculation.mtp_k")? {
+            hipfire_config::ConfigValue::Integer(k) => serde_json::json!(k),
+            _ => serde_json::json!("auto"),
+        },
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
@@ -4154,10 +4395,11 @@ pub(crate) fn load_params(
 /// Call only once the final `dflash_mode` is known. When the mode is `auto`
 /// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
 /// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
-/// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// it: `on` without the file fails closed, `auto` logs one line and falls
+/// back to the remaining speculation policy (MTP `auto` when a head exists).
 /// With no entry at all the artifact is not registry-managed (e.g. a path
-/// that merely shares a basename with an entry file): `auto` runs AR as a
-/// bare artifact, but `on` fails closed instead of silently running AR.
+/// that merely shares a basename with an entry file): `auto` wires no draft
+/// for a bare artifact, but `on` fails closed instead of silently running AR.
 /// The sidecar is looked up in `models_dir` first — `find_model_path`
 /// canonicalizes, so a symlinked target's parent is wherever the artifact
 /// really lives, not the models directory the draft was pulled into — then
@@ -4206,7 +4448,7 @@ pub(crate) fn resolve_dflash_sidecar(
         );
     }
     eprintln!(
-        "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
+        "[hipfire] DFlash draft {} not pulled; no paired draft, speculation falls back — `hipfire pull {tag}`",
         sidecar.file
     );
     Ok(())
@@ -4489,6 +4731,11 @@ pub(crate) struct ReasoningResolution {
     pub contract: ReasoningContract,
     pub warnings: Vec<String>,
 }
+
+/// Concrete effort resolved for effort-native QwenJinja when the request/config
+/// leaves effort unset or `auto`. The raw Jinja templates still default to
+/// `xhigh`; this CLI resolution layer supplies the concrete value.
+const QWEN_JINJA_DEFAULT_EFFORT: &str = "medium";
 
 pub(crate) fn apply_http_reasoning_request(
     body: &serde_json::Value,
@@ -5034,14 +5281,13 @@ pub(crate) fn apply_http_reasoning_request(
                 }
                 effective_effort = None;
             } else if has_explicit_effort || config_effort_is_explicit {
-                let raw = if let Some(value) = effort_raw {
-                    value.to_owned()
-                } else {
-                    config_effort.clone()
-                };
+                let raw = effort_raw
+                    .filter(|value| *value != "auto")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| config_effort.clone());
                 if raw == "auto" {
-                    effective_effort = Some("xhigh".to_string());
-                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                    effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                    request["reasoning_effort"] = serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                 } else {
                     match raw.as_str() {
                         "low" | "medium" | "xhigh" => {
@@ -5050,8 +5296,9 @@ pub(crate) fn apply_http_reasoning_request(
                                     "reasoning_effort '{}' dropped: not in supported {:?}",
                                     raw, supported_efforts
                                 ));
-                                effective_effort = Some("xhigh".to_string());
-                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                                effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                                request["reasoning_effort"] =
+                                    serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                             } else {
                                 effective_effort = Some(raw.clone());
                                 request["reasoning_effort"] = serde_json::json!(raw);
@@ -5062,21 +5309,23 @@ pub(crate) fn apply_http_reasoning_request(
                                 "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
                                 raw
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                         other => {
                             push_warn(format!(
-                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
-                                other
+                                "reasoning_effort '{}' normalized to qwen_jinja default {}",
+                                other, QWEN_JINJA_DEFAULT_EFFORT
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                     }
                 }
             } else {
-                let default = "xhigh".to_string();
+                let default = QWEN_JINJA_DEFAULT_EFFORT.to_string();
                 effective_effort = Some(default.clone());
                 request["reasoning_effort"] = serde_json::json!(default);
             }
@@ -5520,6 +5769,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    // The matrix is the synthetic `bench_prefill`/`bench_decode` protocol:
+    // its prefill rows are fixed token ids on the plain prefill route, never a
+    // prompt and never the speculative prompt prefill `serve` runs. Refuse a
+    // prompt instead of silently measuring something else.
+    if (args.matrix || args.redline) && (args.prompt_file.is_some() || !args.prompt.is_empty()) {
+        bail!(
+            "--matrix/--redline measure synthetic token ids (bench_prefill) and cannot take a prompt; \
+             for a prompt's prefill with the configured speculation use the standard bench \
+             (`hipfire bench MODEL --prompt-file FILE --max-tokens 1`)"
+        );
+    }
     if args.ttft && args.matrix {
         bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
     }
@@ -5571,7 +5831,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq) =
+    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation) =
         open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let max_seq_json = max_seq.json(&loaded);
     let prompt = resolve_bench_prompt(&args)?;
@@ -5607,6 +5867,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             &post_diag,
             &power,
             &max_seq_json,
+            &load_speculation,
         )
     } else if args.ttft {
         bench_ttft(
@@ -5717,6 +5978,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "wall_tok_s": sample_stats(&wall),
                 "ttft_ms": sample_stats(&ttft),
                 "spec_requested": args.speculation,
+                "load_speculation": load_speculation,
                 "spec_route": spec_routes,
                 "spec_tau": spec_tau,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
@@ -5832,7 +6094,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
             BenchShape::Steady => 2048,
             BenchShape::BetterBench => 4096,
         };
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine_slots(paths, &slot_args, max_k, slot_ctx)?;
         print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
@@ -5860,7 +6122,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         print_bench_max_seq(&max_seq, &loaded);
         let mut d = Driver::sequential(engine, max_k, args.reasoning_on);
@@ -5879,7 +6141,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         let lanes = max_k.max(2);
         let vmm = crate::serve::VmmBatchFlags::from_config(&resolved)?;
         let vmm_params = vmm.load_params(config_u64(&resolved, "serve.max_batch_tokens")?);
-        let (engine, loaded, _, _, _, max_seq) =
+        let (engine, loaded, _, _, _, max_seq, _) =
             open_bench_engine_batched(paths, &batch_args, lanes, vmm_params)?;
         print_bench_max_seq(&max_seq, &loaded);
         match Driver::batch(engine, max_k, &loaded, args.reasoning_on) {
@@ -5997,7 +6259,8 @@ fn open_bench_engine_slots(
 /// `open_bench_engine`'s result: the engine, its `loaded` reply, `diag`
 /// before and after the load, the `hardware.devices` selector the daemon
 /// was configured with (the bench's power sampler resolves the same card),
-/// and how the load's `max_seq` was chosen.
+/// how the load's `max_seq` was chosen, and the speculation the load asked
+/// for ([`bench_load_speculation`]).
 type BenchEngine = (
     Engine,
     serde_json::Value,
@@ -6005,7 +6268,22 @@ type BenchEngine = (
     serde_json::Value,
     Option<String>,
     BenchMaxSeq,
+    serde_json::Value,
 );
+
+/// The speculation selectors of a bench load's params (`mtp_mode`,
+/// `dflash_mode`, `dspark_mode`, `ngram_draft`; null when the params leave
+/// one unset), so a report states which speculative route the loaded model
+/// could take.
+fn bench_load_speculation(params: &serde_json::Value) -> serde_json::Value {
+    let field = |key: &str| params.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mtp_mode": field("mtp_mode"),
+        "dflash_mode": field("dflash_mode"),
+        "dspark_mode": field("dspark_mode"),
+        "ngram_draft": field("ngram_draft"),
+    })
+}
 
 /// Positions past the measured ones that the daemon's `bench_prefill` and
 /// `bench_decode` guards require (`tokens + 32 <= physical_cap`).
@@ -6086,16 +6364,18 @@ fn bench_matrix_seq_need(
 
 /// The model's declared context window: `max_position_embeddings` under
 /// `config.text_config`, `config`, or the top level of the source metadata,
-/// the same lookup admission uses for a model's trained context.
+/// extended by YaRN RoPE scaling (checkpoint or `attention.yarn_factor`), the
+/// same lookup admission uses for a model's trained context.
 fn declared_context_from_metadata(metadata_json: &str) -> Option<u64> {
     let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
     let config = meta.get("config").unwrap_or(&meta);
-    config
-        .get("text_config")
-        .unwrap_or(config)
+    let text = config.get("text_config").unwrap_or(config);
+    let native = text
         .get("max_position_embeddings")
         .and_then(serde_json::Value::as_u64)
-        .filter(|&context| context > 0)
+        .filter(|&context| context > 0)?;
+    let scaling = hipfire_runtime::rope::rope_scaling(text).unwrap_or_default();
+    Some(scaling.context_limit(native as usize) as u64)
 }
 
 /// [`declared_context_from_metadata`] for a model file or directory. `None`
@@ -6303,10 +6583,11 @@ fn open_bench_engine(
         params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
         params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
+    let load_speculation = bench_load_speculation(&params);
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
-    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq))
+    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -6573,6 +6854,7 @@ fn bench_matrix(
     diag: &serde_json::Value,
     power: &bench_power::PowerProbe,
     max_seq: &serde_json::Value,
+    load_speculation: &serde_json::Value,
 ) -> Result<()> {
     for size in &args.pp {
         let _ = bench_probe(
@@ -6697,6 +6979,11 @@ fn bench_matrix(
             "max_seq": max_seq,
             "redline_pm4": args.redline,
             "kv_mode": args.kv_mode,
+            "spec_requested": args.speculation,
+            "load_speculation": load_speculation,
+            // `bench_prefill` never drafts: the prompt prefill of a
+            // speculative load (MTP's head fill) is not what these rows time.
+            "prefill_route": "bench_prefill (synthetic ids, no speculative prompt fill)",
             "runs": args.runs,
             "warnings": warnings,
             "power_device": power.device_json(),
@@ -6715,7 +7002,7 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag, _, _) =
+        let (mut engine, _, _, diag, _, _, _) =
             open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
@@ -6792,7 +7079,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _, _, _) =
+        let (mut engine, _, _, _, _, _, _) =
             open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
@@ -8636,7 +8923,7 @@ fn is_model_file(name: &str) -> bool {
 /// `"tokenizer": "{}"`, so loading it as a trunk fails with
 /// `tokenizer metadata field missing or wrong type: model`.
 fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
-    registry
+    let mut files: BTreeSet<&str> = registry
         .models
         .values()
         .flat_map(|entry| {
@@ -8658,7 +8945,10 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
             .map(|sidecar: &Sidecar| sidecar.file.as_str())
             .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
         })
-        .collect()
+        .collect();
+    // The trunk overlays are compiled-in pins, not registry fields.
+    files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
+    files
 }
 
 /// True when `name` is a model file worth showing in a local listing.
@@ -8669,7 +8959,16 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
     !ple::is_ple_sidecar_name(name)
+        && !is_trunk_overlay_name(name)
         && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
+}
+
+/// True for a Flash-Next trunk overlay sidecar (`<base>.trunk-overlay`): an
+/// HFQM container of pre-encoded QT44 tensors that belongs to its base and is
+/// never a model on its own.
+fn is_trunk_overlay_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX)
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -8805,6 +9104,13 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "minimum": min,
             "maximum": max,
         }),
+        ValueRule::NullableIntegerOrAuto { min, max } => serde_json::json!({
+            "type": ["integer", "string", "null"],
+            "minimum": min,
+            "maximum": max,
+            "enum": ["auto"],
+            "nullable": true,
+        }),
         ValueRule::NullableFloat { min, max } => serde_json::json!({
             "type": ["number", "null"],
             "minimum": min,
@@ -8813,6 +9119,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::KvAdaptive => serde_json::json!({
             "type": "string",
             "format": "kv-adaptive-policy",
+        }),
+        ValueRule::PassbackShare => serde_json::json!({
+            "type": "string",
+            "format": "auto-or-share",
         }),
         ValueRule::Deepseek4Placement => serde_json::json!({
             "type": "string",
@@ -8837,8 +9147,10 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableIntegerOrAuto { .. } => "integer|auto|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::PassbackShare => "auto-or-share",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
@@ -9072,6 +9384,79 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// `offload-bench` is a raw device benchmark: it must name a live daemon and
+    /// measure nothing. The predicate behind that refusal is pure filesystem +
+    /// `kill(pid, 0)`, so it is testable without a GPU or a real daemon — and it is
+    /// the only thing standing between a user and two engines sharing the device.
+    #[test]
+    fn live_daemon_pids_sees_live_pid_files_only() {
+        let paths = test_paths("offload-bench-pids");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
+        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
+            .unwrap();
+        // Not pid files, and not a pid: ignored, never an error.
+        std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
+        std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
+        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+
+        assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
+
+        // The same file naming a dead process is no longer a live daemon.
+        std::fs::write(paths.root.join("daemon.pid"), "999999999\n").unwrap();
+        assert!(live_daemon_pids(&paths).is_empty());
+
+        // A missing root is empty, not a panic.
+        let _ = std::fs::remove_dir_all(&paths.root);
+        assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    /// The recommendation a user pins: a singleton when one format was measured,
+    /// otherwise the **median** of the largest measurements. The tie is the point —
+    /// every format is measured over the same `buffer_mb`, so picking by
+    /// `max_by_key(bytes)` silently returned whichever format came last in the
+    /// matrix (q8_0), whose rate profile is not the model's.
+    #[test]
+    fn recommended_share_takes_the_median_of_the_largest() {
+        let report = |format: &str, bytes: usize, share: f64| CalibrationReport {
+            arch: "gfx1201".into(),
+            format: format.into(),
+            m: bytes / 2720,
+            k: 5120,
+            bytes,
+            cpu_bytes_per_s: 4.0e10,
+            gpu_bytes_per_s: 2.5e10,
+            share,
+            predicted_speedup: 1.5,
+        };
+
+        assert!(recommended_share(&[]).is_none());
+
+        // One pinned format: itself, named.
+        let one = vec![report("mq4g256", 201_328_960, 0.375)];
+        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+
+        // A tie on size takes the median share of the tied set, and says so.
+        let tied = vec![
+            report("a", 100, 0.10),
+            report("b", 100, 0.20),
+            report("c", 100, 0.50),
+            report("small", 50, 0.99),
+        ];
+        assert_eq!(
+            recommended_share(&tied),
+            Some(("the 3 largest measured formats".to_string(), 0.20))
+        );
+
+        // A strictly larger entry wins outright, wherever it sits in the matrix.
+        let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
+        assert_eq!(
+            recommended_share(&mixed),
+            Some(("big".to_string(), 0.30))
+        );
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery
@@ -10557,10 +10942,257 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["mtp_mode"], "auto", "MTP auto stays in effect");
         assert!(
             params.get("draft").is_none(),
-            "auto without a pulled draft runs AR"
+            "auto without a pulled draft wires no draft"
         );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn qwen38_27b_dflash_registry() -> RegistryV1 {
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{"qwen3.8":"qwen3.8:27b","qwen3.8:27b-mq4":"qwen3.8:27b"}}
+        }}"#
+        );
+        RegistryV1::parse(&raw, "test").unwrap()
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b() {
+        // Registry layer lowers dflash=auto only for canonical qwen3.8:27b[-*]
+        // trunks that declare a dflash sidecar; BuiltIn off and MTP auto
+        // stay for everything else, including the no-registry path.
+        let paths = test_paths("registry-dflash-default-scope");
+        fs::create_dir_all(&paths.root).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        for (input, expected) in [
+            ("qwen3.8:27b", "auto"),
+            ("qwen3.8", "auto"),
+            ("qwen3.8:27b-mq4", "auto"),
+            ("qwen3.8:27b-mq4-pro", "auto"),
+            ("qwen3.8:27b-mq5", "off"),
+            ("qwen3.8:27boops", "off"),
+            ("qwen3.8:flash-next", "off"),
+            ("qwen3.8:27b-draft-mq4", "off"),
+            ("qwen3.6:27b", "off"),
+            ("qwen3.5:9b", "off"),
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                expected,
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mtp").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mode").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+        }
+        // No registry tag/entry (bare artifact path): BuiltIn off.
+        let bare = resolved_for_model(&paths, "qwen3.8-27b.mq4", None, None).unwrap();
+        assert_eq!(config_string(&bare, "speculation.dflash").unwrap(), "off");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_wires_default_dflash_draft_for_qwen38_27b_only_when_pulled() {
+        // Paired file present: auto + draft wired. Missing: no draft, MTP auto
+        // unchanged. Non-eligible models never wire a draft even with the file
+        // on disk.
+        let paths = test_paths("registry-dflash-default-load");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        let load = |resolved: &hipfire_config::ResolvedConfig, tag: &str, entry: &ModelEntry| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        let missing = load(&resolved, tag, entry);
+        assert_eq!(missing["dflash_mode"], "auto");
+        assert_eq!(missing["mtp_mode"], "auto");
+        assert!(missing.get("draft").is_none(), "no pulled draft, no wiring");
+
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let present = load(&resolved, tag, entry);
+        assert_eq!(present["dflash_mode"], "auto");
+        assert_eq!(present["mtp_mode"], "auto");
+        assert_eq!(present["draft"], draft_path.display().to_string());
+
+        for input in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:9b",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            let params = load(&resolved, tag, entry);
+            assert_eq!(params["dflash_mode"], "off", "{input}");
+            assert_eq!(params["mtp_mode"], "auto", "{input}");
+            assert!(params.get("draft").is_none(), "{input}");
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn qwen38_27b_default_dflash_yields_to_explicit_off_and_blocks_developer_draft() {
+        // The registry layer sits below global/model/one-shot config: an
+        // explicit dflash=off (or speculation.mode=off) wins and strips both
+        // the paired sidecar and a developer.dflash_draft.
+        let paths = test_paths("registry-dflash-default-off-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let developer_draft = "/tmp/developer-draft.hfq";
+        let registry_layer = || NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let global = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("/tmp/global.toml"),
+            },
+            layer,
+        };
+        let model_user = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::ModelUser {
+                model: tag.to_owned(),
+                path: PathBuf::from("/tmp/model.toml"),
+            },
+            layer,
+        };
+
+        // Baseline: registry default is on (auto), the pulled draft is wired.
+        let baseline = resolve(vec![registry_layer()]).unwrap();
+        let params = load(&baseline);
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], draft_path.display().to_string());
+
+        // A developer draft with default auto still wins over the paired file.
+        let mut dev_only = ConfigLayer::default();
+        dev_only
+            .set_cli("developer.dflash_draft", developer_draft)
+            .unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(dev_only)]).unwrap());
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], developer_draft);
+
+        // Explicit global/model off wins and drops sidecar + developer draft.
+        for scope in ["global", "model"] {
+            let mut user = ConfigLayer::default();
+            user.set_cli("speculation.dflash", "off").unwrap();
+            user.set_cli("developer.dflash_draft", developer_draft)
+                .unwrap();
+            let user_layer = if scope == "global" {
+                global(user)
+            } else {
+                model_user(user)
+            };
+            let resolved = resolve(vec![registry_layer(), user_layer]).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                "off",
+                "{scope}"
+            );
+            let params = load(&resolved);
+            assert_eq!(params["dflash_mode"], "off", "{scope}");
+            assert!(
+                params.get("draft").is_none(),
+                "{scope}: off blocks sidecar and developer draft"
+            );
+        }
+
+        // One-shot off (as `--set speculation.dflash=off`) wins over a model-user auto.
+        let mut model_auto = ConfigLayer::default();
+        model_auto.set_cli("speculation.dflash", "auto").unwrap();
+        let params = load(
+            &resolve(vec![
+                registry_layer(),
+                model_user(model_auto),
+                NamedLayer {
+                    source: ConfigSource::OneShot {
+                        argument: "speculation.dflash=off".into(),
+                    },
+                    layer: {
+                        let mut layer = ConfigLayer::default();
+                        layer.set_cli("speculation.dflash", "off").unwrap();
+                        layer
+                    },
+                },
+            ])
+            .unwrap(),
+        );
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
+
+        // speculation.mode=off disables DFlash through the selector as well.
+        let mut mode_off = ConfigLayer::default();
+        mode_off.set_cli("speculation.mode", "off").unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(mode_off)]).unwrap());
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -11137,6 +11769,53 @@ mod tests {
     }
 
     #[test]
+    fn continuous_batch_size_schema_and_cli_share_maximum() {
+        let max = hipfire_config::MAX_CONTINUOUS_BATCH_SIZE;
+        let field = field("serve.continuous_batch_size").expect("continuous_batch_size schema");
+        let hipfire_config::ValueRule::Integer {
+            min: schema_min,
+            max: schema_max,
+        } = field.rule
+        else {
+            panic!("serve.continuous_batch_size must be an integer rule")
+        };
+        assert_eq!(schema_min, 1);
+        assert_eq!(schema_max, i64::try_from(max).unwrap());
+        for lanes in 1..=max {
+            field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap(),
+                ))
+                .unwrap_or_else(|err| panic!("schema rejected {lanes}: {err}"));
+            let parsed = Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .unwrap_or_else(|err| panic!("CLI rejected {lanes}: {err}"));
+            let Some(Commands::Serve(args)) = parsed.command else {
+                panic!("expected serve command")
+            };
+            assert_eq!(args.continuous_batch_size, Some(lanes));
+        }
+        for lanes in [0, max + 1] {
+            assert!(field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap()
+                ))
+                .is_err());
+            assert!(Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
     fn serve_and_run_accept_spec_and_max_seq() {
         let parsed =
             Cli::try_parse_from(["hipfire", "serve", "--spec", "off", "--max-seq", "8192"])
@@ -11681,7 +12360,7 @@ mod tests {
         // `on` + a path with no registry entry + no explicit draft fails
         // closed with the not-managed message instead of silently running AR
         // (Fable's earlier note on unregistered basenames). `auto` on the
-        // same file still runs AR as a bare artifact.
+        // same file wires no draft as a bare artifact.
         let paths = test_paths("dflash-on-foreign-path");
         fs::create_dir_all(&paths.models).unwrap();
         let foreign_dir = paths.root.join("elsewhere");
@@ -11736,6 +12415,42 @@ mod tests {
             params.get("draft").is_none(),
             "auto on a bare artifact runs AR"
         );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_refuses_without_draft_even_with_mtp_head() {
+        let paths = test_paths("dflash-on-no-draft-with-mtp");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        let head = paths.models.join("qwen3.6-35b-a3b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let entry = ModelEntry {
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            mtp: Some(Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        for mtp_mode in ["auto", "on", "off"] {
+            let mut params = serde_json::json!({
+                "dflash_mode": "on",
+                "mtp_mode": mtp_mode,
+            });
+            let error = resolve_dflash_sidecar(
+                &mut params,
+                Some(&entry),
+                &paths.models,
+                &model_path,
+                Some("qwen3.6:35b-a3b-mq4p"),
+            ).expect_err("DFlash on requires a DFlash draft, not an MTP head");
+            assert!(error.to_string().contains("--model-draft"), "{error:#}");
+            assert_eq!(params["mtp_mode"], mtp_mode);
+            assert!(params.get("draft").is_none());
+        }
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -13441,6 +14156,32 @@ mod tests {
         assert!(generates[2].get("max_tokens_fit").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn serve_max_seq_override_reaches_model_load() {
+        let h = Task11HttpHarness::spawn("max-seq-override");
+        h.shared.runtime.lock().unwrap().max_seq_override = Some(65_536);
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+
+        let second_model = "t11-fixture-max-seq-override-second.hfq";
+        fs::write(h.paths.models.join(second_model), b"task11-dummy-model").unwrap();
+        let mut second_body = h.base_body("t11-stop-text", false);
+        second_body["model"] = serde_json::json!(second_model);
+        let (status, _, text) = post_status(h.port(), &second_body);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(loads.len(), 2);
+        assert!(
+            loads
+                .iter()
+                .all(|load| load["params"]["max_seq"] == 65_536)
+        );
+    }
+
     /// A request may not load a file outside the installed models, nor start
     /// a registry download; an installed model still loads.
     #[cfg(unix)]
@@ -14411,6 +15152,573 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn post_systemone(port: u16, body: &serde_json::Value) -> (u16, String, String) {
+        let payload = serde_json::to_vec(body).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "POST /v1/systemone HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status: u16 = response[9..12].parse().unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        (status, headers.to_string(), body.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_named_model_returns_jev_shape() {
+        let harness = Task11HttpHarness::spawn("systemone-named");
+        let (status, headers, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(),
+                "state": "hello",
+                "questions": {"q": {"type": "choice", "instructions": "i",
+                                    "criteria": {"a": "x", "b": "y"}}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "choice");
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(
+            v.get("timing").is_none(),
+            "timing must not leak into the Jev body"
+        );
+        assert!(
+            headers.to_ascii_lowercase().contains("x-hipfire-timing:"),
+            "{headers}"
+        );
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("Jev body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["answers", "model", "usage"],
+            "Jev body must carry exactly {{model, answers, usage}}, no extras: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_without_loaded_model_is_503() {
+        let harness = Task11HttpHarness::spawn("systemone-unloaded");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 503, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_uses_loaded_model() {
+        let harness = Task11HttpHarness::spawn("systemone-loaded");
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let (named_status, _, named_body) = post_systemone(harness.port(), &named);
+        assert_eq!(named_status, 200, "{named_body}");
+        let named_v: serde_json::Value = serde_json::from_str(&named_body).unwrap();
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(v["model"], "jev-latest");
+        assert_eq!(
+            v["model"], named_v["model"],
+            "jev-latest must echo the same model the named request loaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_daemon_validation_error_maps_to_422() {
+        let harness = Task11HttpHarness::spawn("systemone-422");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": 5, "questions": {}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+    }
+
+    #[cfg(unix)]
+    fn timing_header(headers: &str) -> serde_json::Value {
+        let raw = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-hipfire-timing")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("x-hipfire-timing header");
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn session_body(model: &str, tool_choice: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "description": "d",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+        if let Some(tc) = tool_choice {
+            body["tool_choice"] = serde_json::json!(tc);
+        }
+        body
+    }
+
+    /// Session mode (spec §12.6): serve forwards the chat projection of
+    /// `messages` and `tools`, and the Jev body shape is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_forwards_projected_messages_and_tools() {
+        let harness = Task11HttpHarness::spawn("systemone-session");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), None));
+        assert_eq!(status, 200, "{body}");
+        let t = timing_header(&headers);
+        assert_eq!(t["mode"], "session", "{t}");
+        let roles: Vec<&str> = t["session_roles"]
+            .as_array()
+            .expect("session_roles")
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(roles.ends_with(&["user", "assistant"]), "{roles:?}");
+        assert_eq!(t["session_tools"], 1, "{t}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["answers", "model", "usage"], "{body}");
+    }
+
+    /// `tool_choice: "none"` drops tools exactly as the chat projection
+    /// does, proving serve projects rather than passes `tools` through.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_applies_tool_choice_projection() {
+        let harness = Task11HttpHarness::spawn("systemone-session-tc");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), Some("none")));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(timing_header(&headers)["session_tools"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_state_and_messages_together_is_422() {
+        let harness = Task11HttpHarness::spawn("systemone-both");
+        let mut body = session_body(harness.model(), None);
+        body["state"] = serde_json::json!("s");
+        let (status, _, body) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 422, "{body}");
+    }
+
+    /// Serve refuses a session `messages` that is not a non-empty array, that
+    /// the chat projection would reduce to only the injected default system
+    /// message, or that carries an image part (spec §12.6), all as 422 and
+    /// before any daemon round trip. The harness model gets a per-model
+    /// `prompt.system` override, so the default system message really is
+    /// injected (the control request shows it).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_refuses_messages_the_projection_would_empty() {
+        let harness = Task11HttpHarness::spawn("systemone-session-empty");
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set_cli("prompt.system", "injected default system")
+            .unwrap();
+        let mut catalog = hipfire_config::ModelCatalog::default();
+        catalog.models.insert(
+            "t11-session".into(),
+            hipfire_config::LocalModelConfig {
+                path: Some(PathBuf::from(harness.model())),
+                registry_tag: None,
+                overrides,
+            },
+        );
+        write_catalog_toml(&harness.paths.config, &catalog).unwrap();
+        let mut body = session_body(harness.model(), None);
+        let (status, headers, text) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        let roles = timing_header(&headers)["session_roles"].clone();
+        assert_eq!(roles, serde_json::json!(["system", "user", "assistant"]));
+        let image = serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}]}]);
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!("hi"),
+            serde_json::json!([{"role": "bogus", "content": "x"}]),
+            image,
+        ];
+        for messages in cases {
+            body["messages"] = messages.clone();
+            let (status, _, text) = post_systemone(harness.port(), &body);
+            assert_eq!(status, 422, "{messages}: {text}");
+            assert!(text.contains("messages"), "{messages}: {text}");
+        }
+        let log = harness.read_requests_log();
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "only the control request reached the daemon; log={log:?}"
+        );
+    }
+
+    /// A daemon 422 with `required_max_seq` is returned to the client as-is,
+    /// `required_max_seq` included, without any reload: serve never grows
+    /// `max_seq` on a request's behalf.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_returns_422_without_reload() {
+        let harness = Task11HttpHarness::spawn("systemone-huge-ctx");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-huge-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["required_max_seq"], 10_000_000u64, "{body}");
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(
+            loads.len(),
+            1,
+            "only the initial load; no reload; log={log:?}"
+        );
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "no retry past the ceiling; log={log:?}"
+        );
+    }
+
+    /// `_debug_no_snapshot` is a daemon-only gate knob: serve must not
+    /// forward it, only `state` and `questions`.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_does_not_forward_debug_no_snapshot() {
+        let harness = Task11HttpHarness::spawn("systemone-no-debug");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "s", "_debug_no_snapshot": true,
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        assert_eq!(decides.len(), 1, "log={log:?}");
+        assert!(
+            decides[0].get("_debug_no_snapshot").is_none(),
+            "serve forwarded _debug_no_snapshot: {:?}",
+            decides[0]
+        );
+        assert_eq!(decides[0]["state"], "s");
+    }
+
+    /// Spec §13.2: write a per-model `decide.calibration` override for the
+    /// harness fixture into the harness's own models.toml.
+    #[cfg(unix)]
+    fn write_decide_calibration(harness: &Task11HttpHarness, table: &str) {
+        let catalog = format!(
+            "schema_version = 1\n\n[models.\"fixture\"]\npath = {:?}\n\n\
+             [models.\"fixture\".overrides.decide.calibration]\n{table}\n",
+            harness.model()
+        );
+        fs::write(&harness.paths.config.models_toml, catalog).unwrap();
+    }
+
+    /// POST a decide (must succeed) and return the message serve forwarded.
+    #[cfg(unix)]
+    fn forwarded_decide(
+        harness: &Task11HttpHarness,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, _, text) = post_systemone(harness.port(), body);
+        assert_eq!(status, 200, "{text}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        (*decides.last().expect("a forwarded decide")).clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_the_per_model_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal");
+        write_decide_calibration(&harness, "choice = 1.5\nnoul = 0.8");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.5, "score": 1.0, "noul": 0.8})
+        );
+        // Session mode forwards it too.
+        let d = forwarded_decide(&harness, &session_body(harness.model(), None));
+        assert_eq!(d["calibration"]["choice"], 1.5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_sends_no_calibration_without_an_override() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-none");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(d.get("calibration").is_none(), "{d}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_cannot_set_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-client");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "calibration": {"choice": 9.0},
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(
+            d.get("calibration").is_none(),
+            "client calibration forwarded: {d}"
+        );
+        write_decide_calibration(&harness, "noul = 0.8");
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8})
+        );
+    }
+
+    /// A `jev-latest`-style request (no local match, spec §12.5's "use
+    /// whatever is loaded" fallback) resolves `runtime.current_path` — the
+    /// path `find_model_path` returned for the originally named request —
+    /// back to the per-model catalog record for a PATH-ONLY model (no
+    /// registry tag). The override is written through the real `hipfire
+    /// config <model> set` code path (`config_command`), not hand-rolled
+    /// TOML, so the catalog's `path` field and table key are exactly what
+    /// production writes. The harness label deliberately avoids "jev" and
+    /// "latest": `find_model_path`'s separator-stripped fuzzy match would
+    /// otherwise resolve the literal string "jev-latest" straight to a
+    /// same-labelled fixture file and never exercise the fallback branch
+    /// at all (caught empirically while writing this test).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_calibration_for_jev_latest_on_a_path_only_model() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-fallback");
+        config_command(
+            &harness.paths,
+            ConfigArgs {
+                model: Some(harness.model().to_string()),
+                action: Some(ConfigAction::Set {
+                    key: "decide.calibration.noul".to_string(),
+                    value: "0.8".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+
+        // A named request first, so the model actually loads and
+        // `runtime.current_path` is populated.
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &named);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "named request must resolve the override: {d}"
+        );
+
+        // `jev-latest` is not itself a local model: is_local_model is
+        // false, so run_decide falls back to runtime.current_path.
+        let latest = serde_json::json!({"model": "jev-latest", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &latest);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "jev-latest fallback must resolve the same per-model override: {d}"
+        );
+    }
+
+    /// The response `model` is the served model name chat and `/health`
+    /// report (`meta.current_model`, the tag when a tag was requested), not
+    /// the resolved filesystem path.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_model_echo_is_served_model_name() {
+        let harness = Task11HttpHarness::spawn("systemone-echo");
+        let req = |model: &str| {
+            serde_json::json!({"model": model, "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}})
+        };
+        let (status, _, body) = post_systemone(harness.port(), &req(harness.model()));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let served = harness
+            .shared
+            .meta
+            .lock()
+            .unwrap()
+            .current_model
+            .clone()
+            .expect("a model is loaded");
+        assert_eq!(v["model"], served.as_str());
+        // Stand in a tag-style served name for the loaded model (what a tag
+        // request records): the echo must follow it, not the path.
+        harness.shared.meta.lock().unwrap().current_model = Some("qwen3.5:4b".to_owned());
+        let (status, _, body) = post_systemone(harness.port(), &req("jev-latest"));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "qwen3.5:4b", "{body}");
+    }
+
+    /// Write a `/v1/systemone` request and return the live TCP stream
+    /// without reading the response — mirrors `open_nonstream_request`.
+    #[cfg(unix)]
+    fn open_systemone_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/systemone HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    /// A client disconnect mid-decide must not release the admission slot
+    /// before the daemon's (deliberately slow) `decided` reply lands.
+    /// Decide's daemon round trip (`Engine::request`) has no cancellation
+    /// hook, so releasing the slot the instant hyper notices the client is
+    /// gone would let a second decide race the daemon while the first is
+    /// still, invisibly, in flight — corrupting the single-daemon
+    /// serialisation `Admission` exists to guarantee.
+    ///
+    /// This checks `harness.shared.admission.inflight()` directly (the same
+    /// technique `nonstream_client_disconnect_aborts_and_releases_admission`
+    /// uses), not the fake daemon's request log: the fake daemon is a
+    /// single-threaded Python script blocked in `time.sleep(1)` while
+    /// processing the slow decide, so it would not read/log a second
+    /// request's bytes until it finishes regardless of when serve released
+    /// admission — log-ordering alone cannot distinguish early-release from
+    /// held-to-completion here, only `inflight()` can.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_disconnect_does_not_release_admission_early() {
+        let harness = Task11HttpHarness::spawn("systemone-disconnect");
+        let port = harness.port();
+        let slow_body = serde_json::json!({
+            "model": harness.model(), "state": "t-slow",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+
+        let stream = open_systemone_request(port, &slow_body);
+
+        // Wait for the daemon to actually receive the slow decide (proving
+        // the request is admitted and dispatched) before disconnecting, so
+        // the guard is provably held mid-flight.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let slow_decide_seen = |harness: &Task11HttpHarness| {
+            Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "decide")
+                .iter()
+                .any(|row| row.get("state").and_then(|v| v.as_str()) == Some("t-slow"))
+        };
+        while Instant::now() < ready_deadline && !slow_decide_seen(&harness) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slow_decide_seen(&harness),
+            "slow decide never reached the fake daemon within 5s; log={:?}",
+            harness.read_requests_log()
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            1,
+            "precondition: exactly one decide holds admission"
+        );
+
+        drop(stream);
+
+        // Poll admission for up to 300ms right after disconnecting. If the
+        // guard were released the instant hyper notices the client is gone
+        // (the bug), inflight would drop to 0 within this short window, well
+        // before the fake daemon's 1s sleep can possibly have elapsed.
+        let short_deadline = Instant::now() + Duration::from_millis(300);
+        let mut dropped_early = false;
+        while Instant::now() < short_deadline {
+            if harness.shared.admission.inflight() == 0 {
+                dropped_early = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !dropped_early,
+            "admission released within 300ms of disconnect — the slot must stay held for the \
+             full ~1s daemon round trip, not release the instant the client vanishes"
+        );
+
+        // It must still release once the daemon's slow decide actually
+        // completes, within a generous bound past the 1s sleep.
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < release_deadline && harness.shared.admission.inflight() != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must eventually release once the slow daemon call completes"
+        );
+    }
+
     /// Silent non-stream client disconnect aborts the correlated daemon txn,
     /// drains done/aborted before Admission releases, then admits a follow-up.
     #[cfg(unix)]
@@ -14859,6 +16167,25 @@ mod tests {
             err.to_string().contains("--prompt-file"),
             "conflict error should name the flag: {err}"
         );
+    }
+
+    #[test]
+    fn bench_matrix_refuses_a_prompt() {
+        for (prompt, prompt_file) in [
+            (Vec::new(), Some(PathBuf::from("prompt.txt"))),
+            (vec!["hello".to_owned()], None),
+        ] {
+            for redline in [false, true] {
+                let mut args = bench_args_for_test(prompt.clone(), prompt_file.clone());
+                args.matrix = !redline;
+                args.redline = redline;
+                let err = bench_command(&test_paths("bench-matrix-prompt"), args).unwrap_err();
+                assert!(
+                    err.to_string().contains("cannot take a prompt"),
+                    "matrix with a prompt must be refused before any load: {err}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -17086,6 +18413,202 @@ mod tests {
         assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
         assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ---- Flash-Next trunk overlay sidecar: pull, rm, listings -----------------
+
+    const OVERLAY_BASE: &[u8] = b"overlay-base-bytes";
+    const OVERLAY_BYTES: &[u8] = b"pre-encoded-qt44-overlay-bytes";
+
+    /// The registry entry carries no overlay field: the overlay comes only from
+    /// the injected pin table, keyed by the base's sha256/size.
+    fn overlay_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "overlay-model":{{
+                    "repo":"test/repo","file":"overlay-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(OVERLAY_BASE),
+            OVERLAY_BASE.len(),
+        )
+    }
+
+    fn overlay_pins() -> Vec<TrunkOverlayPin> {
+        vec![TrunkOverlayPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: "overlay-model.mq4.trunk-overlay",
+            sha256: ple_sha(OVERLAY_BYTES).leak(),
+            size_bytes: OVERLAY_BYTES.len() as u64,
+        }]
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_with_overlay_pins(
+            paths,
+            PullArgs {
+                model: "overlay-model".into(),
+                force,
+                ple: ple::PleSelection::Auto,
+            },
+            &overlay_pins(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_downloads_and_verifies_the_trunk_overlay_once() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let overlay = paths.models.join("overlay-model.mq4.trunk-overlay");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // A valid file on disk is not downloaded again (an empty server would
+        // refuse any request; the invocation counter proves none was made).
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+
+        // A stale overlay is refreshed and re-verified.
+        fs::write(&overlay, b"stale").unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_never_installs_a_trunk_overlay_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull-corrupt");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        // Same length as the pinned payload, different bytes: the digest rejects it.
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            vec![b'x'; OVERLAY_BYTES.len()],
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert!(paths.models.join("overlay-model.mq4").is_file());
+        assert!(
+            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            "a failed verification must not leave the overlay installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_trunk_overlay_with_its_base() {
+        let paths = test_paths("overlay-rm");
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // An unregistered base takes its `<file>.trunk-overlay` with it too.
+        for file in ["local.mq4", "local.mq4.trunk-overlay"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "local.mq4".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("local.mq4").exists());
+        assert!(!paths.models.join("local.mq4.trunk-overlay").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn trunk_overlays_are_never_listed_or_served_as_models() {
+        let paths = test_paths("overlay-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay listing").unwrap();
+        let overlays = [
+            "overlay-model.mq4.trunk-overlay",
+            "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "unregistered.mq4.trunk-overlay",
+        ];
+        for name in overlays {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        assert!(registry_sidecar_files(&registry).contains(TRUNK_OVERLAY_PINS[0].file));
+        for name in overlays.iter().chain(&["overlay-model.mq4"]) {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(listed, ["overlay-model.mq4"]);
         fs::remove_dir_all(&paths.root).unwrap();
     }
 }

@@ -364,8 +364,8 @@ Verified after the move, on hardware, not just by building:
 | path | tokens | tok/s | |
 |---|---:|---:|---|
 | local gfx1201 | 192 | 181.99 | vs 181.07 pre-move |
-| hiptrx single GPU | 4,096 | 420.4 | coherent |
-| hiptrx **pp=2 multi-GPU** | 793 | 385.3 | vs 257.4 pre-move |
+| 4×gfx1201 multi-GPU host, single GPU | 4,096 | 420.4 | coherent |
+| 4×gfx1201 multi-GPU host, **pp=2 multi-GPU** | 793 | 385.3 | vs 257.4 pre-move |
 
 **Consequence for the ratchets.** `daemon arch refs` reaches 30, not 0, and
 daemon lines 22,440, not < 5,000. The remaining 30 are `use hipfire_arch_*`
@@ -453,7 +453,7 @@ What made it tractable, and what four agents had all missed:
 Final: `daemon.rs` 43,696 → **3,879** lines, arch references **0**, alias uses
 **0**, `#[test]` functions lost against baseline **0**. Verified on both
 gfx1201 hosts with real decoded output — local 3-run median 181.22 tok/s
-against a 181.99 baseline, hiptrx pp=2 387.8 against 385.3.
+against a 181.99 baseline, 4×gfx1201 host pp=2 387.8 against 385.3.
 
 ### The two size targets, measured rather than asserted
 
@@ -502,7 +502,7 @@ defensible but arguable, so the conservative 2.202 : 1 is the claim.
 
 **Correction to the comparator figure.** This document and the design-grounding
 doc both cite llama.cpp at 9.7 : 1. That number could not be reproduced from the
-tree at `/home/kaden/llama.cpp`. Measured: `ggml/` 292,285, `src/models/`
+tree in a local llama.cpp checkout. Measured: `ggml/` 292,285, `src/models/`
 18,040, `src/` total 72,014 — giving **16.20 : 1** (ggml : models) or
 **19.19 : 1** (ggml + substrate : models). hipfire is further from llama.cpp
 than the original target implied; the 2 : 1 gate is met, the gap to the
@@ -572,8 +572,8 @@ maintainer's call, not a refactor's.
 | host | GPUs | arch | build | generation |
 |---|---|---|---|---|
 | local | 1 | gfx1201 | clean clone, exit 0 | lfm2.5-1.2b q8, 3-run median **181.22 tok/s** (baseline 181.99) |
-| hiptrx | 4 | gfx1201 | exit 0 | qwen3.5-0.8b mq4 pp=2, **387.8 tok/s** (baseline 385.3) |
-| hipx | 4 | gfx1010 | fresh worktree, 1m07s, exit 0 | lfm2.5-1.2b q8, 222 tok @ **261.79 tok/s** |
+| 4×gfx1201 multi-GPU host | 4 | gfx1201 | exit 0 | qwen3.5-0.8b mq4 pp=2, **387.8 tok/s** (baseline 385.3) |
+| 4×gfx1010 multi-GPU host | 4 | gfx1010 | fresh worktree, 1m07s, exit 0 | lfm2.5-1.2b q8, 222 tok @ **261.79 tok/s** |
 
 Both binaries (`hipfire`, `daemon`) are produced on every host, and every run
 was checked by reading the decoded text, not just the throughput number.
@@ -631,11 +631,11 @@ and the quant formats. That is 124,348 lines of genuine differentiation, it is
 where the performance advantage lives, and **none of it is what is broken.**
 The compute layer is not touched by any item in § 1.
 
-## §5d · Runtime verification at completion (2026-08-15, hiptrx 4x R9700 gfx1201)
+## §5d · Runtime verification at completion (2026-08-15, 4x R9700 gfx1201 host)
 
 Evidence for the DoD item *"`cargo build --release` with no `--features`
 produces a working `hipfire` binary loading all 12 architectures."* Run at
-`d1158ed6e` from `/home/kaden/hf-saddle`, isolated `HOME` so the shared daemon
+`d1158ed6e` from a local `hf-saddle` worktree, isolated `HOME` so the shared daemon
 flock and the operator's serve were untouched. Decoded text was read in every
 case; a load alone was not accepted as evidence.
 

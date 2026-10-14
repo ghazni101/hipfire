@@ -1319,8 +1319,8 @@ impl Gpu {
     /// Exact gfx1100 Qwen3.6 full-attention preparation. Replaces the
     /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
     /// dispatches with one head-local launch. Admission is enforced by the
-    /// architecture layer; this launcher exposes only the fixed 16Q/2K and
-    /// 24Q/4K, head_dim=256, n_rot=64 shapes.
+    /// architecture layer; this launcher exposes only the fixed 16Q/2K,
+    /// 16Q/4K, and 24Q/4K, head_dim=256, n_rot=64 shapes.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_fa_prep_gfx1100(
@@ -1338,10 +1338,10 @@ impl Gpu {
         n_kv_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !matches!((n_heads, n_kv_heads), (16, 2) | (24, 4)) {
+        if !matches!((n_heads, n_kv_heads), (16, 2) | (16, 4) | (24, 4)) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused FA prep requires 16Q/2K or 24Q/4K heads",
+                "fused FA prep requires 16Q/2K, 16Q/4K, or 24Q/4K heads",
             ));
         }
         let (module, src, kernel) = if n_heads == 24 {
@@ -1418,6 +1418,110 @@ impl Gpu {
                 b.push_ptr(qp);
                 b.push_ptr(gp);
                 b.push_ptr(kp);
+                b.push_ptr(qwp);
+                b.push_ptr(kwp);
+                b.push_ptr(pp);
+                b.push_f32(ep);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 twin of [`Self::qwen35_fa_prep_gfx1100`] with a folded Q8_0
+    /// KV-cache epilogue: the K workgroups quantize their finished rope'd row
+    /// into `k_cache` and `n_kv_heads` extra tail workgroups
+    /// quantize `v_src` into `v_cache`, replacing one
+    /// `kv_cache_write_q8_0_pair` launch per full-attention layer. Cache bytes
+    /// are bit-identical to the pair writer (same quantizer expressions on the
+    /// same values). Certified shape only: 16Q/4K, head_dim 256, single token.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_kvwrite_gfx1100(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        v_src: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        pos_buf: &hip_bridge::DeviceBuffer,
+        eps: f32,
+        freq_base: f32,
+        n_heads: usize,
+        n_kv_heads: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !matches!((n_heads, n_kv_heads), (16, 4)) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "fused FA prep + KV fold requires the certified 16Q/4K shape",
+            ));
+        }
+        if !(self.arch_caps.is_gfx1100()
+            || (self.arch_caps.is_gfx1101()
+                && hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN").as_deref()
+                    == Ok("1")))
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "fused FA prep + KV fold is certified only on gfx1100",
+            ));
+        }
+        const KERNEL: &str = "qwen35_fa_prep_kvwrite_gfx1100";
+        self.ensure_kernel(KERNEL, kernels::QWEN35_FA_KVWRITE_GFX1100_SRC, KERNEL)?;
+
+        let qip = q_interleaved.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vs = v_src.buf.as_ptr();
+        let kc = k_cache.buf.as_ptr();
+        let vc = v_cache.buf.as_ptr();
+        let qwp = q_weight.buf.as_ptr();
+        let kwp = k_weight.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let ep = eps;
+        let fb = freq_base;
+        let mut params: Vec<*mut c_void> = vec![
+            &qip as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &kc as *const _ as *mut c_void,
+            &vc as *const _ as *mut c_void,
+            &qwp as *const _ as *mut c_void,
+            &kwp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+        ];
+        let bytes = (n_heads * 256 * 3 + n_kv_heads * 256 * 2 + (n_heads + n_kv_heads) * 256) * 4
+            + crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, 256) * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(n_heads + 2 * n_kv_heads) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qip);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(kp);
+                b.push_ptr(vs);
+                b.push_ptr(kc);
+                b.push_ptr(vc);
                 b.push_ptr(qwp);
                 b.push_ptr(kwp);
                 b.push_ptr(pp);
@@ -4992,7 +5096,11 @@ impl Gpu {
         n_v_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() || head_dim != 128 || n_v_heads > 256 {
+        let gfx1100_route = self.arch_caps.is_gfx1100()
+            || (self.arch_caps.is_gfx1101()
+                && hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN").as_deref()
+                    == Ok("1"));
+        if !gfx1100_route || head_dim != 128 || n_v_heads > 256 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "conv scalar-prep fusion requires gfx1100, head_dim=128, n_v_heads<=256",

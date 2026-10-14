@@ -94,17 +94,9 @@ fn main() -> Result<(), String> {
                            ldx: usize,
                            qk: bool,
                            gpu: &mut Gpu| {
-        let cands = if qk {
-            hipfire_arch_qwen35_embed::forward::attention_qk_tiles()
-        } else {
-            hipfire_arch_qwen35_embed::forward::attention_pv_tiles()
-        };
-        if let Some(tile) =
-            hipfire_arch_qwen35_embed::forward::attention_lds_tile(&cands, m, batch)
-        {
-            return gpu.gemm_f16_x_f16_wmma_lds_tiled_ld(a, x, y, None, m, k, batch, tile, lda, ldx);
-        }
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
+        hipfire_arch_qwen35_embed::forward::attention_gemm_ld(
+            gpu, a, x, y, m, k, batch, lda, ldx, qk,
+        )
     };
 
 
@@ -124,7 +116,7 @@ fn main() -> Result<(), String> {
         let a_dev = gpu.upload_f16_bits(&idn, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
         let x_dev = gpu.upload_f16_bits(&xn, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
         let y_dev = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(&a_dev, &x_dev, &y_dev, None, tn, tk, tn, tk, tk)
+        gemm_production(&a_dev, &x_dev, &y_dev, tn, tk, tn, tk, tk, true, &mut gpu)
             .map_err(|e| format!("identity gemm: {e:?}"))?;
         let y = gpu.download_f32(&y_dev).map_err(|e| format!("{e:?}"))?;
         let mut worst = 0f32;
@@ -134,8 +126,8 @@ fn main() -> Result<(), String> {
             }
         }
         println!("identity check: Y[b,m]=sum_k X[b,k]A[m,k] with A=I -> max|Y-X| = {worst:.3e}");
-        if worst > 1e-3 {
-            println!("  => the GEMM does NOT behave as Y = X * A^T; operand roles differ.");
+        if y.iter().any(|v| !v.is_finite()) || worst > 1e-3 {
+            return Err("identity GEMM disagrees with X * A^T".into());
         }
     }
 
@@ -158,7 +150,7 @@ fn main() -> Result<(), String> {
         let ap = gpu.upload_f16_bits(&a_packed, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
         let xp = gpu.upload_f16_bits(&x_packed, &[tn, tk]).map_err(|e| format!("{e:?}"))?;
         let yp = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(&ap, &xp, &yp, None, tn, tk, tn, tk, tk)
+        gemm_production(&ap, &xp, &yp, tn, tk, tn, tk, tk, true, &mut gpu)
             .map_err(|e| format!("packed gemm: {e:?}"))?;
         let ref_y = gpu.download_f32(&yp).map_err(|e| format!("{e:?}"))?;
         // same data, but addressed through wider-pitch views.
@@ -167,7 +159,7 @@ fn main() -> Result<(), String> {
         let av = af.sub_offset(0, (tn - 1) * pitch_a + tk);
         let xv = xf.sub_offset(0, (tn - 1) * pitch_x + tk);
         let yv = gpu.alloc_tensor(&[tn, tn], DType::F32).map_err(|e| format!("{e:?}"))?;
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(&av, &xv, &yv, None, tn, tk, tn, pitch_a, pitch_x)
+        gemm_production(&av, &xv, &yv, tn, tk, tn, pitch_a, pitch_x, true, &mut gpu)
             .map_err(|e| format!("pitched gemm: {e:?}"))?;
         let got_y = gpu.download_f32(&yv).map_err(|e| format!("{e:?}"))?;
         let (mut num, mut den) = (0f64, 0f64);
@@ -176,6 +168,17 @@ fn main() -> Result<(), String> {
             den += (ref_y[i] as f64).powi(2);
         }
         println!("pitched vs packed GEMM: rel_l2 = {:.3e}", (num / den).sqrt());
+        if let Some(i) = got_y
+            .iter()
+            .zip(&ref_y)
+            .position(|(got, expected)| got.to_bits() != expected.to_bits())
+        {
+            return Err(format!(
+                "pitched vs packed GEMM differs at {i}: {:08x} != {:08x}",
+                got_y[i].to_bits(),
+                ref_y[i].to_bits(),
+            ));
+        }
     }
 
     // ---- GPU: the eager sequence, exactly as forward.rs runs it ----
@@ -243,6 +246,9 @@ fn main() -> Result<(), String> {
             }
         }
         let r = (num / den).sqrt();
+        if !r.is_finite() {
+            return Err(format!("non-finite eager attention error for head {h}"));
+        }
         worst = worst.max(r as f32);
         println!("  head {h} (kv head {}): rel_l2 = {r:.3e}", h / rep);
     }

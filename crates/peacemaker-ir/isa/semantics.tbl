@@ -1,8 +1,14 @@
 # opcode	semantic class; no unsupported opcode silently completes
 # This table is interpreter dispatch, not a full-domain numerical certificate.
 # The bounded replay gate is QSA convert/attend and sym NT4 gate_up/down.
-# BF16 and FP8 WMMA are unqualified and intentionally have no semantics rows:
-# decoded programs using either hard-error rather than invoke provisional math.
+# A row means the interpreter has a model for the name; the model itself refuses every unmeasured modifier or
+# architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 measured;
+# gfx1151 historical corpus only, fresh receipt pending), v_dot2_f32_f16/bf16 (gfx1201 only), and the gfx1201-only
+# SWMMAC rows v_swmmac_f32_16x16x32_f16/bf16 and v_swmmac_i32_16x16x32_iu8/iu4/x64_iu4 (index_key 0/1, measured
+# neg_lo/neg_hi, integer two-half CLAMP; accumulator NEG[2], float CLAMP and other OPSEL bits refused).
+# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16, the 16-bit-out SWMMAC
+# (f16/bf16 out) and every FP8/BF8 WMMA and SWMMAC.
+# See isa/emu/float_edges.md "Opcode-fill qualification (pending)".
 # v_log_f32_e32, v_rsq_f32_e32 and v_sqrt_f32_e32 are outside that gate;
 # their candidate numeric paths remain unqualified for the full input domain.
 buffer_load_b128	memory
@@ -49,16 +55,19 @@ s_cselect_b32	alu
 s_ctz_i32_b32	alu
 s_delay_alu	wait
 s_endpgm	control
+s_load_b128	memory
 s_load_b256	memory
 s_load_b32	memory
 s_load_b64	memory
 s_lshl_b32	alu
 s_lshr_b32	alu
 s_min_i32	alu
+s_min_u32	alu
 s_mov_b32	alu
 s_mul_hi_u32	alu
 s_mul_i32	alu
 s_mulk_i32	alu
+s_not_b32	alu
 s_or_b32	alu
 s_sub_co_i32	alu
 s_sub_i32	alu
@@ -70,6 +79,7 @@ s_wait_loadcnt_dscnt	wait
 s_wait_storecnt	wait
 s_waitcnt	wait
 s_waitcnt_vscnt	wait
+s_xor_b32	alu
 v_add3_u32	alu
 v_add_f32_e32	alu
 v_add_nc_u32_e32	alu
@@ -77,12 +87,16 @@ v_and_b32_e32	alu
 v_bfe_u32	alu
 v_cmp_class_f32_e64	alu
 v_cmp_eq_u32_e64	alu
+v_cmp_ge_f32_e64	alu
+v_cmp_gt_f32_e64	alu
 v_cmp_gt_i32_e64	alu
 v_cmp_gt_u32_e64	alu
+v_cmp_le_f32_e64	alu
 v_cmp_le_i32_e64	alu
 v_cmp_le_u32_e64	alu
 v_cmp_lt_f32_e64	alu
 v_cmp_lt_i32_e64	alu
+v_cmp_lt_u32_e64	alu
 v_cmp_ne_u32_e64	alu
 v_cmp_neq_f32_e64	alu
 v_cmp_ngt_f32_e64	alu
@@ -114,7 +128,9 @@ v_mad_u32_u24	alu
 v_max3_f32	alu
 v_max3_num_f32	alu
 v_max_f32_e32	alu
+v_max_i32_e32	alu
 v_max_num_f32_e32	alu
+v_min_u32_e32	alu
 v_mov_b32_e32	alu
 v_mul_f32_e32	alu
 v_mul_hi_u32	alu
@@ -142,3 +158,104 @@ v_permlane16_b32	alu
 v_log_f32_e32	alu
 v_rsq_f32_e32	alu
 v_sqrt_f32_e32	alu
+# Opcode-fill rows (names are the canonical isa table names).
+# s_cvt_f32_f16/s_cvt_hi_f32_f16/s_fmaak_f32 exist on gfx1151 only; gfx12 has no s_cvt_hi_f32_f16.
+ds_add_f32	memory
+ds_add_rtn_u32	memory
+ds_add_u32	memory
+ds_load_u16	memory
+ds_or_b32	memory
+ds_store_b96	memory
+flat_load_b96	memory
+flat_load_d16_hi_b16	memory
+flat_load_d16_u8	memory
+flat_load_i8	memory
+flat_store_b128	memory
+flat_store_b16	memory
+flat_store_b32	memory
+flat_store_b8	memory
+flat_store_b96	memory
+flat_store_d16_hi_b16	memory
+s_bfe_i32	alu
+s_bitset1_b32	alu
+s_cvt_f32_f16	alu
+s_cvt_hi_f32_f16	alu
+s_fmaak_f32	alu
+s_nor_b32	alu
+s_pack_lh_b32_b16	alu
+s_sext_i32_i8	alu
+v_add_f32_e64	alu
+v_add_f64	alu
+v_cls_i32_e32	alu
+v_cmp_eq_u64_e32	alu
+v_cmp_eq_u64_e64	alu
+v_cmp_gt_i16_e64	alu
+v_cmp_gt_u64_e32	alu
+v_cmp_le_u64_e32	alu
+v_cmp_lt_i64_e32	alu
+v_cmp_ne_u64_e32	alu
+v_cmp_neq_f16_e64	alu
+v_cmp_nlg_f32_e32	alu
+v_cmp_nlg_f32_e64	alu
+v_cmp_nle_f32_e32	alu
+v_cmp_nle_f32_e64	alu
+v_cmpx_eq_u16_e32	alu
+v_cmpx_eq_u32_e64	alu
+v_cmpx_eq_u64_e32	alu
+v_cmpx_ge_i32_e32	alu
+v_cmpx_ge_u32_e32	alu
+v_cmpx_gt_i64_e64	alu
+v_cmpx_gt_u64_e32	alu
+v_cmpx_gt_u64_e64	alu
+v_cmpx_le_f32_e32	alu
+v_cmpx_le_u64_e64	alu
+v_cmpx_lt_i32_e64	alu
+v_cmpx_lt_i64_e32	alu
+v_cmpx_ne_u16_e32	alu
+v_cmpx_nlg_f32_e32	alu
+v_cmpx_ngt_f32_e32	alu
+v_cvt_f16_i16_e32	alu
+v_cvt_f16_i16_e64	alu
+v_cvt_f32_f64_e32	alu
+v_cvt_f32_ubyte1_e32	alu
+v_cvt_f32_ubyte2_e32	alu
+v_cvt_f32_ubyte3_e32	alu
+v_cvt_f64_f32_e32	alu
+v_cvt_f64_i32_e32	alu
+v_cvt_f64_u32_e32	alu
+v_cvt_i32_f64_e32	alu
+v_cvt_pk_rtz_f16_f32_e32	alu
+v_cvt_u32_u16_e32	alu
+v_cvt_u32_u16_e64	alu
+v_dot4_i32_iu8	alu
+v_dot2_f32_bf16	alu
+v_dot2_f32_f16	alu
+v_dot8_i32_iu4	alu
+v_lshrrev_b64	alu
+v_mad_i32_i24	alu
+v_min3_f32	alu
+v_min_f32_e32	alu
+v_min_f64	alu
+v_mul_f16_e32	alu
+v_mul_f16_e64	alu
+v_mul_lo_u16	alu
+v_nop	alu
+v_sub_co_ci_u32_e32	alu
+v_sub_nc_u16	alu
+v_subrev_co_u32	alu
+v_swmmac_f32_16x16x32_bf16	alu
+v_swmmac_f32_16x16x32_f16	alu
+v_swmmac_i32_16x16x32_iu4	alu
+v_swmmac_i32_16x16x32_iu8	alu
+v_swmmac_i32_16x16x64_iu4	alu
+v_wmma_f32_16x16x16_bf16	alu
+v_wmma_i32_16x16x16_iu8	alu
+v_xad_u32	alu
+s_bcnt1_i32_b32	alu
+s_cmp_gt_i32	alu
+s_cmp_le_u32	alu
+s_max_i32	alu
+v_cmp_eq_f32_e64	alu
+v_mbcnt_lo_u32_b32	alu
+v_readlane_b32	alu
+v_writelane_b32	alu

@@ -18,10 +18,11 @@ code is required for this run.
 **This exact oracle has already been run at a3b scale.**
 `docs/moe-awq/SESSION_FINDINGS_2026-06-11.md:4` — *"All KLD vs an f32-native
 oracle (`q36a3b-f32-oracle.hfq`); refs `q36a3b-{wt2,agentic}-f32.kldref.bin`.
-Branch `feat/moe-awq-experts` on mi300."* The artifacts survive on the NAS:
+Branch `feat/moe-awq-experts` on the MI300X rental box."* The artifacts survive on the NAS
+(`<evidence-root>` is the maintainer's local-only NAS evidence root; it is not part of this repository):
 
 ```
-/mnt/nas/kaden/hipfire/models/Qwen3.6-35b-a3b/
+<evidence-root>/hipfire/models/Qwen3.6-35b-a3b/
     qwen3.6-35b-a3b.f32.hfq      138,658,609,664 B   (Jun 11)
     kldref/wt2.kldref.bin         16,842,528 B  md5 456ddaef569977b372a8c32b5dacbd2f
     kldref/agentic.kldref.bin     16,842,528 B

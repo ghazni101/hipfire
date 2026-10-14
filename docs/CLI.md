@@ -4,18 +4,23 @@ Audience: operators driving the native Rust `hipfire` binary
 (`crates/hipfire-cli`).
 Run `hipfire <cmd> --help` (or `hipfire help <cmd>`) for the live flag text. This page indexes subcommands and file locations; it does **not** duplicate the full model registry or every config key.
 
-Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is installed; otherwise it prints the command list. Config keys: [CONFIG.md](CONFIG.md). Env vars: [env-vars.md](env-vars.md). Models: [MODELS.md](MODELS.md).
+Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the terminal UI and **requires** the `hipfire-tui` binary (`HIPFIRE_TUI_BIN`, `~/.hipfire/bin/hipfire-tui`, the workspace `target/release`, or `PATH`). When that binary is missing the command exits with an error naming the build command; it does not print a command list (use `hipfire help`). Config keys: [CONFIG.md](CONFIG.md). Env vars: [env-vars.md](env-vars.md). Models: [MODELS.md](MODELS.md).
 
 ## Model lifecycle
 
 | Command | Purpose |
 |---|---|
-| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull does **not** enable speculation: `dflash_mode` defaults to **`off`**. With `auto`, the loader uses the sidecar when present (otherwise AR); with `on`, load fails closed if the sidecar is missing. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. When the entry declares an MTP head (`mtp.file`, e.g. every Qwen3.8-27B trunk tier → `qwen3.8-27b.mtp`), the pull fetches it too, and because `mtp_mode` defaults to `auto`, the next load speculates with it ([MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). |
+| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/` and fetch its declared DFlash (`dflash.file`), vision (`vision.file`) and MTP (`mtp.file`) sidecars. The schema `dflash_mode` default is **`off`**; Qwen3.8-27B tiers with a declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) carry registry-layer `auto` ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). A present draft enables eligible DFlash; an absent file leaves native MTP governed by its separate `auto` policy. `dflash_mode=on` / `speculation.dflash=on` refuses without a DFlash draft, even on an MTP-only tier; it never aliases to MTP. Use `--spec mtp` / `speculation.mtp=on` for explicit native MTP. Native MTP `auto` declines a resolved host-mapped routed-expert spill on either execution seam. Uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled refuses an attaching native MTP head, including resident `auto`; use `--spec off` / `speculation.mtp=off` for AR or `HIPFIRE_FP16=0` for explicit MTP. Other resident attachment is unchanged. `dflash_mode=off` beats registry `auto`. Draft path override: `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` / `run --model-draft`; vision override: `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. See [MODELS.md](MODELS.md#dflash-draft-artifacts-registry). |
+| `hipfire pull <tag> --force` | Replace an existing target after downloading and verifying a new copy. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
+| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
+| `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
 | `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar and the `mtp` head follow the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`, and every trunk tier the one `qwen3.8-27b.mtp`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
+| `hipfire remove <tag\|path>` | Alias of `rm`. |
+| `hipfire registry status\|list\|update [-j\|--json]`, `hipfire registry show <tag> [-j]`, `hipfire registry verify [PATH] [-j]` | Inspect the registry migration surface. `status` prints the source in use (bundled, cache or network), schema version, revision, cache path and warnings; `list` prints the registered tags; `show` prints one canonical entry; `update` loads the registry and prints the same report as `status` (the cache is refetched only when older than 24 h); `verify` validates the bundled registry or an explicit v1 JSON file. |
 
 Tags resolve through the dynamic registry + aliases. Authoritative live list:
 `hipfire list -r`. The native binary embeds `registry/v1.json`; the curated
@@ -74,23 +79,48 @@ decode to the q4 the loader derives locally from the q8 rows).
   overwrite existing outputs and a non-monolithic input. `<model>.plehot*` files
   belong to the monolithic layout and are left in place with a note. The summary
   prints `base_index_sha256` and `q8_rows_sha256`.
+- **`hipfire ple rebind --old-base PATH --new-base PATH --source PATH`** is for a repacked monolithic base whose non-PLE weights changed but whose embedded PLE rows did not. It validates the source q4 sidecar against the old base, compares both bases' PLE descriptors and Q8 payloads, verifies every q4 segment digest, and copies the unchanged q4 payload with only the new base-size/index binding. After readback and attachment validation it atomically replaces `<new-base>.ple-q4` with a separate inode, including when that destination was a hardlink to the source. The source file is never rewritten. Changed PLE bytes/layouts or corrupt digests are refused; split bases are not supported. A stock sidecar must not simply be hardlinked to a smaller requantized base: its binding will correctly fail the loader.
 - **`rm` and listings.** `rm` also removes `<model>.ple-q4`, `<model>.ple-q8`,
   their `.plehotrows` packs and `<model>.plehot`. `*.ple-q4`, `*.ple-q8`,
   `*.plehot` and `*.plehotrows` files are sidecars: never listed or served as
   models.
+
+### Flash-Next trunk overlay
+
+The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`,
+`-mq4-xts`) share one base artifact (sha256 `8b15b6fe…`, 125288544792 B). The
+client carries a compiled-in pin for that base, naming the trunk overlay
+`qwen3.8-flash-next.mq4-xts.trunk-overlay` (the canonical base file name plus
+`.trunk-overlay`; 305543168 B, sha256 `df49bc0a…`) in the
+`hipfire-models/qwen3.8-flash-next` repo. There is no registry schema change, so
+older clients keep parsing the published registry. The overlay holds the 108 GDN
+`in_proj_{z,a,b}` projections as pre-encoded symmetric QT44, bound to the base by
+size and index SHA-256. The Qwen4 loader substitutes them for the base's MQ6
+tensors on gfx1151 by default; `HIPFIRE_QWEN4_TRUNK_OVERLAY=0` restores the base
+weights and `=1` applies the overlay on any architecture.
+
+- **Pull.** `hipfire pull <tag>` downloads and SHA-256 verifies the pinned
+  overlay with the other sidecars; a valid file already on disk is not
+  downloaded again, a stale one is refreshed. As for other sidecars, a failed
+  overlay download prints a warning and the pull still succeeds (the base loads
+  unchanged). Any other registry entry (e.g. the RTN-asym file or the local-only
+  zab tier) has no overlay.
+- **`rm` and listings.** `rm <tag>` removes the overlay with the base
+  (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
+  or served as models.
 
 ## Inference
 
 | Command | Purpose |
 |---|---|
 | `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
-| `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `<model>-<WxH>-<seed>.png`. |
+| `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `hipfire-<seed>.png` in the working directory (or the `-o` path) and prints the path. |
 | `hipfire embed <model> [flags] [text...]` | Encode text and/or an image with an embedding checkpoint (arch 17, the Qwen3.5 multi-vector encoder — e.g. `pplx-embed-v2-late-0.6b`). Prints tokens×dims; `--query`/`--doc` score the pair by late-interaction MaxSim; `--json` emits the token-embedding matrix. See [`hipfire embed` flags](#hipfire-embed-flags). |
-| `hipfire chat <model> [--no-color]` | Interactive multi-turn TUI. See [CHAT.md](CHAT.md). |
+| `hipfire chat [model] [-t <f>] [--top-p <f>] [-n <n>] [--system <text>] [--no-color]` | Interactive multi-turn line client over the HTTP service (not the TUI; for the TUI use `hipfire tui`). The model defaults to `serve.default_model`. `-t` is `0..=2`, `--top-p` is `(0,1]`, `-n` is `1..=393216`. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
 | `hipfire stop [port] [--force] [--all]` | Stop the tracked background serve (`~/.hipfire/serve.pid`). `--force` reaps orphan daemons and frees the port; `--all` also reaps orphan quantize jobs. |
-| `hipfire tui [flags...]` | Launch `hipfire-tui` (Home / Chat / Models / Settings / System). |
+| `hipfire tui [flags...]` | Launch `hipfire-tui` (Home / Dashboard / Chat / Models / Settings / System). Trailing arguments are forwarded to `hipfire-tui` (e.g. `--check`). |
 
 ### `hipfire run` flags
 Flags may appear before or after the model. CLI help and the native typed schema list stored globals; **effective `run` sampling** is not “global default unless overridden.” The Rust request resolver transmits only explicit CLI flags, per-model overlay values, or registry `recommended_settings`. Otherwise the field is **omitted** so daemon/HFQ/arch fallback applies. Global-only `temperature` / `top_p` / `repeat_penalty` are not sent. **Chat** is the exception (global session snapshot — [CHAT.md](CHAT.md)).
@@ -103,24 +133,26 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `-n, --max-tokens <int>` | Generation cap (config default `4096`). |
 | `--kv-mode <m>` | Whole-cache KV preset for this load: `auto`, `q8`, `fp8`, `bf16`, `fwht4`/`3`/`2`; legacy spellings `asym4`/`3`/`2`, `turbo`… (see [KV load flags](#kv-load-flags-run--serve--bench)). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend. Omitted = automatic (prefer VMM). `contiguous` is **rejected** (renamed to `legacy`). |
-| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; deprecated, removal in 0.5.0: legacy `asymN`/`turboN` → `fwhtN`; legacy Givens `legacy-asymN`). |
+| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; deprecated since 0.4.0, removal in 0.5.0: legacy `asymN`/`turboN` → `fwhtN`; legacy Givens `legacy-asymN`). |
 | `--kv-v <name>` | Qwen-family V-axis override (`q8`, `lloyd2`/`3`/`4`). |
+| `--head <name>` | Select a published `lm_head` variant from the registry's `heads` (e.g. `--head q4k`). The overlay shadows the model's own head at load time; omitted = the head baked into the model file. |
+| `--tp <N>` | Tensor/expert-parallel degree for this load, `1..=64` (same admission as `serve --tp` / `bench --tp`). Only values above 1 are forwarded and force a local daemon. |
 | `--max-seq <n>` | KV context for this load, within the `memory.max_seq` bounds (512–1048576); sent as the load's `max_seq` and replaces any configured `memory.max_seq`, as `bench --max-seq` does. Unset: eligible growing Qwen VMM KV defaults to min(model trained context, measured card capacity); legacy and other owners retain their bounds. Forces a local daemon (see below). |
 | `--spec <m>` / `--speculation <m>` | Spec mechanism: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (config default `auto`). |
-| `-md, --model-draft <path>` | DFlash draft path; implies `--spec dflash` unless `--spec`/env already set. |
-| `--draft-max`, `--draft <N>` | Draft window for the active mechanism. |
+| `-md, --model-draft <path>` | DFlash draft path; implies `--spec dflash` when `--spec` is not given. |
+| `--draft-max <N>` (alias `--draft`) | Draft window, `1..=32`. With `--spec ngram` it sets the n-gram window, with `--spec mtp` the MTP window, otherwise both. |
 | `--dspark-conf-threshold <f>` | DSpark confidence cutoff in `[0,1]` (qwen3 + deepseek4). |
 | `--system <text>` | System prompt. |
 | `--image <path>` | Vision input (when the model supports it). |
-| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also on `serve`. |
+| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also accepted by `serve` (where `serve -d` does not forward it to the detached child). |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
 | `--stats` | Emit one statistics footer on stderr after successful generation (local or HTTP, streaming or `--no-stream`); generated stdout is unchanged. Suppressed with `--json` and on failed/aborted generation. |
 
-Resolution ladder for speculation: **env > CLI flag > per-model > global**.
-`dflash_mode` itself defaults to **`off`** — see [CONFIG.md](CONFIG.md#speculative-decode). Pulling a draft does not enable DFlash.
+Resolution ladder for speculation: **CLI flag > env > per-model > global > registry card > built-in default**. On `run`, `--spec` replaces the selector the config and environment layers resolved (`hipfire config explain speculation.mode` prints the winning source).
+`dflash_mode` itself defaults to **`off`** in the schema — see [CONFIG.md](CONFIG.md#speculative-decode) — except that Qwen3.8-27B tiers with a registry-declared draft resolve `auto` through the registry layer ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); an explicit `dflash_mode=off` (per-model, global or env) wins. Pulling a draft for any other model does not enable DFlash.
 
-`--stats` example: `[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15`.
+`--stats` illustrative output (values are placeholders, not a benchmark): `[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15`.
 `tokens` counts committed daemon completion IDs, including reasoning, not
 printed characters. `decode` is decode throughput, not wall-inclusive `tok_s`;
 `ttft` is time to first token. `tau` is included only for speculation when
@@ -135,7 +167,7 @@ hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 ```
 
-Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
+Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--head`, `--tp` above 1, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `run_should_force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
 ### KV load flags (`run` / `serve` / `bench`)
 
@@ -158,33 +190,37 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 
 | Flag / arg | Purpose |
 |---|---|
-| `[host]` `[port]` or `host:port` | Bind (config defaults `127.0.0.1` and `11435`). **No authentication and no TLS** — `0.0.0.0` exposes the API on every interface; do that only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
+| up to three positionals: `[model]` `[host]` `[port]` or `host:port` | Optional model, then bind (config defaults `127.0.0.1` and `11435`). **No authentication and no TLS** — `0.0.0.0` exposes the API on every interface; do that only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
+| `--model <tag>` | Model tag/path to pre-warm for this process. |
 | `-d`, `--detach`, `--background` | Background; log `~/.hipfire/serve.log`, pid `~/.hipfire/serve.pid`. |
 | `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend (same as `run`; `contiguous` rejected → use `legacy`). |
 | `--kv-k <name>` / `--kv-v <name>` | Qwen-family K/V axis overrides (same as `run`). |
-| `--max-seq <n>` | KV context for every ordinary model load of this service (512–1048576); replaces the configured/automatic `memory.max_seq` (same contract as `run`). A multi-slot load keeps its per-slot context. Forwarded by `serve -d`. |
+| `--max-seq <n>` | KV context for every ordinary model load of this service (512–1048576); replaces the configured/automatic `memory.max_seq` (same contract as `run`). With `serve.multi_slot` it sets the per-slot context (overriding `serve.multi_slot_ctx`), so total KV scales with the slot count (`serve.multi_slot_slots`). Forwarded by `serve -d`. |
 | `--spec <m>` / `--speculation <m>` | Speculation mode for every model this service loads: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (other values fail at parse). Applied per load after the config selector, so it overrides `speculation.mode` and per-model speculation; `dflash` / `auto` also resolve the registry draft. `--spec off` turns MTP and DFlash off (plain AR), e.g. for an A/B. Unset: config (default `auto`). Forwarded by `serve -d`. |
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
-| `--no-prewarm` | Lazy-load on first request. |
-| `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
-| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). |
+| `--no-prewarm` | Do not load the configured default model before accepting requests (lazy-load on first request). |
+| `--tp N` | Tensor/expert-parallel degree, `1..=64` (supported paths only). |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, `1..=256` (`1` preserves sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits. Forwarded by `serve -d`. |
+| `--ui` | Serve the embedded chat UI at `/ui` on the serve listener. |
+| `--open` | Open the chat UI in the default browser once serving; implies `--ui`. With `-d` the browser launch happens in the launching process and the detached child only enables the route. |
+| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). **Foreground serve only:** `serve -d` does not forward it to the detached child, so set `HIPFIRE_VISION_SIDECAR` or the registry `vision` slot for a detached service. |
 
 ### `hipfire img` flags
 
-Run in a fresh daemon process; the prompt is the positional text. `--steps`
+Run in a fresh daemon process; the prompt is the positional text (a built-in sample prompt when omitted). `--steps`
 defaults to the model's own default (4 for step-distilled `flux.schnell:1`,
 28 for guidance-distilled `flux.dev:1`).
 
 | Flag | Purpose |
 |---|---|
-| `--width` / `--height` | Latent grid size. Defaults match the reference (1024×1024 unless `--image` is given). |
-| `--steps <n>` | Denoise steps; omit for the architecture default. |
-| `--seed <n>` | Same model + seed → byte-identical PNG. |
-| `--backend <cpu\|gpu>` | Transformer backend; defaults to GPU when available. |
-| `--image <path>` | Reference image (FLUX.2 Klein edit only, arch 45). The CLI reads the file and sends its bytes; the daemon never opens a client-named path. |
-| `--sampler <name>` | `euler` / `flow-match` only. |
-| `--json` | Print the JSON result object instead of just the PNG path. |
+| `-o, --out <path>` | Output PNG path (default `hipfire-<seed>.png` in the working directory). |
+| `--width` / `--height` | Pixel size, `1..=8192` and divisible by the VAE compression factor. Default 1024×1024; with `--image` the default is the reference image's own size. |
+| `--steps <n>` | Denoise steps, `1..=128`; omit for the architecture default. |
+| `--seed <n>` | Noise seed (default `0`). Same model + seed → byte-identical PNG. |
+| `--backend <cpu\|gpu>` | `gpu` = the HIP transformer forward, `cpu` = the f32 reference oracle; defaults to `gpu` when available, else `cpu`. Other values are rejected. |
+| `--image <path>` | Reference image for FLUX.2 Klein edit (arch 45 only; a FLUX.1 pipe refuses it). Repeatable, up to 4. Give every `--image` **before** the prompt words: the prompt is a greedy trailing positional. The CLI reads each file and sends its bytes; the daemon never opens a client-named path. |
+| `-j, --json` | Print one JSON result object (`path`, `bytes`, `width`, `height`, `steps`, `seed`, `ms`, `model`) instead of the progress lines and the PNG path. |
 
 Model resolution accepts an HFQ **component pack** (trunk file) — the
 `t5`/`clip`/`vae` sidecar packs are discovered next to it by sibling name
@@ -232,33 +268,39 @@ carries `n_tokens`, with an optional `"kind": "query" | "document"`).
 |---|---|
 | `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml`. |
 | `hipfire config <tag>` | Print resolved per-model policy and override provenance. |
-| `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`--json` on list/get). |
+| `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`-j/--json` on list/get; `reset` with no key removes every override). |
+| `hipfire config explain <key> [-j]` | Explain a key's type, scope, default, effective value and provenance. |
+| `hipfire config schema [-j]` | Print the authoritative typed configuration schema. |
+| `hipfire config migrate` | Convert legacy `config.json` to sparse `config.toml` without deleting the JSON. |
+| `hipfire config profile [set <name>\|create <name>]` | `set` replaces the global sparse config with a built-in (`default`, `dev`, `hip`, `redline`) or custom profile; `create` snapshots the current global config as a new custom profile; with no action it opens the profile wizard in `hipfire-tui`. `migrate`, `schema` and `profile` are global-only. |
 | `hipfire config <tag> list\|get\|set\|reset ...` | Same, scoped to per-model keys. |
 
-Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ranges. Notable defaults from source: `dflash_mode=off`, `speculation=auto`, `thinking=on`, `reasoning_effort=auto`, schema default `thinking_budget=med` (legacy named-cap route only; dropped+warned on effort-native models), `max_tokens=4096`, `idle_timeout=300`. Qwen Jinja contracts additionally accept an explicit integer think cap; other families do not synthesize a force-close mechanism. Reasoning axes and family examples: [CONFIG.md](CONFIG.md), [SERVE.md](SERVE.md).
+Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ranges. Notable defaults from source: `dflash_mode=off` (schema default; Qwen3.8-27B tiers with a paired draft resolve `auto` through the registry layer), `speculation=auto`, `thinking=on`, `reasoning_effort=auto` (no preference: an explicit non-`auto` config/CLI/HTTP value wins; when every layer is unset/`auto`, Qwen3.8 and Ornith 1.5 use hipfire's `medium` default, so `reasoning_effort = "xhigh"` restores the official-template default), schema default `thinking_budget=med` (legacy named-cap route only; dropped+warned on effort-native models), `max_tokens=4096`, `idle_timeout=300`. Qwen Jinja contracts additionally accept an explicit integer think cap; other families do not synthesize a force-close mechanism. Reasoning axes and family examples: [CONFIG.md](CONFIG.md), [SERVE.md](SERVE.md).
 
 ## Quantization and calibration
 
 | Command | Purpose |
 |---|---|
-| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. |
-| `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
-| `hipfire sidecar-gen <model> [flags]` | **Deprecated (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
+| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; quantize from the original safetensors checkpoint instead. GGUF input accepts only `hf4`, `hf6`, `mq4` and `mq6`. |
+| `hipfire-quantize --flux-pipe <pipe_dir> --output <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
+| `hipfire sidecar-gen <model> [flags]` | **Deprecated since 0.4.0 (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
+| `hipfire calibrate-npu-trunk --from <measurements.json> --out <cal.json>` | Write a keyed NPU trunk calibration from offline measurement inputs. Every measured cost is mandatory; the record's `key.kernel.uname_release` must equal the current `uname -r`, otherwise the command fails. |
 
 ### `quantize` (summary)
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable. Safetensors default **`mq4`**; GGUF default **`hf4`**. |
-| `--both` | `mq4` + `mq6`. |
-| `-o` / `--output`, `--output-dir`, `--stem` | Output naming. |
+| `--format <fmt>` | Repeatable: `mq4`, `mq6`, `q8`, `q8f16`, `hf4`, `hf6` (`hfq4`/`hfq4g256` map to `hf4`, `hfq6`/`hfq6g256` to `hf6`). With no `--format` and no `--both` the default is **`mq4`** for safetensors input and **`hf4`** for a `.gguf` file. |
+| `--both` | Add `mq4` and `mq6` to the requested formats (suppresses the default format). |
+| `-o` / `--output` | Exact output path; valid with exactly one format. |
+| `--output-dir`, `--stem` | Output directory (default: working directory) and filename stem (default: the input's file/directory name, `.gguf` removed); files are `<stem>.<format>`. |
 | `--install` | Copy into `~/.hipfire/models/`. |
-| `--register <tag>` | Local alias in `~/.hipfire/models.toml`. |
-| `--upload <owner/repo>`, `--create-repo` | Optional HF publish. |
+| `--register <tag>` | Local alias in `~/.hipfire/models.toml`, pointing at the `mq4` artifact when produced, else the first one. |
+| `--upload <owner/repo>`, `--create-repo` | Optional HF publish through the `hf` CLI (`--create-repo` creates the model repo first). |
 
 Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
 
-### `sidecar-gen` (summary; deprecated, removal in 0.5.0)
+### `sidecar-gen` (summary; deprecated since 0.4.0, removal in 0.5.0)
 
 | Flag | Purpose |
 |---|---|
@@ -276,20 +318,42 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
 | `hipfire bench <model> --spec <m> ...` | Every bench generate sends greedy sampling with the neutral `repeat_penalty 1.0` (any other value routes the daemon to the plain AR decoder), so `--spec mtp\|dflash\|ngram\|dspark\|auto` measures the speculative decoder and `--spec off` the AR decoder on the same workload. JSON records `spec_requested`, a per-run `spec_route` (`"mtp"`, `"mtp+ngram"`, `"dflash"`, a daemon `spec` name, or `null` when AR ran) and per-run `spec_tau`; when `--spec` is not `off` but no run speculated, the bench prints a `warning:` and adds it to `warnings`. |
-| `hipfire bench <model> --concurrency 1,2,4,8 ...` | vLLM-style closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). |
+| `hipfire bench <model> --concurrency 1,2,4,8 ...` | Closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). `--json` is not supported on this path. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
-| `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
+| `hipfire diag [-j\|--json]` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
 | `hipfire version [--json]` | Detailed build/source match, checkout state, target, config schema, and installed-daemon SHA-256. |
-| `hipfire update [@REF]` | **Linux managed installs:** advance the current branch or auto-detect and install a branch/tag/commit. |
+| `hipfire update [REF]` | **Linux managed installs:** advance the current branch or auto-detect and install a branch/tag/commit; a leading `@` on `REF` is optional. |
 | `hipfire update --branch NAME` | Switch to and track a remote branch such as `master` or `beta`. |
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
+| `hipfire setup --source PATH [flags]` | Install or repair this machine's runtime from a source checkout (normally run by `scripts/install.sh`; `--source` is required and must contain `Cargo.toml`). Flags: `--rocm-root PATH`, `--hipcc PATH` (also `HIPFIRE_HIPCC`), `--strict-rocm` (also `HIPFIRE_ROCM_STRICT=1`), `--gpu-arch ARCH`, `--profile auto\|hip\|redline` (`auto` leaves `replay.backend=auto` so `.mq4r` models select Redline), `-y`/`--yes` (alias `--non-interactive`), `--compile-kernels` (compile locally with `hipcc` even when a release kernel pack exists), `--kernel-pack-url URL` (directory or URL holding the kernel-pack assets; default: the tag's GitHub release). A release tag selects that release's prebuilt kernel pack, which needs no device compiler. |
+| `hipfire kernel-pack install --tag TAG --arch ARCH --source PATH [--dest DIR] [--url URL] [--rocm-version V]` | Download, verify and install the prebuilt kernel pack for `TAG` and `ARCH`. `--source` is the checkout the installed daemon was built from; its `HEAD` must be the pack's commit. `--dest` defaults to `~/.hipfire/bin/kernels/compiled/<ARCH>`; `--rocm-version` (default: the resolved ROCm root's `.info/version`) is checked against the pack's supported range. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
 
+`hipfire bench` flags (summary; `hipfire bench --help` is authoritative):
+
+| Flag | Purpose |
+|---|---|
+| `--runs N` | Measured runs; default `5`, must be positive. |
+| `--tp N` | Tensor/expert-parallel degree for the bench daemon, `1..=64`. |
+| `-j`, `--json` | JSON report; not supported with `--exp` or `--concurrency`. |
+| `--exp` | RDNA2 kernel-variant sweep in isolated daemon processes; cannot combine with `--matrix`/`--redline`, `--json` or `--reasoning-on`. |
+| `--matrix` / `--redline` | Synthetic token-id rows; neither takes a prompt. `--redline` additionally selects the Redline replay backend (PM4 transport, graph AR/forward). |
+| `--pp`, `--ctx` | Comma lists for the matrix; default `128,512,2048,4096,8192,20000`. |
+| `--tg N` | Matrix decode length; default `128`. |
+| `--sustained-tg N`, `--sustained-ctx` | Sustained-decode rows run when `--sustained-tg` is set; `--sustained-ctx` defaults to `128,8192`. |
+| `--warmups N` | Warmup iterations before the measured runs of `--ttft` and `--matrix`; default `10`. |
+| `--ttft` | Client-side time to first token: per run, generate one token on the standard prompt and time request-send to first streamed token; reports `prompt_tokens` and TTFT. Standard path only (not with `--matrix`). |
+| `--max-tokens N` | Generated tokens per measured request: default `128` on the standard bench, `256` on the `--concurrency` `steady` shape. |
+| `--reasoning-on` | Let a reasoning model think during the bench (off by default, because a think span usually cannot close inside the benchmark's token budget and the daemon then fails that turn closed); pair with a large enough `--max-tokens`. |
+| `--spec <m>`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq` | Same contracts as on `run`/`serve`. |
+| `--prompt-file PATH` | Read the standard-bench prompt verbatim (raw bytes); mutually exclusive with positional prompt words. |
+| `--concurrency`, `--backend`, `--workload`, `--bench-shape`, `--num-prompts`, `--temperature` | Concurrency sweep controls ([below](#bench-concurrency---concurrency)). |
+
 ### Bench concurrency (`--concurrency`)
 
-`hipfire bench <model> --concurrency 1,2,4,8 [--backend batch|noslots|slots|both] [--workload stateless|multiturn|both] [--bench-shape steady|betterbench] [--runs N]` measures serving throughput the way `vllm bench serve --max-concurrency K --request-rate inf --num-prompts N` does:
+`hipfire bench <model> --concurrency 1,2,4,8 [--backend batch|noslots|slots|both] [--workload stateless|multiturn|both] [--bench-shape <shape>] [--num-prompts N] [--temperature T] [--reasoning-on] [--runs N]` measures serving throughput with a closed-loop sweep at each concurrency level K (`--bench-shape` defaults to `steady`; `hipfire bench --help` lists the other shapes and the flags they need):
 
 - **Closed loop at K.** K client lanes drain one FIFO of N requests. A lane sends its next request the moment its previous one ends, so there is no burst barrier and no lane idles until the queue is empty. Request i is prompt `i mod len` of the shape's list, so every K sends the same multiset in the same order.
 - **Warmup discarded.** Before every sample, 8 separate warmup prompts run closed-loop at the same K with 64-token outputs. No measured prompt is ever a warmup prompt.
@@ -308,18 +372,16 @@ The `multiturn` workload makes each request a two-turn chat. The follow-up ("Exp
 
 | Shape | Requests | Output length | Sampling |
 |---|---|---|---|
-| `steady` (default) | 64 long-answer code prompts (`--num-prompts N` cycles them), identical to the 0.4.2 concurrency audit's `conc_prompts.json` (measured-set md5 `f0b077a766edc166a0c3f18cf81c169c`) | `--max-tokens`, default 256 | greedy |
-| `betterbench` | BetterBench 0.6.0's concurrency workload: every prompt of `--bb-corpus DIR`'s `*.jsonl` files in sorted file order, request i = prompt `i mod len`, 48 requests (`--num-prompts`) | each prompt's own `max_tokens` (default 512); `--max-tokens` is refused | temperature 0.7, top-p 0.95, top-k 20, seed 42 |
+| `steady` (default) | 64 long-answer code prompts built into the binary (`--num-prompts N` cycles them), measured-set md5 `f0b077a766edc166a0c3f18cf81c169c` | `--max-tokens`, default 256 | greedy |
 
-`--temperature` overrides either shape's temperature. The daemon has no `ignore_eos`, so `steady` fixes the output length by prompt choice: its prompts ask for answers longer than 256 tokens. Check that the `finish` column reads `length` only. Sampled requests (temperature > 0) are not batched: the VMM route serves greedy requests only, so a sampled `betterbench` sweep measures the singleton route queued K deep.
+`--temperature` overrides the shape's temperature (default `0` for `steady`). The daemon has no `ignore_eos`, so `steady` fixes the output length by prompt choice: its prompts ask for answers longer than 256 tokens. Check that the `finish` column reads `length` only. Sampled requests (temperature > 0) are not batched: the VMM route serves greedy requests only, so a sampled sweep measures the singleton route queued K deep.
 
-Each sample prints one line on stderr: output tok/s, BetterBench aggregate, steady tok/s, TTFT and TPOT p50/p99, in-flight, τ, ok/total, tokens and duration, finish reasons, routes (`execution_mode/batched=`), cached prompt tokens, mean prompt tokens and the md5 of the decoded texts. The final table has one row per (backend, workload, K):
+Each sample prints one line on stderr: output tok/s, steady tok/s, TTFT and TPOT p50/p99, in-flight, τ, ok/total, tokens and duration, finish reasons, routes (`execution_mode/batched=`), cached prompt tokens, mean prompt tokens and the md5 of the decoded texts. The final table has one row per (backend, workload, K):
 
-- **out tok/s**: vLLM output throughput, output tokens ÷ (last completion − first send). The median of the runs, with min–max in brackets.
-- **bb agg tok/s** (`betterbench` only): BetterBench's `aggregate_tps`, output tokens ÷ closed-loop wall clock.
+- **out tok/s**: output throughput, output tokens ÷ (last completion − first send). The median of the runs, with min–max in brackets.
 - **steady tok/s**: tokens whose arrival falls in the steady window ÷ the window. The window runs from the moment all of the first K requests have a token to the first completion after the last send.
 - **TTFT**: first token − send. **TPOT**: (completion − first token) ÷ (tokens − 1). Both are the medians of the per-sample p50/p99.
-- **in-flight**: achieved concurrency, Σ request latency ÷ duration (SGLang's definition).
+- **in-flight**: achieved concurrency, Σ request latency ÷ duration.
 - **τ**: output tokens per verify window, token-weighted over the sample.
 - **tokens**: median output tokens per sample.
 - **finish**, **batched**, **cached**, **errors**: summed over all samples. A failed request counts no tokens.
@@ -375,7 +437,7 @@ The bench also prints a `max_seq:` line.
 
 When any limiter's residency exceeds 10 % of a measured run, the bench prints one `warning:` line naming the worst residency per limiter, and adds it to the JSON `warnings`. The number is then power- or thermal-limited and is comparable only with runs whose power fields match.
 
-**Strix Halo host note.** At stock limits, pp8192 prefill on a high-TDP Strix Halo box (measured on a Minisforum MS-S1 MAX: STAPM 130 W, fast PPT 160 W, slow PPT 130 W, APU 130 W) is limited first by fast PPT, held at the limit 88 % of the time, and then by GPU temperature, which reaches the thermal point within 0.5–5.5 s of prefill start. Capping all four limits at about 130 W (`ryzenadj --stapm-limit=130000 --fast-limit=130000 --slow-limit=130000 --apu-slow-limit=130000`, or the BIOS power mode) costs about 5 % of burst prefill (1186.7 vs 1247.9 tok/s) and held the GPU at or below 91.5 °C with no thermal throttling. 85 W costs about 17 % of prefill for +49 % tok/J (12.3 vs 8.2). The power limits need root and are not visible to the bench, so record them with the result. Source: the HaloPower study of 2026-10-03, dense 27B pp8192 on hipx (`qcal/release-0.4.1/power/report.md`, §2 and §4).
+**High-TDP APU thermal note.** On a high-TDP Strix Halo box at stock power limits, long prefill (e.g. pp8192) can be limited first by fast PPT and then by GPU temperature, which reaches the thermal point within seconds of prefill start. Capping the four SMU limits (STAPM, fast PPT, slow PPT, APU slow PPT) to a common value around 130 W (`ryzenadj --stapm-limit=130000 --fast-limit=130000 --slow-limit=130000 --apu-slow-limit=130000`, or the BIOS power mode) can keep the GPU below its thermal limit at some cost in burst prefill throughput; lower caps trade more throughput for energy efficiency. The effect depends on chassis, cooling and firmware, so measure the trade-off on your own machine. The power limits need root and are not visible to the bench, so record them with the result.
 
 ## Where files live
 
@@ -413,7 +475,7 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_MODELS_DIR=...` | Override model discovery, pull, list, and TUI model paths. |
 | `HIPFIRE_KV_MODE=...` | Override KV layout preset (`auto` → Qwen fp8 on native-eligible exact gfx1201, else q8/q8; non-Qwen unchanged). |
 | `HIPFIRE_KV_BACKEND=...` | Not a second default plane for ordinary loads; the stable **warning token** `HIPFIRE_KV_BACKEND=legacy` appears on stderr when legacy storage is selected. Config/CLI use `legacy`\|`vmm` only. |
-| `HIPFIRE_SPECULATION=...` | Top of speculation ladder. |
+| `HIPFIRE_SPECULATION=...` | Speculation selector from the environment: overrides per-model and global config; a CLI `--spec` still wins. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
 | `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |
 | `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `off` (default) / `auto` / `on`. |
@@ -422,7 +484,7 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_REGISTRY_URL=...` | Alternate registry URL. |
 | `HIPFIRE_NORMALIZE_PROMPT=0` | Opt out of `\n{3,}` collapse (config `prompt_normalize` default on). |
 | `HIPFIRE_DEBUG=1` | Full stacks on CLI failure. |
-| `NO_COLOR` / `CLICOLOR=0` | Disable ANSI in chat (also `--no-color`). |
+| `--no-color` (chat) | Accepted by `hipfire chat` for compatibility; the line client never emits ANSI color. |
 
 ## Errors and next steps
 

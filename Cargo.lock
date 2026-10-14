@@ -1502,13 +1502,18 @@ dependencies = [
 name = "hipfire-arch-qwen4"
 version = "0.4.2"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-runtime",
  "memmap2",
+ "peacemaker-npu",
+ "railgun",
+ "rayon",
  "rdna-compute",
  "saddle-quant",
+ "serde",
  "serde_json",
  "sha2",
  "smallvec",
@@ -1541,6 +1546,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "flate2",
+ "hipfire-arch-qwen4",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
@@ -1705,19 +1711,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hipfire-isa"
-version = "0.4.1"
-dependencies = [
- "peacemaker-author",
- "peacemaker-ir",
- "peacemaker-lift",
- "radiowave",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "hipfire-loader"
 version = "0.4.2"
 dependencies = [
@@ -1740,10 +1733,12 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
  "hipfire-config",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1805,18 +1800,6 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "ureq",
-]
-
-[[package]]
-name = "hipfire-rip"
-version = "0.4.2"
-dependencies = [
- "hipfire-isa",
- "peacemaker-author",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -2474,7 +2457,7 @@ dependencies = [
 name = "npu-tools"
 version = "0.4.2"
 dependencies = [
- "pm-npu",
+ "peacemaker-npu",
  "railgun",
  "regex",
  "serde_json",
@@ -2674,6 +2657,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "peacemaker-isa"
+version = "0.4.1"
+dependencies = [
+ "peacemaker-author",
+ "peacemaker-ir",
+ "peacemaker-lift",
+ "radiowave",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "peacemaker-lift"
 version = "0.4.2"
 dependencies = [
@@ -2686,6 +2682,22 @@ dependencies = [
  "sha2",
  "smallvec",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "peacemaker-npu"
+version = "0.4.2"
+
+[[package]]
+name = "peacemaker-rip"
+version = "0.4.2"
+dependencies = [
+ "peacemaker-author",
+ "peacemaker-isa",
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2805,10 +2817,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pm-npu"
-version = "0.4.2"
 
 [[package]]
 name = "png"
@@ -2962,6 +2970,7 @@ version = "0.4.2"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "parking_lot",
  "railgun-corpus",
  "rdna-compute",
  "redline-rocr",
@@ -3211,6 +3220,10 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "libloading",
+ "peacemaker-ir",
+ "peacemaker-isa",
+ "peacemaker-lift",
+ "peacemaker-npu",
  "radiowave",
  "railgun",
  "railgun-corpus",

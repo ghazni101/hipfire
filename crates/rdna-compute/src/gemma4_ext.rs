@@ -265,7 +265,6 @@ impl Gpu {
             "kv_cache_write_fwht3_hd512",
         )?;
         {
-            let func = &self.functions["kv_cache_write_fwht3_hd512"];
             let mut kdp = k_dst.buf.as_ptr(); let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr(); let mut s1p = signs1.buf.as_ptr();
             let mut s2p = signs2.buf.as_ptr();
@@ -277,10 +276,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut std::ffi::c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
-                    self.stream_ref(), &mut params)?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_fwht3_hd512",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(s1p);
+                    b.push_ptr(s2p);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         // V: standard Q8_0.
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)

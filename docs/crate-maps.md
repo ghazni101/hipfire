@@ -11,9 +11,9 @@ pre-saddle daemon path survived in docs for weeks after the file moved).
 A map answers "what is in this crate and who touches it." It does **not**
 restate what existing docs already own:
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) owns the workspace tree, the layering
-  DAG, and the request lifecycle. A map names its layer and links; it never
-  re-draws the DAG.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) owns the workspace member list, the
+  layering DAG, and the request lifecycle. A map names its layer and links; it
+  never re-draws the DAG or re-lists the workspace.
 - [`GLOSSARY.md`](GLOSSARY.md) owns named subsystems and the status
   vocabulary `production` / `research` / `legacy`. Maps reuse exactly that
   vocabulary for crate status; they do not redefine DFlash, PFlash, etc.
@@ -40,9 +40,16 @@ byte-for-byte. Never hand-edit inside the markers — rerun the generator.
 The generated section carries only stable structure, measured from the tree:
 
 - modules and exported symbols: every `src/**/*.rs` (doubles as the TOC, with
-  relative links) followed by its `pub` item names, sorted, uncapped;
-- direct dependencies from `Cargo.toml`, split path / external / dev / build;
-- reverse dependencies: workspace crates with a path dependency on this one.
+  relative links) followed by the names of its textual `pub` items (`fn`,
+  `struct`, `enum`, `trait`, `type`, `const`, `static`, `mod`, `use`; also
+  indented ones such as methods in an `impl`), sorted, uncapped. This is a
+  line scan, not visibility analysis: `pub(crate)` items are not matched, and a
+  `pub` item inside a private module is still listed;
+- direct dependencies from `Cargo.toml`, split path / external / dev / build
+  (target-specific tables count under their kind; a path dependency is one
+  written `path = "../…"`);
+- reverse dependencies: workspace crates whose manifest has a path dependency
+  on this one, of any kind.
 
 It deliberately carries no line counts, item/test counts, or totals, so a
 change that only edits function bodies never requires a map regen.
@@ -51,7 +58,8 @@ change that only edits function bodies never requires a map regen.
 
 ```bash
 # Generate or refresh one or more maps (safe to rerun; touches only the
-# generated block):
+# generated block). A crate with no map.md gets a skeleton: Status/Layer
+# header, Purpose and Gotchas placeholders to fill in by hand, and the block.
 scripts/check-crate-maps.py saddle-core
 
 # Drift check — every map present under crates/, or a named subset:
@@ -60,8 +68,10 @@ scripts/check-crate-maps.py --check saddle-core
 ```
 
 Exit codes mirror [`scripts/check-env-docs.py`](../scripts/check-env-docs.py):
-`0` clean, `1` drift found (one line per finding), `2` usage error or a named
-crate without a map.
+`0` clean, `1` drift found (one line per finding), `2` usage error, a named
+crate without a map (`--check`), or a failed generation (missing crate
+directory, or a `map.md` without the markers). CI runs the unscoped
+`--check` in the `gates` job (`.github/workflows/ci.yml`).
 
 `--check` fails when:
 
@@ -69,7 +79,9 @@ crate without a map.
 - the map lists a file that no longer exists;
 - a file gained, lost, or renamed an exported (`pub`) symbol;
 - a declared dependency (or reverse dependency) in the map is stale or
-  missing relative to `Cargo.toml`.
+  missing relative to `Cargo.toml`;
+- the `map.md` is missing its generated-block markers, or the block differs
+  from a fresh generation in any other way.
 
 Fix drift by rerunning the generator for that crate — never by editing inside
 the markers. Crates without a `map.md` are reported as a count but do not

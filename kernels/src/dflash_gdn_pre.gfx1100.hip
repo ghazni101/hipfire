@@ -62,14 +62,17 @@
 // reliably rediscover that tree from `+` source in every block shape (the V
 // region compiled strict and drifted 1 ULP on the parity gate). fmaf pins
 // the exact old tree in all six instantiations (capture Q/K/V, replay
-// Q/K/V). Weight/state loads stay in-place (see conv1d_silu_split.hip).
+// Q/K/V): the first step rounds w3*x and fuses w2*s0 into it. Spelling it
+// fmaf(w3, x, w2*s0) instead rounds w2*s0 and drifts q_raw by 1 ULP.
+// Weight/state loads stay in-place (see conv1d_silu_split.hip).
+#define GDN_PRE_CONV_FIRST(W3, X, W2, S0) fmaf((W2), (S0), (W3) * (X))
 #define GDN_PRE_CONV_STEP(X, C, Y)                                            \
     do {                                                                      \
         float x = (X);                                                        \
         float s0 = (S)[(C) * 3];                                              \
         float s1 = (S)[(C) * 3 + 1];                                          \
         float s2 = (S)[(C) * 3 + 2];                                          \
-        float y = fmaf((W)[(C) * 4 + 3], x, (W)[(C) * 4 + 2] * s0);            \
+        float y = GDN_PRE_CONV_FIRST((W)[(C) * 4 + 3], x, (W)[(C) * 4 + 2], s0); \
         y = fmaf((W)[(C) * 4 + 1], s1, y);                                    \
         y = fmaf((W)[(C) * 4], s2, y);                                        \
         float r = y / (1.0f + expf(-y));                                      \

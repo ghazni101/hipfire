@@ -691,7 +691,7 @@ struct VmmPrefixPlan {
     alias: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DType {
     F32,
     F16,
@@ -1211,6 +1211,8 @@ pub struct Gpu {
     /// trunk header passed [`Gpu::qwen4_trunk_sym_check`]. See
     /// [`Gpu::qwen4_trunk_iu4_applies`].
     pub qwen4_trunk_iu4: bool,
+    /// Armed only by the noncompact Qwen4 eager prefill wrapper.
+    pub qwen4_trunk_iu4_prefill_scope: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -1995,6 +1997,7 @@ impl Gpu {
                 argmax_host: None,
                 prerotated: None,
                 gdn_pair_counters: None,
+                mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
@@ -2059,6 +2062,7 @@ impl Gpu {
             draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
+            qwen4_trunk_iu4_prefill_scope: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
@@ -2074,6 +2078,7 @@ impl Gpu {
             },
             graphs: crate::graph::GraphState {
                 capture_mode: false,
+                host_cpu_weights: false,
                 capture_blobs: Vec::new(),
                 graph_exec: None,
                 captured_graph: None,
@@ -2941,6 +2946,58 @@ impl Gpu {
         }
     }
 
+    /// Pitched D→D copy (`hipMemcpy2DAsync`), host-asynchronous on the active
+    /// stream (legacy/null stream when none). Offsets, pitches and `width` are
+    /// bytes; `height` is rows; the last row needs only `width` bytes. Empty
+    /// copies are no-ops. See `HipRuntime::memcpy_dtod_2d_async_at`. Never
+    /// synchronizes; capture paths need an explicit active stream.
+    /// `HIPFIRE_DTOD_DUMP=1` prints `file:line` and geometry per copy.
+    #[track_caller]
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_dtod_2d_at_ordered_async(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        dst_pitch: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        static DUMP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let dump = *DUMP;
+        if dump {
+            let loc = std::panic::Location::caller();
+            eprintln!(
+                "dtod2d width={} height={} dst_pitch={} src_pitch={} at {}:{}",
+                width,
+                height,
+                dst_pitch,
+                src_pitch,
+                loc.file(),
+                loc.line()
+            );
+        }
+        self.hip.memcpy_dtod_2d_async_at(
+            dst,
+            dst_offset,
+            dst_pitch,
+            src,
+            src_offset,
+            src_pitch,
+            width,
+            height,
+            self.active_stream.as_ref(),
+        )
+    }
+
     /// D→D copy (whole buffer) that picks async on the active stream when set.
     ///
     /// `#[track_caller]` so `HIPFIRE_DTOD_DUMP` attributes the copy to the real
@@ -3529,7 +3586,7 @@ impl Gpu {
     }
 
     /// Load the admitted builder bundle into the same module/function cache as
-    /// JIT kernels. The embedded image keeps runtime independent of hipfire-isa
+    /// JIT kernels. The embedded image keeps runtime independent of peacemaker-isa
     /// and of a working-tree-relative artifact path; it is admitted as an
     /// in-memory code object (no file is written) and every requested export
     /// binds to that one digest. A function already bound to a different image
@@ -4237,7 +4294,12 @@ impl Gpu {
     }
 
     /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
-    pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_int8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -4247,15 +4309,28 @@ impl Gpu {
             self.invalidate_for_scratch_growth();
         }
         self.scratch.ensure_int8_mmq_x(
-            &self.hip, &mut self.compiler, &mut self.modules, &mut self.functions,
-            self.active_stream.as_ref(), &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode, self.flags.force_blob_path, &mut self.replay,
-            self.device_id, x, n, k,
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
         )
     }
 
     /// Reserve (without launching the quantizer) for a fused A8 producer.
-    pub fn reserve_int8_mmq(&mut self, k: usize, n: usize) -> HipResult<crate::scratch::Int8MmqReservation> {
+    pub fn reserve_int8_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
         if k != 0 && n != 0 && k % 256 == 0 {
             let needed = crate::scratch::int8_mmq_x_needed(k, n);
             if crate::scratch::scratch_will_grow(
@@ -4270,7 +4345,10 @@ impl Gpu {
     }
 
     pub fn int8_mmq_prepared_ptr(
-        &self, prepared: &crate::scratch::Int8MmqPrepared, k: usize, n: usize,
+        &self,
+        prepared: &crate::scratch::Int8MmqPrepared,
+        k: usize,
+        n: usize,
     ) -> HipResult<*mut c_void> {
         let (generation, ptr) = self.scratch.int8_mmq_live();
         prepared.checked_ptr(generation, ptr, k, n)
@@ -4284,7 +4362,9 @@ impl Gpu {
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64 && k > 0 && k % 256 == 0
+            && n >= 64
+            && k > 0
+            && k % 256 == 0
     }
 
     /// True when the portable producer-sidecar route is live for this call:
@@ -4687,6 +4767,85 @@ impl Gpu {
         Ok(ptr)
     }
 
+    /// Model-lifetime F16 shadow of a Q8_0 `[M × K]` weight for the MTP append DET dense GEMM
+    /// (`Gpu::gemm_q8_0_xf32_mtp_dense_det_pm`), keyed on the weight's device pointer like
+    /// [`Gpu::ensure_bf16_f16_shadow`] (weights are immutable after load; freed with the other
+    /// shadows on unload; the weight must stay alive and keep its shape).
+    ///
+    /// The shadow has the weight's contiguous row-major `[M, K]` layout. Element `i` is in Q8_0
+    /// block `i / 32` (34 bytes: F16 scale, then 32 signed int8) at slot `i % 32` and converts as
+    /// `F16-RNE(f32(scale) * f32(q))` on the PM-native converter (`kernels::MTP_Q8_DET_PM_GFX1151`,
+    /// entry `mtp_q8_0_to_f16_pm_gfx1151`; no HIP compile, no GEMM fallback). The F32 product of a
+    /// finite scale and an int8 is exact, so the only rounding is the single F16 RNE: a magnitude
+    /// of 65520 or more becomes Inf (overflow), a result under half the smallest F16 subnormal
+    /// becomes a signed zero, F16 subnormals are kept, a non-finite scale propagates (`Inf * 0`
+    /// and NaN scales give NaN). A model's Q8_0 scales are finite, so only overflow and
+    /// underflow of the exponent range can occur. DET numerics, not the incumbent staged GEMV's.
+    ///
+    /// Errors (nothing allocated or launched) off exact gfx1151, for a non-`Q8_0` tensor, `K` not
+    /// a multiple of 64, `M * K * 2` not below 2^31, a packed capacity below `M * K / 32 * 34`
+    /// bytes, or a cached shadow of a different size.
+    pub(crate) fn ensure_q8_0_f16_shadow(
+        &mut self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if weight.dtype != DType::Q8_0 {
+            return Err(err(format!("needs a Q8_0 weight (got {:?})", weight.dtype)));
+        }
+        if m == 0 || k == 0 || k % 64 != 0 || (m as u128) * (k as u128) * 2 >= (1u128 << 31) {
+            return Err(err(format!("shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31")));
+        }
+        let elems = m * k;
+        let packed = elems / 32 * 34;
+        if weight.buf.size() < packed {
+            return Err(err(format!("packed capacity {} is below M*K/32*34 = {packed} bytes", weight.buf.size())));
+        }
+        let key = weight.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
+            if shadow.buf.size() != elems * 2 {
+                return Err(err(format!("cached shadow is {} bytes, M*K*2 = {}", shadow.buf.size(), elems * 2)));
+            }
+            return Ok(shadow.buf.as_ptr());
+        }
+        self.ensure_embedded_kernel(
+            crate::gemm::MTP_Q8_DET_PM_MODULE,
+            kernels::MTP_Q8_DET_PM_GFX1151,
+            crate::gemm::MTP_Q8_DET_PM_ENTRY,
+        )?;
+        let fp16 = self.alloc_tensor(&[elems], DType::F16)?;
+        let ip = weight.buf.as_ptr();
+        let op = fp16.buf.as_ptr();
+        let nv = elems as i32;
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            crate::gemm::MTP_Q8_DET_PM_ENTRY,
+            [elems.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(nv);
+                b
+            },
+        )?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(ptr)
+    }
+
     /// Ensure a model-lifetime FP16 shadow of a qt=35 MFP4G32E8SOA matrix.
     /// This entry is deliberately separate from the HFQ4 helper so adding the
     /// DeepSeek4 CDNA path cannot change any existing Qwen/HFQ4 dequant route.
@@ -4762,6 +4921,7 @@ impl Gpu {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_attn_crossover
     }
+
 
 
     // ── Tensor allocation ───────────────────────────────────────
@@ -5068,7 +5228,24 @@ impl Gpu {
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
         let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
             Ok(p) if !p.is_null() => p,
-            _ => host_ptr,
+            other => {
+                // Loud, once: HIP documents that the mapped device pointer differs
+                // from the host pointer on discrete GPUs and that
+                // `hipHostGetDevicePointer` is *required* to obtain the one a kernel
+                // may dereference (hipHostMallocDefault alone does not map). Falling
+                // back to the host pointer therefore hands kernels a pointer HIP
+                // calls invalid, which reads as zeros or garbage rather than an
+                // error -- indistinguishable from a bad weight downstream.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[host-mapped] hipHostGetDevicePointer failed ({other:?}); using the host \
+                         pointer as the device alias -- GPU reads of these bytes are undefined \
+                         (CPU reads via host_bytes stay correct, so the two disagree silently)"
+                    );
+                });
+                host_ptr
+            }
         };
         let key = dev_ptr as usize;
         if self.host_mapped.insert(key, host_ptr as usize).is_some() {
@@ -5725,6 +5902,24 @@ impl Gpu {
     pub fn host_located(&self, tensor: &GpuTensor) -> bool {
         // bind_thread: skip — pure read of the tensor's own ownership tag; no device call.
         tensor.buf.is_host_mapped()
+    }
+
+    /// Whether the loaded model owns host-mapped weights the CPU multiplies
+    /// (`memory.offload_exec=cpu` over a spilled prefix). A CPU step is a host
+    /// sync point, so hipGraph capture and retained replay are refused while
+    /// this is set — the one central gate, read by the arch forward paths and
+    /// the graph/replay controllers instead of a config-level mirror.
+    pub fn owns_host_cpu_weights(&self) -> bool {
+        // bind_thread: skip — pure ownership-policy read; no device call.
+        self.graphs.host_cpu_weights
+    }
+
+    /// Record whether the model now being loaded owns CPU-executed (host)
+    /// weights. Set once per load from the resolved placement; cleared on unload.
+    pub fn set_host_cpu_weights(&mut self, on: bool) {
+        // bind_thread: skip — updates CPU-side graph/replay policy; no device call.
+        self.graphs.host_cpu_weights = on;
+        self.replay.set_host_cpu_weights(on);
     }
 
     /// The primary physical allocation handle backing a tensor's VMM arena, if any.
@@ -6734,6 +6929,200 @@ impl Gpu {
         )
     }
 
+    /// Flash-Next expert-parallel row all-gather: one copy-only launch that
+    /// fills every row owned by another rank from that owner's buffer.
+    ///
+    /// For slot `s` in `0..n_slots`, `e = slot_experts[s]` (i32, device memory);
+    /// when `e >= 0` and `owner = e % n_ranks != self_rank`, row `s`
+    /// (`n16` uint4 = `n16 * 16` bytes) is copied from `src[owner]` to `dst` at
+    /// the same row offset. Owned rows and negative-id slots are never written.
+    /// Pure uint4 load/store, so the copy is bit-exact for every bit pattern.
+    ///
+    /// `src[r]` is rank `r`'s row-buffer base as a device address (valid on this
+    /// device through P2P); entries `>= n_ranks` may be 0. The launch goes on the
+    /// Gpu's active stream (null stream when none), like every other launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_gather_rows_by_owner(
+        &mut self,
+        slot_experts: &GpuTensor,
+        src: [usize; 4],
+        dst: usize,
+        n_slots: usize,
+        n_ranks: usize,
+        self_rank: usize,
+        n16: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+            ));
+        }
+        if n_slots == 0 || n16 == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_slots and n16 must be non-zero",
+            ));
+        }
+        let slot_bytes = n_slots
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, "ep_gather_rows_by_owner: n_slots overflow"))?;
+        if slot_experts.buf.size() < slot_bytes {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: slot_experts holds fewer than n_slots ids",
+            ));
+        }
+        let mut slots_i32 = i32::try_from(n_slots)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n_slots exceeds i32"))?;
+        let mut ranks_i32 = n_ranks as i32;
+        let mut self_i32 = self_rank as i32;
+        let mut n16_i32 = i32::try_from(n16)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n16 exceeds i32"))?;
+        self.ensure_kernel(
+            "ep_gather_rows_by_owner",
+            crate::kernels::EP_GATHER_ROWS_BY_OWNER_SRC,
+            "ep_gather_rows_by_owner",
+        )?;
+        let ids = slot_experts.buf.as_ptr();
+        let s0 = src[0] as *mut c_void;
+        let s1 = src[1] as *mut c_void;
+        let s2 = src[2] as *mut c_void;
+        let s3 = src[3] as *mut c_void;
+        let d = dst as *mut c_void;
+        let mut params: [*mut c_void; 10] = [
+            &ids as *const _ as *mut c_void,
+            &s0 as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &s3 as *const _ as *mut c_void,
+            &d as *const _ as *mut c_void,
+            &mut slots_i32 as *mut _ as *mut c_void,
+            &mut ranks_i32 as *mut _ as *mut c_void,
+            &mut self_i32 as *mut _ as *mut c_void,
+            &mut n16_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(ids);
+            blob.push_ptr(s0);
+            blob.push_ptr(s1);
+            blob.push_ptr(s2);
+            blob.push_ptr(s3);
+            blob.push_ptr(d);
+            blob.push_i32(slots_i32);
+            blob.push_i32(ranks_i32);
+            blob.push_i32(self_i32);
+            blob.push_i32(n16_i32);
+            blob
+        };
+        let grid_x = (n16 as u32).div_ceil(256);
+        self.launch_maybe_blob(
+            "ep_gather_rows_by_owner",
+            [grid_x, n_slots as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
+    /// [`Self::ep_gather_rows_by_owner`] with explicit owners (balanced EP
+    /// ownership): row `s` is copied from `src[slot_owner[s]]` when
+    /// `slot_owner[s]` is in `0..n_ranks` and not `self_rank`; slots with a
+    /// negative owner and rows this rank owns are never written. `slot_owner`
+    /// holds `n_slots` i32 values in device memory. Same grid, same uint4 copy,
+    /// bit-exact for every pattern; the kernel lives in its own module
+    /// (`ep_gather_rows_by_slot_owner`) so the modulo kernel's bytes are
+    /// unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ep_gather_rows_by_slot_owner(
+        &mut self,
+        slot_owner: &GpuTensor,
+        src: [usize; 4],
+        dst: usize,
+        n_slots: usize,
+        n_ranks: usize,
+        self_rank: usize,
+        n16: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+            ));
+        }
+        if n_slots == 0 || n16 == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: n_slots and n16 must be non-zero",
+            ));
+        }
+        let slot_bytes = n_slots
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| HipError::new(0, "ep_gather_rows_by_slot_owner: n_slots overflow"))?;
+        if slot_owner.buf.size() < slot_bytes {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_slot_owner: slot_owner holds fewer than n_slots owners",
+            ));
+        }
+        let mut slots_i32 = i32::try_from(n_slots)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_slot_owner: n_slots exceeds i32"))?;
+        let mut ranks_i32 = n_ranks as i32;
+        let mut self_i32 = self_rank as i32;
+        let mut n16_i32 = i32::try_from(n16)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_slot_owner: n16 exceeds i32"))?;
+        self.ensure_kernel(
+            "ep_gather_rows_by_slot_owner",
+            crate::kernels::EP_GATHER_ROWS_BY_SLOT_OWNER_SRC,
+            "ep_gather_rows_by_slot_owner",
+        )?;
+        let owners = slot_owner.buf.as_ptr();
+        let s0 = src[0] as *mut c_void;
+        let s1 = src[1] as *mut c_void;
+        let s2 = src[2] as *mut c_void;
+        let s3 = src[3] as *mut c_void;
+        let d = dst as *mut c_void;
+        let mut params: [*mut c_void; 10] = [
+            &owners as *const _ as *mut c_void,
+            &s0 as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &s3 as *const _ as *mut c_void,
+            &d as *const _ as *mut c_void,
+            &mut slots_i32 as *mut _ as *mut c_void,
+            &mut ranks_i32 as *mut _ as *mut c_void,
+            &mut self_i32 as *mut _ as *mut c_void,
+            &mut n16_i32 as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(owners);
+            blob.push_ptr(s0);
+            blob.push_ptr(s1);
+            blob.push_ptr(s2);
+            blob.push_ptr(s3);
+            blob.push_ptr(d);
+            blob.push_i32(slots_i32);
+            blob.push_i32(ranks_i32);
+            blob.push_i32(self_i32);
+            blob.push_i32(n16_i32);
+            blob
+        };
+        let grid_x = (n16 as u32).div_ceil(256);
+        self.launch_maybe_blob(
+            "ep_gather_rows_by_slot_owner",
+            [grid_x, n_slots as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
+        )
+    }
+
     /// 2D strided F32 row copy, one launch for `n_rows` rows:
     ///
     /// ```text
@@ -7239,6 +7628,17 @@ impl Drop for Gpu {
         }
         if let Err(err) = self.release_registered_host_mapped() {
             eprintln!("[rdna-compute] failed to release host-mapped tensor during Gpu drop: {err}");
+        }
+        if self.scratch.mq_rmsnorm_awq_wavegrid_scratch.is_some() {
+            // Persistent wavegrid state can still be in use by queued launches.
+            // A failed sync must retain the allocation rather than free it live.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize AWQ wavegrid scratch during Gpu drop: {err}");
+            } else if let Some(scratch) = self.scratch.mq_rmsnorm_awq_wavegrid_scratch.take() {
+                if let Err(err) = self.hip.free(scratch) {
+                    eprintln!("[rdna-compute] failed to release AWQ wavegrid scratch during Gpu drop: {err}");
+                }
+            }
         }
     }
 }

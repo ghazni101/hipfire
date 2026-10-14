@@ -28,8 +28,11 @@
 //      (`kv_cache_write_fp8_e4m3_batched_slots`,
 //      `attention_flash_fp8_e4m3_batched_masked_slots`) must return an Err:
 //      the kernel TU carries a `#error requires --offload-arch=gfx1201`
-//      guard, so the JIT compile refuses before any launch. On a gfx1201
-//      host this check is skipped (it cannot prove the refusal there).
+//      guard, so the JIT compile refuses before any launch.
+//   4. fp8 slots parity (exact gfx1201 only, replaces check 3 there) — the
+//      same descriptor contract as 1a-1c and 2 for the fp8 tier: zero-base,
+//      non-zero-base over a NaN-poisoned slot 0, two-slot mix, and write
+//      parity, all BIT-EXACT against the descriptor-less launches.
 //
 // Run (GPU required):
 //   cargo run --release -p rdna-compute --example test_bf16_slots_parity
@@ -98,6 +101,26 @@ fn download_f32(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
         .collect()
+}
+
+/// Compare raw IEEE bits, including the sign of zero.
+fn same_f32_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_f32_bits;
+
+    #[test]
+    fn bit_parity_rejects_signed_zero_length_and_nonfinite_mismatches() {
+        assert!(same_f32_bits(&[0.0, -0.0, 1.0], &[0.0, -0.0, 1.0]));
+        assert!(!same_f32_bits(&[0.0], &[-0.0]));
+        assert!(!same_f32_bits(&[1.0], &[]));
+        assert!(!same_f32_bits(&[f32::NAN], &[f32::NAN]));
+        assert!(!same_f32_bits(&[f32::INFINITY], &[f32::INFINITY]));
+    }
 }
 
 fn upload_raw(gpu: &Gpu, bytes: &[u8]) -> GpuTensor {
@@ -180,6 +203,163 @@ fn bf16_attn_slots(
     .expect("bf16 slots attend");
 }
 
+/// fp8 token row: `[Hkv*D E4M3 codes][Hkv f16 scales]`.
+fn fp8_row_bytes() -> usize {
+    N_KV_HEADS * (HEAD_DIM + 2)
+}
+
+/// Poisoned fp8 slab: 0x7F is E4M3FN NaN and 0x7F7F an f16 NaN, so any read
+/// of it (codes or scales) shows up in the attention output.
+fn fp8_poisoned_slab() -> Vec<u8> {
+    vec![0x7Fu8; SLAB_TOKENS * fp8_row_bytes()]
+}
+
+/// A real fp8 slab: SLAB_TOKENS random K/V rows written by the legacy
+/// (descriptor-less) batched writer — the sequential path's own encoding.
+fn fp8_slab(gpu: &mut Gpu, rng: &mut Rng) -> Vec<u8> {
+    let src = rand_f32_vec(SLAB_TOKENS * N_KV_HEADS * HEAD_DIM, rng);
+    let src = upload_f32(gpu, &src);
+    let pos: Vec<i32> = (0..SLAB_TOKENS as i32).collect();
+    let pos = upload_raw(gpu, &i32_bytes(&pos));
+    let slab = upload_raw(gpu, &vec![0u8; SLAB_TOKENS * fp8_row_bytes()]);
+    gpu.kv_cache_write_fp8_e4m3_batched(&slab, &src, &pos, N_KV_HEADS, HEAD_DIM, SLAB_TOKENS)
+        .expect("fp8 legacy slab write");
+    download_raw(gpu, &slab)
+}
+
+/// One `attention_flash_fp8_e4m3_batched_masked_slots` launch (the slots fp8
+/// reader) with a partials buffer sized for the current tile count.
+#[allow(clippy::too_many_arguments)]
+fn fp8_attn_slots(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    out: &GpuTensor,
+    pos: &GpuTensor,
+    descs: Option<&GpuTensor>,
+    rows: Option<&GpuTensor>,
+) {
+    let max_tiles = MAX_CTX.div_ceil(gpu.attn_tile_size());
+    let partials = upload_f32(gpu, &vec![0.0f32; BATCH * N_HEADS * max_tiles * (2 + HEAD_DIM)]);
+    gpu.attention_flash_fp8_e4m3_batched_masked_slots(
+        q,
+        k,
+        v,
+        out,
+        pos,
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        SLAB_TOKENS,
+        MAX_CTX,
+        BATCH,
+        &partials,
+        None,
+        0,
+        0,
+        descs,
+        rows,
+    )
+    .expect("fp8 slots attend");
+}
+
+/// Check 4 (exact gfx1201 only): the fp8 slots tier's write and attend honor
+/// the slot descriptors bit for bit — the same contract checks 1a-1c and 2
+/// prove for bf16. Descriptors use the 32-byte layout with equal K/V bases
+/// (the fp8 K and V strides are equal).
+fn fp8_slots_parity(gpu: &mut Gpu, q: &GpuTensor, pos: &GpuTensor, rng: &mut Rng) {
+    let slab = SLAB_TOKENS * fp8_row_bytes();
+    let k_real = fp8_slab(gpu, rng);
+    let v_real = fp8_slab(gpu, rng);
+    let k_plain = upload_raw(gpu, &k_real);
+    let v_plain = upload_raw(gpu, &v_real);
+    let rows1 = row_slot(gpu, [1; BATCH]);
+
+    // 4a: null descriptors vs a zero-base descriptor table.
+    let out_ref = out_dev(gpu);
+    fp8_attn_slots(gpu, q, &k_plain, &v_plain, &out_ref, pos, None, None);
+    let descs_zero = slab_descs(gpu, [0; SLOTS]);
+    let out_zero = out_dev(gpu);
+    fp8_attn_slots(gpu, q, &k_plain, &v_plain, &out_zero, pos, Some(&descs_zero), Some(&rows1));
+    let dr = download_f32(gpu, &out_ref);
+    assert!(dr.iter().all(|x| x.is_finite()), "check 4a: fp8 reference output is not finite");
+    assert!(dr.iter().any(|x| *x != 0.0), "check 4a: fp8 reference output is all zero");
+    assert!(
+        same_f32_bits(&dr, &download_f32(gpu, &out_zero)),
+        "check 4a: fp8 zero-base descriptor launch diverged from the legacy path"
+    );
+    eprintln!("check 4a fp8 zero-base parity: BIT-EXACT ({} elements)", dr.len());
+
+    // 4b: slot-1 base honored over a NaN-poisoned slot-0 slab.
+    let k_arena = upload_raw(gpu, &[fp8_poisoned_slab(), k_real.clone()].concat());
+    let v_arena = upload_raw(gpu, &[fp8_poisoned_slab(), v_real.clone()].concat());
+    let descs_off = slab_descs(gpu, [0, slab as u64]);
+    let out_under = out_dev(gpu);
+    fp8_attn_slots(gpu, q, &k_arena, &v_arena, &out_under, pos, Some(&descs_off), Some(&rows1));
+    assert!(
+        same_f32_bits(&download_f32(gpu, &out_under), &dr),
+        "check 4b: fp8 slot-1 base honoring diverged from the plain-cache run"
+    );
+    eprintln!("check 4b fp8 non-zero-base understudy: BIT-EXACT, poison untouched");
+
+    // 4c: rows alternate between two real slots; each row equals a plain run
+    // over its own slot's data.
+    let k0 = fp8_slab(gpu, rng);
+    let v0 = fp8_slab(gpu, rng);
+    let k_mix = upload_raw(gpu, &[k0.clone(), k_real.clone()].concat());
+    let v_mix = upload_raw(gpu, &[v0.clone(), v_real.clone()].concat());
+    let rows_alt = row_slot(gpu, [0, 1, 0, 1]);
+    let out_mix = out_dev(gpu);
+    fp8_attn_slots(gpu, q, &k_mix, &v_mix, &out_mix, pos, Some(&descs_off), Some(&rows_alt));
+    let k_slot0 = upload_raw(gpu, &k0);
+    let v_slot0 = upload_raw(gpu, &v0);
+    let out_ref0 = out_dev(gpu);
+    fp8_attn_slots(gpu, q, &k_slot0, &v_slot0, &out_ref0, pos, None, None);
+    let (d_mix, d0) = (download_f32(gpu, &out_mix), download_f32(gpu, &out_ref0));
+    let stride = N_HEADS * HEAD_DIM;
+    for row in 0..BATCH {
+        let want = if row % 2 == 0 { &d0 } else { &dr };
+        assert!(
+            same_f32_bits(&d_mix[row * stride..(row + 1) * stride], &want[row * stride..(row + 1) * stride]),
+            "check 4c: fp8 row {row} (slot {}) diverged from its plain-cache reference",
+            row % 2
+        );
+    }
+    eprintln!("check 4c fp8 two-slot mix: BIT-EXACT per row");
+
+    // 4d: the descriptor write lands the legacy write's bytes at slot 1's
+    // base and leaves slot 0's poison untouched.
+    let src = rand_f32_vec(BATCH * N_KV_HEADS * HEAD_DIM, rng);
+    let src = upload_f32(gpu, &src);
+    let k_ref = upload_raw(gpu, &vec![0u8; slab]);
+    gpu.kv_cache_write_fp8_e4m3_batched(&k_ref, &src, pos, N_KV_HEADS, HEAD_DIM, BATCH)
+        .expect("fp8 plain write");
+    let k_cand = upload_raw(gpu, &[fp8_poisoned_slab(), vec![0u8; slab]].concat());
+    gpu.kv_cache_write_fp8_e4m3_batched_slots(
+        &k_cand,
+        &src,
+        pos,
+        N_KV_HEADS,
+        HEAD_DIM,
+        BATCH,
+        Some(&descs_off),
+        Some(&rows1),
+    )
+    .expect("fp8 slots write");
+    let (ref_bytes, cand_bytes) = (download_raw(gpu, &k_ref), download_raw(gpu, &k_cand));
+    assert!(ref_bytes.iter().any(|b| *b != 0), "check 4d: fp8 legacy write wrote nothing");
+    assert!(
+        cand_bytes[slab..] == ref_bytes[..],
+        "check 4d: fp8 descriptor write bytes at the slot base differ from the legacy write"
+    );
+    assert!(
+        cand_bytes[..slab] == fp8_poisoned_slab()[..],
+        "check 4d: fp8 slot-0 poison slab was written through"
+    );
+    eprintln!("check 4d fp8 slots write parity: BIT-EXACT, slot 0 untouched");
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!("arch: {}", gpu.arch);
@@ -213,7 +393,7 @@ fn main() {
     );
     let (dr, dz) = (download_f32(&gpu, &out_ref), download_f32(&gpu, &out_zero));
     assert!(
-        dr == dz,
+        same_f32_bits(&dr, &dz),
         "check 1a: zero-base descriptor launch diverged from the legacy path"
     );
     eprintln!("check 1a zero-base parity: BIT-EXACT ({} elements)", dr.len());
@@ -238,7 +418,7 @@ fn main() {
         Some(&rows1),
     );
     let du = download_f32(&gpu, &out_under);
-    assert!(du == dr, "check 1b: slot-1 base honoring diverged from the plain-cache run");
+    assert!(same_f32_bits(&du, &dr), "check 1b: slot-1 base honoring diverged from the plain-cache run");
     eprintln!("check 1b non-zero-base understudy: BIT-EXACT, poison untouched");
 
     // ── Check 1c: two-slot mix ───────────────────────────────────────────
@@ -279,7 +459,7 @@ fn main() {
         let got = &d_mix[row * stride..(row + 1) * stride];
         let refv = &want[row * stride..(row + 1) * stride];
         assert!(
-            got == refv,
+            same_f32_bits(got, refv),
             "check 1c: row {row} (slot {}) diverged from its plain-cache reference",
             if *want0 { 0 } else { 1 }
         );
@@ -334,9 +514,11 @@ fn main() {
     // ── Check 3: fp8 fail-closed off gfx1201 ─────────────────────────────
     // The fp8 kernel TU carries `#error "… requires --offload-arch=gfx1201"`,
     // so off gfx1201 the JIT compile must refuse before any launch. On a
-    // gfx1201 host this check cannot prove the refusal and is skipped.
+    // gfx1201 host the refusal cannot be proven; check 4 runs the fp8 slots
+    // write/attend parity there instead.
     if gpu.arch == "gfx1201" {
         eprintln!("check 3 fp8 fail-closed: skipped on gfx1201 (admission host)");
+        fp8_slots_parity(&mut gpu, &q, &pos, &mut rng);
     } else {
         let fp8_cache = upload_raw(&gpu, &vec![0u8; SLAB_TOKENS * row_bytes()]);
         let err = gpu.kv_cache_write_fp8_e4m3_batched_slots(

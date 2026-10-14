@@ -36,7 +36,7 @@ use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
 const MAX_SEQ: usize = 32768;
@@ -179,10 +179,11 @@ struct Loaded {
 }
 
 /// Load the model named by `HIPFIRE_SESSION_CACHE_MODEL` and attach the
-/// forward and an unbounded session cache. `turn_snapshots` sets message-end
-/// snapshots explicitly, whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the
-/// `<|im_end|>` token is still the caller's `set_turn_end_token`).
-fn load(turn_snapshots: bool) -> Loaded {
+/// forward and a session cache of `budget` bytes, with a disk tier in `disk`
+/// when given. `turn_snapshots` sets message-end snapshots explicitly,
+/// whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the `<|im_end|>` token is
+/// still the caller's `set_turn_end_token`).
+fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));
@@ -191,6 +192,15 @@ fn load(turn_snapshots: bool) -> Loaded {
     let receipt = admit_hfqm_artifact(&hfq).expect("admission");
     let mut gpu = Gpu::init().expect("GPU");
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .expect("scratch plan");
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -234,8 +244,14 @@ fn load(turn_snapshots: bool) -> Loaded {
     )
     .expect("assemble");
     bundle.set_turn_snapshots(turn_snapshots);
-    bundle.attach_forward(&mut gpu, MAX_SEQ).expect("forward");
-    bundle.attach_session_cache(SessionCache::new(domain, u64::MAX >> 1));
+    bundle
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
+        .expect("forward");
+    let cache = SessionCache::new(domain, budget);
+    bundle.attach_session_cache(match disk {
+        Some(dir) => cache.with_disk(dir, 1 << 40),
+        None => cache,
+    });
     Loaded {
         bundle,
         gpu,
@@ -256,7 +272,7 @@ fn restored_prefill_matches_cold_on_flash_next() {
         vocab,
         backend,
         ..
-    } = load(false);
+    } = load(false, u64::MAX >> 1, None);
     let chunk = bundle.spec_chunk_rows().expect("chunk rows");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
     let a = prompt(0xa, 3 * chunk + 300);
@@ -318,6 +334,143 @@ fn restored_prefill_matches_cold_on_flash_next() {
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
+/// The resident snapshot alone, as for a 192K prompt past an 8 GiB pool: with
+/// a budget no pool snapshot fits, a prompt sharing three chunks with the
+/// previous one restores them over the rows the live state still holds
+/// (rows above them belong to another prompt) and must match its cold
+/// prefill byte for byte, on AR and on native MTP.
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn resident_restore_matches_cold_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        vocab,
+        ..
+    } = load(false, 1, None);
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let mut a2 = a[..3 * chunk + 100].to_vec();
+    a2.extend(prompt(0xc, 150));
+
+    let cold = run(&mut bundle, &mut gpu, &logits, &a2, 0);
+    run(&mut bundle, &mut gpu, &logits, &a, 0);
+    assert_eq!(stored_bytes(&bundle), 0, "no pool snapshot fits the budget");
+    let reused = bundle.session_plan(&a2, SessionRoute::Ar);
+    assert_eq!(reused, 3 * chunk, "plan must offer the resident snapshot");
+    let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a2, reused);
+    assert_same_state("AR resident", &cold.0, &digests);
+    assert!(
+        warm_logits == cold.1,
+        "AR resident: restored final logits differ from cold"
+    );
+    assert_eq!(warm_ids, cold.2, "AR resident");
+    // A reset outside the cache rewrites the live rows' meaning: dropped.
+    bundle.reset(&mut gpu).expect("reset");
+    assert_eq!(bundle.session_plan(&a2, SessionRoute::Ar), 0);
+
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let cold = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, 0);
+    run_mtp(&mut bundle, &mut gpu, &mut drafter, &a, 0);
+    let reused = bundle.session_plan(&a2, SessionRoute::Mtp);
+    assert_eq!(
+        reused,
+        3 * chunk,
+        "MTP plan must offer the resident snapshot"
+    );
+    let (digests, seed) = run_mtp(&mut bundle, &mut gpu, &mut drafter, &a2, reused);
+    assert_same_state("MTP resident", &cold.0, &digests);
+    assert_eq!(seed, cold.1, "MTP resident seed");
+
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+const DISK_WRITE_PHASE: &str = "HIPFIRE_SESSION_CACHE_DISK_WRITE_PHASE";
+
+fn snap_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter(|e| {
+                    e.as_ref()
+                        .is_ok_and(|e| e.path().extension() == Some("snap".as_ref()))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Snapshots demoted to the disk tier at unload restore in a new process (a
+/// daemon restart of the same build) byte-equal to a cold prefill. The write
+/// phase runs in a child process: one process cannot load the model twice,
+/// because unloading does not return the weight memory to the system.
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn disk_snapshots_restore_after_restart_on_flash_next() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen4-session-disk");
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        vocab,
+        ..
+    } = if std::env::var_os(DISK_WRITE_PHASE).is_some() {
+        // Child: prefill A, then unload, which demotes its three snapshots.
+        let mut loaded = load(false, u64::MAX >> 1, Some(&dir));
+        let chunk = loaded.bundle.spec_chunk_rows().expect("chunk rows");
+        let a = prompt(0xa, 3 * chunk + 300);
+        let logits = loaded
+            .gpu
+            .zeros(&[loaded.vocab], DType::F32)
+            .expect("logits");
+        run(&mut loaded.bundle, &mut loaded.gpu, &logits, &a, 0);
+        loaded.gpu.free_tensor(logits).expect("free logits");
+        loaded
+            .bundle
+            .free_gpu(&mut loaded.gpu)
+            .expect("free bundle");
+        return;
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "disk_snapshots_restore_after_restart_on_flash_next",
+            ])
+            .args(["--nocapture", "--test-threads", "1"])
+            .env(DISK_WRITE_PHASE, "1")
+            .status()
+            .expect("spawn write phase");
+        assert!(status.success(), "write phase failed: {status}");
+        assert_eq!(
+            snap_files(&dir),
+            3,
+            "unload must demote A's three snapshots"
+        );
+        load(false, u64::MAX >> 1, Some(&dir))
+    };
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    let a = prompt(0xa, 3 * chunk + 300);
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+    let reused = bundle.session_plan(&a, SessionRoute::Ar);
+    assert_eq!(reused, 3 * chunk, "plan must offer A's disk snapshot");
+    let (digests, warm_logits, warm_ids) = run(&mut bundle, &mut gpu, &logits, &a, reused);
+    assert_eq!(snap_files(&dir), 0, "restore must promote all three links");
+    let cold = run(&mut bundle, &mut gpu, &logits, &a, 0);
+    assert_same_state("disk A", &cold.0, &digests);
+    assert!(
+        warm_logits == cold.1,
+        "disk A: restored final logits differ from cold"
+    );
+    assert_eq!(warm_ids, cold.2, "disk A");
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// P1b: message-end snapshots (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`, forced on through
 /// `set_turn_snapshots`). A prompt with two message ends below one chunk is
 /// prefilled cold and committed; a second prompt extending the first message
@@ -336,7 +489,7 @@ fn message_end_snapshots_restore_on_flash_next() {
         tokenizer,
         vocab,
         ..
-    } = load(true);
+    } = load(true, u64::MAX >> 1, None);
     let im_end = tokenizer
         .special_token_id("<|im_end|>")
         .expect("tokenizer has <|im_end|>");

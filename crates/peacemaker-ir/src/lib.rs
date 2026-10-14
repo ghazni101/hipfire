@@ -214,7 +214,7 @@ mod tests {
     /// Pinned-encoding gate: every declared gfx12 form's sample instruction is
     /// assembled by the ROCm `llvm-mc` and compared byte-for-byte with the
     /// table's committed encoding. Resolves via `ROCM_PATH` like
-    /// `hipfire-isa::toolchain`; a host without the toolchain (the no-GPU CI
+    /// `peacemaker-isa::toolchain`; a host without the toolchain (the no-GPU CI
     /// runner) skips the comparison — the gate still runs wherever the
     /// assembler exists.
     #[test]
@@ -244,6 +244,37 @@ mod tests {
         }
     }
 
+    /// GPU compiler crates that must never be reachable from a runtime root
+    /// through normal (non-dev, non-build) dependency edges. `peacemaker-npu` is
+    /// deliberately absent: it is the sanctioned runtime hardware builder, and
+    /// its own normal children are still traversed and checked.
+    const FORBIDDEN_GPU_COMPILER_CRATES: [&str; 5] =
+        ["peacemaker-ir", "peacemaker-lift", "peacemaker-author", "peacemaker-isa", "peacemaker-rip"];
+
+    /// Walks only normal (`dep_kinds.kind == null`) edges of a `cargo metadata`
+    /// resolve graph from `root` and returns the first forbidden GPU compiler
+    /// package reached, if any.
+    fn runtime_reached_gpu_compiler(meta: &serde_json::Value, root: &str) -> Option<String> {
+        let packages: HashMap<&str, &str> = meta["packages"].as_array().unwrap().iter()
+            .map(|p| (p["id"].as_str().unwrap(), p["name"].as_str().unwrap())).collect();
+        let graph: HashMap<&str, Vec<&str>> = meta["resolve"]["nodes"].as_array().unwrap().iter()
+            .map(|node| (node["id"].as_str().unwrap(), node["deps"].as_array().unwrap().iter()
+                .filter(|dep| dep["dep_kinds"].as_array().expect("dep_kinds in cargo metadata").iter()
+                    .any(|kind| kind["kind"].is_null()))
+                .map(|dep| dep["pkg"].as_str().unwrap()).collect())).collect();
+        let id = *packages.iter().find(|(_, &name)| name == root).expect("runtime crate present").0;
+        let mut stack = vec![id];
+        let mut visited = HashSet::new();
+        while let Some(pkg) = stack.pop() {
+            if !visited.insert(pkg) { continue; }
+            if FORBIDDEN_GPU_COMPILER_CRATES.contains(&packages[pkg]) {
+                return Some(packages[pkg].to_string());
+            }
+            stack.extend(graph[pkg].iter().copied());
+        }
+        None
+    }
+
     #[test]
     fn runtime_dependency_graph_does_not_include_peacemaker() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
@@ -251,21 +282,40 @@ mod tests {
             .arg(manifest).output().expect("cargo metadata");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let meta: serde_json::Value = serde_json::from_slice(&output.stdout).expect("cargo metadata JSON");
-        let packages: HashMap<&str, &str> = meta["packages"].as_array().unwrap().iter()
-            .map(|p| (p["id"].as_str().unwrap(), p["name"].as_str().unwrap())).collect();
-        let graph: HashMap<&str, Vec<&str>> = meta["resolve"]["nodes"].as_array().unwrap().iter()
-            .map(|node| (node["id"].as_str().unwrap(), node["deps"].as_array().unwrap().iter()
-                .map(|dep| dep["pkg"].as_str().unwrap()).collect())).collect();
         for root in ["hipfire-daemon", "rdna-compute", "railgun-corpus", "railgun"] {
-            let id = *packages.iter().find(|(_, &name)| name == root).expect("runtime crate present").0;
-            let mut stack = vec![id];
-            let mut visited = HashSet::new();
-            while let Some(pkg) = stack.pop() {
-                if !visited.insert(pkg) { continue; }
-                assert!(!packages[pkg].starts_with("peacemaker-"), "{root} reaches {}", packages[pkg]);
-                stack.extend(graph[pkg].iter().copied());
+            if let Some(reached) = runtime_reached_gpu_compiler(&meta, root) {
+                panic!("{root} reaches GPU compiler crate {reached} through normal dependencies");
             }
         }
+    }
+
+    #[test]
+    fn runtime_graph_walk_ignores_dev_and_build_edges_but_follows_normal_transitives() {
+        let edge = |pkg: &str, kind: serde_json::Value| serde_json::json!({
+            "pkg": pkg, "dep_kinds": [{ "kind": kind, "target": null }] });
+        let meta = serde_json::json!({
+            "packages": [
+                { "id": "root", "name": "railgun" },
+                { "id": "npu", "name": "peacemaker-npu" },
+                { "id": "mid", "name": "middle" },
+                { "id": "ir", "name": "peacemaker-ir" },
+                { "id": "isa", "name": "peacemaker-isa" },
+            ],
+            "resolve": { "nodes": [
+                { "id": "root", "deps": [edge("npu", serde_json::Value::Null), edge("ir", "dev".into()), edge("isa", "build".into())] },
+                { "id": "npu", "deps": [edge("mid", serde_json::Value::Null)] },
+                { "id": "mid", "deps": [] },
+                { "id": "ir", "deps": [] },
+                { "id": "isa", "deps": [] },
+            ] },
+        });
+        // dev/build edges to forbidden crates and the sanctioned peacemaker-npu are accepted.
+        assert_eq!(runtime_reached_gpu_compiler(&meta, "railgun"), None);
+
+        // A normal transitive edge below peacemaker-npu to a GPU compiler crate is still detected.
+        let mut leaking = meta.clone();
+        leaking["resolve"]["nodes"][2]["deps"] = serde_json::json!([edge("isa", serde_json::Value::Null)]);
+        assert_eq!(runtime_reached_gpu_compiler(&leaking, "railgun").as_deref(), Some("peacemaker-isa"));
     }
 
     #[test]

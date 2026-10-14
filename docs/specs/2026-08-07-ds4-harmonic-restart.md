@@ -5,12 +5,13 @@
 
 Date: 2026-08-07
 Branch: `ds4-beta-staging` (now fast-forwarded to `ds4-gfx1201-opt` @ `eb55cda9b`)
-Scope: the `hipx` pair **gfx1100 (RX 7900 XTX, 24 GiB, ~960 GB/s) + gfx1151
-(Strix Halo 8060S, 96 GiB, ~256 GB/s)** only. gfx1010 / gfx1030 on the same
-host are explicitly out of scope.
+Scope: the **gfx1100 (RX 7900 XTX, 24 GiB, ~960 GB/s) + gfx1151
+(Strix Halo 8060S, 96 GiB, ~256 GB/s)** pair on one multi-GPU workstation
+only. gfx1010 / gfx1030 on the same host are explicitly out of scope.
 
 Supersedes the forward-work portions of
-[`2026-08-06-deepseek4-harmonic-gfx1100-gfx1151.md`](2026-08-06-deepseek4-harmonic-gfx1100-gfx1151.md).
+`2026-08-06-deepseek4-harmonic-gfx1100-gfx1151.md` (not tracked on `beta`;
+present only on the `ds4-harmonic-experimental` branch, commit `efec22baa`).
 That document and the H0–H8 investigations remain the historical record.
 
 ## 1. Decision
@@ -193,7 +194,7 @@ The harmonic branch's unlanded gfx1100 E8 assets (`buffer`, `prefetch4_buffer`,
 
 ### 3.3 MEASURED per-shape bill (R1, 2026-08-08)
 
-`rocprofv3` over the last 20 decode positions on `hipx`, branch `54948214e`.
+`rocprofv3` over the last 20 decode positions on the gfx1100 + gfx1151 workstation, branch `54948214e`.
 Aggregate confirms the plan: **511 calls, 7.637 ms/token, 2.858 GB, 374.1 GB/s**
 against a predicted 7.586 / 376.7 — 0.7% apart. Live symbol is the generic
 `gemv_mfp4g32_e8_soa` via `gemv_mfp4g32_e8_soa_prerotated`
@@ -391,7 +392,7 @@ requirement, killing it is cheap.
 
 ## 9. Restart ladder
 
-Measurement on `hipx` is a **serial resource** — fresh-process benchmarking
+Measurement on the gfx1100 + gfx1151 workstation is a **serial resource** — fresh-process benchmarking
 with ±10–15% DPM/thermal drift means no two candidates may be timed
 concurrently. Implementation parallelizes; screening does not.
 
@@ -410,7 +411,7 @@ R4-BW is the critical path and should be staffed accordingly: §8 shows the
 whole target turns on it, and every other slice is worth 2–7% against its
 ~9 tok/s.
 
-**Wave 2 — screen serially on hipx, in this order.** Each under §4: 3 fresh
+**Wave 2 — screen serially on the workstation, in this order.** Each under §4: 3 fresh
 processes, median + range spread, mandatory byte-identical golden, 2% gate,
 revert on reject.
 
@@ -461,7 +462,7 @@ correction.
 
 ## 12. R0 waterline (certified 2026-08-08)
 
-Post-merge re-measurement on `hipx`, branch `ds4-beta-staging` @ `54948214e`.
+Post-merge re-measurement on the gfx1100 + gfx1151 workstation, branch `ds4-beta-staging` @ `54948214e`.
 
 | Sample | decode tok/s |
 |---|---:|
@@ -480,8 +481,9 @@ Post-merge re-measurement on `hipx`, branch `ds4-beta-staging` @ `54948214e`.
 - Binary SHA-256 `921566f4d8e3d3848b0741c0b12c48eabaf8aba4a65e3cf0588c57d59230ced7`,
   prompt MD5 `593234a767e71b97a3a4dad6431b47ce`, model SHA-256
   `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`.
-- Evidence: `hipx:/home/kaden/ds4-r0-waterline-20260808/`,
-  `hipx:/home/kaden/ds4-r1-rocprof-20260808/`.
+- Evidence: R0 waterline and R1 rocprof capture directories
+  (`ds4-r0-waterline-20260808/`, `ds4-r1-rocprof-20260808/`), retained on the
+  measurement workstation only; not tracked in this repository.
 
 Gap to the 50 tok/s AR target from this waterline: **+55.5%**.
 
@@ -495,7 +497,7 @@ Only this document survives.**
 ## What happened
 
 Screening the first candidate lever (`HIPFIRE_DS4_GFX1100_E8_PACK`, the
-`shared_jobs` compressor/FFN packing) on `hipx` produced an SDMA fault that
+`shared_jobs` compressor/FFN packing) on the workstation produced an SDMA fault that
 took gfx1100 off the PCIe bus:
 
 ```text
@@ -512,8 +514,8 @@ The run never emitted `"status":"generated"` and stalled with the dense GPU at
 enumerate an absent device — **collateral, not a defect in that lever.**
 
 Recovery without a reboot was attempted and **failed**. Config space on the
-GPU, and on both ports of the card's on-board Navi switch (`0000:65:00.0`,
-`0000:64:00.0`), all read `ffff`; only the root port `0000:00:03.1` stayed
+GPU, and on both ports of the card's on-board Navi switch (`<switch-port-bdf-1>`,
+`<switch-port-bdf-2>`), all read `ffff`; only the root port `<root-port-bdf>` stayed
 alive. `echo 1 > .../remove` unbound amdgpu but then blocked permanently
 against stuck TTM kworkers (6 → 16). A secondary bus reset driven from the
 root port did not re-train the link. The machine required a physical reboot.

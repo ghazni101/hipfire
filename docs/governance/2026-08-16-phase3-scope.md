@@ -1,6 +1,6 @@
 # Phase 3 — trustworthy gates, platform surface, and the last of the descent
 
-**Repo:** `/home/kaden/ClaudeCode/autorocm/hf-integ` · **Branch:** `arch/saddle`
+**Repo:** local hipfire integration worktree · **Branch:** `arch/saddle`
 
 ## Where Phase 2 left things
 
@@ -15,7 +15,7 @@ Two results bound what Phase 3 should be:
   37.7 tok/s**, prefill 425.2 vs 424.1, TTFT 56.4 vs 56.6 ms. Deltas sit inside
   run-to-run spread. Recorded in
   [`docs/perf-checkpoints/2026-08-16-saddle-vs-master-neutrality-qwen38-27b.md`](../perf-checkpoints/2026-08-16-saddle-vs-master-neutrality-qwen38-27b.md).
-- **Compile time is where the layering paid.** n=3 on hiptrx (Threadripper
+- **Compile time is where the layering paid.** n=3 on the 4×gfx1201 host (Threadripper
   9970X, 32c/64t): incremental after touching `hipfire-runtime/src/lib.rs`
   **19,768 → 14,314 ms (−27.6 %)**; after touching
   `hipfire-arch-qwen35/src/lib.rs` **17,045 → 11,703 ms (−31.3 %)**. The
@@ -112,7 +112,7 @@ Measured against what a serving platform is expected to expose:
 | capability | state |
 |---|---|
 | continuous batching, prefix cache, grammar, tool calling, TP/PP/EP, cancellation, admission control | present |
-| **metrics / Prometheus** | **absent** — no `/metrics` in any crate; `tracing::` in **3 of 430** source files |
+| **metrics / Prometheus** | **present** since this scope was written — serve `GET /metrics` (counters, TTFT/TPOT/latency/throughput histograms, serve gauges; see `docs/SERVE.md`). At writing: no `/metrics` in any crate; `tracing::` in **3 of 430** source files |
 | **logprobs** | **absent** — **0** occurrences tree-wide |
 | embeddings, reranking, LoRA-adapter serving | absent |
 | paged attention / block tables | absent by design — see below |
@@ -242,7 +242,7 @@ harness from Phase 2 is standing and takes ~15 minutes to re-run.
 
 Unchanged from Phase 2, plus three learned today:
 
-- Subagents: absolute paths under `/home/kaden/ClaudeCode/autorocm/hf-integ`;
+- Subagents: absolute paths under the integration worktree root;
   no `cargo fmt`/`clippy`/full-suite inside an agent; touch only owned files;
   SPDX verbatim. Parent runs all gates. A subagent self-report is never evidence.
 - **Bare relative paths in editing tools resolve to a different, older checkout.**
@@ -312,7 +312,7 @@ The registration-tax gain behind it — 9 sites to roughly 6 — does not justif
 
 3D carried a hard precondition: *the redline/PM4 replay oracle MUST be shown to fail on a
 deliberate break before a line of kernel dispatch moves.* That control was attempted on
-hiptrx (gfx1201, the arch the fixture targets) and **could not even establish a passing
+the 4×gfx1201 host (gfx1201, the arch the fixture targets) and **could not even establish a passing
 baseline**:
 
 ```

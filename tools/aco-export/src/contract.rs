@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 //! `aco-export contract`: derive the pilot `pm-aco-hip-contract-v1` (consumed by
-//! `hipfire_isa::aco_hsa::AcoHipContract::from_json`) from the captured sidecar/rawspec and the real
+//! `peacemaker_isa::aco_hsa::AcoHipContract::from_json`) from the captured sidecar/rawspec and the real
 //! capture fixture. Nothing is typed in by hand: pointer bindings come from the sidecar's proven
 //! inline-user-SGPR roles, scalars from the push block, shape from the capture meta, FP/resources
 //! from the rawspec, hashes from the artifact files. An SGPR that the body mentions but that has no

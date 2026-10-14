@@ -226,6 +226,10 @@ pub struct KvTierPlan {
     pub batch_size: usize,
     /// Sliding-window kernarg (cohere2moe windowed Q8). `0` = full attention.
     pub window: i32,
+    /// Gemma 4 decode only: the windowed Q8 attend runs the Gemma tiles
+    /// (`Gpu::attention_flash_q8_0_windowed_gemma`). `derive` leaves it off;
+    /// the Gemma 4 sandwich attention sets it on its own plan.
+    pub gemma_tiles: bool,
 }
 
 /// Error returned by `KvTierPlan::derive` when the combination of inputs
@@ -450,6 +454,7 @@ impl KvTierPlan {
             uses_givens,
             batch_size,
             window,
+            gemma_tiles: false,
         })
     }
 }

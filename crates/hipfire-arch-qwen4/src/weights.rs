@@ -14,8 +14,10 @@
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
+use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
 #[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
+use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
     StateKind, WeightEntry,
@@ -196,8 +198,9 @@ fn qwen4_quant_source() -> DTypeConstraint {
 /// the tier this build happens to write would make a published rung of the
 /// other tier unloadable by the very tree that produced it.
 ///
-/// A third rung is admitted for the opt-in dense IU4 trunk
-/// (`HIPFIRE_QWEN4_TRUNK_IU4`): symmetric MQ4G256V2 (qt=44), the aligned-K
+/// A third rung is admitted for the dense IU4 trunk (opt-in through
+/// `HIPFIRE_QWEN4_TRUNK_IU4`, or the default of an artifact carrying the
+/// `qwen4_trunk_iu4_default` marker): symmetric MQ4G256V2 (qt=44), the aligned-K
 /// 256 group the trunk's GEMV (`gemv_mq4g256v2`) and the dense IU4 SET
 /// kernels read. Other four-bit families stay out: their group width is one
 /// the trunk's decode kernels do not read, and their admission would only
@@ -1259,6 +1262,49 @@ impl Qwen4Manifest {
         self.weights.retain(|entry| !entry.residency.is_external());
         self
     }
+
+    /// This manifest declared for one rank of an expert-parallel mesh: every
+    /// routed expert stack (trunk layers and the MTP head, gate/up and down)
+    /// becomes `ShardPolicy::ExpertSharded { n_experts, Stride }`, so rank `r`
+    /// of `ranks` holds experts `e % ranks == r` compactly in ascending `e`
+    /// (local index `e / ranks`). The entries keep their logical shape
+    /// (`[n_experts, ..]`, which the manifest validator requires); the
+    /// fulfilled tensor is `[n_experts / ranks, ..]`. Everything else is
+    /// unchanged, and a manifest that is never passed through here (ep = 1)
+    /// stays byte-identical to the single-device declaration.
+    pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
+        if ep.ranks < 2 || ep.rank >= ep.ranks {
+            return Err(WeightError::EpPlacement(format!(
+                "rank {} of {} is not an expert-parallel placement",
+                ep.rank, ep.ranks
+            )));
+        }
+        let mut sharded = 0usize;
+        for entry in self
+            .weights
+            .iter_mut()
+            .filter(|entry| is_routed_expert_tensor(&entry.name))
+        {
+            let experts = entry.logical_shape.first().copied().unwrap_or(0);
+            if experts == 0 || experts % ep.ranks != 0 {
+                return Err(WeightError::EpPlacement(format!(
+                    "{}: {experts} routed experts do not divide across {} ranks",
+                    entry.name, ep.ranks
+                )));
+            }
+            entry.policy = ShardPolicy::ExpertSharded {
+                n_experts: experts,
+                assign: ExpertAssign::Stride,
+            };
+            sharded += 1;
+        }
+        if sharded == 0 {
+            return Err(WeightError::EpPlacement(
+                "the manifest declares no routed expert tensors (dense FFN)".to_string(),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 fn mtp_entry(
@@ -1862,6 +1908,27 @@ pub struct Qwen4RootWeights {
     pub final_hyper: HyperConnectionReadWeights,
 }
 
+/// Expert-parallel placement of one rank: routed experts are sharded by id,
+/// expert `e` lives on rank `e % ranks` at compact local index `e / ranks`
+/// (owned experts in ascending id order). Everything else is replicated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4EpPlacement {
+    pub rank: usize,
+    pub ranks: usize,
+}
+
+impl Qwen4EpPlacement {
+    /// Whether this rank owns routed expert `expert`.
+    pub fn owns(self, expert: usize) -> bool {
+        expert % self.ranks == self.rank
+    }
+
+    /// Compact local index of an owned expert.
+    pub fn local_index(self, expert: usize) -> usize {
+        expert / self.ranks
+    }
+}
+
 /// Published resident ownership.  External PLE descriptors remain in the
 /// attached transaction census; no fake handle is stored here.
 pub struct Qwen4Weights {
@@ -1874,6 +1941,10 @@ pub struct Qwen4Weights {
     pub layer_refs: Vec<Qwen4LayerWeights>,
     /// `Some` iff `config.mtp` is declared.
     pub mtp: Option<Qwen4MtpWeights>,
+    /// `Some` iff the routed experts were uploaded expert-sharded for one
+    /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
+    /// experts); `None` on the single-device route.
+    ep: Option<Qwen4EpPlacement>,
 }
 
 impl Qwen4Weights {
@@ -1907,6 +1978,7 @@ impl Qwen4Weights {
                 actual: provided.len(),
             });
         }
+        let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
         let mut assembly = tx.begin_assembly();
         for placement in placements {
             if assembly
@@ -1942,7 +2014,14 @@ impl Qwen4Weights {
             root,
             layer_refs,
             mtp,
+            ep,
         })
+    }
+
+    /// The expert-parallel placement these weights were assembled for, or
+    /// `None` on the single-device route.
+    pub fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
+        self.ep
     }
 
     /// Resolve one immutable typed reference to its resident GPU buffer.
@@ -2068,18 +2147,14 @@ impl Qwen4Weights {
                 }
                 let bytes =
                     std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-                if k % 256 != 0 || bytes.len() != m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES {
+                if qt44_matrix_bytes(m, k) != Some(bytes.len()) {
                     return Err(format!(
                         "{}: {} bytes is not a {m}x{k} QT44 matrix",
                         path.display(),
                         bytes.len()
                     ));
                 }
-                let mut copy = gpu
-                    .upload_raw(&bytes, &[bytes.len()])
-                    .map_err(|error| error.to_string())?;
-                copy.dtype = DType::MQ4G256V2;
-                copy
+                upload_qt44(gpu, &bytes)?
             } else {
                 if tensor.dtype == target {
                     continue;
@@ -2091,21 +2166,135 @@ impl Qwen4Weights {
                 }
                 .map_err(|error| format!("requant {} -> {target:?}: {error}", taken.key.name))?
             };
+            let (old_bytes, new_bytes) = swap_resident(gpu, taken, copy)?;
             count += 1;
-            before += tensor.buf.size();
-            after += copy.buf.size();
-            let WeightHandle::Resident(old) =
-                std::mem::replace(&mut taken.handle, WeightHandle::Resident(copy))
-            else {
-                unreachable!()
-            };
-            gpu.free_tensor(old).map_err(|error| error.to_string())?;
+            before += old_bytes;
+            after += new_bytes;
         }
         eprintln!(
             "[qwen4] HIPFIRE_QWEN4_REQUANT {spec:?}: {count} tensors, {before} -> {after} bytes"
         );
         Ok(())
     }
+
+    /// Replace the QT44 targets of a verified trunk overlay
+    /// (`hipfire_runtime::trunk_overlay`), exactly as the `qt44:` rule of
+    /// [`Self::requant_from_env`] does (same upload, dtype and free).
+    ///
+    /// Everything is checked first: each payload must name exactly one
+    /// resident weight whose logical shape is the payload's `[m, k]` and whose
+    /// byte count is the QT44 size.  A failed check replaces nothing and is
+    /// [`TrunkOverlayOutcome::Refused`] (the base weights run).  An upload or
+    /// free error once replacement started is an `Err`.
+    pub fn apply_trunk_overlay(
+        &mut self,
+        gpu: &mut Gpu,
+        payloads: &[TrunkOverlayPayload],
+    ) -> Result<TrunkOverlayOutcome, String> {
+        let mut slots = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let mut resident = self
+                .taken_by_name
+                .get(&payload.name)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&slot| matches!(self.taken[slot].handle, WeightHandle::Resident(_)));
+            let (Some(slot), None) = (resident.next(), resident.next()) else {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {} does not match exactly one resident weight",
+                    payload.name
+                )));
+            };
+            let [m, k] = payload.shape;
+            let projection = &self.taken[slot].projection;
+            if projection.logical_shape != [m, k] {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {}: the model's weight is {:?}, overlay is [{m}, {k}]",
+                    payload.name, projection.logical_shape
+                )));
+            }
+            if qt44_matrix_bytes(m, k) != Some(payload.bytes.len()) {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {}: {} bytes is not a {m}x{k} QT44 matrix",
+                    payload.name,
+                    payload.bytes.len()
+                )));
+            }
+            if slots.contains(&slot) {
+                return Ok(TrunkOverlayOutcome::Refused(format!(
+                    "tensor {} is listed twice",
+                    payload.name
+                )));
+            }
+            slots.push(slot);
+        }
+        let (mut before, mut after) = (0usize, 0usize);
+        for (payload, &slot) in payloads.iter().zip(&slots) {
+            let copy = upload_qt44(gpu, &payload.bytes)?;
+            let (old_bytes, new_bytes) = swap_resident(gpu, &mut self.taken[slot], copy)?;
+            before += old_bytes;
+            after += new_bytes;
+        }
+        Ok(TrunkOverlayOutcome::Applied(TrunkOverlayApplied {
+            tensors: payloads.len(),
+            before_bytes: before,
+            after_bytes: after,
+        }))
+    }
+}
+
+/// What [`Qwen4Weights::apply_trunk_overlay`] did.
+#[derive(Debug)]
+pub enum TrunkOverlayOutcome {
+    Applied(TrunkOverlayApplied),
+    /// Nothing was replaced; the reason is one line.
+    Refused(String),
+}
+
+/// Tensors replaced by a trunk overlay and their device bytes before/after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrunkOverlayApplied {
+    pub tensors: usize,
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+}
+
+/// Byte size of an `m x k` QT44 matrix; `None` unless K is a multiple of 256.
+fn qt44_matrix_bytes(m: usize, k: usize) -> Option<usize> {
+    (k % 256 == 0).then(|| m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES)
+}
+
+/// Upload pre-encoded QT44 bytes as a resident tensor (dtype `MQ4G256V2`).
+/// The one upload path of `HIPFIRE_QWEN4_REQUANT`'s `qt44:` rule and of the
+/// trunk overlay.
+fn upload_qt44(gpu: &mut Gpu, bytes: &[u8]) -> Result<GpuTensor, String> {
+    let mut copy = gpu
+        .upload_raw(bytes, &[bytes.len()])
+        .map_err(|error| error.to_string())?;
+    copy.dtype = DType::MQ4G256V2;
+    Ok(copy)
+}
+
+/// Install `copy` as `taken`'s resident tensor and free the old one; returns
+/// the old and new device bytes.
+fn swap_resident(
+    gpu: &mut Gpu,
+    taken: &mut TakenWeight,
+    copy: GpuTensor,
+) -> Result<(usize, usize), String> {
+    let WeightHandle::Resident(old) = &taken.handle else {
+        let _ = gpu.free_tensor(copy);
+        return Err(format!("{}: weight is not resident", taken.key.name));
+    };
+    let sizes = (old.buf.size(), copy.buf.size());
+    let WeightHandle::Resident(old) =
+        std::mem::replace(&mut taken.handle, WeightHandle::Resident(copy))
+    else {
+        unreachable!()
+    };
+    gpu.free_tensor(old).map_err(|error| error.to_string())?;
+    Ok(sizes)
 }
 
 fn build_root_refs(config: &Qwen4Config) -> Result<Qwen4RootWeights, WeightError> {
@@ -2536,6 +2725,59 @@ fn assembly_manifest(
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
 }
 
+/// Whether `name` is a routed expert stack (trunk `…mlp.experts.*` or the MTP
+/// head's `mtp.layers.0.mlp.experts.*`): the only tensors expert parallelism
+/// shards.
+fn is_routed_expert_tensor(name: &str) -> bool {
+    name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+}
+
+/// The expert-parallel placement recorded in a transaction's projection
+/// census (`lookup(name, layer)` is its device-0 projection): `Some` iff every
+/// routed expert stack of `manifest` was fulfilled `ExpertCompact` for one
+/// `(rank, ranks)`, `None` iff none was. A mixture, or disagreeing
+/// placements, is a corrupt load and is refused before assembly takes handles.
+fn ep_from_projections<'a>(
+    manifest: &Qwen4Manifest,
+    lookup: impl Fn(&str, Option<usize>) -> Option<&'a hipfire_runtime::weight_store::WeightProjection>,
+) -> Result<Option<Qwen4EpPlacement>, WeightError> {
+    use hipfire_runtime::weight_store::WeightProjectionKind;
+    let mut placement: Option<Qwen4EpPlacement> = None;
+    let mut plain = 0usize;
+    let mut compact = 0usize;
+    for entry in manifest
+        .weights
+        .iter()
+        .filter(|entry| is_routed_expert_tensor(&entry.name))
+    {
+        let Some(projection) = lookup(&entry.name, entry.layer) else {
+            continue;
+        };
+        if projection.kind == WeightProjectionKind::ExpertCompact {
+            compact += 1;
+            let this = Qwen4EpPlacement {
+                rank: projection.rank,
+                ranks: projection.world_size,
+            };
+            if placement.is_some_and(|seen| seen != this) {
+                return Err(WeightError::EpPlacement(format!(
+                    "{}: placement {this:?} disagrees with {placement:?}",
+                    entry.name
+                )));
+            }
+            placement = Some(this);
+        } else {
+            plain += 1;
+        }
+    }
+    if compact > 0 && plain > 0 {
+        return Err(WeightError::EpPlacement(format!(
+            "{compact} routed expert tensors were fulfilled compactly and {plain} in full"
+        )));
+    }
+    Ok(placement)
+}
+
 /// Production builds never execute a developer profile.
 #[cfg(not(any(test, feature = "qwen4-dev-profiles")))]
 fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
@@ -2741,6 +2983,9 @@ pub enum WeightError {
         profile: String,
         reason: String,
     },
+    /// An expert-parallel placement that is malformed, or a transaction whose
+    /// routed expert tensors do not agree on one.
+    EpPlacement(String),
 }
 
 impl fmt::Display for WeightError {
@@ -2785,6 +3030,7 @@ impl fmt::Display for WeightError {
             Self::UnsupportedProfile { profile, reason } => {
                 write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
             }
+            Self::EpPlacement(reason) => write!(f, "Qwen4 expert-parallel placement: {reason}"),
         }
     }
 }
@@ -2841,6 +3087,115 @@ mod tests {
         assert!(!is_ple_shard_name(&name("007")));
         assert!(!is_ple_shard_name(&name("")));
         assert!(!is_ple_shard_name("model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn expert_parallel_manifest_shards_only_routed_experts() {
+        use hipfire_runtime::device_mesh::DeviceMesh;
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        // ep = 1 never passes through the transform: every expert stack stays
+        // `Replicate` (the byte-identical single-device declaration).
+        assert!(base
+            .weights
+            .iter()
+            .filter(|entry| is_routed_expert_tensor(&entry.name))
+            .all(|entry| entry.policy == ShardPolicy::Replicate));
+        for ranks in [2usize, 4] {
+            let rank = ranks - 1;
+            let ep = base
+                .clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank, ranks })
+                .unwrap();
+            assert_eq!(ep.identity, base.identity);
+            assert_eq!(ep.state, base.state);
+            assert_eq!(ep.metadata, base.metadata);
+            assert_eq!(ep.weights.len(), base.weights.len());
+            let mut sharded = 0;
+            let mut mtp_sharded = 0;
+            for (before, after) in base.weights.iter().zip(&ep.weights) {
+                if is_routed_expert_tensor(&before.name) {
+                    assert_eq!(
+                        after.policy,
+                        ShardPolicy::ExpertSharded {
+                            n_experts: 512,
+                            assign: ExpertAssign::Stride
+                        },
+                        "{}",
+                        before.name
+                    );
+                    assert_eq!(after.logical_shape, before.logical_shape);
+                    assert_eq!(after.logical_shape[0], 512);
+                    sharded += 1;
+                    mtp_sharded += usize::from(before.name.starts_with("mtp.layers.0."));
+                } else {
+                    assert_eq!(before, after, "{} must be untouched", before.name);
+                }
+            }
+            // 48 trunk layers + the MTP head, gate_up and down each.
+            assert_eq!(sharded, 2 * 49);
+            assert_eq!(mtp_sharded, 2);
+            // The sharded declaration is a valid single-mesh manifest.
+            hipfire_runtime::weight_manifest::validate_manifest(
+                &ep.weights,
+                &DeviceMesh::single().unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn expert_parallel_manifest_refuses_bad_placements() {
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 3), (1, 5)] {
+            assert!(
+                matches!(
+                    base.clone().with_expert_parallel(Qwen4EpPlacement { rank, ranks }),
+                    Err(WeightError::EpPlacement(_))
+                ),
+                "rank {rank} of {ranks}"
+            );
+        }
+    }
+
+    #[test]
+    fn ep_placement_is_recovered_from_the_projection_census() {
+        use hipfire_runtime::weight_store::{WeightProjection, WeightProjectionKind};
+        let manifest = Qwen4Manifest::build(&pinned_config()).unwrap();
+        let projection = |kind, rank, world_size| WeightProjection {
+            kind,
+            axis: None,
+            rank,
+            world_size,
+            logical_shape: vec![512, 1, 1],
+            dtype: DType::MQ4G256V2,
+        };
+        let compact = projection(WeightProjectionKind::ExpertCompact, 1, 4);
+        let plain = projection(WeightProjectionKind::Static, 0, 1);
+        let other = projection(WeightProjectionKind::ExpertCompact, 2, 4);
+        assert_eq!(
+            ep_from_projections(&manifest, |_, _| Some(&compact)).unwrap(),
+            Some(Qwen4EpPlacement { rank: 1, ranks: 4 })
+        );
+        assert_eq!(ep_from_projections(&manifest, |_, _| Some(&plain)).unwrap(), None);
+        assert_eq!(ep_from_projections(&manifest, |_, _| None).unwrap(), None);
+        // A mixture of compact and full expert stacks is refused.
+        assert!(ep_from_projections(&manifest, |name, _| {
+            if name.ends_with("down_proj") {
+                Some(&plain)
+            } else {
+                Some(&compact)
+            }
+        })
+        .is_err());
+        // Two different placements are refused.
+        assert!(ep_from_projections(&manifest, |_, layer| {
+            if layer == Some(3) {
+                Some(&other)
+            } else {
+                Some(&compact)
+            }
+        })
+        .is_err());
     }
     fn pinned_config() -> Qwen4Config {
         crate::config::compact_test_config()

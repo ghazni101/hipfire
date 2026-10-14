@@ -2,22 +2,23 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! S2 launch fusion: hidden-ring scatter kernels on exact gfx1100 and exact
-//! gfx1201 (`ArchCaps::supports_dflash_hidden_scatter_fusion`). The historical
+//! S2 launch fusion: hidden-ring scatter kernels on exact gfx1100, exact
+//! gfx1151 and exact gfx1201 (`ArchCaps::supports_dflash_hidden_scatter_fusion`;
+//! pure byte copies only). The historical
 //! `_gfx1100` symbol names are kept.
 //!
 //! Replaces the per-row `memcpy_dtod_at` storms in
 //! `HiddenStateRingBuffer::commit_staging_to_ring` and
 //! `scatter_hidden_block_to_interleaved` (both in `hipfire-arch-qwen35`'s
 //! `speculative.rs`) with one kernel launch each. Specialized to the
-//! measured DFlash route: `num_extract == 5`, F32, gfx1100. The five source
+//! measured DFlash route: `num_extract == 5`, F32. The five source
 //! and five destination pointers travel directly in the kernarg blob — no
 //! per-cycle pointer table is built, uploaded, or retained.
 //!
 //! Routing contract (checked in-crate so the `&Gpu` scatter path can route
 //! without a signature change):
 //! - [`Gpu::dflash_hidden_commit5_applicable`] is the full fused-commit
-//!   predicate: exact gfx1100 or gfx1201, kill switch clear, 5+5 F32 buffers with enough
+//!   predicate: exact gfx1100, gfx1151 or gfx1201, kill switch clear, 5+5 F32 buffers with enough
 //!   elements, `n <= max_pos`, and neither hipGraph capture nor retained
 //!   replay recording active (the kernels bake the current head, so they
 //!   must never be captured).
@@ -26,11 +27,15 @@
 //!   same-cycle scatter, so by the time
 //!   [`Gpu::dflash_hidden_scatter5_try`] runs the scatter symbol is already
 //!   loaded; a scatter that arrives with no prior fused commit (seed paths,
-//!   non-gfx1100, kill switch) finds the symbol missing and reports `false`
+//!   non-admitted arch, kill switch) finds the symbol missing and reports `false`
 //!   so the caller runs today's loop byte-for-byte.
 //! - [`Gpu::dflash_hidden_scatter5_try`] returns `Ok(true)` when it launched
 //!   (or when there were zero retained rows, a no-op in both paths) and
-//!   `Ok(false)` when the caller must run the loop.
+//!   `Ok(false)` when the caller must run the loop. On exact gfx1151 it also
+//!   returns `Ok(false)` for a finite window with `rows > dst_modulus` (two
+//!   retained rows would alias one destination row, which the sequential loop
+//!   resolves last-writer-wins and the kernel cannot); gfx1100/gfx1201 keep
+//!   their existing behavior.
 //!
 //! Both kernels are pure F32 copies with one writer per destination
 //! element: fused output is bit-identical to the loops. `rows == 0` / `n ==
@@ -52,6 +57,13 @@ const DST_MODULUS_ABSENT: u64 = u64::MAX;
 
 fn all_f32(tensors: &[GpuTensor]) -> bool {
     tensors.iter().all(|t| t.dtype == crate::DType::F32)
+}
+
+/// True when a windowed scatter destination (`dst_modulus != usize::MAX`)
+/// maps two of the `rows` consecutive logical rows onto one destination row,
+/// i.e. `rows > dst_modulus`. Absolute addressing never aliases.
+fn scatter5_window_aliases(rows: usize, dst_modulus: usize) -> bool {
+    dst_modulus != usize::MAX && rows > dst_modulus
 }
 
 impl Gpu {
@@ -216,6 +228,14 @@ impl Gpu {
             // path rather than inventing kernel semantics for it.
             return Ok(false);
         }
+        // Windowed destination: rows r and r + dst_modulus alias one dst row.
+        // The loop is sequential (last row wins); the kernel has no ordering
+        // between threads. Exact gfx1151 admission requires one writer per
+        // destination element, so refuse any aliasing window there and let the
+        // loop run. gfx1100/gfx1201 behavior is unchanged.
+        if self.arch_caps.is_gfx1151() && scatter5_window_aliases(rows, dst_modulus) {
+            return Ok(false);
+        }
         if !all_f32(src) || dst.dtype != crate::DType::F32 {
             return Ok(false);
         }
@@ -288,5 +308,21 @@ impl Gpu {
             blob.as_mut_slice(),
         )?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scatter5_window_aliases;
+
+    #[test]
+    fn window_alias_detects_rows_beyond_modulus() {
+        // Absolute addressing never aliases.
+        assert!(!scatter5_window_aliases(usize::MAX - 1, usize::MAX));
+        // Windowed: aliasing iff rows > modulus.
+        assert!(!scatter5_window_aliases(1, 32));
+        assert!(!scatter5_window_aliases(32, 32));
+        assert!(scatter5_window_aliases(33, 32));
+        assert!(scatter5_window_aliases(13, 8));
     }
 }

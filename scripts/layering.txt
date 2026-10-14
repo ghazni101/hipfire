@@ -21,13 +21,13 @@
  0 hipfire-detect
  0 hipfire-xdna
  0 peacemaker-ir
- 0 pm-npu
+ 0 peacemaker-npu
  0 radiowave
  0 redline
  0 railgun-corpus
  1 hip-bridge
  1 hipfire-client
- 2 hipfire-isa
+ 2 peacemaker-isa
  1 hipfire-registry
  1 hsa-bridge
  1 peacemaker-author
@@ -41,7 +41,7 @@
  2 npu-tools
  3 hipfire-cpu
  3 rdna-compute
- 3 hipfire-rip
+ 3 peacemaker-rip
  4 hipfire-dispatch
  4 saddle-core
  4 railgun-jitcorpus

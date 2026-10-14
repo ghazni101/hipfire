@@ -51,6 +51,7 @@ fn kernel_formats() -> Vec<(CpuQuant, bool)> {
         (CpuQuant::Mq4CG256, true),
         (CpuQuant::Tq2G128, true),
         (CpuQuant::Bq1G128, true),
+        (CpuQuant::Mfp4G32E8, true),
         // Per-128 fp16 header (the V2 family).
         (CpuQuant::Mq4G256V2, true),
         (CpuQuant::Mq6G256V2, true),
@@ -148,6 +149,14 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
     let groups = k / ge;
     // f32: 0.0313, -0.4921. fp16: 0.031311, -0.122986, 0.270996, -0.088684.
     const F16X4: [u16; 4] = [0x2802, 0xafdf, 0x3456, 0xadad];
+    if q == CpuQuant::Mfp4G32E8 {
+        let rb = row_bytes(q, k);
+        for row in 0..m {
+            packed[row * rb..row * rb + 2]
+                .copy_from_slice(&F16X4[row % F16X4.len()].to_le_bytes());
+        }
+        return;
+    }
     for row in 0..m {
         for g in 0..groups {
             let at = (row * groups + g) * gb;
@@ -210,6 +219,7 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
                 CpuQuant::Q8F16 => {
                     packed[at..at + 2].copy_from_slice(&AWKWARD_F16[0].to_le_bytes())
                 }
+                CpuQuant::Mfp4G32E8 => unreachable!("row-header format handled above"),
             }
         }
     }
@@ -330,5 +340,40 @@ fn forced_scalar_path_is_the_s1_arithmetic() {
             acc += partial;
         }
         assert_eq!(*got, acc, "row {row}");
+    }
+}
+
+/// Prepared sums must preserve each affine format's arithmetic. Awkward
+/// metadata and activations expose rounding differences hidden by the
+/// power-of-two shared-job fixtures.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn cached_and_uncached_agree_on_awkward_inputs() {
+    for q in [CpuQuant::Mq4G256, CpuQuant::Mq6G256] {
+        if !row_dot_enabled(q, None) {
+            continue;
+        }
+        for k in [256, 512, 2048, 12288] {
+            let m = 7;
+            let mut packed = testfix::weight_bytes(q, m, k);
+            awkward_headers(q, &mut packed, m, k);
+            for token in 0..4 {
+                let x: Vec<f32> = (0..k)
+                    .map(|i| (((i + token * 71) as u64 * 2654435761) % 4096) as f32 * 0.001 - 2.0)
+                    .collect();
+                let mut sums = vec![0.0; k / 256];
+                prepare_activation_sums(activation_sum_kind(q).unwrap(), &x, &mut sums);
+                for row in 0..m {
+                    let weights = &packed[row * row_bytes(q, k)..];
+                    let uncached = row_dot_avx2(q, weights, k, &x);
+                    let cached = row_dot_with_activation_sums(q, weights, k, &x, &sums);
+                    assert_eq!(
+                        cached.to_bits(),
+                        uncached.to_bits(),
+                        "{q:?} k={k} token={token} row={row}"
+                    );
+                }
+            }
+        }
     }
 }

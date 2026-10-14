@@ -58,6 +58,15 @@ enum PleAction {
     Derive(DeriveArgs),
     /// Split a monolithic model into a PLE-less base plus `<base>.ple-q8`.
     Split(SplitArgs),
+    /// Copy a Q4 table, rebinding only after proving embedded PLE rows unchanged.
+    Rebind {
+        #[arg(long)]
+        old_base: PathBuf,
+        #[arg(long)]
+        new_base: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -97,6 +106,12 @@ pub(crate) fn ple_command(paths: &Paths, args: PleArgs) -> Result<()> {
     match args.action {
         PleAction::Derive(args) => derive_command(paths, args),
         PleAction::Split(args) => split_command(paths, args),
+        PleAction::Rebind { old_base, new_base, source } => {
+            let output = ple_convert::rebind_q4(&old_base, &new_base, &source, &mut |_| {})
+                .map_err(anyhow::Error::msg)?;
+            println!("rebound q4 rows: {}", output.display());
+            Ok(())
+        }
     }
 }
 

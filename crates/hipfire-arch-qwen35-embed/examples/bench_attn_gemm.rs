@@ -5,15 +5,17 @@
 //! Microbenchmark: is the trunk's GEMM fast at *attention's* shape?
 //!
 //! Attention as two batched GEMMs plus a row softmax is only worth building if
-//! `gemm_f16_x_f16_wmma_lds_auto` holds its throughput when the contraction
-//! (`k`) is the head dimension rather than a projection width. QK^T for one
-//! head is `[n_q, n_k, hd]` — M = n_keys, K = hd (256 here), B = n_q — and a
-//! small K means few K-tiles per block, which is exactly where a macro-tile
-//! kernel loses efficiency. This measures it.
+//! the production `attention_gemm_ld` route holds its throughput when the
+//! contraction (`k`) is the head dimension rather than a projection width.
+//! It uses optimized split1 LDS on gfx1201 and the existing gfx11 tile selection.
+//! QK^T for one head is `[n_q, n_k, hd]` — M = n_keys, K = hd (256 here),
+//! B = n_q — and a small K means few K-tiles per block, which is exactly where
+//! a macro-tile kernel loses efficiency. This measures it.
 //!
 //! Usage: cargo run --release -p hipfire-arch-qwen35-embed \
 //!          --example bench_attn_gemm --features lab -- [n] [hd] [iters]
 
+use hipfire_arch_qwen35_embed::forward::attention_gemm_ld;
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
@@ -40,7 +42,7 @@ fn main() -> Result<(), String> {
 
     // ml_dtypes/lldm: out[M=n, k=hd] times x[batch=n, k=hd] -> y[n, n].
     let run = |gpu: &mut Gpu| -> Result<(), String> {
-        gpu.gemm_f16_x_f16_wmma_lds_auto(&w, &x, &y, None, n, hd, n)
+        attention_gemm_ld(gpu, &w, &x, &y, n, hd, n, hd, hd, true)
             .map_err(|e| format!("gemm: {e:?}"))
     };
     for _ in 0..3 {
@@ -57,7 +59,7 @@ fn main() -> Result<(), String> {
 
     let flops = 2.0 * (n as f64) * (n as f64) * (hd as f64);
     println!(
-        "  gemm_f16_x_f16_wmma_lds_auto: {ms:.3} ms/call  ->  {:.2} TFLOP/s",
+        "  attention_gemm_ld (production QK): {ms:.3} ms/call  ->  {:.2} TFLOP/s",
         flops / (ms * 1e-3) / 1e12
     );
     // The per-layer attention budget this must beat to be worth building.

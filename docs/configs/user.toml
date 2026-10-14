@@ -39,7 +39,8 @@ mode = "auto"
 # DFlash remains opt-in. Replaces HIPFIRE_DFLASH_MODE=off.
 dflash = "off"
 mtp = "auto"
-mtp_k = 3
+# `auto` = 4 for native Qwen4 MTP on gfx1151, else 3; an integer pins the cap.
+mtp_k = "auto"
 ngram = "off"
 
 [serve]

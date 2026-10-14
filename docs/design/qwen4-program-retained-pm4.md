@@ -940,7 +940,7 @@ runs recorded here:
 | GPU | AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (Strix Halo, gfx1151) |
 | PCI | `1002:1586`, subsystem `2014:801D`, driver `amdgpu` |
 | Kernel | `7.0.9-cachyos-lto` |
-| Runtime | `libamdhip64.so.7.2.53211` (ROCm 7.2.x, via the merged root `/home/bjoern/.hipfire/rocm-merged`) |
+| Runtime | `libamdhip64.so.7.2.53211` (ROCm 7.2.x, via the merged root `$HOME/.hipfire/rocm-merged`) |
 | Timed prompt digest | `benchmarks/prompts/qwen4_ar_primes.txt` — md5 `0508eec29a44323f62e70fa77d92b834`, sha256 `16c282e391cce0c1ad4b702cdacc1b25c126c474de842f2e9c6d32b7ebd9a752` |
 | Clock policy | automatic (`automatic_clocks: true`), DPM settle + stationarity gate per arm |
 

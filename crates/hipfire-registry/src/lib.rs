@@ -108,6 +108,66 @@ pub struct Sidecar {
     pub size_bytes: Option<u64>,
 }
 
+/// Content identity of one trunk overlay sidecar and of the exact base
+/// artifact it is bound to.
+///
+/// The overlay is an HFQM container of pre-encoded QT44 trunk tensors
+/// (`<base file>.trunk-overlay`) that the Qwen4 loader applies by default on
+/// gfx1151 (`HIPFIRE_QWEN4_TRUNK_OVERLAY=0` is the kill switch). The pin lives
+/// in the client instead of a registry field so that older clients' strict
+/// `deny_unknown_fields` v1 parser keeps accepting the published registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrunkOverlayPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the overlay file.
+    pub repo: &'static str,
+    /// Overlay file name: the canonical base file name plus
+    /// `hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX`.
+    pub file: &'static str,
+    /// SHA-256 of the overlay file.
+    pub sha256: &'static str,
+    /// Size in bytes of the overlay file.
+    pub size_bytes: u64,
+}
+
+/// Trunk overlays known to this client, keyed by exact base artifact identity.
+pub const TRUNK_OVERLAY_PINS: &[TrunkOverlayPin] = &[TrunkOverlayPin {
+    base_sha256: FLASH_NEXT_XTS_SHA256,
+    base_size: FLASH_NEXT_XTS_SIZE,
+    repo: FLASH_NEXT_XTS_REPO,
+    file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+    sha256: "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd",
+    size_bytes: 305_543_168,
+}];
+
+/// A resolved trunk overlay: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrunkOverlay {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as a [`TrunkOverlay`]. An entry without a pinned digest and
+/// size never matches.
+pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<TrunkOverlay> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| TrunkOverlay {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingDefaults {
@@ -316,6 +376,12 @@ impl ModelEntry {
             )
     }
 
+    /// The Flash-Next trunk overlay sidecar of this entry's base artifact, from
+    /// the compiled-in [`TRUNK_OVERLAY_PINS`]; `None` for every other entry.
+    pub fn trunk_overlay(&self) -> Option<TrunkOverlay> {
+        trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
+    }
+
     /// True when this entry is a split base that publishes PLE row sidecars.
     pub fn has_ple_sidecars(&self) -> bool {
         self.ple_q4.is_some() || self.ple_q8.is_some()
@@ -370,8 +436,16 @@ impl ModelEntry {
 /// Backend selection is source-independent at admission. Qwen3.8 entries
 /// with `arch_id=16` (Qwen4) and Muse Glimmer tags write neither length.
 ///
-/// Explicit global/model/one-shot user config remains higher precedence than
-/// this registry layer.
+/// Qwen3.8-27B trunk tiers (`qwen3.8:27b` and `qwen3.8:27b-*`, never a
+/// longer lookalike such as `27boops`) that declare a paired `dflash` sidecar
+/// also lower `speculation.dflash = "auto"`. The load resolver wires the draft
+/// only when that registry-declared file is present; without it MTP `auto`
+/// stays in effect. The schema/BuiltIn default stays `off` for every other
+/// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
+/// declaration get no speculation policy.
+///
+/// Explicit global/model/one-shot user config (including `dflash=off`) remains
+/// higher precedence than this registry layer.
 pub fn config_layer_for_tag(
     tag: &str,
     entry: &ModelEntry,
@@ -385,6 +459,12 @@ pub fn config_layer_for_tag(
     if is_qwen_tag_policy {
         layer
             .set("generation.max_tokens", ConfigValue::Integer(81920))
+            .map_err(|error| error.to_string())?;
+    }
+    let is_qwen38_27b_tier = tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-");
+    if is_qwen_tag_policy && is_qwen38_27b_tier && entry.dflash.is_some() {
+        layer
+            .set("speculation.dflash", ConfigValue::String("auto".into()))
             .map_err(|error| error.to_string())?;
     }
     let is_deepseek_tag_policy =
@@ -1107,6 +1187,184 @@ mod tests {
         assert_eq!(
             parsed.models["qwen3.8:flash-next-rtn-asym"].file,
             "qwen3.8-flash-next.mq4"
+        );
+    }
+
+    #[test]
+    fn flash_next_zab_named_tier_preserves_stock_aliases() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let curated: serde_json::Value =
+            serde_json::from_str(include_str!("../../../registry/models.json")).unwrap();
+        let tag = "qwen3.8:flash-next-mq4-xts-zab";
+        let zab = &wire.models[tag];
+        assert!(zab.repo.is_empty(), "staged artifact must not be pullable");
+        assert_eq!(zab.file, "qwen3.8-flash-next.mq4-xts-zab");
+        assert_eq!(zab.arch_id, Some(16));
+        assert_eq!(zab.quant.as_deref(), Some("mq4"));
+        assert_eq!(
+            zab.sha256.as_deref(),
+            Some("a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa")
+        );
+        assert_eq!(zab.size_bytes, Some(125144775192));
+        let curated_zab: ModelEntry =
+            serde_json::from_value(curated["models"][tag].clone()).unwrap();
+        assert_eq!(zab.sha256, curated_zab.sha256);
+        assert_eq!(zab.size_bytes, curated_zab.size_bytes);
+        assert!(!zab.is_flash_next_xts());
+        assert!(zab.desc.contains("LOCAL-ONLY"));
+        assert!(zab.desc.contains("108 GDN"));
+        assert!(zab.desc.contains("symmetric QT44"));
+        assert!(zab.desc.contains("non-zab bytes unchanged"));
+        assert!(zab.desc.contains("qwen4_trunk_iu4_default=gfx1151-zab-v1"));
+        assert!(zab.desc.contains("HIPFIRE_QWEN4_TRUNK_IU4=0"));
+        assert!(zab.desc.contains("NOT uploaded/pullable"));
+        let settings = zab.recommended_settings.as_ref().unwrap();
+        assert_eq!(settings.temperature, Some(1.0));
+        assert_eq!(settings.top_p, Some(0.95));
+        assert_eq!(settings.top_k, Some(20));
+        assert_eq!(serde_json::to_value(&wire.aliases).unwrap(), curated["aliases"]);
+        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
+        assert!(!wire.aliases.values().any(|target| target == tag));
+        for stock in FLASH_NEXT_FIXTURE_TAGS {
+            let entry = &wire.models[stock];
+            assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO);
+            assert_eq!(entry.sha256.as_deref(), Some(FLASH_NEXT_XTS_SHA256));
+            assert_eq!(entry.size_bytes, Some(FLASH_NEXT_XTS_SIZE));
+            assert_eq!(
+                entry.file,
+                if stock == "qwen3.8:flash-next-mq4-xts" {
+                    FLASH_NEXT_XTS_CANONICAL_FILE
+                } else {
+                    FLASH_NEXT_XTS_LEGACY_FILE
+                }
+            );
+            assert_eq!(entry.recommended_settings, zab.recommended_settings);
+        }
+    }
+
+    const TRUNK_OVERLAY_FILE: &str = "qwen3.8-flash-next.mq4-xts.trunk-overlay";
+
+    #[test]
+    fn trunk_overlay_pin_names_the_canonical_base_file_plus_the_suffix() {
+        assert_eq!(TRUNK_OVERLAY_PINS.len(), 1);
+        let pin = &TRUNK_OVERLAY_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{FLASH_NEXT_XTS_CANONICAL_FILE}{}",
+                hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(pin.file, TRUNK_OVERLAY_FILE);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(pin.size_bytes, 305_543_168);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn trunk_overlay_lookup_matches_the_base_identity_only() {
+        let entry = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        let overlay = entry.trunk_overlay().unwrap();
+        assert_eq!(overlay.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            overlay.sidecar,
+            Sidecar {
+                file: TRUNK_OVERLAY_FILE.into(),
+                sha256: Some(TRUNK_OVERLAY_PINS[0].sha256.into()),
+                size_bytes: Some(305_543_168),
+            }
+        );
+        // The legacy spelling of the same pinned bytes resolves to the canonical overlay name.
+        let legacy = pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE);
+        assert_eq!(legacy.trunk_overlay(), Some(overlay));
+
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = Some(digest('a'));
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1);
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = None;
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = None;
+        assert!(other.trunk_overlay().is_none());
+    }
+
+    #[test]
+    fn trunk_overlay_in_uses_the_supplied_pin_table() {
+        let mut entry = pinned_flash_next_entry("custom.mq4");
+        entry.sha256 = Some(digest('b'));
+        entry.size_bytes = Some(123);
+        assert!(trunk_overlay_in(&entry, TRUNK_OVERLAY_PINS).is_none());
+        let pins = [TrunkOverlayPin {
+            base_sha256: "b".repeat(64).leak(),
+            base_size: 123,
+            repo: "test/repo",
+            file: "custom.mq4.trunk-overlay",
+            sha256: "c".repeat(64).leak(),
+            size_bytes: 7,
+        }];
+        let overlay = trunk_overlay_in(&entry, &pins).unwrap();
+        assert_eq!(overlay.repo, "test/repo");
+        assert_eq!(overlay.sidecar.file, "custom.mq4.trunk-overlay");
+        assert_eq!(overlay.sidecar.sha256, Some(digest('c')));
+        assert_eq!(overlay.sidecar.size_bytes, Some(7));
+        assert!(trunk_overlay_in(&entry, &[]).is_none());
+    }
+
+    #[test]
+    fn bundled_registry_resolves_the_trunk_overlay_on_exactly_the_stock_xts_tags() {
+        let parsed = bundled().unwrap();
+        let mut resolved: Vec<&str> = parsed
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.trunk_overlay().is_some())
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        resolved.sort_unstable();
+        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(resolved, expected);
+        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
+            .trunk_overlay()
+            .is_none());
+        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
+            .trunk_overlay()
+            .is_none());
+        let first = parsed.models["qwen3.8:flash-next"].trunk_overlay().unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            assert_eq!(
+                parsed.models[tag].trunk_overlay().as_ref(),
+                Some(&first),
+                "{tag}"
+            );
+        }
+        let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(alias_tag, "qwen3.8:flash-next");
+        assert_eq!(aliased.trunk_overlay().as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn the_wire_registry_has_no_trunk_overlay_field() {
+        // The overlay pin is compiled into the client; the registry schema is
+        // unchanged so older clients' strict v1 parser keeps accepting it.
+        assert!(!BUNDLED_REGISTRY.contains("trunk_overlay"));
+        assert!(!include_str!("../../../registry/models.json").contains("trunk_overlay"));
+        let mut value: serde_json::Value = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        value["models"]["qwen3.8:flash-next"]["trunk_overlay"] = serde_json::json!({
+            "file": TRUNK_OVERLAY_FILE
+        });
+        assert!(
+            RegistryV1::parse(&value.to_string(), "fixture").is_err(),
+            "ModelEntry stays deny_unknown_fields"
         );
     }
 
@@ -1930,7 +2188,7 @@ mod tests {
         assert_eq!(settings.min_p, Some(0.0));
         assert_eq!(settings.presence_penalty, Some(0.0));
         assert_eq!(settings.repeat_penalty, Some(1.0));
-        assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             settings.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1947,7 +2205,7 @@ mod tests {
         assert_eq!(general.min_p, Some(0.0));
         assert_eq!(general.presence_penalty, Some(0.0));
         assert_eq!(general.repeat_penalty, Some(1.0));
-        assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(general.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             general.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1990,7 +2248,7 @@ mod tests {
         assert!(flash_layer.get("generation.max_tokens").is_none());
         assert_eq!(
             layer.get("reasoning.effort"),
-            Some(&ConfigValue::String("xhigh".into()))
+            Some(&ConfigValue::String("medium".into()))
         );
         // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
         let qwen3_raw = r#"{
@@ -2006,6 +2264,50 @@ mod tests {
         assert!(q3_layer.get("memory.kv_backend").is_none());
         assert!(q3_layer.get("memory.max_seq").is_none());
         assert!(q3_layer.get("generation.max_tokens").is_none());
+    }
+
+    /// Qwen3.8 dense tiers and both Ornith 1.5 artifacts share the effort-native
+    /// Qwen3.8 contract: the registry default and general profile are medium.
+    /// Flash-Next (Qwen4, arch_id=16), sidecar drafts, and the intentional
+    /// Ornith coding/instruct profiles are unchanged.
+    #[test]
+    fn bundled_qwen38_family_effort_defaults_medium() {
+        let registry = bundled().unwrap();
+        let mut tiers = 0;
+        for (tag, entry) in &registry.models {
+            let is_dense_trunk = tag.starts_with("qwen3.8:27b") && !tag.contains("-draft");
+            let is_ornith = tag.starts_with("ornith-1.5:");
+            if !is_dense_trunk && !is_ornith {
+                continue;
+            }
+            let settings = entry
+                .recommended_settings
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tag} must carry recommended_settings"));
+            assert_eq!(
+                settings.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} recommended_settings effort"
+            );
+            let general = entry
+                .sampling_profile("general")
+                .unwrap_or_else(|| panic!("{tag} must carry a general profile"));
+            assert_eq!(
+                general.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} general profile effort"
+            );
+            tiers += 1;
+        }
+        assert!(tiers >= 15, "13 Qwen3.8-27B tiers plus 2 Ornith artifacts");
+
+        // Flash-Next (arch_id=16) never carried an effort default.
+        let (_, flash) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(flash.arch_id, Some(16));
+        assert!(!flash
+            .recommended_settings
+            .as_ref()
+            .is_some_and(|settings| settings.reasoning_effort.is_some()));
     }
 
     #[test]
@@ -2528,6 +2830,258 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_27b_dflash_auto_is_scoped_to_paired_trunk_tiers() {
+        // `speculation.dflash = "auto"` is lowered only for canonical Qwen3.8-27B
+        // trunk tags (`qwen3.8:27b`, `qwen3.8:27b-*`) that declare a `dflash`
+        // sidecar, are not draft/dflash sidecars, and are not arch_id=16.
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq3":{{"repo":"x","file":"qwen3.8-27b.mq3","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-xt":{{"repo":"x","file":"qwen3.8-27b.mq4-xt","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.8:27b-dflash-mq4":{{"repo":"x","file":"qwen38-27b-dflash.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:27b":{{"repo":"x","file":"qwen3.5-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3:8b":{{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.8:9b":{{"repo":"x","file":"qwen3.8-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{
+                "qwen3.8":"qwen3.8:27b",
+                "qwen3.8:latest":"qwen3.8:27b",
+                "qwen3.8:27b-mq4":"qwen3.8:27b",
+                "qwen3.8:fast":"qwen3.8:27b-mq4-xt",
+                "qwen3.8:27b-fast":"qwen3.8:27b-mq4-xt"
+            }}
+        }}"#
+        );
+        let registry = RegistryV1::parse(&raw, "test").unwrap();
+        let auto_value = ConfigValue::String("auto".into());
+        let auto = Some(&auto_value);
+
+        // Canonical tags and every alias that resolves to an eligible tag.
+        for input in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq4-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:27b-mq4",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(layer.get("speculation.dflash"), auto, "{input}->{tag}");
+            // Only the dflash mode is added; MTP and the ngram/mode knobs are untouched.
+            assert!(layer.get("speculation.mtp").is_none(), "{input}->{tag}");
+            assert!(layer.get("speculation.mode").is_none(), "{input}->{tag}");
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(81920)),
+                "{input}->{tag} keeps the existing max_tokens policy"
+            );
+        }
+
+        // Same family/tier without a registry dflash declaration, a longer
+        // lookalike tier, arch_id=16, draft/dflash sidecar tags, and other
+        // families/sizes never get the policy.
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.8:27b-dflash-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:27b",
+            "qwen3:8b",
+            "qwen3.8:9b",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                layer.get("speculation.dflash").is_none(),
+                "{tag} must not default DFlash"
+            );
+        }
+
+        // arch_id and the dflash declaration are both required, not just the tag.
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let mut no_dflash = entry.clone();
+        no_dflash.dflash = None;
+        assert!(config_layer_for_tag(tag, &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        let mut qwen4 = entry.clone();
+        qwen4.arch_id = Some(16);
+        assert!(config_layer_for_tag(tag, &qwen4)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        // A different tag with the same dflash-less entry stays off too.
+        assert!(config_layer_for_tag("qwen3.8:27b-mq4-pro", &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+    }
+
+    #[test]
+    fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
+        // Source-grounded against checked-in registry/v1.json: DFlash-paired
+        // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
+        // declaration), Flash-Next, drafts, and other families do not.
+        let registry = bundled().unwrap();
+        let mut auto_tiers = 0;
+        for (tag, entry) in &registry.models {
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            let expected = (tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
+                && !tag.contains("draft")
+                && !tag.contains("dflash")
+                && entry.arch_id != Some(16)
+                && entry.dflash.is_some();
+            assert_eq!(
+                layer.get("speculation.dflash") == Some(&ConfigValue::String("auto".into())),
+                expected,
+                "{tag}"
+            );
+            if expected {
+                auto_tiers += 1;
+            } else {
+                assert!(layer.get("speculation.dflash").is_none(), "{tag}");
+            }
+        }
+        assert!(
+            auto_tiers >= 1,
+            "at least one bundled Qwen3.8-27B tier declares a DFlash draft"
+        );
+        for tag in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq3-xt",
+            "qwen3.8:27b-mq3-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8:27b-mq4-xts",
+            "qwen3.8:27b-mq4-pro",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(entry.dflash.is_some(), "{tag} declares a DFlash draft");
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{tag}"
+            );
+        }
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27b-mq6-pro",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash")
+                    .is_none(),
+                "{tag}"
+            );
+        }
+        for alias in [
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (resolved, entry) = registry.model(alias).unwrap();
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{alias}->{resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_27b_dflash_auto_yields_to_explicit_user_off() {
+        // Registry layer is lowest; global/model/one-shot dflash=off wins.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,"dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let registry_named = || hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let dflash_of = |layers: Vec<hipfire_config::NamedLayer>| {
+            hipfire_config::resolve(layers)
+                .unwrap()
+                .get("speculation.dflash")
+                .map(|item| item.value.clone())
+        };
+        // Registry alone: auto beats the BuiltIn off default.
+        assert_eq!(
+            dflash_of(vec![registry_named()]),
+            Some(ConfigValue::String("auto".into()))
+        );
+        // Explicit global-user off wins.
+        let mut global_off = ConfigLayer::default();
+        global_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::GlobalUser {
+                        path: std::path::PathBuf::from("/tmp/global.toml"),
+                    },
+                    layer: global_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
+        // Explicit per-model-user off wins too.
+        let mut model_off = ConfigLayer::default();
+        model_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::ModelUser {
+                        model: tag.to_owned(),
+                        path: std::path::PathBuf::from("/tmp/model.toml"),
+                    },
+                    layer: model_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
+    }
+
+    #[test]
     fn tag_policy_explicit_override_wins_over_registry() {
         // Registry tag policy is a low-precedence layer; global/model/one-shot user config wins.
         let raw = r#"{
@@ -2800,21 +3354,22 @@ mod tests {
             }
         }
 
-        // Both Ornith 1.5 artifacts share the release contract:
-        // default/general/coding xhigh, instruct none, and no named
+        // Both Ornith 1.5 artifacts share the Qwen3.8 effort-native contract:
+        // default/general medium (hipfire default; xhigh stays selectable),
+        // explicit coding profile xhigh, instruct none, and no named
         // thinking_budget (absence = uncapped).
         for tag in ["ornith-1.5:35b-a3b", "ornith-1.5:35b-a3b-mq4r"] {
             let (_, ornith) = registry
                 .model(tag)
                 .unwrap_or_else(|| panic!("{tag} must exist"));
             let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
-            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("medium"));
             assert!(
                 ornith_rs.thinking_budget.is_none(),
                 "{tag} effort-native: absence means uncapped"
             );
             let ornith_general = ornith.sampling_profile("general").unwrap();
-            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("medium"));
             assert!(ornith_general.thinking_budget.is_none());
             let ornith_coding = ornith.sampling_profile("coding").unwrap();
             assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));

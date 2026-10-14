@@ -114,6 +114,16 @@ impl EffectiveMesh {
     pub const fn is_single(self) -> bool {
         self.pp == 1 && self.tp == 1 && self.ep == 1
     }
+
+    /// Expert-parallel degrees Qwen4 admits: 512 experts divide evenly and the
+    /// replicated program runs on 1, 2 or 4 cards.
+    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+
+    /// The meshes Qwen4 admits: no pipeline or tensor parallelism, expert
+    /// parallelism of 1, 2 or 4 ranks.
+    pub const fn is_qwen4_admitted(self) -> bool {
+        self.pp == 1 && self.tp == 1 && (self.ep == 1 || self.ep == 2 || self.ep == 4)
+    }
 }
 
 impl Default for EffectiveMesh {
@@ -419,7 +429,7 @@ impl fmt::Display for AdmissionError {
             }
             Self::NonSingleMesh(mesh) => write!(
                 f,
-                "qwen4 admission: only Single is admitted (pp={}, tp={}, ep={})",
+                "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
                 mesh.pp, mesh.tp, mesh.ep
             ),
             Self::UnsupportedFormat(format) => {
@@ -471,7 +481,7 @@ impl Qwen4Admission {
                 Qwen4Capability::NativeMtp,
             ));
         }
-        if !request.effective_mesh.is_single() {
+        if !request.effective_mesh.is_qwen4_admitted() {
             return Err(AdmissionError::NonSingleMesh(request.effective_mesh));
         }
         if !request.artifact.format.is_hfqm() {
@@ -680,5 +690,47 @@ mod tests {
         assert_eq!(geometry.conv_dtype, QuantFormat::BF16);
         assert_eq!(geometry.metadata_dtype, QuantFormat::I64);
         geometry.validate().expect("manifest recipe");
+    }
+
+    #[test]
+    fn ep_mesh_matrix_admits_one_two_four_only() {
+        let admit = |mesh: EffectiveMesh, mtp: bool| {
+            let artifact = Qwen4Artifact::manifest_hfqm();
+            let request = if mtp {
+                Qwen4AdmissionRequest::text_mtp(mesh, artifact)
+            } else {
+                Qwen4AdmissionRequest::text_ar(mesh, artifact)
+            };
+            Qwen4Admission::admit(&config(), &request)
+        };
+        for ep in [1, 2, 4] {
+            let mesh = EffectiveMesh::new(1, 1, ep);
+            assert!(mesh.is_qwen4_admitted());
+            assert_eq!(admit(mesh, false).expect("ep AR admitted").effective_mesh.ep, ep);
+        }
+        assert!(EffectiveMesh::single().is_single());
+        assert!(!EffectiveMesh::new(1, 1, 2).is_single());
+        // 3 is not a divisor-of-512 rank count the program shards to; 0 is malformed.
+        for ep in [0, 3, 5, 8] {
+            assert!(matches!(
+                admit(EffectiveMesh::new(1, 1, ep), false),
+                Err(AdmissionError::NonSingleMesh(_))
+            ));
+        }
+        // pp / tp stay refused at every ep.
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4), (4, 1, 4)] {
+            assert!(matches!(
+                admit(EffectiveMesh::new(pp, tp, ep), false),
+                Err(AdmissionError::NonSingleMesh(_))
+            ));
+        }
+        // Native MTP is admitted on every admitted mesh: under EP the drafter
+        // is replicated on every rank.
+        assert!(admit(EffectiveMesh::single(), true).is_ok());
+        for ep in [2, 4] {
+            let admitted = admit(EffectiveMesh::new(1, 1, ep), true).expect("EP native MTP");
+            assert!(admitted.native_mtp);
+            assert_eq!(admitted.effective_mesh.ep, ep);
+        }
     }
 }

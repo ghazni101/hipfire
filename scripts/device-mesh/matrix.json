@@ -20,7 +20,7 @@
  ],
  "evidence_policy": "issue warpfront/hipfire#666: exact base/producer commits, fixture identities (model sha256, prompt md5, binary md5s, GPU/ROCm/RCCL ids), positive + negative probe commands, disposition.",
  "fixture_lock": {
-  "_note": "Every model file a row consumes, keyed by file name under HIPFIRE_MODELS_DIR. The runner hashes each one before the row runs and files hardware-blocked on any size/sha256 mismatch or unlisted file. Fetch with: hf download <repo> <file> --revision <rev> --local-dir \"$HIPFIRE_MODELS_DIR\". Do not use `hipfire pull` for qwen3.8-27b.mq4-xt: the registry tag now resolves to the re-issued 14987185152-byte upload (80e7c624...), not these bytes.",
+  "_note": "Every model file a row consumes, keyed by file name under HIPFIRE_MODELS_DIR. The runner hashes each one before the row runs and files hardware-blocked on any size/sha256 mismatch or unlisted file. Fetch with: hf download <repo> <file> --revision <rev> --local-dir \"$HIPFIRE_MODELS_DIR\". qwen3.8-27b.mq4-xts is the canonical dense fixture (registry tag qwen3.8:27b-mq4-xts, 14987185152 bytes, sha256 3e38ccba...), so `hipfire pull qwen3.8:27b-mq4-xts` fetches the same file; any other dense file fails the lock.",
   "deepseek-v4-flash-0731-dspark.mq2r": {
    "sha256": "bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e",
    "size_bytes": 5788397278,
@@ -56,10 +56,10 @@
    "size_bytes": 927611840,
    "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen3.8-27b-vision.hfq"
   },
-  "qwen3.8-27b.mq4-xt": {
-   "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
-   "size_bytes": 14980361216,
-   "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen3.8-27b.mq4-xt"
+  "qwen3.8-27b.mq4-xts": {
+   "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
+   "size_bytes": 14987185152,
+   "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/aa80d2cf850739018c8b48b7384e48f58d18dd39/qwen3.8-27b.mq4-xts"
   },
   "qwen38-27b-dflash-mq4.hfq": {
    "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
@@ -80,14 +80,14 @@
     ],
     "positive": [
      "$DAEMON_BIN  # piped-stdin JSONL session (HIPFIRE_DETERMINISTIC=1); see positive_session",
-     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\""
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xts \"Write a haiku about rivers.\""
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -408,7 +408,7 @@
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -522,7 +522,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -605,14 +605,14 @@
      "$DAEMON_BIN  # load with params vision=/nonexistent-vision.hfq; expect wire error, text route still serves"
     ],
     "positive": [
-     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt, assert loaded.vl==false (vision_config embedded, no tower), generate done"
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xts, assert loaded.vl==false (vision_config embedded, no tower), generate done"
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -728,7 +728,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -763,7 +763,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -828,7 +828,7 @@
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1144,14 +1144,14 @@
      "$DAEMON_BIN  # load with pp=99 (unsupported dense cell); expect wire error before teardown, prior model still serves"
     ],
     "positive": [
-     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt, refuse contradictory pp cell, prove zero side effects + prior model usable"
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xts, refuse contradictory pp cell, prove zero side effects + prior model usable"
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1285,14 +1285,14 @@
      "$DAEMON_BIN  # load a directory path as model; expect wire error, no reclassification of the admitted model"
     ],
     "positive": [
-     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt via registry path, unload, reload via filename path; both loaded.arch identical"
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xts via registry path, unload, reload via filename path; both loaded.arch identical"
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1577,7 +1577,7 @@
      "hipfire run --temp 0 --kv-mode q8 /nonexistent-27b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
     ],
     "positive": [
-     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xts \"Write a haiku about rivers.\"",
      "hipfire run --temp 0 --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
     ]
    },
@@ -1585,7 +1585,7 @@
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt",
+    "qwen3.8:27b-mq4-xts",
     "ornith-1.5:35b-a3b-mq4r"
    ],
    "hosts": [
@@ -1616,7 +1616,7 @@
     "HIPFIRE_QWEN35_FIXTURE": "$MODEL"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1151",
@@ -1683,7 +1683,7 @@
     "HIPFIRE_RESET_ROUNDS": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1706,14 +1706,14 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=$MODELS_DIR/qwen38-27b-dflash-mq4.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_DFLASH_DRAFT=$MODELS_DIR/qwen38-27b-dflash-mq4.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
     ],
     "negative": [
-     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1737,18 +1737,18 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1 --nocapture"
     ]
    },
    "env": {
     "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
     "HIPFIRE_HAVE_2_GPU": "1",
     "HIPFIRE_PP_DEVICES": "0,1",
-    "HIPFIRE_PP_RESET_MODEL": "$MODELS_DIR/qwen3.8-27b.mq4-xt",
+    "HIPFIRE_PP_RESET_MODEL": "$MODELS_DIR/qwen3.8-27b.mq4-xts",
     "HIPFIRE_RESET_ROUNDS": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "multi-gpu-2"
@@ -1812,18 +1812,18 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
+     "HIPFIRE_VISION_FIXTURE=\"$MODELS_DIR/qwen3.8-27b.mq4-xts,$MODELS_DIR/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=$MODELS_DIR/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
     ],
     "negative": [
      "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
     ]
    },
    "env": {
-    "HIPFIRE_VISION_FIXTURE": "$MODELS_DIR/qwen3.8-27b.mq4-xt,$MODELS_DIR/qwen3.8-27b-vision.hfq",
+    "HIPFIRE_VISION_FIXTURE": "$MODELS_DIR/qwen3.8-27b.mq4-xts,$MODELS_DIR/qwen3.8-27b-vision.hfq",
     "HIPFIRE_DOTS_OCR_FIXTURE": "$MODELS_DIR/dots-ocr.q8.hfq"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1864,7 +1864,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1201",
@@ -1901,7 +1901,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -1935,7 +1935,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",
@@ -2002,7 +2002,7 @@
     "HIPFIRE_CLI_BIN": "$CLI_BIN"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "multi-gpu-2"
@@ -2021,13 +2021,14 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
     ],
     "negative": []
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt",
-    "ornith-1.5:35b-a3b-mq4r"
+    "qwen3.8:27b-mq4-xts",
+    "ornith-1.5:35b-a3b-mq4r",
+    "qwen3.6:35b-a3b-mq4r"
    ],
    "hosts": [
     "gfx1201",
@@ -2036,16 +2037,17 @@
    ],
    "id": "g1-route-oracles-nonllama",
    "milestone": "G1",
-   "note": "Single-route cells (Qwen35 dense + MoE, fresh load A vs B, bitwise). The PP/TP mesh cells are g1-route-oracles-mesh; the EP cell is g5-ep2-vs-single-physical.",
+   "note": "Single-route cells (Qwen35 dense, Ornith MoE and Qwen3.6 MoE, fresh load A vs B, bitwise). The PP/TP mesh cells are g1-route-oracles-mesh; the EP cell is g5-ep2-vs-single-physical.",
    "predicate": {
     "forbid": [
      "skip:"
     ],
     "kind": "cargo",
-    "min_passed": 2,
+    "min_passed": 3,
     "require": [
      "g1-single-oracle[dense]: PASS",
-     "g1-single-oracle[moe]: PASS"
+     "g1-single-oracle[moe]: PASS",
+     "g1-single-oracle[moe-qwen3.6]: PASS"
     ]
    },
    "probe": "existing",
@@ -2055,8 +2057,8 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture",
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts cargo test -p hipfire-arch-qwen35 --release --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1 --nocapture"
     ]
    },
    "env": {
@@ -2065,7 +2067,7 @@
     "HIPFIRE_TP_USE_RCCL": "0"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "multi-gpu-2"
@@ -2249,7 +2251,7 @@
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.8:27b-mq4-xt"
+    "qwen3.8:27b-mq4-xts"
    ],
    "hosts": [
     "gfx1100",

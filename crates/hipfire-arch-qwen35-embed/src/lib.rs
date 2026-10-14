@@ -50,9 +50,15 @@
 //!   encoders in `hipfire-arch-diffusion` make (~1e-3 relative vs the f32
 //!   reference, not bit-exact). The checkpoint ships f32; an f16-quantized
 //!   `.hfq` of it loads the same way.
-//! - **One sequence per encode.** No padding masks: each request encodes a
-//!   single input, so `attention_text_f32` needs no `key_mask` and GDN needs
-//!   no cumulative padding mask. Batching is a follow-up.
+//! - **One sequence per encode; concurrency batches at the engine.** The
+//!   forward itself takes a single input — no padding masks: `attention_text_f32`
+//!   needs no `key_mask` and GDN needs no cumulative padding mask. Concurrent
+//!   `embed` requests are batched one level up by the multi-slot engine
+//!   (`serve.multi_slot`, `slot_engine.rs`): the sequences are row-concatenated
+//!   into one forward (per-segment GDN state resets, bidirectional attention
+//!   bounded by each segment's `n_valid`), bit-exact against running them
+//!   serially. The forward API stayed single-sequence; the engine owns the
+//!   batch dimension.
 //! - **Two source kinds, both supported.** The HF safetensors directory is
 //!   the native form; a `.hfq` built from it by `hipfire-quantize` loads too.
 //!   The two need different access (`HfqFile`'s native methods, with an owned
@@ -64,7 +70,7 @@
 //!   error sits at its format's bit-width level.
 //! - **The vision tower can live in host RAM.** It is ~250 MB of the model's
 //!   ~740 MB and only an image request touches it, so when the card cannot
-//!   hold everything (`HIPFIRE_EMBED_VISION_OFFLOAD`, auto by default) the
+//!   hold everything (`HIPFIRE_EMBED_VISION_OFFLOAD`, unset = auto) the
 //!   tower's weights are host-mapped and read over PCIe, leaving the trunk
 //!   resident. Text-only embedding then runs on a card whose desktop is
 //!   holding most of it, instead of failing to load; image requests pay PCIe

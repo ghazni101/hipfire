@@ -4788,6 +4788,7 @@ pub fn generate_spec(
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = max_tokens.saturating_sub(generated);
         let window_seed = seed_token;
+        let mtp_outer_t0 = std::time::Instant::now();
         let step = match spec.step(
             gpu,
             slot,
@@ -4826,6 +4827,16 @@ pub fn generate_spec(
         // stop on a strict prefix (EOT/stop/forced/budget) and must not keep
         // the unobserved tail in host or GPU state.
         let position_before = position;
+        let mtp_phase_timing = hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING").ok().as_deref() == Some("1");
+        if mtp_phase_timing {
+            eprintln!(
+                "QWEN35_MTP_STEP {{\"event\":\"mtp_step\",\"pos\":{position_before},\"emit\":{},\"proposed\":{},\"accepted\":{},\"step_us\":{}}}",
+                committed_tail.len(),
+                step.proposed,
+                step.accepted,
+                mtp_outer_t0.elapsed().as_micros() as u64,
+            );
+        }
 
         let mut hit_eos = false;
         let mut think_cap_hit = false;
@@ -5297,6 +5308,12 @@ pub fn generate_spec(
         }
         if hit_eos || think_cap_hit {
             break;
+        }
+        if mtp_phase_timing {
+            eprintln!(
+                "QWEN35_MTP_LOOP {{\"event\":\"mtp_loop\",\"pos\":{position_before},\"loop_us\":{}}}",
+                mtp_outer_t0.elapsed().as_micros() as u64,
+            );
         }
     }
 

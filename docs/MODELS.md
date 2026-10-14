@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-10-07 for the Flash-Next MQ4 XTS naming contract.
+**Last checked:** 2026-10-13 against `registry/models.json` (90 tags, 82 aliases) on the 0.4.2 beta line.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
@@ -38,7 +38,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ## Registry tags (from `registry/models.json`)
 
-Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (`default_kv_mode` when set; else empty — global `kv_cache=auto` resolves to the architecture default: Qwen native `fp8` on eligible exact gfx1201, otherwise `q8`), **Notes** (`desc`, truncated).
+Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
 
 ### Qwen 3.5 dense / hybrid
 
@@ -76,7 +76,7 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.6:35b-a3b-mq5` | `qwen3.6-35b-a3b.mq5` | 23.7 | 26 | | Quality SKU |
 | `qwen3.6:35b-a3b-mq6` | `qwen3.6-35b-a3b.mq6` | 27.7 | 30 | | Max quality |
 
-Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MTP enablement is config/runtime gated (`mtp_mode`, env); registry presence alone is not admission.
+The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`, `ornith-1.5-35b-a3b.mtp`). MTP enablement is config/runtime gated (`mtp_mode`, env); registry presence alone is not admission.
 
 ### Qwen 3.6 dense
 
@@ -92,7 +92,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.8:27b-mq3-xt` | `qwen3.8-27b.mq3-xt` | 11.78 | 13 | q8 | MQ3V2 XT |
 | `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
 | `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
-| `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.98 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
+| `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.99 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
 | `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture ([`AGENTS.md`](../AGENTS.md) §5) |
 | `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base; default; effort-native (`low`/`medium`/`xhigh`, default `xhigh`); uncapped think span unless explicit integer cap |
 | `qwen3.8:27b-mq4-pro` | `qwen3.8-27b.mq4-pro` | 16.46 | 18 | q8 | MQ4V2 Pro |
@@ -132,6 +132,14 @@ The historical RTN-asymmetric `qwen3.8-flash-next.mq4`
 (`qwen3.8:flash-next-rtn-asym`) is a different artifact and is never migrated.
 Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-next-bench-fixture).
 
+Other Flash-Next registry entries, retained for provenance and not the default:
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `qwen3.8:flash-next-mq4-xts-zab` | `qwen3.8-flash-next.mq4-xts-zab` | 125.1 | 128 | **Local-only** (empty `repo`): not uploaded, not pullable |
+| `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | Previous canonical rung (RTN-asymmetric experts), superseded by MQ4 XTS |
+| `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | Earlier canonical rung, superseded |
+
 ### DFlash draft artifacts (registry)
 
 | Tag | File | Size GB | Min VRAM | Pairs with (by name) |
@@ -145,18 +153,24 @@ Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-nex
 | `qwen3.8:27b-draft-mq4` | `qwen38-27b-dflash-mq4.hfq` | 1.21 | 16 | `qwen3.8:27b*` (recommended controller) |
 | `qwen3.8:27b-draft-mq5` | `qwen38-27b-dflash-mq5.hfq` | 1.43 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `qwen3.8:27b-draft-mq6` | `qwen38-27b-dflash-mq6.hfq` | 1.66 | 16 | `qwen3.8:27b*` (same-bit alt) |
-| `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
+| `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` (no filename auto-pairing: attach with `HIPFIRE_DFLASH_DRAFT`) |
 
-Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — default `dflash_mode` is **`off`** (pull ≠ enable); `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
+DSpark draft sidecars are declared on the DeepSeek V4 Flash entries (`deepseek-v4-flash` → `deepseek-v4-flash-0731-dspark.mq2r`, `deepseek-v4-flash:mq2lloyd` → `deepseek-v4-flash-0731-dspark.mq2lloyd`, `deepseek-v4-flash-preview` → `deepseek-v4-flash-dspark.mq2lloyd`); the preview entry also declares an MTP sidecar (`deepseek-v4-flash-mtp.mq2lloyd`). `speculation` accepts `dspark` ([`CONFIG.md`](CONFIG.md#speculative-decode)); see [`GLOSSARY.md`](GLOSSARY.md) for the DSpark path.
+
+Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — the schema default `dflash_mode` is **`off`** (pull ≠ enable) with one registry-scoped exception: the Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b` and the `mq3*` / `mq4*` tiers) get `auto` from the registry layer, so the draft is used when its file is present and the load keeps MTP `auto` when it is absent (an explicit `dflash_mode=off` wins; [`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). Elsewhere `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
 Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — default **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so text loads pay no tower VRAM); `auto` uses the registry/sibling sidecar when present and stays silently text-only when absent; `on` requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
-MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above (`mq3*`, `mq4*`, `mq5*`, `mq6*`) declares the shared `mtp.file` `qwen3.8-27b.mtp` (225,716,224 B, sha256 `f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e`), so `hipfire pull <tag>` fetches it once for all tiers. It is the native `mtp.*` layer of the public `Qwen/Qwen3.8-27B` checkpoint, packed by `hipfire-quantize`'s `mtp_extract --quant mq4` (arch 21). It carries no trunk weights: the head reuses the trunk's embeddings and `lm_head`, which is why one file serves every tier. The MQ4L tiers and the DFlash drafts declare no head.
+MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above (`mq3*`, `mq4*`, `mq5*`, `mq6*`) declares the shared `mtp.file` `qwen3.8-27b.mtp` (225,716,224 B, sha256 `f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e`), so `hipfire pull <tag>` fetches it once for all tiers. It is the native `mtp.*` layer of the public `Qwen/Qwen3.8-27B` checkpoint, packed by `hipfire-quantize`'s `mtp_extract --quant mq4` (arch 21). It carries no trunk weights: the head reuses the trunk's embeddings and `lm_head`, which is why one file serves every tier. The DFlash drafts declare no head.
 - `speculation` and `mtp_mode` ([`CONFIG.md`](CONFIG.md#speculative-decode)) both default to `auto`, so a resolved head runs on every request. The load logs `MTP head loaded (sidecar …)` and each request logs `drafter=mtp`. `off` never loads the head, and `on` fails the load without it.
 - Lookup order: `mtp.file` in the models directory, then `<file>.mtp` beside the model path as typed, then beside the canonical (symlink-resolved) trunk. A head placed beside a symlinked trunk is therefore found.
 - The loader refuses a head whose hidden size or vocab differs from the trunk's (for example a 35B-A3B head beside a 27B trunk). `auto` falls back to AR with one log line, and `on` fails the load with the two sets of dimensions.
 - On gfx1201 with H2 (`qwen3.8:27b-mq4-xts`), MTP decode against AR measured 1.09–1.65× on six of eight task genres, 0.96× on a tool answer and 0.95× on code editing. Greedy MTP output matches its own verifier's argmax, but it can differ from greedy AR output.
 - `hipfire rm` keeps the shared head while another installed tier still declares it ([`CLI.md`](CLI.md)).
+
+Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to one base artifact (sha256 `8b15b6fe…`, 125288544792 B), and the client carries a compiled-in pin for it naming `qwen3.8-flash-next.mq4-xts.trunk-overlay` (305543168 B, sha256 `df49bc0a…`, always the canonical base file name plus `.trunk-overlay`, whichever legacy spelling the wire entry uses) in `hipfire-models/qwen3.8-flash-next`. `hipfire pull <tag>` fetches it next to the base. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
+- `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
+- `hipfire rm` removes the overlay with its base; the local-only `qwen3.8:flash-next-mq4-xts-zab` tier is the same bytes baked into one file and declares no overlay.
 
 ### Qwen3 (non-3.5) dense HF4
 
@@ -188,15 +202,39 @@ MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above 
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `deepseek-v4-flash` | `deepseek-v4-flash-0731.mq2lloyd` | 86.2 | 96 | current 0731 release; DSpark sidecar; default low `reasoning_effort`, uncapped think span (no named budget) |
-| `deepseek-v4-flash:mq2r` | `deepseek-v4-flash-0731.mq2r` | 82 | 96 | current 0731 golden MQ2R; MQ2-Lloyd routed experts + MFP4-E8 dense route; matching `.mq2r` DSpark sidecar |
-| `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | prior nwoolmer preview package, retained under an explicit preview identity |
+| `deepseek-v4-flash` | `deepseek-v4-flash-0731.mq2r` | 82 | 96 | Current 0731 release, MQ2R (default SKU); KV `f32`; target-aligned DSpark sidecar; default low `reasoning_effort`, uncapped think span (no named budget) |
+| `deepseek-v4-flash:mq2lloyd` | `deepseek-v4-flash-0731.mq2lloyd` | 86.2 | 96 | Previous default (MQ2-Lloyd), retained; KV `f32`; DSpark sidecar |
+| `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | Prior preview package, retained under an explicit preview identity; declares MTP and DSpark sidecars |
 | `minimax-m2.7` | `MiniMax-M2.7.mq2` | 79.2 | 96 | arch_id=10 Mixtral-style MoE |
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
 | `vibethinker:3b-mq6` | `vibethinker-3b.mq6.hfq` | 2.51 | 5.0 | Qwen2 MQ6 |
 | `muse-glimmer` | `muse-glimmer-30b.mq4` | 18.61 | 26 | 30B dense + perception encoder; MQ4 quality trunk; always-on Onyx reasoning with strength dial; default uncapped think span |
 | `muse-glimmer:fast` | `muse-glimmer-30b.mq4r` | 16.26 | 24 | MQ4R speed SKU (MQ4 body and attention, Q8 lm_head); same Onyx reasoning contract as `muse-glimmer` |
+
+### Bonsai 27B (1-bit / ternary)
+
+| Tag | File | Size GB | Min VRAM | Default KV | Notes |
+|---|---|---:|---:|---|---|
+| `bonsai:27b-bq1` | `bonsai-27b.bq1` | 3.8 | 5 | q8 | BQ1G128, 1.14 bpw; smallest 27B in the registry |
+| `bonsai:27b-tq2` | `bonsai-27b.tq2` | 7.16 | 8 | q8 | TQ2G128 ternary, 2.125 bpw; the `bonsai` alias target |
+
+Registry `desc` carries dated KLD and tok/s figures for these tags; they are registry text, not a live baseline.
+
+### Maple-Preview (natively ternary MoE)
+
+| Tag | File | Size GB | Min VRAM | Default KV | Notes |
+|---|---|---:|---:|---|---|
+| `maple-preview` | `maple-preview.mq2lloydu` | 6.5 | 12 | bf16 | 20B-A1B natively ternary MoE (arch 15); MQ2G256LloydU packs the body value-exactly; optional `q4k` / `bf16` head packs; reasoning model |
+
+### Image generation (FLUX.1, arch 40)
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `flux.schnell:1` | `flux-schnell-transformer.hfq` | 23.8 | 24 | Step-distilled (4 default steps); pull fetches the trunk plus T5 / CLIP / VAE sidecars |
+| `flux.dev:1` | `flux-dev-transformer.hfq` | 23.8 | 24 | **Local-only placeholder**: FLUX.1-dev packs are not redistributable and are never uploaded |
+
+Served by `hipfire img <tag>` and `/v1/images/generations`; see [`IMAGEGEN.md`](IMAGEGEN.md) and [`CLI.md`](CLI.md).
 
 ### LFM2.5 (registry)
 
@@ -211,15 +249,13 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
 
 ### Gemma4 (registry — no published artifact yet)
 
-> **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.** The
-> rows below are the *intended* tag layout for when the quantize + upload lane
-> publishes; the current `registry/models.json` intentionally lists **zero**
-> `gemma4:` tags so that no registry row can point at a 404. See the report at
-> the bottom of this section for the exact repos/files to publish.
+> **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.**
+> The current `registry/models.json` intentionally lists **zero** `gemma4:`
+> tags so that no registry row can point at a 404. The architecture notes below
+> describe the runtime crate only.
 
-**Architecture ground truth** (`crates/hipfire-arch-gemma4/src/config.rs`,
-`crates/hipfire-arch-gemma4/src/lowered.rs`, and
-`crates/hipfire-arch-gemma4/src/gemma4.rs`):
+**Architecture ground truth** (`crates/hipfire-arch-gemma4/src/config.rs`
+and `crates/hipfire-arch-gemma4/src/gemma4.rs`):
 
 - **Hybrid 5:1 sliding:global** — every 6th layer is global (full) attention.
   The per-layer `layer_types` array is authoritative; on the 12B dense text
@@ -237,7 +273,7 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
   weight-less, implemented with a ones-filled scratch buffer).
 - **KV head counts (variant-dependent):** 12B text — `num_attention_heads = 16`,
   `num_key_value_heads = 8` (sliding) and `num_global_key_value_heads` defaults
-  to sliding when absent; 31B target (per `lowered.rs` comments) — `n_heads = 32`,
+  to sliding when absent; 31B target — `n_heads = 32`,
   `sliding_n_kv_heads = 16`, `full_n_kv_heads = 4`, `sliding_head_dim = 256`,
   `full_head_dim = 512`, `hidden_dim = 21504`. The 12B `hidden_dim` is
   `intermediate_size = 15360`, `dim = 3840`.
@@ -269,21 +305,9 @@ Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) wit
   **22** (`gemma4_unified_assistant` EAGLE drafter) — see
   [`architecture-ids.md`](architecture-ids.md).
 
-| Intended tag | Intended file | Repo (to publish) | Notes |
-|---|---|---|---|
-| `gemma4:12b` | `gemma4-12b.mq4` | `schuttdev/hipfire-gemma4-12b` or `hipfire-models/hipfire-gemma4-12b` | 12B dense text, MQ4 default; `hipfire quantize google/gemma-4-12B-it --arch-id 13 --format mq4` |
-| `gemma4:12b-mq4` | `gemma4-12b.mq4` | same as above | alias-style explicit quant suffix |
-| `gemma4:12b-hfq` | `gemma4-12b.hfq` | same repo | HFQ4 variant if published |
-| `gemma4:12b-draft` | `gemma4-12b-draft.mq4.hfq` | same repo or `…-drafter` side-repo | EAGLE draft (arch_id 22) paired with `gemma4:12b` |
+The Gemma4 EAGLE drafter (arch 22) is currently gated off (`HIPFIRE_GEMMA4_EAGLE=1` to enable; see [`architecture-ids.md`](architecture-ids.md)).
 
-No Gemma4 rows are registered until the files above (or the 27B/31B MoE
-variants) are actually on the Hub and pass `scripts/registry_gen.py` LFS
-probing — that script is the admission gate and will fail-closed on a missing
-file or mismatched `size_gb`. Publishing steps: `hipfire quantize` → upload to
-the Hub → add a `models.json` entry mirroring a dense neighbour like
-`qwen3.6:27b` (fields: `repo`, `file`, `size_gb`, `min_vram_gb`, `desc`,
-`recommended_settings` with temp 1.0/top_p 0.95/top_k 64) → run
-`scripts/registry_gen.py` to stamp `sha256`/`size_bytes`/`arch_id`/`quant`.
+No Gemma4 rows are registered until a quantized artifact is actually on the Hub and passes `scripts/registry_gen.py` probing: that script checks LFS presence and `size_gb` against the real file and fails the run on a mismatch.
 
 ---
 
@@ -311,9 +335,13 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `carnice` | `carnice:9b` |
 | `qwopus` | `qwopus:9b` |
 | `qwopus:{4b,9b,27b}-{mq4,hf4}` | matching primary `qwopus:{4b,9b,27b}` tag |
-| `deepseek4` / `deepseek-v4` | `deepseek-v4-flash` |
-| `deepseek4:mq2r` / `deepseek-v4:mq2r` | `deepseek-v4-flash:mq2r` |
-| `deepseek4:preview` / `deepseek-v4:preview` | `deepseek-v4-flash-preview` |
+| `deepseek4` / `deepseek-v4` / `deepseek-v4-flash-0731` / `ds4` (also `:0731`) | `deepseek-v4-flash` |
+| `deepseek4:mq2r` / `deepseek-v4:mq2r` / `deepseek-v4-flash:mq2r` / `ds4:mq2r` (also `-0731:mq2r`, `:0731-mq2r`) | `deepseek-v4-flash` (MQ2R is the default SKU) |
+| `deepseek4:mq2lloyd` / `deepseek-v4:mq2lloyd` / `deepseek-v4-flash-0731:mq2lloyd` / `ds4:mq2lloyd` (also `:0731-mq2lloyd`) | `deepseek-v4-flash:mq2lloyd` |
+| `deepseek4:preview` / `deepseek-v4:preview` / `ds4:preview` | `deepseek-v4-flash-preview` |
+| `bonsai` | `bonsai:27b-tq2` |
+| `qwen3.8:flash` | `qwen3.8:flash-next` |
+| `muse-glimmer:30b-draft` / `muse-glimmer:30b:draft` / `muse-glimmer-30b:draft` | `muse-glimmer:draft` |
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
@@ -326,22 +354,26 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 
 | Family | arch_id | Crate | Registry examples |
 |---|---:|---|---|
-| LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, many GGUF/HF4 dense |
-| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, carnice/qwopus dense |
-| Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b`, `nex-n2:mini` |
+| LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, `qwen3:0.6b` (HF4 dense) |
+| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense |
+| Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b*`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
-| DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash` |
+| DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash`, `deepseek-v4-flash:mq2lloyd`, `deepseek-v4-flash-preview` |
 | MiniMax-M2 | 10 | `hipfire-arch-minimax` | `minimax-m2.7` |
 | LFM2.5 dense **and** MoE | 11 | `hipfire-arch-lfm2moe` | all `lfm2.5:*` |
 | Cohere2-MoE | 12 | `hipfire-arch-cohere2moe` | `north-mini-code` |
-| Gemma4 text (dense) | 13 | `hipfire-arch-gemma4` | *(none yet — awaiting publish; intended `gemma4:12b`)* |
-| Gemma4 unified-assistant (EAGLE drafter) | 22 | `hipfire-arch-gemma4` `drafter` | *(none yet; intended `gemma4:12b-draft` sidecar for 13)* |
+| Gemma4 text (dense) | 13 | `hipfire-arch-gemma4` | *(no registry tag yet)* |
+| Gemma4 unified-assistant (EAGLE drafter) | 22 | `hipfire-arch-gemma4` `drafter` | *(no registry tag; drafter gated off)* |
+| Muse Glimmer (dense text) | 14 | `hipfire-arch-muse-glimmer` | `muse-glimmer`, `muse-glimmer:fast` (draft: arch 23) |
+| Maple-Preview (ternary MoE) | 15 | `hipfire-arch-maple` | `maple-preview` |
+| Qwen3.8-Flash-Next / Qwen4 experimental | 16 | `hipfire-arch-qwen4` | `qwen3.8:flash-next*` |
+| FLUX.1 MMDiT | 40 | `hipfire-arch-diffusion` | `flux.schnell:1`, `flux.dev:1` |
 
 **Dense LFM2.5 is supported on arch_id 11.** The LFM config parser treats `num_experts == 0` as dense SwiGLU on every layer (`crates/hipfire-arch-lfm2moe/src/config.rs`). Do **not** claim dense LFM is unsupported.
 
 `hipfire-arch-lfm2moe` is a **non-optional** dependency of `hipfire-loader` / daemon load paths on this tree (see crate `Cargo.toml` graphs). Feature flags on `hipfire-runtime` default set do not list a separate `arch-lfm2moe` toggle the way some other arches do — loader always links the crate.
 
-Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
+Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Speculation capability inventory: [`speculation-support-inventory.md`](speculation-support-inventory.md) (current inventory; capability is not admission). Product claims need source + [`admissions.yml`](admissions.yml).
 
 ### LFM optimized prefill — branch-only, not in this tree
 
@@ -391,10 +423,10 @@ Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 
 ```text
 ~/.hipfire/models/
   <registry file names>
-  optional sibling drafts / .triattn*.bin sidecars
+  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars); legacy .triattn*.bin sidecars (CASK, deprecated since 0.4.0, removal in 0.5.0)
 ```
 
-Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table.
+Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R and DeepSeek V4 MQ2R routes by file extension is **deprecated since 0.4.0, removal in 0.5.0** (0.5.0 selects by HFQ metadata; no runtime warning).
 
 ---
 

@@ -218,7 +218,15 @@ pub fn generate_embed(
     // Its own knob, NOT HIPFIRE_EMBED_DEBUG: that one also arms the encoder's
     // per-layer finite `trace()`, which syncs the GPU every layer and inflates
     // every number here (measured 678 ms vs 334 ms on the same request).
-    let timed = std::env::var("HIPFIRE_EMBED_PHASE").ok().as_deref() == Some("1");
+
+    // Phase timing under the same knob the encoder's own trace uses. For a
+    // long document the GPU kernel sum is a small fraction of wall-clock, and
+    // this is what shows where the rest goes (gather, JSON of a wide output,
+    // the download).
+    // Its own knob, NOT HIPFIRE_EMBED_DEBUG: that one also arms the encoder's
+    // per-layer finite `trace()`, which syncs the GPU every layer and inflates
+    // every number here (measured 678 ms vs 334 ms on the same request).
+    let timed = hipfire_config::developer_var("HIPFIRE_EMBED_PHASE").ok().as_deref() == Some("1");
     let t_phase = std::time::Instant::now();
     let assembled = match assemble_input(bundle, gpu, kind, &text, image_bytes) {
         Ok(a) => a,
@@ -281,7 +289,6 @@ pub fn generate_embed(
         );
     }
 }
-
 
 /// The arch-18 kinds are isomorphic to the arch-17 ones; map rather than
 /// re-parse.

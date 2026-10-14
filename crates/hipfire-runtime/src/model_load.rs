@@ -8,27 +8,37 @@
 use crate::device_mesh::{DeviceMesh, DimKind};
 use crate::llama::{EmbeddingFormat, WeightTensor};
 use crate::multi_gpu::Gpus;
+use crate::offload::{ExpertResidency, LayerResidency, Placement, WeightResidency};
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Where each piece of the model lands across a device slice. `single` = the
 /// n==1 degenerate case (everything on device 0). Moved verbatim from
 /// `hipfire-arch-qwen35::qwen35::Layout` — arch-agnostic (depends only on `Gpus`).
+///
+/// `placement` carries the *storage* tier of each layer beside its device: a
+/// contiguously spilled prefix is a pipeline split whose first stage is host RAM
+/// rather than a device, which is why it belongs on this object and not on a new
+/// one. Nothing here decides the placement — the loader resolves it once, before
+/// the first allocation, and attaches it with [`Layout::with_placement`].
 pub struct Layout {
     output_device: usize,
     layer_to_device: Vec<usize>,
+    placement: Placement,
 }
 impl Layout {
     pub fn single(n_layers: usize) -> Self {
         Self {
             output_device: 0,
             layer_to_device: vec![0; n_layers],
+            placement: Placement::all_device(n_layers),
         }
     }
     pub fn from_gpus(g: &Gpus, n_layers: usize) -> Self {
         Self {
             output_device: g.output_device,
             layer_to_device: (0..n_layers).map(|i| g.device_for_layer(i)).collect(),
+            placement: Placement::all_device(n_layers),
         }
     }
 
@@ -63,6 +73,7 @@ impl Layout {
                 .device_of(&output_coord)
                 .expect("output stage coordinate is in bounds on an admitted mesh"),
             layer_to_device,
+            placement: Placement::all_device(n_layers),
         }
     }
 
@@ -97,6 +108,34 @@ impl Layout {
     }
     pub fn output_device(&self) -> usize {
         self.output_device
+    }
+
+    /// Attach a placement resolved by the loader.
+    ///
+    /// The placement must cover exactly the layers this layout bands; a mismatch
+    /// is a loader bug, not a user error, so it is asserted rather than refused.
+    pub fn with_placement(mut self, placement: Placement) -> Self {
+        assert_eq!(
+            placement.n_layers(),
+            self.layer_to_device.len(),
+            "placement covers {} layers but the layout bands {}",
+            placement.n_layers(),
+            self.layer_to_device.len()
+        );
+        self.placement = placement;
+        self
+    }
+
+    pub fn placement(&self) -> &Placement {
+        &self.placement
+    }
+
+    /// One layer's resolved storage tier, as the `WeightSource` seam consumes it.
+    pub fn residency(&self, layer: usize) -> LayerResidency {
+        LayerResidency {
+            weights: self.placement.layer(layer),
+            experts: self.placement.experts(layer),
+        }
     }
 }
 
@@ -135,7 +174,20 @@ pub trait WeightSource {
         embd_fmt: EmbeddingFormat,
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)>;
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<Self::Layer>;
+    /// Read one layer's weights at the residency the loader resolved for it.
+    ///
+    /// `residency` is the storage tier the placement fixed: `weights` for the
+    /// layer's own tensors, `experts` for its routed experts. An impl that cannot
+    /// honour a requested tier must refuse (the decode fails closed on
+    /// `MemoryTarget::HostMapped` for the formats it cannot host) rather than
+    /// place the weights on the device — silently resident is exactly the failure
+    /// a configured spill must never degrade into.
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        residency: LayerResidency,
+    ) -> HipResult<Self::Layer>;
     /// Release one successfully loaded layer during whole-model rollback.
     ///
     /// Layer ownership is architecture-specific (Qwen3.5 carries MoE
@@ -348,7 +400,9 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
 
     fn read_layer(&mut self, layer_idx: usize) -> Result<Self::Layer, Self::Error> {
         let device = self.layout.device_for_layer(layer_idx);
-        self.source.read_layer(&mut self.devices[device], layer_idx)
+        let residency = self.layout.residency(layer_idx);
+        self.source
+            .read_layer(&mut self.devices[device], layer_idx, residency)
     }
 
     fn free_layer(&mut self, layer_idx: usize, layer: Self::Layer) {
@@ -436,7 +490,9 @@ fn load_weights_inner<S: WeightSource>(
     };
     let staged = match fault {
         None => run_staged_load(&mut ops, n_devices, n_devices == 1)?,
-        Some(fault) => run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?,
+        Some(fault) => {
+            run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?
+        }
     };
     Ok(LoadedWeights {
         token_embd: staged.token_embd,
@@ -733,8 +789,8 @@ mod tests {
                 "seam fault {fault:?} must fire"
             );
             source.assert_clean();
-            let loaded = run_staged_load(&mut source, 2, false)
-                .expect("production retry after seam fault");
+            let loaded =
+                run_staged_load(&mut source, 2, false).expect("production retry after seam fault");
             // Non-aliased output owns primary + metadata: 1 embed + 1 norm +
             // 2 output + 4 layers live after a clean production load.
             assert_eq!(source.allocator.live.len(), 8);

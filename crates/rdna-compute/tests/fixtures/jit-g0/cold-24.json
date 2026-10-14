@@ -139,8 +139,8 @@
   },
   {
     "module": "kv_cache_write_fp8_e4m3_batched",
-    "sha256": "2bc1f18954c5a0cf43e4cf3b915822319ab06004cf6e3782d550b76e116a7221",
+    "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
     "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/kv_cache_write_fp8_e4m3_batched.hip",
-    "source_md5": "c72396fcca778b6b7f7332cf17f97929"
+    "source_md5": "5c57194f41ebbfba257da42ac0e6988a"
   }
 ]

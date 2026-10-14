@@ -553,7 +553,7 @@ Phase 1 creates the helper modules below so Phase 2 has disjoint ownership. Publ
 | Attention | `crates/hipfire-arch-lfm2moe/src/prefill_attention.rs` | QKV, Q/K norm, RoPE, KV writes, hd64 causal flash, out residual | no `forward.rs`, state struct, conv source, dense/MoE helper edits |
 | Dense projection/FFN | `crates/hipfire-arch-lfm2moe/src/prefill_dense.rs` | Q8 and MQ4/FWHT dense call sites, gate/up BT choice, residual down | no attention, MoE, state sizing, or chunk loop edits |
 | MoE Path 2 | `crates/hipfire-arch-lfm2moe/src/prefill_moe.rs` | LFM sigmoid+bias routing adapter and existing grouped-WMMA Path-2 invocation | no decode `_k8`, no dense/attention/state ownership, no m2/i8 |
-| State/scratch/chunking | `crates/hipfire-arch-lfm2moe/src/lfm2moe.rs`, `crates/hipfire-arch-lfm2moe/src/forward.rs` | allocation, env capacity, chunk loop, cross-chunk state, final head | no stage helper or HIP kernel edits |
+| State, scratch, and chunking | `crates/hipfire-arch-lfm2moe/src/lfm2moe.rs`, `crates/hipfire-arch-lfm2moe/src/forward.rs` | allocation, env capacity, chunk loop, cross-chunk state, final head | no stage helper or HIP kernel edits |
 
 `crates/hipfire-arch-lfm2moe/src/kernels.rs`, `src/lib.rs`, and daemon selection are frozen after Phase 1 and are conductor-owned integration files, not lane files. Lane branches do not edit them. Shared parity and benchmark harnesses are conductor-run and are not lane-owned. Integration is by reviewed cherry-pick, never rsync.
 

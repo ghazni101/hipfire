@@ -13,7 +13,7 @@ Parent family spec: [`qwen35-vl-mq4v2-spec.md`](../qwen35-vl-mq4v2-spec.md)
 (§3 "Runtime — verify-only" plus §4 shared artifact contract; this record is
 the scoped fix for the one part of §3 verification that FAILED live)
 Sibling narrow spec:
-[`docs/specs/2026-08-27-lfm2-vl-vision-runtime.md`](../../../) on
+[`docs/specs/2026-08-27-lfm2-vl-vision-runtime.md`](2026-08-27-lfm2-vl-vision-runtime.md) on
 `feat/lfm2-vl` — the same two stream-contract fixes were landed there for the
 arch-11 carrier; this branch ports them and nothing else from that branch.
 

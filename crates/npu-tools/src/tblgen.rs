@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Generate checked-in Rust AIE2P metadata; no vendor compiler or runtime.
 //!
-//! Usage: `tblgen --llvm ref/llvm-aie --output crates/pm-npu/src/isa/gen.rs`
+//! Usage: `tblgen --llvm ref/llvm-aie --output crates/peacemaker-npu/src/isa/gen.rs`
 //! Requires upstream llvm-tblgen-18 and its include directory. The temporary
 //! compatibility root excludes compiler ISel patterns, not encoding records; it
 //! preserves dontcare as variables instead of TableGen's default zero. Generated
@@ -41,7 +41,7 @@ pub struct Operand { pub name: &'static str, pub kind: &'static str, pub width: 
 pub struct Encoding { pub name: &'static str, pub mnemonic: &'static str, pub asm: &'static str, pub slot: Slot, pub mask: u64, pub value: u64, pub dontcare_mask: u64, pub fields: &'static [BitField], pub operands: &'static [Operand], pub itinerary: &'static str, pub constraints: &'static str }
 "#;
 
-const DESCRIPTION: &str = "Generate checked-in Rust AIE2P metadata; no vendor compiler or runtime.\n\nUsage: npu-tools tblgen2rs --llvm ref/llvm-aie --output crates/pm-npu/src/isa/gen.rs\nRequires upstream llvm-tblgen-18 and its include directory. The temporary\ncompatibility root excludes compiler ISel patterns, not encoding records; it\npreserves dontcare as variables instead of TableGen's default zero. Generated\nruntime code has no dependency on Python, LLVM, or the reference checkout.\n";
+const DESCRIPTION: &str = "Generate checked-in Rust AIE2P metadata; no vendor compiler or runtime.\n\nUsage: npu-tools tblgen2rs --llvm ref/llvm-aie --output crates/peacemaker-npu/src/isa/gen.rs\nRequires upstream llvm-tblgen-18 and its include directory. The temporary\ncompatibility root excludes compiler ISel patterns, not encoding records; it\npreserves dontcare as variables instead of TableGen's default zero. Generated\nruntime code has no dependency on Python, LLVM, or the reference checkout.\n";
 
 type Res<T> = Result<T, String>;
 

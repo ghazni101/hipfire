@@ -6,7 +6,10 @@ vector path is tested against). Companion to
 [`qt-register.txt`](qt-register.txt) (the authoritative qt-number allocation).
 
 **Every format the crate can decode has a vector kernel.** This file exists to say
-which kernel, under which gate, and what the kernel still does not cover.
+which kernel, under which gate, and what the kernel still does not cover. The
+`CpuQuant` set is the CPU-offload subset of the qt space (see
+[`qt-register.txt`](qt-register.txt) for the full allocation); being listed here
+is a decode/kernel fact, not product admission of that format.
 
 Source of truth in-tree:
 - Dispatch gate `simd::row_dot_enabled(q, requested)` and the format→kernel map
@@ -29,7 +32,7 @@ decode core:
 
 | piece | what it does |
 |---|---|
-| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. Eight codes are exactly `BITS` bytes, so 1/2/3/4-bit chunks are one broadcast + one `vpsrlvd` + one mask, and the 40/48-bit 5/6-bit chunks use 64-bit lanes with the low dwords compacted back into eight lanes. |
+| `codes8::<BITS>` | eight `BITS`-wide codes as `i32` lanes. The 1/2/4-bit chunks use a broadcast, `vpsrlvd` and mask. Three-bit chunks include a preceding header/payload byte in a 32-bit memory broadcast and discard it with the vector shifts. Six-bit chunks use two such 24-bit halves in separate 128-bit lanes. Only 5-bit chunks use 64-bit lanes with low-dword compaction. |
 | `codes_dot_sum::<BITS, PAYLOAD>` | `(Σ c·x, Σ x)` over a run of chunks — two vector accumulators, one horizontal sum each per group. |
 | `uniform_group_dot::<BITS, PAYLOAD, CHUNKS>` | `scale·Σ(c·x) + zero·Σx` for one `(scale, zero)` header. |
 | `v2_group_dot::<BITS>` | the V2 family's per-128 `fp16` header, each half scored then affinely corrected. |
@@ -46,10 +49,12 @@ Two consequences worth keeping in mind when adding a format:
   the TQ2/BQ1 pair needs no kernel of its own: `(code-1)·d` and `bit ? +d : -d` are
   the affine form with `(d, -d)` and `(2d, -d)`.
 
-`load_le` reads *exactly* a chunk's `BITS` bytes — a wider load would be one
-instruction cheaper and would run up to three bytes past the group on its last
-chunk, which the caller's row slice licenses only for rows that are not the
-tensor's last.
+`load_le` reads exactly the 1/2/4/5-bit chunk's bytes. The 3/6-bit decoder
+instead reads a preceding byte within the same group allocation, never beyond
+the payload's end. Its callers require a nonempty header at compile time;
+even the first chunk follows an 8-byte header or a 16-byte MQ3-Lloyd codebook.
+The prefix is removed by logical vector shifts, with no change to the decoded
+codes, floating-point accumulation order, or single-/multi-row layout.
 
 `Mq4G256` (qt 13) keeps a hand-unrolled nibble group (32 codes per 16-byte load)
 rather than the `codes8` path; its recorded measurements were taken with it.
@@ -82,6 +87,7 @@ grouped quant (plain tensor, 256-element "group").
 | 20 | MQ3G256Lloyd | 112 | 8-entry `fp16` codebook | 3-bit indices | yes | `mq3g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 30 | MQ4G256Lloyd | 160 | 16-entry `fp16` codebook | nibble indices | yes | `mq4g256lloyd_row_dot` | AVX2 + FMA + F16C |
 | 31 | MQ5G256 | 168 | f32 `scale`+`zero` | 5-bit packs | yes | `mq5g256_row_dot` | AVX2 + FMA |
+| 34 | MFP4G32E8 | 152 | 16 B row header (`fp16` row scale) + eight 17 B blocks/256 (1 B E8 scale + 16 B nibbles) | 4-bit lattice codes | yes | `mfp4g32_e8_row_dot` | AVX2 + FMA + F16C |
 | 40 | TQ2G128 | 34/128 | `fp16` `d` | 2-bit codes, `(code-1)·d` | no | `tq2g128_row_dot` | AVX2 + FMA + F16C |
 | 41 | BQ1G128 | 18/128 | `fp16` `d` | sign bits, `±d` | no | `bq1g128_row_dot` | AVX2 + FMA + F16C |
 | 44 | MQ4G256V2 | 136 | per-128 `fp16` `[s z]×2` | nibbles | yes | `mq4g256v2_row_dot` | AVX2 + FMA + F16C |
@@ -113,11 +119,16 @@ any runner.
   the crate has no decode for them at all (so a step over one stays on the GPU
   over PCIe): qt 0/4 (`Q4F16G64`/`Q4K`, GGUF-side), qt 5 (`Q8HFQ`, padded rows the
   group model cannot express), qt 14 (`MQ8G256`, `RotationPlan::Mq8Internal` —
-  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32-37
-  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales), qt 28/29
+  an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32/33/35/36/37
+  (HFP4/MFP4 family: per-row 16 B header + per-32 block scales — qt 34 `MFP4G32E8`
+  is covered above), qt 28/29
   (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
-  (`MQ{2,3}G256GL`, MoE-indexed only). See `quant.rs`'s test module for the
-  itemised reasoning.
+  (`MQ{2,3}G256GL`, MoE-indexed only), qt 22 (`TidI32`, a routing table, not a
+  weight), qt 42 (`MFP4G32E8G128`, qt 34 row layout with 128-wide rotation
+  groups), qt 52 (`MQ4G256V2L`, codes index an external per-tensor
+  `lloyd_levels` sidecar rather than a per-group header), qt 53 (`MQ4G128V2`,
+  68 B per-128 groups, admitted by typed Qwen4 consumers only). See `quant.rs`'s
+  test module for the itemised reasoning on the older entries.
 - **Non-x86_64.** `avx2_available()` is `false`, so every format stays scalar;
   there is no NEON path.
 - **MoE / non-qwen35 arches** are out of scope for the CPU-offload *work* (the
@@ -133,7 +144,7 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
 
 ## Verification
 
-`cargo test -p hipfire-cpu` (26 tests, GPU-free — the crate is a leaf):
+`cargo test -p hipfire-cpu` (GPU-free — the crate is a leaf):
 
 - `every_cpu_decodable_format_has_a_kernel` — the kernel table in `simd::tests`
   names exactly the formats `from_quant_type` maps, and nothing else. A format
@@ -153,7 +164,7 @@ qt 49 for `qwen3.8-27b.mq3-xt`.
   against an independent f64 oracle over every format.
 
 Beyond the crate, `cargo test -p hipfire-arch-qwen35 --test gpu_gemv_parity --
---ignored` (needs the GPU; run here on gfx1201) compares the **production GPU
+--ignored` (needs the GPU; run on a gfx1201 device) compares the **production GPU
 launcher** against this crate's GEMV with the vector path active: real fixture
 tensors (`qwen3.5-2b.mq4`, `qwen3.5-2b.mq6`, `qwen3.5-2b.mq3` — qt 13/15/**20** —
 and `qwen3.5-9b.mq4`, with AWQ and pre-rotated arms, m up to 12288, k up to 6144)
@@ -171,8 +182,9 @@ this arch` on gfx1201, so their parity could not run (the crate's
 canonical-table oracle still covers them); and F16/F32/Bf16 are absent from the
 test's synthesised table, so those three rest on the crate tests alone.
 
-Kernel-level microbench (m=4096, k=5120, same rayon pool both arms, best of 3 —
-not a serve-path measurement), speedup of the AVX2 row dot over the scalar decode:
+Kernel-level microbench (historical landing-time measurement; m=4096, k=5120,
+same rayon pool both arms, best of 3 — not a serve-path measurement, re-measure
+before quoting), speedup of the AVX2 row dot over the scalar decode:
 
 | qt | speedup | qt | speedup | qt | speedup | qt | speedup |
 |---:|---:|---:|---:|---:|---:|---:|---:|

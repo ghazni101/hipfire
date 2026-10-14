@@ -26,7 +26,9 @@ do not carry that full identity manifest, so this page is **historical** only
    still not a product default or route certificate. Any product-default or
    admission claim **additionally** requires an explicit row in
    [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
-2. Many older rows used the then-default `asym3` KV mode, now legacy. Current
+2. Many older rows used the then-default `asym3` KV mode (Givens asymmetric KV),
+   which is **deprecated since 0.4.0, removal in 0.5.0** — historical
+   reproduction only. Current
    clean configs resolve `kv_cache=auto` through the model registry and
    otherwise to the architecture default (Qwen native `fp8` on eligible exact
    gfx1201, `q8` elsewhere). Do not compare asym3 rows to q8 or fp8 rows as
@@ -129,7 +131,7 @@ continuations diverged could net-lose.
 | Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
 **Config context for the snapshot (not a timeless default):** CLI default
-`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`); DFlash is opt-in until a campaign
+`dflash_mode` is `"off"` (`crates/hipfire-config/src/lib.rs`), except that the Qwen3.8-27B tiers with a registry-declared draft resolve `auto` ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); DFlash is opt-in elsewhere until a campaign
 proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 (dense Qwen 3.5+ on, A3B off unless overridden) or per model with
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
@@ -176,9 +178,9 @@ Supporting dated notes (still fixture-bound):
   through typed dispatch tables. Presence of a kernel path ≠ Redline admission
   and ≠ a row in [`admissions.yml`](admissions.yml).
 - gfx906 (Vega 20) prefill batch≥16 used the nwarps=4 dp4a MMQ kernel
-  (`docs/plans/gfx906-mmq-prd.md`). Decode batch=1 notes from the 2026-05-05
+  ([`plans/gfx906-mmq-prd.md`](plans/gfx906-mmq-prd.md)). Decode batch=1 notes from the 2026-05-05
   investigation
-  (`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`): residual
+  ([`perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](perf-checkpoints/2026-05-05-gfx906-decode-investigation.md)): residual
   GEMV software-pipelined ILP variant (+4.8% on 9B under that fixture) and fused
   projections pre-quantizing x to Q8_1 with `v_dot4_i32_i8` (+9.3% on 9B).
   Combined historical row: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock

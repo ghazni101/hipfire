@@ -11,7 +11,7 @@ is **methodology and reproduction**, not a gate and not a number store.
 | Sampling forcing proxy | `tools/benchlocal/sampling_proxy.mjs` |
 | Runtime validation routes (mandatory gates) | [`docs/VALIDATION.md`](../VALIDATION.md) |
 | Serve-path harness | [`bench-suite.md`](bench-suite.md), `scripts/serve_harness.py` |
-| Public-comparison interpretation (NAS) | `/mnt/nas/kaden/hipfire/benchlocal/2026-07-31-quality/PUBLISHED-COMPARISON.md` |
+| Public-comparison interpretation (NAS) | `<evidence-root>/hipfire/benchlocal/2026-07-31-quality/PUBLISHED-COMPARISON.md` (`<evidence-root>` = maintainer's local-only NAS evidence root; not in this repository) |
 
 ## What this is and is not
 
@@ -34,7 +34,7 @@ model, replace coherence checks, or redefine validation policy.
 
 ### NAS preservation
 
-Directory: `/mnt/nas/kaden/hipfire/benchlocal/2026-07-31-quality/`
+Directory: `<evidence-root>/hipfire/benchlocal/2026-07-31-quality/` (`<evidence-root>` is the maintainer's local-only NAS evidence root; not in this repository)
 
 | File | Purpose | SHA-256 |
 |---|---|---|
@@ -42,7 +42,7 @@ Directory: `/mnt/nas/kaden/hipfire/benchlocal/2026-07-31-quality/`
 | `SHA256SUMS` | Checksums for the two tarballs + `PUBLISHED-COMPARISON.md` | — |
 | `PUBLISHED-COMPARISON.md` | Public-comparison interpretation and source links | `f874bb284fc62d5f7591afa5d7cb435ae88e9370423afb17c4c90a2c14d58f9c` |
 | `benchlocal-canonical-runs.tar.gz` | Complete local campaign trees (packs, results, summaries, privileged Hermes scratch recovered with sudo); 14303 entries | `216face118f3b346eb42824612d3f809158d7d226c80bda29ccf08592efa8618` |
-| `hiptrx-scratch-homes.tar.gz` | Remote GPU sandbox homes, binaries, logs, and result dirs from host `hiptrx`; 89 entries | `c8068c569a663d8e5b9db31009862b6360b9bdcf51fa4cdabbe95b37bc987349` |
+| `<host>-scratch-homes.tar.gz` | Remote GPU sandbox homes, binaries, logs, and result dirs from the 4×gfx1201 GPU host (archive file name is prefixed with that host's name); 89 entries | `c8068c569a663d8e5b9db31009862b6360b9bdcf51fa4cdabbe95b37bc987349` |
 
 Verified archived score summaries (from `MANIFEST.txt`):
 
@@ -57,7 +57,7 @@ Verified archived score summaries (from `MANIFEST.txt`):
 |---|---|
 | `~/.cache/benchlocal-full-20260731T091750Z/` | Baseline packs/, results/, `full-battery-summary.json`, `sampling-proxy.mjs` (+ pre-thinkfix backup) |
 | `~/.cache/benchlocal-medium-20260731T194729Z/` | Medium packs/, results/, `full-battery-medium-summary.json`, medium proxy |
-| `~/benchlocal-*-20260731T*/` on `hiptrx` | Remote sandbox homes (also in `hiptrx-scratch-homes.tar.gz`) |
+| `~/benchlocal-*-20260731T*/` on the 4×gfx1201 GPU host | Remote sandbox homes (also in `<host>-scratch-homes.tar.gz`) |
 
 Campaign roots are always caller-supplied. Do not hardcode `/tmp` as a
 canonical artifact root.
@@ -99,7 +99,7 @@ python3 scripts/benchlocal_campaign.py verify \
   --manifest tools/benchlocal/manifest.json \
   --campaign-root <ABS_PATH>
 
-# 4. Run the four-route matrix (hiptrx, 4 GPUs, Docker sidecars, isolated
+# 4. Run the four-route matrix (4×gfx1201 host, 4 GPUs, Docker sidecars, isolated
 #    HOME per GPU). Starts daemons + sampling proxies as required by
 #    route.proxy_scope, then executes pack argv from the plan:
 python3 scripts/benchlocal_campaign.py run \
@@ -233,7 +233,7 @@ directly with the sampling flags on the CLI argv (see archived
 
 ## Topology
 
-Four concurrent daemons on host **`hiptrx`**, one per GPU, each with an
+Four concurrent daemons on the 4×gfx1201 GPU host, one per GPU, each with an
 isolated `HOME` (`homes/gpu0..gpu3` in the remote scratch tree).
 
 Port rule (from the manifest):

@@ -699,7 +699,7 @@ pub fn moe_down_writes_expanded(routed_down: DType, has_dtype_tags: bool) -> boo
 
 // ── Dispatch parameters ────────────────────────────────
 
-/// Host-resident routed weights used only by the generic CPU-top-K fallback.
+/// Host-side routed weight views for generic CPU-top-K fallback and dispatch metadata.
 ///
 /// Implementations return borrowed dispatch views on demand so model hot paths
 /// do not rebuild an expert-reference vector for every token.
@@ -707,6 +707,36 @@ pub trait RoutedExpertWeights {
     fn len(&self) -> usize;
 
     fn get(&self, expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)>;
+
+    /// Representative `(gate_up, down)` host-mapped residency, read from the
+    /// owning allocations without querying HIP or traversing the expert table.
+    ///
+    /// The default supports owner-backed `get(0)` tensors and fails closed for
+    /// empty sets and borrowed views. Packed adapters must override this using
+    /// their allocation owners: a borrowed buffer is not residency metadata.
+    fn host_mapped_projections(&self) -> (bool, bool) {
+        self.get(0).map_or((false, false), |(gate_up, down)| {
+            (
+                gate_up.buf.buf.is_host_mapped(),
+                down.buf.buf.is_host_mapped(),
+            )
+        })
+    }
+
+    /// CPU-splice payload for one selected expert: the packed byte spans plus
+    /// their canonical CPU decoder. `None` (the default) means this adapter
+    /// cannot resolve one, and the caller must supply its own resolver — the
+    /// historical contract. Host-placed packed adapters override this using
+    /// their allocation owners, exactly as they do for
+    /// [`Self::host_mapped_projections`]: a borrowed per-expert view is not
+    /// enough to find the owning bucket.
+    fn cpu_splice_expert(
+        &self,
+        _gpu: &Gpu,
+        _expert_idx: usize,
+    ) -> Option<crate::cpu_exec::CpuMoeExpert<'_>> {
+        None
+    }
 
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -727,6 +757,111 @@ pub trait RoutedExpertWeights {
     fn host_mapped(&self) -> bool {
         false
     }
+}
+
+/// Expert-parallel row exchange for the indexed decode MoE and the few-row
+/// grouped QT44/QT53 prefill.
+///
+/// Invoked once per MoE call after the routed down producer wrote `slots`
+/// unweighted expanded rows (slot order, `slots = rows * k`) into
+/// `down_expanded` and before the canonical combine reads them. The
+/// implementation must leave every slot whose expert this rank owns untouched
+/// and overwrite every other slot with the owning rank's bits (a copy, never
+/// arithmetic), so the unchanged combine folds exactly the rows a single
+/// device would have produced. Decode passes `slots = k`.
+pub trait MoeRowGather {
+    fn gather_rows(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        layer_idx: u16,
+        slots: usize,
+        down_expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String>;
+
+    /// Whether this call's layer uses device-assigned (balanced) ownership:
+    /// the lowering then inserts `MoeStage::OwnerAssign` after routing and
+    /// before any stage that reads the routed expert tables. `false` by
+    /// default (static ownership, no stage).
+    fn assigns_owners(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    /// Rewrite the layer's live expert tables and slot owners from
+    /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
+    /// first routed-table reader of the same call.
+    fn assign_owners(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        Err("owner assignment not supported".into())
+    }
+}
+
+/// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4
+/// prefill (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+///
+/// Every rank runs the same router, top-k and stable grouping, so the grouped
+/// row layout (`expert_tile_ids`, `sorted_slot_index`, `inverse_perm`) is
+/// identical on all ranks. Each rank then computes only the tiles of the
+/// experts it owns: the lowering inserts `MoeStage::TileMask` after the
+/// scatter (a copy of the tile ids with every non-owned tile set to the `-1`
+/// sentinel the symmetric GEMMs already exit on, written to
+/// [`MoeTileExchangeParams::tile_ids_owned`]; gate/up and down read that copy)
+/// and `MoeStage::TileExchange` between the mutation fence and the combine,
+/// where [`Self::exchange`] fills every non-owned live tile's BF16 grouped
+/// rows of `y_down_grouped` from the owning rank (a copy, never arithmetic),
+/// so the unchanged BF16-row combine reads exactly the rows a single device
+/// produced.
+///
+/// Protocol (eager only; all ranks execute the same invocation sequence):
+/// `exchange` records this rank's producer-complete event, passes a host
+/// barrier, waits the peer's event, pulls, records its completion event and
+/// passes a second host barrier; [`Self::before_down`] enqueues, right before
+/// the NEXT invocation's routed down overwrites `y_down_grouped`, the wait for
+/// the peer's completion of the previous pull (the peer reads this rank's
+/// buffer only between its producer and completion events).
+pub trait MoeTileExchange {
+    /// This rank, the device table of the owner rank of every expert (`i32`
+    /// per expert, at least `n_experts` words) and `n_experts`; the mask and
+    /// the pull read them as inputs, never as constants.
+    fn owners(&self) -> (usize, &GpuTensor, usize);
+
+    /// Enqueue, on the launch stream, the wait that the peer finished pulling
+    /// this rank's rows of the previous invocation. Called by the routed down
+    /// stage immediately before it writes `y_down_grouped`; a no-op before the
+    /// first invocation.
+    fn before_down(&self, gpu: &mut rdna_compute::Gpu) -> Result<(), String>;
+
+    /// Cross-rank host barrier (every rank calls it at the same point); used to
+    /// order a rank-local drain (`ep_quiesce`) before any rank launches a chunk
+    /// that reads peer VRAM.
+    fn host_barrier(&self) -> Result<(), String>;
+
+    /// Publish this rank's `y_down_grouped` and pull the peer-owned tiles into
+    /// it. `tile_ids` is the UNMASKED scatter output (the pull's predicate is
+    /// `tile_ids[t] >= 0 && owner(tile_ids[t]) != rank`), `tiles` the padded
+    /// tile capacity (`grouped_rows / 16`).
+    fn exchange(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        layer_idx: u16,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> Result<(), String>;
+}
+
+/// The owner-routed chunk exchange of one MoE call: the transport and the
+/// layer's masked tile id buffer (an `i32` per tile, at least the padded tile
+/// capacity; never aliasing `expert_tile_ids`).
+#[derive(Clone, Copy)]
+pub struct MoeTileExchangeParams<'a> {
+    pub exchange: &'a dyn MoeTileExchange,
+    pub tile_ids_owned: &'a GpuTensor,
 }
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from
@@ -752,6 +887,15 @@ pub struct MoeParams<'a> {
     /// output expanded so the architecture layer can combine it into the
     /// residual while producing the next layer's normalized activation.
     pub defer_routed_combine: bool,
+    /// CPU-deferred routed experts (`memory.offload_exec=cpu` on a host-placed
+    /// packed layer). The sealed program keeps the GPU router, rotation, shared
+    /// expert, and residual, but must NOT run the routed
+    /// gate_up/activation/down/combine stages: a host-side batched splice
+    /// (`cpu_exec::moe_cpu_experts`) supplies the routing-weighted routed
+    /// contribution exactly once afterwards, accumulating into `x_residual`.
+    /// Independent of `use_gpu_topk` (the router still runs on the GPU) and
+    /// never a fallback to the per-expert host GEMV path.
+    pub cpu_deferred_experts: bool,
     /// Sealed decode mode (see [`MoeEpMode`]).
     pub ep_mode: MoeEpMode,
     /// Safetensors layer index used by native GPTQ-on-E8 Hessian capture.
@@ -813,6 +957,11 @@ pub struct MoeParams<'a> {
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
+    /// Expert-parallel decode: copy peer-owned expanded rows into
+    /// `down_expanded` between the routed down producer and the combine.
+    /// `None` (every single-device caller) lowers exactly the historical
+    /// stage sequence.
+    pub ep_row_gather: Option<&'a dyn MoeRowGather>,
 }
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────
@@ -1104,6 +1253,14 @@ pub struct MoePrefillParams<'a> {
     /// routed dtype snapshot is pure MQ4. This keeps pure MQ4 models on the
     /// existing i8 default while avoiding mixed-checkpoint corruption.
     pub force_mq4_grouped_fp16: bool,
+    /// CPU-deferred routed experts (see [`MoeParams::cpu_deferred_experts`]).
+    /// Set only for narrow (`<= 4`-row) windows on a CPU-spliced host-placed
+    /// layer: the sealed program keeps normalize/input-basis/router/shared, but
+    /// must NOT run the routed scatter/gate_up/activation/down/combine stages.
+    /// The arch's batched CPU splice supplies the routed contribution once
+    /// afterwards, accumulating into `x_batch`. Wide prefill keeps the real GPU
+    /// grouped read and stays `false`.
+    pub cpu_deferred_experts: bool,
     // routing inputs (model-produced)
     pub topk_indices: &'a GpuTensor,
     pub topk_weights: &'a GpuTensor,
@@ -1158,6 +1315,26 @@ pub struct MoePrefillParams<'a> {
     /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
     /// byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
+    /// Few-row EP row gather (qwen4 EP speculation): when `Some`, the lowering
+    /// admits only the grouped QT44/QT53 branch and inserts a `RowGather` stage
+    /// between the mutation fence and the combine. `None` (the default) changes
+    /// nothing.
+    pub ep_row_gather: Option<&'a dyn MoeRowGather>,
+    /// Where the unfused shared-expert down writes its F32 rows. `None` ⇒
+    /// `down_expanded` (the shared down runs after the combine and would
+    /// otherwise overwrite rows a peer may still be gathering). Required with
+    /// `ep_row_gather`.
+    pub shared_down_out: Option<&'a GpuTensor>,
+    /// Layer index handed to `ep_row_gather` (it selects the gather buffer);
+    /// read only when `ep_row_gather` is `Some`, `0` otherwise.
+    pub ep_layer_idx: u16,
+    /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): when
+    /// `Some`, the lowering admits only the grouped symmetric IU4 prefill (the
+    /// verified-symmetric QT44/QT53 route at >= 512 rows), inserts a
+    /// `TileMask` stage after the scatter and a `TileExchange` stage between the
+    /// mutation fence and the combine, and the grouped gate/up and down read
+    /// the masked tile ids. `None` (the default) changes nothing.
+    pub ep_tile_exchange: Option<MoeTileExchangeParams<'a>>,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///
@@ -1418,11 +1595,20 @@ pub fn gated_moe_prefill_admissible(
     gated_moe_prefill_admissible_for_dtypes(dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
 }
 
+/// Upper extent (rows) of the shared narrow-window width: the MTP verify
+/// window (drafts + 1, capped at 4). Single declaration for every spelling of
+/// this width — the CPU-splice gate (`n <= MAX`) and the verify/coalesced
+/// gates (`2..=MAX`) below all read this. The verify lower bound of 2 is
+/// load-bearing (a 1-row window is decode, not verify) and lives at each
+/// verify use site, not here.
+pub const NARROW_VERIFY_MAX_ROWS: usize = 4;
+
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///
 /// Distinct from [`MoeResolution`] (decode) — prefill adds the Path 0/1/2
 /// grouped-vs-scalar down selection and the Paro i8/k8 levers.
 /// Pure function of [`MoeDtypes`] + arch + [`FeatureFlags`].
+
 pub struct MoePrefillResolution {
     /// Gate_up + down via grouped-GEMM scatter pipeline (Path 2).
     /// Requires WMMA-capable arch (gfx11/gfx12) + `moe_grouped_gemm` flag.
@@ -1453,8 +1639,50 @@ impl MoePrefillResolution {
         arch: &rdna_compute::arch_caps::ArchCaps,
         flags: &rdna_compute::feature_flags::FeatureFlags,
     ) -> Self {
+        Self::resolve_with_batch_ctx(d, arch, flags, 0, false, false)
+    }
+
+    /// Batch- and workload-aware resolution. A narrow *verify* batch (MTP
+    /// verify, n <= 4) whose routed projections are host-mapped takes the
+    /// indexed Path 1. Prompt chunks keep the legacy route regardless of width,
+    /// and so does a verify batch over device-resident experts: the Path 1
+    /// evidence is host-spilled verify only, and Path 1 accumulates in a
+    /// different order than the resident grouped route. `batch == 0` (unknown)
+    /// preserves the legacy shape-blind behavior.
+    ///
+    /// `has_host_projection` is authoritative: the caller MUST set it only when
+    /// the routed projections are actually host-mapped (see
+    /// [`RoutedExpertWeights::host_mapped_projections`]). One exception inside
+    /// the host-mapped case: a host-mapped uniform MQ4 gate_up+down on gfx1201
+    /// with no mixed-expert layer is re-admitted to Path 2 (grouped-WMMA).
+    /// `resolve` (batch0 legacy) always passes `false`.
+    pub fn resolve_with_batch_ctx(
+        d: &MoeDtypes<'_>,
+        arch: &rdna_compute::arch_caps::ArchCaps,
+        flags: &rdna_compute::feature_flags::FeatureFlags,
+        batch: usize,
+        is_verify: bool,
+        has_host_projection: bool,
+    ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
-        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
+        // Resident routed experts never take the narrow-verify route: only a
+        // host-mapped verify window moves to Path 1.
+        let narrow_verify =
+            is_verify && has_host_projection && batch != 0 && batch <= NARROW_VERIFY_MAX_ROWS;
+        // Host-mapped uniform MQ4 gate_up+down on a narrow gfx1201 verify:
+        // re-admit Path 2 (grouped-WMMA) for this one offloaded case. The later
+        // mixed / MQ6 / E8 logic below is unchanged and still governs every
+        // other path. Lower bound of 2 is load-bearing: a 1-row window is
+        // decode, not a verify window, so it must not take the coalesced/Path-2
+        // re-admit.
+        let offloaded_uniform_verify = narrow_verify
+            && (2..=NARROW_VERIFY_MAX_ROWS).contains(&batch)
+            && arch.is_gfx1201()
+            && has_host_projection
+            && !d.routed_has_mixed_experts
+            && matches!(d.routed_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
+            && matches!(d.routed_down, DType::MQ4G256 | DType::MQ4G256V2);
+        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify);
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
@@ -1478,6 +1706,15 @@ impl MoePrefillResolution {
         // tags on any WMMA arch (gfx11 _k2 or gfx12 .gfx12). The routed
         // representative dtype may be MQ6/MQ5 and trip the suppression above,
         // so re-admit Path 2 when the file is graded-mixed (tag table present).
+        //
+        // Load-bearing for CORRECTNESS, not just perf. Measured 2026-10-04 on
+        // qwen3.6-35b-a3b.mq4p: forcing a graded narrow verify onto
+        // both-indexed projections (mixed indexed gate_up AND down together)
+        // drives MTP tau 2.34 -> 0.00 and degenerates the plain AR prompt
+        // prefill (`hipfire run --spec off`) to a repeated-token attractor;
+        // either indexed kernel alone is fine, so this is an all-indexed
+        // interaction, not a single-kernel defect. The narrow-verify gate must
+        // NOT override this re-admit.
         let use_path2 =
             use_path2 || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
         // mfp4-E8 routed experts: use Path 2 (grouped-WMMA) on gfx1151 and gfx12
@@ -1825,5 +2062,241 @@ mod tests {
         let r = MoeResolution::resolve(&d, 6);
         assert!(r.routed_indexable_mq6v2);
         assert!(!r.use_gpu_topk);
+    }
+
+    fn uniform_prefill_dtypes(dtype: DType) -> MoeDtypes<'static> {
+        let mut d = uniform_mq4();
+        d.routed_gate_up = dtype;
+        d.routed_down = dtype;
+        d.experts_all_gate_up_mq4 = dtype == DType::MQ4G256;
+        d.has_paro_shared = dtype == DType::ParoQ4G128;
+        let shared_dtype = match dtype {
+            DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => DType::Q8_0,
+            _ => dtype,
+        };
+        d.shared = Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: shared_dtype,
+            up: shared_dtype,
+            down: shared_dtype,
+        });
+        d
+    }
+
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 6] {
+        // Exhaustive destructuring makes a new resolution field require an
+        // explicit comparison here, without changing the production API.
+        let MoePrefillResolution {
+            use_path2,
+            down_path0,
+            use_paro_i8,
+            use_paro_i8_k8,
+            paro_mode,
+            force_mq4_grouped_fp16,
+        } = r;
+        [
+            *use_path2,
+            *down_path0,
+            *use_paro_i8,
+            *use_paro_i8_k8,
+            *paro_mode,
+            *force_mq4_grouped_fp16,
+        ]
+    }
+
+    fn assert_resident_verify_matches_legacy(d: &MoeDtypes<'_>) {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942"] {
+            for flag_case in 0..4 {
+                let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
+                match flag_case {
+                    1 => flags.moe_grouped_gemm = false,
+                    2 => flags.moe_grouped_i8 = Some(true),
+                    3 => {
+                        flags.moe_paro_i8 = Some(false);
+                        flags.moe_paro_i8_k8 = Some(false);
+                    }
+                    _ => {}
+                }
+                let flags = std::sync::Arc::new(flags);
+                let arch = rdna_compute::arch_caps::ArchCaps::new(arch_name, flags.clone());
+                let legacy = MoePrefillResolution::resolve(d, &arch, &flags);
+                // Unknown width, decode, every narrow verify width, and the
+                // first wide verify all retain the resident legacy route.
+                for batch in 0..=NARROW_VERIFY_MAX_ROWS + 1 {
+                    let resident = MoePrefillResolution::resolve_with_batch_ctx(
+                        d, &arch, &flags, batch, true, false,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&resident),
+                        prefill_resolution_fields(&legacy),
+                        "{arch_name}, {:?}/{:?}, mixed={}, flags={flag_case}, batch={batch}",
+                        d.routed_gate_up, d.routed_down, d.routed_has_mixed_experts,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_resident_verify_uniform_matches_legacy_all_fields() {
+        for dtype in [
+            DType::MQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256,
+            DType::MFP4G32E8,
+            DType::MFP3G32E8,
+            DType::MFP2G32E8,
+            DType::ParoQ4G128,
+        ] {
+            assert_resident_verify_matches_legacy(&uniform_prefill_dtypes(dtype));
+        }
+    }
+
+    #[test]
+    fn prefill_resident_verify_mixed_experts_matches_legacy_all_fields() {
+        for representative in [DType::MQ4G256, DType::MQ6G256, DType::MQ6G256V2, DType::MQ5G256] {
+            let mut d = uniform_prefill_dtypes(representative);
+            d.routed_has_mixed_experts = true;
+            d.experts_all_gate_up_mq4 = false;
+            d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ6G256V2]);
+            d.per_expert_down = Some(&[DType::MQ6G256, DType::MQ4G256V2]);
+            assert_resident_verify_matches_legacy(&d);
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_uniform_mq4_gfx1201_narrow_readmits_path2() {
+        let ctx = crate::context::DispatchCtx::for_test("gfx1201");
+        for dtype in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = uniform_prefill_dtypes(dtype);
+            let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert!(legacy.use_path2);
+            for batch in 2..=NARROW_VERIFY_MAX_ROWS {
+                let host = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &ctx.flags, batch, true, true,
+                );
+                assert!(host.use_path2, "{dtype:?}, batch={batch}");
+                assert_eq!(
+                    prefill_resolution_fields(&host),
+                    prefill_resolution_fields(&legacy),
+                    "{dtype:?}, batch={batch}",
+                );
+            }
+            let decode = MoePrefillResolution::resolve_with_batch_ctx(
+                &d, &ctx.arch, &ctx.flags, 1, true, true,
+            );
+            assert!(!decode.use_path2, "one row must not take the Path 2 re-admit");
+
+            let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
+            flags.moe_grouped_gemm = false;
+            for batch in 2..=NARROW_VERIFY_MAX_ROWS {
+                let disabled = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &flags, batch, true, true,
+                );
+                assert!(!disabled.use_path2, "re-admit must respect grouped-GEMM opt-out");
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_narrow_verify_keeps_indexed_policy() {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for dtype in [
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ6G256,
+                DType::MQ6G256V2,
+                DType::MQ5G256,
+                DType::MFP4G32E8,
+                DType::MFP3G32E8,
+                DType::MFP2G32E8,
+                DType::ParoQ4G128,
+            ] {
+                let d = uniform_prefill_dtypes(dtype);
+                let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+                for batch in 1..=NARROW_VERIFY_MAX_ROWS {
+                    if arch_name == "gfx1201"
+                        && matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2)
+                        && batch >= 2
+                    {
+                        continue; // Covered by the uniform MQ4 re-admit test.
+                    }
+                    let host = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, true, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&host),
+                        [false, false, false, false, dtype == DType::ParoQ4G128, false],
+                        "{arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+                for batch in [0, NARROW_VERIFY_MAX_ROWS + 1] {
+                    let host = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, true, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&host),
+                        prefill_resolution_fields(&legacy),
+                        "unknown/wide host verify: {arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+                for batch in 0..=NARROW_VERIFY_MAX_ROWS + 1 {
+                    let prompt = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, false, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&prompt),
+                        prefill_resolution_fields(&legacy),
+                        "host prompt: {arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_mixed_narrow_verify_keeps_grouped_route() {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            let mut d = uniform_prefill_dtypes(DType::MQ6G256);
+            d.routed_has_mixed_experts = true;
+            d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ6G256]);
+            d.per_expert_down = Some(&[DType::MQ4G256, DType::MQ6G256]);
+            let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert!(legacy.use_path2);
+            for batch in 1..=NARROW_VERIFY_MAX_ROWS {
+                let host = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &ctx.flags, batch, true, true,
+                );
+                assert_eq!(
+                    prefill_resolution_fields(&host),
+                    prefill_resolution_fields(&legacy),
+                    "{arch_name}, mixed host verify, batch={batch}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_window_extent_lower_bound_is_two() {
+        // The shared narrow-window extent: bumping it is a deliberate edit.
+        assert_eq!(NARROW_VERIFY_MAX_ROWS, 4);
+        // The splice-width gate (`n <= MAX`) accepts the 1-row decode window.
+        for n in [1, 2, NARROW_VERIFY_MAX_ROWS] {
+            assert!(n <= NARROW_VERIFY_MAX_ROWS, "splice gate must accept {n}");
+        }
+        assert!(NARROW_VERIFY_MAX_ROWS + 1 > NARROW_VERIFY_MAX_ROWS);
+        // The verify/coalesced gates (`2..=MAX`) admit 2..=MAX but never the
+        // 1-row decode window — that lower bound of 2 is load-bearing for the
+        // gfx1201 Path-2 re-admit and must not be collapsed to `n <= MAX`.
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&1));
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&0));
+        for n in 2..=NARROW_VERIFY_MAX_ROWS {
+            assert!((2..=NARROW_VERIFY_MAX_ROWS).contains(&n), "verify range must admit {n}");
+        }
+        assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
     }
 }

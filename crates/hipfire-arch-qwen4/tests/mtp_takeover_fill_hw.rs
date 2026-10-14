@@ -120,7 +120,7 @@ fn model_path() -> PathBuf {
 fn summary_of(arm: &Arm, stdout: &str) -> Value {
     let lines: Vec<&str> = stdout
         .lines()
-        .filter_map(|line| line.strip_prefix(SUMMARY_PREFIX))
+        .filter_map(|line| line.split_once(SUMMARY_PREFIX).map(|(_, json)| json))
         .collect();
     assert_eq!(
         lines.len(),
@@ -143,6 +143,16 @@ fn summary_of(arm: &Arm, stdout: &str) -> Value {
         arm.name
     );
     summary
+}
+
+#[test]
+fn takeover_summary_accepts_libtest_prefix() {
+    let stdout = concat!(
+        "test mtp_takeover_fill_arm ... MTP_TAKEOVER_FILL_SUMMARY ",
+        "{\"arm\":\"batched-fill\",\"result\":{}}\n",
+        "ok\n"
+    );
+    assert_eq!(summary_of(&ARMS[0], stdout)["result"], json!({}));
 }
 
 /// `event == "window"` trace objects emitted by the drafter on stderr.

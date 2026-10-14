@@ -6,7 +6,10 @@
 // Usage:
 //   hfq_overlay_subset <output.hfq> <input.hfq> \
 //     [--name <exact-name>]... [--suffix <name-suffix>]... \
-//     [--rename <old-name>=<new-name>]...
+//     [--rename <old-name>=<new-name>]... \
+//     [--qt44-payload-dir <directory>]
+// The payload option imports already encoded rank-2 QT44 matrices, using the
+// input's names/shapes and metadata; it never decodes or requantizes weights.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
@@ -47,6 +50,7 @@ fn main() -> io::Result<()> {
     let mut exact = BTreeSet::<String>::new();
     let mut suffixes = Vec::<String>::new();
     let mut renames = BTreeMap::<String, String>::new();
+    let mut qt44_payload_dir = None;
     let mut index = 3;
     while index < args.len() {
         if index + 1 == args.len() {
@@ -57,6 +61,11 @@ fn main() -> io::Result<()> {
                 exact.insert(args[index + 1].clone());
             }
             "--suffix" => suffixes.push(args[index + 1].clone()),
+            "--qt44-payload-dir" => {
+                if qt44_payload_dir.replace(PathBuf::from(&args[index + 1])).is_some() {
+                    return Err(invalid("duplicate --qt44-payload-dir"));
+                }
+            }
             "--rename" => {
                 let (old, new) = args[index + 1]
                     .split_once('=')
@@ -114,6 +123,23 @@ fn main() -> io::Result<()> {
     if output_names.len() != selected.len() {
         return Err(invalid("selectors/renames produce duplicate output names"));
     }
+    if let Some(directory) = &qt44_payload_dir {
+        for tensor in &mut selected {
+            if tensor.shape.len() != 2 || tensor.shape[1] % 256 != 0 {
+                return Err(invalid(format!("{}: QT44 requires rank 2 and K divisible by 256", tensor.name)));
+            }
+            let path = directory.join(format!("{}.bin", tensor.name));
+            let expected = u64::from(tensor.shape[0]) * u64::from(tensor.shape[1] / 256) * 136;
+            let actual = std::fs::metadata(&path)?.len();
+            if actual != expected {
+                return Err(invalid(format!("{}: {actual} bytes != QT44 expected {expected}", path.display())));
+            }
+            tensor.quant_type = 44;
+            tensor.group_size = 256;
+            tensor.data_offset = 0;
+            tensor.data_size = actual;
+        }
+    }
 
     let encoded_index = encode_index(&selected)?;
     let metadata_offset = 32_u64;
@@ -139,11 +165,18 @@ fn main() -> io::Result<()> {
     let mut buffer = vec![0_u8; 16 * 1024 * 1024];
     let mut payload_bytes = 0_u64;
     for tensor in &selected {
-        input_file.seek(SeekFrom::Start(tensor.data_offset))?;
+        let mut payload_file;
+        let source = if let Some(directory) = &qt44_payload_dir {
+            payload_file = File::open(directory.join(format!("{}.bin", tensor.name)))?;
+            &mut payload_file
+        } else {
+            &mut input_file
+        };
+        source.seek(SeekFrom::Start(tensor.data_offset))?;
         let mut remaining = tensor.data_size;
         while remaining > 0 {
             let chunk = remaining.min(buffer.len() as u64) as usize;
-            input_file.read_exact(&mut buffer[..chunk])?;
+            source.read_exact(&mut buffer[..chunk])?;
             output_file.write_all(&buffer[..chunk])?;
             remaining -= chunk as u64;
             payload_bytes += chunk as u64;
@@ -163,7 +196,7 @@ fn usage(program: &str) -> ! {
     eprintln!(
         "usage: {program} <output.hfq> <input.hfq> \
          [--name <exact-name>]... [--suffix <name-suffix>]... \
-         [--rename <old-name>=<new-name>]..."
+         [--rename <old-name>=<new-name>]... [--qt44-payload-dir <directory>]"
     );
     std::process::exit(2);
 }

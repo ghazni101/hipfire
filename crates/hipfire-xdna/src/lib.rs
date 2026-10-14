@@ -757,11 +757,9 @@ mod imp {
                 unsafe { libc::close(fd) };
                 return Err(e);
             }
-            // mlock attempted; failure only degrades (probe behavior).
-            // SAFETY: our mapping.
-            unsafe {
-                libc::mlock(heap_cpu, HEAP_SIZE);
-            }
+            // No mlock: the driver keeps BO pages resident (pinned, unevictable shmem) and maps them
+            // VM_PFNMAP, where mlock only tests RLIMIT_MEMLOCK and locks nothing. See railgun::npu
+            // `Device::map_heap` for the amdxdna/mm citations.
 
             // --- hardware context ---
             let qos = super::QosInfo::default(); // reference QoS: all zero
@@ -834,10 +832,6 @@ mod imp {
                 unsafe { libc::close(fd) };
                 return Err(e);
             }
-            // SAFETY: our mapping.
-            unsafe {
-                libc::mlock(cmd_ptr, map_len);
-            }
 
             Ok(Self {
                 inner: Arc::new(DeviceInner {
@@ -898,10 +892,6 @@ mod imp {
                     let e = XdnaError::os("alloc-map");
                     cleanup_handle(inner.fd, handle);
                     return Err(e);
-                }
-                // SAFETY: our mapping.
-                unsafe {
-                    libc::mlock(p, map_len);
                 }
                 (p as *mut u8, map_len)
             };

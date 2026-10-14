@@ -1955,22 +1955,25 @@ pub(crate) fn run() {
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
-    // Architectures-first resolution, matching the loader's `derive_arch_id`:
-    // a bare composite class (e.g. `Qwen3_5Model`, the multi-vector embedding
+    // The bare composite class `Qwen3_5Model` (the multi-vector embedding
     // encoder, arch 17) shares its `model_type` (`qwen3_5`) with the causal
-    // LM (5) and is only distinguishable by the architectures field. Without
-    // this the quantizer would stamp 5 and the loader would refuse the .hfq.
-    let arch_class = config
+    // LM (5) and is only distinguishable by the architectures field; without
+    // it the quantizer would stamp 5 and the loader would refuse the .hfq.
+    // Every other checkpoint keeps resolving by `model_type`
+    // (`arch_mapping::quantize_arch_id`).
+    let architectures = config
         .get("architectures")
         .and_then(|a| a.as_array())
-        .and_then(|a| a.iter().find_map(|v| v.as_str()))
-        .and_then(hipfire_runtime::arch_mapping::lookup_architecture);
+        .into_iter()
+        .flat_map(|a| a.iter())
+        .filter_map(|v| v.as_str());
     // Single source of truth for model_type -> arch_id lives in hipfire-runtime::arch_mapping.
     // Fail-closed on unknown model_type: error naming the type and listing supported ones,
     // unless an explicit --arch-id override is supplied (operator knows best).
-    let auto_arch_id: u32 = match arch_class
-        .or_else(|| hipfire_runtime::arch_mapping::lookup_model_type(arch_str))
-    {
+    let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::quantize_arch_id(
+        arch_str,
+        architectures,
+    ) {
         Some(id) => id,
         None => {
             if let Some(ov) = args.arch_id {

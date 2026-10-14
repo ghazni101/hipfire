@@ -15,6 +15,7 @@
 pub mod fclk;
 pub mod tape;
 pub mod hip_runtime;
+pub mod trunk;
 use core::ffi::c_void;
 use core::mem::size_of;
 
@@ -31,6 +32,9 @@ mod sys {
         pub fn lseek(fd: i32, off: i64, whence: i32) -> i64;
         pub fn __errno_location() -> *mut i32;
         pub fn clock_gettime(clock_id: i32, tp: *mut [i64; 2]) -> i32;
+        /// `struct rlimit { rlim_t rlim_cur, rlim_max; }` with 64-bit `rlim_t` (x86_64 Linux).
+        pub fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+        pub fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
     }
     pub const O_RDWR: i32 = 2;
     pub const SEEK_SET: i32 = 0;
@@ -42,9 +46,9 @@ mod sys {
     pub const MAP_PRIVATE: i32 = 2;
     pub const MAP_FIXED: i32 = 0x10;
     pub const MAP_ANON: i32 = 0x20;
-    pub const MAP_LOCKED: i32 = 0x2000;
     pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
     pub const CLOCK_MONOTONIC: i32 = 1;
+    pub const RLIMIT_MEMLOCK: i32 = 8;
 }
 
 pub fn errno() -> i32 {
@@ -270,6 +274,15 @@ impl Device {
         Ok(st.cols_filled)
     }
 
+    // BO mappings (heap, SHMEM/CMD, imported dma-buf, userptr) are never `MAP_LOCKED`: the driver owns their
+    // residency and `MAP_LOCKED` would only test RLIMIT_MEMLOCK (8 MiB under ssh) without locking anything
+    // (Linux 7.3 amdxdna). Pages: drm_gem_get_pages marks the shmem mapping unevictable (drm_gem.c:690); the
+    // heap is pinned for the hwctx lifetime (amdxdna/aie2_ctx.c:699), exec BOs from submit until free
+    // (amdxdna_ctx.c:556, amdxdna_gem.c:649), userptr pages are pin_user_pages(FOLL_LONGTERM)
+    // (amdxdna_ubuf.c:146). The mmap is VM_PFNMAP/VM_MIXEDMAP (drm_gem_shmem_helper.c:784, amdxdna_gem.c:543,
+    // amdxdna_cbuf.c:187, ttm_bo_vm.c:511) and prefaulted page by page (amdxdna_gem.c:483). For such vmas
+    // do_mmap checks the rlimit and fails with EAGAIN (mm/mmap.c:428), then drops VM_LOCKED without charging
+    // locked_vm (mm/vma.c:2747), so VmLck stays 0.
     /// Allocate the DEV_HEAP and map it at a 64 MiB-aligned host VA (the firmware requires the
     /// heap's host mapping alignment under SVA; see the installed shim's `buffer::vaddr`).
     pub fn map_heap(&mut self, len: usize) -> Result<(), String> {
@@ -283,9 +296,9 @@ impl Device {
             return Err(format!("reserve heap VA: errno={}", errno()));
         }
         let aligned = ((reserve as usize + align - 1) & !(align - 1)) as *mut c_void;
-        let host = unsafe { sys::mmap(aligned, len, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_LOCKED | sys::MAP_FIXED, self.fd, gi.map_offset as i64) };
+        let host = unsafe { sys::mmap(aligned, len, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_FIXED, self.fd, gi.map_offset as i64) };
         if host == sys::MAP_FAILED {
-            return Err(format!("mmap heap: errno={} (RLIMIT_MEMLOCK?)", errno()));
+            return Err(format!("mmap heap: errno={}", errno()));
         }
         // Trim the unused parts of the reservation.
         unsafe {
@@ -328,7 +341,7 @@ impl Device {
         ioctl(self.fd, amdxdna::<CreateBo>(CREATE_BO), &mut cb, "create_bo mapped")?;
         let mut gi = GetBoInfo { handle: cb.handle, ..Default::default() };
         ioctl(self.fd, amdxdna::<GetBoInfo>(GET_BO_INFO), &mut gi, "get_bo_info mapped")?;
-        let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_LOCKED, self.fd, gi.map_offset as i64) };
+        let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED, self.fd, gi.map_offset as i64) };
         if host == sys::MAP_FAILED {
             return Err(format!("mmap bo: errno={}", errno()));
         }
@@ -380,7 +393,7 @@ impl Device {
         if unsafe { sys::ioctl(self.fd, amdxdna::<GetBoInfo>(GET_BO_INFO), &mut gi as *mut GetBoInfo as *mut c_void) } < 0 {
             return Err(Error::last_os_error());
         }
-        let host = unsafe { sys::mmap(core::ptr::null_mut(), size, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_LOCKED, self.fd, gi.map_offset as i64) };
+        let host = unsafe { sys::mmap(core::ptr::null_mut(), size, sys::PROT_RW, sys::MAP_SHARED, self.fd, gi.map_offset as i64) };
         if host == sys::MAP_FAILED {
             return Err(Error::last_os_error());
         }
@@ -391,7 +404,9 @@ impl Device {
     }
 
     /// SHMEM BO over caller-owned user pages (`ptr`, `len` page aligned): the driver pins them (`amdxdna_get_ubuf`,
-    /// `pin_user_pages_fast(FOLL_WRITE | FOLL_LONGTERM)`) and imports the resulting dma-buf (`amdxdna_drm_va_tbl`
+    /// `pin_user_pages_fast(FOLL_WRITE | FOLL_LONGTERM)`) and charges them to `RLIMIT_MEMLOCK` through the process's
+    /// pinned_vm (`amdxdna_ubuf.c:127-133`, `ENOMEM` above the limit); see [`ensure_pin_headroom`].
+    /// It imports the resulting dma-buf (`amdxdna_drm_va_tbl`
     /// with one entry). The returned `Bo` owns the GEM handle and its own mmap (`Bo::host`, a second CPU view of the
     /// same pages); under identity SVA the NPU reaches the buffer through that VA. The pages must stay mapped until
     /// the `Bo` is dropped.
@@ -409,7 +424,7 @@ impl Device {
         let mut bo = Bo { handle: cb.handle, xdna: u64::MAX, host: core::ptr::null_mut(), len, mapped: false, fd: self.fd };
         let mut gi = GetBoInfo { handle: cb.handle, ..Default::default() };
         ioctl(self.fd, amdxdna::<GetBoInfo>(GET_BO_INFO), &mut gi, "get_bo_info userptr")?;
-        let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED | sys::MAP_LOCKED, self.fd, gi.map_offset as i64) };
+        let host = unsafe { sys::mmap(core::ptr::null_mut(), len, sys::PROT_RW, sys::MAP_SHARED, self.fd, gi.map_offset as i64) };
         // Linux 7.2 amdxdna refuses mmap of a userptr BO (EINVAL); the caller's mapping is a view of the same pinned
         // pages, so fall back to it (unowned: `mapped` stays false and Drop does not munmap it).
         if host == sys::MAP_FAILED {
@@ -437,6 +452,55 @@ impl Drop for Device {
             sys::close(self.fd);
         }
     }
+}
+
+/// `RLIMIT_MEMLOCK` headroom for `need` more bytes of driver-pinned userptr pages ([`Device::userptr_bo`]).
+///
+/// The driver admits a userptr BO only while pinned_vm (`VmPin`) plus the new pages stays within the soft limit,
+/// unless the process has CAP_IPC_LOCK. When the soft limit is short and the hard limit allows, it is raised to
+/// exactly `VmPin + need`. Otherwise this fails closed and names the bytes and the host fix.
+pub fn ensure_pin_headroom(need: usize) -> Result<(), String> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|e| format!("read /proc/self/status: {e}"))?;
+    let field = |key: &str| status.lines().find_map(|l| l.strip_prefix(key)).map(str::trim);
+    let cap_eff = field("CapEff:").and_then(|v| u64::from_str_radix(v, 16).ok()).ok_or("CapEff missing from /proc/self/status")?;
+    if cap_eff & (1 << CAP_IPC_LOCK) != 0 {
+        return Ok(());
+    }
+    let pinned = field("VmPin:").and_then(|v| v.strip_suffix("kB")).and_then(|v| v.trim().parse::<u64>().ok())
+        .ok_or("VmPin missing from /proc/self/status")? * 1024;
+    let mut lim = [0u64; 2];
+    if unsafe { sys::getrlimit(sys::RLIMIT_MEMLOCK, &mut lim) } != 0 {
+        return Err(format!("getrlimit(RLIMIT_MEMLOCK): errno={}", errno()));
+    }
+    let required = pinned + need as u64;
+    if lim[0] >= required {
+        return Ok(());
+    }
+    if lim[1] < required {
+        return Err(pin_limit_error(need as u64, pinned, lim[1]));
+    }
+    let raised = [required, lim[1]];
+    if unsafe { sys::setrlimit(sys::RLIMIT_MEMLOCK, &raised) } != 0 {
+        return Err(format!("setrlimit(RLIMIT_MEMLOCK soft {} -> {required} B, hard {}): errno={}", lim[0], lim[1], errno()));
+    }
+    eprintln!("npu: RLIMIT_MEMLOCK soft limit raised {} -> {required} B for {need} B of userptr pins (hard limit {} B)", lim[0], lim[1]);
+    Ok(())
+}
+
+const CAP_IPC_LOCK: u32 = 14;
+
+/// Host limit for `required` pinned bytes plus 25% margin, rounded up to the MiB: a bounded value, not `infinity`.
+fn bounded_memlock_bytes(required: u64) -> u64 {
+    (required + required.div_ceil(4)).div_ceil(1 << 20) << 20
+}
+
+fn pin_limit_error(need: u64, pinned: u64, hard: u64) -> String {
+    let required = pinned + need;
+    let bounded = bounded_memlock_bytes(required);
+    format!("RLIMIT_MEMLOCK hard limit {hard} B is below the {required} B the NPU needs to pin ({need} B of userptr \
+        arenas + {pinned} B already pinned); raise the memlock limit of the hipfire process to {bounded} B ({} MiB = \
+        required x1.25): systemd `LimitMEMLOCK={bounded}`, shell `ulimit -l {}` (KiB) or limits.d `memlock {}`; see \
+        docs/npu/npu-trunk.md#host-memlock-limit", bounded >> 20, bounded >> 10, bounded >> 10)
 }
 
 /// Declared hot-path patch locations, indexed in u32 words from each BO's start.
@@ -713,6 +777,16 @@ impl Drop for HwCtx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memlock_bound_is_required_plus_quarter_rounded_to_mib() {
+        // The shipped Flash-Next trunk: 2 banks x (A 8192x2880, C GdnIn + QsaIn, three 4 KiB placeholders).
+        assert_eq!(bounded_memlock_bytes(1_053_843_456), 1257 << 20);
+        assert_eq!(bounded_memlock_bytes(4 << 20), 5 << 20);
+        let e = pin_limit_error(1_053_843_456, 0, 8 << 20);
+        assert!(e.contains("hard limit 8388608 B is below the 1053843456 B"), "{e}");
+        assert!(e.contains("LimitMEMLOCK=1318060032") && e.contains("ulimit -l 1287168"), "{e}");
+    }
 
     #[test]
     fn start_cu_matches_hand_computed_layout() {

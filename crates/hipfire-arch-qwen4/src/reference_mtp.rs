@@ -17,6 +17,7 @@
 //! No acceptance policy or generation loop lives here.
 
 use crate::ops;
+use rdna_compute::rope::{Rope, RopeScaling};
 use std::fmt;
 
 /// The CPU/reference Qwen4 MTP module has one full-attention layer.
@@ -43,7 +44,7 @@ pub const MTP_ROPE_THETA: f32 = 10_000_000.0;
 
 /// QSA geometry is explicit so test fixtures can use small dimensions while
 /// the native constructor retains the checkpoint's 24/2/256 and 4/128 shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MtpQsaGeometry {
     pub q_heads: usize,
     pub kv_heads: usize,
@@ -54,7 +55,8 @@ pub struct MtpQsaGeometry {
     pub budget: usize,
     pub max_seq_len: usize,
     pub rotary_dim: usize,
-    pub rope_theta: u32,
+    /// QSA rotary embedding; the native geometry is the unscaled checkpoint.
+    pub rope: Rope,
 }
 
 impl MtpQsaGeometry {
@@ -69,7 +71,10 @@ impl MtpQsaGeometry {
             budget: MTP_INDEX_BUDGET,
             max_seq_len,
             rotary_dim: MTP_ROTARY_DIM,
-            rope_theta: MTP_ROPE_THETA as u32,
+            rope: Rope {
+                theta: MTP_ROPE_THETA as f64,
+                scaling: RopeScaling::None,
+            },
         }
     }
 
@@ -193,7 +198,7 @@ impl MtpQsaState {
                 self.geometry.compress_ratio,
                 start,
                 self.geometry.index_dim,
-                self.geometry.rope_theta as f32,
+                self.geometry.rope,
             )
             .map_err(|_| MtpError::Shape("MTP pooled index key"))?;
             self.compressed_keys.extend_from_slice(&pooled);
@@ -968,7 +973,7 @@ pub fn mtp_forward_step(
             &mut norm,
             input.position,
             weights.qsa_geometry.rotary_dim,
-            weights.qsa_geometry.rope_theta as f32,
+            weights.qsa_geometry.rope,
         )
         .map_err(|_| MtpError::Shape("MTP Q RoPE"))?;
         q_rot[head * weights.qsa_geometry.head_dim..(head + 1) * weights.qsa_geometry.head_dim]
@@ -985,7 +990,7 @@ pub fn mtp_forward_step(
             &mut norm,
             input.position,
             weights.qsa_geometry.rotary_dim,
-            weights.qsa_geometry.rope_theta as f32,
+            weights.qsa_geometry.rope,
         )
         .map_err(|_| MtpError::Shape("MTP K RoPE"))?;
         row.copy_from_slice(&norm);
@@ -1254,7 +1259,7 @@ mod tests {
             budget: 4,
             max_seq_len: 8,
             rotary_dim: 2,
-            rope_theta: 10_000,
+            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
         };
         let mut qsa = MtpQsaState::new(geometry).unwrap();
         for pos in 0..3 {
@@ -1283,7 +1288,7 @@ mod tests {
             budget: 4,
             max_seq_len: 16,
             rotary_dim: 2,
-            rope_theta: 10_000,
+            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
         };
         let mut qsa = MtpQsaState::new(geometry).unwrap();
         qsa.append_token(0, &[1.0, 0.0], &[1.0, 0.0], &[0.0, 1.0])
@@ -1310,7 +1315,7 @@ mod tests {
             budget: 4,
             max_seq_len: 8,
             rotary_dim: 2,
-            rope_theta: 10_000,
+            rope: Rope { theta: 10_000.0, scaling: RopeScaling::None },
         })
         .unwrap();
         state.wide_hidden = vec![1.0, 2.0];

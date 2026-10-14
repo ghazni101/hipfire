@@ -258,6 +258,10 @@ required-features = []
 name = "imatrix_collect"
 required-features = []
 
+[[example]]
+name = "probe_k5120_logits"
+required-features = ["lab", "arch-qwen35"]
+
 [package.metadata.cargo-machete]
 # byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.
 # hipfire-dispatch: no direct code reference, but [features].deltanet forwards hipfire-dispatch/deltanet.

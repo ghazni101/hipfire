@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-ring: silicon harness for the persistent V9 ring (`pm_npu::kernels::ring`).
+//! npu-ring: silicon harness for the persistent V9 ring (`peacemaker_npu::kernels::ring`).
 //!
 //! usage: npu-ring M N K --slots S [--nslots R] [--rounds N | --fit-ms B] [--mode prepublish|paced|empty-paced|empty-prepublish]
 //!                 [--neg skip-done|stale-seq] [--timeout-ms T] [--allow-hang]
@@ -62,9 +62,9 @@
 //! ->wait-return. rt_us: paced = per-run (seq published -> done seen); prepublish = per-run done-to-done interval (the
 //! first is submit->first done). firstdone_us = submit -> first observed done. Exit 0 = everything verified (negatives
 //! detected), 1 = failure, 2 = usage.
-use pm_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
-use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9, persistent_v9_lean, producer_may_publish, Neg, PatchKind, RingLayout, SlotPlan};
+use peacemaker_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
+use peacemaker_npu::kernels::gemm_core::Control;
+use peacemaker_npu::kernels::ring::{empty_persistent, patch_seq, persistent_v9, persistent_v9_lean, producer_may_publish, Neg, PatchKind, RingLayout, SlotPlan};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{compiler_fence, Ordering};

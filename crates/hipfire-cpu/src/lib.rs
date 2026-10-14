@@ -29,6 +29,7 @@
 
 pub mod epilogue;
 pub mod gemv;
+pub mod moe;
 pub mod quant;
 pub mod simd;
 

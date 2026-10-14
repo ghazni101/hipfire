@@ -111,6 +111,16 @@ fn hot_stem(name: &str, src_hash: &str) -> String {
     format!("{name}.{src_hash}")
 }
 
+/// Process-wide lock for one cache path's compile and publish; see
+/// `KernelCompiler::hipcc_compile_publish`. Entries live for the process:
+/// one per distinct kernel stem it JIT-compiles.
+fn stem_publish_lock(stem_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(locks.entry(stem_path.to_path_buf()).or_default())
+}
+
 /// Final hot object filename for a (`name`, `src_hash`) pair.
 fn hot_object_name(name: &str, src_hash: &str) -> String {
     format!("{}.hsaco", hot_stem(name, src_hash))
@@ -1358,6 +1368,7 @@ impl KernelCompiler {
             &src_hash,
             &self.extra_flags,
             &module_flags,
+            true,
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
 
@@ -1399,6 +1410,7 @@ impl KernelCompiler {
             &src_hash,
             &self.extra_flags,
             &module_flags,
+            false,
         )?;
         self.ensure_radiowave_certification(name, &obj_path);
 
@@ -1648,6 +1660,14 @@ impl KernelCompiler {
     /// publish the final hot blob+hash. Never writes final hashes directly.
     /// On any failure, temps are cleaned and prior hot pairs remain intact.
     /// Hash publication errors are **not** ignored.
+    ///
+    /// One stem compiles and publishes under a process-wide lock: an
+    /// expert-parallel mesh runs one `Gpu` per rank in one process and every
+    /// rank JITs the same kernels on first use. Unserialized, one rank's forced
+    /// republish removed the hash sidecar while another rank's post-publish
+    /// check read it, and rewrote the `.hip` source another rank's hipcc was
+    /// reading. With `reuse_published`, a pair another thread published while
+    /// this one waited is taken as is; `recompile` passes `false`.
     fn hipcc_compile_publish(
         hipcc_bin: &Path,
         rocm_env_root: Option<&Path>,
@@ -1658,6 +1678,7 @@ impl KernelCompiler {
         src_hash: &str,
         extra_flags: &str,
         module_flags: &[String],
+        reuse_published: bool,
     ) -> HipResult<()> {
         // Content-keyed outputs: the source file, final blob, and temps all
         // carry the hash, so concurrent builds compiling different sources
@@ -1667,9 +1688,14 @@ impl KernelCompiler {
         let stem = hot_stem(name, src_hash);
         let src_path = cache_dir.join(format!("{stem}.hip"));
         let final_hsaco = cache_dir.join(format!("{stem}.hsaco"));
+        let final_hash = cache_dir.join(format!("{stem}.hash"));
+        let stem_lock = stem_publish_lock(&cache_dir.join(&stem));
+        let _publishing = stem_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if reuse_published && pair_valid(&final_hsaco, &final_hash, src_hash) {
+            return Ok(());
+        }
         let token = unique_token();
         let tmp_obj = cache_dir.join(format!(".{stem}.{token}.hsaco.tmp"));
-
         let cleanup_tmp = || {
             let _ = std::fs::remove_file(&tmp_obj);
         };
@@ -1716,7 +1742,6 @@ impl KernelCompiler {
         cleanup_tmp();
 
         // Defensive: final pair must be valid after publication.
-        let final_hash = cache_dir.join(format!("{stem}.hash"));
         if !pair_valid(&final_hsaco, &final_hash, src_hash) {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -1885,7 +1910,7 @@ impl KernelCompiler {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         Self::hipcc_compile_publish(&hipcc_bin, rocm_env_root.as_deref(),
                             &arch, &cache_dir, &module.name, &job.source, &module.hash,
-                            &extra_flags, &job.module_flags)
+                            &extra_flags, &job.module_flags, true)
                     })).unwrap_or_else(|panic| {
                         let reason = panic.downcast_ref::<&str>().copied()
                             .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
@@ -2873,6 +2898,58 @@ mod tests {
             leftover_temps(&hot)
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_compilers_of_one_kernel_compile_once_and_all_succeed() {
+        // Expert-parallel ranks are separate compilers in one process sharing
+        // one cache root; all of them miss the same kernel at once.
+        let root = temp_root("hipcc_publish_concurrent");
+        let _ = std::fs::remove_dir_all(&root);
+        let hot = root.join("hot");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let calls = root.join("calls");
+        let hipcc = bin.join("slow_hipcc");
+        std::fs::write(
+            &hipcc,
+            format!(
+                "#!/bin/sh\necho x >> \"{}\"\nsleep 0.3\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nprintf COMPILED > \"$out\"\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hipcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ranks = 4;
+        let start = Arc::new(std::sync::Barrier::new(ranks));
+        let results = (0..ranks)
+            .map(|_| {
+                let (hot, hipcc, start) = (hot.clone(), hipcc.clone(), Arc::clone(&start));
+                thread::spawn(move || {
+                    let mut c = test_compiler("", "hipcc 7.2");
+                    c.cache_dir = hot;
+                    c.has_hipcc = true;
+                    c.hipcc_bin = hipcc;
+                    start.wait();
+                    c.compile("k", "__global__ void k() {}").map(Path::to_path_buf)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        for result in &results {
+            let path = result.as_ref().expect("every concurrent compile must succeed");
+            assert_eq!(std::fs::read(path).unwrap(), b"COMPILED");
+        }
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        assert!(leftover_temps(&hot).is_empty(), "{:?}", leftover_temps(&hot));
         let _ = std::fs::remove_dir_all(&root);
     }
 

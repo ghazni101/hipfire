@@ -4,8 +4,62 @@
 
 use super::{Memory, Result, State};
 use crate::{Inst, operand::{Operand, ImmField, VmemToken}};
+/// Access size from the data-size token (`b8 u8 i8 b16 u16 i16 b32 u32 f32 b64 b96 b128 b256`); `d16`, `hi`,
+/// `rtn`, `2addr` and the address-space prefix are modifiers.
 fn width(name:&str)->Result<usize> {
-    if name.contains("b256"){Ok(32)}else if name.contains("b128"){Ok(16)}else if name.contains("b96"){Ok(12)}else if name.contains("b64"){Ok(8)}else if name.contains("b32"){Ok(4)}else if name.contains("b16")||name.contains("u16"){Ok(2)}else if name.contains("u8"){Ok(1)}else{Err(format!("unknown memory width {name}"))}
+    for token in name.split('_') {
+        match token {
+            "b256"=>return Ok(32),"b128"=>return Ok(16),"b96"=>return Ok(12),"b64"=>return Ok(8),
+            "b32"|"u32"|"i32"|"f32"=>return Ok(4),"b16"|"u16"|"i16"=>return Ok(2),"b8"|"u8"|"i8"=>return Ok(1),
+            _=>(),
+        }
+    }
+    Err(format!("unknown memory width {name}"))
+}
+/// Width in bits of a signed (`i8`/`i16`) load field; unsigned and untyped loads zero-extend.
+fn sign_bits(name:&str)->Option<u32> {
+    name.split('_').find_map(|token| match token {"i8"=>Some(8),"i16"=>Some(16),_=>None})
+}
+#[derive(Clone,Copy)]
+enum Atomic { AddU32, OrB32, AddF32 }
+fn ds_atomic(name:&str)->Option<(Atomic,bool)> {
+    Some(match name {"ds_add_u32"=>(Atomic::AddU32,false),"ds_add_rtn_u32"=>(Atomic::AddU32,true),"ds_or_b32"=>(Atomic::OrB32,false),"ds_add_f32"=>(Atomic::AddF32,false),_=>return None})
+}
+/// LDS read-modify-write: `tmp = MEM[addr]; MEM[addr] op= DATA; RETURN_DATA = tmp`. The ISA does not state how lanes
+/// of one wave that target the same dword are ordered, so a returning or floating-point atomic with two active lanes
+/// on one dword is an error; integer add/or without a return are order independent and apply lane by lane.
+/// `ds_add_f32` is host IEEE binary32 (the ISA: "handles NAN/INF/denorm"; NaN results/operands carry no stated
+/// payload rule and are an error). Addresses must be dword aligned.
+fn ds_atomic_execute(kind:Atomic,returns:bool,name:&str,i:&Inst,s:&mut State,lds:&mut [u8])->Result<()> {
+    let ops=&i.operands;
+    let (addr_op,data_op)=if returns {(1,2)} else {(0,1)};
+    if ops.len()<=data_op {return Err(format!("{name}: missing operand"));}
+    let offset:u64=ops.iter().map(|op|if let Operand::Imm(ImmField::DsOffset(n))=op {u64::from(*n)}else{0}).sum();
+    let mut seen=std::collections::HashSet::new();
+    for lane in 0..32 {
+        if s.exec&(1<<lane)==0 {continue;}
+        let addr=u64::from(s.read(&ops[addr_op],lane,0)?).wrapping_add(offset);
+        if addr&3!=0 {return Err(format!("{name}: unaligned LDS atomic address {addr:#x}"));}
+        if (returns||matches!(kind,Atomic::AddF32))&&!seen.insert(addr) {
+            return Err(format!("{name}: two active lanes target LDS dword {addr:#x}; the ISA does not order them"));
+        }
+        let slot=lds.get_mut(addr as usize..addr as usize+4).ok_or_else(||format!("LDS atomic out of bounds {addr:#x}"))?;
+        let old=u32::from_le_bytes((&*slot).try_into().unwrap());
+        let data=s.read(&ops[data_op],lane,0)?;
+        let new=match kind {
+            Atomic::AddU32=>old.wrapping_add(data),
+            Atomic::OrB32=>old|data,
+            Atomic::AddF32=>{
+                let (x,y)=(f32::from_bits(old),f32::from_bits(data));
+                let r=x+y;
+                if x.is_nan()||y.is_nan()||r.is_nan() {return Err(format!("{name}: NaN operand or result: payload is not specified"));}
+                r.to_bits()
+            }
+        };
+        slot.copy_from_slice(&new.to_le_bytes());
+        if returns {s.put(&ops[0],lane,0,old)?;}
+    }
+    Ok(())
 }
 /// Validates the MUBUF operand shape and returns whether OFFEN supplies a vector offset.
 /// IDXEN is not representable in the IR: the decoder narrows the VADDR register to one
@@ -75,6 +129,7 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
         }
         for (lane,val) in values.into_iter().enumerate(){if s.exec&(1<<lane)!=0{s.put(&ops[0],lane,0,val)?;}}return Ok(());
     }
+    if let Some((kind,returns))=ds_atomic(name) {return ds_atomic_execute(kind,returns,name,i,s,lds);}
     let load=name.contains("load");
     let ds=name.starts_with("ds_");
     let buffer=name.starts_with("buffer_");
@@ -115,6 +170,11 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
                     if raw_bounds.is_some_and(|(relative,limit)|relative.checked_add((offset+size)as u64).is_none_or(|end|end>limit)) {continue;}
                     let src=if ds {lds.get(cur as usize+offset..cur as usize+offset+size).ok_or_else(||format!("LDS read out of bounds {cur:#x}+{n}"))?}else{mem.read(cur+offset as u64,size)?};
                     bytes[offset..offset+size].copy_from_slice(src);
+                }
+                if let Some(bits)=sign_bits(name) {
+                    // flat_load_i8 / *_i16: sign-extend the loaded field (to 16 bits for d16 forms, merged below).
+                    let raw=u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                    bytes[0..4].copy_from_slice(&((((raw<<(32-bits)) as i32)>>(32-bits)) as u32).to_le_bytes());
                 }
                 for w in 0..n.div_ceil(4) {let mut val=u32::from_le_bytes(bytes[w*4..w*4+4].try_into().unwrap());
                     if name.contains("d16_hi") {val=(s.read(data,lane,data_word+w)?&0xffff)|(val<<16);}
@@ -201,5 +261,123 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
         st.exec=u32::MAX;for lane in 0..32 {st.v[158][lane]=(lane*4) as u32;}
         execute("ds_bpermute_b32",&insn("ds_bpermute_b32",vec![reg(Kind::V,4,1),reg(Kind::V,158,1),reg(Kind::V,5,1),Operand::Imm(ImmField::DsOffset(64))]),&mut st,&mut Memory::default(),&mut lds).unwrap();
         for lane in 0..32 {assert_eq!(st.v[4][lane],100+((lane+16)%32) as u32,"lane {lane}");}
+    }
+    fn insn_on(arch:Arch,name:&str,operands:Vec<Operand>)->Inst {
+        let table=if arch==Arch::Gfx1201 {crate::isa::gfx12()}else{crate::isa::gfx1100()};
+        let row=table.iter().find(|r|r.name==name).unwrap_or_else(||panic!("{name} missing from {arch:?}"));
+        Inst::from_parts(arch,row.op,row.form,Default::default(),operands.into_iter().collect(),Default::default(),None,Default::default()).unwrap()
+    }
+    fn flat_state(bytes:&[u8])->(State,Memory) {
+        let mut st=state();st.v[2][0]=0x1000;st.v[3][0]=0;
+        let mut mem=Memory::default();mem.map("m".into(),0x1000,bytes.to_vec()).unwrap();(st,mem)
+    }
+    // Loads: i8 sign-extends the byte; d16 forms merge into the other half; b96 fills three registers.
+    #[test] fn flat_loads_sign_extend_merge_halves_and_load_b96() {
+        let bytes:Vec<u8>=(0..16).map(|n|0x80+n).collect();
+        for arch in [Arch::Gfx1100,Arch::Gfx1201] {
+            let (mut st,mut mem)=flat_state(&bytes);
+            let run=|st:&mut State,mem:&mut Memory,name:&str,dst:Operand|execute(name,&insn_on(arch,name,vec![dst,reg(Kind::V,2,2)]),st,mem,&mut []);
+            if arch==Arch::Gfx1201 {
+                run(&mut st,&mut mem,"flat_load_i8",reg(Kind::V,0,1)).unwrap();
+                assert_eq!(st.v[0][0],0xffff_ff80);
+                run(&mut st,&mut mem,"flat_load_b96",reg(Kind::V,4,3)).unwrap();
+                assert_eq!([st.v[4][0],st.v[5][0],st.v[6][0]],[0x8382_8180,0x8786_8584,0x8b8a_8988]);
+                assert_eq!(st.v[7][0],0);
+            }
+            st.v[0][0]=0xabcd_1234;
+            run(&mut st,&mut mem,"flat_load_d16_u8",reg(Kind::V,0,1)).unwrap();
+            assert_eq!(st.v[0][0],0xabcd_0080,"{arch:?}");
+            st.v[0][0]=0xabcd_1234;
+            run(&mut st,&mut mem,"flat_load_d16_hi_b16",reg(Kind::V,0,1)).unwrap();
+            assert_eq!(st.v[0][0],0x8180_1234,"{arch:?}");
+        }
+    }
+    // Stores: b8/b16 write exactly their size, d16_hi stores bits [31:16], b96/b128 write whole dwords.
+    #[test] fn flat_stores_write_exact_sizes_and_the_high_half() {
+        for arch in [Arch::Gfx1100,Arch::Gfx1201] {
+            let (mut st,mut mem)=flat_state(&[0x11;16]);
+            st.v[1][0]=0xdead_beef;
+            let run=|st:&mut State,mem:&mut Memory,name:&str,src:Operand|execute(name,&insn_on(arch,name,vec![reg(Kind::V,2,2),src]),st,mem,&mut []);
+            run(&mut st,&mut mem,"flat_store_b8",reg(Kind::V,1,1)).unwrap();
+            assert_eq!(mem.read(0x1000,4).unwrap(),[0xef,0x11,0x11,0x11]);
+            st.v[4][0]=1;st.v[5][0]=2;st.v[6][0]=3;st.v[7][0]=4;
+            if arch==Arch::Gfx1201 {
+                st.v[2][0]=0x1004;
+                run(&mut st,&mut mem,"flat_store_d16_hi_b16",reg(Kind::V,1,1)).unwrap();
+                assert_eq!(mem.read(0x1004,4).unwrap(),[0xad,0xde,0x11,0x11]);
+                run(&mut st,&mut mem,"flat_store_b16",reg(Kind::V,1,1)).unwrap();
+                assert_eq!(mem.read(0x1004,4).unwrap(),[0xef,0xbe,0x11,0x11]);
+                st.v[2][0]=0x1000;
+                run(&mut st,&mut mem,"flat_store_b96",reg(Kind::V,4,3)).unwrap();
+                assert_eq!(mem.read(0x1000,12).unwrap(),[1,0,0,0,2,0,0,0,3,0,0,0]);
+                assert_eq!(mem.read(0x100c,4).unwrap(),[0x11;4]);
+            } else {
+                st.v[2][0]=0x1008;
+                run(&mut st,&mut mem,"flat_store_b32",reg(Kind::V,1,1)).unwrap();
+                assert_eq!(mem.read(0x1008,4).unwrap(),0xdead_beefu32.to_le_bytes());
+                st.v[2][0]=0x1000;
+                run(&mut st,&mut mem,"flat_store_b128",reg(Kind::V,4,4)).unwrap();
+                assert_eq!(mem.read(0x1000,16).unwrap(),[1,0,0,0,2,0,0,0,3,0,0,0,4,0,0,0]);
+            }
+        }
+    }
+    #[test] fn ds_u16_load_and_b96_store() {
+        let mut lds=[0u8;64];
+        let mut st=state();st.exec=0b11;
+        st.v[1][0]=6;st.v[1][1]=20;
+        st.v[2][0]=1;st.v[3][0]=2;st.v[4][0]=3;st.v[2][1]=4;st.v[3][1]=5;st.v[4][1]=6;
+        execute("ds_store_b96",&insn_on(Arch::Gfx1100,"ds_store_b96",vec![reg(Kind::V,1,1),reg(Kind::V,2,3)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!(&lds[6..18],&[1,0,0,0,2,0,0,0,3,0,0,0]);
+        assert_eq!(&lds[20..32],&[4,0,0,0,5,0,0,0,6,0,0,0]);
+        assert_eq!(lds[18],0);
+        // ds_load_u16 zero-extends the 16-bit word at byte 24 (the dword 5).
+        st.v[0][0]=0xffff_ffff;st.v[1][0]=24;
+        execute("ds_load_u16",&insn_on(Arch::Gfx1100,"ds_load_u16",vec![reg(Kind::V,0,1),reg(Kind::V,1,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!(st.v[0][0],5);
+    }
+    // LDS atomics: integer add/or without return are lane-order independent; returns and float adds refuse
+    // same-dword collisions; ds_add_f32 is IEEE.
+    #[test] fn ds_atomics_apply_read_modify_write_and_refuse_unordered_collisions() {
+        let mut lds=[0u8;32];
+        lds[0..4].copy_from_slice(&10u32.to_le_bytes());
+        lds[4..8].copy_from_slice(&0xf0u32.to_le_bytes());
+        let mut st=state();st.exec=0b111;
+        st.v[1]=[0;32];st.v[2][0]=1;st.v[2][1]=2;st.v[2][2]=4;
+        // Three lanes add into dword 0: 10 + 1 + 2 + 4.
+        execute("ds_add_u32",&insn_on(Arch::Gfx1100,"ds_add_u32",vec![reg(Kind::V,1,1),reg(Kind::V,2,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!(u32::from_le_bytes(lds[0..4].try_into().unwrap()),17);
+        st.v[1]=[4;32];st.v[2]=[0x0f;32];
+        execute("ds_or_b32",&insn_on(Arch::Gfx1100,"ds_or_b32",vec![reg(Kind::V,1,1),reg(Kind::V,2,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!(u32::from_le_bytes(lds[4..8].try_into().unwrap()),0xff);
+        // Returning add: distinct dwords return the old value; the offset field adds to the address.
+        let mut st=state();st.exec=0b11;
+        st.v[1][0]=0;st.v[1][1]=4;st.v[2][0]=100;st.v[2][1]=200;st.v[0]=[0x77;32];
+        execute("ds_add_rtn_u32",&insn_on(Arch::Gfx1100,"ds_add_rtn_u32",vec![reg(Kind::V,0,1),reg(Kind::V,1,1),reg(Kind::V,2,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap();
+        assert_eq!((st.v[0][0],st.v[0][1],st.v[0][2]),(17,0xff,0x77));
+        assert_eq!(u32::from_le_bytes(lds[0..4].try_into().unwrap()),117);
+        assert_eq!(u32::from_le_bytes(lds[4..8].try_into().unwrap()),0xff+200);
+        st.v[1][1]=0;
+        let e=execute("ds_add_rtn_u32",&insn_on(Arch::Gfx1100,"ds_add_rtn_u32",vec![reg(Kind::V,0,1),reg(Kind::V,1,1),reg(Kind::V,2,1)]),&mut st,&mut Memory::default(),&mut lds).unwrap_err();
+        assert!(e.contains("does not order"),"{e}");
+        // ds_add_f32.
+        let mut lds=[0u8;16];
+        lds[8..12].copy_from_slice(&1.5f32.to_bits().to_le_bytes());
+        let mut st=state();st.exec=1;st.v[1][0]=8;st.v[2][0]=2.25f32.to_bits();
+        let add=|st:&mut State,lds:&mut [u8]|execute("ds_add_f32",&insn_on(Arch::Gfx1100,"ds_add_f32",vec![reg(Kind::V,1,1),reg(Kind::V,2,1)]),st,&mut Memory::default(),lds);
+        add(&mut st,&mut lds).unwrap();
+        assert_eq!(f32::from_bits(u32::from_le_bytes(lds[8..12].try_into().unwrap())),3.75);
+        // A denormal addend is IEEE-exact (the ISA lists denormals as handled).
+        st.v[2][0]=1;
+        lds[8..12].copy_from_slice(&1u32.to_le_bytes());
+        add(&mut st,&mut lds).unwrap();
+        assert_eq!(u32::from_le_bytes(lds[8..12].try_into().unwrap()),2);
+        st.v[2][0]=f32::NAN.to_bits();
+        assert!(add(&mut st,&mut lds).is_err());
+        st.v[2][0]=1f32.to_bits();st.v[1][0]=9;
+        assert!(add(&mut st,&mut lds).unwrap_err().contains("unaligned"));
+        st.v[1][0]=8;st.exec=0b11;st.v[1][1]=8;
+        assert!(add(&mut st,&mut lds).unwrap_err().contains("does not order"));
+        st.exec=1;st.v[1][0]=16;
+        assert!(add(&mut st,&mut lds).is_err());
     }
 }

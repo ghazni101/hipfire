@@ -91,10 +91,13 @@ and removed — do not reintroduce it.
 
 ### 1. Environment (mi300x)
 
+`$SCRATCH` below is a placeholder for a local scratch directory with enough free space; set it before running.
+
 ```bash
-# ROCm wheel already at /mnt/scratch/torch_oracle_rocm (still run --device cpu
+export SCRATCH=/path/to/scratch
+# ROCm wheel already at $SCRATCH/torch_oracle_rocm (still run --device cpu
 # unless the GPU is free AND you coordinated over hub).
-export PYTHONPATH=/mnt/scratch/torch_oracle_rocm
+export PYTHONPATH=$SCRATCH/torch_oracle_rocm
 
 python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 # expected: 2.13.0+rocm7.2 True   (use --device cpu anyway while captures run)
@@ -103,12 +106,12 @@ python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 Fresh install if needed:
 
 ```bash
-python3 -m pip install --target=/mnt/scratch/torch_oracle_site   torch --index-url https://download.pytorch.org/whl/cpu
-python3 -m pip install --target=/mnt/scratch/torch_oracle_site safetensors numpy
+python3 -m pip install --target=$SCRATCH/torch_oracle_site   torch --index-url https://download.pytorch.org/whl/cpu
+python3 -m pip install --target=$SCRATCH/torch_oracle_site safetensors numpy
 
 # or ROCm 7.2:
-python3 -m pip install --target=/mnt/scratch/torch_oracle_rocm   torch --index-url https://download.pytorch.org/whl/rocm7.2
-python3 -m pip install --target=/mnt/scratch/torch_oracle_rocm safetensors numpy
+python3 -m pip install --target=$SCRATCH/torch_oracle_rocm   torch --index-url https://download.pytorch.org/whl/rocm7.2
+python3 -m pip install --target=$SCRATCH/torch_oracle_rocm safetensors numpy
 ```
 
 ### 2. Layout (local worktree is source of truth)
@@ -129,28 +132,29 @@ crates/hipfire-arch-deepseek4/reference_oracle/
 `sys.modules["kernel"] = kernel_shim` before import. No lines of `model.py`
 are edited.
 
-Sync to the box:
+Sync to the box (`<oracle-host>` is the oracle machine; `$HIPFIRE_ROOT` is the work directory, using the same path locally and on `<oracle-host>`; `$SCRATCH` as above):
 
 ```bash
+export HIPFIRE_ROOT=/path/to/hipfire-work
 rsync -av --delete \
   crates/hipfire-arch-deepseek4/reference_oracle/ \
-  mi300x:/root/hipfire-work/ds4-parent-gate/crates/hipfire-arch-deepseek4/reference_oracle/
+  <oracle-host>:"$HIPFIRE_ROOT"/ds4-parent-gate/crates/hipfire-arch-deepseek4/reference_oracle/
 # also keep the scratch harness in sync if you use it:
 rsync -av crates/hipfire-arch-deepseek4/reference_oracle/ \
-  mi300x:/mnt/scratch/torch_oracle_harness/
+  <oracle-host>:"$SCRATCH"/torch_oracle_harness/
 ```
 
 ### 3. Run
 
 ```bash
-cd /root/hipfire-work/ds4-parent-gate/crates/hipfire-arch-deepseek4/reference_oracle
-# or: cd /mnt/scratch/torch_oracle_harness
-export PYTHONPATH=/mnt/scratch/torch_oracle_rocm:$PWD
+cd "$HIPFIRE_ROOT"/ds4-parent-gate/crates/hipfire-arch-deepseek4/reference_oracle
+# or: cd $SCRATCH/torch_oracle_harness
+export PYTHONPATH=$SCRATCH/torch_oracle_rocm:$PWD
 
 # Full gates 1–4, layers 0..6, 128 tokens, CPU
 nohup setsid python3 run_oracle.py \
-  --model /mnt/scratch/models/DeepSeek-V4-Flash-0731 \
-  --tokens /mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens_128.bin \
+  --model $SCRATCH/models/DeepSeek-V4-Flash-0731 \
+  --tokens $SCRATCH/quantization/deepseek-v4-flash-0731-parent-baseline/tokens_128.bin \
   --device cpu --layers 7 --seq 128 \
   --parent-stages /tmp/parent_stages_only.txt \
   --out /tmp/torch_oracle_summary.json \
@@ -203,7 +207,7 @@ See `RESIDUAL_POS_TRAJ.md` and `artifacts/residual_pos_traj.json.compact.json`.
 
 ```bash
 # on mi300x with GPU free (~5 min, ~4.7 GiB VRAM peak):
-export PYTHONPATH=/mnt/scratch/torch_oracle_rocm:/mnt/scratch/torch_oracle_harness
+export PYTHONPATH=$SCRATCH/torch_oracle_rocm:$SCRATCH/torch_oracle_harness
 python3 -u residual_pos_traj.py --seq 1024 --layers all --out /tmp/residual_pos_traj.json
 ```
 

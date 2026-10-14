@@ -319,11 +319,31 @@ fn recipe_fields(arch: &str, flags: &DenseRecipeFlags) -> CanonicalFields {
 /// unchanged: nothing here toggles a loader transform.
 pub fn resolve_dense_recipe(gpu: &Gpu, config: &Qwen35Config) -> SwResult<LayoutRecipe> {
     check_dense_config(config)?;
+    refuse_host_mapped_weights(gpu)?;
     let flags = resolve_dense_flags(gpu, config)?;
     Ok(LayoutRecipe {
         schema: DENSE_RECIPE_SCHEMA.to_owned(),
         fields: recipe_fields(&gpu.arch, &flags),
     })
+}
+
+/// The load-time half of the v1 allowlist that the config can no longer state:
+/// partial GPU offload is resolved from the budgets at load, and a model with
+/// any host-mapped weight cannot share them — the shared seal describes
+/// device-resident bytes.
+///
+/// The test is the live host-mapped allocation count, not the CPU-exec policy
+/// flag (`owns_host_cpu_weights`): the allowlist refused *any* partial offload
+/// (beta's `i_gpu_start != 0`), and a `pcie` layer spill registers host-mapped
+/// owners without setting that flag. `validate_dense_seal` refuses host-mapped
+/// owners again at seal validation; this is the early, named refusal.
+fn refuse_host_mapped_weights(gpu: &Gpu) -> SwResult<()> {
+    if gpu.host_mapped_count() != 0 {
+        return Err(SharedWeightError::unsupported(
+            "partial GPU offload (host-mapped weights)",
+        ));
+    }
+    Ok(())
 }
 
 // ─── Config identity ────────────────────────────────────────────────────
@@ -339,9 +359,10 @@ pub fn check_dense_config(c: &Qwen35Config) -> SwResult<()> {
     if c.reap_keep.is_some() {
         return Err(SharedWeightError::unsupported("REAP keep-map"));
     }
-    if c.i_gpu_start != 0 {
-        return Err(SharedWeightError::unsupported("partial GPU offload (i_gpu_start != 0)"));
-    }
+    // Partial GPU offload is no longer a config fact: placement is resolved at
+    // load time from the budgets, so the refusal lives at the Gpu-bearing
+    // entries below (`resolve_dense_recipe` / `export_prepare`) and reads
+    // `Gpu::owns_host_cpu_weights()`.
     if c.n_layers == 0 || c.layer_types.len() != c.n_layers || c.n_layers as u64 > MAX_LAYERS {
         return Err(SharedWeightError::invalid(format!(
             "layer topology: n_layers {} vs layer_types {}",
@@ -378,7 +399,6 @@ pub fn dense_config_fields(c: &Qwen35Config) -> CanonicalFields {
     };
     u("dim", c.dim as u64);
     u("n_layers", c.n_layers as u64);
-    u("i_gpu_start", c.i_gpu_start as u64);
     u("vocab_size", c.vocab_size as u64);
     u("norm_eps_bits", u64::from(c.norm_eps.to_bits()));
     u("eos_token", u64::from(c.eos_token));
@@ -1968,6 +1988,7 @@ fn export_prepare(
     recipe: &LayoutRecipe,
 ) -> SwResult<Prepared> {
     check_dense_config(config)?;
+    refuse_host_mapped_weights(gpu)?;
     if gpu.arch != SUPPORTED_DEVICE_ARCH {
         return Err(SharedWeightError::unsupported(format!(
             "device arch {} (v1 admits {SUPPORTED_DEVICE_ARCH})",
@@ -2499,7 +2520,6 @@ mod tests {
         Qwen35Config {
             dim: 256,
             n_layers: layer_types.len(),
-            i_gpu_start: 0,
             vocab_size: 32,
             norm_eps: 1e-6,
             eos_token: 7,
@@ -2890,9 +2910,6 @@ mod tests {
         assert!(check_dense_config(&b).is_err());
         b = a.clone();
         b.paged_experts = true;
-        assert!(check_dense_config(&b).is_err());
-        b = a.clone();
-        b.i_gpu_start = 1;
         assert!(check_dense_config(&b).is_err());
         check_dense_config(&a).expect("dense");
     }

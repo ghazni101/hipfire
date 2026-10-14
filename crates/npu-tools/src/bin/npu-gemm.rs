@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-gemm: run `pm_npu::kernels::gemm_i8::design` (single core) or, with `--array`/`--variant`,
-//! `pm_npu::kernels::gemm_array::design_variant_core` (whole 8x4 array or a bisect variant, selectable core
+//! npu-gemm: run `peacemaker_npu::kernels::gemm_i8::design` (single core) or, with `--array`/`--variant`,
+//! `peacemaker_npu::kernels::gemm_array::design_variant_core` (whole 8x4 array or a bisect variant, selectable core
 //! program) on the NPU via railgun::npu.
 //!
 //! usage: npu-gemm M N K [--iters I] [--col C0] [--timeout-ms T] [--dump-status]
@@ -10,7 +10,8 @@
 //!        npu-gemm M N K --variant V1|V2|V3|V4|V5|V6|V6b [--core Fast|Serial|LockOnly|FastSlowCtl|ClockProbe] [--probe-iters N] [--iters I] [--timeout-ms T] [--dump-status]
 //!        npu-gemm M N K --variant V8|V9|V10 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]
 //!        ... [--memory native|vmm-host|vmm-host-uncached] [--burst 0..3] [--axcache 0..15] [--axqos 0..15]
-//!        npu-gemm M 1280 K --variant G80 [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]   (int8 epilogue only, N exactly 1280, K a multiple of 64 up to 2560; `--b-prefix` is V10-only and exits 2)
+//!        npu-gemm M 1280 K --variant G80 [--epi i32|int8|bf16] [--rowmajor-pitch P --rowmajor-col0 C0] [--shift S] [--core Fast|FastSlowCtl] [--iters I] [--reuse-ctx] [--timeout-ms T].
+//!        npu-gemm M 512 K --variant G80 --epi bf16 --n512 [--rowmajor-pitch P --rowmajor-col0 C0] [--iters I] [--reuse-ctx] [--loop SECONDS]   (out-projection design, K <= 6336).
 //!        npu-gemm M N K --variant V10 --b-prefix [same V8|V9|V10 options]             (B prefix mode; V10 only)
 //!        npu-gemm TOKENS FEATURES K --fold-contract ief15 [--iters N] [--loop SECS] [--reuse-ctx] [--lean] [--switch-with T2,F2,K2] [--timeout-ms T] [--dump-status]   (IEF15 N0 probe; K a multiple of 128 with 1..=136 epochs)
 //!        npu-gemm --ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--dump-status] [--expected-only]   (IEF15 N0 single-core semantics probe: expected bytes from the simulator running the exact PDI+TXN, one fresh-context submit, per-case MATCH/MISMATCH table; `--expected-only` never touches the hardware)
@@ -58,6 +59,11 @@
 //! `--variant V9` is the resident-B nw-outer design (`gemm_array::design_v9`, same pair core as V8, dynamic TXN,
 //! context reusable); it takes the same `--shift`/`--core`/`--ctl-probe`/`--reuse-ctx`/`--loop` controls as V8 but is
 //! Int8-epilogue only: `--epi i32` exits 2.
+//! `--variant G80` is the G80 design (`gemm_g80::design_g80`, N exactly 1280, K a multiple of 64 up to 2560;
+//! same `--core`/`--ctl-probe`/`--a-from-hip`/`--reuse-ctx`/`--loop` controls as V8). It takes `--epi int8` (default,
+//! `--shift S`) or `--epi i32` (exact int32 C) or `--epi bf16` (integer exact-product, single RNE).
+//! I32/BF16 reject `--shift`. BF16 uses deterministic grid scales and compares every checked output
+//! against `w8a8_epi::bf16_direct`. Row-major additionally checks zero padded rows and untouched poison outside the panel window.
 //! `--variant V10` is the mw-outer both-operands-resident design (`gemm_array::design_v10`, same pair core and
 //! compact C as V9, dynamic TXN, context reusable): the whole B segment (`NW*kc*4096` words per row) stays resident in
 //! the memtile and is replayed for every M-wave while A is streamed per M-wave (wave order `w = mw*NW + nw`), so each
@@ -88,10 +94,10 @@
 //! explicitly for that program.
 //! `--iu4-epochs` (with `--variant V8 --epi i32`, core Fast or FastSlowCtl): M = tokens, N = weight rows, K a multiple
 //! of 256. Deterministic native hipfire IU4 operands (symmetric MQ4G256V2 weights x `block_i4_128` activations,
-//! `pm_npu::kernels::iu4`) run on `iu4::EpochGemm` (V8 i32, K = 128 per wave, one M-wave block per K128 epoch), and every
+//! `peacemaker_npu::kernels::iu4`) run on `iu4::EpochGemm` (V8 i32, K = 128 per wave, one M-wave block per K128 epoch), and every
 //! verified submit is compared with the CPU reference of the GPU's per-epoch int32 partials `C_e` (all `[e][t][r]`).
 //! Useful ops are the real 2·M·N·K; `epochs * ceil(M/512) * ceil(N/512) <= 256` waves per submit.
-//! `--fold-contract ief15` (`pm_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3 / §8 M0; AxQOS 0 and the vendor BD
+//! `--fold-contract ief15` (`peacemaker_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3 / §8 M0; AxQOS 0 and the vendor BD
 //! word 5 defaults, so `--burst/--axcache/--axqos/--memory/--a-from-hip/--variant/--array/--core/--epi/--shift/--ctl-probe/
 //! --iu4-epochs` exit 2): TOKENS x FEATURES x K, deterministic native QT44 / A4 operands (`iu4::random_operands`, extremes
 //! on) with the production sidecar encoders (`encode_weight_scales`, `encode_act_scales`), packed with `pack_in` and checked
@@ -107,12 +113,11 @@
 //! (a lean TXN is only valid directly after a completed submit of the same design). Useful ops are the real 2*T*F*K; busy
 //! TOPS is useful ops over summed submit -> completion time, wall TOPS over the wall clock including host verification.
 use railgun::npu::hip_runtime::{HipDmabufA, HipMemoryKind};
-use pm_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v8, design_v9, design_variant_probe, Variant};
-use pm_npu::kernels::gemm_g80::design_g80;
-use pm_npu::kernels::gemm_core::{clock_probe_cycles_per_iter, Control, CoreVariant, Epilogue, Probe};
-use pm_npu::kernels::gemm_i8::{cpu_reference, design, ArgKind};
-use pm_npu::kernels::iu4::{self, EpochGemm};
-use pm_npu::kernels::iu4_ief15::{self, Ief15Gemm};
+use peacemaker_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v8, design_v9, design_variant_probe, Variant};
+use peacemaker_npu::kernels::gemm_core::{clock_probe_cycles_per_iter, Control, CoreVariant, Epilogue, Probe};
+use peacemaker_npu::kernels::gemm_i8::{cpu_reference, design, ArgKind};
+use peacemaker_npu::kernels::iu4::{self, EpochGemm};
+use peacemaker_npu::kernels::iu4_ief15::{self, Ief15Gemm};
 use railgun::npu::{Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::ops::Range;
 use npu_tools::util::{lcg};
@@ -474,15 +479,40 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         });
         match opt_str(args, "--epi").unwrap_or("int8").to_ascii_lowercase().as_str() {
             "int8" => Some(Epilogue::Int8 { shift: shift.unwrap_or(12) }),
-            "i32" if v9 || v10 || g80 => { eprintln!("--variant {} supports --epi int8 only (the int32 epilogue is not implemented for V9/V10/G80)", variant.as_ref().map_or("V9", |v| v.name())); std::process::exit(2) }
+            "i32" if v9 || v10 => { eprintln!("--variant {} supports --epi int8 only (the int32 epilogue is not implemented for V9/V10)", variant.as_ref().map_or("V9", |v| v.name())); std::process::exit(2) }
             "i32" if shift.is_none() => Some(Epilogue::I32),
+            "bf16" if g80 && shift.is_none() => Some(Epilogue::Bf16),
+            "bf16" => { eprintln!("--epi bf16 needs --variant G80 and no --shift"); std::process::exit(2) }
             "i32" => { eprintln!("--shift needs --epi int8"); std::process::exit(2) }
-            other => { eprintln!("--epi must be i32 or int8, got {other:?}"); std::process::exit(2) }
+            other => { eprintln!("--epi must be i32, int8 or (G80 only) bf16, got {other:?}"); std::process::exit(2) }
         }
     } else if opt_str(args, "--epi").is_some() || opt_str(args, "--shift").is_some() {
         eprintln!("--epi/--shift are only valid with --variant V8, V9, V10 or G80");
         std::process::exit(2)
     } else { None };
+    // `--n512` (G80 BF16 only): the N=512 / K<=6336 resident-B out-projection design (`gemm_g80_n512`, 512-row waves).
+    let n512 = args.iter().any(|a| a == "--n512");
+    if n512 && !(g80 && epi == Some(Epilogue::Bf16)) {
+        eprintln!("--n512 needs --variant G80 --epi bf16"); std::process::exit(2)
+    }
+    let (wave_m, wave_n) = if n512 { (512, 512) } else { (256, 1280) };
+    let rowmajor = opt_str(args, "--rowmajor-pitch").map(|p| {
+        let parse = |name: &str, value: &str| value.parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("{name} needs an unsigned integer"); std::process::exit(2)
+        });
+        let pitch = parse("--rowmajor-pitch", p);
+        let col0 = parse("--rowmajor-col0", opt_str(args, "--rowmajor-col0").unwrap_or("0"));
+        if epi != Some(Epilogue::Bf16) || pitch % 2 != 0 || col0 % 2 != 0 ||
+            pitch / 2 > 1 << 20 || col0.checked_add(wave_n).is_none_or(|end| end > pitch) ||
+            m.div_ceil(wave_m).checked_mul(wave_m).and_then(|r| r.checked_mul(pitch)).and_then(|n| n.checked_mul(2)).is_none() {
+            eprintln!("row-major needs G80 BF16, even pitch/col0, col0+{wave_n} <= pitch <= {}, and a representable arena", 2 << 20);
+            std::process::exit(2)
+        }
+        peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }
+    });
+    if rowmajor.is_none() && opt_str(args, "--rowmajor-col0").is_some() {
+        eprintln!("--rowmajor-col0 requires --rowmajor-pitch"); std::process::exit(2)
+    }
     let a_from_hip = args.iter().any(|a| a == "--a-from-hip");
     let memory = opt_str(args, "--memory").map(|s| {
         if !pair || a_from_hip {
@@ -509,9 +539,10 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         std::process::exit(2)
     }
     if g80 {
-        let (max_k, wave_n) = (pm_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1);
+        let (max_k, wave_n) = if n512 { (peacemaker_npu::kernels::gemm_g80_n512::MAX_KC * 64, 512) }
+            else { (peacemaker_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1) };
         if n != wave_n || k % 64 != 0 || k == 0 || k > max_k {
-            eprintln!("--variant G80 needs N = {wave_n} and K a multiple of 64 in 64..={max_k}, got N={n} K={k}");
+            eprintln!("--variant G80{} needs N = {wave_n} and K a multiple of 64 in 64..={max_k}, got N={n} K={k}", if n512 { " --n512" } else { "" });
             std::process::exit(2)
         }
     }
@@ -524,6 +555,9 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         Probe::parse(s).unwrap_or_else(|e| { eprintln!("--ctl-probe: {e}"); std::process::exit(2) })
     });
     let timing_only = ctl_probe.is_some_and(Probe::timing_only);
+    if epi == Some(Epilogue::Bf16) && ctl_probe.is_some_and(|p| p.timing_only() || p.layout != 0) {
+        eprintln!("--epi bf16 requires ordinary GEMM compute and layout 0"); std::process::exit(2)
+    }
     let probe_iters: u32 = match opt_str(args, "--probe-iters") {
         None => 0,
         Some(_) if core != CoreVariant::ClockProbe => {
@@ -584,21 +618,22 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             iu4_io = Some((g.padded(&partials), g.pack_in(&w, &x), g.useful_ops()));
             g.design
         }
-        Some(epi) if g80 => design_g80(m, n, k, epi, control),
+        Some(epi) if g80 && n512 => peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
+        Some(epi) if g80 => peacemaker_npu::kernels::gemm_g80::design_g80_bf16_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
         Some(epi) if v10 && b_prefix => design_v10_prefix(m, n, k, epi, control),
         Some(epi) if v10 => design_v10(m, n, k, epi, control),
         Some(epi) if v9 => design_v9(m, n, k, epi, control),
         Some(epi) => design_v8(m, n, k, epi, control),
         None => design_variant_probe(m, n, k, variant.unwrap_or(Variant::V6), core, probe_iters),
     };
-    let defaults = pm_npu::dma::ShimAxi::default();
+    let defaults = peacemaker_npu::dma::ShimAxi::default();
     let field = |name: &str, default: u32, max: u32| {
         opt_str(args, name).map_or(default, |s| match s.parse::<u32>() {
             Ok(v) if v <= max => v,
             _ => { eprintln!("{name} must be 0..={max}"); std::process::exit(2) }
         })
     };
-    let axi = pm_npu::dma::ShimAxi {
+    let axi = peacemaker_npu::dma::ShimAxi {
         burst: field("--burst", defaults.burst, 3),
         cache: field("--axcache", defaults.cache, 15),
         qos: field("--axqos", defaults.qos, 15),
@@ -623,7 +658,22 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         let mut seed = 0x5eed_u64;
         let a: Vec<i8> = (0..m * k).map(|_| lcg(&mut seed)).collect();
         let b: Vec<i8> = (0..k * n).map(|_| lcg(&mut seed)).collect();
-        (d.reference(&a, &b), d.pack_in(&a, &b), d.useful_ops())
+        if epi == Some(Epilogue::Bf16) {
+            use peacemaker_npu::kernels::{gemm_g80::{pack_a_bf16, pack_b_bf16}, w8a8_epi::bf16_direct};
+            let mut scale = || {
+                let mantissa = 16384 + (u16::from(lcg(&mut seed) as u8) << 6);
+                let exponent = -20 + i16::from(lcg(&mut seed) as u8 % 7);
+                (mantissa, exponent)
+            };
+            let ds: Vec<_> = (0..m).map(|_| scale()).collect();
+            let ss: Vec<_> = (0..n).map(|_| scale()).collect();
+            let want = peacemaker_npu::kernels::gemm_i8::cpu_reference(&a, &b, m, n, k).into_iter().enumerate()
+                .map(|(at, i)| { let (sm, se) = ss[at % n]; let (dm, de) = ds[at / n];
+                    i32::from(bf16_direct(i, sm, se, dm, de)) }).collect();
+            (want, [pack_a_bf16(&d, &a, &ds), pack_b_bf16(&d, &b, &ss)], d.useful_ops())
+        } else {
+            (d.reference(&a, &b), d.pack_in(&a, &b), d.useful_ops())
+        }
     };
     let want_c0 = if timing_only { "n/a (timing-only)".to_string() } else if lock_only { format!("{:#010x} (lock pattern)", lock_word(0, 0)) } else { want[0].to_string() };
     let (host_rd, host_wr) = (d.host_bytes_read(), d.host_bytes_written());
@@ -730,7 +780,17 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         if got.len() != want.len() {
             return (usize::MAX, got.first().map_or(0, |v| *v).to_string());
         }
-        (got.iter().zip(&want).filter(|(g, w)| g != w).count(), got[0].to_string())
+        let outside_bad = if let Some(peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+            bos[out_idx].as_slice().chunks_exact(2).enumerate().filter(|(at, bytes)| {
+                let col = at % pitch;
+                (col < col0 || col >= col0 + n) && bytes.iter().any(|&b| b != 0xA5)
+            }).count()
+        } else { 0 };
+        let padding_bad = if let Some(peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+            (m..d.waves() * d.wave_m()).flat_map(|row| (0..n).map(move |col| 2 * (row * pitch + col0 + col)))
+                .filter(|&off| bos[out_idx].as_slice()[off..off + 2] != [0, 0]).count()
+        } else { 0 };
+        (got.iter().zip(&want).filter(|(g, w)| g != w).count() + outside_bad + padding_bad, got[0].to_string())
     };
     let fmt_bad = |bad: usize| {
         if timing_only {
@@ -1202,15 +1262,15 @@ fn run_ief15(args: &[String], tokens: usize, features: usize, k: usize) -> bool 
 }
 
 /// `--ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--expected-only]`: the IEF15 N0 single-core semantics probe
-/// (`pm_npu::kernels::iu4_ief15_probe`, design doc `docs/ief15-n0.md` section 7 step 1). The expected bytes are the output of
-/// the exact probe PDI + TXN run in `pm_npu::sim::config::Config`; the same PDI + TXN is then submitted once on a fresh
+/// (`peacemaker_npu::kernels::iu4_ief15_probe`, design doc `docs/ief15-n0.md` section 7 step 1). The expected bytes are the output of
+/// the exact probe PDI + TXN run in `peacemaker_npu::sim::config::Config`; the same PDI + TXN is then submitted once on a fresh
 /// hardware context (shim BD word 5 and AxQoS are the vendor defaults) and compared byte for byte. Prints one
 /// MATCH/MISMATCH line per case (case id, encoding, operands, output byte range; a mismatch also the first differing
 /// lane, expected vs got) and returns false on any mismatch or a non-completed wait. `--dump PATH` writes the expected
 /// bytes to `PATH.expected` and the hardware bytes to `PATH.got`; `--expected-only` stops after the simulator run (no
 /// hardware access): it prints the expected blob's size and FNV-1a/64 and returns true.
 fn run_ief15_probe(args: &[String]) -> bool {
-    use pm_npu::kernels::iu4_ief15_probe::{self as probe, SemanticsProbe};
+    use peacemaker_npu::kernels::iu4_ief15_probe::{self as probe, SemanticsProbe};
     fn bad_flag(msg: String) -> ! { eprintln!("{msg}"); std::process::exit(2) }
     for f in ["--array", "--variant", "--core", "--epi", "--shift", "--ctl-probe", "--a-from-hip", "--memory", "--burst", "--axcache",
         "--axqos", "--b-prefix", "--probe-iters", "--iu4-epochs", "--gap-us", "--fold-contract", "--loop", "--reuse-ctx", "--iters"] {
@@ -1226,7 +1286,7 @@ fn run_ief15_probe(args: &[String]) -> bool {
         cases.len(), d.program_bytes, d.args[0].bytes, d.args[1].bytes, d.pdi.len(), d.insts.len());
     // Expected bytes: the exact PDI + TXN in the simulator.
     let mut sim_args = vec![input.clone(), vec![0xA5u8; d.args[1].bytes]];
-    let mut sim = pm_npu::sim::config::Config::from_pdi(&d.pdi).expect("simulator: probe PDI");
+    let mut sim = peacemaker_npu::sim::config::Config::from_pdi(&d.pdi).expect("simulator: probe PDI");
     sim.tick_limit = 50_000_000;
     if let Err(e) = sim.submit(&d.insts, &mut sim_args) { println!("simulator run of the probe failed: {e:?}"); return false; }
     let expected = sim_args.remove(1);

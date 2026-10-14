@@ -117,7 +117,7 @@ SP1's gates carry over unchanged and are not re-derived:
 
 - **`scripts/attn_legacy_baseline.sh`** — numeric legacy fingerprint. Any SP2
   change that touches a shared kernel must leave it bitwise identical.
-- **`scripts/kernel_resource_gate.sh`** — VGPR/scratch/occupancy, both arches.
+- **`scripts/kernel_resource_gate.sh`** — VGPR, scratch and occupancy, both arches.
   Added in SP1 after a 25% occupancy regression passed nine numeric checks. Any
   SP2 kernel edit re-runs it, and a deliberate cost updates the baseline in the
   same commit with the reason.

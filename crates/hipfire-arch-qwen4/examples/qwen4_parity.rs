@@ -2187,6 +2187,7 @@ fn run_qsa(
             index_dim,
             position: None,
             grid_bound: blocks,
+            yarn: rdna_compute::rope::RopeYarn::OFF,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -2371,6 +2372,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2408,6 +2410,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2451,6 +2454,7 @@ fn run_qsa(
                 head_stride: 8,
                 position: *position,
                 rotary_dim: 8,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3297,6 +3301,7 @@ fn run_mtp(
             index_dim,
             position: None,
             grid_bound: 1,
+            yarn: rdna_compute::rope::RopeYarn::OFF,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -3858,6 +3863,12 @@ fn run_quality_candidate(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &config, &manifest,
+    )
+    .map_err(|error| error.to_string())?;
     // Load by byte range like the serve loader and state runner. The borrowed
     // mmap path never finished on gfx1151 UMA (over an hour, stuck in SVM
     // registration); range loading takes about a minute.
@@ -3898,7 +3909,7 @@ fn run_quality_candidate(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));
     bundle
-        .attach_forward(&mut gpu, 2048)
+        .attach_forward(&mut gpu, 2048, scratch_mode)
         .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
     let vocab = config.vocab_size;
     let logits = gpu

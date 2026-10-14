@@ -2299,6 +2299,15 @@ fn load(
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
     let receipt = admit_hfqm_artifact(&hfq).map_err(e)?;
     let mut gpu = Gpu::init().map_err(e)?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(e)?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2340,7 +2349,7 @@ fn load(
         backend,
     )
     .map_err(e)?;
-    bundle.attach_forward(&mut gpu, max_seq).map_err(e)?;
+    bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(e)?;
     if spec.is_some() {
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
     }

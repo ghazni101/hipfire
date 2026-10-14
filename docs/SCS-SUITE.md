@@ -2,13 +2,21 @@
 
 # SCS suite — serving-cache-scheduler black-box test suite
 
-`scripts/scs_suite.py` is a 69-cell black-box test suite for the
-`feat/serving-cache-scheduler` branch, driven entirely over the
-OpenAI-compatible HTTP surface of a running `hipfire serve` container. It was
-built to exercise every externally observable feature of the branch against
-the live `qwen35-4b-mq4v1-multislot` container (4 slots, ctx 50000, prefix
-cache on, `json-schema-strict-v1`, jump-forward on, `.mtp` + `.vl` sidecars
-present, queue timeout 300 s).
+`scripts/scs_suite.py` is a 69-cell black-box test suite written for the
+`feat/serving-cache-scheduler` branch (historical scope; see
+[`specs/2026-09-05-serving-cache-scheduler-summary.md`](specs/2026-09-05-serving-cache-scheduler-summary.md)).
+It is driven entirely over the OpenAI-compatible HTTP surface of a running
+`hipfire serve` container and was built to exercise every externally
+observable feature of that branch.
+
+**Prerequisites.** The cells assume the reference deployment they were
+written against: a `qwen35-4b-mq4v1-multislot` container with 4 slots
+(`--slots`, default 4), ctx 50000, prefix cache on, `json-schema-strict-v1`,
+jump-forward on, `.mtp` + `.vl` sidecars present, and a 300 s queue timeout.
+Against another configuration, configuration-dependent cells (for example
+A1/A3/H1, which assert `--slots`, and the env-dependent D7/H3) can fail or
+skip for reasons unrelated to a regression. The suite is not a general
+certification of any release.
 
 It complements, and does not replace, the other verification layers:
 
@@ -16,18 +24,20 @@ It complements, and does not replace, the other verification layers:
 |---|---|---|
 | Host unit tests | `cargo test --workspace --lib` | pool/index/fairness/grammar internals |
 | GPU compose oracle | `test_serve_prefix_cache --mtp-k N` | engine-level reuse + fault cells (A19/A20) |
-| Product harness | `scripts/serve_harness.py` | generic serve semantics, chain/battery/session |
+| Product harness | `scripts/serve_harness.py` | generic serve semantics (`--mode` battery/chain/session, plus images and prefix-fanout) |
 | **This suite** | `scripts/scs_suite.py` | **the branch's user-facing contracts end to end**, incl. areas no other layer covers over HTTP (capability advertisement, 503/cancel/stall behavior, schema×cache composition, strict-JSON framing, error-status mapping) |
 
 ## Usage
 
 ```bash
 # against the default container (127.0.0.1:8420)
-python3 scripts/scs_suite.py                       # full suite, ~5-8 min
+python3 scripts/scs_suite.py                       # full suite
 python3 scripts/scs_suite.py --list                # list all cells
 python3 scripts/scs_suite.py --area C              # one area (A B C D E F G V H)
 python3 scripts/scs_suite.py --cell E2 --cell D3   # specific cells
 python3 scripts/scs_suite.py --json-out report.json --docker-name <container>
+# other endpoint / config: --host, --port, --model (default qwen3.5:4b),
+# --slots (default 4), --spec auto|on|off, --timeout-scale
 ```
 
 Exit code 0 iff no FAIL. A companion JSON report (per-cell status, evidence,
@@ -52,7 +62,7 @@ endpoint.
 | B | generation + sampling contract (shapes, SSE frames, usage chunk, reasoning separation, coherence battery, greedy/seeded determinism, sampling params, finish=length) | B1-B10 |
 | C | prefix cache correctness: cold/warm reuse, warm replay identity, A10 long-gen replay, branch + mid-page fork (W10-4), multi-turn chain, false-reuse guard, concurrent shared-prefix isolation (COW), soak stability, gen-param independence | C1-C9 |
 | E | strict JSON Schema: valid output + determinism, streaming schema, framing-aware cursor (W10-2), enum/const, min/maxItems, required/closed, nested, unsupported keywords (P0-2), malformed keyword values, union type, bare object, structural errors, integer dead-end (P1-7), `json_object`/`text` refusal, schema×cache composition | E1-E16 |
-| F | typed refusals on the multi-slot route: tools, stop, logprobs, tool-role messages, reasoning_effort/think-cap/budget, min_p range, `n`, `logit_bias` | F1-F9 |
+| F | multi-slot route refusals and support: tools supported (F1), stop (F2), logprobs (F3), tool-result role (F4), reasoning_effort (F5), think cap / named budget (F6), min_p range (F7), `n` (F8), `logit_bias` (F9) | F1-F9 |
 | G | HTTP limits + error mapping: invalid JSON, unknown model, max_tokens bounds, 413 Content-Length, seed validation, empty messages, ctx overshoot | G1-G7 |
 | V | vision×radix isolation (A18: repeated image request must show `cached_tokens 0`) | V1 |
 | D | scheduler/admission: two-slot parallel generation + progressive service (wave-12), four-slot saturation, queue-full 503 + Retry-After, post-burst drain (pop_ready regression), cancel storm, long/short prefill interleave, queue timeout (env-dependent) | D1-D7 |
@@ -67,15 +77,18 @@ Design invariants enforced across cells:
 - **Prompt md5s recorded** for every fixture (in the JSON report), per the
   byte-identical-prompt rule.
 
-## Results on qwen35-4b-mq4v1-multislot (2026-09-13)
+## Historical run record: qwen35-4b-mq4v1-multislot (2026-09-13)
 
-Seven full runs. Runs 1–5 were executed while a second agent ran concurrent
-workload on the same GPU and endpoint; runs 6–7 are the clean re-verification
-(quiet endpoint, hipfire the only GPU client, fresh engine each run). The
-container runs binary `dd5faaeaf87c68532c8f57876b4f4b16` (image built
+The dated runs below are a historical record of the branch at that time, not a
+beta certification and not re-run for 0.4.2.
+
+Seven full runs. Runs 1–5 were executed while a second workload ran
+concurrently on the same GPU and endpoint; runs 6–7 are the clean
+re-verification (quiet endpoint, hipfire the only GPU client, fresh engine each
+run). The container ran binary `dd5faaeaf87c68532c8f57876b4f4b16` (image built
 14:23 +04) for ALL runs — the branch's post-17:00 fix commits
 (`e80f3e110`…`13f9a27fc`) are NOT in this image, so these runs do not verify
-those fixes; rebuilding the container is the follow-up.
+those fixes; rebuilding the container was the follow-up.
 
 ### Poisoning forensics
 
@@ -161,15 +174,16 @@ service), and the post-gauntlet canaries (H1, H2 cold-side).
 The later fix campaign repaired grammar, stream accounting, and error contracts.
 Seed parking makes sampling deterministic for identical logits, but does not make
 shape-dependent kernels batch-invariant. B8/C5/D1 therefore remain observational
-warnings until the opt-in mode planned in `2026-09-13-batch-invariance-design.md`
-lands; they are not acceptance failures.
+warnings until the opt-in mode planned in
+[`specs/2026-09-13-batch-invariance-design.md`](specs/2026-09-13-batch-invariance-design.md)
+lands (that design is not implemented); they are not acceptance failures.
 
-## Post-merge re-verification (2026-09-14, upstream v0.3.1 merged)
+## Historical post-merge re-verification (2026-09-14, upstream v0.3.1 merged)
 
-Container rebuilt from merge commit `de1455476` (upstream/master @ v0.3.1
-merged into the branch). Clean single run on a fresh engine:
-**63 pass / 2 fail / 1 warn / 3 skip** (report:
-`.codeinsight+research/scs-post-merge-2026-09-14-r3.json`).
+Historical run record, not beta certification. Container rebuilt from merge
+commit `de1455476` (upstream/master @ v0.3.1 merged into the branch). Clean
+single run on a fresh engine: **63 pass / 2 fail / 1 warn / 3 skip** (the JSON
+report from that run is not checked in).
 
 Fixed by the post-17:00 commits + upstream merge (all verified green):
 E2/E3/E4 (grammar stream + framing cursor + dead-end), E12, E15, F8, F9,
@@ -206,8 +220,8 @@ engine lifetime.
   exposed over HTTP — adding a stats surface would let black-box runs
   distinguish eviction from publication failure (H2) and honest reuse from
   accounting lies (phantom).
-- The run3/run5 daemon deaths are attributed to the second agent's GPU
-  workload (see poisoning forensics): with the endpoint quiet they do not
+- The run3/run5 daemon deaths are attributed to the second workload's GPU
+  use (see poisoning forensics): with the endpoint quiet they do not
   reproduce across two full clean runs. If the engine's hipMalloc
   failure mode (poison the daemon, exit 0) is ever hit again under a real
   co-tenant, treat it as an engine robustness gap, not just deployment

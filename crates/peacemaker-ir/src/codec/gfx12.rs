@@ -1242,3 +1242,205 @@ mod aco_pilot_scalar_tests {
         }
     }
 }
+
+/// Opcode-fill census for gfx1201: 37 emitted-gap identities plus the Mesa 60e95b7 WMMA, dot and
+/// SWMMAC identities (14 added here; (VOP3P,0x16), (VOP3P,0x44) and (VOP3P,0x56) already existed).
+/// Samples are pinned ROCm `llvm-mc -mcpu=gfx1201` words; each opcode is cross-checked against
+/// Mesa `aco_opcodes.py` (gfx12 column; VOP3-promoted VOPC/VOP2/VOP1 add +0/+0x100/+0x180).
+#[cfg(test)]
+mod opcode_fill_rows_tests {
+    use super::*;
+    use crate::effects::ImplicitSet;
+
+    /// (table row, llvm-mc words, llvm text = table sample, Mesa name, Mesa format, Mesa gfx12 opcode)
+    type Pinned = (&'static str, &'static [u32], &'static str, &'static str, &'static str, u16);
+    const NEW_ROWS: &[Pinned] = &[
+        ("flat_load_i8", &[0xec04_407c, 0x0000_0001, 0x0000_0402], "flat_load_i8 v1, v[2:3] offset:4", "flat_load_sbyte", "FLAT", 0x11),
+        ("flat_load_b96", &[0xec05_807c, 0x0000_0001, 0x0000_0804], "flat_load_b96 v[1:3], v[4:5] offset:8", "flat_load_dwordx3", "FLAT", 0x16),
+        ("flat_store_b8", &[0xec06_007c, 0x0080_0000, 0x0000_0402], "flat_store_b8 v[2:3], v1 offset:4", "flat_store_byte", "FLAT", 0x18),
+        ("flat_store_b16", &[0xec06_407c, 0x0080_0000, 0x0000_0202], "flat_store_b16 v[2:3], v1 offset:2", "flat_store_short", "FLAT", 0x19),
+        ("flat_store_b96", &[0xec07_007c, 0x0200_0000, 0x0000_0c02], "flat_store_b96 v[2:3], v[4:6] offset:12", "flat_store_dwordx3", "FLAT", 0x1c),
+        ("flat_load_d16_u8", &[0xec07_807c, 0x0000_0001, 0x0000_0102], "flat_load_d16_u8 v1, v[2:3] offset:1", "flat_load_ubyte_d16", "FLAT", 0x1e),
+        ("flat_store_d16_hi_b16", &[0xec09_407c, 0x0080_0000, 0x0000_0202], "flat_store_d16_hi_b16 v[2:3], v1 offset:2", "flat_store_short_d16_hi", "FLAT", 0x25),
+        ("s_sext_i32_i8", &[0xbe87_0e07], "s_sext_i32_i8 s7, s7", "s_sext_i32_i8", "SOP1", 0xe),
+        ("s_bitset1_b32", &[0xbe86_129f], "s_bitset1_b32 s6, 31", "s_bitset1_b32", "SOP1", 0x12),
+        ("s_nor_b32", &[0x8f03_0403], "s_nor_b32 s3, s3, s4", "s_nor_b32", "SOP2", 0x1e),
+        ("v_nop", &[0x7e00_0000], "v_nop", "v_nop", "VOP1", 0x0),
+        ("v_sqrt_f32_e32", &[0x7e02_6702], "v_sqrt_f32_e32 v1, v2", "v_sqrt_f32", "VOP1", 0x33),
+        ("v_cls_i32_e32", &[0x7e02_7702], "v_cls_i32_e32 v1, v2", "v_ffbh_i32", "VOP1", 0x3b),
+        ("v_cvt_f16_i16_e32", &[0x7e02_a302], "v_cvt_f16_i16_e32 v1.l, v2.l", "v_cvt_f16_i16", "VOP1", 0x51),
+        ("v_cvt_u32_u16_e32", &[0x7e02_d702], "v_cvt_u32_u16_e32 v1, v2.l", "v_cvt_u32_u16", "VOP1", 0x6b),
+        ("v_sub_co_ci_u32_e32", &[0x4202_0b02], "v_sub_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo", "v_subb_co_u32", "VOP2", 0x21),
+        ("v_mul_f16_e32", &[0x6a02_0702], "v_mul_f16_e32 v1.l, v2.l, v3.l", "v_mul_f16", "VOP2", 0x35),
+        ("v_cmp_nlg_f32_e64", &[0xd41a_0000, 0x0202_0501], "v_cmp_nlg_f32_e64 s0, v1, v2", "v_cmp_nlg_f32", "VOPC", 0x1a),
+        ("v_cmp_gt_i16_e64", &[0xd434_0000, 0x0202_0501], "v_cmp_gt_i16_e64 s0, v1.l, v2.l", "v_cmp_gt_i16", "VOPC", 0x34),
+        ("v_cmpx_le_u64_e64", &[0xd4db_007e, 0x0202_0610], "v_cmpx_le_u64_e64 s[16:17], v[3:4]", "v_cmpx_le_u64", "VOPC", 0xdb),
+        ("v_mul_f16_e64", &[0xd535_0001, 0x0202_0702], "v_mul_f16_e64 v1.l, v2.l, v3.l", "v_mul_f16", "VOP2", 0x35),
+        ("v_cvt_f16_i16_e64", &[0xd5d1_0001, 0x0201_0102], "v_cvt_f16_i16_e64 v1.l, v2.l", "v_cvt_f16_i16", "VOP1", 0x51),
+        ("v_cvt_u32_u16_e64", &[0xd5eb_0001, 0x0201_0102], "v_cvt_u32_u16_e64 v1, v2.l", "v_cvt_u32_u16", "VOP1", 0x6b),
+        ("v_mad_i32_i24", &[0xd60a_0001, 0x0412_0702], "v_mad_i32_i24 v1, v2, v3, v4", "v_mad_i32_i24", "VOP3", 0x20a),
+        ("v_subrev_co_u32", &[0xd702_0102, 0x0202_0f09], "v_subrev_co_u32 v2, s1, v9, v7", "v_subrev_co_u32_e64", "VOP3", 0x302),
+        ("v_mul_lo_u16", &[0xd705_0001, 0x0202_0702], "v_mul_lo_u16 v1.l, v2.l, v3.l", "v_mul_lo_u16_e64", "VOP3", 0x305),
+        ("v_lshrrev_b64", &[0xd73d_0009, 0x0202_0709], "v_lshrrev_b64 v[9:10], v9, v[3:4]", "v_lshrrev_b64", "VOP3", 0x33d),
+        ("v_wmma_f32_16x16x16_bf16", &[0xcc41_4000, 0x1c02_1908], "v_wmma_f32_16x16x16_bf16 v[0:7], v[8:11], v[12:15], v[0:7]", "v_wmma_f32_16x16x16_bf16", "VOP3P", 0x41),
+        ("v_wmma_bf16_16x16x16_bf16", &[0xcc43_4000, 0x1c02_1104], "v_wmma_bf16_16x16x16_bf16 v[0:3], v[4:7], v[8:11], v[0:3]", "v_wmma_bf16_16x16x16_bf16", "VOP3P", 0x43),
+        ("v_swmmac_f32_16x16x32_f16", &[0xcc50_4000, 0x1c52_1908], "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20", "v_swmmac_f32_16x16x32_f16", "VOP3P", 0x50),
+        ("v_swmmac_f32_16x16x32_bf16", &[0xcc51_4000, 0x1c52_1908], "v_swmmac_f32_16x16x32_bf16 v[0:7], v[8:11], v[12:19], v20", "v_swmmac_f32_16x16x32_bf16", "VOP3P", 0x51),
+        ("v_swmmac_f16_16x16x32_f16", &[0xcc52_4000, 0x1c42_1104], "v_swmmac_f16_16x16x32_f16 v[0:3], v[4:7], v[8:15], v16", "v_swmmac_f16_16x16x32_f16", "VOP3P", 0x52),
+        ("v_swmmac_bf16_16x16x32_bf16", &[0xcc53_4000, 0x1c42_1104], "v_swmmac_bf16_16x16x32_bf16 v[0:3], v[4:7], v[8:15], v16", "v_swmmac_bf16_16x16x32_bf16", "VOP3P", 0x53),
+        ("v_swmmac_i32_16x16x32_iu8", &[0xcc54_4000, 0x1c3a_1508], "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_i32_16x16x32_iu8", "VOP3P", 0x54),
+        ("v_swmmac_i32_16x16x32_iu4", &[0xcc55_4000, 0x1c2e_1308], "v_swmmac_i32_16x16x32_iu4 v[0:7], v8, v[9:10], v11", "v_swmmac_i32_16x16x32_iu4", "VOP3P", 0x55),
+        ("v_swmmac_f32_16x16x32_fp8_fp8", &[0xcc57_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_fp8_fp8", "VOP3P", 0x57),
+        ("v_swmmac_f32_16x16x32_fp8_bf8", &[0xcc58_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_fp8_bf8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_fp8_bf8", "VOP3P", 0x58),
+        ("v_swmmac_f32_16x16x32_bf8_fp8", &[0xcc59_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_bf8_fp8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_bf8_fp8", "VOP3P", 0x59),
+        ("v_swmmac_f32_16x16x32_bf8_bf8", &[0xcc5a_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_bf8_bf8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_bf8_bf8", "VOP3P", 0x5a),
+        ("v_dot2_f32_f16", &[0xcc13_4000, 0x1c0e_0501], "v_dot2_f32_f16 v0, v1, v2, v3", "v_dot2_f32_f16", "VOP3P", 0x13),
+        ("v_dot2_f32_bf16", &[0xcc1a_4000, 0x1c0e_0501], "v_dot2_f32_bf16 v0, v1, v2, v3", "v_dot2_f32_bf16", "VOP3P", 0x1a),
+        ("v_dot8_i32_iu4", &[0xcc18_4000, 0x7c0e_0501], "v_dot8_i32_iu4 v0, v1, v2, v3 neg_lo:[1,1,0]", "v_dot8_i32_iu4", "VOP3P", 0x18),
+        ("v_cmp_nlg_f32_e32", &[0x7c34_0501], "v_cmp_nlg_f32_e32 vcc_lo, v1, v2", "v_cmp_nlg_f32", "VOPC", 0x1a),
+        ("v_cmp_le_u64_e32", &[0x7cb6_0602], "v_cmp_le_u64_e32 vcc_lo, s[2:3], v[3:4]", "v_cmp_le_u64", "VOPC", 0x5b),
+        ("v_cmp_gt_u64_e32", &[0x7cb8_0602], "v_cmp_gt_u64_e32 vcc_lo, s[2:3], v[3:4]", "v_cmp_gt_u64", "VOPC", 0x5c),
+        ("v_cmp_ne_u64_e32", &[0x7cba_0e80], "v_cmp_ne_u64_e32 vcc_lo, 0, v[7:8]", "v_cmp_lg_u64", "VOPC", 0x5d),
+        ("v_cmpx_ge_i32_e32", &[0x7d8c_0501], "v_cmpx_ge_i32_e32 v1, v2", "v_cmpx_ge_i32", "VOPC", 0xc6),
+        ("v_cmpx_ge_u32_e32", &[0x7d9c_1a0f], "v_cmpx_ge_u32_e32 s15, v13", "v_cmpx_ge_u32", "VOPC", 0xce),
+        ("v_cmpx_lt_i64_e32", &[0x7da2_0602], "v_cmpx_lt_i64_e32 s[2:3], v[3:4]", "v_cmpx_lt_i64", "VOPC", 0xd1),
+        ("v_cmpx_eq_u64_e32", &[0x7db4_0e80], "v_cmpx_eq_u64_e32 0, v[7:8]", "v_cmpx_eq_u64", "VOPC", 0xda),
+        ("v_cmpx_gt_u64_e32", &[0x7db8_0602], "v_cmpx_gt_u64_e32 s[2:3], v[3:4]", "v_cmpx_gt_u64", "VOPC", 0xdc),
+    ];
+    /// Rows that predate the fill. `(VOP3P,0x16)` is `v_dot4_i32_iu8` (canonical ACO/LLVM name; the old
+    /// alias `v_dot4_i32_i8` is iu8 with neg_lo:[1,1,0]); operand signedness comes from neg_lo.
+    const EXISTING_USEFUL: &[Pinned] = &[
+        ("v_dot4_i32_iu8", &[0xcc16_4000, 0x7c0e_0501], "v_dot4_i32_iu8 v0, v1, v2, v3 neg_lo:[1,1,0]", "v_dot4_i32_iu8", "VOP3P", 0x16),
+        ("v_dot4_i32_iu8", &[0xcc16_4000, 0x1c0e_0501], "v_dot4_i32_iu8 v0, v1, v2, v3", "v_dot4_i32_iu8", "VOP3P", 0x16),
+        ("v_wmma_i32_16x16x16_iu8", &[0xcc44_4008, 0x7c22_0900], "v_wmma_i32_16x16x16_iu8 v[8:15], v[0:1], v[4:5], v[8:15] neg_lo:[1,1,0]", "v_wmma_i32_16x16x16_iu8", "VOP3P", 0x44),
+        ("v_swmmac_i32_16x16x64_iu4", &[0xcc56_4000, 0x1c3a_1508], "v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_i32_16x16x64_iu4", "VOP3P", 0x56),
+    ];
+
+    fn mesa_family(form: Form) -> &'static [&'static str] {
+        match form {
+            Form::Sop1 => &["SOP1"], Form::Sop2 => &["SOP2"], Form::Vop1 => &["VOP1"], Form::Vop2 => &["VOP2"],
+            Form::Vopc => &["VOPC"], Form::Vop3p => &["VOP3P"], Form::Vmem(crate::inst::VmemForm::Flat) => &["FLAT"],
+            Form::Vop3 => &["VOP3", "VOPC", "VOP2", "VOP1"],
+            other => panic!("unexpected form {other:?}"),
+        }
+    }
+    fn mesa_offset(mesa_format: &str, form: Form) -> u16 {
+        match (mesa_format, form) { ("VOP2", Form::Vop3) => 0x100, ("VOP1", Form::Vop3) => 0x180, _ => 0 }
+    }
+    fn v(base: u16, len: u8) -> RegRef { RegRef { kind: Kind::V, base, len } }
+    fn s(base: u16, len: u8) -> RegRef { RegRef { kind: Kind::S, base, len } }
+    fn inst(words: &[u32]) -> Inst { decode(words).unwrap().0 }
+
+    #[test]
+    fn every_filled_row_matches_mesa_table_and_llvm_words() {
+        let mut failures = Vec::new();
+        for (pinned, check_table) in NEW_ROWS.iter().map(|p| (p, true)).chain(EXISTING_USEFUL.iter().map(|p| (p, false))) {
+            let &(name, words, text, mesa_name, mesa_format, mesa_op) = pinned;
+            let result = (|| -> Result<(), String> {
+                let (inst, used) = decode(words).map_err(|e| e.to_string())?;
+                if used != words.len() { return Err(format!("width {used} != {}", words.len())); }
+                if inst.op.name(Arch::Gfx1201) != Some(name) {
+                    return Err(format!("decoded as {:?}", inst.op.name(Arch::Gfx1201)));
+                }
+                let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).ok_or("no table row")?;
+                if check_table {
+                    let table: Vec<u32> = row.encoding.split_whitespace().map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+                    if row.sample != text || table != words { return Err(format!("table sample {:?} {:?} != pinned {text:?} {words:08x?}", row.sample, row.encoding)); }
+                }
+                if !mesa_family(inst.form).contains(&mesa_format) { return Err(format!("{mesa_name} is Mesa {mesa_format}, row is {:?}", inst.form)); }
+                if inst.op.id != mesa_op + mesa_offset(mesa_format, inst.form) {
+                    return Err(format!("{mesa_name} gfx12 opcode {mesa_op:#x} does not map to row opcode {:#x}", inst.op.id));
+                }
+                if encode(&inst).map_err(|e| e.to_string())?.as_slice() != words { return Err("re-encode differs".into()); }
+                // Typed fields alone (no decoded provenance) rebuild the same words.
+                let rebuilt = Inst::from_parts(Arch::Gfx1201, inst.op, inst.form, inst.fields.clone(), inst.operands.clone(),
+                    inst.mods.clone(), inst.literal, Provenance::default()).map_err(|e| e.to_string())?;
+                if encode(&rebuilt).map_err(|e| e.to_string())?.as_slice() != words { return Err("typed rebuild differs".into()); }
+                if decode(&encode(&inst).unwrap()).map_err(|e| e.to_string())?.0 != inst { return Err("decode(encode(i)) != i".into()); }
+                Ok(())
+            })();
+            if let Err(error) = result { failures.push(format!("{name} {words:08x?}: {error}")); }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(NEW_ROWS.len(), 51);
+    }
+
+    #[test]
+    fn filled_rows_carry_source_verified_effects() {
+        // SWMMAC reads and writes its accumulator VDST and reads the A, B and sparse-index registers.
+        let swmmac = inst(&[0xcc50_4000, 0x1c52_1908]); // v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
+        assert_eq!(swmmac.effects.defs.as_slice(), &[v(0, 8)]);
+        for reg in [v(0, 8), v(8, 4), v(12, 8), v(20, 1)] { assert!(swmmac.effects.uses.contains(&reg), "{reg:?}"); }
+        let wmma = inst(&[0xcc41_4000, 0x1c02_1908]); // v_wmma_f32_16x16x16_bf16 v[0:7], v[8:11], v[12:15], v[0:7]
+        assert_eq!(wmma.effects.defs.as_slice(), &[v(0, 8)]);
+        for reg in [v(8, 4), v(12, 4), v(0, 8)] { assert!(wmma.effects.uses.contains(&reg), "{reg:?}"); }
+        let dot = inst(&[0xcc13_4000, 0x1c0e_0501]); // v_dot2_f32_f16 v0, v1, v2, v3
+        assert_eq!(dot.effects.defs.as_slice(), &[v(0, 1)]);
+        assert_eq!(dot.effects.uses.as_slice(), &[v(1, 1), v(2, 1), v(3, 1)]);
+        // FLAT: Load/Ds and Store/Ds counters; D16 loads preserve the other half of VDST.
+        let load = inst(&[0xec07_807c, 0x0000_0001, 0x0000_0102]); // flat_load_d16_u8 v1, v[2:3] offset:1
+        assert_eq!(load.effects.defs.as_slice(), &[v(1, 1)]);
+        assert!(load.effects.uses.contains(&v(1, 1)) && load.effects.uses.contains(&v(2, 2)));
+        let counters = &load.effects.mem.as_ref().unwrap().counters;
+        assert!(counters.contains(Counter::Load) && counters.contains(Counter::Ds));
+        let store = inst(&[0xec07_007c, 0x0200_0000, 0x0000_0c02]); // flat_store_b96 v[2:3], v[4:6] offset:12
+        assert!(store.effects.defs.is_empty());
+        assert!(store.effects.uses.contains(&v(2, 2)) && store.effects.uses.contains(&v(4, 3)));
+        let counters = &store.effects.mem.as_ref().unwrap().counters;
+        assert!(counters.contains(Counter::Store) && counters.contains(Counter::Ds));
+        // SALU.
+        let nor = inst(&[0x8f03_0403]); // s_nor_b32 s3, s3, s4: writes SCC
+        assert_eq!((nor.effects.implicit.reads, nor.effects.implicit.writes), (0, ImplicitSet::SCC));
+        let bitset = inst(&[0xbe86_129f]); // s_bitset1_b32 s6, 31: read-modify-write of SDST, SCC untouched
+        assert_eq!(bitset.effects.defs.as_slice(), &[s(6, 1)]);
+        assert!(bitset.effects.uses.contains(&s(6, 1)));
+        assert_eq!((bitset.effects.implicit.reads, bitset.effects.implicit.writes), (0, 0));
+        // VALU implicit state.
+        let nop = inst(&[0x7e00_0000]);
+        assert!(nop.effects.defs.is_empty() && nop.effects.uses.is_empty() && nop.operands.is_empty());
+        assert_eq!((nop.effects.implicit.reads, nop.effects.implicit.writes), (0, 0));
+        let subb = inst(&[0x4202_0b02]); // v_sub_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo
+        assert_eq!((subb.effects.implicit.reads, subb.effects.implicit.writes), (ImplicitSet::VCC, ImplicitSet::VCC));
+        let cmp = inst(&[0x7cb6_0602]); // v_cmp_le_u64_e32 vcc_lo, s[2:3], v[3:4]
+        assert_eq!((cmp.effects.implicit.reads, cmp.effects.implicit.writes), (0, ImplicitSet::VCC));
+        assert!(cmp.effects.defs.is_empty());
+        assert!(cmp.effects.uses.contains(&s(2, 2)) && cmp.effects.uses.contains(&v(3, 2)));
+        for words in [&[0x7d8c_0501u32][..], &[0xd4db_007e, 0x0202_0610]] { // v_cmpx_ge_i32_e32, v_cmpx_le_u64_e64
+            let cmpx = inst(words);
+            assert_eq!((cmpx.effects.implicit.reads, cmpx.effects.implicit.writes), (0, ImplicitSet::EXEC));
+            assert!(cmpx.effects.defs.is_empty());
+        }
+        let subrev = inst(&[0xd702_0102, 0x0202_0f09]); // v_subrev_co_u32 v2, s1, v9, v7
+        assert!(subrev.effects.defs.contains(&v(2, 1)) && subrev.effects.defs.contains(&s(1, 2)));
+        // 16-bit destinations write one half and therefore read the old VGPR.
+        for words in [&[0x7e02_a302u32][..], &[0x6a02_0702], &[0xd535_0001, 0x0202_0702], &[0xd5d1_0001, 0x0201_0102], &[0xd705_0001, 0x0202_0702]] {
+            let half = inst(words);
+            assert_eq!(half.effects.defs.as_slice(), &[v(1, 1)], "{words:08x?}");
+            assert!(half.effects.uses.contains(&v(1, 1)), "{words:08x?}");
+        }
+    }
+
+    /// Every declared don't-care / literal combination of the new rows roundtrips on its own sample.
+    #[test]
+    fn filled_rows_roundtrip_all_declared_dont_care_values() {
+        for &(name, words, ..) in NEW_ROWS {
+            let (inst, _) = decode(words).unwrap();
+            let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+            for rule in row.fields.iter().filter(|r| r.class == FieldClass::Ignored) {
+                let Some(placement) = (match rule.name {
+                    "w0_extra" => Some((0, 0)), "w1_extra" | "vsrc_unused" => Some((1, 0)),
+                    "src2_unused" => Some((1, 18)), "src1_unused" => Some((1, 9)),
+                    _ => None,
+                }) else { continue };
+                for &allowed in &rule.allowed {
+                    let mut variant = words.to_vec();
+                    let mask = rule.mask << placement.1;
+                    variant[placement.0] = (variant[placement.0] & !mask) | (allowed << placement.1);
+                    let (decoded, used) = decode(&variant).unwrap_or_else(|e| panic!("{name} {variant:08x?}: {e}"));
+                    assert_eq!(used, variant.len(), "{name}");
+                    assert_eq!(encode(&decoded).unwrap().as_slice(), variant.as_slice(), "{name} {variant:08x?}");
+                }
+            }
+        }
+    }
+}

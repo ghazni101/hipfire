@@ -28,10 +28,8 @@
 //! FWHT-rotated for the rotated formats (see [`crate::quant`]) — so one kernel
 //! serves a rotated format and its byte-identical unrotated sibling.
 //!
-//! `Mq4G256` (qt 13) keeps its own hand-unrolled nibble path ([`mq4_group_dot`]):
-//! it predates this core, decodes 32 codes per 16-byte load instead of 8 per
-//! 4-byte load, and its numbers are the ones the recorded qt 13 measurements
-//! were taken with, so it is left alone rather than re-derived from the table.
+//! `Mq4G256` (qt 13) keeps its own nibble path ([`mq4_group_dot`]), decoding
+//! 32 codes per 16-byte load instead of 8 per 4-byte load.
 
 use core::arch::x86_64::*;
 
@@ -57,17 +55,9 @@ unsafe fn load_le<const BITS: usize>(p: *const u8) -> u64 {
     match BITS {
         1 => *p as u64,
         2 => (p as *const u16).read_unaligned() as u64,
-        // Three bytes from one 32-bit load of the byte *before* the chunk plus
-        // the chunk, shifted down. In bounds for every chunk: a group's payload
-        // always starts at least one header byte in.
-        3 => ((p.sub(1) as *const u32).read_unaligned() >> 8) as u64,
         4 => (p as *const u32).read_unaligned() as u64,
         5 => (p as *const u32).read_unaligned() as u64 | ((*p.add(4) as u64) << 32),
-        6 => {
-            (p as *const u32).read_unaligned() as u64
-                | (((p.add(4) as *const u16).read_unaligned() as u64) << 32)
-        }
-        _ => unreachable!("no format packs codes wider than six bits"),
+        _ => unreachable!("load_le handles only 1-, 2-, 4- and 5-bit chunks"),
     }
 }
 
@@ -84,14 +74,41 @@ unsafe fn shifts64<const BITS: usize, const OFF: usize>() -> __m256i {
 /// lanes (each already masked to its width).
 ///
 /// One broadcast of the chunk plus one variable shift per code. An 8-code chunk
-/// is `8·BITS` bits, so widths up to four fit a 32-bit lane and a single shift;
-/// the 5- and 6-bit packs are 40 and 48 bits and need the field in 64-bit lanes,
-/// where each lane carries one code and the four low dwords of each half are
-/// compacted back into eight lanes.
+/// is `8·BITS` bits, so widths up to four fit a 32-bit lane and a single shift.
+/// Three-bit chunks retain the preceding byte and discard it in the vector
+/// shift. Six-bit chunks broadcast two prefix bytes and their six payload bytes,
+/// then shuffle two 24-bit halves into the corresponding 128-bit lanes.
+/// Five-bit packs need 64-bit lanes, compacted back into eight i32 lanes.
+///
+/// # Safety
+///
+/// Requires AVX2 and `BITS` readable payload bytes at `p`. For 3-bit packs,
+/// `p.sub(1)` must also be readable; for 6-bit packs, `p.sub(2)` must be
+/// readable. These prefix bytes belong to the same allocation's group header
+/// or earlier payload, never before the allocation's first byte.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
-    if BITS <= 4 {
+    if BITS == 6 {
+        // One qword ends exactly at this chunk's last payload byte. Repeat
+        // [prefix, code bytes] for each four-code half; the shifts below discard
+        // its prefix. Both extra bytes are within the group header or payload.
+        let packed = _mm256_set1_epi64x((p.sub(2) as *const i64).read_unaligned());
+        let bytes = _mm256_setr_epi8(
+            1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4,
+            4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7,
+        );
+        let v = _mm256_shuffle_epi8(packed, bytes);
+        let shifts = _mm256_setr_epi32(8, 14, 20, 26, 8, 14, 20, 26);
+        let mask = _mm256_set1_epi32(0x3f);
+        _mm256_and_si256(_mm256_srlv_epi32(v, shifts), mask)
+    } else if BITS == 3 {
+        // Fold the prefix-byte removal into the existing vector shifts. This
+        // enables a memory broadcast instead of a scalar load/shift/transfer.
+        let v = _mm256_set1_epi32((p.sub(1) as *const i32).read_unaligned());
+        let shifts = _mm256_setr_epi32(8, 11, 14, 17, 20, 23, 26, 29);
+        _mm256_and_si256(_mm256_srlv_epi32(v, shifts), _mm256_set1_epi32(7))
+    } else if BITS <= 4 {
         let v = _mm256_set1_epi32(load_le::<BITS>(p) as i32);
         let b = BITS as i32;
         let shifts = _mm256_setr_epi32(0, b, 2 * b, 3 * b, 4 * b, 5 * b, 6 * b, 7 * b);
@@ -118,21 +135,60 @@ unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
 /// rather than one per chunk.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize>(
+unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize, const CACHED: bool>(
     gptr: *const u8,
     xg: *const f32,
     first: usize,
     last: usize,
+    cached_sum: f32,
 ) -> (f32, f32) {
-    let mut dot = _mm256_setzero_ps();
-    let mut sum = _mm256_setzero_ps();
-    for idx in first..last {
-        let xv = _mm256_loadu_ps(xg.add(idx * 8));
-        let c = _mm256_cvtepi32_ps(codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS)));
-        dot = _mm256_fmadd_ps(c, xv, dot);
-        sum = _mm256_add_ps(sum, xv);
+    const { assert!((BITS != 3 || PAYLOAD >= 1) && (BITS != 6 || PAYLOAD >= 2)) };
+    // Two independent chains per sum, stepped two chunks at a time. A single
+    // chain serializes on the `fma`'s four-cycle latency while the decode is
+    // several uops per chunk, so a same-chain reuse every *other* iteration
+    // (~5+ cycles apart at this decode's throughput) already covers that
+    // latency; a wider fold would only add register pressure. `first..last` is
+    // arbitrary, so the odd tail folds into the first chain.
+    //
+    // With `CACHED` the caller has already reduced this range's `Σx`
+    // ([`super::prepare_activation_sums`]) and only the dot chain runs; the
+    // cached value is returned in the second slot. The dot FMAs and, when
+    // `!CACHED`, the sum vectors and their reduction order are identical in
+    // both modes.
+    let mut dot0 = _mm256_setzero_ps();
+    let mut dot1 = _mm256_setzero_ps();
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let mut idx = first;
+    while idx + 1 < last {
+        let j = idx + 1;
+        let x0 = _mm256_loadu_ps(xg.add(idx * 8));
+        let c0 = _mm256_cvtepi32_ps(codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS)));
+        let x1 = _mm256_loadu_ps(xg.add(j * 8));
+        let c1 = _mm256_cvtepi32_ps(codes8::<BITS>(gptr.add(PAYLOAD + j * BITS)));
+        dot0 = _mm256_fmadd_ps(c0, x0, dot0);
+        dot1 = _mm256_fmadd_ps(c1, x1, dot1);
+        if !CACHED {
+            sum0 = _mm256_add_ps(sum0, x0);
+            sum1 = _mm256_add_ps(sum1, x1);
+        }
+        idx += 2;
     }
-    (hsum256(dot), hsum256(sum))
+    if idx < last {
+        let x = _mm256_loadu_ps(xg.add(idx * 8));
+        let c = _mm256_cvtepi32_ps(codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS)));
+        dot0 = _mm256_fmadd_ps(c, x, dot0);
+        if !CACHED {
+            sum0 = _mm256_add_ps(sum0, x);
+        }
+    }
+    let dot = hsum256(_mm256_add_ps(dot0, dot1));
+    let sum = if CACHED {
+        cached_sum
+    } else {
+        hsum256(_mm256_add_ps(sum0, sum1))
+    };
+    (dot, sum)
 }
 
 /// One group with a single `(scale, zero)` over all `CHUNKS` of its chunks:
@@ -142,13 +198,19 @@ unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize>(
 /// `f32` header, an `fp16` pair and TQ2/BQ1's *derived* `(d, -d)` / `(2d, -d)`.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn uniform_group_dot<const BITS: usize, const PAYLOAD: usize, const CHUNKS: usize>(
+unsafe fn uniform_group_dot<
+    const BITS: usize,
+    const PAYLOAD: usize,
+    const CHUNKS: usize,
+    const CACHED: bool,
+>(
     gptr: *const u8,
     xg: *const f32,
     scale: f32,
     zero: f32,
+    cached_sum: f32,
 ) -> f32 {
-    let (dot, sum) = codes_dot_sum::<BITS, PAYLOAD>(gptr, xg, 0, CHUNKS);
+    let (dot, sum) = codes_dot_sum::<BITS, PAYLOAD, CACHED>(gptr, xg, 0, CHUNKS, cached_sum);
     scale * dot + zero * sum
 }
 
@@ -161,13 +223,42 @@ unsafe fn uniform_group_dot<const BITS: usize, const PAYLOAD: usize, const CHUNK
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f32 {
     let h = f16_quad(gptr);
-    let (d0, s0) = codes_dot_sum::<BITS, 8>(gptr, xg, 0, 16);
-    let (d1, s1) = codes_dot_sum::<BITS, 8>(gptr, xg, 16, 32);
+    let (d0, s0) = codes_dot_sum::<BITS, 8, false>(gptr, xg, 0, 16, 0.0);
+    let (d1, s1) = codes_dot_sum::<BITS, 8, false>(gptr, xg, 16, 32, 0.0);
     (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
 }
 
-/// The `CB`-entry `fp16` codebook at the group's start, indexed per lane by
-/// `sel`.
+/// The `CB`-entry `fp16` codebook at the group's start, widened to `f32` lanes:
+/// `lo` holds the first (and, for the 4- and 8-entry books, only) eight entries
+/// and `hi` the second eight of a 16-entry book, zero otherwise. The caller
+/// loads this once per group rather than once per chunk.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn codebook_tables<const CB: usize>(gptr: *const u8) -> (__m256, __m256) {
+    if CB == 16 {
+        (
+            _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i)),
+            _mm256_cvtph_ps(_mm_loadu_si128(gptr.add(16) as *const __m128i)),
+        )
+    } else if CB == 8 {
+        (
+            _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i)),
+            _mm256_setzero_ps(),
+        )
+    } else {
+        (
+            _mm256_insertf128_ps(
+                _mm256_setzero_ps(),
+                _mm_cvtph_ps(_mm_loadl_epi64(gptr as *const __m128i)),
+                0,
+            ),
+            _mm256_setzero_ps(),
+        )
+    }
+}
+
+/// One lane's codebook value for each index in `sel`, against a table already
+/// widened by [`codebook_tables`].
 ///
 /// A 4- or 8-entry book is one `vpermd`; a 16-entry book is two plus a blend on
 /// the index's top bit. `vpermd` only looks at an index's low three bits, which
@@ -175,47 +266,55 @@ unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f3
 /// picks the half.
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn codebook_lookup<const CB: usize>(gptr: *const u8, sel: __m256i) -> __m256 {
+unsafe fn codebook_lookup<const CB: usize>(lo: __m256, hi: __m256, sel: __m256i) -> __m256 {
     if CB == 16 {
-        let lo = _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i));
-        let hi = _mm256_cvtph_ps(_mm_loadu_si128(gptr.add(16) as *const __m128i));
         let top = _mm256_slli_epi32(_mm256_and_si256(sel, _mm256_set1_epi32(8)), 28);
         _mm256_blendv_ps(
             _mm256_permutevar8x32_ps(lo, sel),
             _mm256_permutevar8x32_ps(hi, sel),
             _mm256_castsi256_ps(top),
         )
-    } else if CB == 8 {
-        let table = _mm256_cvtph_ps(_mm_loadu_si128(gptr as *const __m128i));
-        _mm256_permutevar8x32_ps(table, sel)
     } else {
-        let table = _mm256_insertf128_ps(
-            _mm256_setzero_ps(),
-            _mm_cvtph_ps(_mm_loadl_epi64(gptr as *const __m128i)),
-            0,
-        );
-        _mm256_permutevar8x32_ps(table, sel)
+        _mm256_permutevar8x32_ps(lo, sel)
     }
 }
 
 /// One group of a Lloyd-codebook format: `CB` `fp16` entries at the group's
 /// start, then `PAYLOAD` bytes of `BITS`-wide indices.
 ///
-/// There is no affine term — the codebook *is* the decode — so this needs one
-/// accumulator, not two.
+/// There is no affine term — the codebook *is* the decode — so the group needs
+/// one dot accumulator, split into two interleaved chains as in
+/// [`codes_dot_sum`] to keep the `fma` latency from serializing. The table is
+/// widened once, not once per chunk.
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn codebook_group_dot<const BITS: usize, const CB: usize, const PAYLOAD: usize>(
     gptr: *const u8,
     xg: *const f32,
 ) -> f32 {
-    let mut dot = _mm256_setzero_ps();
-    for idx in 0..32 {
-        let sel = codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS));
-        let vals = codebook_lookup::<CB>(gptr, sel);
-        dot = _mm256_fmadd_ps(vals, _mm256_loadu_ps(xg.add(idx * 8)), dot);
+    const { assert!((BITS != 3 || PAYLOAD >= 1) && (BITS != 6 || PAYLOAD >= 2)) };
+    let (cb_lo, cb_hi) = codebook_tables::<CB>(gptr);
+    let mut dot0 = _mm256_setzero_ps();
+    let mut dot1 = _mm256_setzero_ps();
+    // 32 chunks (256 elements) per group, even, so the pair step leaves no tail.
+    let mut idx = 0;
+    while idx < 32 {
+        let j = idx + 1;
+        let sel0 = codes8::<BITS>(gptr.add(PAYLOAD + idx * BITS));
+        let sel1 = codes8::<BITS>(gptr.add(PAYLOAD + j * BITS));
+        dot0 = _mm256_fmadd_ps(
+            codebook_lookup::<CB>(cb_lo, cb_hi, sel0),
+            _mm256_loadu_ps(xg.add(idx * 8)),
+            dot0,
+        );
+        dot1 = _mm256_fmadd_ps(
+            codebook_lookup::<CB>(cb_lo, cb_hi, sel1),
+            _mm256_loadu_ps(xg.add(j * 8)),
+            dot1,
+        );
+        idx += 2;
     }
-    hsum256(dot)
+    hsum256(_mm256_add_ps(dot0, dot1))
 }
 
 /// `(scale, zero)` from an `f32` header — the flat HFQ/MQ families, 8 B.
@@ -290,7 +389,7 @@ macro_rules! affine_row_dot {
         #[target_feature(enable = $feat)]
         unsafe fn $group(gptr: *const u8, xg: *const f32) -> f32 {
             let (scale, zero) = $hdr(gptr);
-            uniform_group_dot::<$bits, $payload, { $ge / 8 }>(gptr, xg, scale, zero)
+            uniform_group_dot::<$bits, $payload, { $ge / 8 }, false>(gptr, xg, scale, zero, 0.0)
         }
         row_dot!($(#[$meta])* $name, $group, $ge, $gb, $feat);
     };
@@ -353,7 +452,11 @@ row_dot!(
 /// nibble as `c[2j+1]`), so no shuffle of the activation is needed.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn mq4_group_dot(gptr: *const u8, xg: *const f32) -> f32 {
+unsafe fn mq4_group_dot<const CACHED: bool>(
+    gptr: *const u8,
+    xg: *const f32,
+    cached_sum: f32,
+) -> f32 {
     let scale = f32_at(gptr);
     let zero = f32_at(gptr.add(4));
     let mask = _mm_set1_epi8(0x0f);
@@ -378,24 +481,113 @@ unsafe fn mq4_group_dot(gptr: *const u8, xg: *const f32) -> f32 {
         acc = _mm256_fmadd_ps(c1, x1, acc);
         acc = _mm256_fmadd_ps(c2, x2, acc);
         acc = _mm256_fmadd_ps(c3, x3, acc);
-        acc_x = _mm256_add_ps(
-            acc_x,
-            _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)),
-        );
+        if !CACHED {
+            acc_x = _mm256_add_ps(
+                acc_x,
+                _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)),
+            );
+        }
     }
-    scale * hsum256(acc) + zero * hsum256(acc_x)
+    let sum_x = if CACHED { cached_sum } else { hsum256(acc_x) };
+    scale * hsum256(acc) + zero * sum_x
 }
 
-row_dot!(
-    /// qt 13 — `Mq4G256`: nibbles under the original `f32` header. The
-    /// hand-unrolled nibble group above, at 32 codes per 16-byte load — see the
-    /// module docs for why it is not the `codes8` path.
-    mq4g256_row_dot,
-    mq4_group_dot,
-    256,
-    136,
-    "avx2,fma"
-);
+/// qt 13 — `Mq4G256` row dot with the original `f32` header and no cached sums,
+/// 256 elements / 136 B per group.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn mq4g256_row_dot(row: *const u8, k: usize, x: *const f32) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..k / 256 {
+        acc += mq4_group_dot::<false>(row.add(g * 136), x.add(g * 256), 0.0);
+    }
+    acc
+}
+
+/// qt 13 — `Mq4G256` row dot reusing the per-group `Σx` for
+/// [`super::ActivationSumKind::Mq4Quartets`] prepared by
+/// [`super::prepare_activation_sums`]. Same group accumulation and dot FMAs as
+/// [`mq4g256_row_dot`].
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn mq4g256_row_dot_cached(
+    row: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..k / 256 {
+        acc += mq4_group_dot::<true>(row.add(g * 136), x.add(g * 256), *sums.add(g));
+    }
+    acc
+}
+
+/// qt 15 — `Mq6G256` row dot reusing the per-group `Σx` for
+/// [`super::ActivationSumKind::Mq6Pairs`] prepared by
+/// [`super::prepare_activation_sums`]: the shared `codes8` decode and
+/// `f32_pair` header, 256 elements / 200 B per group.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn mq6g256_row_dot_cached(
+    row: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..k / 256 {
+        let gptr = row.add(g * 200);
+        let (scale, zero) = f32_pair(gptr);
+        acc += uniform_group_dot::<6, 8, 32, true>(
+            gptr,
+            x.add(g * 256),
+            scale,
+            zero,
+            *sums.add(g),
+        );
+    }
+    acc
+}
+
+/// Per-256-element-group `Σx` in [`mq4_group_dot`]'s exact order: eight 32-wide
+/// blocks accumulated as `acc_x += ((x0+x1)+(x2+x3))` over four AVX vectors,
+/// then one [`hsum256`]. `out[g]` is group `g`'s sum.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn activation_sums_mq4(x: *const f32, out: *mut f32, groups: usize) {
+    for g in 0..groups {
+        let xg = x.add(g * 256);
+        let mut acc_x = _mm256_setzero_ps();
+        for blk in 0..8usize {
+            let xb = xg.add(blk * 32);
+            let x0 = _mm256_loadu_ps(xb);
+            let x1 = _mm256_loadu_ps(xb.add(8));
+            let x2 = _mm256_loadu_ps(xb.add(16));
+            let x3 = _mm256_loadu_ps(xb.add(24));
+            acc_x = _mm256_add_ps(
+                acc_x,
+                _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)),
+            );
+        }
+        *out.add(g) = hsum256(acc_x);
+    }
+}
+
+/// Per-256-element-group `Σx` in [`codes_dot_sum`]'s exact order: even 8-lane
+/// chunks into `sum0`, odd into `sum1`, then one `hsum256(sum0 + sum1)`.
+/// `out[g]` is group `g`'s sum.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn activation_sums_mq6(x: *const f32, out: *mut f32, groups: usize) {
+    for g in 0..groups {
+        let xg = x.add(g * 256);
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut idx = 0;
+        while idx + 1 < 32 {
+            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(xg.add(idx * 8)));
+            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(xg.add((idx + 1) * 8)));
+            idx += 2;
+        }
+        *out.add(g) = hsum256(_mm256_add_ps(sum0, sum1));
+    }
+}
 
 // ── one f32 (scale, zero) header per 256-element group ───────────────────────
 //
@@ -576,7 +768,7 @@ row_dot!(
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn tq2g128_group(gptr: *const u8, xg: *const f32) -> f32 {
     let (d, _) = f16_pair(gptr);
-    uniform_group_dot::<2, 2, 16>(gptr, xg, d, -d)
+    uniform_group_dot::<2, 2, 16, false>(gptr, xg, d, -d, 0.0)
 }
 
 row_dot!(
@@ -595,7 +787,7 @@ row_dot!(
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn bq1g128_group(gptr: *const u8, xg: *const f32) -> f32 {
     let (d, _) = f16_pair(gptr);
-    uniform_group_dot::<1, 2, 16>(gptr, xg, 2.0 * d, -d)
+    uniform_group_dot::<1, 2, 16, false>(gptr, xg, 2.0 * d, -d, 0.0)
 }
 
 // ── a per-group fp16 codebook instead of an affine header ────────────────────
@@ -752,4 +944,97 @@ unsafe fn q8f16_group(gptr: *const u8, xg: *const f32) -> f32 {
         dot = _mm256_fmadd_ps(v, _mm256_loadu_ps(xg.add(c * 8)), dot);
     }
     scale * hsum256(dot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prefix bytes must not leak into codes, including a chunk ending at the
+    /// packed buffer's last byte. Every possible code occupies every lane.
+    #[target_feature(enable = "avx2")]
+    unsafe fn check_prefixed_codes<const BITS: usize>() {
+        let mask = (1u32 << BITS) - 1;
+        let prefix_bytes = if BITS == 6 { 2 } else { 1 };
+        let mut packed = vec![0u8; BITS + prefix_bytes];
+        for phase in 0..=mask {
+            let expected: [u32; 8] =
+                core::array::from_fn(|lane| (phase + lane as u32 * 13) & mask);
+            let word = expected.iter().enumerate().fold(0u64, |word, (lane, &code)| {
+                word | ((code as u64) << (lane * BITS))
+            });
+            packed[prefix_bytes..].copy_from_slice(&word.to_le_bytes()[..BITS]);
+            for prefix in 0..=u8::MAX {
+                packed[..prefix_bytes].fill(prefix);
+                let mut got = [0u32; 8];
+                _mm256_storeu_si256(
+                    got.as_mut_ptr() as *mut __m256i,
+                    codes8::<BITS>(packed.as_ptr().add(prefix_bytes)),
+                );
+                assert_eq!(got, expected, "bits={BITS} phase={phase} prefix={prefix}");
+            }
+        }
+    }
+
+    #[test]
+    fn three_and_six_bit_codes_ignore_prefix_bytes() {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe {
+                check_prefixed_codes::<3>();
+                check_prefixed_codes::<6>();
+            }
+        }
+    }
+}
+
+/// AoS E8 rows: one fp16 row scale, then 17-byte blocks of 32 weights.
+///
+/// # Safety
+/// Requires AVX2/FMA/F16C, `16 + (k / 32) * 17` readable bytes at `row`,
+/// `k` readable f32 values at `x`, and `k % 256 == 0`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mfp4g32_e8_row_dot(row: *const u8, k: usize, x: *const f32) -> f32 {
+    let row_scale = f16_pair(row).0;
+    let shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+    let mask = _mm256_set1_epi32(15);
+    let center = _mm256_set1_epi32(7);
+    let mut acc = 0.0f32;
+    for group in 0..k / 256 {
+        let mut dot = _mm256_setzero_ps();
+        for block in 0..8 {
+            let at = row.add(16 + (group * 8 + block) * 17);
+            let scale = row_scale * crate::quant::mfp4_e8_scale(*at) * 0.88;
+            let scale = _mm256_set1_ps(scale);
+            for word in 0..4 {
+                // Exactly four codeword bytes, including at the final row end.
+                let index = (at.add(1 + word * 4) as *const u32).read_unaligned();
+                let parity = (index
+                    ^ (index >> 4)
+                    ^ (index >> 8)
+                    ^ (index >> 12)
+                    ^ (index >> 16)
+                    ^ (index >> 20)
+                    ^ (index >> 24))
+                    & 1;
+                let last = ((index >> 27) & 14) | parity;
+                let nibbles = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set1_epi32(index as i32), shifts),
+                    mask,
+                );
+                let nibbles =
+                    _mm256_blend_epi32(nibbles, _mm256_set1_epi32(last as i32), 0x80);
+                let coordinates = _mm256_add_ps(
+                    _mm256_cvtepi32_ps(_mm256_sub_epi32(nibbles, center)),
+                    _mm256_set1_ps((index >> 31) as f32 * 0.5),
+                );
+                // Round the decoded weight before its FMA, as in the scalar
+                // decoder. Folding scale into x changes the format's bits.
+                let weights = _mm256_mul_ps(scale, coordinates);
+                let xp = x.add(group * 256 + block * 32 + word * 8);
+                dot = _mm256_fmadd_ps(weights, _mm256_loadu_ps(xp), dot);
+            }
+        }
+        acc += hsum256(dot);
+    }
+    acc
 }

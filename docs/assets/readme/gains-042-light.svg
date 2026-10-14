@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="558" viewBox="0 0 880 558" role="img" aria-label="hipfire 0.4.2 measured gains">
+<title>hipfire 0.4.2 measured gains</title>
+<text x="0" y="28" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="18" fill="#1f2328" text-anchor="start" font-weight="bold">hipfire 0.4.2: measured before → after</text>
+<rect x="0" y="48" width="12" height="12" fill="#8c959f"/>
+<text x="18" y="59" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">before</text>
+<rect x="80" y="48" width="12" height="12" fill="#d1242f"/>
+<text x="98" y="59" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#59636e" text-anchor="start" font-weight="normal">0.4.2</text>
+<text x="0" y="88" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#1f2328" text-anchor="start" font-weight="bold">Strix Halo 27B DFlash decode (tok/s, higher is better)</text>
+<text x="0" y="104" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#59636e" text-anchor="start" font-weight="normal">Strix Halo (gfx1151), PerfOpt kernel · 2026-10-13 · CHANGELOG 00d4b7464</text>
+<text x="230" y="140" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">code (merge_sort_thinking_off)</text>
+<rect x="250" y="124" width="340.1" height="14" rx="2" fill="#8c959f"/>
+<text x="596.1" y="136" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">97.9</text>
+<rect x="250" y="142" width="470.0" height="14" rx="2" fill="#d1242f"/>
+<text x="726.0" y="154" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">135.3</text>
+<text x="880" y="140" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">+38.2%</text>
+<text x="230" y="186" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">prose (prose_river_short)</text>
+<rect x="250" y="170" width="66.0" height="14" rx="2" fill="#8c959f"/>
+<text x="322.0" y="182" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">19.0</text>
+<rect x="250" y="188" width="91.4" height="14" rx="2" fill="#d1242f"/>
+<text x="347.4" y="200" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">26.3</text>
+<text x="880" y="186" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">+38.4%</text>
+<text x="0" y="226" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#1f2328" text-anchor="start" font-weight="bold">Qwen3.8-27B DFlash-default prefill (tok/s, higher is better)</text>
+<text x="0" y="242" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#59636e" text-anchor="start" font-weight="normal">one R9700 (gfx1201) · 2026-10-12 · CHANGELOG 5514ae905</text>
+<text x="230" y="278" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">8.2K-token prompt</text>
+<rect x="250" y="262" width="363.8" height="14" rx="2" fill="#8c959f"/>
+<text x="619.8" y="274" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">3,809</text>
+<rect x="250" y="280" width="470.0" height="14" rx="2" fill="#d1242f"/>
+<text x="726.0" y="292" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">4,921</text>
+<text x="880" y="278" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">+29.2%</text>
+<text x="0" y="318" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#1f2328" text-anchor="start" font-weight="bold">Flash-Next NPU prefill route, TTFT (ms, lower is better)</text>
+<text x="0" y="334" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#59636e" text-anchor="start" font-weight="normal">Strix Halo (gfx1151) + XDNA2 NPU · 2026-10-13 · CHANGELOG 475f3bb80</text>
+<text x="230" y="370" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">16K-token prompt</text>
+<rect x="250" y="354" width="470.0" height="14" rx="2" fill="#8c959f"/>
+<text x="726.0" y="366" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">7,878</text>
+<rect x="250" y="372" width="422.7" height="14" rx="2" fill="#d1242f"/>
+<text x="678.7" y="384" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">7,085</text>
+<text x="880" y="370" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">-10.1%</text>
+<text x="0" y="410" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#1f2328" text-anchor="start" font-weight="bold">Flash-Next EP2 prefill vs one card (tok/s, higher is better)</text>
+<text x="0" y="426" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#59636e" text-anchor="start" font-weight="normal">2x R9700 (gfx1201) · 2026-10-13 · CHANGELOG a5993c7f8</text>
+<text x="230" y="462" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">8K prompt (1.30x)</text>
+<rect x="250" y="446" width="330.9" height="14" rx="2" fill="#8c959f"/>
+<text x="586.9" y="458" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">3,033</text>
+<rect x="250" y="464" width="430.2" height="14" rx="2" fill="#d1242f"/>
+<text x="686.2" y="476" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">3,943</text>
+<text x="880" y="462" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">+30.0%</text>
+<text x="230" y="508" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="end" font-weight="normal">16K prompt (1.15x)</text>
+<rect x="250" y="492" width="409.6" height="14" rx="2" fill="#8c959f"/>
+<text x="665.6" y="504" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">3,754</text>
+<rect x="250" y="510" width="470.0" height="14" rx="2" fill="#d1242f"/>
+<text x="726.0" y="522" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#1f2328" text-anchor="start" font-weight="normal">4,308</text>
+<text x="880" y="508" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d1242f" text-anchor="end" font-weight="bold">+14.8%</text>
+<text x="0" y="548" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#59636e" text-anchor="start" font-weight="normal">Fixture-bound measurements from CHANGELOG 0.4.2; sources in docs/assets/readme-data.json.</text>
+</svg>

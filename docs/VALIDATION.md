@@ -16,9 +16,10 @@ used; no local planning tool is merge evidence.
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-22 |
-| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
-| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Original route inventory date | 2026-07-22 (historical provenance) |
+| Original inventory source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` (historical provenance) |
+| Original comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` (historical provenance) |
+| Documentation audit | 2026-10-13, `origin/beta` @ `c7a732ad5`: source and documentation review only. No hardware certification was rerun and the route inventory was not remeasured. |
 | Integrated commit / tree hashes | External Git/CI only. |
 
 ## Rules
@@ -64,8 +65,9 @@ who approves judges that the evidence matches the claim.
 [`hw-gate`](../.github/workflows/hw-gate.yml) is optional automation that can
 collect load/serve/kernel evidence and post seat commentary on a PR. It does
 not approve PRs, does not replace the [merge bar](#merge-bar-required), and
-does not own `master`. When it runs, two model seats may assist investigation
-under their own identities (`hipfire-sol[bot]`, `hipfire-fable[bot]`); a human
+does not own `master`. When it runs, two automated reviewer seats (seat 1:
+diff review and route selection; seat 2: investigation) may assist under
+their own automation identities; a human
 still owns the approving review. Diffs that touch no hardware-relevant
 surface need no hardware route.
 
@@ -91,28 +93,31 @@ execution-risk judgment; they are not a gate by themselves.
 
 A PR body may carry a fenced JSON block after the marker:
 `{"routes":[{"mode":"battery"|"chain","tag":"registry:tag"}],"claim":"..."}`.
-When hw-gate runs, Sol treats the claim as a claim, runs the requested routes
-when the tag exists on the runner, reports unknown or absent tags as
-unavailable (not failed), and states in its verdict whether the claim was
-proven, disproven, or not exercised. The PR template ships the skeleton.
-Authors may instead attach equivalent manual harness output; either path is
-evidence for direct review, not an acceptance pass by itself.
+Author and seat-selected routes are limited to `battery` and `chain`
+(`scripts/hw-gate/review.py` drops other modes); the `-dflash` variants below
+come only from the bucket manifest. When hw-gate runs, seat 1 treats the claim
+as a claim, runs the requested routes when the tag exists on the runner,
+reports unknown or absent tags as unavailable (not failed), and states in its
+verdict whether the claim was proven, disproven, or not exercised. The PR
+template ships the skeleton. Authors may instead attach equivalent manual
+harness output; either path is evidence for direct review, not an acceptance
+pass by itself.
 
-### Seat 1 — Sol (when automation runs)
+### Seat 1 — diff review and route selection (when automation runs)
 
-Sol (`openai-codex/gpt-5.6-sol`, read-only tools in a PR checkout) reads the
+Seat 1 (read-only tools in a PR checkout) reads the
 diff before anything runs and decides `run_hardware`: the hardware job builds
 the PR and runs its daemon as the maintainer's user on their workstation, so
-Sol refuses diffs that reach outside the process (network, filesystem beyond
+seat 1 refuses diffs that reach outside the process (network, filesystem beyond
 model/cache/temp, env or credential reads, process spawning, unexplained build
 or dependency changes, obfuscated blobs, unexplained `unsafe`). A maintainer's
 **`hw-run`** label only ever forces a run and is removed after each run and on
-every push. Sol also composes the route list: the mandatory fixtures for the
-touched buckets, the author's requested routes, and its own additions.
+every push. Seat 1 also composes the route list: the mandatory fixtures for
+the touched buckets, the author's requested routes, and its own additions.
 
-After hardware, Sol reads every decoded turn and returns `greenlight` /
-`needs-human` / `block` with regressions cited by `file:line` and fixture. Sol
-never merges and never approves; its review is a comment that may inform the
+After hardware, seat 1 reads every decoded turn and returns `greenlight` /
+`needs-human` / `block` with regressions cited by `file:line` and fixture. Seat
+1 never merges and never approves; its review is a comment that may inform the
 human reviewer.
 
 ### Fixtures and harnesses
@@ -126,13 +131,22 @@ missing or mismatched pinned fixture **fails that automation run**. Requested
 extra tags resolve through `registry/v1.json`; one absent from the runner is
 reported as unavailable.
 
-- **`load` bucket** — `battery` on every fixture (varied prompts, expect
-  substrings, attractor / runaway / empty detection).
-- **`serve` bucket** — `battery` + `chain` (related turns through the prefix
-  cache: reset, cache, and terminal semantics).
+`serve_harness.py --mode` accepts `battery`, `chain`, `session`, `images`
+(tiny diffusion-pipeline fixture, not vision input) and `prefix-fanout`; hw-gate
+drives only `battery` and `chain`, plus `--dflash on` variants of both
+(`battery-dflash`, `chain-dflash`, from `HARNESS_MODES` in
+`scripts/hw-gate/run.py`). A `-dflash` mode needs a fixture-declared draft whose
+sha256 matches the manifest; a lane without that draft reports the mode as not
+run rather than falling back to plain decode.
+
+- **`load` bucket** — `battery` and `battery-dflash` on every fixture (varied
+  prompts, expect substrings, attractor / runaway / empty detection).
+- **`serve` bucket** — adds `chain` and `chain-dflash` (related turns through
+  the prefix cache: reset, cache, and terminal semantics).
 - **`kernel` bucket** — `battery` plus
   [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py)
-  capture + HIP/PM4 parity on the dense trunk.
+  capture + HIP/PM4 parity on the dense trunk (`--pm4` with the manifest's
+  capture/measure/decode iteration counts).
 
 Decoded assistant text is posted **verbatim** in the evidence comment. Reading
 it is part of review. The per-turn prefill/decode rates in that table are
@@ -177,30 +191,30 @@ Numerical/state parity for KV still needs a path-specific oracle (claim
 map row below); this procedure only covers user-facing load/serve
 semantics and the disclosure path for agents filing PRs.
 
-### Seat 2 — Fable (when automation runs)
+### Seat 2 — investigation (when automation runs)
 
-Fable (`anthropic/claude-fable-5-1`, thinking `xhigh`) reads the diff, the
-evidence, and Sol's verdict — and then, when that evidence does not prove the
-change, may gather more evidence itself. It runs with a real shell in a
-sandboxed checkout of the PR head on the hardware host: every hiptrx GPU is
-reserved for the session (a host-level lock serializes Fable sessions and
-excludes the lane runs), the PR and the base branch are both built for A/B,
-every registry artifact on the host is available read-only, and everything
-Fable writes to `$HW_GATE_EVIDENCE` is uploaded with its decision. There is
-no fixed route vocabulary: Fable chooses what proves the change — a
-multi-GPU load for new topology code, a refused-load-then-generate sequence
-for a moved refusal, Redline parity for a kernel, a base-vs-PR A/B for a
-"no behavior change" refactor. The sandbox bounds reach, not judgment: no
-network, no writes outside its home/evidence/build tree, no other GPUs, no
-credentials, no `gh` (the script posts), a wall-clock budget
-(`HW_GATE_MAX_MINUTES`, default 45), and only registry artifacts.
+Seat 2 reads the diff, the evidence, and seat 1's verdict — and then, when
+that evidence does not prove the change, may gather more evidence itself. It
+runs with a real shell in a sandboxed checkout of the PR head on the hardware
+host: every GPU on the host is reserved for the session (a host-level lock
+serializes seat-2 sessions and excludes the lane runs), the PR and the base
+branch are both built for A/B, every registry artifact on the host is
+available read-only, and everything seat 2 writes to `$HW_GATE_EVIDENCE` is
+uploaded with its decision. There is no fixed route vocabulary: seat 2 chooses
+what proves the change — a multi-GPU load for new topology code, a
+refused-load-then-generate sequence for a moved refusal, Redline parity for a
+kernel, a base-vs-PR A/B for a "no behavior change" refactor. The sandbox
+bounds reach, not judgment: no network, no writes outside its
+home/evidence/build tree, no other GPUs, no credentials, no `gh` (the script
+posts), a wall-clock budget (`HW_GATE_MAX_MINUTES`, default 45), and only
+registry artifacts.
 
-Fable returns a decision comment with an `investigation` table
+Seat 2 returns a decision comment with an `investigation` table
 (question → route run → evidence file → result), an `unproven` list for what
 this host could not exercise, and an announcement written for the author. It
-may disagree with Sol and must say why. **Fable does not replace the required
-approving review and does not promote `master`.** Seat commentary is input to
-the maintainer, not an acceptance pass or auto-merge contract.
+may disagree with seat 1 and must say why. **Seat 2 does not replace the
+required approving review and does not promote `master`.** Seat commentary is
+input to the maintainer, not an acceptance pass or auto-merge contract.
 
 ### The floor (`scripts/hw-gate/review.py`)
 
@@ -209,7 +223,7 @@ When automation runs, the workflow's own rule is split in two:
 | Tier | Fires on | Who can override |
 |---|---|---|
 | **hard** | a failed fixture or harness, an attractor, a policy-file change, a `RATCHET-RAISE:` commit without the `ratchet-raise` label | nobody within the automation — evidence stays failed / policy stays held |
-| **soft** | coverage gaps, confidence < 0.8, Sol's `needs-human`, an unparseable verdict | Fable, with a stated reason |
+| **soft** | coverage gaps, confidence < 0.8, seat 1's `needs-human`, an unparseable verdict | seat 2, with a stated reason |
 
 Hard-floor failures are strong signals for the human reviewer; they are still
 not a separate required GitHub check beyond the [merge bar](#merge-bar-required).
@@ -296,7 +310,7 @@ Narrow roles. Do not widen a harness into a universal gate.
 | Harness | Path | Role | Not this harness |
 |---|---|---|---|
 | **gates.sh** | [`scripts/gates.sh`](../scripts/gates.sh) | Maintained **manual** wrapper: optional Redline capture, generic serve battery, optional fresh-process perf compare (`probe_commits.sh`). Requires `--model`. | Not CI-default. Not universal. Does not call retired coherence-gate scripts. |
-| **serve_harness.py** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | **Model-agnostic** user-facing serve behavior (battery / chain / session): finish reasons, runaway/empty, prefix cache, prefill/decode timing, recall hooks. | Not LFM thinking-frame specifics. Not Redline route proof. |
+| **serve_harness.py** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | **Model-agnostic** user-facing serve behavior (`--mode` `battery` / `chain` / `session` for text turns; `prefix-fanout` for prefix-cache concurrency; `images` for the tiny diffusion-pipeline fixture): finish reasons, runaway/empty, prefix cache, prefill/decode timing, recall hooks. | Not LFM thinking-frame specifics. Not Redline route proof. Not vision-input (VL) coverage. |
 | **serve_harness.py (LFM tag)** | [`scripts/serve_harness.py`](../scripts/serve_harness.py) | LFM2.5 serve smoke with the exact registry tag; use registry sampling or `recipe:nothink` for non-thinking framing. | Not a substitute for numerical parity oracles. |
 | **redline_daemon_harness.py** | [`scripts/redline_daemon_harness.py`](../scripts/redline_daemon_harness.py) | Resident-daemon **Redline** capture, phase fingerprint, shadow/parity, and timing evidence under manual-capture env. | Discovery/correctness evidence ≠ product timed-arm route proof by itself. Does not enable AQL routing. |
 | **dispatch_profile** | [`tools/redline/dispatch_profile.py`](../tools/redline/dispatch_profile.py) | Manual **attribution-only** steady-state retained-PM4 per-dispatch span diagnostic (instrumented GFX12 tape). | **Not** route proof, certification/admission, or absolute/pure kernel timing: timestamp commands add observer overhead and spans include preceding PM4 boundary packets. |
@@ -323,28 +337,36 @@ Use only when the claim class below names them. They are not universal.
 |---|---|---|
 | Docs, env-var tables, no-GPU Rust/Python/CLI only | Automatic: `.github/workflows/no-gpu-ci.yml` invokes `scripts/no-gpu-ci.sh`; for a fast docs-only local check run `python3 scripts/check-env-docs.py` plus `git diff --check` | Automatic CI and/or manual local equivalent — **not** GPU/model evidence |
 | New/changed `.hip` kernel (numeric) | `test_kernels`; then model-level manual route for the arch under test | Manual + channel |
+| gfx1151 Qwen4 F16 WMMA grouped MoE X-LDS entries (`HIPFIRE_QWEN4_MOE_X_LDS`, default `auto`) | CPU: `cargo test -p rdna-compute --lib qwen4_moe_x_lds` (the `auto` / `1` / `0` predicate). GPU: [`qwen4_moe_f16_lds_oracle`](../crates/rdna-compute/examples/qwen4_moe_f16_lds_oracle.rs) (`cargo build --release -p rdna-compute --features lab --example qwen4_moe_f16_lds_oracle`; `--mode check`, flag unset or `1`, so the production launchers take the LDS entries); then `serve_harness.py --sampling greedy` on long prompts with `HIPFIRE_QWEN4_MOE_X_LDS=0` versus unset and `--compare-transcript`. Exercise the F16 route (asymmetric routed headers, or `HIPFIRE_QWEN4_MOE_SYM_IU4=0`); the default symmetric IU4 route is not a substitute. | Manual kernel oracle: all bytes, poison/guards, asymmetric experts, routing/run-length coverage, negative controls; manual serve for semantics; speed claims need matched fresh-process prefill-matrix runs. `--mode time` is synthetic kernel timing only. |
 | Dispatch `bind_thread` / public `dispatch.rs` bind surface | `.githooks/pre-commit` → `scripts/verify-bind-thread.sh` (or run that script manually) | Automatic hook or manual bind check — **not** `test_kernels` |
 | Forward / fusion / KV **numerical or state parity** | Path-specific parity/state oracle for that arch/surface; **blocked** if no oracle exists | Manual oracle — **not** `serve_harness.py` |
 | Forward / fusion / sampling / KV **user-facing serve semantics** | `scripts/serve_harness.py` with the exact model (after parity route if the change can break numbers/state); add `scripts/gates.sh` when the Redline+serve+optional perf wrapper is desired | Manual serve (semantics only) |
 | KV backend rename / Qwen K–V axes / Qwen implicit default (load+serve semantics) | Load/serve harness route above **plus** [KV backend / K–V axis changes](#kv-backend--kv-axis-changes-load--serve): Qwen path **and** tag with matching backend + K/V axes; exact gfx1201 native fp8 and non-gfx1201 q8 defaults; card-B [`scripts/guard_gfx1201_baseline.py`](../scripts/guard_gfx1201_baseline.py) including graph replay (`HIPFIRE_GRAPH=1`). PR authors check the legacy-disclosure item in [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md) — do not duplicate that checklist here. | Manual load/serve + guard; disclosure via PR template |
 | LFM2.5 chat framing / thinking output | `scripts/serve_harness.py` with an `lfm2.5:*` registry tag | Manual LFM |
-| VL vision-tower forward numerical parity (arch-5 / arch-11 carriers) | Dump-and-diff vs an HF `transformers` reference for the exact checkpoint, pixel inputs pinned by hash (`benchmarks/vision/dump_hf_reference.py` precedent; family route: [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md) §5, [`specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md)); **blocked** for a checkpoint with no reference dump. Expected floor on 4:2:0 JPEG inputs: `patches` rel-L1 ≈ 5e-3 (zune-jpeg IDCT/chroma vs PIL's libjpeg-turbo; `jpeg-decoder` only narrows it to ≈ 3.5e-3; since d147fccb3 hipfire decodes JPEG with `libjpeg-turbo-rs`, byte-identical to PIL/libjpeg-turbo on all five committed fixtures, and the `patches` floor is the CatmullRom-vs-PIL-bicubic kernel alone: ≈ 2.6e-3 on doge, max one u8 step; 2026-09-07); 4:4:4 inputs reach ≈ 1e-4. Judge tower parity on the shape of the per-block curve and the serve battery, not on beating that floor | Manual oracle — not `serve_harness.py`; a green VL serve battery is *not* parity evidence |
-| VL image-bearing serve semantics (`generate_vl` over `/v1/chat/completions`) | Manual OpenAI-compatible battery through `hipfire serve` with the exact VL artifact: committed fixtures under [`../benchmarks/vision/images/`](../benchmarks/vision/images/) + the fixed desc/ocr prompts of `comparison-2026-05-23.md`, greedy temp 0; stream **and** non-stream typed-emission check (reasoning vs `content` deltas; no literal `<think>`/`<|im_end|>` chunks in content); client-disconnect probe mid-stream followed by an immediate follow-up turn (no slot wedge); eyeball every decoded output; record artifact sha256, fixture hashes, binary md5s. No scripted harness exists (**blocked** until one lands); `scripts/serve_harness.py` is text-only today and does not exercise this surface | Manual serve (semantics only) |
+| VL vision-tower forward numerical parity (arch-5 / arch-11 carriers) | Dump-and-diff vs an HF `transformers` reference for the exact checkpoint, pixel inputs pinned by hash (`benchmarks/vision/dump_hf_reference.py` precedent; the archived VL family specs are historical design provenance, not current validation authority, so the route is owned by that script and the source it exercises); **blocked** for a checkpoint with no reference dump. Expected floor on 4:2:0 JPEG inputs: `patches` rel-L1 ≈ 5e-3 (zune-jpeg IDCT/chroma vs PIL's libjpeg-turbo; `jpeg-decoder` only narrows it to ≈ 3.5e-3; since d147fccb3 hipfire decodes JPEG with `libjpeg-turbo-rs`, byte-identical to PIL/libjpeg-turbo on all five committed fixtures, and the `patches` floor is the CatmullRom-vs-PIL-bicubic kernel alone: ≈ 2.6e-3 on doge, max one u8 step; 2026-09-07); 4:4:4 inputs reach ≈ 1e-4. Judge tower parity on the shape of the per-block curve and the serve battery, not on beating that floor | Manual oracle — not `serve_harness.py`; a green VL serve battery is *not* parity evidence |
+| VL image-bearing serve semantics (`generate_vl` over `/v1/chat/completions`) | Manual OpenAI-compatible battery through `hipfire serve` with the exact VL artifact: committed fixtures under [`../benchmarks/vision/images/`](../benchmarks/vision/images/) + the fixed desc/ocr prompts of [`comparison-2026-05-23.md`](../benchmarks/vision/comparison-2026-05-23.md), greedy temp 0; stream **and** non-stream typed-emission check (reasoning vs `content` deltas; no literal `<think>`/`<|im_end|>` chunks in content); client-disconnect probe mid-stream followed by an immediate follow-up turn (no slot wedge); eyeball every decoded output; record artifact sha256, fixture hashes, binary md5s. No scripted harness exists (**blocked** until one lands); `scripts/serve_harness.py` is text-only today and does not exercise this surface | Manual serve (semantics only) |
 | Retained replay / PM4 / AQL graft | `scripts/redline_daemon_harness.py` **and** the certification steps in `docs/REDLINE.md` | Manual Redline; promotion still policy-gated |
 | Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable | Measured; not admission |
 | Existing sealed MQ4R Redline fixture reproduction | `python3 -m tools.redline golden` for its exact gfx1100/gfx1151/gfx1201 fixture only | Measured reproduction; exact identity + route proof + stationary floor; not admission. Does **not** imply that every default-eligible `.mq4r` model file is one of the sealed fixtures. |
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |
 | Model/route **admission** (registry evidence) | Row in [`admissions.yml`](admissions.yml) | Schema v2; exactly one evidence-bound record (LFM2.5-350M MQ4 gfx1201 retained-PM4). No inferred/wildcard rows. Registry admission/evidence is distinct from runtime wiring: the sealed LFM row does **not** select a runtime default and current automatic selection does not use it. |
-| MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | Cross-model automatic runtime predicate (the gfx1201 Qwen3.5 dense and Qwen4 rows below are the other product defaults). Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic (no `arch_id` gate). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
+| MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | Cross-model automatic runtime predicate (the gfx1201 Qwen3.5 dense and Qwen4 rows below are the other product defaults). Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic apart from the exclusions applied by `retained_redline_default` in the same file: Muse Glimmer (arch 14) is withheld until its PM4 lowering lands, Gemma 4 (arch 13) is never admitted (unvalidated retained tape), expert-parallel loads (`ep` > 1) are never admitted, and a Qwen3.5 process using CPU-executed partial offload gets no retained default. Selection by file extension is marked deprecated since 0.4.0, removal in 0.5.0 (0.5.0 selects by HFQ metadata). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
 | gfx1201 Qwen3.5 dense **runtime** automatic Redline default | Source predicate `retained_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) §3 | Runtime-only: exact GPU arch `gfx1201`; `model_arch` `qwen3_5` (dense, any weight format); PP=1; TP=1; no drafter → retained PM4/Auto for plain-AR decode unless disabled with `replay.backend = "hip"`, the built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Every new gfx1201 decode kernel must pass the graph-vs-PM4 parity gate (logits, hidden, DeltaNet state, KV at ctx 512/8,192/32,768, 256 greedy tokens). **Not** registry admission and **not** Section 7 certification. |
 | gfx1201 Qwen4 (Flash-Next) **runtime** automatic Redline default | Source predicate `retained_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) §3 | Runtime-only: exact GPU arch `gfx1201`; `model_arch` `qwen4` (any weight format); PP=1; TP=1; no drafter (a native MTP head is a drafter, so only MTP-off loads replay) → retained PM4/Auto for plain-AR decode, same opt-outs as the Qwen3.5 row. A change to the Qwen4 decode tape must pass `scripts/redline_daemon_harness.py --qwen4 --pm4` (HIP/PM4/blob bit-exact over the shadow positions) and greedy text equality against `HIPFIRE_REPLAY_BACKEND=hip`. **Not** registry admission and **not** Section 7 certification. |
-| VMM continuous-batching serve route (`serve.vmm_batch`, default off) | State oracle `cb_vmm_state_oracle` (k=1..8, unequal prompts, contexts 512/8,192/32,768, 256 greedy steps, negative controls; extended with the 63/64/65/96/128-row aggregate cases and wide-verify on/off, HIP and PeaceMaker arms for `HIPFIRE_CB_VERIFY_CHUNK128`) for exactness; kernel byte oracle `cb_verify_gemm_oracle` for the 64..=128-row exact verify GEMMs (DFlash only, gfx1201 dense MQ4G256V2); flag-off load ack/route identical to base; `conc_http.py` k=1..8 with eyeballed outputs and exactly-once terminals for serve semantics; loaded ack must report `continuous_batch_route=vmm`, `vmm_batch_kv_backend=vmm` without any `kv_backend`/`max_seq` override. Default promotion needs every gate in the CB plan, not a throughput win. | Manual oracle + serve; perf per `methodology/perf-benchmarking.md` |
+| railgun typed-program authoring / validation (G0 recording invariance, G4 probe, G7 shadow diff, `HIPFIRE_RAILGUN_CHECK`) | `cargo test -p railgun-cert` (recording-inventory source scan); `scripts/redline_daemon_harness.py --g0 --inventory <json>` (add `--g0-program`; `--dflash-cycle --draft` for the DFlash window); shadow/check procedures in [`REDLINE.md`](REDLINE.md) §5 | Manual diagnostic evidence for the railgun program model only. railgun authors and validates typed programs (kernel nodes, resources, effects, hazard edges, lowering); Redline is the retained-replay transport. They are not the same system and railgun is not a full Redline replacement: a green railgun check is not Redline route proof, certification, or admission, and the default route stays plain retained PM4. |
+| VMM continuous-batching serve route (`serve.vmm_batch`, default off) | State oracle `cb_vmm_state_oracle` (k=1..8, unequal prompts, contexts 512/8,192/32,768, 256 greedy steps, negative controls; extended with the 63/64/65/96/128-row aggregate cases and wide-verify on/off, HIP and PeaceMaker arms for `HIPFIRE_CB_VERIFY_CHUNK128`) for exactness; kernel byte oracle `cb_verify_gemm_oracle` for the 64..=128-row exact verify GEMMs (DFlash only, gfx1201 dense MQ4G256V2); flag-off load ack/route identical to base; `scripts/serve_harness.py --concurrent-clients 1,2,3,4,5,6,7,8` (battery/chain only; greedy runs assert per-client isolation equality) with eyeballed outputs and exactly-once terminals for serve semantics; loaded ack must report `continuous_batch_route=vmm`, `vmm_batch_kv_backend=vmm` without any `kv_backend`/`max_seq` override. Default promotion needs every gate in the CB plan, not a throughput win. | Manual oracle + serve; perf per `methodology/perf-benchmarking.md` |
 | Shared-weight host import (`HIPFIRE_WEIGHT_HOST=1`, developer, default off; dense Qwen3.5 arch 5, exact gfx1201, PP=TP=1, no drafter/MTP/vision, `HIPFIRE_REPLAY_BACKEND=hip`) — [`CONFIG.md`](CONFIG.md#shared-weight-host-developer-linux-default-off) | Pure CPU: `cargo test -p hipfire-runtime weight_host`, `cargo test -p hipfire-arch-qwen35 shared_weights`, `cargo test -p hipfire-daemon --bin daemon gpu_lock` (identity/canonical-hash/negative-manifest/shared-claim fixtures). G1: `shared_weight_state_oracle` (build with `--features lab`) `weights` / `compare-weights` modes — every one of the 1,347 owners byte-equal private vs import, second importer adds no W-sized physical allocation (sysfs `mem_info_vram_used`). G2: two daemon builds with different executed code objects (`HIPFIRE_MODULE_LOAD_AUDIT=1`) import one epoch under correct-class fabric admission; mismatched recipe/source/admission and malformed clients refused before any FD; tenant SIGTERM, live-tenant drain and host SIGTERM; VRAM returns to baseline. G3 (acceptance): `shared_weight_state_oracle` own-solo vs concurrent **byte** equality of f32 logits, hidden/DeltaNet/KV state, token IDs and UTF-8 for each of two builds, HIP eager and `HIPFIRE_GRAPH=1`, ≥3 fresh processes per arm, contexts 512/8,192/32,768 where two tenants fit, matched private-vs-import load parity and the ≤20% warm weight-ready gate. Default-off CI (`no-gpu-ci.sh`) must stay green; adjacent architectures keep their legacy path. | Manual oracle + lifecycle evidence; timing only through a separate exclusive (or memory-isolated) run. **Not** a performance claim, not Halo/UMA, Flash-Next or host-mapped support. |
 | Embedding encoder (arch 17) forward / attention kernel / weight-format change | `scripts/oracle_pplx_embed.py` — a torch-free NumPy reference of the whole text encoder (embedding gather, zero-centered RMSNorm, fused q+gate split, per-head Q/K norm, partial interleaved mRoPE, bidirectional GQA attention, the GatedDeltaNet causal recurrence, SwiGLU, Dense head) — diffed against the artifact under test; **plus** `scripts/check_embed_quant.py` when the quantizer or a weight format is involved, which loads every artifact (dir or `.hfq`, any format) and asserts each inside its bit-width band (`q8` 3e-2, 6-bit 8e-2, 4-bit 2.5e-1 — an order under the O(1) a broken dequant arm produces). Both are manual; the crate's own unit tests cover the GPU-free parts (config parse, arch mapping, skiplist mask, L2 normalize, MaxSim, image splice, dequant dispatch). | Manual oracle + quantization matrix — **not** `serve_harness.py`: that harness drives text generation and does not exercise the non-chat `embed` verb |
+<<<<<<< HEAD
 | Embedding (arch 17) **multi-slot / batched forward** change (`serve.multi_slot`, `encode_embeddings_batch`, the slot engine, the admit/batch path) | `scripts/check_embed_multislot.py --model <dir> [--slots N] [--oracle]` — encodes the same inputs through the ordinary daemon and through `experimental_multi_slot` and requires them **bit-identical** (the batched forward is deterministic: the GDN state is reset per segment and one weight copy serves the batch), then optionally diffs the slot route against `scripts/oracle_pplx_embed.py` for an independent leg. Exact, not statistical, on purpose: a segment that reads another segment's rows or delta-rule state still returns plausible vectors, so a tolerance would pass the very bug the route can have. Also `cargo run --release -p hipfire-arch-qwen35-embed --example batch_parity --features lab -- <model>` for the forward alone, and the HTTP path (`/v1/embeddings` through a multi-slot `hipfire serve`) when the change touches admission or the client's reply routing. | Adjacent to `serve_harness.py` (same serve route) but that harness drives generation; the batched forward is only reachable through the `embed` verb |
 | Embedding (arch 17) perf claim | `scripts/bench_embed.py` against committed `benchmarks/prompts/embed_*.txt` (JSONL or HTTP transport), fresh process, warmups then medians, prompt md5s recorded in the JSON. The encoder has **no `tg`** — no LM head exists (`tie_word_embeddings: true`, zero `lm_head` tensors), so there is no decode loop; only the single bidirectional pass (`pp`) is meaningful. | Measured per `methodology/perf-benchmarking.md`; not admission |
 | EmbeddingGemma 2 (arch 18) forward / attention / weight-format change | `scripts/check_embeddinggemma2_parity.py --model <dir> --ref <ref.npz>` — drives the daemon `embed` verb end-to-end and diffs served 768-d embeddings and their Matryoshka truncations against a float32 CPU `transformers` reference (generated by the committed `scripts/make_embeddinggemma2_reference.py`; band 2e-2 rel-L2, expected ~1e-3), plus the edge-case contract (image input refused text-only, empty text refused, oversized `dims` refused, >8192-token truncation lands on exactly 8192). The tokenizer leg is implicit — `n_input_tokens` must equal the reference's HF tokenization length per case (the crate's SP-BPE merge path is what makes that hold; the greedy default diverges). | Manual oracle + edge-case contract — not `serve_harness.py` (drives generation) |
 | EmbeddingGemma 2 (arch 18) multi-slot / batched forward change | Same route as arch 17: sequential-vs-slot bit-identity plus the parity script against the slot daemon. | Manual oracle |
+=======
+| Embedding (arch 17) perf claim | `scripts/bench_embed.py` against committed `benchmarks/prompts/embed_*.txt` (JSONL or HTTP transport), fresh process, warmups then medians, prompt md5s recorded in the JSON. The encoder has **no `tg`** — no LM head exists (`tie_word_embeddings: true`, zero `lm_head` tensors), so there is no decode loop; only the single bidirectional pass (`pp`) is meaningful. | Measured per `methodology/perf-benchmarking.md`; not admission |
+| EmbeddingGemma 2 (arch 18) forward / attention / weight-format change | `scripts/check_embeddinggemma2_parity.py --model <dir> --ref <ref.npz>` — drives the daemon `embed` verb end-to-end and diffs served 768-d embeddings and their Matryoshka truncations against a float32 CPU `transformers` reference (generated by the committed `scripts/make_embeddinggemma2_reference.py`; band 2e-2 rel-L2, expected ~1e-3), plus the edge-case contract (image input refused text-only, empty text refused, oversized `dims` refused, >8192-token truncation lands on exactly 8192). The tokenizer leg is implicit — `n_input_tokens` must equal the reference's HF tokenization length per case (the crate's SP-BPE merge path is what makes that hold; the greedy default diverges). | Manual oracle + edge-case contract — not `serve_harness.py` (drives generation) |
+| EmbeddingGemma 2 (arch 18) multi-slot / batched forward change | Same route as arch 17: sequential-vs-slot bit-identity plus the parity script against the slot daemon. | Manual oracle |
+>>>>>>> upstream/beta
 | Unknown surface | **Blocked** until an owner adds a row here | Fail closed |
 
 ## Retired gates (historical only)
@@ -354,7 +376,7 @@ be required for merge, promotion, or benchmark claims.
 
 | Pattern | Status |
 |---|---|
-| `scripts/coherence-gate-*.sh` (e.g. `coherence-gate-dflash.sh`, `coherence-gate-qwen35-dspark.sh`, `coherence-gate-minimax.sh`, `coherence-gate-cohere2moe.sh`, `coherence-gate-deepseek4-*.sh`, …) | **Historical reproduction only.** Never promotion or acceptance. Deprecated since 0.4.0, removed in 0.5.0 (with `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`); each prints a deprecation warning. |
+| `scripts/coherence-gate-*.sh` (e.g. `coherence-gate-qwen35-dspark.sh`, `coherence-gate-qwen3-dspark.sh`, `coherence-gate-minimax.sh`, `coherence-gate-cohere2moe.sh`, `coherence-gate-deepseek4-*.sh`, …) | **Historical reproduction only.** Never promotion or acceptance. Deprecated since 0.4.0, removal in 0.5.0 (with `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`); each prints a deprecation warning. There is **no universal successor**: use the claim-specific route in the [claim → route map](#claim--route-map), or treat the surface as blocked. |
 | `tools/change_gate/`, `.github/agentic-review/`, and the pre-hw-gate agentic static-review route | **Retired.** Superseded as a review path; historical references only. Not merge evidence. |
 | Other gate scripts **not named anywhere in this selector** | Do not treat as canonical acceptance unless a future INDEX/VALIDATION revision names them. Supporting tools already listed above stay in force. |
 
@@ -371,6 +393,7 @@ blocked on purpose.
 | `serve_harness` as numerical/state parity or universal forward proof | **Rejected** — semantics only; oracle or **blocked** |
 | `serve_harness` success as Redline route proof | **Rejected** |
 | `redline_daemon_harness` fingerprint as installed product PM4/AQL route | **Rejected** without `REDLINE.md` ladder |
+| railgun G0/G7/check result as Redline route proof or as a replacement for the Redline ladder | **Rejected** — railgun validates typed programs; it does not certify a retained route |
 | Coherence-gate pass as current acceptance | **Rejected** |
 | `change_gate` / agentic-review route as current acceptance | **Rejected** — retired; historical only |
 | hw-gate success as required merge gate, auto-approval, or auto-promotion | **Rejected** — optional evidence only; direct review + required no-GPU checks remain |

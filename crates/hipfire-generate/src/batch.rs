@@ -2840,6 +2840,31 @@ pub fn vmm_staging_request(
     })
 }
 
+/// Expert-parallel fields of a Qwen4 load ack: `ep` (rank count),
+/// `ep_devices` (HIP device id per rank) and `ep_rank_resident_bytes`
+/// (device memory in use on each rank's GPU once the mesh was attached:
+/// resident weights, state and scratch). Absent without a mesh (ep == 1).
+fn qwen4_ep_ack_fields(
+    v: &mut serde_json::Value,
+    device_ids: &[i32],
+    resident_bytes: &[u64],
+) {
+    v["ep"] = serde_json::json!(device_ids.len());
+    v["ep_devices"] = serde_json::json!(device_ids);
+    v["ep_rank_resident_bytes"] = serde_json::json!(resident_bytes);
+}
+
+fn qwen4_ep_ack(ack: String, m: &LoadedModel) -> String {
+    let Some(mesh) = m.qwen4().and_then(|b| b.ep_mesh()) else {
+        return ack;
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
+        return ack;
+    };
+    qwen4_ep_ack_fields(&mut v, mesh.device_ids(), mesh.used_bytes());
+    v.to_string()
+}
+
 /// Daemon load ack: on the VMM batch route (`vmm_batch` Some) append the
 /// actual per-request owner receipt. Absent on every other route, so the
 /// flag-off ack is returned unchanged. A Qwen4 model reports the `fn-lanes`
@@ -2853,6 +2878,7 @@ pub fn vmm_loaded_ack(
     row_budget: usize,
     gpu: &rdna_compute::Gpu,
 ) -> String {
+    let ack = qwen4_ep_ack(ack, m);
     let Some(p) = vmm_batch else {
         return ack;
     };
@@ -7332,6 +7358,16 @@ mod tests {
             frequency_penalty: 0.0,
             repeat_window: 64,
         }
+    }
+
+    #[test]
+    fn qwen4_ep_ack_reports_rank_count_devices_and_per_rank_bytes() {
+        let mut v = serde_json::json!({"type": "loaded"});
+        qwen4_ep_ack_fields(&mut v, &[0, 1, 2, 3], &[30 << 30, 29 << 30, 29 << 30, 29 << 30]);
+        assert_eq!(v["ep"], 4);
+        assert_eq!(v["ep_devices"], serde_json::json!([0, 1, 2, 3]));
+        assert_eq!(v["ep_rank_resident_bytes"][0], 30u64 << 30);
+        assert_eq!(v["ep_rank_resident_bytes"].as_array().map(Vec::len), Some(4));
     }
 
     #[test]

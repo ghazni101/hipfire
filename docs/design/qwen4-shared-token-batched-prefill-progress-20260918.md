@@ -7,6 +7,12 @@ This is the mutable implementation/progress record for
 The plan remains immutable. This record is updated with concrete ownership,
 changed files, evidence, and blockers as work lands.
 
+Evidence paths written as `.codeinsight+research/...` refer to a gitignored,
+host-local artifact tree that is not part of the repository or published with
+it. They are non-link citations that identify the original run records (the
+SHA256/MD5 values, counters, and verdicts quoted here are the reproducibility
+anchors); regenerate the artifacts by re-running the cited commands.
+
 ## Contract accepted before implementation
 
 CodeGraph was attempted first (`which codegraph` / `command -v codegraph`) and
@@ -394,10 +400,10 @@ Host gates, with raw logs retained under
 
 - `flock -w 3600 /tmp/hipfire-build.lock cargo build --release --workspace
   --all-targets --locked` passed without taking the GPU lock.  The exact
-  product paths are `/home/bjoern/hipfire/target/release/daemon` (MD5
+  product paths are `<repo>/target/release/daemon` (MD5
   `cda02f6fc9688e215ec8ad95e4f3c9dc`, SHA256
   `bb346923ed1d974282d2b0068a6df16bcac6230499800f89ea9ed931671de53f`) and
-  `/home/bjoern/hipfire/target/release/hipfire` (MD5
+  `<repo>/target/release/hipfire` (MD5
   `12553c586915590ccc2f355c4d513446`, SHA256
   `4e9211dc6f28fb6a671e045034a645c2619f493d2521223ed76cc946ebb633de`).
   Log: `post-hc-build-release-workspace-all-targets-locked.log`.
@@ -598,12 +604,12 @@ identity; these are scoped engineering evidence, not six product promotions:
 
 | # | staged lever | immutable evidence and disposition |
 |---:|---|---|
-| 1 | QSA selection-only parallelism | [`selection-candidate/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/selection-candidate/manifest.json) — `parallel-qsa-select-only`, frozen before the attention edit; no standalone product claim. |
-| 2 | QSA selection-plus-attention parallelism | [`attention-candidate/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/attention-candidate/manifest.json) — `parallel-qsa-select-and-attention`, immutable pre-sentinel evidence; no promotion claim. |
-| 3 | QSA selection sentinel | [`selection-sentinel/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/selection-sentinel/manifest.json) — accepted pre-GDN route with exact oracle/profile comparisons; not a product baseline. |
-| 4 | GDN shared exact-128 BF16 QK norm | [`gdn-shared-norm128/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/gdn-shared-norm128/manifest.json) — accepted pre-N8 route with exact oracle/profile comparisons; not a product baseline. |
-| 5 | gfx1151 N8 measured-prefill multirow allowlist | [`n8-gfx1151/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/n8-gfx1151/manifest.json) — accepted kernel optimization and frozen A comparison; no product-win claim. |
-| 6 | HC rows/grid-Y batching | [`hc-rows-gridy-20260919-v3/manifest.json`](../../.codeinsight+research/qwen4/perf-targets-20260918/baseline/hc-rows-gridy-20260919-v3/manifest.json) — current final candidate; no product-target claim. |
+| 1 | QSA selection-only parallelism | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/selection-candidate/manifest.json` — `parallel-qsa-select-only`, frozen before the attention edit; no standalone product claim. |
+| 2 | QSA selection-plus-attention parallelism | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/attention-candidate/manifest.json` — `parallel-qsa-select-and-attention`, immutable pre-sentinel evidence; no promotion claim. |
+| 3 | QSA selection sentinel | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/selection-sentinel/manifest.json` — accepted pre-GDN route with exact oracle/profile comparisons; not a product baseline. |
+| 4 | GDN shared exact-128 BF16 QK norm | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/gdn-shared-norm128/manifest.json` — accepted pre-N8 route with exact oracle/profile comparisons; not a product baseline. |
+| 5 | gfx1151 N8 measured-prefill multirow allowlist | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/n8-gfx1151/manifest.json` — accepted kernel optimization and frozen A comparison; no product-win claim. |
+| 6 | HC rows/grid-Y batching | `.codeinsight+research/qwen4/perf-targets-20260918/baseline/hc-rows-gridy-20260919-v3/manifest.json` — current final candidate; no product-target claim. |
 
 The first two rows are deliberately separate QSA source/cache stages, while
 the selection sentinel is the accepted combined route that gates the GDN
@@ -721,23 +727,23 @@ boundary in shared `execute_hyper_read` with contiguous chunks bounded by the
 already-owned `bf16_scratch.numel()` capacity.  The candidate added no kernel,
 scratch allocation, precision/reduction change, architecture gate, or GDN
 change.  The candidate source diff and snapshot remain preserved in
-[`candidate-git-diff.patch`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-git-diff.patch)
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-git-diff.patch`
 and
-[`candidate-source-snapshot.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-source-snapshot.json).
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/candidate-source-snapshot.json`.
 
 The candidate profile established a genuine launch-count reduction on the
 natural `[128,128,35]` path (`observed_target_natural_launches=4656`) while
 leaving the scalar `grid512` count unchanged at `84681`; see
-[`candidate-profile-summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/profile/rocprof/current-marker-20260919/candidate-profile-summary.json).
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/profile/rocprof/current-marker-20260919/candidate-profile-summary.json`.
 The host tail/row-crossing probe was exact for rows `1`, `35`, and `128`, but
 is explicitly a host simulation:
-[`chunk-tail-row-crossing-probe.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/chunk-tail-row-crossing-probe.json).
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/chunk-tail-row-crossing-probe.json`.
 The candidate full GPU oracle remained exact (`exact_bits=true`,
 `state_exact=true`, `ids_equal=true`) and the AR/native-MTP Paris smoke passed,
 but these are correctness and integration evidence, not throughput promotion:
-[`result.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/oracle/result.json)
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/oracle/result.json`
 and
-[`summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/serve-smoke-20260919-paris/summary.json).
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/serve-smoke-20260919-paris/summary.json`.
 
 For the natural marker, the all-symbol raw-trace ranking (not the
 target-only hot-symbol filter) sums `4,715.890965 ms` of device duration over
@@ -750,7 +756,7 @@ target-only hot-symbol filter) sums `4,715.890965 ms` of device duration over
 `gated_delta_step_shared_norm128_gfx1151` (`493.483439 ms`).  This profile
 attribution is retained for a better next-lever choice and is not a native
 throughput claim:
-[`natural-marker-all-symbol-top5.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/natural-marker-all-symbol-top5.json).
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/metadata/natural-marker-all-symbol-top5.json`.
 
 The valid native primary measurement used fixed products, private
 `max_seq=2048` configuration, DPM warmup `10s`, the exact 291-token prompt,
@@ -761,7 +767,7 @@ discarded zero-based samples `0..9`, and retained only sample `10`; all raw
 arrays of length `11` are preserved.  The cooperative GPU lock serialized
 these arms, but unrelated GPU clients were preserved, so this is not an
 uncontended measurement.  The durable record is
-[`primary-summary.json`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/primary-summary.json):
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/primary-summary.json`:
 A prefill median was `51.4 tok/s`, B was `53.4 tok/s` (`+2.0 tok/s`,
 `+3.9%`), but that delta was below the maximum observed arm spread
 (`2.2 tok/s`); decode medians were equal at `13.2 tok/s`.  This is
@@ -772,7 +778,7 @@ the decision; their artifacts remain preserved.
 The separately run 24-token France fixture is exploratory only: the bench
 itself warns that its prefill number is launch overhead, not throughput.
 Its A/B raw records are retained under
-[`second-prompt-20260919`](../../.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/second-prompt-20260919/),
+`.codeinsight+research/qwen4/current-pp-profile-20260919-v1/candidate/perf-v3-abbaab-20260919/second-prompt-20260919/`,
 but this short prompt cannot repair the primary no-clear-win result or serve
 as transfer evidence.
 
@@ -848,7 +854,7 @@ Rejected on the same day and not retained: a single-row gate O1×R16 tile
 halving weight fetches is cancelled by doubled X traffic) and a half-slotted
 gate O2×R16 tile that failed bitwise parity.  Both are recorded with raw
 numbers in
-[`REJECTED-TILE-EXPERIMENTS-20260920.md`](../../.codeinsight+research/qwen4/pp500-kernel-check/REJECTED-TILE-EXPERIMENTS-20260920.md).
+`.codeinsight+research/qwen4/pp500-kernel-check/REJECTED-TILE-EXPERIMENTS-20260920.md`.
 
 ### 2026-09-20 second pass — dense kernel rewrite, gate liveness elision, and the half-slotted defect
 

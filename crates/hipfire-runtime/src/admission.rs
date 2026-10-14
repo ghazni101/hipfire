@@ -19,6 +19,12 @@ pub struct ModelFootprint {
     pub weights_bytes: u64,
     /// Charged per session, per token of granted context.
     pub kv_bytes_per_token: u64,
+    /// Pinned host bytes the loader really allocated (`hipHostMalloc`), charged
+    /// once against the host tier. Separate from `weights_bytes` because these
+    /// pages are unreclaimable and are NOT part of the device heap — charging
+    /// them to VRAM would over-admit, and not charging them anywhere would let a
+    /// spill-starved host starve the desktop.
+    pub pinned_host_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +80,10 @@ impl AdmissionController {
             budget_bytes,
             admitted: Vec::new(),
             host_budget: crate::swap::DEFAULT_HOST_BUDGET_BYTES,
-            host_used: 0,
+            // The loader's pinned host weights are already resident by the time a
+            // controller exists, so they are charged here rather than admitted:
+            // the host tier's remaining budget is what a swap-out can use.
+            host_used: footprint.pinned_host_bytes,
         }
     }
 
@@ -269,6 +278,7 @@ mod tests {
         ModelFootprint {
             weights_bytes: 15 * GIB,
             kv_bytes_per_token: 34 * 1024,
+            pinned_host_bytes: 0,
         }
     }
 
@@ -321,6 +331,7 @@ mod tests {
         ModelFootprint {
             weights_bytes: 20 * GIB,
             kv_bytes_per_token: 10_854,
+            pinned_host_bytes: 0,
         }
     }
 
@@ -415,12 +426,38 @@ mod tests {
         );
     }
 
+    /// Pinned host weights are real, unreclaimable memory that is NOT part of the
+    /// device heap: they must be charged to the host tier (so a swap-out cannot
+    /// spend them again) and must not be charged to VRAM (or a spill could never
+    /// buy the context it exists to buy).
+    #[test]
+    fn pinned_host_weights_are_charged_to_the_host_tier() {
+        let mut a = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 0,
+                pinned_host_bytes: 700,
+            },
+            1 << 30,
+        );
+        a.set_host_budget(1000);
+        assert_eq!(
+            a.host_used_bytes(),
+            700,
+            "the loader's pinned bytes are charged at construction"
+        );
+        assert!(a.admit_host(300), "the remaining host budget is usable");
+        assert_eq!(a.host_used_bytes(), 1000);
+        assert!(!a.admit_host(1), "and not one byte more");
+    }
+
     #[test]
     fn the_host_tier_has_its_own_budget() {
         let mut a = AdmissionController::new(
             ModelFootprint {
                 weights_bytes: 0,
                 kv_bytes_per_token: 0,
+                pinned_host_bytes: 0,
             },
             1 << 30,
         );
@@ -470,5 +507,4 @@ mod tests {
     fn page_bytes_empty_layers_is_zero() {
         assert_eq!(page_bytes(&[], &[]), Some(0));
     }
-
 }

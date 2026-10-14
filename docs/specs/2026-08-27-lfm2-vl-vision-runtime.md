@@ -9,7 +9,7 @@ Author: engineering (hipfire agent)
 Date: 2026-08-27
 Parent carrier recipe: [`docs/lfm2-vl-mq4v2-spec.md`](../lfm2-vl-mq4v2-spec.md)
 §3.3–3.4 (the unbuilt remainder this record specifies)
-Sibling family spec: [`qwen35-vl-mq4v2-spec.md`](../../../) on `feat/qwen35-vl`
+Sibling family spec: [`qwen35-vl-mq4v2-spec.md`](../qwen35-vl-mq4v2-spec.md) on `feat/qwen35-vl`
 (§4 shared VL artifact contract remains authoritative for metadata/dtypes)
 Validation routing: [`docs/methodology/arch-port-validation.md`](../methodology/arch-port-validation.md)
 (model-arch forward bring-up loop); `docs/VALIDATION.md` has **no** VL row

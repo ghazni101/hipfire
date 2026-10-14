@@ -49,6 +49,11 @@ required_features_daemon    == 0
 # the Qwen4 think-budget/EOS serve fixes (163d26d5b0, 325f31cc1a); e4d816e6b2
 # already removed formatter churn. v0.4.1 shipped at 5392 with CI red on this
 # ratchet; recorded here in 0.4.1.1 rather than masking the gate.
+# RATCHET-RAISE 5392 -> 5393: the MoE host-offload branch threads the slot's
+# `mtp_mode` into the Qwen35 slot forward, preserving explicit native MTP's
+# forced advances on the CPU-splice route. The implicit MoE auto-fit/default
+# change was removed, so the parsed-MoE replay-default plumbing and its ten
+# daemon lines were also removed. Only the required slot argument remains.
 # RATCHET-RAISE 5392 -> 5440: the `embed` wire verb (arch 17, the qwen3.5
 # multi-vector embedding encoder) adds a dispatch arm + its non-embed refusal
 # to the daemon's message loop. The body lives in hipfire-generate::embed (the
@@ -64,6 +69,28 @@ required_features_daemon    == 0
 # literal (`daemon_arch_id` stays 0). Paid down when the message loop's
 # per-verb refusal boilerplate is factored out, as noted at the 5392 raise.
 daemon_lines                <= 5460
+# RATCHET-RAISE 5460 -> 5495: the arch-17 embedding arms in the daemon message
+# loop (#855, beta-base replay) — the generate refusal that is keyed after the
+# attempt id and admission token are bound (its attempt-0 twin hung requests),
+# the embed arm's thread-creation bound, the multi-slot engine spawn and its
+# carrier-delegated slot preflight, and the request-named-model reload policy.
+# Same paydown as the 5392 raise: factor the per-verb refusal boilerplate out.
+# RATCHET-RAISE 5393 -> 5496 (#855, arch 17, the qwen3.5 multi-vector
+# embedding encoder pplx-embed-v2), on top of #858's 5392 -> 5393 above:
+# +103 lines in daemon main.rs, in two hunks.
+#   +77  the `embed` verb arm: the multi-slot worker spawn with its
+#        thread-creation bound checked before spawning, the no-model and
+#        not-an-embedding-checkpoint refusals, and the call into
+#        hipfire-generate::embed, which owns the body (the img_generate
+#        precedent, so main.rs names no arch-crate type);
+#   +26  the `generate` arm's refusal of an embedding checkpoint, keyed after
+#        the attempt id and admission token are bound (an attempt-0 refusal
+#        hangs the caller; without any refusal the generic body downcasts the
+#        wrong bundle and panics the daemon).
+# Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
+# stays 0. Paid down when the message loop's per-verb refusal boilerplate is
+# factored out.
+daemon_lines                <= 5515
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -161,3 +188,20 @@ bypass_slack                == 0
 # genuine growth the corrected regex has caught — at the old adjacent-only
 # regex it would have been invisible, which is the whole reason it was fixed.
 bypass_total                <= 365
+# RATCHET-RAISE 306 -> 357: measurement correction, not new debt. The checker's
+# regex required `gpu.` adjacent to the method name and missed rustfmt-wrapped
+# `gpu\n    .gemm_*` chains; 51 existing call sites across six arch crates
+# became visible (deepseek4 +20, muse-glimmer +11, minimax +7, diffusion +7,
+# qwen35 +5, gemma4 +1). No arch reached for the Gpu handle newly; the holster
+# objective's descent starts from 357.
+# RATCHET-RAISE 357 -> 364: hipfire-arch-qwen35-embed (new, #855) records its
+# 7 existing-style debt sites: the trunk's f16 WMMA GEMM projections and the
+# encoder attention's eager decomposition (Q*K^T and P*V WMMA GEMMs), the same
+# registry-key debt the other arch crates carry. Migration target: the shared
+# encoder-attention op and project_weights family (staged follow-up).
+# RATCHET-RAISE 364 -> 366 (#855 maintainer hardening): measured arch 17
+# hipfire-arch-qwen35-embed 7 -> 9, registry refs 0; all other crate counts
+# unchanged. The two additional gfx1201 split1 pitched WMMA Q*K^T and P*V
+# entry points avoid head gathers and carry the same encoder-attention
+# registry-key debt; the existing gfx11 route is unchanged.
+bypass_total                <= 366

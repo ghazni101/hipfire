@@ -26,7 +26,7 @@
 //!
 //! ## Coverage (the whole served fleet, one substrate)
 //! - `Proj` / `ResidualGemv` / `Moe`     → qwen35, MiniMax(reuse), cohere2moe(reuse)
-//! - `Attend` (flavor-carrying)          → all; Gemma SWA/qk-norm/softcap/k_eq_v live here as flavors
+//! - `Attend`                            → all
 //! - `Recurrent`                         → qwen35 DeltaNet linear-attention state
 //! - `Conv`                              → LFM2 depthwise causal short-conv mixer (+ conv state)
 //! - `Escape(EscapeKind)`                → irregular/stateful: deepseek4 compressor/indexer/SWA, etc.
@@ -34,7 +34,9 @@
 //! NOTE: nothing here is on a live path yet. The live forward remains
 //! `execute_steps`; this substrate is wired behind `HIPFIRE_FORWARD_LOWERED`
 //! (default off) in later steps, validated byte-identical via the
-//! `HIPFIRE_FORWARD_ORACLE` dual-run.
+//! `HIPFIRE_FORWARD_ORACLE` dual-run. `run_layer_program` additionally refuses
+//! the `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu` combination when a
+//! program op reads a host-mapped weight (see the executor docs).
 
 use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::context::DispatchCtx;
@@ -62,54 +64,10 @@ pub enum ScratchSlot {
     Cache(u32),
 }
 
-/// FFN/gate-up activation flavor. SiLU for qwen-family; GeLU-tanh (GeGLU) for
-/// Gemma (`gelu_tanh(gate)·up`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActFlavor {
-    SiluMul,
-    GeluTanhMul,
-}
-
-/// RoPE flavor carried by an `Attend` super-op (resolved from config at load).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RopeFlavor {
-    None,
-    /// Standard rotate-half (most archs). `theta` = rope base.
-    HalfRotate {
-        theta: f32,
-    },
-    /// Interleaved full-dim RoPE (e.g. cohere2moe).
-    Interleaved {
-        theta: f32,
-    },
-}
-
-/// Attention-block flavor — everything that distinguishes one arch's attention
-/// from another, resolved at load so the per-token `Attend` is branch-free.
-/// Gemma exercises the full surface (SWA window, per-head qk-norm, q·√hd scaling,
-/// the k_eq_v weightless-V-RMSNorm prelude, logit softcap).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttnFlavor {
-    /// Sliding-window size; 0 = full (global) attention. Gemma alternates
-    /// Sliding(1024)/Full per layer.
-    pub window: u32,
-    /// Per-head q_norm/k_norm over head_dim (Gemma, qwen35).
-    pub qk_norm: bool,
-    /// q *= sqrt(head_dim) (Gemma query scaling).
-    pub q_scale_sqrt_hd: bool,
-    /// V = copy of K before k_norm + weightless RMSNorm on V (Gemma full layers).
-    pub k_eq_v: bool,
-    /// Attention-logit softcap value; 0.0 = none (Gemma-2 style).
-    pub logit_softcap: f32,
-    pub rope: RopeFlavor,
-}
-
 /// Per-super-op flavor payload (None for ops with no flavor axis, e.g. Proj).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OpFlavor {
     None,
-    Attn(AttnFlavor),
-    Act(ActFlavor),
 }
 
 /// Irregular/stateful ops that don't map onto a single fused kernel. Each is a
@@ -123,8 +81,6 @@ pub enum EscapeKind {
     Deepseek4IndexerTopK,
     /// deepseek4 sparse SWA over the gathered top-K KV.
     Deepseek4SwaTopK,
-    /// Gemma final logit softcap (output stage).
-    GemmaLogitSoftcap,
 }
 
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the
@@ -146,7 +102,7 @@ pub enum SuperOpKind {
     /// projection cluster did NOT fuse — mirrors execute_steps' unfused
     /// per-step launch_op path (rmsnorm, then individual Proj gemvs).
     Norm,
-    /// Attention block (flavor in `OpFlavor::Attn`).
+    /// Attention block.
     Attend,
     /// MoE FFN block (routes to MoeFamily / run_moe_decode).
     Moe,
@@ -249,9 +205,9 @@ fn lower_walk(
 /// the frozen `KernelKey`s match `execute_steps` byte-for-byte — no fusion drift.
 ///
 /// TODO(arch-migration, Step 3+): populate `WeightSlot`/`ScratchSlot` bindings
-/// and `AttnFlavor`/`ActFlavor` from the arch's weight/scratch tables + config.
-/// This step freezes the FUSION STRUCTURE + kernel keys; the per-arch migration
-/// supplies the operand slots + flavor data (and the executor binds them).
+/// from the arch's weight/scratch tables. This step freezes the FUSION
+/// STRUCTURE + kernel keys; the per-arch migration supplies the operand slots
+/// (and the executor binds them).
 pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
     lower_walk(
         steps.len(),
@@ -391,6 +347,23 @@ pub trait ForwardBindings {
         op: &OpBinding,
         kind: EscapeKind,
     ) -> Result<(), DispatchError>;
+
+    /// Whether this op reads a host-mapped weight buffer.
+    ///
+    /// The lowered program carries indices only ([`WeightSlot`]), so the executor
+    /// cannot test residency itself: the arch answers from its live weight tables
+    /// via `gpu.host_located(&weight.buf)` — the same test
+    /// `crate::cpu_exec::reads_host_mapped_weight` applies to a `Step`'s weight.
+    /// Only GEMV/GEMM weights count (projections, the fused down-projection, the
+    /// MoE router/shared/routed weights): norm, state, KV, and conv reads stay on
+    /// the GPU by design (see the `cpu_exec` scope docs) and must not trip this.
+    /// `run_layer_program` refuses the `HIPFIRE_FORWARD_LOWERED` +
+    /// `memory.offload_exec=cpu` combination when any op answers true. Defaults
+    /// to `false`, so resident-only archs (no spill support) — and any lowered
+    /// program with no host-mapped weight — run exactly as before.
+    fn op_reads_host_mapped_weight(&self, _gpu: &Gpu, _op: &SuperOp) -> bool {
+        false
+    }
 
     // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
     // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
@@ -715,12 +688,36 @@ pub fn dispatch_super_op<B: ForwardBindings>(
 /// arch's forward (qwen35 first) builds a `LoweredForward` at load and calls this
 /// behind `HIPFIRE_FORWARD_LOWERED` (default off), oracle-validated byte-identical
 /// vs the hand `execute_steps` path before the default is flipped per arch.
+///
+/// Fail closed on `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu`: when CPU
+/// execution is enabled and any op in `program` reads a host-mapped weight (via
+/// [`ForwardBindings::op_reads_host_mapped_weight`] — the same
+/// `gpu.host_located(&weight.buf)` test `crate::cpu_exec::reads_host_mapped_weight`
+/// applies to a `Step`'s weight), this returns a `DispatchError` instead of
+/// launching. The lowered path bypasses the step seam that routes host-mapped
+/// weights to the CPU, so it would read them on the GPU over PCIe and skip both
+/// the CPU splice and the splice coverage. A lowered program with no
+/// host-mapped weight runs exactly as before.
 pub fn run_layer_program<B: ForwardBindings>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     program: &LayerProgram,
     bindings: &mut B,
 ) -> Result<(), DispatchError> {
+    if crate::cpu_exec::cpu_exec_enabled()
+        && program
+            .iter()
+            .any(|op| bindings.op_reads_host_mapped_weight(gpu, op))
+    {
+        return Err(DispatchError::Hip(
+            "HIPFIRE_FORWARD_LOWERED with memory.offload_exec=cpu refuses a lowered program \
+             reading a host-mapped weight: the lowered path bypasses the step seam that routes \
+             host-mapped weights to the CPU, so it would read them on the GPU over PCIe and skip \
+             the CPU splice and the splice coverage. Set memory.offload_exec=pcie \
+             (HIPFIRE_OFFLOAD_EXEC=pcie) or HIPFIRE_FORWARD_LOWERED=0"
+                .into(),
+        ));
+    }
     for op in program {
         dispatch_super_op(gpu, ctx, op, bindings)?;
     }

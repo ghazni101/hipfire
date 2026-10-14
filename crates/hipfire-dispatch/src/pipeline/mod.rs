@@ -30,6 +30,7 @@ pub mod moe_dump;
 pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
+pub mod sandwich;
 pub(crate) mod steps;
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
@@ -40,6 +41,10 @@ pub use layer_ops::{
     DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
     HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
     IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
+    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
+    execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
+    CoreWindow,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,
@@ -1881,11 +1886,18 @@ fn dispatch_grouped_gemm(
     force_mq4_fp16: bool,
     paro_i8: bool,
     paro_i8_k8: bool,
+    coalesced: bool,
 ) -> Result<(), DispatchError> {
     reject_mq4g128v2(dtype, "moe")?;
     // Mixed per-expert: the merged grouped kernel carries the per-expert stride
     // via the dtype_tags table; takes priority over the uniform dtype dispatch.
     if let Some(tags) = expert_dtype_tags {
+        if coalesced {
+            return hip!(gpu.gemm_mixed_moe_grouped_wmma_coalesced(
+                ptrs, tags, tile_ids, sorted_slot_index, x, y,
+                m, k, x_row_div, m_total, rows,
+            ));
+        }
         return hip!(gpu.gemm_mixed_moe_grouped_wmma(
             ptrs,
             tags,
@@ -4495,6 +4507,7 @@ fn prefill_gate_up_stage(
     res: &crate::families::moe::MoePrefillResolution,
     path2_m_total: usize,
     force_mq4_grouped_fp16: bool,
+    coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
     let (n, mi, k_top) = (p.batch_size, p.mi, p.k_top);
     let gate_up_k = p.gate_up_k;
@@ -4531,6 +4544,7 @@ fn prefill_gate_up_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            coalesced_verify && p.routed_experts.host_mapped_projections().0,
         )?;
         // The explicit unscatter stage follows this grouped GEMM.
     } else {
@@ -4878,6 +4892,7 @@ fn prefill_down_stage(
     path2_m_total: usize,
     total_slots: usize,
     force_mq4_grouped_fp16: bool,
+    coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
     let (n, k_top) = (p.batch_size, p.k_top);
     let (down_m, down_k) = (p.down_m, p.down_k);
@@ -4902,6 +4917,7 @@ fn prefill_down_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            coalesced_verify && p.routed_experts.host_mapped_projections().1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {

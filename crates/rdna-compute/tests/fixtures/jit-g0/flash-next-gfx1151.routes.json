@@ -150,7 +150,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "3f12e2b85e2ca4d5c265a538dbf9f26e64bd1efe62e3df7f916695c8f830659d",
+      "sha256": "4206f421af1a8bd2b331bb77952516e0689179d046896b9e381b7afe3b2b1ad9",
       "symbols": [
         "gated_delta_chunk_gate_wmma"
       ],
@@ -868,7 +868,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "e903c9cdda8d03e55aec629e3f66f48542d3532733b787653ab9ec2b43656432",
+      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
       "symbols": [
         "quantize_bf16_q8_0"
       ],
@@ -1202,7 +1202,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
+      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
       "symbols": [
         "gated_delta_conv_qknorm_bf16_f32_batched_k4",
         "gdn_state_f32_to_q8",

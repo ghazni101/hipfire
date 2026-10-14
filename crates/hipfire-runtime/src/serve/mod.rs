@@ -289,6 +289,10 @@ pub struct SlotEngineConfig {
     pub vl_path: Option<PathBuf>,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
+    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
+    /// site reads this (not `mtp_k`) for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,
@@ -341,6 +345,7 @@ pub struct SlotModelPreflight {
     pub vl_path: Option<PathBuf>,
 }
 
+
 /// Which prompt the encoder wraps the input in. Queries and documents carry
 /// different markers and different truncation limits, and the document side
 /// additionally drops the multi-vector mask's punctuated positions — so the
@@ -385,6 +390,7 @@ pub struct EmbedResponse {
     pub n_input_tokens: usize,
 }
 
+
 /// Arch-erased multi-slot engine. The concrete engine runs its own thread
 /// and is driven through this narrow surface: submit a request, cancel a
 /// queued one, close/reset a session, read stats, and shut down. The wire
@@ -404,6 +410,7 @@ pub trait SlotEngineHandle: Send + Sync {
     fn reset(&self) -> Result<(), String>;
     /// Snapshot of engine-level counters (submitted/rejected/completed/…).
     fn stats(&self) -> EngineStats;
+
     /// Serve one batch of embedding encodes synchronously, one result per
     /// request in order.
     ///
@@ -427,6 +434,7 @@ pub trait SlotEngineHandle: Send + Sync {
     ) -> Result<Vec<Result<EmbedResponse, String>>, String> {
         Err("this engine does not serve embeddings".into())
     }
+
     /// Consuming shutdown: close the command channel, fail in-flight
     /// requests, join the engine thread and free GPU state. On `Err` the
     /// caller may withhold `unloaded` to keep the load registered.

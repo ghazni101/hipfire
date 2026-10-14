@@ -2,9 +2,10 @@
   "schema": "pm-union-corpus-v1",
   "corpus_id": "pm-union-u0-mq4-residual-4cell-v1",
   "freeze_date": "2026-10-11",
+  "path_placeholders": "Paths without a placeholder are repository-relative. <release-workdir>, <release-0.4.0-workdir> and <peacemaker-workdir> denote local working directories (local-only evidence, not tracked in this repository); <pci-bdf> and <device-uuid> are redacted device identifiers.",
   "status": "Frozen DEFINITION plus observed pilot EXPORT pins. The pilot has exported the V0 SPIR-V and the ACO/RADV raw binary, ABI sidecar and rawspec (section `exported_artifacts`); that is an export only. No raw lift, HSA adapter, PM-HIP object, Vulkan reference receipt, binary-replay or equality/parity result exists, and none is claimed. Hpm and Vpm do not exist; no result digest exists for any arm.",
   "plan": {
-    "path": "/home/kaden/qcal/release-0.4.2/pm-programs/PM-UNION.md",
+    "path": "<release-workdir>/pm-programs/PM-UNION.md",
     "sections": [
       "5.1 (:170-185)",
       "5.2 (:187-208)",
@@ -13,22 +14,22 @@
     ]
   },
   "provenance": {
-    "union_u0_worktree": "/home/kaden/qcal/release-0.4.2/pm-union/UnionU0/",
+    "union_u0_worktree": "<release-workdir>/pm-union/u0/",
     "union_u0_worktree_head": "2bb9670061a51aa4c4fbe9e802de8a44f7b6d795",
     "original_repo_head": "2bb9670061a51aa4c4fbe9e802de8a44f7b6d795",
-    "pilot_worktree": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/",
+    "pilot_worktree": "<release-workdir>/worktrees/pm-aco-pilot-20261011/",
     "pilot_head": "d7ae3672b34f15b96500bfadc14334d58e2d355f",
     "pilot_files_uncommitted_at_freeze": true,
     "mesa_pin": {
       "tag": "mesa-26.0.8",
       "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
-      "source": "/home/kaden/qcal/peacemaker/aco-shim/pin.json:2-8",
+      "source": "<peacemaker-workdir>/aco-shim/pin.json:2-8",
       "local_modifications_at_freeze": [
         "src/amd/compiler/meson.build (modified)",
         "src/amd/compiler/aco-shim (untracked)"
       ]
     },
-    "pilot_scope": "AcoPilot F1-F4 are untouched and referenced, not edited."
+    "pilot_scope": "ACO pilot F1-F4 are untouched and referenced, not edited."
   },
   "kernel": {
     "symbol": "gemv_mq4g256v2_residual",
@@ -216,10 +217,10 @@
   },
   "fixtures": {
     "occ0": {
-      "directory": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/",
+      "directory": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/",
       "schema": "pmdt-capture-v1",
       "meta_json": {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/meta.json",
+        "path": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/meta.json",
         "sha256": "22dead9e3a1887d15230d0653281724f52ac445ba155e206d224e6da831de0b6"
       },
       "files": {
@@ -343,14 +344,14 @@
       "dynamic_lds": 0,
       "arch": "gfx1201",
       "captured_kernarg_hex": "0000207e917400000030dbac8d74000000b09fb18d7400000014000000180000",
-      "model": "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
+      "model": "<release-0.4.0-workdir>/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
       "context_tokens": 512
     },
     "occ127": {
-      "directory": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/",
+      "directory": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/",
       "schema": "pmdt-capture-v1",
       "meta_json": {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/meta.json",
+        "path": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/meta.json",
         "sha256": "85062964edbd75e896f995628225c10c6be4a20a1c8f55785288598f357870af"
       },
       "files": {
@@ -473,7 +474,7 @@
       ],
       "dynamic_lds": 0,
       "arch": "gfx1201",
-      "model": "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
+      "model": "<release-0.4.0-workdir>/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
       "context_tokens": 512
     }
   },
@@ -1082,214 +1083,214 @@
   "source_pins": [
     {
       "role": "hipcc incumbent source (compile input of the pinned object: weight-buffer preamble + kernel)",
-      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gemv_hfq4g256_residual_mq4v2.hip",
+      "path": "<release-workdir>/parallel-packs/registry/gfx1201/gemv_hfq4g256_residual_mq4v2.hip",
       "sha256": "869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e",
       "hashed_with": "sha256sum",
       "note": "inventory source_sha256 inventory.json:43159"
     },
     {
       "role": "tree kernel source (kernel body only; text differs from registry snapshot by the 55-line preamble)",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/src/gemv_mq4g256v2_residual.hip",
+      "path": "kernels/src/gemv_mq4g256v2_residual.hip",
       "sha256": "be1bc095db85d98b9665421093e0c06cd0b320610e4a58100e8f6c82d14094c2",
       "hashed_with": "sha256sum"
     },
     {
       "role": "hipcc incumbent object (Hllvm)",
-      "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco",
+      "path": "<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco",
       "sha256": "bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca",
       "hashed_with": "sha256sum",
       "note": "inventory object_sha256 inventory.json:43194"
     },
     {
       "role": "hipcc incumbent build command",
-      "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/command.json",
+      "path": "<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/command.json",
       "sha256": "a0d1d53faef63691a0e00312e7360082fd57d2de60551381c4dc1edbbb78b19d",
       "hashed_with": "sha256sum"
     },
     {
       "role": "decode-twin inventory",
-      "path": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/inventory.json",
+      "path": "<release-workdir>/pm-decode-twins/inventory.json",
       "sha256": "b17f6b13e0c740f40fd9a3090fa3e84603d378afb622671eb487583a70f85f10",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin source (additional incumbent)",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "path": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
       "sha256": "ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin asm",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
       "sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin code object",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
       "sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin hxaco",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
       "sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin radiowave record",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.radiowave.json",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.radiowave.json",
       "sha256": "9d5924ff7e7699493c48d610c0d9ce23bbf496001f5591a9081195a8de02bacf",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin shape record",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.shape.json",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.shape.json",
       "sha256": "16dd862bd1ba296f48baaea43c97d90a003a326851237362cad45134e6f23847",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin proof record",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.proof.json",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.proof.json",
       "sha256": "1b71bd5d8f82ce3bd74e47bb8cd67d7f45be951b367c8dfaba8f36b6e6b23a98",
       "hashed_with": "sha256sum"
     },
     {
       "role": "accepted builder twin m7 record",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.m7.json",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.m7.json",
       "sha256": "8e036da174efbc71e40468ba2b292a7711300ef2402536611ff87fd32650ba41",
       "hashed_with": "sha256sum"
     },
     {
       "role": "SPIR-V source twin template (V0/Hpm/Vpm producer input; pilot-owned, uncommitted working tree)",
-      "path": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
       "sha256": "9d8b98b85de1b42d6836fa07949f40b071c1b2846c9dd69aaa7302c129ab90cb",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pilot four-arm oracle harness (pilot-owned, uncommitted working tree)",
-      "path": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
       "sha256": "0b5e98bd947d1f486841f6b81328ffcaf83590b7e925868cc5cb1fd232fd7ead",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pilot Vulkan reference receipt consumer (pilot-owned, uncommitted working tree)",
-      "path": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/tools/aco-export/src/reference.rs",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/tools/aco-export/src/reference.rs",
       "sha256": "c642bef439335978f8a1c7aa6c1943174be24f66e95de963cb1be6a0f6a10125",
       "hashed_with": "sha256sum"
     },
     {
       "role": "Mesa pin record",
-      "path": "/home/kaden/qcal/peacemaker/aco-shim/pin.json",
+      "path": "<peacemaker-workdir>/aco-shim/pin.json",
       "sha256": "c6c6942f845f75a306d8370d4864339113f2c41283d9ef70bcb1405f46fdeab7",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/compiler/aco_opcodes.py",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_opcodes.py",
       "sha256": "d0ac25b0b52185c807b32acb751a4d96be9d5792e1ec4773835b64b191010e7e",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/compiler/aco_assembler.cpp",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_assembler.cpp",
       "sha256": "a2a35b4716206714ba0518e23985d7d51bad8d884c4106c969f0b23d7122d784",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/compiler/aco_insert_waitcnt.cpp",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_insert_waitcnt.cpp",
       "sha256": "e84a9fb537fc05983b0bc5ce4282c2dc2b6fa0e2494ab9e6cd841abdc021ef87",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/compiler/aco_interface.cpp",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_interface.cpp",
       "sha256": "a19f1d12a9824cd39ba5a297c60fe3191dd3aa848b7117d566ddd5346d2dd428",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_pipeline_compute.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_compute.c",
       "sha256": "5fd82d7674abc36bc740e5049a95d6aaaf4e2ade41fd5ea12b2cc9d691662052",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_shader.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_shader.c",
       "sha256": "db5b23f445c9229535537b3fedfbdd3550c9d0720058ff53de7be03e0f856706",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_pipeline_binary.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_binary.c",
       "sha256": "81c652fe0613b0e567a86f9113ef8bec99891da899842c5d43447f5d76271599",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_pipeline_cache.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_cache.c",
       "sha256": "9dff38382af8be6f4f9c393c82b2d7282d0f53674a1cb4848a4641d007cb1b1f",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_shader_args.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_shader_args.c",
       "sha256": "e9165b77f105f19192dba05fa478c069de01556d4bb658a89c02b0ed196e39a7",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_device_memory.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_device_memory.c",
       "sha256": "e3d12ae5bbf93073e4cfc732a153d591b9e64c1c34c6c6f7df4eae1c2cb0e053",
       "hashed_with": "sha256sum"
     },
     {
       "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
-      "path": "/home/kaden/qcal/peacemaker/mesa/src/amd/vulkan/radv_physical_device.c",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_physical_device.c",
       "sha256": "9a4fbe36d5426aabb967410a06cb05a1f7387465a8917c72c09cb8def097d26d",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: whole-state snapshot/twin/restore + negative-control methodology",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/rdna-compute/src/railgun_check.rs",
+      "path": "crates/rdna-compute/src/railgun_check.rs",
       "sha256": "93f44ce2d6790d9520cc06c16f49371cd41805569d263d9ee9e27a3a5dbd2af3",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: PeacemakerRecord/OracleReceipt vocabulary",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/radiowave/src/lib.rs",
+      "path": "crates/radiowave/src/lib.rs",
       "sha256": "302b8fbfe1390da0af10b0aec74600609aa2bf76e0466e0c15f62e477d552d1f",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: ReplayQuiescence",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/rdna-compute/src/replay.rs",
+      "path": "crates/rdna-compute/src/replay.rs",
       "sha256": "2711fd12c1c5daa4478345bb443518bb03344056084f131d3b83ecdbac7dab4b",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: launch_maybe_blob_bound capture boundary",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/rdna-compute/src/dispatch.rs",
+      "path": "crates/rdna-compute/src/dispatch.rs",
       "sha256": "bc27840992fb02b05e4b3550797dce797ead42cbb45af428077f77085c013e48",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: load_kernel_module/load_embedded_module funnel",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/rdna-compute/src/scratch.rs",
+      "path": "crates/rdna-compute/src/scratch.rs",
       "sha256": "2830287ff2144e4f90bc74f2aaa0683089c57e99fa6bf2aff5ad7691b53ce769",
       "hashed_with": "sha256sum"
     },
     {
       "role": "H source: m7 static check",
-      "path": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/hipfire-isa/src/pm_check.rs",
+      "path": "crates/peacemaker-isa/src/pm_check.rs",
       "sha256": "33b12c3d37a7b2d4715f7a177273259e5ce1609c49cf31d55eec6fd90e2a04e2",
       "hashed_with": "sha256sum"
     }
   ],
   "citations": {
     "pilot_oracle": {
-      "file": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
+      "file": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
       "lines": {
         "purpose_modes": "4-47",
         "consts_abi": "62-76",
@@ -1308,7 +1309,7 @@
       }
     },
     "hip_kernel": {
-      "file": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/kernels/src/gemv_mq4g256v2_residual.hip",
+      "file": "kernels/src/gemv_mq4g256v2_residual.hip",
       "lines": {
         "launch_bounds": "35-42",
         "signature": "43-48",
@@ -1323,7 +1324,7 @@
       }
     },
     "spirv_source": {
-      "file": "/home/kaden/qcal/release-0.4.2/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
+      "file": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
       "lines": {
         "float_controls": "33-34",
         "local_size": "36",
@@ -1334,14 +1335,14 @@
       }
     },
     "builder_twin": {
-      "file": "/home/kaden/ClaudeCode/warpfront/hipfire-beta/crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "file": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
       "lines": {
         "recipe_header": "1-10",
         "build_gfx1201": "20-50"
       }
     },
     "inventory": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/inventory.json",
+      "file": "<release-workdir>/pm-decode-twins/inventory.json",
       "lines": {
         "module_entry": "43136",
         "source_sha256": "43159",
@@ -1358,7 +1359,7 @@
       "pm_check.rs": "35 (m7)"
     },
     "mesa_pinned": {
-      "root": "/home/kaden/qcal/peacemaker/mesa/",
+      "root": "<peacemaker-workdir>/mesa/",
       "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
       "lines": {
         "src/amd/compiler/aco_interface.cpp": "102-174 pipeline (spill/schedule/RA/post-RA/waitcnt/delay_alu/clauses), 247-270 select+assemble+callback",
@@ -1386,84 +1387,84 @@
   "exported_artifacts": {
     "status": "exported; NO lift, NO equality, NO replay proof, NO Vulkan reference receipt (`aco-vulkan-ref-v1`), NO candidate manifest (`aco-pm-candidate-v1`) observed",
     "observed_at": "2026-10-11 (files mtime Oct 11 07:27)",
-    "owner": "AcoPilot (pilot-owned; U0 records observations only, no edit)",
-    "directory": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/",
+    "owner": "ACO pilot owner (pilot-owned; U0 records observations only, no edit)",
+    "directory": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/",
     "files": [
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/artifact.json",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/artifact.json",
         "bytes": 13425,
         "sha256": "79214366483647be3b79700cdf9e02ac9e92c9e8a86ae835311eafdc65168cbd",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
         "bytes": 18220,
         "sha256": "a551573300dc9db3771ebe9417d8503fbd1e720942c4835ee7cd0cc2a618e0fc",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
         "bytes": 5476,
         "sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
         "bytes": 7516,
         "sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
         "bytes": 1548,
         "sha256": "b785dae525c27dadb5b3bd7cd664a9c77eb00525d20ce8b9a0d2aeb69a163413",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.aco.dump",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.aco.dump",
         "bytes": 38085,
         "sha256": "1315fbca1e7d2ad5b174ee120c88a6f2ae45b6eaa61c7d946eb8a69439c575b2",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture.json",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture.json",
         "bytes": 6492,
         "sha256": "975ce74211e0f632e07d39a1699c78fc0eb941a503feb014fd0c4ee4242938ef",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/identity.json",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/identity.json",
         "bytes": 446,
         "sha256": "8bfcdba291d95458de7cf49df6bce40b5185469da92b9b7faf7d38a2a14a5ef1",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/aco.disasm.txt",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/aco.disasm.txt",
         "bytes": 67214,
         "sha256": "b841a8492aabf9c7495dc7dd1f7bd2a905c1aac93d60e501daa0379080b657a4",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/final.nir.txt",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/final.nir.txt",
         "bytes": 54146,
         "sha256": "bab2ff5d8532e498a0ac00d53f0d127a4cf1ac4d8042eaf14957545d808bb344",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
         "bytes": 477,
         "sha256": "ee131477bcb39587e5f1e1297d7ebdbae2ea3e5fc2fea5f08a5418caaedec83e",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       },
       {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host.stderr.txt",
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host.stderr.txt",
         "bytes": 746,
         "sha256": "4a7a9935ff78436aba3ae10a027d5c782c893967c3cee4465b8999c6f742ef7a",
         "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
       }
     ],
     "binary": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
       "bytes": 5476,
       "sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
       "executable": {
@@ -1484,7 +1485,7 @@
       "note": "This is the ACO callback binary (code only), not a RADV-serialized pipeline binary: no vkGetPipelineBinaryData blob, pipeline key or global key exists in the export, so Vpm identity fields (blob_sha256, compat/global key) remain unfulfilled."
     },
     "rawspec": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
       "schema": "pm-raw-kernel-spec-v1",
       "sha256": "b785dae525c27dadb5b3bd7cd664a9c77eb00525d20ce8b9a0d2aeb69a163413",
       "binary_sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
@@ -1505,7 +1506,7 @@
       }
     },
     "abi_sidecar": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
       "schema": "pm-aco-abi-v1",
       "sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd",
       "push_block": {
@@ -1533,7 +1534,7 @@
       "note_unhandled_by_design": "ttmp8 and other ttmp reads are not declared; the lift is stated to reject an undefined read"
     },
     "spirv": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
       "bytes": 18220,
       "sha256": "a551573300dc9db3771ebe9417d8503fbd1e720942c4835ee7cd0cc2a618e0fc",
       "source_glsl_sha256": "9d8b98b85de1b42d6836fa07949f40b071c1b2846c9dd69aaa7302c129ab90cb",
@@ -1551,7 +1552,7 @@
           "main",
           "gemv_mq4g256v2_residual.comp",
           "-o",
-          "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv"
+          "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv"
         ]
       },
       "validator": {
@@ -1610,16 +1611,16 @@
         "version": "0.1.0"
       },
       "driver_library": {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/mesa-build/src/amd/vulkan/libvulkan_radeon.so",
+        "path": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/libvulkan_radeon.so",
         "sha256": "65bd3163bf8b1351237d59e5fc451b7a69cb24efab4a8861075a46469ec18118",
         "sha256_reverified_with_sha256sum": true
       },
       "icd_json": {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json",
+        "path": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json",
         "sha256": "b6230d88bdf42e25332ac7fb4dacb17c54b93099040776a969800a67e49885b1"
       },
       "vk_aco_host": {
-        "path": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/bin/vk_aco_host",
+        "path": "<release-workdir>/pm-aco-pilot/bin/vk_aco_host",
         "sha256": "f82dde11c4568afec55467d8599879a372f2fec7a2bb5bfe8833781836288021",
         "source_sha256": "d02bb4593ad00d3efe88a8c36ba38390ab00eb4eece1f1bb7d7b6275acccf803"
       },
@@ -1661,8 +1662,8 @@
       "env": {
         "MESA_SHADER_CACHE_DISABLE": "true",
         "RADV_DEBUG": "nocache",
-        "RADV_ACO_EXPORT_DIR": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture-tmp",
-        "VK_DRIVER_FILES": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json"
+        "RADV_ACO_EXPORT_DIR": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture-tmp",
+        "VK_DRIVER_FILES": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json"
       },
       "disassembler": {
         "path": "/opt/rocm/core-10.1/lib/llvm/bin/llvm-mc",
@@ -1677,8 +1678,8 @@
     },
     "device": {
       "name": "AMD Radeon AI PRO R9700 (RADV GFX1201)",
-      "pci_bdf": "0000:13:00.0",
-      "device_uuid": "00000000130000000000000000000000",
+      "pci_bdf": "<pci-bdf>",
+      "device_uuid": "<device-uuid>",
       "driver_uuid": "414d442d4d4553412d44525600000000",
       "driver_info": "Mesa 26.0.8 (git-60e95b7878)",
       "api_version": "1.4.335",
@@ -1690,7 +1691,7 @@
       "note": "Compile capture only; a compile on this device is not an execution receipt."
     },
     "stats": {
-      "source": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
+      "source": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
       "driver_pipeline_hash": 754289669937981336,
       "instructions": 985,
       "valu": 614,
@@ -1701,7 +1702,7 @@
       "note": "driver statistics as printed; not a performance claim"
     },
     "pilot_prepare_cross_check": {
-      "file": "/home/kaden/qcal/release-0.4.2/pm-aco-pilot/prepare/prepare.json",
+      "file": "<release-workdir>/pm-aco-pilot/prepare/prepare.json",
       "sha256": "86f1787d52c5e6a93782e51dc9e8f1b0287e96c08eb964a9bc369ac09c20fbc4",
       "observation": "pilot `oracle prepare` framed pre-image digests equal U0's framed digests for C1 (fixture_m5120_k6144) and C3 (odd_tail_m5119_k5888, captured_grid and minimal_grid share the same buffers); C2/C4 (occ127) not prepared by the pilot at observation time",
       "compared": {

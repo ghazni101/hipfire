@@ -322,6 +322,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 
 
 def quant_for(file: str) -> str | None:
+    # Local-only Flash-Next ZAB carrier keeps the stock MQ4 quant family.
+    if file == "qwen3.8-flash-next.mq4-xts-zab":
+        return "mq4"
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
     if m and m.group(1) in KNOWN_QUANTS:

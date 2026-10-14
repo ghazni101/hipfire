@@ -1,7 +1,7 @@
 ; PM-native gfx1151 gate/up SiLU epilogue for the coop27 gate_up arm. Assembled by native/build.sh as
 ; ief_silu.head.s + silu_dag_gfx1151.inc + ief_silu.tail.s (no vendor assembler).
 ; silu_dag_gfx1151.inc is the verbatim body of one SiLU group of the incumbent `gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151`
-; epilogue (`hipfire-isa emit --kernel iu4_v2b --epi all --arch gfx1151`, wt-land-041m 798d63b3a, `iu4_v2b::silu_group` ->
+; epilogue (`peacemaker-isa emit --kernel iu4_v2b --epi all --arch gfx1151`, wt-land-041m 798d63b3a, `iu4_v2b::silu_group` ->
 ; `Epilogue::silu_dense`): h[k] = g[k] / (1 + expf(-g[k])) * u[k], gate in v32..v39, up in v64..v71, scratch v160..v207,
 ; s48..s95, vcc; same float mode bits as that entry (denorm 3, ieee 1, round 0).
 ;

@@ -18,6 +18,7 @@
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, MeshEpoch};
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
+use crate::tp_shard::ExpertAssign;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
@@ -1368,6 +1369,91 @@ fn validate_external_range(
     Ok(())
 }
 
+/// One rank of an expert-parallel fulfillment. Entries declared
+/// [`ShardPolicy::ExpertSharded`] with `Stride` assignment are uploaded
+/// compactly: rank `r` of `ranks` keeps experts `e % ranks == r` in ascending
+/// `e` (local index `e / ranks`), so the uploaded tensor is
+/// `[n_experts / ranks, ..]` and byte-identical per expert to the source.
+/// Every other entry is fulfilled exactly as on a single device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EpFulfill {
+    pub rank: usize,
+    pub ranks: usize,
+}
+
+/// The owned experts' bytes of a stacked expert tensor under `Stride`
+/// assignment: expert `e`'s extent `[e*B, (e+1)*B)` for every
+/// `e % ranks == rank`, concatenated in ascending `e`.
+pub fn compact_owned_experts(
+    bytes: &[u8],
+    n_experts: usize,
+    rank: usize,
+    ranks: usize,
+    assign: ExpertAssign,
+) -> Result<Vec<u8>, String> {
+    if assign != ExpertAssign::Stride {
+        return Err(format!("compact expert upload supports Stride assignment, got {assign:?}"));
+    }
+    if ranks == 0 || rank >= ranks {
+        return Err(format!("expert rank {rank} is outside {ranks} ranks"));
+    }
+    if n_experts == 0 || n_experts % ranks != 0 {
+        return Err(format!("{n_experts} experts do not divide across {ranks} ranks"));
+    }
+    if bytes.is_empty() || bytes.len() % n_experts != 0 {
+        return Err(format!(
+            "{} payload bytes do not split into {n_experts} equal experts",
+            bytes.len()
+        ));
+    }
+    let per_expert = bytes.len() / n_experts;
+    let mut compact = Vec::with_capacity(bytes.len() / ranks);
+    for expert in (rank..n_experts).step_by(ranks) {
+        compact.extend_from_slice(&bytes[expert * per_expert..(expert + 1) * per_expert]);
+    }
+    Ok(compact)
+}
+
+/// Validate one expert-stack payload against its manifest entry and upload
+/// the rank's owned experts compactly (device-pooled or pinned host-mapped per
+/// the entry's residency). Returns the tensor, shaped `[n_experts / ranks, ..]`,
+/// and the source dtype.
+fn upload_expert_compact(
+    gpu: &mut Gpu,
+    entry: &WeightEntry,
+    ep: EpFulfill,
+    n_experts: usize,
+    assign: ExpertAssign,
+    payload: SourcePayload<'_>,
+) -> Result<(GpuTensor, DType), String> {
+    let (info, bytes): (&crate::model_source::TensorInfo, &[u8]) = match &payload {
+        SourcePayload::Borrowed { info, bytes } => (info, bytes),
+        SourcePayload::Owned { info, bytes } => (info, bytes.as_slice()),
+        SourcePayload::Range(_) => {
+            return Err(
+                "expert-parallel expert stacks need a borrowed or owned payload, not a source range"
+                    .to_string(),
+            );
+        }
+    };
+    let dtype = source_dtype(&info.dtype)?;
+    validate_payload_shape(entry, &info.shape)?;
+    if !entry.dtype_constraint.accepts(dtype) {
+        return Err(format!(
+            "source dtype {dtype:?} violates constraint {:?}",
+            entry.dtype_constraint
+        ));
+    }
+    validate_payload_extent(&info.shape, dtype, bytes.len())?;
+    let compact = compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign)?;
+    let mut shape = entry.logical_shape.clone();
+    shape[0] = n_experts / ep.ranks;
+    let mut tensor = upload_resident_bytes(gpu, entry.residency, &compact, &shape)
+        .map_err(|error| format!("pooled upload failed: {error}"))?;
+    tensor.dtype = dtype;
+    Ok((tensor, dtype))
+}
+
 /// Fulfill a Single manifest from the canonical source payload seam.
 ///
 /// Small tensors may be borrowed from a source mmap or owned by the callback.
@@ -1380,6 +1466,27 @@ pub fn fulfill_manifest_from_payloads<'a, F>(
     n_layers: usize,
     gpu: &mut Gpu,
     expected: WeightOrigin,
+    source: F,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
+    fulfill_manifest_from_payloads_ep(weights, mesh, n_layers, gpu, expected, None, source)
+}
+
+/// [`fulfill_manifest_from_payloads`] for one rank of an expert-parallel
+/// mesh: with `ep` set, every [`ShardPolicy::ExpertSharded`] entry uploads its
+/// owned experts compactly (see [`EpFulfill`]) and records an
+/// `ExpertCompact` projection carrying `rank`/`ranks`. `ep == None` is the
+/// single-device path, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn fulfill_manifest_from_payloads_ep<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    ep: Option<EpFulfill>,
     source: F,
 ) -> Result<WeightLoadTransaction, FulfillError>
 where
@@ -1488,6 +1595,45 @@ where
             continue;
         }
 
+        if let (Some(ep), ShardPolicy::ExpertSharded { n_experts, assign }) = (ep, &entry.policy) {
+            let payload = match source(entry) {
+                Ok(payload) => payload,
+                Err(reason) => {
+                    return Err(rollback_fulfill_error(
+                        store,
+                        gpu,
+                        fulfill_entry_error(entry, format!("source read failed: {reason}")),
+                    ));
+                }
+            };
+            let (tensor, dtype) =
+                match upload_expert_compact(gpu, entry, ep, *n_experts, *assign, payload) {
+                    Ok(uploaded) => uploaded,
+                    Err(reason) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                };
+            let projection = projection_for(entry, ep.rank, ep.ranks, dtype);
+            if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(entry, reason.to_string()),
+                ));
+            }
+            if test_support::record_resident_upload() {
+                return Err(rollback_fulfill_error(
+                    store,
+                    gpu,
+                    fulfill_entry_error(entry, "test fault injected after resident upload"),
+                ));
+            }
+            continue;
+        }
         let payload = match source(entry) {
             Ok(payload) => payload,
             Err(reason) => {
@@ -1809,6 +1955,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expert `e` of a stack is `per_expert` bytes `(e * 7 + i) as u8`, so a
+    /// misplaced or swapped extent changes the bytes.
+    fn expert_stack(n_experts: usize, per_expert: usize) -> Vec<u8> {
+        (0..n_experts)
+            .flat_map(|e| (0..per_expert).map(move |i| (e * 7 + i) as u8))
+            .collect()
+    }
+
+    #[test]
+    fn compact_owned_experts_concatenates_owned_extents_ascending() {
+        let (n, b) = (16, 5);
+        let stack = expert_stack(n, b);
+        for ranks in [2usize, 4] {
+            let mut owned_total = 0;
+            for rank in 0..ranks {
+                let compact =
+                    compact_owned_experts(&stack, n, rank, ranks, ExpertAssign::Stride).unwrap();
+                let expected: Vec<u8> = (0..n)
+                    .filter(|e| e % ranks == rank)
+                    .flat_map(|e| stack[e * b..(e + 1) * b].iter().copied())
+                    .collect();
+                assert_eq!(compact, expected, "ranks={ranks} rank={rank}");
+                assert_eq!(compact.len(), n / ranks * b);
+                // Local index e / ranks holds expert e.
+                for e in (rank..n).step_by(ranks) {
+                    let local = e / ranks;
+                    assert_eq!(&compact[local * b..(local + 1) * b], &stack[e * b..(e + 1) * b]);
+                }
+                owned_total += compact.len();
+            }
+            assert_eq!(owned_total, stack.len(), "ranks partition the stack");
+        }
+    }
+
+    #[test]
+    fn compact_owned_experts_refuses_bad_geometry() {
+        let stack = expert_stack(8, 4);
+        let stride = ExpertAssign::Stride;
+        assert!(compact_owned_experts(&stack, 8, 2, 2, stride).is_err());
+        assert!(compact_owned_experts(&stack, 8, 0, 3, stride).is_err());
+        assert!(compact_owned_experts(&stack, 8, 0, 0, stride).is_err());
+        assert!(compact_owned_experts(&stack[..31], 8, 0, 2, stride).is_err());
+        assert!(compact_owned_experts(&[], 8, 0, 2, stride).is_err());
+        assert!(compact_owned_experts(&stack, 8, 0, 2, ExpertAssign::Contiguous).is_err());
+    }
     use crate::device_mesh::DimKind;
     use crate::weight_manifest::{DTypeConstraint, PinTarget, ShardPolicy};
 

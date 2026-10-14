@@ -23,10 +23,10 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
-    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
-    PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
+    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
+    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
+    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,
@@ -730,20 +730,54 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     // The repacker completely overwrites all three planes on each launch.
     // ADD is a read-modify-write of Y0, represented conservatively as Write.
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
-        return Some(vec![read(0), read(8), read(16), read(24),
-            write(32), write(40), write(48)]);
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]);
     }
     match kernel {
         "gemm_mq4g256v2_fp8_set_row_b1"
         | "gemm_mq4g256v2_fp8_add_row_b1"
-        | "gemm_mq4g256v2_fp8_silu_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)]),
-        "gemm_mq4g256v2_fp8_qkv_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32),
-                write(40), write(48), write(56)]),
-        "gemm_mq4g256v2_fp8_qkvza_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32),
-                write(40), write(48), write(56), write(64)]),
+        | "gemm_mq4g256v2_fp8_silu_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+            ])
+        }
+        "gemm_mq4g256v2_fp8_qkv_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+                write(48),
+                write(56),
+            ])
+        }
+        "gemm_mq4g256v2_fp8_qkvza_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+                write(48),
+                write(56),
+                write(64),
+            ])
+        }
         _ => {}
     }
     if matches!(
@@ -760,6 +794,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -921,6 +956,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         // expert_weight_ptrs, dtype_tags, tile_ids, sorted_slot_index, X_src (read); Y_grouped (write)
@@ -983,6 +1019,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
         return Some(vec![read(0), read(8), write(16)]);
+    }
+    // Exact-gfx1100 small-N gate/up LDS-stage GEMM. Five pointers followed by
+    // gate_m, up_m, K, N: weights and X are read, split outputs are overwritten.
+    if kernel == "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage" {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    // Typed F32 copy used when hidden-state staging is recorded for retained
+    // replay: dst, src, n.
+    if kernel == "copy_f32_buffer" {
+        return Some(vec![write(0), read(8)]);
     }
     // F16 dense batched GEMM (Maple router + DeepSeek compressor shapes). 3 pointers
     // + 3 i32 (M,K,B) = 36 explicit bytes. A@0 and X@8 are reads; Y@16 is a pure
@@ -1067,11 +1113,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     match kernel {
         "add_inplace_f32" => Some(vec![write(0), read(8)]),
         "fused_rmsnorm_mq_rotate"
+        | "fused_rmsnorm_mq_rotate_f16"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_lds" => {
             Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
+        "fused_rmsnorm_mq_rotate_awq_f16" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
         "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1079,6 +1134,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(24),
             write(32),
             write(40),
+        ]),
+        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous scratch.
+        "fused_rmsnorm_mq_rotate_awq_wavegrid" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
         ]),
         "rmsnorm_reduce_gfx1100" => Some(vec![read(0), write(8)]),
         "compressor_add_ape_f32_buf" => Some(vec![write(0), read(8), read(16)]),
@@ -1268,6 +1333,22 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        // FA prep with folded Q8_0 KV epilogue:
+        // [0]=q_interleaved(r) [8]=q(w) [16]=gate(w) [24]=k(w) [32]=v_src(r)
+        // [40]=k_cache(w) [48]=v_cache(w) [56]=q_weight(r) [64]=k_weight(r)
+        // [72]=pos_buf(r)
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            write(40),
+            write(48),
+            read(56),
+            read(64),
+            read(72),
+        ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -1366,16 +1447,28 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        // gfx1100 split-KV verifier: preconvert writes persistent Q16 scratch;
+        // the partial pass scans Q16/K/V/positions into split records; merge
+        // reads those records and writes the final attention output.
+        "attention_fa2_q_preconvert_gfx1100" => Some(vec![read(0), write(8), read(16), read(24)]),
+        "attention_q8_0_fa2_gqa_partial_gfx1100" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
+        "attention_q8_0_fa2_gqa_merge_gfx1100" => Some(vec![read(0), write(8)]),
         // The gfx1201 GQA fp8, gfx1100 GQA Q8_0 and gfx1151 GQA Q8_0 decode
         // tiles and the head-dim-split reduces keep their reference twins'
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
-        | "attention_flash_q8_0_tile_gqa_gfx1151" => {
+        | "attention_flash_q8_0_tile_gqa_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
@@ -1396,14 +1489,23 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "fused_rmsnorm_mq_rotate_f16" {
+        return Some(48);
+    }
+    if kernel == "fused_rmsnorm_mq_rotate_awq_f16" {
+        return Some(64);
+    }
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
         return Some(80);
     }
-    if matches!(kernel, "gemm_mq4g256v2_fp8_set_row_b1"
-        | "gemm_mq4g256v2_fp8_add_row_b1"
-        | "gemm_mq4g256v2_fp8_silu_row_b1"
-        | "gemm_mq4g256v2_fp8_qkv_row_b1"
-        | "gemm_mq4g256v2_fp8_qkvza_row_b1") {
+    if matches!(
+        kernel,
+        "gemm_mq4g256v2_fp8_set_row_b1"
+            | "gemm_mq4g256v2_fp8_add_row_b1"
+            | "gemm_mq4g256v2_fp8_silu_row_b1"
+            | "gemm_mq4g256v2_fp8_qkv_row_b1"
+            | "gemm_mq4g256v2_fp8_qkvza_row_b1"
+    ) {
         return Some(96);
     }
     if matches!(
@@ -1503,6 +1605,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(64);
     }
@@ -1632,6 +1735,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
             | "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         return Some(64);
@@ -1681,6 +1785,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
         return Some(48);
+    }
+    // Five pointers + four i32 = 56 explicit bytes, padded to the recorder's
+    // required 16-byte boundary.
+    if kernel == "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage" {
+        return Some(64);
+    }
+    // Two pointers + one i32 = 20 explicit bytes, padded to 32.
+    if kernel == "copy_f32_buffer" {
+        return Some(32);
     }
     // F16 dense batched GEMM: 3 ptr + M,K,B = 36 → 48 padded. gfx11 and gfx12
     // share one ABI — see `Gpu::gemm_f16_x_f16_wmma`, whose blob builder pushes
@@ -1742,8 +1855,12 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
+        "attention_fa2_q_preconvert_gfx1100" => Some(48),
+        "attention_q8_0_fa2_gqa_partial_gfx1100" => Some(64),
+        "attention_q8_0_fa2_gqa_merge_gfx1100" => Some(32),
         "attention_scores_band_mask_f32" => Some(24),
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151"
         | "fused_rmsnorm_mq_rotate"
@@ -1794,16 +1911,22 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
+        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
+        // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(96),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "attention_flash_q8_0_tile_gqa_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -1981,15 +2104,22 @@ fn encode_bound_kernarg(
     let mut encoded = snapshot.to_vec();
     for slot in &layout.slots {
         let binding = bindings.resource(slot.resource).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} has no bound resource", slot.offset)
+            format!(
+                "{kernel}: pointer slot at offset {} has no bound resource",
+                slot.offset
+            )
         })?;
         let base = binding.base().as_ptr() as usize as u64;
         let address = base.checked_add(slot.interior_offset).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} base overflows", slot.offset)
+            format!(
+                "{kernel}: pointer slot at offset {} base overflows",
+                slot.offset
+            )
         })?;
-        let end = slot.offset.checked_add(8).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} overflows", slot.offset)
-        })?;
+        let end = slot
+            .offset
+            .checked_add(8)
+            .ok_or_else(|| format!("{kernel}: pointer slot at offset {} overflows", slot.offset))?;
         if end > encoded.len() {
             return Err(format!(
                 "{kernel}: pointer slot at offset {} out of bounds (len {})",
@@ -2007,11 +2137,7 @@ fn encode_bound_kernarg(
 /// except the moved pointer slots — checked by the refresh path with its own
 /// slot mask). `debug_assert` covers debug builds; `HIPFIRE_REPLAY_BINDINGS_VERIFY=1`
 /// promotes the check to a hard error in release for the harness.
-fn verify_bound_kernarg(
-    kernel: &str,
-    snapshot: &[u8],
-    encoded: &[u8],
-) -> Result<(), String> {
+fn verify_bound_kernarg(kernel: &str, snapshot: &[u8], encoded: &[u8]) -> Result<(), String> {
     let mismatch = bound_kernarg_mismatch_message(kernel, snapshot, encoded);
     debug_assert!(
         mismatch.is_none(),
@@ -2029,11 +2155,7 @@ fn verify_bound_kernarg(
 /// Pure mismatch description for the snapshot gate: `None` when the
 /// re-encoded segment equals the snapshot, else the fail-closed message with
 /// the launch name and the first differing offset.
-fn bound_kernarg_mismatch_message(
-    kernel: &str,
-    snapshot: &[u8],
-    encoded: &[u8],
-) -> Option<String> {
+fn bound_kernarg_mismatch_message(kernel: &str, snapshot: &[u8], encoded: &[u8]) -> Option<String> {
     if snapshot == encoded {
         return None;
     }
@@ -4992,7 +5114,10 @@ impl PreparedPm4Replay {
         if let Ok(timing) = &result {
             crate::gap_timing::add_ns(
                 crate::gap_timing::Slot::GpuSpan,
-                timing.last_end.saturating_sub(timing.first_start).saturating_mul(1_000_000_000)
+                timing
+                    .last_end
+                    .saturating_sub(timing.first_start)
+                    .saturating_mul(1_000_000_000)
                     / timing.frequency_hz.max(1),
             );
         }
@@ -5090,6 +5215,10 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    /// The model owns host-mapped weights the CPU multiplies; a CPU step is a host
+    /// sync point, so a retained tape can neither record nor replay it. Set by the
+    /// loader from the resolved placement; cleared on unload.
+    host_cpu_weights: bool,
     replay_observation: ReplayObservation,
     radiowave_effect_launches: usize,
     fallback_effect_launches: usize,
@@ -5206,6 +5335,7 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            host_cpu_weights: false,
             replay_observation: ReplayObservation::default(),
             unknown_effect_launches: 0,
             radiowave_effect_launches: 0,
@@ -6289,7 +6419,9 @@ impl ReplayController {
                         shadow_decisions.push(railgun::shadow::RedlineDecision {
                             effects: redline_effect_source(current_launch),
                             resource_independent: resources_independent,
-                            name_acquire: self.pm4_mid_acquire_policy.acquire_between(previous, current),
+                            name_acquire: self
+                                .pm4_mid_acquire_policy
+                                .acquire_between(previous, current),
                             pre_dispatch_name: gfx12_pre_dispatch_acquire,
                         });
                     }
@@ -6447,7 +6579,9 @@ impl ReplayController {
                         match executable {
                             None => {}
                             Some(Ok(railgun_commands)) => commands = railgun_commands,
-                            Some(Err(reason)) => return Err(format!("railgun backend refused: {reason}")),
+                            Some(Err(reason)) => {
+                                return Err(format!("railgun backend refused: {reason}"))
+                            }
                         }
                     }
                 }
@@ -6486,8 +6620,15 @@ impl ReplayController {
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
-            if self.railgun_shadow.as_ref().is_some_and(railgun_shadow::RailgunShadow::backend_railgun) {
-                return Err("railgun backend refused: multi-queue PM4 tapes are not lowered by railgun".to_owned());
+            if self
+                .railgun_shadow
+                .as_ref()
+                .is_some_and(railgun_shadow::RailgunShadow::backend_railgun)
+            {
+                return Err(
+                    "railgun backend refused: multi-queue PM4 tapes are not lowered by railgun"
+                        .to_owned(),
+                );
             }
             let min_parallel_width = pm4_min_parallel_width_from_config();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
@@ -6860,9 +7001,16 @@ impl ReplayController {
     pub(crate) fn prepared_pm4_submitted_kernargs(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let prepared = self.prepared_pm4.as_mut().ok_or("no prepared PM4 replay")?;
         if !prepared.dynamic_grids.is_empty() {
-            return Err(format!("{} dynamic grid patches", prepared.dynamic_grids.len()));
+            return Err(format!(
+                "{} dynamic grid patches",
+                prepared.dynamic_grids.len()
+            ));
         }
-        Ok(prepared.kernargs.iter_mut().map(|k| k.as_mut_bytes().to_vec()).collect())
+        Ok(prepared
+            .kernargs
+            .iter_mut()
+            .map(|k| k.as_mut_bytes().to_vec())
+            .collect())
     }
 
     /// Generation of the prepared PM4 program (see `pm4_generation`).
@@ -6872,7 +7020,9 @@ impl ReplayController {
 
     /// The prepared railgun program's surfaces (`None` without the shadow).
     pub(crate) fn railgun_program_surfaces(&self) -> Option<railgun_shadow::ProgramSurfaces> {
-        self.railgun_shadow.as_ref().and_then(|s| s.surfaces().cloned())
+        self.railgun_shadow
+            .as_ref()
+            .and_then(|s| s.surfaces().cloned())
     }
 
     pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
@@ -6948,10 +7098,19 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Record whether the loaded model owns CPU-executed (host) weights. Set once
+    /// per load from the resolved placement; cleared on unload.
+    pub fn set_host_cpu_weights(&mut self, on: bool) {
+        self.host_cpu_weights = on;
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.
     pub fn begin_capture(&mut self) -> Result<(), &'static str> {
+        if self.host_cpu_weights {
+            return Err("the model owns CPU-executed (host) weights");
+        }
         match self.state {
             ReplayState::Hip => return Err("replay backend is disabled"),
             ReplayState::Fallback => return Err("replay controller is in sticky fallback"),
@@ -7268,7 +7427,8 @@ impl ReplayController {
         // tape-global `ResourceId` now, while the allocations are live. Any
         // unresolvable slot (or unknown kernel) leaves the launch untyped on
         // the raw snapshot path — never a partial slot set.
-        let binding_layout = self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
+        let binding_layout =
+            self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
         let before = self.recorded.len();
         self.record_hip_launch_with_accesses(
             kernel,
@@ -7519,7 +7679,9 @@ impl ReplayController {
             .as_mut()
             .expect("prepared PM4 route checked above");
         if prepared.bound_explicit_lens.len() != prepared.kernargs.len() {
-            return Err("retained PM4 binding cache disagrees with prepared kernarg count".to_owned());
+            return Err(
+                "retained PM4 binding cache disagrees with prepared kernarg count".to_owned(),
+            );
         }
         for (index, kernarg) in prepared.kernargs.iter_mut().enumerate() {
             let explicit_len = prepared.bound_explicit_lens[index];
@@ -7529,8 +7691,12 @@ impl ReplayController {
             let Some(layout) = launch.binding_layout.as_ref() else {
                 continue;
             };
-            let encoded =
-                encode_bound_kernarg(&launch.kernarg, layout, &self.replay_bindings, &launch.kernel)?;
+            let encoded = encode_bound_kernarg(
+                &launch.kernarg,
+                layout,
+                &self.replay_bindings,
+                &launch.kernel,
+            )?;
             let bytes = kernarg.as_mut_bytes();
             if explicit_len > encoded.len() || explicit_len > bytes.len() {
                 return Err(format!(
@@ -8121,8 +8287,12 @@ mod tests {
         snapshot[16..24].copy_from_slice(&base_b.to_ne_bytes());
         snapshot[24..28].copy_from_slice(&0x0000_0007u32.to_ne_bytes());
         let mut issuer = Recorder::new();
-        let resource_a = issuer.resource("fixture-a", 0x1_0000).expect("valid resource");
-        let resource_b = issuer.resource("fixture-b", 0x2_0000).expect("valid resource");
+        let resource_a = issuer
+            .resource("fixture-a", 0x1_0000)
+            .expect("valid resource");
+        let resource_b = issuer
+            .resource("fixture-b", 0x2_0000)
+            .expect("valid resource");
         let mut bindings = ReplayBindings::new();
         // SAFETY: synthetic non-deref'd addresses used only as binding identity
         // in unit tests; sizes match the fixture resources; never launched.
@@ -8225,6 +8395,7 @@ mod tests {
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
         "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
         "fused_rmsnorm_mq_rotate_wavegrid",
+        "fused_rmsnorm_mq_rotate_awq_wavegrid",
         "rmsnorm_reduce_gfx1100",
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
@@ -8241,6 +8412,7 @@ mod tests {
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_k5120_gfx1100",
+        "fused_gate_up_mq4g256v2_k5120_gfx1201",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
@@ -8259,6 +8431,7 @@ mod tests {
         "qwen35_fa_prep_gfx1151",
         "qwen35_fa_prep_gfx1201",
         "qwen36_27b_fa_prep_gfx1201",
+        "qwen35_fa_prep_kvwrite_gfx1100",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -8998,6 +9171,198 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_campaign_fusions_keep_padded_replay_contract() {
+        use RecordedAccessMode::{Read, Write};
+        let prep = "qwen35_fa_prep_kvwrite_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..10 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_f32(0.0);
+        blob.push_f32(0.0);
+        assert_eq!(blob.len(), 88);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(prep), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(prep)
+            .expect("folded FA prep contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read), (8, Write), (16, Write), (24, Write), (32, Read),
+                (40, Write), (48, Write), (56, Read), (64, Read), (72, Read),
+            ]
+        );
+
+        let awq = "fused_rmsnorm_mq_rotate_awq_wavegrid";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(awq)
+            .expect("AWQ wavegrid contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
+        );
+    }
+
+    #[test]
+    fn gfx1100_fa2_split_verify_keeps_padded_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+
+        let preconvert = "attention_fa2_q_preconvert_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(preconvert), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(preconvert)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Write), (16, Read), (24, Read)]
+        );
+
+        let partial = "attention_q8_0_fa2_gqa_partial_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.push_f32(0.0);
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(partial), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(partial)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Write), (32, Read)]
+        );
+
+        let merge = "attention_q8_0_fa2_gqa_merge_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(std::ptr::null());
+        blob.push_ptr(std::ptr::null());
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(merge), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(merge)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Write)]
+        );
+    }
+
+    #[test]
+    fn gfx1100_f16_projection_producers_keep_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+
+        let base = "fused_rmsnorm_mq_rotate_f16";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(base), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(base)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Write)]
+        );
+
+        let awq = "fused_rmsnorm_mq_rotate_awq_f16";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(awq)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Write),
+            ]
+        );
+
+        let gate_up = "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 64);
+        assert_eq!(expected_kernarg_bytes(gate_up), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(gate_up)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Write), (32, Write)]
+        );
+
+        let copy = "copy_f32_buffer";
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(std::ptr::null());
+        blob.push_ptr(std::ptr::null());
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(copy), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(copy)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Write), (8, Read)]
+        );
+    }
+
+    #[test]
     fn gfx1201_qwen36_27b_decode_fusions_keep_padded_replay_contract() {
         use RecordedAccessMode::{Read, Write};
         // Gated norm/MQ rotation launcher: x, z, weight, [awq_scale], signs1,
@@ -9044,7 +9409,15 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec![(0, Read), (8, Write), (16, Write), (24, Write), (32, Read), (40, Read), (48, Read)]
+            vec![
+                (0, Read),
+                (8, Write),
+                (16, Write),
+                (24, Write),
+                (32, Read),
+                (40, Read),
+                (48, Read)
+            ]
         );
     }
 
@@ -9492,6 +9865,7 @@ mod tests {
         for symbol in [
             "gemm_mixed_moe_grouped_wmma_k2",
             "gemm_mixed_moe_grouped_wmma_gfx12",
+            "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
             "gemm_mixed_moe_grouped_wmma_4w_k2",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
@@ -9831,15 +10205,19 @@ mod tests {
 
     #[test]
     fn fused_gate_up_mq4v2_k5120_matches_generic_replay_contract() {
-        let candidate = "fused_gate_up_mq4g256v2_k5120_gfx1100";
-        let baseline = "fused_gate_up_mq4g256v2";
-        assert_eq!(expected_kernarg_bytes(candidate), Some(64));
-        let got = pointer_effects(candidate).unwrap();
-        let want = pointer_effects(baseline).unwrap();
-        assert_eq!(got.len(), want.len());
-        for (got, want) in got.iter().zip(want.iter()) {
-            assert_eq!(got.offset, want.offset);
-            assert_eq!(got.mode, want.mode);
+        for candidate in [
+            "fused_gate_up_mq4g256v2_k5120_gfx1100",
+            "fused_gate_up_mq4g256v2_k5120_gfx1201",
+        ] {
+            let baseline = "fused_gate_up_mq4g256v2";
+            assert_eq!(expected_kernarg_bytes(candidate), Some(64));
+            let got = pointer_effects(candidate).unwrap();
+            let want = pointer_effects(baseline).unwrap();
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want.iter()) {
+                assert_eq!(got.offset, want.offset);
+                assert_eq!(got.mode, want.mode);
+            }
         }
     }
 
@@ -10900,8 +11278,13 @@ mod tests {
         assert!(controller.recorded_launches().is_empty());
         let seen = controller.finish_g0_observation().unwrap();
         assert_eq!(
-            seen.iter().map(|l| (l.kernel.as_str(), l.grid, l.shared_mem, l.kernarg.clone())).collect::<Vec<_>>(),
-            vec![("a", [1, 2, 3], 0, vec![1, 2]), ("b", [4, 1, 1], 128, vec![3])]
+            seen.iter()
+                .map(|l| (l.kernel.as_str(), l.grid, l.shared_mem, l.kernarg.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a", [1, 2, 3], 0, vec![1, 2]),
+                ("b", [4, 1, 1], 128, vec![3])
+            ]
         );
         assert!(controller.finish_g0_observation().is_err());
 
@@ -11209,7 +11592,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let snapshot = earlier.snapshot_recorded_kernargs();
 
@@ -11227,7 +11610,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
 
         let synthesized = current
@@ -11267,7 +11650,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let launches = controller.recorded_launches().to_vec();
         let mut bindings: Vec<(usize, ReplayKernargBinding)> = vec![(
@@ -11336,7 +11719,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let launches = controller.recorded_launches().to_vec();
         let mut bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
@@ -11362,7 +11745,7 @@ mod tests {
                 None,
                 declared,
                 None,
-            None,
+                None,
             );
             replay_sequence_hash(controller.recorded_launches())
         };

@@ -20,6 +20,7 @@ use crate::mtp_spec::validate_native_mtp_prefill_request;
 use crate::state::Qwen4State;
 use hip_bridge::launch_counters;
 use hipfire_runtime::external_rows::RowCacheStats;
+use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use rdna_compute::tensor_ops::{
     indexed_attention_cache_append, indexed_attention_pool_rope, indexed_attention_reuse_selection,
@@ -371,6 +372,7 @@ fn append_target_single(
             }
         };
         let result = (|| {
+            qsa.invalidate_f16_arena();
             indexed_attention_cache_append(
                 gpu,
                 &IndexedAttentionCacheAppend {
@@ -504,6 +506,7 @@ fn select_target(
                         rows: 1,
                     }),
                     grid_bound: visible / config.indexer_compress_ratio,
+                    yarn: config.rope().yarn(raw_width.min(64)),
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -572,6 +575,7 @@ fn select_mtp(
                     rows: 1,
                 }),
                 grid_bound: visible / config.indexer_compress_ratio,
+                yarn: config.rope().yarn(raw_width.min(64)),
             },
         )
         .map_err(|e| e.to_string())?;
@@ -1084,9 +1088,15 @@ fn rollback_failure(
     }))
 }
 
+/// Position-zero cache hit refusal. A valid cache hit resumes a session
+/// snapshot at `0 < start_pos < prompt_len` with exactly the prompt suffix, so
+/// `start_pos == 0` with `cache_hit == true` is an invalid zero-length cached
+/// prefix (it is not an empty fill: the fill is the complete 3-token prompt).
 fn cache_suffix_refusal() -> Value {
+    // expect_err: a cache hit at position zero is invalid; valid suffix cache
+    // hits (0 < start_pos < prompt_len) are supported and are not exercised here.
     let refusal = validate_native_mtp_prefill_request(&[1, 2, 3], &[1, 2, 3], 0, true)
-        .expect_err("cache-hit suffix must be refused");
+        .expect_err("position-zero cache hit must be refused");
     json!({
         "case": "cache_suffix_refusal",
         "status": "pass",
@@ -1450,15 +1460,37 @@ impl ProfileReport {
     }
 }
 
-fn qwen4_range_payload(
-    source: &hipfire_runtime::hfq::HfqModelSource,
+/// Same policy as the product loader (`hipfire-loader` carriers.rs):
+/// UMA and external-residency entries stream bounded ranges; discrete
+/// non-external entries (including `HostMapped`, which the store rejects as a
+/// range) are borrowed from the resident source bytes.
+fn qwen4_use_range_payload(is_uma: bool, residency: WeightResidency) -> bool {
+    is_uma || residency.is_external()
+}
+
+fn qwen4_oracle_payload<'a>(
+    source: &'a hipfire_runtime::hfq::HfqModelSource,
     entry: &WeightEntry,
-) -> Result<hipfire_runtime::model_source::SourcePayload<'static>, String> {
-    source
-        .tensor_range(&entry.name)
-        .map_err(|error| error.to_string())?
-        .map(hipfire_runtime::model_source::SourcePayload::Range)
-        .ok_or_else(|| format!("missing tensor '{}'", entry.name))
+    use_ranges: bool,
+) -> Result<hipfire_runtime::model_source::SourcePayload<'a>, String> {
+    use hipfire_runtime::model_source::SourcePayload;
+    if qwen4_use_range_payload(use_ranges, entry.residency) {
+        return source
+            .tensor_range(&entry.name)
+            .map_err(|error| error.to_string())?
+            .map(SourcePayload::Range)
+            .ok_or_else(|| {
+                if entry.residency.is_external() {
+                    format!("missing external tensor '{}'", entry.name)
+                } else {
+                    format!("missing resident tensor '{}'", entry.name)
+                }
+            });
+    }
+    let (info, bytes) = source
+        .tensor_data(&entry.name)
+        .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+    Ok(SourcePayload::Borrowed { info, bytes })
 }
 
 /// Load the admitted production artifact, execute exactly one target token and
@@ -1503,6 +1535,11 @@ fn run_profile_inner(
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let gpu_init_ns = profile_duration_ns(gpu_init_started);
     emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1510,6 +1547,7 @@ fn run_profile_inner(
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
     let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
@@ -1541,7 +1579,7 @@ fn run_profile_inner(
             };
             emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
 
-            qwen4_range_payload(&source, entry)
+            qwen4_oracle_payload(&source, entry, use_ranges)
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
@@ -1568,7 +1606,7 @@ fn run_profile_inner(
     let attach_forward_started = Instant::now();
     let setup_result = (|| -> Result<(), String> {
         bundle
-            .attach_forward(&mut gpu, 1)
+            .attach_forward(&mut gpu, 1, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         Ok(())
     })();
@@ -1824,12 +1862,18 @@ pub fn run_state_parity(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
         &manifest.weights,
@@ -1837,7 +1881,7 @@ pub fn run_state_parity(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -1855,7 +1899,7 @@ pub fn run_state_parity(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {
         bundle
-            .attach_forward(&mut gpu, 2048)
+            .attach_forward(&mut gpu, 2048, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         bundle
             .attach_mtp(&mut gpu, 2048)
@@ -2079,7 +2123,36 @@ fn bundle_family_json(gpu: &Gpu, bundle: &crate::bundle::Qwen4Bundle) -> Result<
         .as_ref()
         .map(|mtp| mtp_families(gpu, &bundle.config, mtp.parity_state()))
         .transpose()?;
-    Ok(json!({"target": target, "mtp": mtp}))
+    // The draft head's request state (observed-token history the batched
+    // and per-row fills both feed).
+    let draft = bundle.mtp.as_ref().map(|mtp| {
+        let state = mtp.draft.request_state();
+        json!({"full_steps": state.full_steps, "margin_bits": state.margin.to_bits()})
+    });
+    Ok(json!({"target": target, "mtp": mtp, "draft_request_state": draft}))
+}
+
+/// The hardware oracles' routed-expert placement: every expert resident
+/// unless `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` asks for layers `0..N` in VRAM
+/// and the rest host-mapped (a discrete card that cannot hold them all, and
+/// the only way to reach the long-prefill staging route). `auto` is refused:
+/// an oracle's arms must share one fixed placement.
+fn oracle_expert_placement(gpu: &Gpu, weights: &[WeightEntry]) -> Result<Vec<WeightEntry>, String> {
+    let mut weights = weights.to_vec();
+    match crate::expert_residency::expert_vram_layers_from_env()? {
+        None => {}
+        Some(crate::expert_residency::ExpertVramLayers::Layers(layers)) => {
+            if gpu.is_uma() {
+                return Err("host-mapped experts are only for discrete GPUs".to_string());
+            }
+            let moved = crate::expert_residency::place_routed_experts(&mut weights, layers);
+            eprintln!("routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped");
+        }
+        Some(crate::expert_residency::ExpertVramLayers::Auto) => {
+            return Err("hardware oracles take a fixed expert layer count, not auto".to_string());
+        }
+    }
+    Ok(weights)
 }
 
 fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
@@ -2131,12 +2204,15 @@ fn read_state_tokens(path: &Path) -> Result<(Vec<u32>, Value), String> {
 }
 
 /// Native-MTP prompt fill digests for each prompt length: the MTP head and
-/// target state families after `mtp_prefill`, the pending hidden row, the
-/// seed, and one following draft window. Run once per
-/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` setting and compare the two outputs; the
-/// route is read once per process.
+/// target state families after `mtp_prefill`, the final prompt row's
+/// logits, the pending hidden row, the seed, and one following draft
+/// window. Run once per route setting (e.g.
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`) and compare the two outputs; routes are
+/// read once per process.
 ///
-/// `warm_chunks == 0` fills each length cold. Otherwise each length is the
+/// `warm_chunks == 0` fills each length cold: the first `length` tokens of
+/// `prompt_text` (tokenized without a template) when given, else a
+/// deterministic spread over the vocabulary. Otherwise each length is the
 /// suffix of a session-cache hit: a cold fill of a warm prompt of
 /// `P = warm_chunks * chunk_rows` tokens (plus one row) publishes the
 /// snapshot at `P`, then a prompt sharing those `P` tokens and followed by
@@ -2147,6 +2223,7 @@ pub fn run_mtp_fill_digest(
     lengths: &[usize],
     max_seq: usize,
     warm_chunks: usize,
+    prompt_text: Option<&str>,
 ) -> Result<Value, String> {
     use hipfire_runtime::arch_model::ArchModel;
     use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
@@ -2155,6 +2232,7 @@ pub fn run_mtp_fill_digest(
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("tokenizer: {error}"))?;
+    let prompt_ids = prompt_text.map(|text| tokenizer.encode(text));
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
@@ -2169,20 +2247,27 @@ pub fn run_mtp_fill_digest(
         "qwen4",
         gpu.device_id,
     );
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single()
         .map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -2201,7 +2286,7 @@ pub fn run_mtp_fill_digest(
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
         bundle
-            .attach_forward(&mut gpu, max_seq)
+            .attach_forward(&mut gpu, max_seq, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         bundle
             .attach_mtp(&mut gpu, max_seq)
@@ -2262,10 +2347,29 @@ pub fn run_mtp_fill_digest(
                     &|| false,
                 )?
             } else {
-                let prompt = tokens(length as u64, length);
+                let prompt = match prompt_ids.as_deref() {
+                    Some(ids) => ids
+                        .get(..length)
+                        .ok_or_else(|| {
+                            format!("prompt text has {} tokens, fewer than {length}", ids.len())
+                        })?
+                        .to_vec(),
+                    None => tokens(length as u64, length),
+                };
                 drafter.mtp_prefill(&mut gpu, &mut bundle, &prompt, &prompt, 0, false, &|| false)?
             };
             let after_fill = bundle_family_json(&gpu, &bundle)?;
+            // The prompt's last row: the final chunk's LM head writes it.
+            let mut final_logits = Family::new();
+            append_f32(
+                &gpu,
+                &mut final_logits,
+                bundle
+                    .spec_logits
+                    .as_ref()
+                    .ok_or("qwen4 spec logits are not attached")?,
+                bundle.config.vocab_size,
+            )?;
             let mut pending = Family::new();
             append_f32(
                 &gpu,
@@ -2281,6 +2385,7 @@ pub fn run_mtp_fill_digest(
             rows.push(json!({
                 "length": length,
                 "seed": seed,
+                "final_logits": final_logits.finish(),
                 "pending_hidden": pending.finish(),
                 "families_after_fill": after_fill,
                 "window_committed": window.committed,
@@ -2309,6 +2414,18 @@ pub fn run_mtp_fill_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oracle_payload_policy_matches_product_loader() {
+        assert!(!qwen4_use_range_payload(false, WeightResidency::Resident));
+        assert!(!qwen4_use_range_payload(false, WeightResidency::HostMapped));
+        assert!(qwen4_use_range_payload(true, WeightResidency::Resident));
+        assert!(qwen4_use_range_payload(true, WeightResidency::HostMapped));
+        assert!(qwen4_use_range_payload(
+            false,
+            WeightResidency::external_rows(128, 1)
+        ));
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {
@@ -2510,10 +2627,26 @@ mod tests {
             .find(|scenario| field(scenario, "case").as_str() == Some("cache_suffix_refusal"))
             .expect("cache suffix refusal scenario");
         assert_eq!(field(cache, "cache_hit").as_bool(), Some(true));
-        assert!(field(cache, "refusal")
-            .as_str()
-            .unwrap()
-            .contains("cache-hit suffix"));
+        assert_eq!(field(cache, "prompt_len").as_u64(), Some(3));
+        assert_eq!(field(cache, "fill_len").as_u64(), Some(3));
+        assert_eq!(
+            field(cache, "refusal").as_str(),
+            Some("Qwen4 native MTP cache hit at 0 needs a non-empty suffix of a 3-token prompt")
+        );
+    }
+
+    #[test]
+    fn cache_suffix_refusal_reports_position_zero_cache_hit_refusal() {
+        let report = cache_suffix_refusal();
+        assert_pass(&report);
+        assert_eq!(field(&report, "case").as_str(), Some("cache_suffix_refusal"));
+        assert_eq!(field(&report, "cache_hit").as_bool(), Some(true));
+        assert_eq!(field(&report, "prompt_len").as_u64(), Some(3));
+        assert_eq!(field(&report, "fill_len").as_u64(), Some(3));
+        assert_eq!(
+            field(&report, "refusal").as_str(),
+            Some("Qwen4 native MTP cache hit at 0 needs a non-empty suffix of a 3-token prompt")
+        );
     }
 }
 
@@ -2654,19 +2787,27 @@ pub fn run_mtp_takeover_fill_oracle(
     let receipt = crate::admit_hfqm_artifact(&hfq)
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let mut gpu = Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &receipt.config, &receipt.manifest,
+    )
+    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
     let mesh = hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
+        &weights,
         &mesh,
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
     ).map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     // Match run_mtp_fill_digest: the reusable family walker uses logical
     // F32 row widths. This is a head-fill/rollback oracle, not a KV-format
@@ -2694,7 +2835,7 @@ pub fn run_mtp_takeover_fill_oracle(
         n_max: 3,
     }));
     let run = (|| -> Result<Value, String> {
-        bundle.attach_forward(&mut gpu, max_seq).map_err(|error| error.to_string())?;
+        bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(|error| error.to_string())?;
         bundle.attach_mtp(&mut gpu, max_seq).map_err(|error| error.to_string())?;
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
         let dim = bundle.config.hc_count.checked_mul(bundle.config.hidden_size)

@@ -118,6 +118,10 @@ fn spawn_slot_engine(arch_id: u32, cfg: SlotEngineConfig) -> Result<AnySlotEngin
 /// sequential arm keeps its own parsing; this owns the multi-slot route's.
 pub struct SlotLoadParams {
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state. `mtp_k > 0` cannot distinguish `auto`
+    /// from an explicit `on`, so this rides beside it into `EngineConfig`
+    /// for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw `params.kv_mode` (empty = env/config), resolved engine-side
     /// through `QWEN35_SLOTS_POLICY`.
     pub kv_mode_raw: String,
@@ -142,12 +146,26 @@ impl SlotLoadParams {
     pub fn from_load_msg(msg: &serde_json::Value) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
-        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
-        let mtp_mode = param_str("mtp_mode").unwrap_or("off");
-        let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
+        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
+        // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
+        // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
+        // The tri-state survives beside mtp_k: the engine's host-spill
+        // decline reads the mode, not the depth. Absent normalizes to
+        // "off" (default Off); the mtp_k rule below (empty/off -> 0) is
+        // verbatim.
+        let mtp_mode_raw = param_str("mtp_mode").unwrap_or("off");
+        let mtp_mode = hipfire_config::MtpMode::parse(mtp_mode_raw);
+        let mtp_k = if mtp_mode_raw.is_empty() || mtp_mode_raw == "off" {
             0
         } else {
-            param("mtp_k").and_then(|v| v.as_u64()).unwrap_or(4) as usize
+            match param("mtp_k") {
+                None => 4,
+                Some(v) => v.as_u64().map(|k| k as usize).unwrap_or_else(|| {
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT)
+                }),
+            }
         };
         // Same precedence as the sequential loader: load param > env/config.
         let kv_mode_raw = param_str("kv_mode").unwrap_or("").to_string();
@@ -189,6 +207,7 @@ impl SlotLoadParams {
         };
         Self {
             mtp_k,
+            mtp_mode,
             kv_mode_raw,
             kv_backend,
             kv_mode_resolved,
@@ -370,6 +389,7 @@ impl SlotBackend {
         cap_tokens: usize,
         prefill_chunk: usize,
         mtp_k: usize,
+        mtp_mode: hipfire_config::MtpMode,
         kv_mode_raw: &str,
         kv_backend: &str,
         dflash_draft: Option<PathBuf>,
@@ -450,43 +470,19 @@ impl SlotBackend {
         // registered in hipfire-config as serve.max_queue /
         // serve.max_queue_bytes / serve.queue_timeout_ms with env
         // HIPFIRE_SERVE_MAX_QUEUE / HIPFIRE_SERVE_MAX_QUEUE_BYTES /
-        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults 64 / 256 MiB / 30000 ms
-        // (the registered config defaults). The CLI startup guard rejects
+        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults are the registered
+        // `DefaultValue::Integer` entries in hipfire-config's field table:
+        // serve.max_queue = 64, serve.max_queue_bytes = 268435456 (256 MiB),
+        // serve.queue_timeout_ms = 600000 (10 min). The CLI startup guard rejects
         // serve.max_queue=0 for multi-slot; Rig::build also refuses
         // WaitQueue::new(0, _) as a backstop.
-        let wait_max_count = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(64);
-        let wait_max_bytes = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue_bytes")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(268435456);
-        let queue_timeout_ms = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.queue_timeout_ms")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(30000);
+        let process_config = hipfire_config::active_or_local_process_config();
+        let wait_max_count =
+            integer_or_registered_default(&process_config.values, "serve.max_queue") as usize;
+        let wait_max_bytes =
+            integer_or_registered_default(&process_config.values, "serve.max_queue_bytes") as u64;
+        let queue_timeout_ms =
+            integer_or_registered_default(&process_config.values, "serve.queue_timeout_ms") as u64;
         // Read the structured-output jump-forward flag (spec §7.3 G3).
         // Key registered as serve.structured_jump_forward with env
         // HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD. Default false — no
@@ -530,6 +526,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 mtp_k,
+                mtp_mode,
                 is_vl,
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
@@ -1802,6 +1799,7 @@ fn cpu_preflight(
             rec_top_p: None,
         });
     }
+
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
@@ -2346,6 +2344,22 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
         return Some("suffix not supported in experimental multi-slot".to_string());
     }
     None
+}
+
+/// Integer config value for `key`, falling back to the registered default in
+/// hipfire-config's field table (single source of truth: a hard-coded
+/// fallback here drifts when the registered default changes).
+///
+/// Panics if `key` is not a registered integer field; that is a programmer
+/// error caught by `waiting_room_fallbacks_are_the_registered_defaults`.
+fn integer_or_registered_default(layer: &hipfire_config::ConfigLayer, key: &str) -> i64 {
+    if let Some(hipfire_config::ConfigValue::Integer(i)) = layer.values.get(key) {
+        return *i;
+    }
+    match hipfire_config::field(key).map(|f| f.default) {
+        Some(hipfire_config::DefaultValue::Integer(i)) => i,
+        _ => panic!("config key {key} is not a registered integer field"),
+    }
 }
 
 // ── Message projection (pure) ────────────────────────────────────────────────
@@ -2943,12 +2957,69 @@ mod tests {
     use hipfire_runtime::prompt_frame::Role;
     use serde_json::json;
 
+    /// The waiting-room fallbacks used when the process config lacks a key
+    /// must equal the registered defaults (a hard-coded 30000 ms once
+    /// drifted from the registered 600000 ms).
+    #[test]
+    fn waiting_room_fallbacks_are_the_registered_defaults() {
+        let empty = hipfire_config::ConfigLayer::default();
+        for (key, expected) in [
+            ("serve.max_queue", 64),
+            ("serve.max_queue_bytes", 268_435_456),
+            ("serve.queue_timeout_ms", 600_000),
+        ] {
+            let registered = hipfire_config::field(key).expect("registered key").default;
+            assert!(
+                matches!(registered, hipfire_config::DefaultValue::Integer(i) if i == expected),
+                "{key}: registered default is {registered:?}, expected {expected}"
+            );
+            assert_eq!(integer_or_registered_default(&empty, key), expected, "{key}");
+        }
+        let mut set = hipfire_config::ConfigLayer::default();
+        set.set("serve.queue_timeout_ms", hipfire_config::ConfigValue::Integer(1234))
+            .unwrap();
+        assert_eq!(integer_or_registered_default(&set, "serve.queue_timeout_ms"), 1234);
+    }
+
     #[test]
     fn arch_validation_accepts_5_and_6() {
         assert!(validate_arch_id(5).is_ok());
         assert!(validate_arch_id(6).is_ok());
         assert!(validate_arch_id(7).is_err());
         assert!(validate_arch_id(9).is_err());
+    }
+    #[test]
+    fn slot_mtp_parse_preserves_tri_state_and_k_default() {
+        // The tri-state must survive beside mtp_k: auto and an explicit on
+        // are indistinguishable downstream when only mtp_k travels, and a
+        // check alone cannot restore the distinction.
+        let parse = |params: serde_json::Value| {
+            SlotLoadParams::from_load_msg(&serde_json::json!({ "params": params }))
+        };
+        // Absent and off: Off with k forced to 0 (verbatim rule).
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "mtp_mode": "off", "mtp_k": 7 }),
+            serde_json::json!({ "mtp_mode": "", "mtp_k": 7 }),
+        ] {
+            let p = parse(params);
+            assert_eq!(p.mtp_mode, hipfire_config::MtpMode::Off);
+            assert_eq!(p.mtp_k, 0);
+        }
+        // auto and on keep the existing k default-4 rule verbatim.
+        let auto = parse(serde_json::json!({ "mtp_mode": "auto" }));
+        assert_eq!(auto.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto.mtp_k, 4);
+        let on = parse(serde_json::json!({ "mtp_mode": "on" }));
+        assert_eq!(on.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on.mtp_k, 4);
+        // Explicit k still wins on both armed modes.
+        let auto_k = parse(serde_json::json!({ "mtp_mode": "auto", "mtp_k": 2 }));
+        assert_eq!(auto_k.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto_k.mtp_k, 2);
+        let on_k = parse(serde_json::json!({ "mtp_mode": "on", "mtp_k": 2 }));
+        assert_eq!(on_k.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on_k.mtp_k, 2);
     }
 
     /// P10: a generate with no sampling fields resolves on the multi-slot
@@ -3241,24 +3312,11 @@ mod tests {
 
     #[test]
     fn load_caps_admit_only_the_default_dflash_block() {
-        for ok in [
-            json!({"params": {}}),
-            json!({"params": {"dflash_block": 16}}),
-            json!({"params": {"dflash_block": "auto"}}),
-        ] {
-            assert!(
-                validate_load_caps(&ok, "gfx1100").is_none(),
-                "{ok} must be admitted"
-            );
+        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
+            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
         }
-        for bad in [
-            json!({"params": {"dflash_block": 8}}),
-            json!({"params": {"dflash_block": 99}}),
-        ] {
-            assert!(
-                validate_load_caps(&bad, "gfx1100").is_some(),
-                "{bad} must be refused"
-            );
+        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
+            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
         }
     }
 

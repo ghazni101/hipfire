@@ -2174,6 +2174,28 @@ static __device__ __forceinline__ void gated_delta_params_flat(
     beta[flat] = 1.0f / (1.0f + expf(-bf16_to_f32(bf16_round(b[flat]))));
 }
 
+#ifdef NPU_TRUNK_ARENA
+static __device__ __forceinline__ void gated_delta_params_flat_arena(
+    const __hip_bfloat16* a, const __hip_bfloat16* b,
+    const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias,
+    float* gate, float* beta, int flat, int heads,
+    int a_pitch, int a_col0, int b_pitch, int b_col0) {
+    const int head = flat % heads;
+    const float al = bf16_to_f32(a_log[head]);
+    const float dt = bf16_to_f32(dt_bias[head]);
+    const float av = a_pitch ? bf16_to_f32(a[(size_t)(flat / heads) * a_pitch + a_col0 + head])
+        : bf16_to_f32(bf16_round(((const float*)a)[flat]));
+    const float bv = b_pitch ? bf16_to_f32(b[(size_t)(flat / heads) * b_pitch + b_col0 + head])
+        : bf16_to_f32(bf16_round(((const float*)b)[flat]));
+    const float value = av + dt;
+    const float softplus = value > 20.0f
+        ? value
+        : (value < -20.0f ? expf(value) : log1pf(expf(value)));
+    gate[flat] = -expf(al) * softplus;
+    beta[flat] = 1.0f / (1.0f + expf(-bv));
+}
+#endif
+
 extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -2194,7 +2216,12 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     float* gate,
     float* beta,
     int param_elements,
-    int heads) {
+    int heads
+#ifdef NPU_TRUNK_ARENA
+    , int input_pitch, int input_col0, int param_a_pitch, int param_a_col0,
+    int param_b_pitch, int param_b_col0
+#endif
+    ) {
     // Compact 1-D grid: blocks [0, conv_blocks * row_grid) are the convolution
     // tiles (bx = channel block, by = 16-row block), the trailing blocks are
     // the parameter blocks.
@@ -2203,7 +2230,13 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     if (blockIdx.x >= conv_total) {
         const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
         if (flat < param_elements)
+#ifdef NPU_TRUNK_ARENA
+            gated_delta_params_flat_arena((const __hip_bfloat16*)param_a,
+                (const __hip_bfloat16*)param_b, a_log, dt_bias, gate, beta, flat, heads,
+                param_a_pitch, param_a_col0, param_b_pitch, param_b_col0);
+#else
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+#endif
         return;
     }
     const unsigned by = blockIdx.x / conv_blocks;
@@ -2218,7 +2251,11 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     auto in = [&](int j) {
         if (input_bf16) {
             __hip_bfloat16 b;
+#ifdef NPU_TRUNK_ARENA
+            b.data = ((const unsigned short*)input)[input_pitch ? (size_t)j * input_pitch + input_col0 + channel : j * channels + channel];
+#else
             b.data = ((const unsigned short*)input)[j * channels + channel];
+#endif
             return b;
         }
         return bf16_round(input[j * channels + channel]);
@@ -2344,13 +2381,24 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     int param_elements,
     int heads,
     __hip_bfloat16* qn,
-    __hip_bfloat16* kn) {
+    __hip_bfloat16* kn
+#ifdef NPU_TRUNK_ARENA
+    , int input_pitch, int input_col0, int param_a_pitch, int param_a_col0,
+    int param_b_pitch, int param_b_col0
+#endif
+    ) {
     const unsigned conv_blocks = (unsigned)(channels + 255) / 256u;
     const unsigned conv_total = conv_blocks * (((unsigned)rows + 15u) / 16u);
     if (blockIdx.x >= conv_total) {
         const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
         if (flat < param_elements)
+#ifdef NPU_TRUNK_ARENA
+            gated_delta_params_flat_arena((const __hip_bfloat16*)param_a,
+                (const __hip_bfloat16*)param_b, a_log, dt_bias, gate, beta, flat, heads,
+                param_a_pitch, param_a_col0, param_b_pitch, param_b_col0);
+#else
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
+#endif
         return;
     }
     const unsigned by = blockIdx.x / conv_blocks;
@@ -2376,7 +2424,11 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
         const unsigned short* kern_u16 = (const unsigned short*)kernel;
         auto in4 = [&](int j, __hip_bfloat16 (&o)[4]) {
             if (input_bf16) {
+#ifdef NPU_TRUNK_ARENA
+                const uint2 w = *(const uint2*)(in_u16 + (input_pitch ? (size_t)j * input_pitch + input_col0 + c0 : (size_t)j * channels + c0));
+#else
                 const uint2 w = *(const uint2*)(in_u16 + (size_t)j * channels + c0);
+#endif
                 o[0].data = (unsigned short)(w.x & 0xFFFFu);
                 o[1].data = (unsigned short)(w.x >> 16);
                 o[2].data = (unsigned short)(w.y & 0xFFFFu);
@@ -2471,7 +2523,11 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     auto in = [&](int j) {
         if (input_bf16) {
             __hip_bfloat16 b;
+#ifdef NPU_TRUNK_ARENA
+            b.data = ((const unsigned short*)input)[input_pitch ? (size_t)j * input_pitch + input_col0 + channel : j * channels + channel];
+#else
             b.data = ((const unsigned short*)input)[j * channels + channel];
+#endif
             return b;
         }
         return bf16_round(input[j * channels + channel]);
@@ -2829,7 +2885,8 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
     int head_dim,
     int head_stride,
     int position,
-    int rotary_dim) {
+    int rotary_dim,
+    RopeYarn yarn) {
     int head = (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     if (head >= heads) return;
@@ -2856,8 +2913,8 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
         int base = channel < half ? channel : partner;
         float angle = (float)position
             * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
-        float sine = sinf(angle);
-        float cosine = cosf(angle);
+        float sine, cosine;
+        rope_yarn_sincos(angle, base, yarn, &sine, &cosine);
         value = channel < half ? value * cosine - other * sine
             : other * sine + value * cosine;
     }
@@ -3122,6 +3179,7 @@ static __device__ __forceinline__ float qsa_norm_rope_head(
     int head_dim,
     int position,
     int rotary_dim,
+    RopeYarn yarn,
     float* input_row,
     float* row_sum) {
     const int channel = (int)threadIdx.x;
@@ -3152,8 +3210,8 @@ static __device__ __forceinline__ float qsa_norm_rope_head(
         int base = channel < half ? channel : partner;
         float angle = (float)position
             * powf(10000000.0f, -((float)(2 * base)) / (float)rotary_dim);
-        float sine = sinf(angle);
-        float cosine = cosf(angle);
+        float sine, cosine;
+        rope_yarn_sincos(angle, base, yarn, &sine, &cosine);
         value = channel < half ? value * cosine - other * sine
             : other * sine + value * cosine;
     }
@@ -3169,7 +3227,8 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     int head_dim,
     int head_stride,
     int position_start,
-    int rotary_dim) {
+    int rotary_dim,
+    RopeYarn yarn) {
     int row = (int)blockIdx.z;
     int head = (int)blockIdx.x;
     if (row >= rows || head >= heads || blockIdx.y != 0) return;
@@ -3177,7 +3236,7 @@ extern "C" __global__ void indexed_attention_norm_rope_f32_batched(
     __shared__ float input_row[256];
     __shared__ float row_sum;
     const float value = qsa_norm_rope_head(values + start, norm, head_dim, position_start + row,
-                                           rotary_dim, input_row, &row_sum);
+                                           rotary_dim, yarn, input_row, &row_sum);
     if ((int)threadIdx.x < head_dim) values[start + threadIdx.x] = value;
 }
 
@@ -3208,7 +3267,8 @@ static __device__ __forceinline__ void qsa_decode_prologue(
     int heads,
     int kv_heads,
     int head_dim,
-    int position_start) {
+    int position_start,
+    RopeYarn yarn) {
     __shared__ float input_row[256];
     __shared__ float row_sum;
     __shared__ float kv_amax[8];
@@ -3225,7 +3285,7 @@ static __device__ __forceinline__ void qsa_decode_prologue(
     if (block < index_heads) {
         float* row = index_row + block * index_dim;
         const float value = qsa_norm_rope_head(row, index_q_norm, index_dim, position,
-                                               min(index_dim, 64), input_row, &row_sum);
+                                               min(index_dim, 64), yarn, input_row, &row_sum);
         if (c < index_dim) row[c] = value;
         return;
     }
@@ -3233,7 +3293,7 @@ static __device__ __forceinline__ void qsa_decode_prologue(
     if (block < heads) {
         float* row = qgate + block * 2 * head_dim;
         const float value = qsa_norm_rope_head(row, q_norm, head_dim, position,
-                                               min(head_dim, 64), input_row, &row_sum);
+                                               min(head_dim, 64), yarn, input_row, &row_sum);
         if (c < head_dim) row[c] = value;
         return;
     }
@@ -3241,7 +3301,7 @@ static __device__ __forceinline__ void qsa_decode_prologue(
     if (block < kv_heads) {
         float* row = keys + block * head_dim;
         const float value = qsa_norm_rope_head(row, k_norm, head_dim, position,
-                                               min(head_dim, 64), input_row, &row_sum);
+                                               min(head_dim, 64), yarn, input_row, &row_sum);
         if constexpr (F == QSA_KV_F32) {
             if (c < head_dim) {
                 const int channel = block * head_dim + c;
@@ -3282,12 +3342,12 @@ static __device__ __forceinline__ void qsa_decode_prologue(
         CACHE* full_values, RAW* raw_index_keys, const __hip_bfloat16* index_q_norm,       \
         const __hip_bfloat16* q_norm, const __hip_bfloat16* k_norm, int index_heads,       \
         int index_dim, int index_kv_width, int heads, int kv_heads, int head_dim,          \
-        int position_start) {                                                              \
+        int position_start, RopeYarn yarn) {                                               \
         qsa_decode_prologue<FORMAT, RAW>(                                                  \
             index_row, qgate, keys, values, reinterpret_cast<unsigned char*>(full_keys),   \
             reinterpret_cast<unsigned char*>(full_values), raw_index_keys, index_q_norm,   \
             q_norm, k_norm, index_heads, index_dim, index_kv_width, heads, kv_heads,       \
-            head_dim, position_start);                                                     \
+            head_dim, position_start, yarn);                                               \
     }
 QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_f32, QSA_KV_F32, float, float)
 #if defined(QSA_HAS_FP8)
@@ -3416,7 +3476,8 @@ static __device__ __forceinline__ void qsa_pool_rope(
     int block_count,
     int compress,
     int index_dim,
-    int first_block) {
+    int first_block,
+    RopeYarn yarn) {
     // The grid starts at `first_block` (0 for the full pool): blocks below it
     // already hold this kernel's output for their unchanged raw keys (the
     // incremental decode caller), so an incremental launch covers only the
@@ -3469,11 +3530,11 @@ static __device__ __forceinline__ void qsa_pool_rope(
             : bf16_to_f32(norm[partner]);
         float other = bf16_to_f32(bf16_round(
             bf16_to_f32(other_bf16) * inv * (1.0f + other_norm)));
+        int pair = channel < half ? channel : partner;
         float angle = (float)(block * compress)
-            * powf(10000000.0f, -((float)(2 * (channel < half ? channel : partner)))
-                / (float)rotary_dim);
-        float sine = sinf(angle);
-        float cosine = cosf(angle);
+            * powf(10000000.0f, -((float)(2 * pair)) / (float)rotary_dim);
+        float sine, cosine;
+        rope_yarn_sincos(angle, pair, yarn, &sine, &cosine);
         value = channel < half ? value * cosine - other * sine
             : other * sine + value * cosine;
     }
@@ -3482,14 +3543,14 @@ static __device__ __forceinline__ void qsa_pool_rope(
 
 extern "C" __global__ void indexed_attention_pool_rope_f32(
     const float* raw_keys, float* pooled, const __hip_bfloat16* norm, int block_count,
-    int compress, int index_dim, int first_block) {
-    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block);
+    int compress, int index_dim, int first_block, RopeYarn yarn) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block, yarn);
 }
 
 extern "C" __global__ void indexed_attention_pool_rope_bf16(
     const __hip_bfloat16* raw_keys, __hip_bfloat16* pooled, const __hip_bfloat16* norm,
-    int block_count, int compress, int index_dim, int first_block) {
-    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block);
+    int block_count, int compress, int index_dim, int first_block, RopeYarn yarn) {
+    qsa_pool_rope(raw_keys, pooled, norm, block_count, compress, index_dim, first_block, yarn);
 }
 
 static __device__ __forceinline__ float4 qsa_index_load4(const float* row, int d4) {

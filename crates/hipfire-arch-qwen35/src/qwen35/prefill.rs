@@ -39,11 +39,15 @@ use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::context::DispatchWorkload;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_admitted as dispatch_gfx1100_split_verify_admitted;
+use hipfire_dispatch::families::attention::gfx1100_split_verify_min_ctx as dispatch_gfx1100_split_verify_min_ctx;
 use hipfire_dispatch::families::attention::AttnParams;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyModel;
+use hipfire_dispatch::families::attention::Gfx1100SplitVerifyRoute;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::families::moe::codebook_batched_admit_enabled;
+use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, codebook_batched_admit_enabled};
 #[cfg(test)]
 use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
@@ -333,7 +337,9 @@ fn packed_mq4_down_admitted(
     down: (DType, usize, usize),
     hidden_dim: usize,
 ) -> bool {
-    packed_admitted && separate && residual
+    packed_admitted
+        && separate
+        && residual
         && down.0 == DType::MQ4G256
         && (down.1, down.2) == (5120, 17408)
         && hidden_dim == down.2
@@ -354,18 +360,32 @@ fn try_packed_mq4_down(
         !pbs.lean && gpu.packed_mq4_admitted(down.m, down.k, n),
         h_source == FfnGateOutput::Separate,
         matches!(epilogue, BatchEpilogue::Residual),
-        (down.gpu_dtype, down.m, down.k), hidden_dim,
+        (down.gpu_dtype, down.m, down.k),
+        hidden_dim,
     ) {
         return Ok(false);
     }
     gpu.flush_residual_fold()?;
     fused_silu_mul_rotate_mq_batched_for(
-        gpu, down, &pbs.gate_ffn_batch, &pbs.up_batch,
-        &pbs.ffn_hidden_batch, hidden_dim, n,
+        gpu,
+        down,
+        &pbs.gate_ffn_batch,
+        &pbs.up_batch,
+        &pbs.ffn_hidden_batch,
+        hidden_dim,
+        n,
     )?;
-    run_residual_gemm_key(gpu, hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
-        &down.buf, down.gpu_dtype, &pbs.ffn_hidden_batch, &pbs.x_batch,
-        down.m, down.k, n)?;
+    run_residual_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmMq4PackedResidual,
+        &down.buf,
+        down.gpu_dtype,
+        &pbs.ffn_hidden_batch,
+        &pbs.x_batch,
+        down.m,
+        down.k,
+        n,
+    )?;
     Ok(true)
 }
 
@@ -409,22 +429,34 @@ fn try_packed_mq4_ffn_gate_up(
     }
     gpu.flush_residual_fold()?;
     let separate_awq_inputs = gate.awq_scale.is_some() || up.awq_scale.is_some();
-    for (index, (weight, output)) in [
-        (gate, &pbs.gate_ffn_batch),
-        (up, &pbs.up_batch),
-    ].into_iter().enumerate() {
+    for (index, (weight, output)) in [(gate, &pbs.gate_ffn_batch), (up, &pbs.up_batch)]
+        .into_iter()
+        .enumerate()
+    {
         // Sidecars are per-weight and may differ (or exist on only one side).
         // Reuse the rotated input only when neither projection carries AWQ.
         if index == 0 || separate_awq_inputs {
             fused_rmsnorm_rotate_mq_batched_for(
-                gpu, &pbs.x_batch, norm, weight, &pbs.x_rot_batch,
-                weight.k, config.norm_eps, n,
+                gpu,
+                &pbs.x_batch,
+                norm,
+                weight,
+                &pbs.x_rot_batch,
+                weight.k,
+                config.norm_eps,
+                n,
             )?;
         }
         run_plain_gemm_key(
-            gpu, hipfire_dispatch::types::KernelKey::GemmMq4Packed,
-            &weight.buf, weight.gpu_dtype, &pbs.x_rot_batch, output,
-            weight.m, weight.k, n,
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4Packed,
+            &weight.buf,
+            weight.gpu_dtype,
+            &pbs.x_rot_batch,
+            output,
+            weight.m,
+            weight.k,
+            n,
         )?;
     }
     Ok(true)
@@ -728,6 +760,44 @@ fn a4_fa_gate_in_place_enabled() -> bool {
 /// on).
 fn a4_attn_epilogue_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_A4_ATTN_EPI", true)
+}
+/// gfx1201 ragged fp8q packet: `HIPFIRE_FA_RAGGED_PACKET=0` restores the
+/// incumbent admission (no fp8q prep / Q-resident attention for a widened
+/// chunk whose tail is not a whole 512-row run). Default on.
+fn fa_ragged_packet_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_FA_RAGGED_PACKET", true)
+}
+/// Incumbent fp8q n/commit-stride shape predicate (unchanged): single runs
+/// up to 512 rows or whole 512-row runs, with `commit_stride` either absent or
+/// exactly `Some(512)` over whole runs.
+fn fa_fp8q_incumbent_shape(n: usize, commit_stride: Option<usize>) -> bool {
+    (n <= 512 || n % 512 == 0)
+        && (commit_stride.is_none()
+            || (commit_stride == Some(WIDENED_COMMIT_ROWS) && n % WIDENED_COMMIT_ROWS == 0))
+}
+/// New ragged shape: ordinary widened prefill (`commit_stride == Some(512)`)
+/// of `n` in `(512, 32768]` rows with a 64..=511-row tail, whose context ends
+/// exactly at the chunk end and fits the physical cache. Returns
+/// `(prefix_rows, tail_rows)`; the prefix is whole 512-row runs.
+fn fa_ragged_packet_split(
+    n: usize,
+    commit_stride: Option<usize>,
+    start_pos: usize,
+    max_ctx_len: usize,
+    physical_cap: usize,
+) -> Option<(usize, usize)> {
+    let tail = n % WIDENED_COMMIT_ROWS;
+    if commit_stride == Some(WIDENED_COMMIT_ROWS)
+        && n > WIDENED_COMMIT_ROWS
+        && n <= 32768
+        && (64..WIDENED_COMMIT_ROWS).contains(&tail)
+        && start_pos.checked_add(n) == Some(max_ctx_len)
+        && max_ctx_len <= physical_cap
+    {
+        Some((n - tail, tail))
+    } else {
+        None
+    }
 }
 /// gfx1201 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
@@ -1591,6 +1661,17 @@ pub const PREFILL_MAX_BATCH: usize = 256;
 /// Minimum number of rows for the batched prefill kernels.
 const MIN_BATCH: usize = 2;
 
+/// Widest batched forward whose routed experts run on the CPU when the loader
+/// armed the expert splice (`memory.offload_exec=cpu`). Matches the MTP verify
+/// window (drafts + 1, capped at 4): the narrow speculative verify and the
+/// accepted-prefix rollback replay both fit, so they share the single-token
+/// decode's CPU target arithmetic. The gate is width-only — every armed-sink
+/// forward at `n <= 4` splices on the CPU irrespective of dispatch workload, so
+/// a `Standard` tape-disabled rollback replay and an ordinary very short prompt
+/// prefill take it too. Wider prompt prefill and wide verify keep the GPU
+/// grouped PCIe read, which beats the CPU expert FFN by >10x at chunk sizes.
+/// Single source is [`hipfire_dispatch::families::moe::NARROW_VERIFY_MAX_ROWS`].
+
 /// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
 /// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
 const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
@@ -1712,7 +1793,9 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
-        .ok().as_deref() == Some("1")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Separately admitted native MQ4 route: no V2 producer or lean PBS contract.
@@ -1725,7 +1808,9 @@ fn native_mq4_widened_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
 }
 
 fn native_mq4_widened_flags_admitted(
-    arch: &str, flags: &rdna_compute::FeatureFlags, screen: bool,
+    arch: &str,
+    flags: &rdna_compute::FeatureFlags,
+    screen: bool,
 ) -> bool {
     arch == "gfx1100"
         && !flags.fp16_disabled
@@ -1993,15 +2078,36 @@ fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Op
 /// Steady-state bytes of one dense tape-free [`PrefillBatchScratch`] at
 /// `rows` rows: every unconditional allocation including positions, rope,
 /// tokens, the four F16 sidecars and the 256-byte prologue control plane.
-/// `None` for MoE configs (out of scope) or on arithmetic overflow.
+/// `None` on arithmetic overflow.
 ///
-/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for
-/// dense configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
+/// Only the *dense* arms are enumerated here (this enumerator predates the MoE
+/// route). A MoE config is charged through
+/// [`PrefillBatchScratch::projected_allocation_bytes`], the checked mirror of the
+/// same constructor that already models its shared-expert, expanded-expert and
+/// grouped-GEMM scratch term-for-term. Returning `None` for MoE (the previous
+/// behaviour) left the reservation at zero, and the placement search then
+/// under-spilled by exactly that scratch — the difference between a load and an
+/// `hipMalloc: out of memory`.
+///
+/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for dense
+/// configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
 /// `D + V + I + Q` elems/row, plus 256 fixed bytes.
 fn dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     if config.num_experts != 0 {
-        return None;
+        // `cap_gdn_tape = true` is the conservative arm: the tape is an
+        // `alloc_opt!` in the constructor, so charging it can only make the
+        // placement spill slightly more, never less.
+        return crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(
+            config, rows, true,
+        )
+        .ok()
+        .and_then(|bytes| usize::try_from(bytes).ok());
     }
+    dense_layer_prefill_allocation_bytes(config, rows)
+}
+
+/// The arch-independent terms of [`dense_prefill_allocation_bytes`].
+fn dense_layer_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     let d = config.dim;
     let i = config.hidden_dim;
     let k = config
@@ -2094,9 +2200,17 @@ pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> O
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
     let packed = hipfire_config::developer_var("HIPFIRE_GFX1100_PACKED_MQ4_PREFILL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if arch == "gfx1100" && (native_mq4_widened_requested() || packed) {
-        base.checked_add(native_mq4_projection_deficit(config, WIDENED_COMMIT_ROWS, 0, 0, 0)?)
+        base.checked_add(native_mq4_projection_deficit(
+            config,
+            WIDENED_COMMIT_ROWS,
+            0,
+            0,
+            0,
+        )?)
     } else {
         Some(base)
     }
@@ -2112,11 +2226,18 @@ fn native_mq4_projection_deficit(
     live_f16: usize,
     live_partials: usize,
 ) -> Option<usize> {
-    let mmq = config.hidden_dim.checked_add(127)?.checked_div(128)?
-        .checked_mul(144)?.checked_mul(rows)?;
+    let mmq = config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(144)?
+        .checked_mul(rows)?;
     let tail = rows.min(127);
     let f16 = tail.checked_mul(config.hidden_dim)?.checked_mul(2)?;
-    let partials = tail.checked_mul(config.dim)?.checked_mul(4)?.checked_mul(4)?;
+    let partials = tail
+        .checked_mul(config.dim)?
+        .checked_mul(4)?
+        .checked_mul(4)?;
     mmq.saturating_sub(live_mmq)
         .checked_add(f16.saturating_sub(live_f16))?
         .checked_add(partials.saturating_sub(live_partials))
@@ -2284,11 +2405,13 @@ fn memory_admitted_rung(
         .unwrap_or(usize::MAX);
         let projection_deficit = if native_mq4 {
             native_mq4_projection_deficit(
-                config, rung,
+                config,
+                rung,
                 gpu.scratch.q8_1_mmq_x_scratch_bytes,
                 gpu.scratch.fp16_x_scratch_bytes,
                 gpu.scratch.ksplit_det_partials_bytes,
-            ).unwrap_or(usize::MAX)
+            )
+            .unwrap_or(usize::MAX)
         } else if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -4841,6 +4964,7 @@ fn build_moe_prefill_params<'a>(
     model_has_mq6_moe: bool,
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
+    cpu_deferred_experts: bool,
 ) -> HipResult<(
     hipfire_dispatch::pipeline::sealed_moe::BoundMoeExperts<'a>,
     hipfire_dispatch::families::moe::MoePrefillParams<'a>,
@@ -4901,6 +5025,17 @@ fn build_moe_prefill_params<'a>(
         per_expert_gate_up,
         per_expert_down,
     };
+    crate::qwen35::weights::trace_moe_arm(
+        "prefill",
+        moe_dtypes.routed_gate_up,
+        moe_dtypes.routed_down,
+        moe_dtypes.experts_all_gate_up_mq4,
+        ffn.packed_expert_owners.as_ref().is_some_and(|owners| {
+            owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
+                && owners.down.iter().all(|b| b.buf.is_host_mapped())
+        }),
+        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+    );
 
     let paro_gate_up =
         ffn.paro_shared
@@ -4967,6 +5102,7 @@ fn build_moe_prefill_params<'a>(
         force_mq4_grouped_fp16: model_has_mq6_moe
             && gpu.arch_caps.is_gfx1151()
             && gpu.flags.moe_grouped_i8.is_none(),
+        cpu_deferred_experts,
         topk_indices,
         topk_weights,
         x_batch: &pbs.x_batch,
@@ -4993,6 +5129,10 @@ fn build_moe_prefill_params<'a>(
         paro_down,
         down_awq_scale: None,
         routed_out,
+        ep_row_gather: None,
+        shared_down_out: None,
+        ep_layer_idx: 0,
+        ep_tile_exchange: None,
     };
     Ok((bound, moe_prefill_params))
 }
@@ -5025,6 +5165,7 @@ pub(crate) fn preflight_moe_ffn_batched_ep(
         model_has_mq6_moe,
         Some(routed_out),
         route,
+        false,
     )?;
     hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
         .map(|_| ())
@@ -5055,6 +5196,7 @@ pub(crate) fn moe_ffn_batched_ep_slot_geometry(
         model_has_mq6_moe,
         Some(routed_out),
         PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+        false,
     )?;
     let resolution = hipfire_dispatch::families::moe::MoePrefillResolution::resolve(
         &params.dtypes,
@@ -5101,6 +5243,7 @@ pub(crate) fn finish_moe_ffn_batched_ep_slot_order(
         model_has_mq6_moe,
         Some(routed_out),
         PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+        false,
     )?;
     let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
         .map_err(HipError::from)?;
@@ -5120,6 +5263,45 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
     routed_out: Option<&'a GpuTensor>,
     route: PrefillRouteMode<'a>,
 ) -> HipResult<()> {
+    prefill_moe_ffn_body_batched_with_route_layered(
+        gpu, ffn, ffn_norm, config, pbs, n, ctx, model_has_mq6_moe, routed_out, route,
+        ffn.layer_idx as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_moe_ffn_body_batched_with_route_layered<'a>(
+    gpu: &mut Gpu,
+    ffn: &'a MoeFfnWeights,
+    ffn_norm: &'a GpuTensor,
+    config: &Qwen35Config,
+    pbs: &'a PrefillBatchScratch,
+    n: usize,
+    ctx: &'a DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&'a GpuTensor>,
+    route: PrefillRouteMode<'a>,
+    layer_idx: usize,
+) -> HipResult<()> {
+    // Narrow CPU-arithmetic forwards (the `<=4`-row speculative verify and the
+    // accepted-prefix rollback replay) must recompute the routed experts on the
+    // CPU, matching single-token decode; the GPU grouped PCIe read would
+    // otherwise diverge from the CPU target arithmetic these rows are validated
+    // against. The splice is width-only: any splice-armed layer at `n <= 4`
+    // takes it regardless of dispatch workload, so the tape-disabled
+    // accepted-prefix rollback (a `Standard` `forward_prefill_batch` call) and
+    // an ordinary very short `<=4` prompt prefill both land on the CPU. Wider
+    // prompt prefill and wide verify keep the real expert tables and the GPU
+    // grouped read, where the CPU expert FFN loses by >10x. Expert-parallel
+    // prefill never defers: its routed partial is gathered and all-reduced, and
+    // the CPU splice would fold the routed FFN into `x_batch` twice.
+    let cpu_deferred_experts = ffn.cpu_deferred_experts
+        && n <= NARROW_VERIFY_MAX_ROWS
+        && routed_out.is_none()
+        && !matches!(
+            route,
+            PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
+        );
     let (bound, params) = build_moe_prefill_params(
         gpu,
         ffn,
@@ -5130,11 +5312,14 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         model_has_mq6_moe,
         routed_out,
         route,
+        cpu_deferred_experts,
     )?;
     let compact_ep = matches!(
         &params.prelude.route,
         PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
     ) && bound.rank_count() > 1;
+    // The CPU splice below adds into `pbs.x_batch` directly, so it is correct
+    // on every down path: the deferred program omitted the routed stages.
     let sealed = if compact_ep {
         hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
     } else {
@@ -5154,8 +5339,48 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
         )
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
 
+        // Window span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): sealed GPU program
+        // vs CPU splice vs caller-side gap. Host wall around calls this body
+        // already makes; no new sync, no order change.
+        let t_window = std::time::Instant::now();
+        let t_sealed = std::time::Instant::now();
         execute_steps(gpu, ctx, &[Step::Moe(sealed)])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let sealed_ns = t_sealed.elapsed().as_nanos() as u64;
+        // The sealed program above runs the CPU expert splice in place of the
+        // routed GPU stages for this call, so the splice's cost is inside
+        // `sealed_ns` and cannot be separated on this side; `cpu_splice_ns`
+        // therefore reports 0 and the stage-side trace is the authority for
+        // the splice's own timing.
+        if cpu_deferred_experts {
+            // The omitted GPU routed tail no longer changes the FP16 staging
+            // cache key. The next layer reuses x_rot_batch with new contents.
+            gpu.invalidate_fp16_cache();
+        } else {
+            // `memory.offload_exec=cpu` deliberately does **not** splice the
+            // routed experts for ordinary wide prefill: the batched prefill
+            // params bind the real expert tables, so the sealed step above
+            // already produced the routed contribution with the GPU's grouped
+            // read over the host-mapped blobs (one weight pass per unique expert
+            // per chunk). The CPU expert FFN is compute-bound and loses to that
+            // by >10x at chunk sizes (measured 15x on ornith/gfx1201).
+        }
+        let total_ns = t_window.elapsed().as_nanos() as u64;
+        if hipfire_dispatch::cpu_exec::moe_trace_enabled() {
+            hipfire_dispatch::cpu_exec::moe_window_trace(
+                layer_idx,
+                hipfire_dispatch::cpu_exec::MoeWindowTiming {
+                    total_ns,
+                    gpu_sealed_ns: sealed_ns,
+                    // The splice now runs inside the sealed program (stage-side), so
+                    // its cost is part of `gpu_sealed_ns`; see the comment above.
+                    cpu_splice_ns: 0,
+                    other_ns: total_ns.saturating_sub(sealed_ns),
+                    rows: n,
+                    top_k: config.num_experts_per_tok,
+                },
+            );
+        }
 
         #[cfg(feature = "moe-oracle")]
         {
@@ -5702,21 +5927,28 @@ pub(crate) fn batch_chunk_upload_positions(
 /// S3-f16-projection-inputs: exact-route gate for the FP16 projection-input
 /// fast path (all four `batch_chunk_*` projection hooks below).
 ///
-/// All predicates are cheap field reads — no env/lock/JIT in the cycle (the
-/// kill switch resolves once at `FeatureFlags` init). Every failed predicate
-/// runs the pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
+/// All ordinary-path predicates are cheap field reads. Capture/recording is
+/// admitted only together with the exact-gfx1100 split-verifier experiment:
+/// that route owns fixed, preallocated F16 sidecars and records every producer
+/// and consumer through the blob funnel. Every failed predicate runs the
+/// pre-change F32-producer + `convert_f32_to_f16` path byte-for-byte.
 #[inline]
 fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, dim: usize) -> bool {
-    matches!(fusion, DflashFusionCtx::ChainVerify)
+    let recording = gpu.graphs.capture_mode || gpu.replay.is_recording();
+    let recording_supported = !recording
+        || (fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n));
+    fusion.is_chain_verify()
         // The PM FP8 verify scope never takes an F16-input projection route.
         && !gpu.fp8_verify_scope
-        && gpu.arch_caps.is_gfx1100()
+        && gpu.arch_caps.supports_dflash_f16_projection_fusions()
         && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
         && dim % 256 == 0
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording()
+        && recording_supported
+        // IU4 verify (gfx1201): every projection takes the A4 producer + IU4
+        // GEMM at every row count; an F16 projection there is a mixed route.
+        && !gpu.iu4_verify_scope
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6407,12 +6639,46 @@ fn batch_chunk_delta_net_input_projection(
     Ok(false)
 }
 
-/// Queue one DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
+/// Default-on switch for the singleton chain-verify batched tape copy
+/// (`HIPFIRE_VERIFY_TAPE_COPY_BATCH=0` restores three `memcpy_dtod_at_auto`).
+fn verify_tape_copy_batch_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_VERIFY_TAPE_COPY_BATCH")
+            .map_or(true, |v| v.trim() != "0")
+    });
+    *ENABLED
+}
+
+/// One DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
 /// post-sigmoid alpha and beta rows of `pbs`'s rows `[0, n)`, into the layer's
 /// tape slots at `tape_offset`) as three descriptors for
 /// `Gpu::tape_copy_batched`. `pbs` may be a row view of a shared scratch: the
-/// source is its first row. Shared by the per-request pre-GDN sink branch and
-/// the lane-batched multi-request route, so both queue identical descriptors.
+/// source is its first row.
+fn gdn_tape_copy_descriptors(
+    tape: &crate::speculative::GdnTape,
+    pbs: &PrefillBatchScratch,
+    n_v_heads: usize,
+    tape_offset: usize,
+    n: usize,
+    delta_layer_idx: usize,
+) -> [rdna_compute::tape_copy::TapeCopy; 3] {
+    use rdna_compute::tape_copy::TapeCopy;
+    let qkv_row_bytes = tape.qkv_dim * 4;
+    let alpha_row_bytes = n_v_heads * 4;
+    let off_qkv = tape_offset * qkv_row_bytes;
+    let off_a = tape_offset * alpha_row_bytes;
+    let copy_qkv = n * qkv_row_bytes;
+    let copy_a = n * alpha_row_bytes;
+    [
+        TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv),
+        TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a),
+        TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a),
+    ]
+}
+
+/// Queue the three descriptors of [`gdn_tape_copy_descriptors`] on `sink`.
+/// Shared by the per-request pre-GDN sink branch and the lane-batched
+/// multi-request route, so both queue identical descriptors.
 pub(crate) fn push_gdn_tape_copies(
     sink: &mut Vec<rdna_compute::tape_copy::TapeCopy>,
     tape: &crate::speculative::GdnTape,
@@ -6422,16 +6688,7 @@ pub(crate) fn push_gdn_tape_copies(
     n: usize,
     delta_layer_idx: usize,
 ) {
-    use rdna_compute::tape_copy::TapeCopy;
-    let qkv_row_bytes = tape.qkv_dim * 4;
-    let alpha_row_bytes = n_v_heads * 4;
-    let off_qkv = tape_offset * qkv_row_bytes;
-    let off_a = tape_offset * alpha_row_bytes;
-    let copy_qkv = n * qkv_row_bytes;
-    let copy_a = n * alpha_row_bytes;
-    sink.push(TapeCopy::new(&tape.qkv_bufs[delta_layer_idx].buf, off_qkv, &pbs.dn_qkv_batch.buf, 0, copy_qkv));
-    sink.push(TapeCopy::new(&tape.alpha_bufs[delta_layer_idx].buf, off_a, &pbs.dn_alpha_batch.buf, 0, copy_a));
-    sink.push(TapeCopy::new(&tape.beta_bufs[delta_layer_idx].buf, off_a, &pbs.dn_beta_batch.buf, 0, copy_a));
+    sink.extend(gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx));
 }
 
 /// The pre-GDN fused sigmoid(beta) + alpha gate over rows `[0, n)` of `pbs`
@@ -6504,7 +6761,7 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // (kill switch, non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
-    if fusion == DflashFusionCtx::ChainVerify
+    if fusion.is_chain_verify()
         && !gpu.flags.gdn_pre_fuse_off
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && config.linear_num_key_heads < n_v_heads
@@ -6609,15 +6866,27 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // next layer's producers run. Nothing on this path writes the
     // source rows after the sigmoid, so the tape bytes are equal.
     if let Some(tape) = gdn_tape.as_ref() {
-        let qkv_row_bytes = tape.qkv_dim * 4;
-        let alpha_row_bytes = n_v_heads * 4;
-        let off_qkv = tape_offset * qkv_row_bytes;
-        let off_a = tape_offset * alpha_row_bytes;
-        let copy_qkv = n * qkv_row_bytes;
-        let copy_a = n * alpha_row_bytes;
         if let Some(sink) = tape_sink {
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
+        } else if fusion.is_chain_verify()
+            && matches!(batch_semantics, BatchSemantics::Sequential)
+            && tree_verify
+                .as_ref()
+                .and_then(|c| c.parent_indices)
+                .is_none()
+            && verify_tape_copy_batch_enabled()
+        {
+            // Singleton chain verify: one batched launch for the same three
+            // descriptors, issued at the original copy point (before conv).
+            let copies = gdn_tape_copy_descriptors(tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
+            gpu.tape_copy_batched(&copies)?;
         } else {
+            let qkv_row_bytes = tape.qkv_dim * 4;
+            let alpha_row_bytes = n_v_heads * 4;
+            let off_qkv = tape_offset * qkv_row_bytes;
+            let off_a = tape_offset * alpha_row_bytes;
+            let copy_qkv = n * qkv_row_bytes;
+            let copy_a = n * alpha_row_bytes;
             gpu.memcpy_dtod_at_auto(
                 &tape.qkv_bufs[delta_layer_idx].buf,
                 off_qkv,
@@ -6748,7 +7017,7 @@ fn s4_residual_fast(
     epilogue: &BatchEpilogue<'_>,
     n: usize,
 ) -> bool {
-    fusion == DflashFusionCtx::ChainVerify
+    fusion.is_chain_verify()
         // The PM FP8 verify scope keeps the F32 producer + FP8 residual GEMM
         // (batched == singleton by construction; no F16-input residual GEMM).
         && !gpu.fp8_verify_scope
@@ -7667,7 +7936,13 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -7699,6 +7974,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -8928,6 +9204,25 @@ fn batch_chunk_full_attn_input_projection(
     Ok(())
 }
 
+/// Shared admission for the S6 DFlash prep and paired Q8 K/V-write folds.
+fn dflash_fa_batch_fusion_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    fusion.is_chain_verify()
+        && gpu.arch_caps.supports_dflash_fa_batch_fusions()
+        && !gpu.flags.fa_batch_fuse_off
+        && !gpu.flags.rope_interleaved_legacy
+        && !hipfire_runtime::triattn::tap_enabled()
+        && matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
+        && config.head_dim == 256
+        && n_rot == 64
+        && n >= 1
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S6-fa-prep-q8-pair.
 ///
@@ -8986,15 +9281,15 @@ fn batch_chunk_full_attn_prepare(
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
-    let fa_prep_fused_ok = (fusion == DflashFusionCtx::ChainVerify
-        || (fusion == DflashFusionCtx::Off
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true)))
-        && gpu.arch_caps.is_gfx1100()
-        && !gpu.flags.fa_batch_fuse_off
-        && !gpu.flags.rope_interleaved_legacy
-        && !hipfire_runtime::triattn::tap_enabled()
-        && fa_prep_shape_ok
-        && n >= 1;
+    let fa_prep_fused_ok = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n)
+        || ((fusion == DflashFusionCtx::Off
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true))
+            && gpu.arch_caps.is_gfx1100()
+            && !gpu.flags.fa_batch_fuse_off
+            && !gpu.flags.rope_interleaved_legacy
+            && !hipfire_runtime::triattn::tap_enabled()
+            && fa_prep_shape_ok
+            && n >= 1);
     // gfx1151 twin (`qwen35_fa_prep_batched_gfx1151`, same source) in
     // ordinary prefill, bit-exact against the three-launch chain on the
     // Halo; HIPFIRE_GFX1151_FA_PREP=0 restores the chain.
@@ -9485,6 +9780,55 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
     }
 }
 
+/// Scalar adapter from Qwen model state into the dispatch-owned split-verifier
+/// admission contract. The predicate itself intentionally stays out of the
+/// arch prefill body so declarative Steps can reuse it without semantic drift.
+fn gfx1100_split_verify_model<'a>(
+    gpu: &'a Gpu,
+    config: &Qwen35Config,
+) -> Gfx1100SplitVerifyModel<'a> {
+    Gfx1100SplitVerifyModel {
+        arch: gpu.arch_caps.arch(),
+        verify_attn: gpu.flags.verify_attn,
+        split_verify: gpu.flags.gfx1100_fa2_split_verify,
+        num_experts: config.num_experts,
+        n_heads: config.n_heads,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        resolved_min_ctx: fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+    }
+}
+
+#[doc(hidden)]
+pub fn gfx1100_split_verify_min_ctx(gpu: &Gpu, config: &Qwen35Config) -> Option<usize> {
+    dispatch_gfx1100_split_verify_min_ctx(&gfx1100_split_verify_model(gpu, config))
+}
+
+/// `quant_q8`: both K and V use exact plain Q8; the K-only cache flag
+/// must also be paired with `matches!(kv_cache.v_mode, llama::VMode::Q8)`.
+/// `kv_vmm`: the target KV cache is a VMM owner
+/// ([`llama::KvCache::uses_vmm_backend`]). Legacy KV is never admitted.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn gfx1100_split_verify_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    quant_q8: bool,
+    kv_vmm: bool,
+    batch_size: usize,
+    logical_ctx_len: usize,
+    flash_partials_numel: usize,
+) -> bool {
+    dispatch_gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+        model: gfx1100_split_verify_model(gpu, config),
+        quant_q8,
+        kv_vmm,
+        batch_size,
+        logical_ctx_len,
+        flash_partials_numel,
+    })
+}
+
 /// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
 /// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
 /// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
@@ -9521,6 +9865,7 @@ fn q8_multirow_attn_admitted(
     is_independent: bool,
     capture_mode: bool,
     replay_recording: bool,
+    capture_safe_fixed_grid: bool,
 ) -> bool {
     matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
@@ -9529,8 +9874,7 @@ fn q8_multirow_attn_admitted(
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
-        && !capture_mode
-        && !replay_recording
+        && ((!capture_mode && !replay_recording) || capture_safe_fixed_grid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9550,6 +9894,7 @@ fn batch_chunk_fa_attend(
     multirow: bool,
     commit_stride: Option<usize>,
     gfx12_fa_prep_fp8q: bool,
+    pair_q8_writes: bool,
 ) -> HipResult<()> {
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -9571,6 +9916,22 @@ fn batch_chunk_fa_attend(
     }
     if batch_semantics.is_independent() {
         unreachable!("independent variant must carry active_mask");
+    }
+    if gfx12_fa_prep_fp8q {
+        // Newly admitted ragged chunks (never produced by the incumbent
+        // admission: its Some(512) arm requires n % 512 == 0) take the direct
+        // range route and return before the aligned/F32 segment paths.
+        if let Some((prefix, tail)) = fa_ragged_packet_split(
+            n,
+            commit_stride,
+            start_pos,
+            max_ctx_len,
+            kv_cache.physical_cap,
+        ) {
+            return batch_chunk_fa_attend_ragged_fp8q(
+                gpu, config, pbs, s, kv_cache, n, prefix, tail, start_pos, layer_idx,
+            );
+        }
     }
     if let Some(stride) = commit_stride {
         // Exact gfx1201 native-fp8 packet path: write the whole widened
@@ -9743,22 +10104,35 @@ fn batch_chunk_fa_attend(
         );
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.k_gpu[layer_idx],
-            &pbs.fa_k_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
-        gpu.kv_cache_write_q8_0_batched(
-            &kv_cache.v_gpu[layer_idx],
-            &pbs.fa_v_batch,
-            &pbs.positions,
-            config.n_kv_heads,
-            config.head_dim,
-            n,
-        )?;
+        if pair_q8_writes {
+            gpu.kv_cache_write_q8_0_pair_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        } else {
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.k_gpu[layer_idx],
+                &pbs.fa_k_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+            )?;
+        }
         // Experimental gfx1201 verifier arm: retain the FA2 packed-Q8/LDS
         // front end, split the live KV tile range to restore occupancy at
         // small verifier batches, then combine CK-style LSE/Oacc partials.
@@ -9800,7 +10174,7 @@ fn batch_chunk_fa_attend(
             }
             _ => {}
         }
-        if gpu.attention_flash_q8_0_rows_masked(
+        if gpu.attention_flash_q8_0_rows_masked_logical(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
@@ -9810,8 +10184,18 @@ fn batch_chunk_fa_attend(
             config.n_kv_heads,
             config.head_dim,
             max_ctx_len,
+            start_pos + n,
             n,
             &s.flash_partials,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+                kv_cache.uses_vmm_backend(),
+                n,
+                start_pos + n,
+                s.flash_partials.numel(),
+            ),
         )? {
             return Ok(());
         }
@@ -9840,6 +10224,91 @@ fn batch_chunk_fa_attend(
         layer_idx,
         None,
     )
+}
+
+/// Newly admitted ragged fp8q chunk (`n = prefix + tail`, prefix whole 512-row
+/// runs, tail 64..=511 rows, `start_pos + n == max_ctx_len`): validate the
+/// native fp8 tier, write all `n` K/V rows once, then run two Q-resident range
+/// attentions over the full two-plane Raw Q (code plane `[n*H*D]`, scale plane
+/// `[n*H*4]`) into segment views of the whole-`n` F32 output. Prefix rows see
+/// context `start_pos + prefix`, tail rows `start_pos + n`; pre-written later
+/// K/V rows are unobservable under the causal mask.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_ragged_fp8q(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    prefix: usize,
+    tail: usize,
+    start_pos: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(prefix + tail, n);
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n,
+        is_tree: false,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    if plan.write_key != hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3Batched
+        || plan.attend_key != hipfire_dispatch::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+    {
+        return Err(HipError::new(
+            0,
+            "ragged fp8q packet requires the native fp8 batched KV tier",
+        ));
+    }
+    let q_dim = config.n_heads * config.head_dim;
+    let q_bytes = n * config.n_heads * (config.head_dim + 4);
+    let q_raw = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), q_bytes) },
+        shape: vec![q_bytes],
+        dtype: DType::Raw,
+    };
+    gpu.kv_cache_write_fp8_e4m3_batched(
+        &kv_cache.k_gpu[layer_idx],
+        &pbs.fa_k_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+    )?;
+    gpu.kv_cache_write_fp8_e4m3_batched(
+        &kv_cache.v_gpu[layer_idx],
+        &pbs.fa_v_batch,
+        &pbs.positions,
+        config.n_kv_heads,
+        config.head_dim,
+        n,
+    )?;
+    for (off, len, max_ctx_len) in [
+        (0, prefix, start_pos + prefix),
+        (prefix, tail, start_pos + n),
+    ] {
+        let positions = pbs.positions.sub_offset(off, len);
+        let out = pbs.fa_attn_out_batch.sub_offset(off * q_dim, len * q_dim);
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &out,
+            &positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            len,
+            n,
+            off,
+        )?;
+    }
+    Ok(())
 }
 
 /// Shared KV-write + flash-attention dispatch tail (F2 extraction).
@@ -9977,10 +10446,15 @@ fn batch_chunk_fa_attend_a4(
 /// switch clear, never DFlash chain verify, GQA 24/4 HD256 with a 64-wide
 /// rotary. Shared by [`batch_chunk_full_attn_attn`] and the multi-request
 /// chunk, which evaluates it per request with that request's `fusion`/`n`.
-fn gfx12_fa_prep_admitted(gpu: &Gpu, config: &Qwen35Config, fusion: DflashFusionCtx, n: usize) -> bool {
+fn gfx12_fa_prep_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    fusion: DflashFusionCtx,
+    n: usize,
+) -> bool {
     gpu.arch == "gfx1201"
         && gpu.flags.gfx12_fa_prep_fused
-        && fusion != DflashFusionCtx::ChainVerify
+        && !fusion.is_chain_verify()
         && !gpu.flags.rope_interleaved_legacy
         && !hipfire_runtime::triattn::tap_enabled()
         && config.head_dim == 256
@@ -10032,11 +10506,24 @@ pub(crate) fn batch_chunk_full_attn_attn(
         && config.n_heads == 24
         && config.n_kv_heads == 4
         && (64..=32768).contains(&n)
-        && (n <= 512 || n % 512 == 0)
         && (64..=262_144).contains(&max_ctx_len)
         && tree_verify.is_none()
-        && (commit_stride.is_none()
-            || (commit_stride == Some(WIDENED_COMMIT_ROWS) && n % WIDENED_COMMIT_ROWS == 0));
+        && (fa_fp8q_incumbent_shape(n, commit_stride)
+            || (fa_ragged_packet_enabled()
+                && fa_ragged_packet_split(
+                    n,
+                    commit_stride,
+                    start_pos,
+                    max_ctx_len,
+                    kv_cache.physical_cap,
+                )
+                .is_some()));
+    // Only the new ragged shape is admitted outside the incumbent n/commit
+    // predicate. It keeps the F32 attention output (no A4 attention epilogue:
+    // the A4 attend step cannot express the two-plane range launches).
+    let newly_admitted_ragged =
+        gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
+    let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n);
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
     // the output projection will select a sigmoid producer that reads the
@@ -10064,6 +10551,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // writes that producer's A4 slab (`HIPFIRE_A4_ATTN_EPI=0` keeps the
     // attention + producer pair). Implies the fp8q single-step attend.
     let a4_epi_awq = if fa_gate_in_place
+        && !newly_admitted_ragged
         && gpu.a4_slab_active()
         && gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
         && a4_attn_epilogue_enabled()
@@ -10142,6 +10630,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
                 fa_attn_multirow,
                 commit_stride,
                 gfx12_fa_prep_fp8q,
+                pair_q8_writes,
             )?;
             None
         }
@@ -10220,7 +10709,13 @@ fn batch_chunk_full_attn_ffn_gate_up(
         return Ok(FfnGateOutput::Separate);
     }
     if try_packed_mq4_ffn_gate_up(
-        gpu, &layer.w_gate, &layer.w_up, &layer.ffn_norm, config, pbs, n,
+        gpu,
+        &layer.w_gate,
+        &layer.w_up,
+        &layer.ffn_norm,
+        config,
+        pbs,
+        n,
     )? {
         return Ok(FfnGateOutput::Separate);
     }
@@ -10251,6 +10746,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 layer.w_up.m,
                 layer.w_gate.k,
                 n,
+                fusion.split_verify_active() && gpu.gfx1100_q8_fa2_split_capture_assets_ready(n),
             )
             .map(|()| FfnGateOutput::Separate);
     }
@@ -11031,6 +11527,10 @@ fn batch_chunk_delta_net_moe(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // Batched MoE LA layer. LA body is the same as DeltaNet
     // (rmsnorm + qkvza + sigmoid_alpha + conv1d + L2norm +
     // repeat_interleave + GDN + gated_norm + wo+residual);
@@ -11828,7 +12328,10 @@ fn batch_chunk_delta_net_moe(
     // silu_mul + w_down) block. Takes pbs.x_batch as input AND
     // accumulates the FFN output residual back into it via the
     // batched indexed down kernel's atomicAdd path.
-    prefill_moe_ffn_body_batched_with_route(
+    // Attn half ends here; MoE FFN body (with its own window span) below.
+    let attn_ns = t_attn.elapsed().as_nanos() as u64;
+    let t_moe = std::time::Instant::now();
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -11839,7 +12342,22 @@ fn batch_chunk_delta_net_moe(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
+    let moe_ns = t_moe.elapsed().as_nanos() as u64;
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
 
     Ok(())
 }
@@ -11868,6 +12386,13 @@ fn batch_chunk_full_attn_moe(
     weights: &Qwen35Weights,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this chunk already runs; no new sync, no order change.
+    // `t_attn` starts here so it covers the prep half (QKV projection +
+    // norms + RoPE, the largest GPU piece) plus the finish's attend tail;
+    // `attn_ns` closes just before the finish's MoE FFN body.
+    let t_layer = std::time::Instant::now();
+    let t_attn = std::time::Instant::now();
     // F2 split: QKV projection + norms + RoPE (everything above the old
     // attend call) live in `batch_chunk_full_attn_moe_prep`; called here
     // for the single-chunk path in the original position.
@@ -11882,6 +12407,7 @@ fn batch_chunk_full_attn_moe(
         tree_verify,
         layer_idx,
     )?;
+    let attn_head_ns = t_attn.elapsed().as_nanos() as u64;
     // F2 split: KV-write + flash attention, sigmoid/wo and the MoE FFN now
     // live in `batch_chunk_full_attn_moe_finish` so a chunk pair can share
     // one merged attend step; called here for the single-chunk path in the
@@ -11906,6 +12432,24 @@ fn batch_chunk_full_attn_moe(
         routed_out,
         route,
     )?;
+    // Single-chunk path only: the merged-pair path calls prep/finish directly
+    // and stays untimed. `attn` = prep head (QKV/norms/RoPE); the finish's
+    // attend-tail + MoE body are inside `finish` and not separately timed
+    // here, so `moe` = total − head (reconciles standalone; precise per-layer
+    // MoE comes from the `moe window` lines).
+    let total_ns = t_layer.elapsed().as_nanos() as u64;
+    if hipfire_dispatch::moe_trace_enabled() {
+        hipfire_dispatch::moe_layer_trace(
+            layer_idx,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns: attn_head_ns,
+                moe_ns: total_ns.saturating_sub(attn_head_ns),
+                rows: n,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -12295,6 +12839,8 @@ fn batch_chunk_full_attn_moe_finish(
     routed_out: Option<&GpuTensor>,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // (Layer timers live in the parent `batch_chunk_full_attn_moe`: `t_attn`
+    // covers the prep half plus this attend tail; `attn_ns` closes below.)
     // Batched KV write + flash attention (via dispatch).
     batch_chunk_fa_attend(
         gpu,
@@ -12311,6 +12857,7 @@ fn batch_chunk_full_attn_moe_finish(
         layer_idx,
         fa_attn_multirow,
         None, // commit_stride: MoE finish keeps legacy cadence
+        false,
         false,
     )?;
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -12453,8 +13000,9 @@ fn batch_chunk_full_attn_moe_finish(
         )?;
     }
 
-    // Batched MoE FFN.
-    prefill_moe_ffn_body_batched_with_route(
+    // Batched MoE FFN (parent `batch_chunk_full_attn_moe` owns the layer
+    // span on the single-chunk path; the pair path calls this untimed).
+    prefill_moe_ffn_body_batched_with_route_layered(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -12465,6 +13013,7 @@ fn batch_chunk_full_attn_moe_finish(
         weights.moe_has_mq6,
         routed_out,
         route,
+        layer_idx,
     )?;
     Ok(())
 }
@@ -12954,7 +13503,7 @@ fn forward_prefill_chunk_pair(
     );
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+        .with_verify_tile_attend(fusion.is_chain_verify());
 
     // Mask slot is call-relative: rebase per half.
     let mo_c = mask_override.as_ref().and_then(|ovr| {
@@ -13091,6 +13640,15 @@ fn forward_prefill_chunk_pair(
             false,
             multirow_common.4,
             multirow_common.5,
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+                kv_cache.uses_vmm_backend(),
+                n,
+                max_ctx,
+                s.flash_partials.numel(),
+            ),
         )
     };
     let multirow_c = multirow_admitted(max_ctx_c);
@@ -13698,8 +14256,7 @@ pub(crate) fn forward_batch_chunk_impl(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+
 
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
@@ -13771,8 +14328,12 @@ pub(crate) fn forward_batch_chunk_impl(
     // and re-scans the whole KV once per row, so a small verify block over a
     // long context pays the scan n times (202 vs 103 ms at 33k). The layer's
     // GEMMs stay batched either way — only the attend step switches to the
-    // multi-row tile. Its tile grid is sized from the live logical context on
-    // the host, so a captured replay would keep the first cycle's tile count.
+    // multi-row tile. The incumbent tile grid is sized from the live logical
+    // context and therefore stays out of capture. The gfx1100 split-KV route
+    // uses fixed S=8 geometry and is admitted only inside its exact opt-in
+    // gfx1100 envelope on VMM KV (`kernel.gfx1100_fa2_split_verify`, default
+    // off; the parent `kernel.verify_attn` still opts out);
+    // the launcher independently rejects every other captured shape.
     let fa_attn_multirow = q8_multirow_attn_admitted(
         gpu.arch_caps.arch(),
         kv_cache.quant_q8,
@@ -13784,6 +14345,15 @@ pub(crate) fn forward_batch_chunk_impl(
         batch_semantics.is_independent(),
         gpu.graphs.capture_mode,
         gpu.replay.is_recording(),
+        gfx1100_split_verify_admitted(
+            gpu,
+            config,
+            kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+            kv_cache.uses_vmm_backend(),
+            n,
+            start_pos + n,
+            s.flash_partials.numel(),
+        ),
     );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
@@ -13872,7 +14442,8 @@ pub(crate) fn forward_batch_chunk_impl(
                 && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
-        .with_verify_tile_attend(fusion == DflashFusionCtx::ChainVerify);
+        .with_verify_tile_attend(fusion.is_chain_verify())
+        .with_batch_size(n);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -14308,8 +14879,9 @@ fn run_fa_layer_body(
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
     let ctx = DispatchCtx::new(gpu);
-    let fused_epilogue =
-        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos)?;
+    let fused_epilogue = kv_cache_attention_dispatch(
+        &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
+    )?;
 
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -14806,13 +15378,21 @@ mod tests {
         ] {
             assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, shape, 256));
             assert!(!packed_mq4_ffn_gate_up_admitted(true, shape, rejected, 256));
-            assert!(!packed_mq4_ffn_gate_up_admitted(true, rejected, rejected, 256));
+            assert!(!packed_mq4_ffn_gate_up_admitted(
+                true, rejected, rejected, 256
+            ));
         }
     }
 
     #[test]
     fn packed_mq4_down_refuses_prepared_partial_and_nonuniform_inputs() {
-        assert!(!packed_mq4_down_admitted(true, true, true, (DType::MQ4G256V2, 5120, 17408), 17408));
+        assert!(!packed_mq4_down_admitted(
+            true,
+            true,
+            true,
+            (DType::MQ4G256V2, 5120, 17408),
+            17408
+        ));
         for dtype in [DType::MQ4G256] {
             let shape = (dtype, 5120, 17408);
             assert!(packed_mq4_down_admitted(true, true, true, shape, 17408));
@@ -14820,10 +15400,27 @@ mod tests {
             assert!(!packed_mq4_down_admitted(true, false, true, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, false, shape, 17408));
             assert!(!packed_mq4_down_admitted(true, true, true, shape, 8704));
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 2560, 17408), 17408));
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 2560, 17408),
+                17408
+            ));
         }
-        for dtype in [DType::MQ4G256V2Lloyd, DType::MQ4G256Lloyd, DType::HFQ4G256, DType::Q8_0] {
-            assert!(!packed_mq4_down_admitted(true, true, true, (dtype, 5120, 17408), 17408));
+        for dtype in [
+            DType::MQ4G256V2Lloyd,
+            DType::MQ4G256Lloyd,
+            DType::HFQ4G256,
+            DType::Q8_0,
+        ] {
+            assert!(!packed_mq4_down_admitted(
+                true,
+                true,
+                true,
+                (dtype, 5120, 17408),
+                17408
+            ));
         }
     }
 
@@ -14839,6 +15436,7 @@ mod tests {
                         n,
                         4097,
                         Some(4096),
+                        false,
                         false,
                         false,
                         false,
@@ -14872,6 +15470,7 @@ mod tests {
                 is_independent,
                 capture_mode,
                 replay_recording,
+                false,
             )
         };
         assert!(!admitted(
@@ -14983,12 +15582,62 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
+                false,
             ));
         }
+    }
+
+    #[test]
+    fn q8_multirow_attn_allows_only_explicit_fixed_grid_capture() {
+        assert!(q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(!q8_multirow_attn_admitted(
+            "gfx1100",
+            true,
+            256,
+            16,
+            8192,
+            Some(4096),
+            false,
+            false,
+            true,
+            true,
+            false,
+        ));
     }
 
     #[test]
@@ -16511,7 +17160,6 @@ mod tests {
         Qwen35Config {
             dim: 5120,
             n_layers: 64,
-            i_gpu_start: 0,
             vocab_size: 152064,
             norm_eps: 1e-6,
             eos_token: 2,
@@ -16567,22 +17215,42 @@ mod tests {
     fn native_mq4_wide_rejects_unaudited_dispatch_overrides() {
         let make = || rdna_compute::FeatureFlags::for_test("gfx1100");
         assert!(native_mq4_widened_flags_admitted("gfx1100", &make(), false));
-        assert!(!native_mq4_widened_flags_admitted("gfx1201", &make(), false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1201",
+            &make(),
+            false
+        ));
         assert!(!native_mq4_widened_flags_admitted("gfx1100", &make(), true));
         let mut variants = Vec::new();
-        let mut f = make(); f.fp16_disabled = true; variants.push(f);
-        let mut f = make(); f.rocblas_all_archs = true; variants.push(f);
-        let mut f = make(); f.gemv_dp4a = Some(true); variants.push(f);
-        let mut f = make(); f.mmq_override = Some(false); variants.push(f);
-        let mut f = make(); f.mmq_min_batch = Some(2048); variants.push(f);
-        let mut f = make(); f.qkvza_split_tail = true; variants.push(f);
-        let mut f = make(); f.wo_wmma_variant = Some("k4".into()); variants.push(f);
+        let mut f = make();
+        f.fp16_disabled = true;
+        variants.push(f);
+        let mut f = make();
+        f.rocblas_all_archs = true;
+        variants.push(f);
+        let mut f = make();
+        f.gemv_dp4a = Some(true);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_override = Some(false);
+        variants.push(f);
+        let mut f = make();
+        f.mmq_min_batch = Some(2048);
+        variants.push(f);
+        let mut f = make();
+        f.qkvza_split_tail = true;
+        variants.push(f);
+        let mut f = make();
+        f.wo_wmma_variant = Some("k4".into());
+        variants.push(f);
         // Packed FFN shares the budgeted MMQ slot and keeps native tails.
         let mut packed = make();
         packed.packed_mq4_prefill = true;
         assert!(native_mq4_widened_flags_admitted("gfx1100", &packed, false));
         packed.mmq_override = Some(false);
-        assert!(!native_mq4_widened_flags_admitted("gfx1100", &packed, false));
+        assert!(!native_mq4_widened_flags_admitted(
+            "gfx1100", &packed, false
+        ));
         for f in variants {
             assert!(!native_mq4_widened_flags_admitted("gfx1100", &f, false));
         }
@@ -16595,14 +17263,27 @@ mod tests {
         let f16 = 127 * 17408 * 2;
         let partials = 127 * 5120 * 4 * 4;
         assert_eq!(mmq, 153 * 1024 * 1024);
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
-                   Some(mmq + f16 + partials));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq, f16, partials), Some(0));
-        assert_eq!(native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials), Some(f16));
-        assert_eq!(native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0), None);
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, 0, 0, 0),
+            Some(mmq + f16 + partials)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq, f16, partials),
+            Some(0)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, 8192, mmq + 1, 0, partials),
+            Some(f16)
+        );
+        assert_eq!(
+            native_mq4_projection_deficit(&config, usize::MAX, 0, 0, 0),
+            None
+        );
         for rows in [512, 1024, 2048, 4096, 8192] {
-            assert_eq!(native_mq4_projection_deficit(&config, rows, 0, 0, 0),
-                       Some(rows * 19584 + f16 + partials));
+            assert_eq!(
+                native_mq4_projection_deficit(&config, rows, 0, 0, 0),
+                Some(rows * 19584 + f16 + partials)
+            );
         }
     }
 
@@ -16645,10 +17326,31 @@ mod tests {
         let fp8_delta = (4096 - 512) * fp8_row_bytes_wide(&config).unwrap();
         assert_eq!(fp8_delta, 64_354_304);
         assert_eq!(dense_delta + fp8_delta, 2_664_144_896);
-        // MoE configs are out of scope for the byte ledger.
+        // MoE configs charge the same dense terms plus the Path-2 grouped-GEMM
+        // scratch `PrefillBatchScratch::new_opt` allocates for them, through the
+        // checked mirror of that constructor. This used to be `None` (out of
+        // scope), which left `minimum_prefill_reservation_bytes` undefined for
+        // every MoE model and made the partial-offload placement under-spill by
+        // exactly that scratch.
         let mut moe = widened_test_config();
         moe.num_experts = 256;
-        assert_eq!(dense_prefill_allocation_bytes(&moe, 512), None);
+        moe.num_experts_per_tok = 8;
+        moe.moe_intermediate_size = 512;
+        moe.shared_expert_intermediate_size = 512;
+        let moe_bytes =
+            dense_prefill_allocation_bytes(&moe, 512).expect("a MoE config is chargeable");
+        let dense_only = dense_layer_prefill_allocation_bytes(&moe, 512).unwrap();
+        assert!(
+            moe_bytes > dense_only,
+            "the MoE charge must include the grouped scratch it allocates: {moe_bytes} vs {dense_only}"
+        );
+        let mirror =
+            crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(&moe, 512, true)
+                .unwrap();
+        assert_eq!(
+            moe_bytes as u64, mirror,
+            "must be exactly the constructor mirror"
+        );
         // Wrong hidden_dim breaks the allocation envelope.
         let mut narrow = widened_test_config();
         narrow.hidden_dim = 3584;
@@ -17961,5 +18663,39 @@ mod tests {
             "oracle PASS: {} f32 + {nbytes} block bytes identical (K={k} N={N} layer={fa_idx})",
             f32_unfused.len(),
         );
+    }
+
+    #[test]
+    fn fa_ragged_packet_split_admits_only_new_shape() {
+        const S: Option<usize> = Some(WIDENED_COMMIT_ROWS);
+        let cap = 262_144;
+        // New shape: prefix of whole 512-row runs + 64..=511 tail.
+        assert_eq!(fa_ragged_packet_split(1088, S, 0, 1088, cap), Some((1024, 64)));
+        assert_eq!(fa_ragged_packet_split(1023, S, 4096, 5119, cap), Some((512, 511)));
+        assert_eq!(fa_ragged_packet_split(32768 - 448, S, 7, 32768 - 441, cap), Some((32256, 64)));
+        // Tail boundaries, aligned, small, and oversized chunks.
+        assert_eq!(fa_ragged_packet_split(1087, S, 0, 1087, cap), None);
+        assert_eq!(fa_ragged_packet_split(1024, S, 0, 1024, cap), None);
+        assert_eq!(fa_ragged_packet_split(511, S, 0, 511, cap), None);
+        assert_eq!(fa_ragged_packet_split(576, S, 0, 576, cap), Some((512, 64)));
+        assert_eq!(fa_ragged_packet_split(32768 + 64, S, 0, 32768 + 64, cap), None);
+        // Authority: only ordinary widened prefill (`Some(512)`).
+        assert_eq!(fa_ragged_packet_split(1088, None, 0, 1088, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, Some(256), 0, 1088, cap), None);
+        // Context must end exactly at the chunk end and fit the physical cache.
+        assert_eq!(fa_ragged_packet_split(1088, S, 10, 1088, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, 10, 1099, cap), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, 1000, 2088, 2087), None);
+        assert_eq!(fa_ragged_packet_split(1088, S, usize::MAX, usize::MAX, usize::MAX), None);
+
+        // Incumbent predicate is unchanged and never admits the ragged shape.
+        assert!(fa_fp8q_incumbent_shape(512, None));
+        assert!(fa_fp8q_incumbent_shape(100, None));
+        assert!(fa_fp8q_incumbent_shape(1024, None));
+        assert!(fa_fp8q_incumbent_shape(1024, S));
+        assert!(!fa_fp8q_incumbent_shape(100, S));
+        assert!(!fa_fp8q_incumbent_shape(1088, None));
+        assert!(!fa_fp8q_incumbent_shape(1088, S));
+        assert!(!fa_fp8q_incumbent_shape(1024, Some(256)));
     }
 }

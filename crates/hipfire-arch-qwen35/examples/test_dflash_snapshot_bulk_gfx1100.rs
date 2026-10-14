@@ -26,7 +26,7 @@
 //! Run: `cargo run --release -p hipfire-arch-qwen35 --example
 //! test_dflash_snapshot_bulk_gfx1100`. Passes on any arch (outside the bulk
 //! arches the snapshot rides the memcpy loops and `bulk_n_items()` is
-//! `None`); on gfx1100 and gfx1201 (railgun E0 port) the tables must arm with
+//! `None`); on gfx1100, gfx1151 and gfx1201 the tables must arm with
 //! the exact item counts. The test name keeps its historical suffix.
 
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, StateQuant};
@@ -145,16 +145,16 @@ fn run_case(gpu: &mut Gpu, bulk_arch: bool, ef_on: bool) {
         };
     match snap.bulk_n_items() {
         Some(n) => {
-            assert!(bulk_arch, "{tag}: tables armed off gfx1100/gfx1201");
+            assert!(bulk_arch, "{tag}: tables armed off gfx1100/gfx1151/gfx1201");
             assert_eq!(n, expect_items, "{tag}: item count");
         }
         None => assert!(
             !bulk_arch,
-            "{tag}: tables disarmed on gfx1100/gfx1201 (n_items would be {expect_items})"
+            "{tag}: tables disarmed on gfx1100/gfx1151/gfx1201 (n_items would be {expect_items})"
         ),
     }
     eprintln!(
-        "{tag}: bulk_n_items={:?} (expect {expect_items} on gfx1100/gfx1201)",
+        "{tag}: bulk_n_items={:?} (expect {expect_items} on gfx1100/gfx1151/gfx1201)",
         snap.bulk_n_items()
     );
 
@@ -221,8 +221,9 @@ fn run_case(gpu: &mut Gpu, bulk_arch: bool, ef_on: bool) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let bulk_arch = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
-        && !gpu.flags.dn_snapshot_bulk_off;
+    let bulk_arch =
+        (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
+            && !gpu.flags.dn_snapshot_bulk_off;
     eprintln!("arch={} bulk_arch={bulk_arch}", gpu.arch);
     run_case(&mut gpu, bulk_arch, true);
     run_case(&mut gpu, bulk_arch, false);

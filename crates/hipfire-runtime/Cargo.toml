@@ -114,6 +114,10 @@ minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_o
 minijinja-contrib = { workspace = true, features = ["pycompat"] }
 tracing = "0.1"
 sha2.workspace = true
+# Canonical host-side quant decoder: `weight_backend::dequantize_to_f32`
+# delegates the block-quantized formats to `hipfire_cpu::quant`, so there is one
+# decoder rather than a transcription. `hipfire-cpu` is a leaf (rayon only).
+hipfire-cpu = { path = "../hipfire-cpu" }
 
 # Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -167,6 +171,18 @@ name = "bench_qwen35_mq4"
 required-features = []
 
 [[example]]
+name = "probe_awq_wavegrid"
+required-features = ["deltanet"]
+
+[[example]]
+name = "probe_fa_prep"
+required-features = ["deltanet"]
+
+[[example]]
+name = "probe_fa_kvwrite"
+required-features = ["deltanet"]
+
+[[example]]
 name = "dflash_spec_demo"
 required-features = []
 
@@ -211,6 +227,13 @@ required-features = []
 # (`--features lab`) to keep the ungated-example ratchet flat.
 [[example]]
 name = "sample_batch_exact_oracle"
+required-features = ["lab"]
+
+# Offline replay/simulator for HIPFIRE_DFLASH_ONLINE_TUNE dumps (developer
+# research tool, no GPU). Gated (`--features lab`) to keep the
+# ungated-example ratchet flat.
+[[example]]
+name = "dflash_online_replay"
 required-features = ["lab"]
 
 # Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
@@ -653,6 +676,10 @@ name = "test_wmma_residual_hfq3"
 required-features = ["lab"]
 
 [[example]]
+name = "tp2_cross_device_graph_reduce"
+required-features = ["lab"]
+
+[[example]]
 name = "tp4_cross_device_graph_barrier"
 required-features = ["lab"]
 
@@ -728,4 +755,12 @@ required-features = ["lab"]
 
 [[example]]
 name = "a13_repro"
+required-features = ["lab"]
+
+[[example]]
+name = "ep_row_gather_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "ep2_boundary_micro"
 required-features = ["lab"]

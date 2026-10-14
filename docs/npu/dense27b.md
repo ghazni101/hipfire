@@ -1,10 +1,20 @@
 # Dense Qwen3.8-27B (MQ4XTS) IU4 prefill on Strix Halo: NPU co-op study
 
-NpuDense27b, 2026-10-02/03, branch `npu/dense27b`.
+> **Lifecycle: historical study (2026-10-02/03, hipfire 0.4.1 beta), verdict KILL; not a
+> shipped path.** The int32-partials (`I32` epilogue, per-epoch `C_e`) route and the
+> IEF fold candidate studied here were killed and never wired; no GPU fold of NPU
+> partials exists in any serving route. Every number is a dated, fixture-bound measurement
+> or labelled estimate for the dense-27B pp8192 step on one Halo host, not current
+> performance or an admission. The 0.4.2 Flash-Next gfx1151 NPU trunk is a different route:
+> input projections only, calibration schema 4, BF16-direct only (no I32 contract),
+> out-projection unwired. See [`npu-trunk.md`](npu-trunk.md) for the current route and
+> schema.
+
+Dated 2026-10-02/03 (workspace branch `npu/dense27b`, not in this repository).
 
 Sources (read-only):
-- hipfire `/home/kaden/ClaudeCode/warpfront/wt-land-041m` (beta f7960b4e8; written `W:` below);
-- the Halo trace `/home/kaden/qcal/release-0.4.1/iu4-roofline` (written `R:`);
+- hipfire 0.4.1 beta source snapshot, commit f7960b4e8 (written `W:` below);
+- the Halo kernel-trace study, workspace-local (written `R:`);
 - the fixture `qwen3.8-27b.mq4-xts` (JSON header, `HFQMC`).
 
 Every number is labelled **measured** (with its log) or **estimate**.
@@ -36,7 +46,7 @@ lm_head is a 1-row GEMV in prefill, not an IU4 GEMM.
 
 ## 2. The GPU route's exact numeric contract
 
-Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,244-290,346-371,443-483`, `W:crates/hipfire-isa/src/kernels/iu4_fold.rs`, `W:crates/hipfire-isa/src/kernels/iu4_v2b.rs:1-40,521-527`, `W:kernels/src/block_i4_128_quant.hip`.
+Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,244-290,346-371,443-483`, `W:crates/peacemaker-isa/src/kernels/iu4_fold.rs`, `W:crates/peacemaker-isa/src/kernels/iu4_v2b.rs:1-40,521-527`, `W:kernels/src/block_i4_128_quant.hip`.
 
 1. **Weights (symmetric MQ4G256V2, "XTS").** Each feature row is `K/256` groups of 136 B. A group is `[f16 sc0, f16 zp0, f16 sc1, f16 zp1]` plus 128 nibble bytes. K half `h` (epoch `e = 2*group + h`) is the 64 B at `+8+64h`. Byte `j` holds K `2j` in its low nibble and `2j+1` in its high nibble.
    - Nibbles `u` are unsigned, with `zp == -8*sc`.
@@ -55,16 +65,16 @@ Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,
    - gate_up stores `h = g/(1+expf(-g))*u` with hipcc's `expf`/`fdiv` DAG (`iu4_v2b.rs:753-759`). Its input `g` is a full f32, so no lookup table can reproduce it.
    - z+β+α splits rows 6144..6239 into β/α and drops the 160 padding rows.
 
-CPU reference of 1–4 (Rust): `crates/pm-npu/src/kernels/iu4.rs`, with `partials` and `fold_set`, operand decoders, the exact f16 widening, and tests including a case that separates single-rounded fma from multiply-then-add.
+CPU reference of 1–4 (Rust): `crates/peacemaker-npu/src/kernels/iu4.rs`, with `partials` and `fold_set`, operand decoders, the exact f16 widening, and tests including a case that separates single-rounded fma from multiply-then-add.
 
 ## 3. NPU kernel: native IU4 operands → bit-exact per-epoch int32 partials
 
-`iu4::EpochGemm` (`crates/pm-npu/src/kernels/iu4.rs`) is the silicon-proven **V8 i32** whole-array design run as an **epoch-batched GEMM**. Wave rows `e*Mpad + t` carry activation epoch `e`, and every wave of epoch `e` streams weight epoch `e` as its B tile (`gemm_array::ArrayDesign::pack_in_per_mw`, a host-layout-only extension). Core programs, routes, descriptors and TXN are unchanged. The output is `C_e[e][t][feature]` int32.
+`iu4::EpochGemm` (`crates/peacemaker-npu/src/kernels/iu4.rs`) is the silicon-proven **V8 i32** whole-array design run as an **epoch-batched GEMM**. Wave rows `e*Mpad + t` carry activation epoch `e`, and every wave of epoch `e` streams weight epoch `e` as its B tile (`gemm_array::ArrayDesign::pack_in_per_mw`, a host-layout-only extension). Core programs, routes, descriptors and TXN are unchanged. The output is `C_e[e][t][feature]` int32.
 
 - The inputs are the hipfire-native buffers. The host packer expands nibbles to the int8 the V8 core consumes, applying the rebias, so the integers are identical and nothing about precision changes. Core-side int4 unpack (`VLDB.UNPACK` exists) would save 64 KiB of the 1.125 MiB moved per wave, which is not the binding resource (see §4).
 - CLI: `npu-gemm TOKENS FEATURES K --variant V8 --epi i32 --iu4-epochs`. Every checked submit compares all partials with `iu4::partials`.
 
-**Simulator** (exact PDI/TXN interpreter, `crates/pm-npu/tests/iu4_epochs.rs`, log `logs/dense27b/sim-iu4-epochs.log`): exact for 512²×256 (Fast and Slow control), 300×700×512 (token/feature padding), 1024³ (32 waves, two token blocks per epoch), and 3 submits with different operands on one context. All runs include the extreme partials +8192 and −7168. The CPU fold of the NPU partials is bit-identical to the fold of the CPU partials.
+**Simulator** (exact PDI/TXN interpreter, `crates/peacemaker-npu/tests/iu4_epochs.rs`, log `logs/dense27b/sim-iu4-epochs.log`): exact for 512²×256 (Fast and Slow control), 300×700×512 (token/feature padding), 1024³ (32 waves, two token blocks per epoch), and 3 submits with different operands on one context. All runs include the extreme partials +8192 and −7168. The CPU fold of the NPU partials is bit-identical to the fold of the CPU partials.
 
 **Silicon** (measured, window w1, `logs/dense27b/w1-be0be55.log`, 2026-10-02 23:39 UTC, fclk pinned, kernel log clean): 0 mismatches in every checked submit.
 
@@ -106,9 +116,9 @@ Constraints hit: V9 (`K ≤ 3456`) and V10 (`kc·(2+NW) ≤ 112`) admit no 27B s
 
 ## 5. Can the NPU do the f32 fold exactly? Lane-level models
 
-`crates/pm-npu/src/kernels/iu4_fold_model.rs`, log `logs/dense27b/fold-model.log`.
+`crates/peacemaker-npu/src/kernels/iu4_fold_model.rs`, log `logs/dense27b/fold-model.log`.
 
-Both models compute `t = RN(sc·d)` then `fma(t, C, s)` from AIE2P lane primitives only, and charge each primitive to its VLIW slot (`crates/pm-npu/src/isa/gen.rs`):
+Both models compute `t = RN(sc·d)` then `fma(t, C, s)` from AIE2P lane primitives only, and charge each primitive to its VLIW slot (`crates/peacemaker-npu/src/isa/gen.rs`):
 - **Mv**: `vadd/vsub.32`, `vband`, `vbor`, `vlt/vge/veqz`, `vsel`, `vabs`, `vmov`, `vups`; 16 i32 lanes, one per bundle.
 - **St**: `vsrs` with a scalar shift and conv-even rounding.
 - **Vec**: `vmul` 32×16 into 64-bit lanes, accumulator `vadd/vsub`, fp32-accumulator `vadd.f/vsub.f/vmul.f` (bf16 inputs only). This slot is shared with the GEMM's VMAC.
@@ -129,7 +139,7 @@ Lanes outside a fast path are flagged to a scalar fallback, and the fallback res
 
 The GEMM itself costs **0.331 cycles per output-epoch** per core (measured 1357 cycles per 128×64×64 chunk). The exact fold therefore costs **4.2–5.5×** the GEMM with the float-assisted path, ~3.7× with a perfect Mv/Vec rebalance, and ≥ 23× integer-only. None reaches ≤ 3×.
 
-The float-assisted path also **assumes** the fp32-accumulator add is IEEE RNE on silicon, which is unverified. The probe is not run, pending a declaration to Main.
+The float-assisted path also **assumes** the fp32-accumulator add is IEEE RNE on silicon, which is unverified. The probe is not run, pending a project decision.
 
 NPU core rate with the fold (ESTIMATE) = 32 · 1.8 GHz · 256 / cycles: **8.1 / 10.7 / 12.0 TOPS** (16-lane / 32-lane / balanced).
 
@@ -170,7 +180,7 @@ The raw (not drift-corrected) α curve shifts every row by ≤ 0.3 %. Break-even
 
 ## 8. Verdict
 
-**KILL the end-to-end co-op prototype under the current bit-exact contract** (accepted by Main 2026-10-03).
+**KILL the end-to-end co-op prototype under the current bit-exact contract** (accepted 2026-10-03).
 - Parity holds only for the int32 partials. They are measured-exact on silicon but write-bound at 3.3 TOPS, and the GPU cannot afford to read them.
 - An exact NPU-side fold costs 4–5.5× the GEMM (≥ 23× without fp hardware) and rests on an unverified fp32-accumulator RNE assumption.
 - The best modelled exact gain is +1 to +3 % of a pp8192 step. Getting it would require:
@@ -180,7 +190,7 @@ The raw (not drift-corrected) α curve shifts every row by ≤ 0.3 %. Break-even
   - a split SiLU pass,
   - GPU-driven sync.
 
-The fp32-accumulator probe and a Flash-Next small-M window were dropped (Main; NpuLevers measured those shapes in its w5).
+The fp32-accumulator probe and a Flash-Next small-M window were dropped (project decision; the levers study measured those shapes in its w5, see `report.md`).
 
 ## 9. What a fold-contract change would have to look like (design note; no hipfire edit)
 
@@ -214,14 +224,14 @@ With the NPU at 19–22 TOPS, the §7 model gives **step 6311–6490 ms, 1262–
 3. **Parity.** CPU model of IEF, then the NPU kernel on the exact simulator, bit-exact vs the GPU on captured real tiles of every GEMM type including the ADD and split epilogues. Then one ≤ 90 s silicon window comparing NPU bytes with GPU bytes.
 4. **Co-op prototype** (relay sync first), with the derate re-measured. §6 is drift-flagged, so it needs a thermally stable protocol: interleaved alone/concurrent pairs and a cool-down. GO if the measured step gain is ≥ 3 % net of every extra pass.
 
-IEF changes the GPU numerics of a shipped route, so it needs user approval before any hipfire work. Main is taking it to the user.
+IEF changes the GPU numerics of a shipped route, so it needs user approval before any hipfire work. Escalated for a user decision.
 
 ## 10. Files
 
-- `crates/pm-npu/src/kernels/iu4.rs`: contract, CPU reference, `EpochGemm`.
-- `crates/pm-npu/src/kernels/iu4_fold_model.rs`: fold lane models.
-- `crates/pm-npu/src/kernels/gemm_array.rs`: `pack_in_per_mw`, `wave_m`.
-- `crates/pm-npu/tests/iu4_epochs.rs`.
+- `crates/peacemaker-npu/src/kernels/iu4.rs`: contract, CPU reference, `EpochGemm`.
+- `crates/peacemaker-npu/src/kernels/iu4_fold_model.rs`: fold lane models.
+- `crates/peacemaker-npu/src/kernels/gemm_array.rs`: `pack_in_per_mw`, `wave_m`.
+- `crates/peacemaker-npu/tests/iu4_epochs.rs`.
 - `npu-gemm`: `--iu4-epochs`, `--gap-us`.
 - `tools/npu/npu-dense27b-w1.sh`, `tools/npu/npu-dense27b-m4.sh`.
-- Logs: `logs/dense27b/`.
+- Logs: `logs/dense27b/` (workspace-local, not in this repository).

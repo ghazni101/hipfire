@@ -174,7 +174,7 @@ pub(crate) enum QuantType {
     // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
     // See findings/prismml-q2_0-layout.md.
     BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
-    // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
+    // (exactly 1.125 bpw = 18 B * 8 / 128 weights). [FP16 d][16B sign bits], bit set for +d.
     /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
     /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
     /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
@@ -233,8 +233,10 @@ pub(crate) enum QuantType {
     /// Each logical row is independently tiled as `ceil(K/128)` groups; every
     /// group is 68 B: `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)`
     /// 64 B low-nibble-even packed payload. The final partial group is zero
-    /// padded before FWHT. This is a CPU/wire format only until a dedicated
-    /// GPU decoder is implemented; it must never be interpreted as qt=44 or
+    /// padded before FWHT. Loaded and decoded on GPU (`gemv_mq4g128v2*`
+    /// kernels); it is the Flash-Next routed-expert down_proj role
+    /// (`ROUTED_DOWN_DTYPE` in hipfire-arch-qwen4). Exactly 4.25 bpw
+    /// (68 B * 8 / 128 weights). It must never be interpreted as qt=44 or
     /// the legacy MQ4G128.
     MQ4G128V2 = 53,
 }

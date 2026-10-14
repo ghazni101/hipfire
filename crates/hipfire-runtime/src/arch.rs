@@ -155,6 +155,24 @@ pub trait Architecture: Send + 'static {
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String>;
 
+    /// [`Self::load_weights`] with the partial-offload placement the loader
+    /// resolved before its first allocation.
+    ///
+    /// The default ignores the placement and loads fully resident, which keeps
+    /// every arch that has not adopted the storage seam unchanged; an arch whose
+    /// loader can place layers or routed experts in host RAM overrides it. A
+    /// `None` placement means the caller has no measured capacity to place
+    /// against, and must behave exactly like a fully resident load.
+    #[allow(unused_variables)]
+    fn load_weights_with_placement(
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
+        placement: Option<&crate::offload::Placement>,
+    ) -> Result<Self::Weights, String> {
+        Self::load_weights(hfq, cfg, gpu)
+    }
+
     /// Allocate per-decode GPU scratch for this arch.
     ///
     /// Returns the `State` object the daemon's generation loop holds
@@ -182,7 +200,6 @@ pub trait Architecture: Send + 'static {
     // the trait is intentionally minimal — just enough scaffolding for
     // a canary arch crate to implement and the runtime to type-check.
 
-
     /// Override EOS handling for this arch. Default uses ChatML
     /// `<|im_end|>` plus the `<think>` strip policy from runtime.
     ///
@@ -193,7 +210,6 @@ pub trait Architecture: Send + 'static {
         EosFilterOverrides::default()
     }
 }
-
 
 /// Per-arch overrides for EOS / end-of-turn filtering.
 ///

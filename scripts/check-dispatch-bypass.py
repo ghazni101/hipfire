@@ -49,7 +49,7 @@ TABLE = "docs/governance/debt-dispatch-bypass.txt"
 # bearing: rustfmt breaks a long method chain onto its own line, so the
 # adjacent form `gpu.gemv_...` only matches the calls short enough for the
 # formatter to keep on one line. Measured 2026-10-12: the adjacent form
-# undercounted the tree by 56 calls (307 vs 363), every one a genuine
+# undercounted the tree by 51 calls (306 vs 357), every one a genuine
 # `gpu\n    .gemm_*` inside a match arm, across seven crates. `\s*` cannot skip
 # intervening non-whitespace, so `gpu.alloc_tensor(..)` followed later by
 # `.gemm_x()` still does not match.

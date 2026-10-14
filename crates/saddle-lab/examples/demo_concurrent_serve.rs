@@ -221,6 +221,7 @@ fn main() {
     let footprint = ModelFootprint {
         weights_bytes: weight_bytes,
         kv_bytes_per_token,
+        pinned_host_bytes: 0,
     };
     println!(
         "\nAdmissionController footprint (measured, this model): weights={:.2} GiB, \

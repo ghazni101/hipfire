@@ -1,8 +1,27 @@
 # Spec: LFM2.5-VL-3B — `mq4v2` quantization + vision support on arch 11
 
-Status: DRAFT (implementation branch `feat/lfm2-vl`; sibling arch-5 carrier
-on `feat/qwen35-vl`)
-Author: engineering (hipfire agent)
+> **Lifecycle: historical (design and bring-up record).** Retained for
+> provenance of the 2026-08 arch-11 LFM2.5-VL carrier work. It is **not**
+> current procedure, product authority, or acceptance: the §6 acceptance
+> criteria and the §7 file list are the original plan, not a live gate, and
+> the `pipeline.rs` / `lfm2moe.rs` line numbers cited below refer to the
+> bring-up branch and are not maintained. Current behavior is defined by the
+> code (`crates/hipfire-quantize/src/pipeline.rs`,
+> `crates/hipfire-quantize/src/model_filter.rs`,
+> `crates/hipfire-runtime/src/arch_mapping.rs` `lfm2_vl` → 11,
+> `crates/hipfire-arch-lfm2moe/src/lfm2moe.rs` qt 44 → `MQ4G256V2`,
+> `crates/hipfire-arch-lfm2-vl/`), by
+> [`architecture-ids.md`](architecture-ids.md) (arch 11), by
+> [`specs/2026-08-27-lfm2-vl-vision-runtime.md`](specs/2026-08-27-lfm2-vl-vision-runtime.md),
+> and by [`VALIDATION.md`](VALIDATION.md) for any VL claim route (route
+> existence is not per-checkpoint evidence). The §4 metadata contract is a
+> historical statement of the plan; see the sibling record
+> [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md).
+
+Status at the time: DRAFT (implementation branch `feat/lfm2-vl`; sibling
+arch-5 carrier on `feat/qwen35-vl`). The `hipfire-arch-lfm2-vl` crate this
+draft proposed as "new" is now in-tree.
+Author: engineering
 Target checkpoint: `LiquidAI/LFM2.5-VL-3B` (`model_type: lfm2_vl`)
 
 > **As-built on `feat/lfm2-vl` (2026-08-27):** the §2 quantizer recipe is
@@ -72,7 +91,7 @@ tower is a SigLIP-2 ViT — the *same family* as LFM2.5-VL's encoder (SigLIP2 Na
 > **As-built correction (2026-08-26):** the quantizer routes all norms
 > (`embedding_norm`, `ffn_norm`, `operator_norm`, `{q,k}_layernorm`) to
 > **Q8F16**, not F16 as the table above planned — verified in the census of
-> `~/.hipfire/models/lfm2.5-vl-3b.mq4v2.hfq` (99 Q8F16 tensors, 441 F16 =
+> `lfm2.5-vl-3b.mq4v2.hfq` (local build; 99 Q8F16 tensors, 441 F16 =
 > vision+projector only). The table reflects the original plan; the artifact
 > is authoritative.
 

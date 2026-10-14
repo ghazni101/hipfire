@@ -101,7 +101,7 @@ fn run()->Result<()> {let mut args=std::env::args().skip(1);let dir=PathBuf::fro
     }
     #[test]fn gated_modules_have_semantic_rows(){
         let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
-        for module in ["qsa_gather_pm_gfx1151.hxaco","qsa_gather_pm_gfx1201.hxaco","qwen4_moe_iu4_sym_pm_gfx1151.hxaco","qwen4_moe_iu4_sym_pm_gfx1201.hxaco"] {
+        for module in ["dflash_sampled_accept_pm_gfx1201.hxaco","qsa_gather_pm_gfx1151.hxaco","qsa_gather_pm_gfx1201.hxaco","qwen4_moe_iu4_sym_pm_gfx1151.hxaco","qwen4_moe_iu4_sym_pm_gfx1201.hxaco"] {
             let bytes=fs::read(root.join(module)).unwrap();
             let p=peacemaker_lift::lift_object(&bytes,peacemaker_lift::Options{frontend:Frontend::Builder}).unwrap().program;
             for k in &p.kernels {for id in &k.body.layout {

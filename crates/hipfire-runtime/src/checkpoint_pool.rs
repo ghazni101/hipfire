@@ -33,8 +33,6 @@ pub trait CheckpointBlob {
     fn bytes_len(&self) -> u64;
 }
 
-
-
 // ───────────────────────────────────────────────────────────────────────────
 // Pool entry
 // ───────────────────────────────────────────────────────────────────────────
@@ -291,11 +289,12 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         })
     }
 
-    /// Evict the oldest unpinned entry and return its blob for the caller
-    /// to free. `None` when the pool is empty or every entry is pinned.
-    pub fn pop_lru(&mut self) -> Option<B> {
+    /// Evict the oldest unpinned entry and return its key and blob for the
+    /// caller to free. `None` when the pool is empty or every entry is pinned.
+    pub fn pop_lru(&mut self) -> Option<(CheckpointKey, B)> {
         let key = self.find_oldest_unpinned_key()?;
-        self.evict_internal(key)
+        let blob = self.evict_internal(key.clone())?;
+        Some((key, blob))
     }
 
     /// Explicitly evict the checkpoint at `(domain, p, fp)`.
@@ -1404,7 +1403,7 @@ mod tests {
             pool.insert(d.clone(), p, p, HostBlob { bytes: 100 });
         }
         assert!(pool.pin(&d, 128, 128));
-        assert_eq!(pool.pop_lru().map(|blob| blob.bytes), Some(100));
+        assert_eq!(pool.pop_lru().map(|(_, blob)| blob.bytes), Some(100));
         assert!(
             !pool.contains(&d, 256, 256),
             "oldest unpinned (256) goes first"

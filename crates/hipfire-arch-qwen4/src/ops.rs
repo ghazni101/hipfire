@@ -9,6 +9,7 @@
 //! policy.  GPU lowering consumes the same shape/ordering contracts through the
 //! Qwen4-specific dispatch and compute modules.
 
+use rdna_compute::rope::Rope;
 use crate::state::{ReferenceGdnLayerState, StateError};
 use std::cmp::Ordering;
 use std::fmt;
@@ -458,22 +459,24 @@ fn l2_norm(values: &[f32]) -> Vec<f32> {
 
 /// Prefix-HalfSplit RoPE.  The rotated half is the first `rotary_dim` values;
 /// each half is rotated against its corresponding partner, not interleaved
-/// adjacent pairs.
+/// adjacent pairs.  `rope` scaling follows the QSA kernels' f32 order
+/// ([`rdna_compute::rope::RopeYarn::sin_cos`]); unscaled is plain RoPE.
 pub fn rope_prefix_halfsplit(
     values: &mut [f32],
     position: usize,
     rotary_dim: usize,
-    theta: f32,
+    rope: Rope,
 ) -> Result<(), OpError> {
     if rotary_dim % 2 != 0 || rotary_dim > values.len() {
         return Err(OpError::Shape("Prefix-HalfSplit rotary dimension"));
     }
+    let (theta, yarn) = (rope.theta as f32, rope.yarn(rotary_dim));
     let half = rotary_dim / 2;
     for i in 0..half {
         let exponent = (2 * i) as f32 / rotary_dim as f32;
         let inv_freq = theta.powf(-exponent);
         let angle = position as f32 * inv_freq;
-        let (sin, cos) = angle.sin_cos();
+        let (sin, cos) = yarn.sin_cos(angle, i);
         let left = values[i];
         let right = values[i + half];
         values[i] = left * cos - right * sin;
@@ -489,7 +492,7 @@ pub fn qsa_pool_block(
     block_size: usize,
     block_start: usize,
     head_dim: usize,
-    rope_theta: f32,
+    rope: Rope,
 ) -> Result<Vec<f32>, OpError> {
     if block_size == 0 || keys.len() != block_size * head_dim {
         return Err(OpError::Shape("QSA pool block"));
@@ -505,7 +508,7 @@ pub fn qsa_pool_block(
     for value in &mut pooled {
         *value *= inv;
     }
-    rope_prefix_halfsplit(&mut pooled, block_start, head_dim.min(64), rope_theta)?;
+    rope_prefix_halfsplit(&mut pooled, block_start, head_dim.min(64), rope)?;
     Ok(pooled)
 }
 
@@ -759,9 +762,38 @@ mod tests {
     #[test]
     fn prefix_halfsplit_rotates_partner_halves() {
         let mut values = [1.0, 0.0, 0.0, 1.0];
-        rope_prefix_halfsplit(&mut values, 1, 4, 10_000.0).unwrap();
+        let rope = Rope {
+            theta: 10_000.0,
+            scaling: rdna_compute::rope::RopeScaling::None,
+        };
+        rope_prefix_halfsplit(&mut values, 1, 4, rope).unwrap();
         assert!(values.iter().all(|value| value.is_finite()));
         assert_ne!(values, [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// The host reference under YaRN follows HF's scaled inverse frequencies
+    /// (Qwen3.8 README override) at a position past the native context.
+    #[test]
+    fn prefix_halfsplit_yarn_matches_hf_inverse_frequencies() {
+        use rdna_compute::rope::{RopeScaling, Yarn};
+        let rope = Rope {
+            theta: 10_000_000.0,
+            scaling: RopeScaling::Yarn(Yarn::new(4.0, 262_144, None, None, None, None)),
+        };
+        let (position, dim) = (300_001usize, 64usize);
+        let input: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let mut values = input.clone();
+        rope_prefix_halfsplit(&mut values, position, dim, rope).unwrap();
+        let (inv_freq, mscale) = rope.inv_freq(dim);
+        for (i, freq) in inv_freq.iter().enumerate() {
+            let (sin, cos) = (position as f64 * freq).sin_cos();
+            let (l, r) = (input[i] as f64, input[i + dim / 2] as f64);
+            let want = [(l * cos - r * sin) * mscale, (l * sin + r * cos) * mscale];
+            for (got, want) in [values[i], values[i + dim / 2]].into_iter().zip(want) {
+                // f32 angles near 3e5 rad carry ~0.03 rad of rounding.
+                assert!((got as f64 - want).abs() < 0.05, "pair {i}: {got} vs {want}");
+            }
+        }
     }
 
     #[test]

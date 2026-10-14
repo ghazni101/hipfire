@@ -14,6 +14,16 @@ pub fn f32_to_f16(x:u32)->u16 {
     let he=e-112;if he>=31{return sign|0x7c00;}if he<=0 {if he < -10{return sign;}return sign|rne(f|0x800000,(14-he)as u32)as u16;}
     sign|(((he as u32)<<10)+rne(f,13))as u16
 }
+/// binary32 to binary16 rounding toward zero (`v_cvt_pk_rtz_f16_f32`): the mantissa is truncated, a finite
+/// magnitude above the largest half gives the largest finite half rather than infinity, infinity stays infinity.
+/// A NaN input keeps the payload convention of [`f32_to_f16`]; callers decide whether NaN is qualified.
+pub fn f32_to_f16_rtz(x:u32)->u16 {
+    let sign=((x>>16)&0x8000)as u16;let e=((x>>23)&255)as i32;let f=x&0x7fffff;
+    if e==255{return sign|0x7c00|if f==0{0}else{((f>>13)as u16)|0x200};}
+    let he=e-112;if he>=31{return sign|0x7bff;}
+    if he<=0{if he< -10{return sign;}return sign|((f|0x800000)>>(14-he))as u16;}
+    sign|(((he as u32)<<10)|(f>>13))as u16
+}
 pub fn f32_to_bf16(x:u32)->u16 {if x&0x7fffffff>0x7f800000 {((x>>16)|0x40)as u16}else{(x.wrapping_add(0x7fff+((x>>16)&1))>>16)as u16}}
 /// AMD gfx12 OCP E4M3: finite top exponent, signed zero, canonical NaN.
 pub fn fp8_to_f32(x:u8)->u32 {

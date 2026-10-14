@@ -134,6 +134,11 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k,
+        mtp_mode: if mtp_k > 0 {
+            hipfire_config::MtpMode::Auto
+        } else {
+            hipfire_config::MtpMode::Off
+        },
         kv_mode_raw: String::new(),
         kv_backend: "legacy".to_string(),
         prefix_cache: true,
@@ -331,6 +336,11 @@ fn main() {
                     is_vl: false,
                     vl_path: None,
                     mtp_k,
+                    mtp_mode: if mtp_k > 0 {
+                        hipfire_config::MtpMode::Auto
+                    } else {
+                        hipfire_config::MtpMode::Off
+                    },
                     kv_mode_raw: String::new(),
                     kv_backend: "legacy".to_string(),
                     prefix_cache: true,
@@ -482,6 +492,11 @@ fn main() {
             is_vl: false,
             vl_path: None,
             mtp_k,
+            mtp_mode: if mtp_k > 0 {
+                hipfire_config::MtpMode::Auto
+            } else {
+                hipfire_config::MtpMode::Off
+            },
             kv_mode_raw: String::new(),
             kv_backend: "legacy".to_string(),
             prefix_cache: true,

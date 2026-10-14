@@ -70,15 +70,26 @@ port, the CLI prints `port N is still in use by a process that is not this
 install's hipfire; not killing it`. `--all` also runs `pkill -f` against
 release quantize binaries.
 
-Flags (also accepted by `restart`):
+Flags (also accepted by `restart`). In detached mode (`-d`) the parent forwards
+these to the foreground child as CLI arguments; none of them is turned into an
+environment variable.
 
 | Flag | Effect |
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
+| `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
+| `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
-| `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
-| `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
-| `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |
+| `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |
+| `--kv-backend legacy\|vmm` | KV storage backend for models this service loads |
+| `--max-seq N` | KV context for every load, within the `memory.max_seq` bounds (512..1048576); overrides the configured/automatic context |
+| `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
+| `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
+| `--tp N` | Tensor/expert-parallel degree (1..64) |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
+| `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
+| `--ui` | Serve the embedded chat UI (see below) |
+| `--open` | Open the chat UI in the default browser once serving; implies `--ui` |
 
 Positional forms: `[model] [host] [port]`, or `host:port` / `[ipv6]:port`.
 Without a model arg, pre-warm uses `HIPFIRE_MODEL` if set, else
@@ -95,6 +106,20 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
+   A failure the config itself decides — a load-time refusal such as
+   `dflash_mode=on` with no DFlash draft and no MTP head — is not transient:
+   every later request reloads and is refused the same way, while `/health`
+   still answers `ok`. Fix the config (or pass `developer.dflash_draft`)
+   rather than retrying. The same holds for the partial-offload refusals, each
+   of which names its knob on screen: a pinned `memory.gpu_layer_budget` /
+   `memory.moe_expert_budget` placement that does not fit device weights, a
+   spill that exceeds pinned host RAM (+ 4 GiB headroom) or the GTT
+   `pages_limit`, an unpackable host-placed expert layer (neither the uniform
+   nor the graded packer applies), host-placed packed AWQ experts under
+   `memory.offload_exec=cpu`, a configured spill on a non-spillable load
+   (`tp > 1`, `pp > 1`, EP, VL tower, paged experts, REAP keep-map, or a
+   non-Qwen3.5 arch), and `memory.offload_exec=cpu` together with a
+   retained-replay (Redline) backend.
    Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
    engine is its only backend, so a failed pre-warm (for example, slot-engine
    allocations that do not fit beside another process on the card) logs the
@@ -156,7 +181,20 @@ Config and env owners for bind, idle, queue, and body limits:
    concurrent 9-token queries go from 100 ms serial (80 req/s) to 19 ms
    (**416 req/s, 5.2x**) in a single 72-row forward. 2 slots matched serial in
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
-   1–4 of 4 prompts. A waiter that is still queued after `serve.queue_timeout_ms`
+   1–4 of 4 prompts.
+
+   The **embedding** route (arch 17) uses the same switch with a different
+   engine behind it: `POST /v1/embeddings` requests arriving together are
+   served as **one batched forward** rather than one at a time, and because the
+   encoder is deterministic (no KV, GDN state reset per sequence) that batch is
+   **bit-identical** to encoding each input alone — batching is a throughput
+   choice there, never an output change (`scripts/check_embed_multislot.py`
+   checks it bit-for-bit). `serve.multi_slot_slots` is the number of requests
+   one forward may hold and `serve.max_batch_tokens` its row budget; an
+   isolated request pays only the collector's window
+   (`HIPFIRE_EMBED_BATCH_WINDOW_US`, default 2 ms). Measured on gfx1101, eight
+   concurrent 9-token queries: 96 ms serial (83 req/s) against a 16 ms
+   concurrent batch (501 req/s, **6.0x**) — all eight in one forward. A waiter that is still queued after `serve.queue_timeout_ms`
    (default 10 minutes, long enough for one full generation; `0` waits
    forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,
@@ -183,13 +221,16 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native`, `capabilities` |
-| `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
-| `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
+| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`; `503` unless `status` is `ok` |
+| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture` |
+| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
+| `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
 | `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
 | `POST` | `/v1/responses` | OpenAI Responses API (stream or non-stream), adapted onto chat completions |
-| `GET` | `/ui`, `/ui/*` | Embedded chat UI (opt-in; see below) |
+| `POST` | `/v1/images/generations` | OpenAI-shaped image generation on the resident FLUX checkpoint; see below |
+| `POST` | `/v1/images/edits` | Reference-image edit (multipart, FLUX.2 Klein); see below |
+| `GET` | `/`, `/ui`, `/ui/`, `/ui/index.html`, `/ui/app.js`, `/ui/db.js`, `/ui/render.js`, `/ui/style.css` | Embedded chat UI (opt-in; see below). Exactly these paths: `/` redirects (302) to `/ui`; other `/ui/...` paths are `404` |
 
 There is **no** `/v1/completions` route in the current CLI serve.
 
@@ -221,7 +262,12 @@ multi-slot serve could not load its model (pre-warm, or the reload after a
 respawn), after which serve exits 1 so a service manager can restart it.
 `model` is the loaded tag/path or `null` when idle/unloaded or after a failed
 model switch; `loading_model` names an asynchronous pre-warm or post-restart
-reload.
+reload. `token` is a per-process instance token. `n_ctx` is the `max_seq` the
+resident model was loaded with (`null` while none is resident).
+`reasoning_contract`, `reasoning_effort_native` and `reasoning_efforts`
+publish the resident model's reasoning capability (see the reasoning contract
+below). All of these come from serve's own metadata, so `/health` never waits
+on a model load.
 
 Model switch lifecycle: a load request is first admitted read-only; a refused
 admission leaves the prior model (and its drafter) loaded. Once admitted, a
@@ -238,6 +284,38 @@ next load's clean-VMM check starts from zero owners in either swap direction.
 # Loopback example (safe default for local smoke):
 curl -s http://127.0.0.1:11435/health
 ```
+
+### `GET /metrics`
+
+Prometheus text format, read from gateway counters and `ServeMeta`, so a
+scrape never waits on a model load. Token counts, throughput and tau come
+from the daemon's `done` event and are recorded only when that event carries
+the field: a route that does not report one adds nothing, never a zero.
+TTFT, latency and TPOT are measured at the gateway.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `hipfire_requests_total` | counter | Completed chat and image requests |
+| `hipfire_requests_failed_total` | counter | Requests answered with an error, or whose stream ended in one |
+| `hipfire_admission_rejected_total` | counter | Requests refused by admission (queue full or wait timed out) |
+| `hipfire_prompt_tokens_total` | counter | `done.prompt_tokens` (`prefill_tokens + cached_tokens` if absent, as in `usage`) |
+| `hipfire_completion_tokens_total` | counter | `done.tokens` (`done.completion_tokens` if absent) |
+| `hipfire_cached_prompt_tokens_total` | counter | `done.cached_tokens` |
+| `hipfire_retries_total`, `hipfire_retries_succeeded_total` | counter | Transient-failure retries attempted / that then completed |
+| `hipfire_queue_depth`, `hipfire_queue_capacity` | gauge | Requests in flight or queued; admission capacity |
+| `hipfire_uptime_seconds` | gauge | Seconds since serve started |
+| `hipfire_engine_up` | gauge | 1 while the daemon is up, 0 while restarting or unhealthy |
+| `hipfire_model_loading` | gauge | 1 while a model load is in progress |
+| `hipfire_context_capacity_tokens` | gauge | Context the resident model was loaded with (0 when none) |
+| `hipfire_model_info{model="…"}` | gauge | 1 for the resident model; no sample when none is resident |
+| `hipfire_ttft_milliseconds` | histogram | Time to first generated token (reasoning included), chat requests |
+| `hipfire_request_latency_milliseconds` | histogram | Wall time, chat and image requests |
+| `hipfire_time_per_output_token_milliseconds` | histogram | `(latency − ttft) / (tokens − 1)`; requests with at least 2 tokens |
+| `hipfire_decode_tokens_per_second`, `hipfire_prefill_tokens_per_second` | histogram | `done.decode_tok_s` (`done.tok_s` if absent), `done.prefill_tok_s` |
+| `hipfire_spec_tau` | summary (`_sum`/`_count`) | `done.tau`, speculative routes only |
+
+Buckets: TTFT and latency `10 … 60000` ms; TPOT `2 … 500` ms; throughput
+`1 … 5000` tok/s.
 
 ### `POST /v1/chat/completions`
 
@@ -436,19 +514,22 @@ with chat's status mapping.
 
 ### `POST /v1/images/generations`
 
-OpenAI-shaped image generation on a loaded diffusion checkpoint (arch 40
-FLUX.1, arch 45 FLUX.2 Klein). Body fields: `model` (must already be loaded on
-this server), `prompt`, optional `width` /
-`height` (or OpenAI `size: "WxH"`), `steps` (defaults to the architecture
-default: 4 for `flux.schnell`, 28 for `flux.dev`), `seed`, `n` (must be 1),
-`response_format` (must be `b64_json`). References the same denoise path as the
-`img_generate` daemon message (`hipfire img`).
+OpenAI-shaped image generation on the **resident** diffusion checkpoint (arch 40
+FLUX.1, arch 45 FLUX.2 Klein). Serve does not switch models for this route:
+load the checkpoint first, and `model` is only echoed back in the response
+(it is not a selector). Body fields: `prompt` (required), optional `width` /
+`height` (or OpenAI `size: "WxH"`, which wins), `steps` (architecture default
+when omitted: 4 for `flux.schnell`, 28 for `flux.dev`), `seed`, `n` (must be
+1), `response_format` (must be `b64_json`), and the daemon-validated
+`sampler` (euler flow-match only), `negative_prompt` and `backend`
+(`cpu` or `gpu`). Same denoise path as the `img_generate` daemon message
+(`hipfire img`). Image requests share the admission queue with chat.
 
 ```json
 {"model": "flux.schnell:1", "prompt": "a tiny lighthouse on a rock, sunset", "size": "512x512", "response_format": "b64_json"}
 ```
 
-Response: `{ "data": [ { "b64_json": "…", "width": 512, "height": 512, "seed": 0, "steps": 4 } ], "model": "…", "hipfire": { "ms": 1234 } }`.
+Response: `{ "created": 1790000000, "model": "<loaded model path>", "data": [ { "b64_json": "…", "size": "512x512" } ], "hipfire": { "seed": 0, "steps": 4, "width": 512, "height": 512, "ms": 1234 } }`.
 
 This body takes no image input. A request with an `images` field is refused
 with a 400 that points at `/v1/images/edits`.
@@ -456,18 +537,20 @@ with a 400 that points at `/v1/images/edits`.
 ### `POST /v1/images/edits`
 
 OpenAI-shaped reference edit (FLUX.2 Klein, arch 45 only): `multipart/form-data`
-with one to four `image` file parts (PNG or JPEG, at most 32 MB each after
-upload) plus the text fields of `/v1/images/generations` (`prompt` required;
-`size`, `steps`, `seed`, `n`, `response_format`). The image bytes travel in
-the request; the server never reads a file the client names. Each reference
-is area-capped at 1 MP and floored to a multiple of 16, and conditions every
-denoise step without being denoised. Without `size` the output takes the
-first reference's size. The whole body counts against `serve.max_request_bytes`.
+with one to four `image` file parts (repeat the part; `image[]` is also
+accepted; PNG or JPEG, at most 32 MiB each) plus the text fields of
+`/v1/images/generations` (`prompt` required; `size`, `width`, `height`,
+`steps`, `seed`, `n`, `response_format`). Numeric fields must be non-negative
+integers. The image bytes travel in the request; the server never reads a file
+the client names. Each reference is area-capped at 1 MP and floored to a
+multiple of 16, and conditions every denoise step without being denoised.
+Without `size` the output takes the first reference's size. The whole body
+counts against `serve.max_request_bytes`.
 
 ```bash
-curl -s -X POST http://127.0.0.1:11580/v1/images/edits \
-  -F image=.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
-  | jq -r .data[0].b64_json | base64 -d > bike-blue.png
+curl -s -X POST http://127.0.0.1:11435/v1/images/edits \
+  -F image=@bike.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
+  | jq -r '.data[0].b64_json' | base64 -d > bike-blue.png
 ```
 
 Response: the same shape as `/v1/images/generations`.
@@ -489,6 +572,11 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
   positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
   Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
   are dropped+warned.
+- A request that omits effort (or sends `auto`) on Qwen3.8 or Ornith 1.5 defers to
+  configured effort, and if none is set resolves to hipfire's `medium` default (the
+  official template default is `xhigh`). An explicit non-`auto` `reasoning_effort` /
+  `reasoning.effort` in the request wins, so `"xhigh"` restores the old behavior.
+  Thinking off drops the effort. This default does not imply a cap.
 
 **Examples:**
 
@@ -500,14 +588,14 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "chat_template_kwargs": {"enable_thinking": false}
 }'
 
-# Qwen3.8 — semantic effort only (still uncapped unless max_think_tokens is set)
+# Qwen3.8 — semantic effort only; omitted/auto resolves to medium, xhigh is explicit (still uncapped unless max_think_tokens is set)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3.8:27b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
-  "reasoning_effort": "medium"
+  "reasoning_effort": "xhigh"
 }'
 
-# Ornith 1.5 — Qwen3.8-compatible semantic effort (default xhigh; still uncapped unless max_think_tokens)
+# Ornith 1.5 — Qwen3.8-compatible semantic effort (omitted/auto resolves to medium; still uncapped unless max_think_tokens)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "ornith-1.5:35b-a3b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
@@ -570,9 +658,9 @@ a silently truncated `200`. Non-streaming failures keep the typed
 status mapping (`400` request/config, `503` + `Retry-After` overload or
 transient, `500` internal).
 
-Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
-`deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
-LCP can hit. Other arches reset every request (stateless OpenAI shape).
+Loads whose ack reports `cache_capable: true`, or whose route is continuous-batch
+capable, skip the per-request `reset` so multi-turn longest-common-prefix reuse
+can hit. Other loads reset every request (stateless OpenAI shape).
 
 ### Client notes (Zed / OpenAI-compatible agents)
 

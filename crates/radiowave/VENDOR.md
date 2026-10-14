@@ -51,10 +51,11 @@ next re-vendor will silently revert it.
 | `src/union.rs` (new), `tests/union_identity.rs` (new), `README.md` | upstream commit `e073038d6bcfac3934e3c1a62f9ec2659c3abaf2` (`feat(radiowave): add union identity records`), plus the upstream test-compat fix commit `274c196359dcc4a5f76ea41e5226cf720f5f93e4` (`test(radiowave): keep union_identity to the upstream CompileManifest API`), made **upstream first** in the private worktree `pm-union/UnionU0-upstream`, branch `pm-union-u0-20261011`, parented on upstream commit `98d35126f3b5574d845d55ad5ca01efb939a1e72`; not pushed to a remote | Byte-copied from that commit; `cmp`-identical when copied. `README.md` here was identical to the upstream README before the commit, so it re-vendors whole. |
 | `tests/downstream_peacemaker_manifest.rs` (new, **downstream-only**) | none; not in upstream | Upstream `CompileManifest` has no `peacemaker` field and upstream has no `PeacemakerRecord`, so the Peacemaker round-trip/masquerade checks live here instead of the shared `tests/union_identity.rs`. Do not send upstream; keep it when re-vendoring. |
 | `src/lib.rs`: one added line, `pub mod union;` | same upstream commit adds the identical line | **`src/lib.rs` was NOT re-vendored.** This copy still differs from upstream parent `98d3512` in unrelated ways, as do `src/main.rs`, `src/oracle.rs`, `src/recipes_fp8.rs` and three `tests/artifacts/*.json`; those differences are pre-existing and untouched. The whole crate is therefore **not** claimed identical to any single upstream commit. |
+| `src/lib.rs`: Windows executable-suffix tool lookup and its CPU-only regression test (#835, original commit `2284a98cd825415ae2391b6bfcd24b077fa3bf93`) | Upstream port not established by this review | Downstream lookup tries the bare name then the host suffix in each SDK directory. The corresponding fix still needs to land in `Kaden-Schutt/redline`; preserve it during re-vendoring until then. |
 
 The union schema is a separate serde module: `CompileManifest`,
 `PeacemakerRecord` and `OracleReceipt` (and every existing downstream user:
-`hipfire-isa`, `railgun-cert`, `rdna-compute`) are unchanged. The module is
+`peacemaker-isa`, `railgun-cert`, `rdna-compute`) are unchanged. The module is
 CPU-only and adds no dependency.
 
 To re-vendor the union module later, copy `src/union.rs`,

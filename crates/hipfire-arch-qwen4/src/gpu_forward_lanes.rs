@@ -58,7 +58,7 @@ use crate::config::LayerType;
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
     program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward,
-    Qwen4GpuForwardError, Qwen4GpuForwardScratch, DECODE_Q8_PER_LAYER, EPSILON,
+    Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::ple_stage::ple_async_upload;
 use crate::program::{
@@ -517,16 +517,18 @@ struct SegViews {
     top1: GpuTensor,
 }
 
-/// `tensor` from row `begin` of `width` elements per row to its end.
-fn rows_from(tensor: &GpuTensor, begin: usize, width: usize) -> Result<GpuTensor, Qwen4GpuForwardError> {
-    let offset = begin
-        .checked_mul(width)
-        .ok_or_else(|| invalid("lane row view offset overflows"))?;
-    let numel = tensor.numel();
-    if offset > numel {
-        return Err(invalid("lane row view starts past its scratch tensor"));
-    }
-    Ok(tensor.sub_offset(offset, numel - offset))
+/// Segment views of the scratch.  Every row-banded field comes from
+/// [`Qwen4GpuForwardScratch::segment_view`]: a dedicated field is addressed at
+/// its logical row width, a field of an alias set (compact scratch) at the row
+/// pitch of the allocation that owns its storage, so a segment occupies the
+/// same rows of the owner whichever member of the set a phase uses.
+fn seg_rows(
+    scratch: &Qwen4GpuForwardScratch,
+    field: ScratchField,
+    seg: Segment,
+    logical_width: usize,
+) -> Result<GpuTensor, Qwen4GpuForwardError> {
+    scratch.segment_view(field, seg.begin, seg.rows, logical_width)
 }
 
 impl SegViews {
@@ -555,37 +557,39 @@ impl SegViews {
             ),
             None => (view(&scratch.token_ids, 0, 0), view(&scratch.token_ids, 0, 0)),
         };
+        use ScratchField as F;
+        let rows = |field: F, width: usize| seg_rows(scratch, field, seg, width);
         Ok(Self {
-            streams: rows_from(&scratch.streams, b, wide)?,
-            hc_normalized: rows_from(&scratch.hc_normalized, b, wide)?,
-            hc_low: rows_from(&scratch.hc_low, b, dims.hc_lowrank)?,
-            hc_up: rows_from(&scratch.hc_up, b, wide)?,
-            hc_mixed: rows_from(&scratch.hc_mixed, b, hidden)?,
-            hc_gates: rows_from(&scratch.hc_gates, b, dims.hc_count)?,
-            projection: rows_from(&scratch.projection, b, dims.gdn_qkv())?,
-            projection2: rows_from(&scratch.projection2, b, dims.gdn_qkv())?,
-            gdn_a: rows_from(&scratch.gdn_a, b, value_heads)?,
-            gdn_b: rows_from(&scratch.gdn_b, b, value_heads)?,
-            gdn_gate: rows_from(&scratch.gdn_gate, b, value_heads)?,
-            gdn_beta: rows_from(&scratch.gdn_beta, b, value_heads)?,
-            gdn_recurrent_output: rows_from(&scratch.gdn_recurrent_output, b, dims.gdn_value())?,
-            gdn_z: rows_from(&scratch.gdn_z, b, dims.gdn_value())?,
-            gdn_output: rows_from(&scratch.gdn_output, b, dims.gdn_value())?,
-            qsa_index: rows_from(&scratch.qsa_index, b, dims.index_width())?,
-            qsa_qgate: rows_from(&scratch.qsa_qgate, b, 2 * dims.q_width())?,
-            qsa_k: rows_from(&scratch.qsa_k, b, dims.kv_width())?,
-            qsa_v: rows_from(&scratch.qsa_v, b, dims.kv_width())?,
-            qsa_output: rows_from(&scratch.qsa_output, b, dims.q_width())?,
-            attention_output: rows_from(&scratch.attention_output, b, hidden)?,
-            ffn_output: rows_from(&scratch.ffn_output, b, hidden)?,
+            streams: rows(F::Streams, wide)?,
+            hc_normalized: rows(F::HcNormalized, wide)?,
+            hc_low: rows(F::HcLow, dims.hc_lowrank)?,
+            hc_up: rows(F::HcUp, wide)?,
+            hc_mixed: rows(F::HcMixed, hidden)?,
+            hc_gates: rows(F::HcGates, dims.hc_count)?,
+            projection: rows(F::Projection, dims.gdn_qkv())?,
+            projection2: rows(F::Projection2, dims.gdn_qkv())?,
+            gdn_a: rows(F::GdnA, value_heads)?,
+            gdn_b: rows(F::GdnB, value_heads)?,
+            gdn_gate: rows(F::GdnGate, value_heads)?,
+            gdn_beta: rows(F::GdnBeta, value_heads)?,
+            gdn_recurrent_output: rows(F::GdnRecurrentOutput, dims.gdn_value())?,
+            gdn_z: rows(F::GdnZ, dims.gdn_value())?,
+            gdn_output: rows(F::GdnOutput, dims.gdn_value())?,
+            qsa_index: rows(F::QsaIndex, dims.index_width())?,
+            qsa_qgate: rows(F::QsaQgate, 2 * dims.q_width())?,
+            qsa_k: rows(F::QsaK, dims.kv_width())?,
+            qsa_v: rows(F::QsaV, dims.kv_width())?,
+            qsa_output: rows(F::QsaOutput, dims.q_width())?,
+            attention_output: rows(F::AttentionOutput, hidden)?,
+            ffn_output: rows(F::FfnOutput, hidden)?,
             router_logits: matrix_view(&scratch.router_logits, seg.rows, router_columns(dims))?,
-            ple_rows: rows_from(&scratch.ple_rows, b, ple_embed_dim)?,
-            ple_query: rows_from(&scratch.ple_query, b, wide)?,
-            ple_key: rows_from(&scratch.ple_key, b, wide)?,
-            ple_value: rows_from(&scratch.ple_value, b, hidden)?,
-            ple_gated: rows_from(&scratch.ple_gated, b, wide)?,
-            ple_normed: rows_from(&scratch.ple_normed, b, wide)?,
-            ple_output: rows_from(&scratch.ple_output, b, wide)?,
+            ple_rows: rows(F::PleRows, ple_embed_dim)?,
+            ple_query: rows(F::PleQuery, wide)?,
+            ple_key: rows(F::PleKey, wide)?,
+            ple_value: rows(F::PleValue, hidden)?,
+            ple_gated: rows(F::PleGated, wide)?,
+            ple_normed: rows(F::PleNormed, wide)?,
+            ple_output: rows(F::PleOutput, wide)?,
             embeddings: view(&scratch.embeddings, b * hidden, seg.rows * hidden),
             embedding_rot: view(&scratch.embedding_rot, b * hidden, seg.rows * hidden),
             token_ids: view(
@@ -806,6 +810,11 @@ fn forward_lanes_scoped(
     out: &StepOutputs<'_>,
     policy: &LaneStagePolicy,
 ) -> Result<(), Qwen4GpuForwardError> {
+    if fwd.ep_placement().is_some() {
+        return Err(invalid(
+            "lane steps do not run under expert parallelism (EP forwards are one-row decode and chunk forwards only)",
+        ));
+    }
     // Lanes are the Flash-Next route: the stage policy, row sharing and
     // decode copies are evidenced for its recipe only.
     if !bundle.config.profile.is_flash_next() {
@@ -936,7 +945,7 @@ fn forward_lanes_scoped(
                 .map(|lane| lane.state.position + lane.tokens.len())
                 .max()
                 .unwrap_or(0);
-            if let Some(qsa) = lanes[0].state.qsa.first() {
+            if let Some(qsa) = lanes[0].state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
                     qsa.format,
@@ -1388,6 +1397,7 @@ fn forward_lanes_scoped(
                                     raw_index_keys: &qsa.raw_index_keys,
                                     pooled_keys: &qsa.pooled_keys,
                                     selected_indices: &qsa.selected_indices,
+                                    f16_arena: if prefill { qsa.f16_arena_ref() } else { None },
                                     full_capacity: qsa.full_capacity,
                                     raw_capacity: qsa.raw_capacity,
                                     pooled_capacity: qsa.pooled_capacity,
@@ -1418,6 +1428,7 @@ fn forward_lanes_scoped(
                                 kv_heads: dims.num_key_value_heads,
                                 head_dim: dims.head_dim,
                                 rotary_dim: config.rotary_dim(),
+                                rope: config.rope(),
                                 input_width: dims.hidden,
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
@@ -1686,6 +1697,7 @@ fn forward_lanes_scoped(
                 state.pooled_len = pooled_len;
                 state.selected_len = selected_len;
                 state.position = position;
+                state.clamp_f16_valid();
             }
             for lane in lanes.iter_mut() {
                 for &token in lane.tokens {
@@ -1700,12 +1712,17 @@ fn forward_lanes_scoped(
             }
             Ok(())
         }
-        Err(error) => match ple.abort() {
-            Ok(_) => Err(error),
-            Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
-                "lane step failed: {error}; PLE cleanup failed: {cleanup}"
-            ))),
-        },
+        Err(error) => {
+            for lane in lanes.iter() {
+                lane.state.invalidate_f16_arenas();
+            }
+            match ple.abort() {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(Qwen4GpuForwardError::Ple(format!(
+                    "lane step failed: {error}; PLE cleanup failed: {cleanup}"
+                ))),
+            }
+        }
     }
 }
 

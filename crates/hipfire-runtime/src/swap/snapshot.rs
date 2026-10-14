@@ -499,6 +499,15 @@ mod tests {
     }
 
     #[test]
+    fn a_mismatched_kv_dtype_tag_is_refused_even_when_strides_match() {
+        for kv_dtype_tag in [11, 12, 13] {
+            let mut other = stamp();
+            other.kv_dtype_tag = kv_dtype_tag;
+            assert!(matches!(snap().validate(other), Err(SwapError::Stamp(_))));
+        }
+    }
+
+    #[test]
     fn a_corrupted_payload_is_refused() {
         let mut s = snap();
         s.payload[10] ^= 0xFF;

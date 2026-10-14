@@ -1,10 +1,12 @@
 # Gemma 4 E-Series gfx1201 Validation
 
+> **Lifecycle: historical validation record, not current performance, default, or admission authority.** It preserves the provenance of promoting the Gemma 4 E-series batched prefill routes to gfx1201. Every figure is a measurement on named fixtures, artifacts, and binaries (E2B/E4B Q8 on one R9700 host) and is not a floor or a promise; the historical reproduction commands below reproduce those measurements only and neither promote nor accept anything. Current defaults come from source and [`CONFIG.md`](CONFIG.md) / [`env-vars.md`](env-vars.md) (`kernel.gemma4_*`, `HIPFIRE_GEMMA4_PREFILL_BATCH`): in 0.4.2 the Gemma 4 prefill policy is `auto` on exact gfx1100 and gfx1201 only, with batch 1 and all routes off elsewhere (gfx1151 included). This record's archival scope does not cover the 0.4.2 Flash-Next (Qwen4) PLE row-table default, which is separate and unchanged by it: `memory.ple_format = auto` selects q4 on gfx1151 and q8 elsewhere ([`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables)). The Q8 weights and PLE kernels measured here are Gemma 4 E-series on gfx1100/gfx1201 and support no claim about gfx1151 or Qwen4 PLE tables. `target/validation/...` paths in this record name outputs of an untracked build directory, not repository files.
+
 ## Environment
 
 - Host GPU: AMD Radeon AI PRO R9700, `gfx1201`, 32 GiB VRAM
 - ROCm/HIP: `7.14.60850`
-- Build: `cargo build --release --features deltanet --example daemon -p hipfire-runtime`
+- Build (historical invocation; the daemon is now the `daemon` binary of `hipfire-daemon`, built with `cargo build --release -p hipfire-daemon`): `cargo build --release --features deltanet --example daemon -p hipfire-runtime`
 - Build result: success in 54.40 seconds
 - KV cache: Q8
 - Sampling: greedy, temperature 0
@@ -84,4 +86,4 @@ The gfx1201 production policy uses prefill batch 64 and enables batched embeddin
 
 Historical measurement context: an earlier safe-policy hard30 rerun explicitly disabled PLE branch batching (it is the opt-out baseline, not the current default). E2B prefill improved from 494.255 to 519.645 tok/s (+5.14%) and E4B improved from 428.385 to 451.550 tok/s (+5.41%); TTFT medians fell by 4.89% and 5.13%. All 60 paired predictions were byte-identical, with unchanged accuracy and zero correctness regressions. Full-logit and cross-architecture evidence is in `GEMMA4_ESERIES_LOGIT_STABILITY.md`.
 
-Reproduce the isolated route matrix with `scripts/bench-gemma4-gfx12-prefill-routes-ab.sh` and the longer-output gate with `scripts/bench-gemma4-gfx12-prefill-quality-ab.sh`.
+Historical reproduction only (no promotion or acceptance): the isolated route matrix with `scripts/bench-gemma4-gfx12-prefill-routes-ab.sh` and the longer-output gate with `scripts/bench-gemma4-gfx12-prefill-quality-ab.sh`. Current binaries route the PLE branch through the exact kernel, so a rerun measures the exact route rather than the original F16-activation WMMA route behind the per-route table above.

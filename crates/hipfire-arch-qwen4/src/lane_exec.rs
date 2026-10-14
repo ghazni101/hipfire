@@ -507,6 +507,18 @@ pub struct Qwen4LaneExecutor<'a> {
     pub(crate) bundle: &'a mut Qwen4Bundle,
 }
 
+/// Lane (continuous-batch) steps do not run under expert parallelism; every
+/// executor entry refuses before it touches any lane state.
+fn refuse_expert_parallel(bundle: &Qwen4Bundle) -> Result<(), String> {
+    if bundle.weights.ep_placement().is_some() {
+        return Err(
+            "Qwen4 lane steps do not run under expert parallelism (EP is one-row decode and chunk forwards only)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 impl Qwen4LaneExecutor<'_> {
     fn store(&self) -> Result<&Qwen4LaneStore, String> {
         self.bundle
@@ -545,6 +557,7 @@ impl Qwen4LaneExecutor<'_> {
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
     ) -> Result<Vec<LaneDraft>, String> {
+        refuse_expert_parallel(self.bundle)?;
         let mut store = self
             .bundle
             .lanes
@@ -572,6 +585,7 @@ impl Qwen4LaneExecutor<'_> {
     /// arenas (an MTP lane's head arenas too) through the step's end
     /// position. Mapping happens here, never inside a forward (I4).
     pub fn provision_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
+        refuse_expert_parallel(self.bundle)?;
         let ends = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
@@ -628,6 +642,7 @@ impl Qwen4LaneExecutor<'_> {
     /// for the picks (the download synchronizes). On error every participant
     /// is poisoned and the executor returns to idle.
     pub fn forward_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<StepOutput, String> {
+        refuse_expert_parallel(self.bundle)?;
         let key = StepKey::of(plan);
         let store = self
             .bundle

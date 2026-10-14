@@ -2821,6 +2821,18 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
+        static AWQ_WAVEGRID: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_AWQ_NORM_WAVEGRID").as_deref() == Ok("1")
+        });
+        if self.arch_caps.is_gfx1100()
+            && *AWQ_WAVEGRID
+            && k >= 2_048
+            && k.is_multiple_of(256)
+            && k / 256 <= 32
+        {
+            return self
+                .fused_rmsnorm_rotate_mq_awq_wavegrid_gfx1100(x, weight, awq_scale, x_rot, k, eps);
+        }
         // gfx1201 / gfx1151 / gfx1100 decode: K/256 workgroups, each redoing the row's reduction
         // and rotating one group (bit-identical to the one-workgroup launch).
         let group_grid = self.flags.dec_norm_grids_enabled() && k % 256 == 0;
@@ -2867,6 +2879,85 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// gfx1100 AWQ wavegrid: K/256 wave32 workgroups, one FWHT group each.
+    /// Spreads the reduction + rotation across CUs so VRAM latency overlaps
+    /// instead of serializing behind a single workgroup's load stream.
+    /// Reduction order differs from the LDS tree — ship gate is exact
+    /// greedy-token parity over a long replay, not bit-identical buffers.
+    fn fused_rmsnorm_rotate_mq_awq_wavegrid_gfx1100(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        const KERNEL: &str = "fused_rmsnorm_mq_rotate_awq_wavegrid";
+        self.scratch
+            .ensure_mq_rmsnorm_awq_wavegrid_scratch(&self.hip, self.device_id)?;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC,
+            KERNEL,
+        )?;
+
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let awp = awq_scale.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let scratch = self
+            .scratch
+            .mq_rmsnorm_awq_wavegrid_scratch
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &awp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &scratch as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+
+        let groups = (k / 256) as u32;
+        let bytes = k * 4 * 4 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [groups, 1, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(scratch);
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b
@@ -10727,6 +10818,27 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Persistent dual-row variant (gfx1100, opt-in): bit-identical per-row
+        // arithmetic, 2 rows per block. Wins on short-row shapes (K=4096
+        // wo-class: ~+50% DRAM-cold GB/s); neutral on long-K shapes.
+        // Per-group LDS dequant-LUT variant (gfx1100, opt-in): publishes the
+        // 16 group values sc*i+zp to shared memory once per group; lanes then
+        // look values up instead of running extract+cvt+MAD chains.
+        // Bit-exact by construction (same expression, same summation order).
+        // The LDS-staged activation residual probe was removed 2026-10-09.
+        // Its kernel paired nibbles 4..7 of each lane's word with x offsets
+        // 0..3 (it needed a second float4 at +4), so it never computed the
+        // GEMV it claimed; the wired launch also requested 0 bytes of dynamic
+        // LDS for a kernel that stages `k` floats in `extern __shared__`.
+        // Both defects invalidate the 2026-08 amendment 2k measurements and
+        // its "BITEXACT" claim (see
+        // docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md).
+        //
+        // The residual-family negative oracles that used to sit here
+        // (per-group dequant LUT, persistent dual-row, dual-row selector) were
+        // removed 2026-10-09 with the rest of the v1-only surface: they only
+        // ever applied to the legacy `gemv_hfq4g256_residual` path, and Magnum
+        // V2 dtypes take their own dedicated residual kernels.
         let use_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_residual_stage_x32
             && self.flags.rdna3_hfq4_residual_k2048
@@ -10863,7 +10975,14 @@ impl Gpu {
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
+        let prof_name = if k == 4096 {
+            "gemv_hfq4g256_residual_k4096"
+        } else if k == 9216 {
+            "gemv_hfq4g256_residual_k9216"
+        } else {
+            "gemv_hfq4g256_residual"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", prof_name, bytes);
         let result = if cdna3 {
             // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
             // when enabled; gfx906/908 (or env override) keep wave64 base.
@@ -15890,6 +16009,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        crate::moe::require_span(y_gate, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched gate rows")?;
+        crate::moe::require_span(y_up, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched up rows")?;
         const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched";
         self.ensure_kernel(
             FUNC,
@@ -18786,12 +18907,80 @@ impl Gpu {
         })
     }
 
+    /// [`Gpu::gemv_q8_0_staged_rows`] (K = 2560) of two matrices that read
+    /// the same `rows` activation rows, in one launch; each output row is
+    /// bitwise the single-matrix kernel's. Few-row verify, shared gate/up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_k2560_staged_rows_x2(
+        &mut self,
+        a0: &GpuTensor,
+        y0: &GpuTensor,
+        m0: usize,
+        a1: &GpuTensor,
+        y1: &GpuTensor,
+        m1: usize,
+        x: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
+        if !self.gemv_q8_0_staged_rows_supported(2560, rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_q8_0_k2560_staged_rows_x2 shape",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_q8_0_k2560_staged_rows_x2";
+        self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, FUNC)?;
+        let (a0_ptr, y0_ptr, a1_ptr, y1_ptr) = (
+            a0.buf.as_ptr(),
+            y0.buf.as_ptr(),
+            a1.buf.as_ptr(),
+            y1.buf.as_ptr(),
+        );
+        let x_ptr = x.buf.as_ptr();
+        let (m0_val, m1_val, rows_val) = (m0 as i32, m1 as i32, rows as i32);
+        let mut params = [
+            &a0_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &m0_val as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &m1_val as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [(m0 + m1) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a0_ptr);
+                b.push_ptr(y0_ptr);
+                b.push_i32(m0_val);
+                b.push_ptr(a1_ptr);
+                b.push_ptr(y1_ptr);
+                b.push_i32(m1_val);
+                b.push_ptr(x_ptr);
+                b.push_i32(rows_val);
+                b
+            },
+        )
+    }
+
     /// [`Gpu::gemv_q8_0_staged_rows`]'s K = 2560 kernel over any `rows >= 1`
     /// activation rows (x row stride 2560, y row stride M) in one launch of
     /// grid `[m, ceil(rows / 8)]`: each block stages its weight row once and
     /// dots it with its tile of eight rows (the last tile holds the rest);
-    /// each output row is bitwise the single-row staged kernel's. gfx1151
-    /// only, like the single-row path. Prompt fill.
+    /// each output row is bitwise the single-row staged kernel's. Exact
+    /// gfx1151 and gfx1201 only (Qwen4 MTP prompt fill). The single-row
+    /// reference is the staged kernel on gfx1151 and the unstaged
+    /// `gemv_q8_0` on gfx1201, whose dot (f16 scale, signed-byte
+    /// conversion, one accumulator over the blocks in order, shuffle tree
+    /// 16..1) the staged body repeats after copying the weight row to LDS;
+    /// the fill oracle (`qwen4_mtp_fill`, batched vs per-row) checks both.
     pub fn gemv_q8_0_k2560_staged_rows_tiled(
         &mut self,
         a: &GpuTensor,
@@ -18803,7 +18992,10 @@ impl Gpu {
         const FUNC: &str = "gemv_q8_0_k2560_staged_rows_tiled";
         const TILE: usize = 8;
         let tiles = rows.div_ceil(TILE);
-        if !self.arch_caps.is_gfx1151() || rows == 0 || tiles > 65_535 {
+        if !(self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+            || rows == 0
+            || tiles > 65_535
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemv_q8_0_k2560_staged_rows_tiled shape",

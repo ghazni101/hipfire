@@ -8,6 +8,12 @@
 //! `qwen3.8-flash-next-gptq3.mq4` artifact named by
 //! `HIPFIRE_MTP_IDENTITY_MODEL`.
 //!
+//! Loading uses the shared production expert-residency policy:
+//! `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=auto` or `N` places discrete-GPU
+//! expert spill in pinned host RAM; auto reserves native MTP and QSA gather
+//! workspace. Product code and sampled coverage, identity and law assertions
+//! are unchanged.
+//!
 //! The serve battery's prose prompt (thinking off, rendered as `hipfire
 //! serve` renders one user message) is decoded from a cold state
 //! `HIPFIRE_SAMPLED_MTP_TRIALS` times (default 2000) per arm, each trial with
@@ -17,6 +23,10 @@
 //!   production host sampler (`sampler::sample_cpu`);
 //! - `batched`: sampled native MTP, `HIPFIRE_MTP_INCREMENTAL=0`;
 //! - `interleaved`: sampled native MTP, `HIPFIRE_MTP_INCREMENTAL=1`.
+//! - `adaptive`: sampled native MTP on the default route (floor on, no route
+//!   knob): calibration token, probe windows, and retirement when the floor
+//!   decides it. Its per-seed bytes depend on wall-clock prices, so it is
+//!   compared with AR in distribution only and never replayed.
 //!
 //! Trial seeds are SplitMix64-scrambled (`trial_seed`), distinct per arm:
 //! the host AR sampler's xorshift32 maps consecutive seeds to nearly equal
@@ -25,7 +35,9 @@
 //! Each MTP arm's per-position marginals and its (t1, t2) joint are compared
 //! with AR's by a two-sample chi-square homogeneity test (cells with fewer
 //! than 5 expected draws pooled); every p-value must exceed `ALPHA`. Each MTP
-//! arm also replays its first `REPLAYS` seeds and must emit the same IDs.
+//! arm on a forced floor-off route (`batched`, `interleaved`) also replays its
+//! first `REPLAYS` seeds and must emit the same IDs; replay is asserted only
+//! for those arms.
 //! Temperature / top_p / top_k / min_p come from `HIPFIRE_SAMPLED_MTP_TEMP` /
 //! `HIPFIRE_SAMPLED_MTP_TOP_P` / `HIPFIRE_SAMPLED_MTP_TOP_K` (unset = absent)
 //! / `HIPFIRE_SAMPLED_MTP_MIN_P` (default 1.0 / 0.95 / absent / 0); both arms
@@ -33,9 +45,11 @@
 //! `HIPFIRE_SAMPLED_MTP_OUT`; an arm whose `<arm>.ids.json` is already there
 //! is reused, so the arms can run first as separate time-boxed invocations of
 //! `sampled_mtp_distribution_arm` (set `HIPFIRE_SAMPLED_MTP_ARM`,
-//! `HIPFIRE_MTP_SAMPLED=1` and the arm's `HIPFIRE_MTP_INCREMENTAL` yourself).
-//! The arms inherit `HIPFIRE_MTP_SAMPLED_MODE`, so the test checks whichever
-//! sampled verifier that selects (unset: speculative rejection sampling).
+//! `HIPFIRE_MTP_SAMPLED=1`, `HIPFIRE_MTP_SAMPLED_MODE=leviathan` and the arm's
+//! route knobs yourself: every arm checks it already runs under its
+//! environment and fails naming the variable otherwise). Every arm runs the
+//! speculative-rejection-sampling (Leviathan) verifier explicitly; the naive
+//! verifier has its own test below.
 //!
 //! Repeat / presence / frequency penalties (default neutral) reach BOTH arms,
 //! as a request's would: `HIPFIRE_SAMPLED_MTP_REPEAT_PENALTY` (1.0),
@@ -105,13 +119,68 @@
 //! exists in `HIPFIRE_SAMPLED_MTP_OUT` is reused.
 //!
 //! Both identity arms read the same penalty and prompt-fixture env as above.
+//!
+//! # Arm environment and sidecars
+//!
+//! A parent resets what a benchmark shell may have left behind
+//! (`HIPFIRE_MTP_INCREMENTAL`, `HIPFIRE_MTP_AR_FLOOR`, `HIPFIRE_MTP_TRACE`,
+//! `HIPFIRE_MTP_PHASE_TIMING`) in every child: forced `batched` /
+//! `interleaved` arms (also `ngram_*` / `copy_*`) set their route AND
+//! `HIPFIRE_MTP_AR_FLOOR=0`; `ar`, `adaptive` and `*_adaptive` arms leave both
+//! unset (floor on). `HIPFIRE_*` variables are not otherwise cleaned: they are
+//! recorded.
+//!
+//! Every result's `<ids stem>.config.json` carries the config AND an identity:
+//! the effective `HIPFIRE_*` environment (so the resident-sampling levers,
+//! the floor and route knobs and the graph knobs), the executable's SHA-256,
+//! a hash of the production sources compiled in, and the model artifact's and
+//! `.ple-q4` / `.ple-q8` sidecars' sizes and SHA-256. A result is reused only
+//! when that whole document equals the one expected now, which now includes
+//! the n-gram arms (they had no sidecar). `<ids stem>.receipt.json` adds the
+//! GPU arch / UUID / PCI BDF, the graph flags the runtime resolved, git state
+//! and host (informational, not compared).
+//!
+//! MTP arms also write `<arm>.evidence.json` (route / window counters per
+//! request, window rows, HIP call-count deltas around each window) and
+//! `<arm>.text.txt` (decoded text of the first trials). Only quantities the
+//! drafter and the runtime already report are recorded; nothing is inferred.
+//! Failures are labelled: `DISTRIBUTION FAILURE (law)` for a p-value under
+//! `ALPHA`, `COVERAGE FAILURE` for a run that did not exercise what it claims.
+//!
+//! # Adaptive late-position case
+//!
+//! Four output tokens end inside the floor's calibration window plus one probe
+//! window, so the short `adaptive` arm cannot reach retirement.
+//! `sampled_mtp_adaptive_floor_coverage_pilot_on_flash_next` runs a declared
+//! cohort of `PILOT_TRIALS` adaptive requests of `HIPFIRE_SAMPLED_MTP_LATE_TOKENS`
+//! (default and minimum 128) IDs and checks, from the per-window records,
+//! that at least one request shows calibration (drafted 0, accepted 0,
+//! `mtp_windows` 0 -> 1, one position) -> the source's
+//! `MTP_FLOOR_PROBE_WINDOWS` probe windows -> `mtp_retired` false -> true ->
+//! a later target-only window (`ar_windows` +1, still retired) that emitted at
+//! index >= 31. The pilot is coverage, not statistics. If the fixture does
+//! not retire, declare a longer `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` or commit a
+//! different fixture and restart the whole cohort; never force retirement,
+//! drop non-retiring trials or condition on route history.
+//! `sampled_mtp_adaptive_late_matches_ar_distribution_on_flash_next` then
+//! compares adaptive MTP with AR over `HIPFIRE_SAMPLED_MTP_TRIALS` (default
+//! and minimum 2000) independent trials per arm: early marginals 0..=3 and
+//! the (t1, t2) joint, late marginals 31, 63, 95, 127 and joints (31, 32),
+//! (63, 64), (95, 96), (126, 127), with the same homogeneity test and `ALPHA`,
+//! and requires the aggregate coverage above. Trials are split into disjoint
+//! `START..END` shards (`HIPFIRE_SAMPLED_MTP_SHARD`; seeds are
+//! `trial_seed(salt, trial index)`, so no seed repeats and shards compose);
+//! run `sampled_mtp_late_arm` directly per shard / per arm (`late_ar`,
+//! `late_adaptive`) to fit fabric holds, then the aggregate test reuses every
+//! config-verified shard and runs only the missing ranges.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{qwen4_ngram_mod_config, Qwen4MtpDrafter};
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
@@ -119,10 +188,15 @@ use hipfire_runtime::spec::{MtpDrafter, MtpRequestStats, SpecRequestConfig};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu};
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+#[path = "common/hw_identity.rs"]
+mod hw_identity;
+use hw_identity::Counters;
 
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
 const OUT_ENV: &str = "HIPFIRE_SAMPLED_MTP_OUT";
@@ -140,6 +214,13 @@ const FREQUENCY_PENALTY_ENV: &str = "HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY";
 const PROMPT_ENV: &str = "HIPFIRE_SAMPLED_MTP_PROMPT";
 const INCREMENTAL_ENV: &str = "HIPFIRE_MTP_INCREMENTAL";
 const SAMPLED_MODE_ENV: &str = "HIPFIRE_MTP_SAMPLED_MODE";
+const FLOOR_ENV: &str = "HIPFIRE_MTP_AR_FLOOR";
+const SHARD_ENV: &str = "HIPFIRE_SAMPLED_MTP_SHARD";
+const LATE_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_LATE_TOKENS";
+const LATE_ARM_TEST: &str = "sampled_mtp_late_arm";
+/// Harness-control variables: they differ between a parent and each child
+/// without changing what the arm computes, so identities exclude them.
+const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, SHARD_ENV];
 
 /// The serve battery's prose prompt (`scripts/serve_harness.py`).
 const PROSE: &str = "Write a four-sentence story about a lighthouse keeper who finds something unexpected washed up on the rocks.";
@@ -148,7 +229,7 @@ const MAX_SEQ: usize = 4096;
 const MTP_K: usize = 3;
 const REPLAYS: usize = 5;
 const ALPHA: f64 = 1e-3;
-const ARMS: [&str; 3] = ["ar", "batched", "interleaved"];
+const ARMS: [&str; 4] = ["ar", "batched", "interleaved", "adaptive"];
 
 /// The n-gram triple under test (`n_match`, `n_min`, `n_max`): the arch-16
 /// default of `hipfire_config::ngram_mod_triple_for_arch`.
@@ -173,42 +254,51 @@ struct NgramArm {
     name: &'static str,
     /// The AR arm whose distribution this arm must match.
     reference: &'static str,
-    /// Runs the copied-span fixture (hits required) rather than the prose prompt.
+    /// Runs the copied-span fixture (hits required on forced routes) rather
+    /// than the prose prompt.
     copy: bool,
     /// `trial_seed` salt, distinct per arm.
     salt: u64,
-    /// `HIPFIRE_MTP_INCREMENTAL` the parent gives the arm's process.
-    incremental: &'static str,
 }
 
-static NGRAM_ARMS: [NgramArm; 4] = [
+/// A `*batched` / `*interleaved` name is a forced floor-off route and a
+/// `*_adaptive` name the default route (`arm_route`).
+static NGRAM_ARMS: [NgramArm; 6] = [
     NgramArm {
         name: "ngram_batched",
         reference: "ar",
         copy: false,
         salt: 0x4E1,
-        incremental: "0",
     },
     NgramArm {
         name: "ngram_interleaved",
         reference: "ar",
         copy: false,
         salt: 0x4E2,
-        incremental: "1",
+    },
+    NgramArm {
+        name: "ngram_adaptive",
+        reference: "ar",
+        copy: false,
+        salt: 0x4E3,
     },
     NgramArm {
         name: "copy_batched",
         reference: COPY_AR_ARM,
         copy: true,
         salt: 0xC0B1,
-        incremental: "0",
     },
     NgramArm {
         name: "copy_interleaved",
         reference: COPY_AR_ARM,
         copy: true,
         salt: 0xC0B2,
-        incremental: "1",
+    },
+    NgramArm {
+        name: "copy_adaptive",
+        reference: COPY_AR_ARM,
+        copy: true,
+        salt: 0xC0B3,
     },
 ];
 
@@ -332,8 +422,24 @@ impl Fixture {
     }
 }
 
-/// Penalties and fixture as recorded JSON fields.
-fn config_base(kind: &str, arm: &str, pen: &Penalties, fixture: Fixture) -> serde_json::Value {
+/// One request's decode: IDs, window totals, final request stats and the
+/// per-window records of `Loaded::mtp_request`.
+struct MtpRun {
+    ids: Vec<u32>,
+    drafted: usize,
+    accepted: usize,
+    stats: MtpRequestStats,
+    windows: Vec<WindowRec>,
+}
+
+/// Penalties, fixture and the arm's identity as recorded JSON fields.
+fn config_base(
+    kind: &str,
+    arm: &str,
+    pen: &Penalties,
+    fixture: Fixture,
+    identity: &Value,
+) -> Value {
     serde_json::json!({
         "kind": kind,
         "arm": arm,
@@ -343,57 +449,34 @@ fn config_base(kind: &str, arm: &str, pen: &Penalties, fixture: Fixture) -> serd
         "presence_penalty": pen.presence_penalty,
         "frequency_penalty": pen.frequency_penalty,
         "mtp_k": MTP_K,
+        "identity": identity,
     })
-}
-
-/// `HIPFIRE_MTP_INCREMENTAL` a distribution / identity arm runs under.
-fn arm_incremental(arm: &str) -> Option<&'static str> {
-    match arm {
-        "batched" => Some("0"),
-        "interleaved" => Some("1"),
-        _ => None,
-    }
-}
-
-/// What a child arm process actually runs under.
-fn child_incremental(arm: &str) -> Option<String> {
-    (arm != "ar")
-        .then(|| std::env::var(INCREMENTAL_ENV).ok())
-        .flatten()
 }
 
 fn dist_config(
     arm: &str,
-    incremental: Option<String>,
+    identity: &Value,
     pen: &Penalties,
     fixture: Fixture,
     sampling: (f32, f32, Option<u32>, f32),
     trials: usize,
-) -> serde_json::Value {
-    let mut config = config_base("distribution", arm, pen, fixture);
+) -> Value {
+    let mut config = config_base("distribution", arm, pen, fixture, identity);
     config["temp"] = serde_json::json!(sampling.0);
     config["top_p"] = serde_json::json!(sampling.1);
     config["top_k"] = serde_json::json!(sampling.2);
     config["min_p"] = serde_json::json!(sampling.3);
     config["trials"] = serde_json::json!(trials);
     config["tokens"] = serde_json::json!(TOKENS);
-    config["incremental"] = serde_json::json!(incremental);
-    config["sampled_mode"] = serde_json::json!(std::env::var(SAMPLED_MODE_ENV).ok());
+    config["sampled_mode"] = serde_json::json!("leviathan");
     config
 }
 
-fn id_config(
-    arm: &str,
-    incremental: Option<String>,
-    mode: Option<String>,
-    pen: &Penalties,
-    fixture: Fixture,
-) -> serde_json::Value {
-    let mut config = config_base("identity", arm, pen, fixture);
+fn id_config(arm: &str, identity: &Value, pen: &Penalties, fixture: Fixture) -> Value {
+    let mut config = config_base("identity", arm, pen, fixture, identity);
     config["tokens"] = serde_json::json!(ID_TOKENS);
     config["seeds"] = serde_json::json!(ID_SEEDS);
-    config["incremental"] = serde_json::json!(incremental);
-    config["sampled_mode"] = serde_json::json!(mode);
+    config["sampled_mode"] = serde_json::json!("naive");
     config
 }
 
@@ -431,6 +514,17 @@ fn write_config(ids_path: &Path, config: &serde_json::Value) -> Result<(), Strin
     .map_err(|e| format!("{}: {e}", config_path.display()))
 }
 
+/// The informational receipt (GPU identity, resolved graph flags, git state)
+/// next to the ids file: `<ids stem>.receipt.json`.
+fn write_receipt(ids_path: &Path, receipt: &Value) -> Result<(), String> {
+    let path = ids_path.with_extension("receipt.json");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(receipt).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Sampling / trial / penalty / fixture settings of a distribution run.
 struct DistSettings {
     trials: usize,
@@ -458,10 +552,10 @@ impl DistSettings {
         })
     }
 
-    fn config(&self, arm: &str, incremental: Option<String>) -> serde_json::Value {
+    fn config(&self, arm: &str, identity: &Value) -> Value {
         dist_config(
             arm,
-            incremental,
+            identity,
             &self.pen,
             self.fixture,
             (self.temp, self.top_p, self.top_k, self.min_p),
@@ -601,93 +695,49 @@ fn homogeneity<K: std::hash::Hash + Eq + Clone>(a: &[K], b: &[K]) -> (f64, usize
 fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let model = model_path();
     let dir = out_dir();
-    let exe = std::env::current_exe().expect("test binary path");
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
     let mut samples: Vec<Vec<Vec<u32>>> = Vec::new();
     let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
     for arm in ARMS {
         let ids_path = dir.join(format!("{arm}.ids.json"));
-        if ids_path.exists() {
-            let expected = settings.config(arm, arm_incremental(arm).map(str::to_string));
-            check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
-            eprintln!("reusing {}", ids_path.display());
-            samples
-                .push(serde_json::from_slice(&fs::read(&ids_path).unwrap()).expect("arm ids json"));
-            continue;
-        }
-        let mut child = Command::new(&exe);
-        child
-            .args([
-                "--exact",
-                ARM_TEST,
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(ARM_ENV, arm)
-            .env(MODEL_ENV, &model)
-            .env(OUT_ENV, &dir)
-            .env("HIPFIRE_MTP_SAMPLED", "1")
-            .env_remove("HIPFIRE_MTP_INCREMENTAL")
-            .stdin(Stdio::null());
-        match arm {
-            "batched" => {
-                child.env("HIPFIRE_MTP_INCREMENTAL", "0");
-            }
-            "interleaved" => {
-                child.env("HIPFIRE_MTP_INCREMENTAL", "1");
-            }
-            _ => {}
-        }
-        let output = child
-            .output()
-            .unwrap_or_else(|e| panic!("spawn {arm}: {e}"));
-        fs::write(dir.join(format!("{arm}.out")), &output.stdout).unwrap();
-        fs::write(dir.join(format!("{arm}.err")), &output.stderr).unwrap();
-        assert!(
-            output.status.success(),
-            "{arm} arm failed ({}); logs in {}",
-            output.status,
-            dir.display()
+        let expected = settings.config(
+            arm,
+            &arm_identity(arm, "leviathan", &model_id, &CONTROL_ENV),
         );
-        let arm_samples: Vec<Vec<u32>> =
-            serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
-        samples.push(arm_samples);
+        if ids_path.exists() {
+            eprintln!("reusing {}", ids_path.display());
+        } else {
+            spawn_arm(ARM_TEST, arm, "leviathan", &model, &dir, None, arm)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // Reused and fresh results alike must carry the config expected now.
+        check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
+        samples.push(
+            serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json"),
+        );
     }
-    let mut report = format!("config (ar arm): {}\n", settings.config("ar", None));
+    let mut report = format!(
+        "config (ar arm): {}\n",
+        settings.config(
+            "ar",
+            &arm_identity("ar", "leviathan", &model_id, &CONTROL_ENV)
+        )
+    );
     let mut failures = Vec::new();
+    let mut coverage = Vec::new();
     let ar = &samples[0];
     for (arm, mtp) in ARMS.iter().zip(&samples).skip(1) {
-        for position in 0..TOKENS {
-            let a: Vec<u32> = ar.iter().map(|ids| ids[position]).collect();
-            let b: Vec<u32> = mtp.iter().map(|ids| ids[position]).collect();
-            let (stat, df, p) = homogeneity(&a, &b);
-            let line = format!(
-                "{arm} vs ar, token {}: chi2={stat:.2} df={df} p={p:.4} (n={}+{})\n",
-                position + 1,
-                a.len(),
-                b.len()
-            );
-            if p < ALPHA {
-                failures.push(line.clone());
-            }
-            report.push_str(&line);
-        }
-        let a: Vec<(u32, u32)> = ar.iter().map(|ids| (ids[0], ids[1])).collect();
-        let b: Vec<(u32, u32)> = mtp.iter().map(|ids| (ids[0], ids[1])).collect();
-        let (stat, df, p) = homogeneity(&a, &b);
-        let line = format!("{arm} vs ar, (t1,t2) joint: chi2={stat:.2} df={df} p={p:.4}\n");
-        if p < ALPHA {
-            failures.push(line.clone());
-        }
-        report.push_str(&line);
+        compare_to_reference(arm, "ar", ar, mtp, &mut report, &mut failures);
+        let evidence = read_json(&dir.join(format!("{arm}.evidence.json")))
+            .unwrap_or_else(|e| panic!("{e}"));
+        short_arm_coverage(arm, &evidence, &mut report, &mut coverage);
     }
     eprint!("{report}");
     fs::write(dir.join("report.txt"), &report).unwrap();
     assert!(
-        failures.is_empty(),
-        "sampled MTP differs from AR in distribution (alpha {ALPHA}; logs in {}):\n{}",
-        dir.display(),
-        failures.concat()
+        failures.is_empty() && coverage.is_empty(),
+        "{}",
+        failure_message(&dir, &failures, &coverage)
     );
 }
 
@@ -717,26 +767,26 @@ fn load(model: &Path) -> Result<Loaded, String> {
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
-    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
-    if gpu.is_uma() {
-        hfq.drop_mmap();
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        let archs = devices
+            .iter()
+            .map(|device| device.arch.as_str())
+            .collect::<Vec<_>>();
+        if residency::keeps_host_memory_out_of_reclaim(hipfire_arch_qwen4::ARCH_ID, &archs) {
+            hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+                "Qwen4 model on {}",
+                archs.join(",")
+            ));
+        }
     }
-    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
-    let expected = WeightOrigin::for_single(&mesh, &gpu);
-    let source = HfqModelSource::from_hfq(hfq);
-    let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        &mut gpu,
-        expected,
-        |entry| {
-            source
-                .tensor_range(&entry.name)
-                .map_err(|e| e.to_string())?
-                .map(SourcePayload::Range)
-                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
-        },
+    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
     )
     .map_err(|e| e.to_string())?;
     let state_format = hipfire_arch_qwen4::resolve_state_format(
@@ -746,6 +796,146 @@ fn load(model: &Path) -> Result<Loaded, String> {
         &receipt.config,
     )?;
     let backend = Qwen4KvBackend::automatic(&gpu);
+    let use_ranges = gpu.is_uma();
+    let mut weights = receipt.manifest.weights.clone();
+    let explicit = residency::expert_vram_layers_from_env()?;
+    if use_ranges {
+        if explicit.is_some() {
+            return Err(format!(
+                "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            ));
+        }
+    } else {
+        let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+            hfq.tensor_data(&entry.name)
+                .map(|(_, bytes)| bytes.len() as u64)
+        };
+        let (non_expert, layer_experts) = residency::resident_split(&weights, bytes_of)?;
+        let experts = residency::routed_expert_bytes(&weights, bytes_of)?;
+        let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+        let free = free as u64;
+        let chunk =
+            hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, MAX_SEQ);
+        let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
+            backend,
+            gpu.is_uma(),
+            MAX_SEQ,
+            chunk,
+            gpu.vmm_recommended_granularity().unwrap_or(1),
+        );
+        // Every oracle arm reserves the same native MTP footprint.
+        let head = residency::language_head_dtype(&weights)
+            .ok_or("qwen4: manifest has no language head")?;
+        let row_capture =
+            hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(&gpu, &receipt.config)
+                .then_some(state_format.gdn);
+        let mtp = hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+            &receipt.config,
+            &context,
+            chunk,
+            MTP_K,
+            head,
+            row_capture,
+            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(&gpu),
+        )
+        .ok_or("qwen4: native MTP device bytes overflow")?;
+        let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            &gpu,
+            state_format.qsa,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                receipt.config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| {
+                (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64)
+            })
+            .ok_or("qwen4: QSA gather scratch size overflows")
+        })
+        .transpose()?;
+        let reserve = residency::auto_vram_reserve(
+            &receipt.config,
+            &context,
+            chunk,
+            scratch_mode,
+            state_format.layout(),
+            Some(mtp),
+            gather,
+        )?;
+        let placement = residency::resolve_expert_vram_layers(explicit, || {
+            Ok(residency::fits_fully_resident(free, non_expert, experts, reserve))
+        })?;
+        if let Some(policy) = placement {
+            let vram_layers = match policy {
+                residency::ExpertVramLayers::Layers(layers) => layers,
+                residency::ExpertVramLayers::Auto => {
+                    let needed = non_expert
+                        .checked_add(reserve)
+                        .ok_or("qwen4: non-expert weights plus reserve overflow")?;
+                    if free < needed {
+                        return Err(format!(
+                            "qwen4: {free} free VRAM bytes cannot hold {non_expert} non-expert weight bytes plus {reserve} reserve bytes even with every routed expert in host RAM"
+                        ));
+                    }
+                    residency::auto_vram_layers(
+                        free,
+                        non_expert,
+                        layer_experts,
+                        receipt.config.num_hidden_layers,
+                        reserve,
+                    )
+                }
+            };
+            let moved = residency::place_routed_experts(&mut weights, vram_layers);
+            let host = residency::host_mapped_bytes(&weights, bytes_of)?;
+            residency::check_host_ram(
+                host,
+                rdna_compute::kv_slots::mem_available_bytes(),
+                residency::ttm_pool_estimate(),
+            )?;
+            residency::check_gtt_cap(host, residency::gtt_budget())?;
+            eprintln!(
+                "qwen4 routed experts: layers 0..{} in VRAM, {moved} tensors ({host} bytes) in pinned host RAM",
+                vram_layers.min(receipt.config.num_hidden_layers)
+            );
+        } else {
+            eprintln!(
+                "qwen4 routed experts: {} MoE layers fully resident, 0 host-mapped bytes",
+                residency::moe_layer_count(&receipt.config)
+            );
+        }
+    }
+    // Placement has finished reading payloads before UMA releases the mmap.
+    if use_ranges {
+        hfq.drop_mmap();
+    }
+    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
+    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let source = HfqModelSource::from_hfq(hfq);
+    let transaction = fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if use_ranges || entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|e| e.to_string())?
+                    .map(SourcePayload::Range)
+                    .ok_or_else(|| format!("missing tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))?;
+            Ok(SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
         &receipt.manifest.identity.recipe,
@@ -759,7 +949,7 @@ fn load(model: &Path) -> Result<Loaded, String> {
     )
     .map_err(|e| e.to_string())?;
     bundle
-        .attach_forward(&mut gpu, MAX_SEQ)
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .map_err(|e| e.to_string())?;
     Ok(Loaded {
         gpu,
@@ -774,6 +964,11 @@ impl Loaded {
     /// `text` as one user message, thinking off, rendered as `hipfire serve`
     /// renders it.
     fn render(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.render_with(text, false)
+    }
+
+    /// [`render`](Self::render) with the thinking switch given.
+    fn render_with(&self, text: &str, thinking: bool) -> Result<Vec<u32>, String> {
         let user = Message {
             role: Role::User,
             content: text.to_string(),
@@ -789,7 +984,7 @@ impl Loaded {
             template: &self.template,
             system: None,
             user: text,
-            enable_thinking: false,
+            enable_thinking: thinking,
             bos_token: None,
             reasoning_strength: None,
             reasoning_effort: None,
@@ -842,17 +1037,20 @@ impl Loaded {
         tokens: usize,
     ) -> Result<(Vec<u32>, usize, usize), String> {
         self.mtp_request(drafter, prompt, cfg, tokens)
-            .map(|(ids, drafted, accepted, _)| (ids, drafted, accepted))
+            .map(|run| (run.ids, run.drafted, run.accepted))
     }
 
-    /// [`mtp_ids`](Self::mtp_ids) plus the request's `request_stats()`.
+    /// [`mtp_ids`](Self::mtp_ids) plus the request's `request_stats()` and a
+    /// record of every window: the stats and position before and after, the
+    /// window's drafts / accepted / committed, and the HIP call-count deltas
+    /// around the `mtp_step`. This is the one decode loop of every MTP arm.
     fn mtp_request(
         &mut self,
         drafter: &mut Qwen4MtpDrafter,
         prompt: &[u32],
         cfg: SpecRequestConfig,
         tokens: usize,
-    ) -> Result<(Vec<u32>, usize, usize, MtpRequestStats), String> {
+    ) -> Result<MtpRun, String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
         let mut seed_token = drafter.mtp_prefill(
@@ -866,25 +1064,48 @@ impl Loaded {
         )?;
         let mut ids = vec![seed_token];
         let (mut drafted, mut accepted) = (0, 0);
+        let mut windows = Vec::new();
         while ids.len() < tokens && seed_token != eos {
             let position = self.bundle.state.position;
+            let k = MTP_K.min(tokens - ids.len());
+            let before = StatsSnap::of(&drafter.request_stats());
+            let started = Counters::now();
             let window = drafter.mtp_step(
                 &mut self.gpu,
                 &mut self.bundle,
                 position,
                 seed_token,
                 &ids,
-                MTP_K.min(tokens - ids.len()),
+                k,
                 eos,
                 None,
             )?;
+            let counters = Counters::now().since(started);
+            windows.push(WindowRec {
+                index: ids.len(),
+                position_before: position,
+                position_after: self.bundle.state.position,
+                k_budget: k,
+                drafts: window.drafts_generated,
+                accepted: window.accepted,
+                committed: window.committed.len(),
+                before,
+                after: StatsSnap::of(&drafter.request_stats()),
+                counters,
+            });
             drafted += window.drafts_generated;
             accepted += window.accepted;
             seed_token = *window.committed.last().ok_or("empty MTP window")?;
             ids.extend_from_slice(&window.committed);
         }
         ids.truncate(tokens);
-        Ok((ids, drafted, accepted, drafter.request_stats()))
+        Ok(MtpRun {
+            ids,
+            drafted,
+            accepted,
+            stats: drafter.request_stats(),
+            windows,
+        })
     }
 }
 
@@ -969,6 +1190,7 @@ fn new_drafter_with(
 }
 
 fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    require_arm_env(arm, "leviathan")?;
     let DistSettings {
         trials,
         temp,
@@ -978,9 +1200,10 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         pen,
         fixture,
     } = DistSettings::from_env()?;
+    let env = own_env(&CONTROL_ENV);
     let settings_config = dist_config(
         arm,
-        child_incremental(arm),
+        &own_identity(model, dir, &CONTROL_ENV)?,
         &pen,
         fixture,
         (temp, top_p, top_k, min_p),
@@ -995,7 +1218,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     fixture.check_prompt(prompt.len(), &pen)?;
     let eos = loaded.bundle.config.eos_token_id;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} repeat_penalty={} repeat_window={} presence_penalty={} frequency_penalty={} fixture={} state={}",
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} repeat_penalty={} repeat_window={} presence_penalty={} frequency_penalty={} fixture={} state={} route_class={}",
         loaded.gpu.arch,
         prompt.len(),
         pen.repeat_penalty,
@@ -1003,7 +1226,8 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         pen.presence_penalty,
         pen.frequency_penalty,
         fixture.name(),
-        loaded.state
+        loaded.state,
+        hw_identity::route_class(&env)
     );
     println!("ARM {arm} config {settings_config}");
     let started = std::time::Instant::now();
@@ -1021,29 +1245,43 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
     } else {
         let mut drafter = new_drafter(&mut loaded)?;
+        let budget = floor_probe_budget()?;
+        let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
         let mut run = |loaded: &mut Loaded, seed: u64| {
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
-            loaded
-                .mtp_ids(&mut drafter, &prompt, cfg, TOKENS)
-                .map(|(ids, _, _)| ids)
+            loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
         };
         for trial in 0..trials {
-            samples.push(run(&mut loaded, trial_seed(0x5EC, trial))?);
+            let seed = trial_seed(0x5EC, trial);
+            let result = run(&mut loaded, seed)?;
+            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            samples.push(result.ids);
         }
-        for trial in 0..REPLAYS.min(trials) {
-            let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
-            if replay != samples[trial] {
-                return Err(format!(
-                    "seed {} replayed {replay:?}, first run {:?}",
-                    trial + 1,
-                    samples[trial]
-                ));
+        // Only a forced floor-off route replays byte for byte; the adaptive
+        // route's choices depend on wall-clock prices.
+        if hw_identity::forced_floor_off(&env) {
+            for trial in 0..REPLAYS.min(trials) {
+                let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
+                if replay.ids != samples[trial] {
+                    return Err(format!(
+                        "seed {} replayed {:?}, first run {:?}",
+                        trial + 1,
+                        replay.ids,
+                        samples[trial]
+                    ));
+                }
             }
+            println!(
+                "ARM {arm} replayed {} seeds identically",
+                REPLAYS.min(trials)
+            );
+        } else {
+            println!(
+                "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
+                hw_identity::route_class(&env)
+            );
         }
-        println!(
-            "ARM {arm} replayed {} seeds identically",
-            REPLAYS.min(trials)
-        );
+        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
     // Positions after an EOS read as EOS.
@@ -1061,6 +1299,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     write_config(&ids_path, &settings_config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
     loaded
         .bundle
         .free_gpu(&mut loaded.gpu)
@@ -1122,60 +1361,34 @@ impl IdCase {
 fn naive_sampled_mtp_emits_seeded_ar_ids() {
     let model = model_path();
     let dir = out_dir();
-    let exe = std::env::current_exe().expect("test binary path");
     let mut arms: Vec<Vec<IdCase>> = Vec::new();
     let pen = Penalties::from_env().unwrap_or_else(|e| panic!("{e}"));
     let fixture = Fixture::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
     for arm in ID_ARMS {
         let ids_path = dir.join(format!("{arm}.identity.json"));
         let expected = id_config(
             arm,
-            arm_incremental(arm).map(str::to_string),
-            Some("naive".to_string()),
+            &arm_identity(arm, "naive", &model_id, &CONTROL_ENV),
             &pen,
             fixture,
         );
         if ids_path.exists() {
-            check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
             eprintln!("reusing {}", ids_path.display());
         } else {
-            let mut child = Command::new(&exe);
-            child
-                .args([
-                    "--exact",
-                    ID_ARM_TEST,
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(ARM_ENV, arm)
-                .env(MODEL_ENV, &model)
-                .env(OUT_ENV, &dir)
-                .env("HIPFIRE_MTP_SAMPLED", "1")
-                .env("HIPFIRE_MTP_SAMPLED_MODE", "naive")
-                .env_remove("HIPFIRE_MTP_INCREMENTAL")
-                .stdin(Stdio::null());
-            match arm {
-                "batched" => {
-                    child.env("HIPFIRE_MTP_INCREMENTAL", "0");
-                }
-                "interleaved" => {
-                    child.env("HIPFIRE_MTP_INCREMENTAL", "1");
-                }
-                _ => {}
-            }
-            let output = child
-                .output()
-                .unwrap_or_else(|e| panic!("spawn {arm}: {e}"));
-            fs::write(dir.join(format!("{arm}.identity.out")), &output.stdout).unwrap();
-            fs::write(dir.join(format!("{arm}.identity.err")), &output.stderr).unwrap();
-            assert!(
-                output.status.success(),
-                "{arm} arm failed ({}); logs in {}",
-                output.status,
-                dir.display()
-            );
+            spawn_arm(
+                ID_ARM_TEST,
+                arm,
+                "naive",
+                &model,
+                &dir,
+                None,
+                &format!("{arm}.identity"),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
         }
+        // Reused and fresh results alike must carry the config expected now.
+        check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
         let json: Vec<serde_json::Value> =
             serde_json::from_slice(&fs::read(&ids_path).expect("arm identity ids"))
                 .expect("arm identity json");
@@ -1234,12 +1447,12 @@ fn sampled_mtp_identity_arm() {
 }
 
 fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    require_arm_env(arm, "naive")?;
     let pen = Penalties::from_env()?;
     let fixture = Fixture::from_env()?;
     let config = id_config(
         arm,
-        child_incremental(arm),
-        std::env::var(SAMPLED_MODE_ENV).ok(),
+        &own_identity(model, dir, &CONTROL_ENV)?,
         &pen,
         fixture,
     );
@@ -1314,6 +1527,7 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
     if let Some(drafter) = drafter {
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
@@ -1325,51 +1539,93 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// N-gram composition arms
+// Arm environment, identity, coverage and failure classification
 // ---------------------------------------------------------------------------
 
-/// Per-position marginals and the (t1, t2) joint of `mtp` against its AR
-/// `reference`; lines go to `report`, p-values under `ALPHA` to `failures`.
-fn compare_to_reference(
-    arm: &str,
-    reference: &str,
-    ar: &[Vec<u32>],
-    mtp: &[Vec<u32>],
-    report: &mut String,
-    failures: &mut Vec<String>,
-) {
-    for position in 0..TOKENS {
-        let a: Vec<u32> = ar.iter().map(|ids| ids[position]).collect();
-        let b: Vec<u32> = mtp.iter().map(|ids| ids[position]).collect();
-        let (stat, df, p) = homogeneity(&a, &b);
-        let line = format!(
-            "{arm} vs {reference}, token {}: chi2={stat:.2} df={df} p={p:.4} (n={}+{})\n",
-            position + 1,
-            a.len(),
-            b.len()
-        );
-        if p < ALPHA {
-            failures.push(line.clone());
-        }
-        report.push_str(&line);
+/// Route knob of a forced arm: a `batched` / `interleaved` name is a fixed
+/// route (`HIPFIRE_MTP_INCREMENTAL` 0 / 1, floor off); every other arm
+/// (`ar`, `adaptive`, `*_adaptive`, `late_*`) runs with no route knob.
+fn arm_route(arm: &str) -> Option<&'static str> {
+    if arm.ends_with("interleaved") {
+        Some("1")
+    } else if arm.ends_with("batched") {
+        Some("0")
+    } else {
+        None
     }
-    let a: Vec<(u32, u32)> = ar.iter().map(|ids| (ids[0], ids[1])).collect();
-    let b: Vec<(u32, u32)> = mtp.iter().map(|ids| (ids[0], ids[1])).collect();
-    let (stat, df, p) = homogeneity(&a, &b);
-    let line = format!("{arm} vs {reference}, (t1,t2) joint: chi2={stat:.2} df={df} p={p:.4}\n");
-    if p < ALPHA {
-        failures.push(line.clone());
-    }
-    report.push_str(&line);
 }
 
-/// Run one arm as a fresh process of `test`.
-fn run_ngram_arm_process(
+/// What a parent changes in its child's environment. Every arm resets the
+/// inherited route / floor / trace / timing state, so a benchmark shell's
+/// forcing variables never reach a result; forced arms set their route and
+/// switch the floor off explicitly; the adaptive and `ar` arms leave both
+/// unset (floor on, no forced route).
+fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut overrides: Vec<(&'static str, Option<&'static str>)> = vec![
+        ("HIPFIRE_MTP_SAMPLED", Some("1")),
+        (SAMPLED_MODE_ENV, Some(mode)),
+        ("HIPFIRE_MTP_TRACE", None),
+        ("HIPFIRE_MTP_PHASE_TIMING", None),
+    ];
+    match arm_route(arm) {
+        Some(route) => {
+            overrides.push((INCREMENTAL_ENV, Some(route)));
+            overrides.push((FLOOR_ENV, Some("0")));
+        }
+        None => {
+            overrides.push((INCREMENTAL_ENV, None));
+            overrides.push((FLOOR_ENV, None));
+        }
+    }
+    overrides
+}
+
+/// A child (or a separately launched arm) must already be running under its
+/// arm's environment: a stale shell variable is an error, not a silently
+/// different configuration.
+fn require_arm_env(arm: &str, mode: &'static str) -> Result<(), String> {
+    for (name, want) in arm_overrides(arm, mode) {
+        let have = std::env::var(name).ok();
+        if have.as_deref() != want {
+            return Err(format!(
+                "{name} is {have:?} but arm {arm} requires {want:?}; set it (or unset it) before running this arm directly"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The identity a parent expects of `arm`'s child.
+fn arm_identity(arm: &str, mode: &'static str, model: &Value, exclude: &[&str]) -> Value {
+    hw_identity::config_identity(
+        &hw_identity::env_snapshot(&arm_overrides(arm, mode), exclude),
+        model,
+    )
+}
+
+/// The environment of the running process (a child, or a direct arm run).
+fn own_env(exclude: &[&str]) -> BTreeMap<String, String> {
+    hw_identity::env_snapshot(&[], exclude)
+}
+
+/// The identity of the running process.
+fn own_identity(model: &Path, dir: &Path, exclude: &[&str]) -> Result<Value, String> {
+    Ok(hw_identity::config_identity(
+        &own_env(exclude),
+        &hw_identity::model_identity(model, dir)?,
+    ))
+}
+
+/// Run `test` as a fresh child process for `arm` under the arm's environment;
+/// `shard` is the late case's trial range. Logs go to `<log_stem>.out/.err`.
+fn spawn_arm(
     test: &str,
     arm: &str,
-    incremental: Option<&str>,
+    mode: &'static str,
     model: &Path,
     dir: &Path,
+    shard: Option<(usize, usize)>,
+    log_stem: &str,
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("test binary path: {e}"))?;
     let mut child = Command::new(exe);
@@ -1384,25 +1640,535 @@ fn run_ngram_arm_process(
         .env(ARM_ENV, arm)
         .env(MODEL_ENV, model)
         .env(OUT_ENV, dir)
-        .env("HIPFIRE_MTP_SAMPLED", "1")
-        .env_remove("HIPFIRE_MTP_INCREMENTAL")
         .stdin(Stdio::null());
-    if let Some(value) = incremental {
-        child.env("HIPFIRE_MTP_INCREMENTAL", value);
+    for (name, value) in arm_overrides(arm, mode) {
+        match value {
+            Some(value) => {
+                child.env(name, value);
+            }
+            None => {
+                child.env_remove(name);
+            }
+        }
+    }
+    match shard {
+        Some((start, end)) => {
+            child.env(SHARD_ENV, format!("{start}..{end}"));
+        }
+        None => {
+            child.env_remove(SHARD_ENV);
+        }
     }
     let output = child
         .output()
-        .map_err(|e| format!("spawn {arm}: {e}"))?;
-    fs::write(dir.join(format!("{arm}.out")), &output.stdout).map_err(|e| e.to_string())?;
-    fs::write(dir.join(format!("{arm}.err")), &output.stderr).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("spawn {log_stem}: {e}"))?;
+    fs::write(dir.join(format!("{log_stem}.out")), &output.stdout).map_err(|e| e.to_string())?;
+    fs::write(dir.join(format!("{log_stem}.err")), &output.stderr).map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "{arm} arm failed ({}); logs in {}",
+            "{log_stem} arm failed ({}); logs in {}",
             output.status,
             dir.display()
         ));
     }
     Ok(())
+}
+
+/// The two kinds of failure never share a verdict: a distribution failure is
+/// a statistic under `ALPHA` (a possible law bug); a coverage failure is a
+/// run that did not exercise what it claims to (no law verdict either way).
+fn failure_message(dir: &Path, distribution: &[String], coverage: &[String]) -> String {
+    let mut message = String::new();
+    if !distribution.is_empty() {
+        message.push_str(&format!(
+            "DISTRIBUTION FAILURE (law): sampled MTP differs from AR in distribution (alpha {ALPHA}; logs in {}):\n{}",
+            dir.display(),
+            distribution.concat()
+        ));
+    }
+    if !coverage.is_empty() {
+        message.push_str(&format!(
+            "COVERAGE FAILURE (not a distribution result; logs in {}):\n{}",
+            dir.display(),
+            coverage.concat()
+        ));
+    }
+    message
+}
+
+fn read_json(path: &Path) -> Result<Value, String> {
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn write_json(path: &Path, value: &Value) -> Result<(), String> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The `MTP_FLOOR_PROBE_WINDOWS` the binary under test was built with, read
+/// from the embedded `mtp_spec.rs` source rather than copied here.
+fn floor_probe_budget() -> Result<usize, String> {
+    const SOURCE: &str = include_str!("../src/mtp_spec.rs");
+    let line = SOURCE
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("const MTP_FLOOR_PROBE_WINDOWS: usize")
+        })
+        .ok_or("MTP_FLOOR_PROBE_WINDOWS is not declared in mtp_spec.rs")?;
+    line.split('=')
+        .nth(1)
+        .map(|value| value.trim().trim_end_matches(';').trim())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|budget| *budget > 0)
+        .ok_or_else(|| format!("cannot read the probe budget from {line:?}"))
+}
+
+/// What a window did to the request's counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StatsSnap {
+    mtp_windows: usize,
+    ar_windows: usize,
+    ngram_windows: usize,
+    retired: bool,
+}
+
+impl StatsSnap {
+    fn of(stats: &MtpRequestStats) -> Self {
+        Self {
+            mtp_windows: stats.mtp_windows,
+            ar_windows: stats.ar_windows,
+            ngram_windows: stats.ngram_mod_windows,
+            retired: stats.mtp_retired,
+        }
+    }
+}
+
+/// One `mtp_step` as the decode loop observed it: only quantities the drafter
+/// and the bundle already report, plus the HIP call-count deltas around it.
+#[derive(Clone, Copy, Debug)]
+struct WindowRec {
+    /// Generated IDs before the window; its first committed ID is `ids[index]`.
+    index: usize,
+    position_before: usize,
+    position_after: usize,
+    /// The draft budget passed to `mtp_step`.
+    k_budget: usize,
+    drafts: usize,
+    accepted: usize,
+    committed: usize,
+    before: StatsSnap,
+    after: StatsSnap,
+    counters: Counters,
+}
+
+/// Column names of [`WindowRec::row`]; the counter columns follow.
+const WINDOW_COLUMNS: [&str; 11] = [
+    "index",
+    "position_before",
+    "position_after",
+    "k_budget",
+    "drafts",
+    "accepted",
+    "committed",
+    "mtp_windows_after",
+    "ar_windows_after",
+    "ngram_windows_after",
+    "retired_after",
+];
+
+impl WindowRec {
+    fn row(&self) -> Value {
+        let mut row = vec![
+            json!(self.index),
+            json!(self.position_before),
+            json!(self.position_after),
+            json!(self.k_budget),
+            json!(self.drafts),
+            json!(self.accepted),
+            json!(self.committed),
+            json!(self.after.mtp_windows),
+            json!(self.after.ar_windows),
+            json!(self.after.ngram_windows),
+            json!(self.after.retired),
+        ];
+        if let Value::Array(counters) = self.counters.to_row() {
+            row.extend(counters);
+        }
+        Value::Array(row)
+    }
+}
+
+/// A native window: `mtp_windows` moved by one, `ar_windows` did not.
+fn is_native_window(window: &WindowRec) -> bool {
+    window.after.mtp_windows == window.before.mtp_windows + 1
+        && window.after.ar_windows == window.before.ar_windows
+}
+
+/// A target-only window after retirement: `ar_windows` moved by one,
+/// `mtp_windows` did not.
+fn is_ar_window(window: &WindowRec) -> bool {
+    window.after.ar_windows == window.before.ar_windows + 1
+        && window.after.mtp_windows == window.before.mtp_windows
+}
+
+/// The request's first window is the floor's AR calibration token: nothing
+/// drafted or accepted, `mtp_windows` 0 -> 1 with `ar_windows` still 0, one
+/// position advanced.
+fn is_calibration_window(window: &WindowRec) -> bool {
+    window.before.mtp_windows == 0
+        && window.before.ar_windows == 0
+        && !window.before.retired
+        && window.drafts == 0
+        && window.accepted == 0
+        && window.committed == 1
+        && is_native_window(window)
+        && window.position_after == window.position_before + 1
+}
+
+/// One request's floor sequence, read off its window records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SeqCoverage {
+    /// The first window was the calibration token.
+    calibration_ok: bool,
+    /// The window at which `mtp_retired` went false -> true.
+    retired_at: Option<usize>,
+    /// Native windows after calibration that completed before retirement
+    /// (the retiring window counts when it was itself native).
+    probes_before_retirement: usize,
+    /// Generated index of every later target-only window that ran while
+    /// `mtp_retired` stayed true.
+    post_retirement_ar: Vec<usize>,
+    /// Calibration, the whole probe budget, the ordinary false -> true
+    /// retirement and a later AR window, all in one request.
+    full: bool,
+    /// `full`, and an AR window after retirement emitted at index >= `late_from`.
+    late_after_retirement: bool,
+}
+
+impl SeqCoverage {
+    fn to_json(&self) -> Value {
+        json!({
+            "calibration_ok": self.calibration_ok,
+            "retired_at_step": self.retired_at,
+            "probes_before_retirement": self.probes_before_retirement,
+            "post_retirement_ar_indices": self.post_retirement_ar,
+            "full": self.full,
+            "late_after_retirement": self.late_after_retirement,
+        })
+    }
+}
+
+fn analyze_windows(windows: &[WindowRec], probe_budget: usize, late_from: usize) -> SeqCoverage {
+    let mut coverage = SeqCoverage {
+        calibration_ok: windows.first().is_some_and(is_calibration_window),
+        ..SeqCoverage::default()
+    };
+    coverage.retired_at = windows
+        .iter()
+        .position(|window| !window.before.retired && window.after.retired);
+    if let Some(at) = coverage.retired_at {
+        let before = windows[1.min(at)..at]
+            .iter()
+            .filter(|window| is_native_window(window))
+            .count();
+        coverage.probes_before_retirement = before + usize::from(is_native_window(&windows[at]));
+        coverage.post_retirement_ar = windows[at + 1..]
+            .iter()
+            .filter(|window| {
+                is_ar_window(window) && window.before.retired && window.after.retired
+            })
+            .map(|window| window.index)
+            .collect();
+        coverage.full = coverage.calibration_ok
+            && coverage.probes_before_retirement >= probe_budget
+            && !coverage.post_retirement_ar.is_empty();
+        coverage.late_after_retirement = coverage.full
+            && coverage
+                .post_retirement_ar
+                .iter()
+                .any(|index| *index >= late_from);
+    }
+    coverage
+}
+
+/// Aggregate window / floor evidence over an arm's trials. Every trial is
+/// observed; nothing is selected by route history. `samples` keeps the first
+/// `sample_limit` trials' decoded text and window rows, plus the first trial
+/// with a complete floor sequence so its text can be read.
+#[derive(Default)]
+struct Evidence {
+    sample_limit: usize,
+    trials: usize,
+    no_window_trials: usize,
+    calibration_ok_trials: usize,
+    retired_trials: usize,
+    full_trials: usize,
+    late_full_trials: usize,
+    first_full_trial: Option<usize>,
+    mtp_windows: usize,
+    ar_windows: usize,
+    ngram_windows: usize,
+    steps: usize,
+    drafted: usize,
+    accepted: usize,
+    post_retirement_ar_steps: usize,
+    retire_steps: Vec<usize>,
+    counters: [u64; 10],
+    per_trial: Vec<Value>,
+    samples: Vec<Value>,
+    sampled_full: bool,
+    texts: String,
+}
+
+impl Evidence {
+    fn with_samples(sample_limit: usize) -> Self {
+        Self {
+            sample_limit,
+            ..Self::default()
+        }
+    }
+
+    fn observe(
+        &mut self,
+        trial: usize,
+        seed: u64,
+        run: &MtpRun,
+        tokenizer: &Tokenizer,
+        probe_budget: usize,
+        late_from: usize,
+    ) {
+        let coverage = analyze_windows(&run.windows, probe_budget, late_from);
+        self.trials += 1;
+        self.no_window_trials += usize::from(run.windows.is_empty());
+        self.calibration_ok_trials += usize::from(coverage.calibration_ok);
+        if let Some(step) = coverage.retired_at {
+            self.retired_trials += 1;
+            self.retire_steps.push(step);
+        }
+        if coverage.full {
+            self.full_trials += 1;
+            self.first_full_trial.get_or_insert(trial);
+            self.late_full_trials += usize::from(coverage.late_after_retirement);
+        }
+        self.mtp_windows += run.stats.mtp_windows;
+        self.ar_windows += run.stats.ar_windows;
+        self.ngram_windows += run.stats.ngram_mod_windows;
+        self.steps += run.windows.len();
+        self.drafted += run.drafted;
+        self.accepted += run.accepted;
+        self.post_retirement_ar_steps += coverage.post_retirement_ar.len();
+        for window in &run.windows {
+            for (total, delta) in self.counters.iter_mut().zip(window.counters.to_array()) {
+                *total += delta;
+            }
+        }
+        self.per_trial.push(json!({
+            "trial": trial,
+            "seed": seed,
+            "ids": run.ids.len(),
+            "steps": run.windows.len(),
+            "drafted": run.drafted,
+            "accepted": run.accepted,
+            "mtp_windows": run.stats.mtp_windows,
+            "ar_windows": run.stats.ar_windows,
+            "ngram_mod_windows": run.stats.ngram_mod_windows,
+            "mtp_retired": run.stats.mtp_retired,
+            "coverage": coverage.to_json(),
+        }));
+        let wanted_full = coverage.full && !self.sampled_full;
+        if self.samples.len() < self.sample_limit || wanted_full {
+            self.sampled_full |= coverage.full;
+            let text = tokenizer.decode(&run.ids);
+            self.texts.push_str(&format!(
+                "=== trial {trial} seed {seed} ({} ids, floor sequence full: {}) ===\n{text}\n\n",
+                run.ids.len(),
+                coverage.full
+            ));
+            let late_ids: Vec<Value> = coverage
+                .post_retirement_ar
+                .iter()
+                .filter(|index| **index >= late_from)
+                .filter_map(|index| run.ids.get(*index).map(|id| json!([index, id])))
+                .collect();
+            self.samples.push(json!({
+                "trial": trial,
+                "seed": seed,
+                "ids": run.ids,
+                "text": text,
+                "coverage": coverage.to_json(),
+                "post_retirement_late_ids": late_ids,
+                "windows": run.windows.iter().map(WindowRec::row).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    fn to_json(&self, probe_budget: usize, late_from: usize) -> Value {
+        let counters: serde_json::Map<String, Value> = hw_identity::COUNTER_COLUMNS
+            .iter()
+            .zip(self.counters)
+            .map(|(name, total)| ((*name).to_string(), json!(total)))
+            .collect();
+        let mut columns: Vec<&str> = WINDOW_COLUMNS.to_vec();
+        columns.extend(hw_identity::COUNTER_COLUMNS);
+        json!({
+            "probe_budget": probe_budget,
+            "late_from": late_from,
+            "trials": self.trials,
+            "no_window_trials": self.no_window_trials,
+            "calibration_ok_trials": self.calibration_ok_trials,
+            "retired_trials": self.retired_trials,
+            "full_trials": self.full_trials,
+            "late_full_trials": self.late_full_trials,
+            "first_full_trial": self.first_full_trial,
+            "mtp_windows": self.mtp_windows,
+            "ar_windows": self.ar_windows,
+            "ngram_windows": self.ngram_windows,
+            "steps": self.steps,
+            "drafted": self.drafted,
+            "accepted": self.accepted,
+            "post_retirement_ar_steps": self.post_retirement_ar_steps,
+            "retire_steps": self.retire_steps,
+            "counters": counters,
+            "window_columns": columns,
+            "per_trial": self.per_trial,
+            "samples": self.samples,
+        })
+    }
+
+    /// `<stem>.evidence.json` and the decoded sample text `<stem>.text.txt`.
+    fn write(&self, dir: &Path, stem: &str, probe_budget: usize, late_from: usize) -> Result<(), String> {
+        write_json(
+            &dir.join(format!("{stem}.evidence.json")),
+            &self.to_json(probe_budget, late_from),
+        )?;
+        let path = dir.join(format!("{stem}.text.txt"));
+        fs::write(&path, &self.texts).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+/// Short (4-token) arm coverage from its evidence: a forced floor-off arm
+/// must never touch the floor; the adaptive arm must start every request
+/// with the calibration window. Four tokens do NOT exercise retirement; the
+/// late case does.
+fn short_arm_coverage(arm: &str, evidence: &Value, report: &mut String, coverage: &mut Vec<String>) {
+    let count = |key: &str| evidence[key].as_u64().unwrap_or(0) as usize;
+    let (trials, ar, retired, calibrated, no_window) = (
+        count("trials"),
+        count("ar_windows"),
+        count("retired_trials"),
+        count("calibration_ok_trials"),
+        count("no_window_trials"),
+    );
+    let line = format!(
+        "{arm}: trials={trials} steps={} mtp_windows={} ar_windows={ar} ngram_windows={} retired_trials={retired} calibration_first_window_trials={calibrated} no_window_trials={no_window} drafted={} accepted={}\n",
+        count("steps"),
+        count("mtp_windows"),
+        count("ngram_windows"),
+        count("drafted"),
+        count("accepted"),
+    );
+    report.push_str(&line);
+    if arm_route(arm).is_some() {
+        if ar != 0 || retired != 0 || count("mtp_windows") == 0 {
+            coverage.push(format!(
+                "{line}  a forced floor-off arm must run native windows and never an AR window or retirement\n"
+            ));
+        }
+    } else if calibrated + no_window != trials {
+        coverage.push(format!(
+            "{line}  the adaptive arm's first window must be the calibration token in every request\n"
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// N-gram composition arms
+// ---------------------------------------------------------------------------
+
+/// Per-position marginals and joints of `mtp` against its AR `reference`;
+/// lines go to `report`, p-values under `ALPHA` to `failures`.
+#[allow(clippy::too_many_arguments)]
+fn compare_positions(
+    arm: &str,
+    reference: &str,
+    ar: &[Vec<u32>],
+    mtp: &[Vec<u32>],
+    marginals: &[usize],
+    joints: &[(usize, usize)],
+    report: &mut String,
+    failures: &mut Vec<String>,
+) {
+    for &position in marginals {
+        let a: Vec<u32> = ar.iter().map(|ids| ids[position]).collect();
+        let b: Vec<u32> = mtp.iter().map(|ids| ids[position]).collect();
+        let (stat, df, p) = homogeneity(&a, &b);
+        let line = format!(
+            "{arm} vs {reference}, token {}: chi2={stat:.2} df={df} p={p:.4} (n={}+{})\n",
+            position + 1,
+            a.len(),
+            b.len()
+        );
+        if p < ALPHA {
+            failures.push(line.clone());
+        }
+        report.push_str(&line);
+    }
+    for &(first, second) in joints {
+        let a: Vec<(u32, u32)> = ar.iter().map(|ids| (ids[first], ids[second])).collect();
+        let b: Vec<(u32, u32)> = mtp.iter().map(|ids| (ids[first], ids[second])).collect();
+        let (stat, df, p) = homogeneity(&a, &b);
+        let line = format!(
+            "{arm} vs {reference}, (t{},t{}) joint: chi2={stat:.2} df={df} p={p:.4}\n",
+            first + 1,
+            second + 1
+        );
+        if p < ALPHA {
+            failures.push(line.clone());
+        }
+        report.push_str(&line);
+    }
+}
+
+/// The four-token comparison: every position's marginal and the (t1, t2) joint.
+fn compare_to_reference(
+    arm: &str,
+    reference: &str,
+    ar: &[Vec<u32>],
+    mtp: &[Vec<u32>],
+    report: &mut String,
+    failures: &mut Vec<String>,
+) {
+    let marginals: Vec<usize> = (0..TOKENS).collect();
+    compare_positions(arm, reference, ar, mtp, &marginals, &[(0, 1)], report, failures);
+}
+
+/// An n-gram arm's recorded config (the `ar` arm uses [`dist_config`]).
+fn ngram_config(
+    arm: &str,
+    spec: Option<&NgramArm>,
+    identity: &Value,
+    sampling: (f32, f32, Option<u32>, f32),
+    pen: &Penalties,
+    trials: usize,
+) -> Value {
+    let copy = spec.is_none_or(|spec| spec.copy);
+    let mut config = config_base("ngram-distribution", arm, pen, Fixture::Prose, identity);
+    config["fixture"] = json!(if copy { "copy" } else { "prose" });
+    config["temp"] = json!(sampling.0);
+    config["top_p"] = json!(sampling.1);
+    config["top_k"] = json!(sampling.2);
+    config["min_p"] = json!(sampling.3);
+    config["trials"] = json!(trials);
+    config["tokens"] = json!(TOKENS);
+    config["sampled_mode"] = json!("leviathan");
+    config["triple"] = json!([NGRAM_TRIPLE.0, NGRAM_TRIPLE.1, NGRAM_TRIPLE.2]);
+    config["salt"] = json!(spec.map_or(COPY_AR_SALT, |spec| spec.salt));
+    config
 }
 
 #[test]
@@ -1415,11 +2181,20 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
         trials >= NGRAM_MIN_TRIALS,
         "{TRIALS_ENV}={trials}: the n-gram arms need at least {NGRAM_MIN_TRIALS} trials"
     );
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let sampling = sampling_from_env().unwrap_or_else(|e| panic!("{e}"));
     let mut arms: Vec<(&str, Option<&NgramArm>)> = vec![("ar", None), (COPY_AR_ARM, None)];
     arms.extend(NGRAM_ARMS.iter().map(|arm| (arm.name, Some(arm))));
     let mut samples: HashMap<&str, Vec<Vec<u32>>> = HashMap::new();
     for (name, spec) in arms {
         let ids_path = dir.join(format!("{name}.ids.json"));
+        let identity = arm_identity(name, "leviathan", &model_id, &CONTROL_ENV);
+        let expected = if name == "ar" {
+            settings.config("ar", &identity)
+        } else {
+            ngram_config(name, spec, &identity, sampling, &settings.pen, trials)
+        };
         if ids_path.exists() {
             eprintln!("reusing {}", ids_path.display());
         } else {
@@ -1428,9 +2203,11 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
             } else {
                 NGRAM_ARM_TEST
             };
-            run_ngram_arm_process(test, name, spec.map(|arm| arm.incremental), &model, &dir)
+            spawn_arm(test, name, "leviathan", &model, &dir, None, name)
                 .unwrap_or_else(|e| panic!("{e}"));
         }
+        // Reused and fresh results alike must carry the config expected now.
+        check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
         let ids: Vec<Vec<u32>> =
             serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
         assert!(
@@ -1443,6 +2220,7 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
     }
     let mut report = String::new();
     let mut failures = Vec::new();
+    let mut coverage = Vec::new();
     for arm in &NGRAM_ARMS {
         compare_to_reference(
             arm.name,
@@ -1460,7 +2238,7 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
                 arm.name
             )
         });
-        let stats: serde_json::Value = serde_json::from_slice(&bytes).expect("arm stats json");
+        let stats: Value = serde_json::from_slice(&bytes).expect("arm stats json");
         let count = |key: &str| stats[key].as_u64().expect("arm stats count") as usize;
         let (windows, drafts, accepted, native) = (
             count("ngram_mod_windows"),
@@ -1473,20 +2251,25 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
             arm.name,
             count("trials")
         );
-        if arm.copy && (windows == 0 || drafts == 0) {
-            failures.push(format!("{line}  the copied-span fixture produced no n-gram hits\n"));
+        // The forced copy arms must hit (the pool proposes on the first
+        // window). An adaptive copy arm spends its first window on the
+        // floor's calibration token, so its hits are reported, not required.
+        if arm.copy && arm_route(arm.name).is_some() && (windows == 0 || drafts == 0) {
+            coverage.push(format!("{line}  the copied-span fixture produced no n-gram hits\n"));
         } else if !arm.copy && native == 0 {
-            failures.push(format!("{line}  no native MTP window ran on the prose prompt\n"));
+            coverage.push(format!("{line}  no native MTP window ran on the prose prompt\n"));
         }
         report.push_str(&line);
+        let evidence = read_json(&dir.join(format!("{}.evidence.json", arm.name)))
+            .unwrap_or_else(|e| panic!("{e}"));
+        short_arm_coverage(arm.name, &evidence, &mut report, &mut coverage);
     }
     eprint!("{report}");
     fs::write(dir.join("ngram-report.txt"), &report).unwrap();
     assert!(
-        failures.is_empty(),
-        "n-gram + sampled MTP differs from AR in distribution or never hit (alpha {ALPHA}; logs in {}):\n{}",
-        dir.display(),
-        failures.concat()
+        failures.is_empty() && coverage.is_empty(),
+        "{}",
+        failure_message(&dir, &failures, &coverage)
     );
 }
 
@@ -1554,15 +2337,24 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     if spec.is_none() && arm != COPY_AR_ARM {
         return Err(format!("unknown n-gram arm {arm}"));
     }
+    require_arm_env(arm, "leviathan")?;
     let trials: usize = env_or(TRIALS_ENV, NGRAM_MIN_TRIALS);
     if trials < NGRAM_MIN_TRIALS {
         return Err(format!(
             "{TRIALS_ENV}={trials}: the n-gram arms need at least {NGRAM_MIN_TRIALS} trials"
         ));
     }
-    let (temp, top_p, top_k, min_p) = sampling_from_env()?;
+    let sampling = sampling_from_env()?;
+    let (temp, top_p, top_k, min_p) = sampling;
     // The env penalties reach both the AR reference and the n-gram arms.
     let pen = Penalties::from_env()?;
+    let env = own_env(&CONTROL_ENV);
+    let identity = own_identity(model, dir, &CONTROL_ENV)?;
+    let config = ngram_config(arm, spec, &identity, sampling, &pen, trials);
+    let ids_path = dir.join(format!("{arm}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+    }
     let mut loaded = load(model)?;
     let copy = spec.is_none_or(|spec| spec.copy);
     let prompt = if copy {
@@ -1572,11 +2364,13 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     };
     let eos = loaded.bundle.config.eos_token_id;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={NGRAM_TRIPLE:?} state={}",
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={NGRAM_TRIPLE:?} state={} route_class={}",
         loaded.gpu.arch,
         prompt.len(),
-        loaded.state
+        loaded.state,
+        hw_identity::route_class(&env)
     );
+    println!("ARM {arm} config {config}");
     let started = std::time::Instant::now();
     let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
     match spec {
@@ -1593,23 +2387,22 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
         }
         Some(spec) => {
-            let config = qwen4_ngram_mod_config(NGRAM_TRIPLE)?;
-            let mut drafter = new_drafter_with(&mut loaded, Some(config))?;
+            let pool_config = qwen4_ngram_mod_config(NGRAM_TRIPLE)?;
+            let mut drafter = new_drafter_with(&mut loaded, Some(pool_config))?;
+            let budget = floor_probe_budget()?;
+            let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
             let mut run = |loaded: &mut Loaded, trial: usize| {
-                let cfg = spec_request_ngram(
-                    temp,
-                    top_p,
-                    top_k,
-                    min_p,
-                    trial_seed(spec.salt, trial),
-                    &pen,
-                );
-                loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
+                let seed = trial_seed(spec.salt, trial);
+                let cfg = spec_request_ngram(temp, top_p, top_k, min_p, seed, &pen);
+                loaded
+                    .mtp_request(&mut drafter, &prompt, cfg, TOKENS)
+                    .map(|result| (result, seed))
             };
             let (mut windows, mut drafts, mut accepted, mut native) = (0usize, 0usize, 0usize, 0usize);
             let mut first_stats: Vec<MtpRequestStats> = Vec::new();
             for trial in 0..trials {
-                let (ids, _, _, stats) = run(&mut loaded, trial)?;
+                let (result, seed) = run(&mut loaded, trial)?;
+                let stats = result.stats;
                 if !stats.mtp_ngram {
                     return Err(format!("trial {trial}: the n-gram pool was not armed"));
                 }
@@ -1620,22 +2413,32 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
                 if trial < REPLAYS {
                     first_stats.push(stats);
                 }
-                samples.push(ids);
+                evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+                samples.push(result.ids);
             }
-            for trial in 0..REPLAYS.min(trials) {
-                let (replay, _, _, stats) = run(&mut loaded, trial)?;
-                if replay != samples[trial] || stats != first_stats[trial] {
-                    return Err(format!(
-                        "trial {trial} replayed {replay:?} / {stats:?}, first run {:?} / {:?}",
-                        samples[trial], first_stats[trial]
-                    ));
+            // Only a forced floor-off route replays byte for byte; the
+            // adaptive route's choices depend on wall-clock prices.
+            if hw_identity::forced_floor_off(&env) {
+                for trial in 0..REPLAYS.min(trials) {
+                    let (replay, _) = run(&mut loaded, trial)?;
+                    if replay.ids != samples[trial] || replay.stats != first_stats[trial] {
+                        return Err(format!(
+                            "trial {trial} replayed {:?} / {:?}, first run {:?} / {:?}",
+                            replay.ids, replay.stats, samples[trial], first_stats[trial]
+                        ));
+                    }
                 }
+                println!(
+                    "ARM {arm} replayed {} seeds identically; ngram_mod_windows={windows} drafts={drafts} accepted={accepted} mtp_windows={native}",
+                    REPLAYS.min(trials)
+                );
+            } else {
+                println!(
+                    "ARM {arm} replay not asserted (route class {}); ngram_mod_windows={windows} drafts={drafts} accepted={accepted} mtp_windows={native}",
+                    hw_identity::route_class(&env)
+                );
             }
-            println!(
-                "ARM {arm} replayed {} seeds identically; ngram_mod_windows={windows} drafts={drafts} accepted={accepted} mtp_windows={native}",
-                REPLAYS.min(trials)
-            );
-            if spec.copy && (windows == 0 || drafts == 0) {
+            if spec.copy && arm_route(arm).is_some() && (windows == 0 || drafts == 0) {
                 return Err(format!(
                     "the copied-span fixture produced no n-gram hits in {trials} trials (ngram_mod_windows={windows}, drafts={drafts})"
                 ));
@@ -1645,18 +2448,17 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
                     "no native MTP window ran in {trials} prose trials (ngram_mod_windows={windows})"
                 ));
             }
-            fs::write(
-                dir.join(format!("{arm}.stats.json")),
-                serde_json::to_vec(&serde_json::json!({
+            write_json(
+                &dir.join(format!("{arm}.stats.json")),
+                &json!({
                     "trials": trials,
                     "ngram_mod_windows": windows,
                     "ngram_mod_drafts": drafts,
                     "ngram_mod_accepted": accepted,
                     "mtp_windows": native,
-                }))
-                .map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
+                }),
+            )?;
+            evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
             Box::new(drafter).mtp_free(&mut loaded.gpu);
         }
     }
@@ -1670,12 +2472,988 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         loaded.tokenizer.decode(&samples[0])
     );
     fs::write(
-        dir.join(format!("{arm}.ids.json")),
+        &ids_path,
         serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
     loaded
         .bundle
         .free_gpu(&mut loaded.gpu)
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive late-position case
+// ---------------------------------------------------------------------------
+//
+// A long request under the default (adaptive) route: calibration token, the
+// probe windows, the floor's ordinary retirement decision and the target-only
+// windows after it, compared with AR at late positions. The short arms above
+// cannot reach this: four output tokens end inside calibration plus one
+// probe window.
+
+const LATE_AR_ARM: &str = "late_ar";
+const LATE_ADAPTIVE_ARM: &str = "late_adaptive";
+const LATE_PILOT_ARM: &str = "late_pilot";
+const LATE_AR_SALT: u64 = 0x1A7E_A200;
+const LATE_MTP_SALT: u64 = 0x1A7E_5EC0;
+const LATE_PILOT_SALT: u64 = 0x1A7E_9170;
+/// Generated IDs per trial (`HIPFIRE_SAMPLED_MTP_LATE_TOKENS` may only raise it).
+const LATE_TOKENS_DEFAULT: usize = 128;
+/// Fewest independent trials per compared arm.
+const LATE_MIN_TRIALS: usize = 2000;
+/// Zero-based late marginals and adjacent joints, next to the early marginals.
+const LATE_MARGINALS: [usize; 4] = [31, 63, 95, 127];
+const LATE_JOINTS: [(usize, usize); 4] = [(31, 32), (63, 64), (95, 96), (126, 127)];
+const LATE_EARLY_MARGINALS: [usize; 4] = [0, 1, 2, 3];
+/// The declared coverage pilot: a small seed cohort that shows whether the
+/// fixture and length exercise the floor. It carries no acceptance statistics.
+const PILOT_TRIALS: usize = 24;
+/// Trials whose decoded text and window rows an arm keeps.
+const EVIDENCE_SAMPLES: usize = 8;
+/// The late arms' parent / child control variables (`TRIALS` is excluded so
+/// shards run under any total agree).
+const LATE_CONTROL_ENV: [&str; 5] = [MODEL_ENV, OUT_ENV, ARM_ENV, SHARD_ENV, TRIALS_ENV];
+
+fn late_salt(arm: &str) -> u64 {
+    match arm {
+        LATE_AR_ARM => LATE_AR_SALT,
+        LATE_ADAPTIVE_ARM => LATE_MTP_SALT,
+        LATE_PILOT_ARM => LATE_PILOT_SALT,
+        _ => 0,
+    }
+}
+
+fn late_tokens() -> Result<usize, String> {
+    let tokens: usize = strict_env(LATE_TOKENS_ENV, LATE_TOKENS_DEFAULT)?;
+    if tokens < LATE_TOKENS_DEFAULT {
+        return Err(format!(
+            "{LATE_TOKENS_ENV}={tokens}: the late indices need at least {LATE_TOKENS_DEFAULT} generated IDs"
+        ));
+    }
+    Ok(tokens)
+}
+
+fn late_trials() -> Result<usize, String> {
+    let trials: usize = strict_env(TRIALS_ENV, 2000)?;
+    if trials < LATE_MIN_TRIALS {
+        return Err(format!(
+            "{TRIALS_ENV}={trials}: the late case needs at least {LATE_MIN_TRIALS} trials per arm"
+        ));
+    }
+    Ok(trials)
+}
+
+/// `<arm>.<start>-<end>.<ext>` in `dir`.
+fn late_file(dir: &Path, arm: &str, range: (usize, usize), ext: &str) -> PathBuf {
+    dir.join(format!("{arm}.{}-{}.{ext}", range.0, range.1))
+}
+
+/// The trial range an arm process runs: `HIPFIRE_SAMPLED_MTP_SHARD=START..END`
+/// or all of `0..total` (`total` is the pilot's cohort or the trial count).
+fn shard_range(arm: &str, trials: usize) -> Result<(usize, usize), String> {
+    let total = if arm == LATE_PILOT_ARM {
+        PILOT_TRIALS
+    } else {
+        trials
+    };
+    let Ok(value) = std::env::var(SHARD_ENV) else {
+        return Ok((0, total));
+    };
+    let (start, end) = value
+        .split_once("..")
+        .ok_or_else(|| format!("{SHARD_ENV}={value}: expected START..END"))?;
+    let parse = |text: &str| {
+        text.trim()
+            .parse::<usize>()
+            .map_err(|e| format!("{SHARD_ENV}={value}: {e}"))
+    };
+    let (start, end) = (parse(start)?, parse(end)?);
+    if start >= end || end > total {
+        return Err(format!(
+            "{SHARD_ENV}={value}: the range must be non-empty and within 0..{total}"
+        ));
+    }
+    Ok((start, end))
+}
+
+fn late_config(
+    arm: &str,
+    identity: &Value,
+    settings: &DistSettings,
+    tokens: usize,
+    range: (usize, usize),
+) -> Value {
+    let mut config = config_base(
+        "late-distribution",
+        arm,
+        &settings.pen,
+        settings.fixture,
+        identity,
+    );
+    config["temp"] = json!(settings.temp);
+    config["top_p"] = json!(settings.top_p);
+    config["top_k"] = json!(settings.top_k);
+    config["min_p"] = json!(settings.min_p);
+    config["tokens"] = json!(tokens);
+    config["shard"] = json!([range.0, range.1]);
+    config["salt"] = json!(late_salt(arm));
+    config["sampled_mode"] = json!("leviathan");
+    config["probe_budget"] = json!(floor_probe_budget().ok());
+    config["late_marginals"] = json!(LATE_MARGINALS);
+    config["late_joints"] = json!(LATE_JOINTS);
+    config
+}
+
+/// Sorted `(start, end)` of every `<arm>.<start>-<end>.ids.json` in `dir`.
+fn late_shards(dir: &Path, arm: &str) -> Result<Vec<(usize, usize)>, String> {
+    let prefix = format!("{arm}.");
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let name = entry
+            .map_err(|e| e.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".ids.json"))
+        else {
+            continue;
+        };
+        let Some((start, end)) = rest.split_once('-') else {
+            continue;
+        };
+        if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) {
+            found.push((start, end));
+        }
+    }
+    found.sort_unstable();
+    Ok(found)
+}
+
+/// Uncovered parts of `0..total` given sorted shards. An overlap would count
+/// a seed twice and a shard beyond `total` is not part of this cohort: both
+/// are errors, not something to patch around.
+fn shard_gaps(shards: &[(usize, usize)], total: usize) -> Result<Vec<(usize, usize)>, String> {
+    let mut gaps = Vec::new();
+    let mut next = 0;
+    for &(start, end) in shards {
+        if start >= end || end > total {
+            return Err(format!("shard {start}-{end} lies outside 0..{total}"));
+        }
+        if start < next {
+            return Err(format!(
+                "shard {start}-{end} overlaps an earlier shard ending at {next}: a seed would be counted twice"
+            ));
+        }
+        if start > next {
+            gaps.push((next, start));
+        }
+        next = end;
+    }
+    if next < total {
+        gaps.push((next, total));
+    }
+    Ok(gaps)
+}
+
+/// Every shard of `arm` covering exactly `0..total`, each verified against
+/// its recorded config; missing ranges are run as fresh child processes
+/// (one per gap: use [`SHARD_ENV`] on `sampled_mtp_late_arm` to run them
+/// separately, inside one fabric hold each).
+#[allow(clippy::too_many_arguments)]
+fn ensure_late_shards(
+    model: &Path,
+    dir: &Path,
+    arm: &str,
+    total: usize,
+    tokens: usize,
+    settings: &DistSettings,
+    identity: &Value,
+) -> Result<Vec<(usize, usize)>, String> {
+    let verify = |shards: &[(usize, usize)]| -> Result<(), String> {
+        for &range in shards {
+            check_config(
+                &late_file(dir, arm, range, "ids.json"),
+                &late_config(arm, identity, settings, tokens, range),
+            )?;
+        }
+        Ok(())
+    };
+    let shards = late_shards(dir, arm)?;
+    verify(&shards)?;
+    for gap in shard_gaps(&shards, total)? {
+        eprintln!("{arm}: running missing shard {}..{}", gap.0, gap.1);
+        spawn_arm(
+            LATE_ARM_TEST,
+            arm,
+            "leviathan",
+            model,
+            dir,
+            Some(gap),
+            &format!("{arm}.{}-{}", gap.0, gap.1),
+        )?;
+    }
+    let shards = late_shards(dir, arm)?;
+    verify(&shards)?;
+    if !shard_gaps(&shards, total)?.is_empty() {
+        return Err(format!("{arm}: shards {shards:?} do not cover 0..{total}"));
+    }
+    Ok(shards)
+}
+
+/// Aggregate coverage of the adaptive arm from its shards' evidence, as
+/// report lines plus coverage failures. Requires every request to start with
+/// calibration and at least one request to show the whole floor sequence:
+/// calibration, the probe budget, natural retirement, then a target-only
+/// window after it that emitted at a late index. It does not require every
+/// request to retire (routes are timing-dependent) and never forces one.
+fn adaptive_coverage(parts: &[Value], budget: usize, report: &mut String) -> Vec<String> {
+    let total = |key: &str| -> usize {
+        parts
+            .iter()
+            .map(|part| part[key].as_u64().unwrap_or(0) as usize)
+            .sum()
+    };
+    let (trials, calibrated, no_window, retired, full, late_full, steps) = (
+        total("trials"),
+        total("calibration_ok_trials"),
+        total("no_window_trials"),
+        total("retired_trials"),
+        total("full_trials"),
+        total("late_full_trials"),
+        total("steps"),
+    );
+    let first_full = parts
+        .iter()
+        .filter_map(|part| part["first_full_trial"].as_u64())
+        .min();
+    let mut retire_steps: Vec<u64> = parts
+        .iter()
+        .flat_map(|part| part["retire_steps"].as_array().cloned().unwrap_or_default())
+        .filter_map(|step| step.as_u64())
+        .collect();
+    retire_steps.sort_unstable();
+    let median = retire_steps.get(retire_steps.len() / 2).copied();
+    report.push_str(&format!(
+        "adaptive floor coverage: trials={trials} probe_budget={budget} calibration_first_window_trials={calibrated} no_window_trials={no_window} retired_trials={retired} full_sequence_trials={full} late_full_sequence_trials={late_full} first_full_trial={first_full:?} retire_step(min/median/max)={:?}/{median:?}/{:?} mtp_windows={} ar_windows={} ngram_windows={} post_retirement_ar_steps={} drafted={} accepted={} steps={steps}\n",
+        retire_steps.first(),
+        retire_steps.last(),
+        total("mtp_windows"),
+        total("ar_windows"),
+        total("ngram_windows"),
+        total("post_retirement_ar_steps"),
+        total("drafted"),
+        total("accepted"),
+    ));
+    if steps > 0 {
+        let mut means = String::from("per-window HIP call means (hip_bridge::launch_counters):");
+        for name in hw_identity::COUNTER_COLUMNS {
+            let sum: u64 = parts
+                .iter()
+                .map(|part| part["counters"][name].as_u64().unwrap_or(0))
+                .sum();
+            means.push_str(&format!(" {name}={:.2}", sum as f64 / steps as f64));
+        }
+        report.push_str(&means);
+        report.push('\n');
+    }
+    let mut failures = Vec::new();
+    if calibrated + no_window != trials {
+        failures.push(format!(
+            "only {calibrated} of {trials} requests began with the calibration window\n"
+        ));
+    }
+    if retired == 0 {
+        failures.push(format!(
+            "no request retired naturally in {trials} trials: the fixture/length does not exercise retirement (declare a longer {LATE_TOKENS_ENV} or a different committed fixture and restart the whole cohort; do not force it)\n"
+        ));
+    }
+    if full == 0 {
+        failures.push(format!(
+            "no request completed calibration -> {budget} probe windows -> retirement -> a later target-only window\n"
+        ));
+    } else if late_full == 0 {
+        failures.push(format!(
+            "no complete floor sequence emitted a post-retirement target-only ID at index >= {}\n",
+            LATE_MARGINALS[0]
+        ));
+    }
+    failures
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn sampled_mtp_adaptive_floor_coverage_pilot_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let tokens = late_tokens().unwrap_or_else(|e| panic!("{e}"));
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let budget = floor_probe_budget().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let range = (0, PILOT_TRIALS);
+    let identity = arm_identity(LATE_PILOT_ARM, "leviathan", &model_id, &LATE_CONTROL_ENV);
+    let expected = late_config(LATE_PILOT_ARM, &identity, &settings, tokens, range);
+    let ids_path = late_file(&dir, LATE_PILOT_ARM, range, "ids.json");
+    if ids_path.exists() {
+        eprintln!("reusing {}", ids_path.display());
+    } else {
+        spawn_arm(
+            LATE_ARM_TEST,
+            LATE_PILOT_ARM,
+            "leviathan",
+            &model,
+            &dir,
+            Some(range),
+            &format!("{LATE_PILOT_ARM}.{}-{}", range.0, range.1),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
+    let evidence = read_json(&late_file(&dir, LATE_PILOT_ARM, range, "evidence.json"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut report = format!(
+        "coverage pilot (declared cohort of {PILOT_TRIALS} seeds, {tokens} IDs, fixture {}; not acceptance statistics)\n",
+        settings.fixture.name()
+    );
+    let failures = adaptive_coverage(std::slice::from_ref(&evidence), budget, &mut report);
+    for trial in evidence["per_trial"].as_array().into_iter().flatten() {
+        report.push_str(&format!("{trial}\n"));
+    }
+    eprint!("{report}");
+    fs::write(dir.join("late-pilot-report.txt"), &report).unwrap();
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failure_message(&dir, &[], &failures)
+    );
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4); long: use sampled_mtp_late_arm shards under fabric holds"]
+fn sampled_mtp_adaptive_late_matches_ar_distribution_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let trials = late_trials().unwrap_or_else(|e| panic!("{e}"));
+    let tokens = late_tokens().unwrap_or_else(|e| panic!("{e}"));
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let budget = floor_probe_budget().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let mut ids: HashMap<&str, Vec<Vec<u32>>> = HashMap::new();
+    let mut adaptive_evidence: Vec<Value> = Vec::new();
+    for arm in [LATE_AR_ARM, LATE_ADAPTIVE_ARM] {
+        let identity = arm_identity(arm, "leviathan", &model_id, &LATE_CONTROL_ENV);
+        let shards = ensure_late_shards(&model, &dir, arm, trials, tokens, &settings, &identity)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut all: Vec<Vec<u32>> = Vec::with_capacity(trials);
+        for range in shards {
+            let part: Vec<Vec<u32>> = serde_json::from_value(
+                read_json(&late_file(&dir, arm, range, "ids.json"))
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .expect("shard ids json");
+            assert_eq!(part.len(), range.1 - range.0, "{arm} shard {range:?} trial count");
+            assert!(
+                part.iter().all(|ids| ids.len() == tokens),
+                "{arm} shard {range:?} id count"
+            );
+            all.extend(part);
+            if arm == LATE_ADAPTIVE_ARM {
+                adaptive_evidence.push(
+                    read_json(&late_file(&dir, arm, range, "evidence.json"))
+                        .unwrap_or_else(|e| panic!("{e}")),
+                );
+            }
+        }
+        assert_eq!(all.len(), trials, "{arm}: trial count");
+        ids.insert(arm, all);
+    }
+    let mut report = format!(
+        "late-position case: {trials} trials per arm, {tokens} IDs, fixture {}, early marginals {LATE_EARLY_MARGINALS:?}, late marginals {LATE_MARGINALS:?}, joints {LATE_JOINTS:?}\n",
+        settings.fixture.name()
+    );
+    let mut marginals = LATE_EARLY_MARGINALS.to_vec();
+    marginals.extend(LATE_MARGINALS);
+    let mut joints = vec![(0, 1)];
+    joints.extend(LATE_JOINTS);
+    let mut distribution = Vec::new();
+    compare_positions(
+        LATE_ADAPTIVE_ARM,
+        LATE_AR_ARM,
+        &ids[LATE_AR_ARM],
+        &ids[LATE_ADAPTIVE_ARM],
+        &marginals,
+        &joints,
+        &mut report,
+        &mut distribution,
+    );
+    let coverage = adaptive_coverage(&adaptive_evidence, budget, &mut report);
+    eprint!("{report}");
+    fs::write(dir.join("late-report.txt"), &report).unwrap();
+    assert!(
+        distribution.is_empty() && coverage.is_empty(),
+        "{}",
+        failure_message(&dir, &distribution, &coverage)
+    );
+}
+
+/// One late arm (`late_ar`, `late_adaptive`, `late_pilot`) over a trial range
+/// in a fresh process. Spawned by the two tests above, and runnable directly
+/// to compute one shard inside a time-boxed hold: set
+/// `HIPFIRE_SAMPLED_MTP_ARM`, `HIPFIRE_SAMPLED_MTP_SHARD=START..END` and the
+/// arm's environment (`require_arm_env` names anything that is wrong).
+#[test]
+#[ignore = "child process of the sampled_mtp_adaptive_* tests; runs one shard when run directly"]
+fn sampled_mtp_late_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_late_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} arm: {error}");
+    }
+}
+
+fn run_late_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    if !matches!(arm, LATE_AR_ARM | LATE_ADAPTIVE_ARM | LATE_PILOT_ARM) {
+        return Err(format!("unknown late arm {arm}"));
+    }
+    require_arm_env(arm, "leviathan")?;
+    let settings = DistSettings::from_env()?;
+    let tokens = late_tokens()?;
+    let range = shard_range(arm, settings.trials)?;
+    let env = own_env(&LATE_CONTROL_ENV);
+    let identity = own_identity(model, dir, &LATE_CONTROL_ENV)?;
+    let config = late_config(arm, &identity, &settings, tokens, range);
+    let ids_path = late_file(dir, arm, range, "ids.json");
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+        println!(
+            "ARM {arm} shard {}..{} already complete under this config",
+            range.0, range.1
+        );
+        return Ok(());
+    }
+    let DistSettings {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        fixture,
+        ..
+    } = settings;
+    let mut loaded = load(model)?;
+    let prompt = loaded.render(&fixture.text())?;
+    fixture.check_prompt(prompt.len(), &pen)?;
+    let eos = loaded.bundle.config.eos_token_id;
+    let budget = floor_probe_budget()?;
+    println!(
+        "ARM {arm} arch={} prompt_tokens={} shard={}..{} tokens={tokens} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} fixture={} state={} route_class={} probe_budget={budget}",
+        loaded.gpu.arch,
+        prompt.len(),
+        range.0,
+        range.1,
+        fixture.name(),
+        loaded.state,
+        hw_identity::route_class(&env)
+    );
+    println!("ARM {arm} config {config}");
+    let started = std::time::Instant::now();
+    let (start, end) = range;
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
+    let progress = |trial: usize| {
+        if (trial + 1 - start) % 25 == 0 {
+            println!(
+                "ARM {arm} {}/{} trials in {:.0}s",
+                trial + 1 - start,
+                end - start,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    };
+    if arm == LATE_AR_ARM {
+        let logits = loaded
+            .gpu
+            .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+        for trial in start..end {
+            let seed = trial_seed(LATE_AR_SALT, trial) as u32;
+            samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, tokens)?);
+            progress(trial);
+        }
+        loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    } else {
+        let mut evidence = Evidence::with_samples(if arm == LATE_PILOT_ARM {
+            PILOT_TRIALS
+        } else {
+            EVIDENCE_SAMPLES
+        });
+        let salt = late_salt(arm);
+        let mut drafter = new_drafter(&mut loaded)?;
+        for trial in start..end {
+            let seed = trial_seed(salt, trial);
+            let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
+            let result = loaded.mtp_request(&mut drafter, &prompt, cfg, tokens)?;
+            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            samples.push(result.ids);
+            progress(trial);
+        }
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
+        evidence.write(
+            dir,
+            &format!("{arm}.{}-{}", range.0, range.1),
+            budget,
+            LATE_MARGINALS[0],
+        )?;
+    }
+    // Positions after an EOS read as EOS; every trial is kept.
+    for ids in &mut samples {
+        ids.resize(tokens, eos);
+    }
+    println!(
+        "ARM {arm} shard {}..{} in {:.1}s; first sample: {:?}",
+        range.0,
+        range.1,
+        started.elapsed().as_secs_f64(),
+        loaded.tokenizer.decode(&samples[0])
+    );
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// GPU-free checks of the coverage logic
+// ---------------------------------------------------------------------------
+
+mod coverage_logic {
+    use super::*;
+
+    fn rec(
+        index: usize,
+        position: usize,
+        before: (usize, usize, bool),
+        after: (usize, usize, bool),
+        drafts: usize,
+        committed: usize,
+    ) -> WindowRec {
+        let snap = |(mtp_windows, ar_windows, retired): (usize, usize, bool)| StatsSnap {
+            mtp_windows,
+            ar_windows,
+            ngram_windows: 0,
+            retired,
+        };
+        WindowRec {
+            index,
+            position_before: position,
+            position_after: position + committed,
+            k_budget: 3,
+            drafts,
+            accepted: drafts.min(committed.saturating_sub(1)),
+            committed,
+            before: snap(before),
+            after: snap(after),
+            counters: Counters::default(),
+        }
+    }
+
+    /// calibration, three probe windows (the last one retires), then AR.
+    fn full_sequence(first_ar_index: usize) -> Vec<WindowRec> {
+        vec![
+            rec(1, 100, (0, 0, false), (1, 0, false), 0, 1),
+            rec(2, 101, (1, 0, false), (2, 0, false), 3, 4),
+            rec(6, 105, (2, 0, false), (3, 0, false), 3, 2),
+            rec(8, 107, (3, 0, false), (4, 0, true), 3, 4),
+            rec(first_ar_index, 111, (4, 0, true), (4, 1, true), 0, 1),
+        ]
+    }
+
+    #[test]
+    fn adaptive_sequence_full_when_every_stage_is_present() {
+        let coverage = analyze_windows(&full_sequence(12), 3, 31);
+        assert!(coverage.calibration_ok);
+        assert_eq!(coverage.retired_at, Some(3));
+        assert_eq!(coverage.probes_before_retirement, 3);
+        assert_eq!(coverage.post_retirement_ar, vec![12]);
+        assert!(coverage.full);
+        assert!(!coverage.late_after_retirement);
+        let late = analyze_windows(&full_sequence(40), 3, 31);
+        assert!(late.full && late.late_after_retirement);
+    }
+
+    #[test]
+    fn adaptive_sequence_needs_the_whole_probe_budget() {
+        // Retirement is decided by the router at the start of the fourth
+        // step (the AR window itself) after only two probes.
+        let windows = vec![
+            rec(1, 100, (0, 0, false), (1, 0, false), 0, 1),
+            rec(2, 101, (1, 0, false), (2, 0, false), 3, 4),
+            rec(6, 105, (2, 0, false), (3, 0, false), 3, 2),
+            rec(8, 107, (3, 0, false), (3, 1, true), 0, 1),
+            rec(9, 108, (3, 1, true), (3, 2, true), 0, 1),
+        ];
+        let coverage = analyze_windows(&windows, 3, 31);
+        assert_eq!(coverage.probes_before_retirement, 2);
+        assert!(!coverage.full);
+        // ...and the same sequence satisfies a budget of two.
+        assert!(analyze_windows(&windows, 2, 31).full);
+    }
+
+    #[test]
+    fn adaptive_sequence_needs_an_ar_window_after_the_retiring_step() {
+        let mut windows = full_sequence(12);
+        windows.pop();
+        let coverage = analyze_windows(&windows, 3, 31);
+        assert_eq!(coverage.retired_at, Some(3));
+        assert!(coverage.post_retirement_ar.is_empty());
+        assert!(!coverage.full);
+        // The retiring step itself being the AR window does not count as "later".
+        let only_ar = vec![
+            rec(1, 100, (0, 0, false), (1, 0, false), 0, 1),
+            rec(2, 101, (1, 0, false), (2, 0, false), 3, 4),
+            rec(6, 105, (2, 0, false), (3, 0, false), 3, 2),
+            rec(8, 107, (3, 0, false), (4, 0, false), 3, 4),
+            rec(12, 111, (4, 0, false), (4, 1, true), 0, 1),
+        ];
+        let coverage = analyze_windows(&only_ar, 3, 31);
+        assert_eq!(coverage.retired_at, Some(4));
+        assert_eq!(coverage.probes_before_retirement, 3);
+        assert!(coverage.post_retirement_ar.is_empty() && !coverage.full);
+    }
+
+    #[test]
+    fn adaptive_sequence_without_retirement_or_calibration_is_not_full() {
+        let mut windows = full_sequence(12);
+        windows.truncate(3);
+        let coverage = analyze_windows(&windows, 3, 31);
+        assert!(coverage.calibration_ok && coverage.retired_at.is_none() && !coverage.full);
+
+        // A first window that drafted is not the calibration token.
+        let mut windows = full_sequence(12);
+        windows[0].drafts = 3;
+        let coverage = analyze_windows(&windows, 3, 31);
+        assert!(!coverage.calibration_ok && !coverage.full);
+        assert!(analyze_windows(&[], 3, 31) == SeqCoverage::default());
+    }
+
+    #[test]
+    fn late_shards_cover_exactly_once() {
+        assert_eq!(shard_gaps(&[], 10), Ok(vec![(0, 10)]));
+        assert_eq!(shard_gaps(&[(0, 4), (4, 10)], 10), Ok(vec![]));
+        assert_eq!(
+            shard_gaps(&[(2, 4), (6, 8)], 10),
+            Ok(vec![(0, 2), (4, 6), (8, 10)])
+        );
+        assert!(shard_gaps(&[(0, 5), (4, 10)], 10).is_err(), "overlap");
+        assert!(shard_gaps(&[(0, 12)], 10).is_err(), "beyond the cohort");
+    }
+
+    #[test]
+    fn probe_budget_is_read_from_the_source_under_test() {
+        assert!(floor_probe_budget().unwrap() >= 1);
+    }
+
+    #[test]
+    fn forced_arms_reset_the_floor_and_adaptive_arms_clear_it() {
+        let find = |arm: &str, name: &str| {
+            arm_overrides(arm, "leviathan")
+                .into_iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(find("batched", FLOOR_ENV), Some(Some("0")));
+        assert_eq!(find("batched", INCREMENTAL_ENV), Some(Some("0")));
+        assert_eq!(find("copy_interleaved", INCREMENTAL_ENV), Some(Some("1")));
+        for arm in ["ar", "adaptive", "ngram_adaptive", LATE_ADAPTIVE_ARM, LATE_PILOT_ARM] {
+            assert_eq!(find(arm, FLOOR_ENV), Some(None), "{arm}");
+            assert_eq!(find(arm, INCREMENTAL_ENV), Some(None), "{arm}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thinking termination
+// ---------------------------------------------------------------------------
+//
+// A sampled-speculation change must not stop a long thinking turn from
+// closing. `sampled_mtp_thinking_terminates_like_ar_on_flash_next` renders a
+// fixed built-in math prompt with thinking ON (the same chat frame as
+// `render`, only `enable_thinking` differs), decodes it in plain AR (host
+// sampler) and in sampled adaptive MTP (Leviathan) on the same binary with the
+// same sampling, penalties and budget, over a fixed seed cohort
+// (`trial_seed(salt, 0..seeds)`), and requires `</think>` in the decoded
+// output of EVERY seed of BOTH arms. Nothing is selected after the fact: every
+// seed counts, and a seed that does not close fails the test. No law,
+// sampler or routing is changed; the arms are the production AR sampler and
+// the production adaptive sampled MTP path (floor on, no route knob).
+//
+// Decoded text of every seed is written to `think_ar.think.txt` and
+// `think_adaptive.think.txt`; per-seed IDs / close index to `*.think.json`;
+// the MTP arm's per-window route / accepted / retirement counters to
+// `think_adaptive.evidence.json`. Results carry the same config / identity /
+// receipt sidecars as the other arms and are reused only under an equal config.
+// `HIPFIRE_SAMPLED_MTP_THINK_TOKENS` (default 3500) and
+// `HIPFIRE_SAMPLED_MTP_THINK_SEEDS` (default 4) change the declared budget and
+// cohort for both arms together.
+
+const THINK_AR_ARM: &str = "think_ar";
+const THINK_ADAPTIVE_ARM: &str = "think_adaptive";
+const THINK_ARM_TEST: &str = "sampled_mtp_think_arm";
+const THINK_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_TOKENS";
+const THINK_SEEDS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_SEEDS";
+/// Generated IDs per request, shared by both arms; must leave room in `MAX_SEQ`.
+const THINK_TOKENS_DEFAULT: usize = 3500;
+const THINK_SEEDS_DEFAULT: usize = 4;
+const THINK_AR_SALT: u64 = 0x7A1A_A200;
+const THINK_MTP_SALT: u64 = 0x7A1A_5EC0;
+const THINK_CLOSE: &str = "</think>";
+/// A fixed counting problem with a cheap-to-verify answer (the answer is 400)
+/// that invites a long deliberate check; sent as one user message.
+const THINK_PROMPT: &str = "How many positive integers less than 1000 are divisible by 3 or by 5 but not by 15? Work it out carefully, then verify the count with a second, independent method before giving the final answer.";
+
+fn think_dims() -> Result<(usize, usize), String> {
+    let tokens: usize = strict_env(THINK_TOKENS_ENV, THINK_TOKENS_DEFAULT)?;
+    let seeds: usize = strict_env(THINK_SEEDS_ENV, THINK_SEEDS_DEFAULT)?;
+    if tokens == 0 || tokens + 512 > MAX_SEQ || seeds == 0 {
+        return Err(format!(
+            "{THINK_TOKENS_ENV}={tokens} / {THINK_SEEDS_ENV}={seeds}: need 0 < tokens <= {} and seeds >= 1",
+            MAX_SEQ - 512
+        ));
+    }
+    Ok((tokens, seeds))
+}
+
+fn think_config(
+    arm: &str,
+    identity: &Value,
+    settings: &DistSettings,
+    tokens: usize,
+    seeds: usize,
+) -> Value {
+    let mut config = config_base(
+        "think-termination",
+        arm,
+        &settings.pen,
+        Fixture::Prose,
+        identity,
+    );
+    config["fixture"] = json!("think");
+    config["prompt_sha256"] = json!(hw_identity::sha256_hex(THINK_PROMPT.as_bytes()));
+    config["temp"] = json!(settings.temp);
+    config["top_p"] = json!(settings.top_p);
+    config["top_k"] = json!(settings.top_k);
+    config["min_p"] = json!(settings.min_p);
+    config["tokens"] = json!(tokens);
+    config["seeds"] = json!(seeds);
+    config["salt"] = json!(if arm == THINK_AR_ARM {
+        THINK_AR_SALT
+    } else {
+        THINK_MTP_SALT
+    });
+    config["sampled_mode"] = json!("leviathan");
+    config
+}
+
+/// One arm in a fresh process; spawned by the termination test below.
+#[test]
+#[ignore = "child process of sampled_mtp_thinking_terminates_like_ar_on_flash_next"]
+fn sampled_mtp_think_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_think_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} arm: {error}");
+    }
+}
+
+fn run_think_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    if !matches!(arm, THINK_AR_ARM | THINK_ADAPTIVE_ARM) {
+        return Err(format!("unknown thinking arm {arm}"));
+    }
+    require_arm_env(arm, "leviathan")?;
+    let settings = DistSettings::from_env()?;
+    let (tokens, seeds) = think_dims()?;
+    let identity = own_identity(model, dir, &CONTROL_ENV)?;
+    let config = think_config(arm, &identity, &settings, tokens, seeds);
+    let ids_path = dir.join(format!("{arm}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+        println!("ARM {arm} already complete under this config");
+        return Ok(());
+    }
+    let DistSettings {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        ..
+    } = settings;
+    let env = own_env(&CONTROL_ENV);
+    let mut loaded = load(model)?;
+    let prompt = loaded.render_with(THINK_PROMPT, true)?;
+    if prompt.len() + tokens + MTP_K + 1 > MAX_SEQ {
+        return Err(format!(
+            "prompt {} + {tokens} IDs does not fit MAX_SEQ {MAX_SEQ}",
+            prompt.len()
+        ));
+    }
+    let close_id = {
+        let ids = loaded.tokenizer.encode(THINK_CLOSE);
+        (ids.len() == 1).then(|| ids[0])
+    };
+    println!(
+        "ARM {arm} arch={} prompt_tokens={} tokens={tokens} seeds={seeds} close_token={close_id:?} route_class={} state={}",
+        loaded.gpu.arch,
+        prompt.len(),
+        hw_identity::route_class(&env),
+        loaded.state
+    );
+    println!("ARM {arm} config {config}");
+    let budget = floor_probe_budget()?;
+    let mut evidence = Evidence::with_samples(seeds);
+    let mut all_ids: Vec<Vec<u32>> = Vec::with_capacity(seeds);
+    let mut records: Vec<Value> = Vec::with_capacity(seeds);
+    let mut texts = String::new();
+    let started = std::time::Instant::now();
+    let logits = if arm == THINK_AR_ARM {
+        Some(
+            loaded
+                .gpu
+                .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut drafter = if arm == THINK_ADAPTIVE_ARM {
+        Some(new_drafter(&mut loaded)?)
+    } else {
+        None
+    };
+    for n in 0..seeds {
+        let (ids, seed) = match (logits.as_ref(), drafter.as_mut()) {
+            (Some(logits), None) => {
+                let seed = trial_seed(THINK_AR_SALT, n);
+                let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+                (loaded.ar_ids(logits, &prompt, &cfg, seed as u32, tokens)?, seed)
+            }
+            (None, Some(drafter)) => {
+                let seed = trial_seed(THINK_MTP_SALT, n);
+                let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
+                let run = loaded.mtp_request(drafter, &prompt, cfg, tokens)?;
+                evidence.observe(n, seed, &run, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+                (run.ids, seed)
+            }
+            _ => return Err("thinking arm state".into()),
+        };
+        let text = loaded.tokenizer.decode(&ids);
+        let close_at = close_id.and_then(|id| ids.iter().position(|&token| token == id));
+        let closed = close_at.is_some() || text.contains(THINK_CLOSE);
+        println!(
+            "ARM {arm} seed#{n}: {} ids, closed={closed} close_index={close_at:?}, {:.0}s",
+            ids.len(),
+            started.elapsed().as_secs_f64()
+        );
+        texts.push_str(&format!(
+            "=== seed#{n} ({seed}): {} ids, closed={closed} ===\n{text}\n\n",
+            ids.len()
+        ));
+        records.push(json!({
+            "seed_index": n,
+            "seed": seed,
+            "ids": ids.len(),
+            "closed": closed,
+            "close_index": close_at,
+        }));
+        all_ids.push(ids);
+    }
+    if let Some(logits) = logits {
+        loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    }
+    if let Some(drafter) = drafter {
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
+        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
+    }
+    write_json(
+        &dir.join(format!("{arm}.think.json")),
+        &json!({ "prompt_tokens": prompt.len(), "close_token": close_id, "seeds": records }),
+    )?;
+    let text_path = dir.join(format!("{arm}.think.txt"));
+    fs::write(&text_path, &texts).map_err(|e| format!("{}: {e}", text_path.display()))?;
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&all_ids).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
+fn sampled_mtp_thinking_terminates_like_ar_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let (tokens, seeds) = think_dims().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let mut closed = [0usize; 2];
+    let mut report = format!(
+        "thinking termination: {seeds} seeds, {tokens} IDs, prompt sha256 {}\n",
+        hw_identity::sha256_hex(THINK_PROMPT.as_bytes())
+    );
+    for (slot, arm) in [THINK_AR_ARM, THINK_ADAPTIVE_ARM].into_iter().enumerate() {
+        let identity = arm_identity(arm, "leviathan", &model_id, &CONTROL_ENV);
+        let expected = think_config(arm, &identity, &settings, tokens, seeds);
+        let ids_path = dir.join(format!("{arm}.ids.json"));
+        if ids_path.exists() {
+            eprintln!("reusing {}", ids_path.display());
+        } else {
+            spawn_arm(THINK_ARM_TEST, arm, "leviathan", &model, &dir, None, arm)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
+        let think =
+            read_json(&dir.join(format!("{arm}.think.json"))).unwrap_or_else(|e| panic!("{e}"));
+        for record in think["seeds"].as_array().into_iter().flatten() {
+            closed[slot] += usize::from(record["closed"].as_bool().unwrap_or(false));
+            report.push_str(&format!("{arm}: {record}\n"));
+        }
+    }
+    report.push_str(&format!(
+        "closed {THINK_CLOSE}: ar {}/{seeds}, sampled adaptive MTP {}/{seeds}\n",
+        closed[0], closed[1]
+    ));
+    eprint!("{report}");
+    fs::write(dir.join("think-report.txt"), &report).unwrap();
+    // Decoded text of every seed: think_ar.think.txt, think_adaptive.think.txt.
+    assert!(
+        closed[0] == seeds,
+        "plain AR closed {THINK_CLOSE} in only {}/{seeds} seeds within {tokens} IDs (decoded text in {}/think_ar.think.txt): the shared budget is too small for this prompt, so the comparison is void; raise {THINK_TOKENS_ENV}",
+        closed[0],
+        dir.display()
+    );
+    assert!(
+        closed[1] == seeds,
+        "THINKING TERMINATION FAILURE: plain AR closed {THINK_CLOSE} in {seeds}/{seeds} seeds but sampled adaptive MTP in {}/{seeds} (decoded text in {}/think_adaptive.think.txt)",
+        closed[1],
+        dir.display()
+    );
 }

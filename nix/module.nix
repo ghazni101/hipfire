@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, options, lib, pkgs, ... }:
 
 let
   cfg = config.services.hipfire;
@@ -30,8 +30,16 @@ let
     "memory.max_seq" = cfg.maxSeq;
     "generation.repeat_penalty" = cfg.repeatPenalty;
     "memory.kv_cache" = cfg.kvCache;
-    "speculation.dflash" = cfg.dflashMode;
     "serve.idle_timeout_seconds" = cfg.idleTimeout;
+  }
+  # An untouched dflashMode (only the option default, mkOptionDefault priority;
+  # `isDefined` is true for that default, so compare the priority) writes no
+  # speculation.dflash, so the registry's per-model policy applies (auto only
+  # for Qwen3.8-27B tiers with a declared paired draft; every other model keeps
+  # the schema default off). Any explicit definition, including "auto", is
+  # written as a global that outranks the registry layer.
+  // lib.optionalAttrs (options.services.hipfire.dflashMode.highestPrio < (lib.mkOptionDefault null).priority) {
+    "speculation.dflash" = cfg.dflashMode;
   }
   // lib.optionalAttrs (cfg.defaultModel != "") {
     "serve.default_model" = cfg.defaultModel;
@@ -242,8 +250,16 @@ in
 
     dflashMode = lib.mkOption {
       type = lib.types.enum [ "on" "off" "auto" ];
-      default = "off";
-      description = "DFlash speculative decode: on / off / auto.";
+      default = "auto";
+      description = ''
+        DFlash speculative decode: on / off / auto. Leaving this option unset
+        writes no `speculation.dflash` key, so the registry's per-model policy
+        applies: `auto` only for Qwen3.8-27B tiers whose registry entry declares
+        a paired DFlash draft, `off` (the schema default) for every other model.
+        Setting it explicitly, to `"auto"` as well, writes a global
+        `speculation.dflash` that outranks the registry layer; `"off"` is the
+        kill switch that disables DFlash for every model.
+      '';
     };
 
     idleTimeout = lib.mkOption {

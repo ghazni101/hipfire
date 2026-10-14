@@ -2,7 +2,7 @@
 
 Date: 2026-09-16. **Planning-only / read-only screen** for `/home/kaden/ClaudeCode/warpfront/wt-lloyd` (`mq4-lloyd`). No source edits, no GPU/NPU runs, no formatters, no suites, no commit. Parent runs any hardware probe on **hipx** (Linux kernel 7.0, ROCm 7.15, gfx1151 iGPU; NPU node expected at `/dev/accel/accel0` via `amdxdna`). This document packages the software stack, compute facts, runnable probe recipe, hipfire integration sketch, and kill criteria so the parent can execute once without redesign thrash.
 
-> Prior disposition: `docs/plans/2026-09-15-halo-gap-plan.md` listed **NPU** under deferred/rejected levers. This screen does **not** reopen a backend. It defines measurements that either kill the idea cleanly or unlock a separate Sol spec. Do not treat any TOPS or pp2048 gain below as measured on hipx.
+> Prior disposition: the 2026-09-15 Halo gap plan (internal) listed **NPU** under deferred/rejected levers. This screen does **not** reopen a backend. It defines measurements that either kill the idea cleanly or unlock a separate Sol spec. Do not treat any TOPS or pp2048 gain below as measured on hipx.
 
 ## Ten-line summary
 

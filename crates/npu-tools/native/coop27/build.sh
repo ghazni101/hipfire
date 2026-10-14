@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 # Regenerate the coop27 PM-native code objects (no vendor assembler/compiler). Build peacemaker from the approved PM tree:
-#   CARGO_TARGET_DIR=/path/out cargo build --locked --manifest-path /path/wt-land-041m/Cargo.toml -p hipfire-isa --features toolchain --bin peacemaker
+#   CARGO_TARGET_DIR=/path/out cargo build --locked --manifest-path /path/wt-land-041m/Cargo.toml -p peacemaker-isa --features toolchain --bin peacemaker
 #   PEACEMAKER=/path/out/debug/peacemaker bash crates/npu-tools/native/coop27/build.sh
 # ief_silu_gfx1151.s is generated: head + the incumbent's verbatim SiLU group DAG + tail (see ief_silu.head.s).
 set -euo pipefail
@@ -26,7 +26,7 @@ cat "$here/ief_silu2.head.s" "$here/silu_dag_lowreg.inc" "$here/ief_silu2.tail.s
 "$pm" native --arch=gfx1151 "$here/ief_silu2_gfx1151.s" --co="$here/ief_silu2_gfx1151.co"
 
 # ---- ief_fold_gfx1151: epilogue fold twins + merged wide tails (coop-epi-fuse) ----
-# v2b_pm_gfx1151.s is the PM emitter output `hipfire-isa emit --kernel iu4_v2b --epi all --arch gfx1151` of hipfire
+# v2b_pm_gfx1151.s is the PM emitter output `peacemaker-isa emit --kernel iu4_v2b --epi all --arch gfx1151` of hipfire
 # wt-land-041m 9aef0a35f; assembled alone it is byte-identical to the ELF inside the vendored .hxaco (the incumbent).
 # ief_gu_fold / ief_add_fold: the incumbent gate_up SiLU / down ADD entry instruction for instruction (label to its end
 # label), then fold_sched.inc (NPU-column SiLU / addc, flag-gated, work-claimed) before the VGPR dealloc + s_endpgm.

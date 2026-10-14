@@ -1,9 +1,0 @@
-[package]
-name = "pm-npu"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "AIE2P (XDNA2 NPU) builder: core instruction encoder/scheduler, CDO/PDI writer, DPU transaction writer, kernels, and a pure-CPU AIE2P simulator (`sim`). Experimental, dark: nothing in the hipfire runtime calls it."
-publish = false
-
-[dependencies]

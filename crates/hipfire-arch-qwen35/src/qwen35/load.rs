@@ -47,6 +47,10 @@ use hipfire_runtime::model_load::LoadedWeights;
 pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::offload::expert_memory_target;
+use hipfire_runtime::offload::memory_target;
+use hipfire_runtime::offload::LayerBytes;
+use hipfire_runtime::offload::LayerResidency;
 use hipfire_runtime::paro::paro_load_norm;
 use hipfire_runtime::paro::paro_text_prefix;
 use hipfire_runtime::tp_shard::ExpertAssign;
@@ -58,7 +62,9 @@ use hipfire_runtime::weight_backend::load_embedding;
 use hipfire_runtime::weight_backend::resolve_lm_head;
 use hipfire_runtime::weight_backend::reupload_f16_as_f32;
 use hipfire_runtime::weight_backend::HfqBackend;
+use hipfire_runtime::weight_backend::MemoryTarget;
 use hipfire_runtime::weight_backend::ParoBackend;
+use hipfire_runtime::weight_manifest::WeightResidency;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
@@ -143,37 +149,29 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
-/// Shared quant-type dispatch for a projection weight.
+/// Shared quant-type dispatch for a projection weight at `target`.
 ///
-/// `up` decides where the code blob lands: the device reader passes
-/// `Gpu::upload_raw`, the offloaded reader passes `Gpu::upload_raw_host`
-/// (host-mapped system RAM, read over PCIe). Both hold byte-identical bytes, so the
-/// numerics are unchanged and only the physical location differs. Injecting the
-/// uploader rather than passing a `host` flag keeps ONE copy of the match: the
-/// device path is reached through `&Gpu` (the `read_proj` fn-pointer contract,
-/// which cannot hand out `&mut Gpu`) while the host path needs `&mut Gpu` to
-/// register the host-mapped owner it must later free — a signature no single
-/// parameter can satisfy.
+/// `target` decides where the code blob lands through [`upload_codes`]: VRAM, or
+/// pinned host-mapped system RAM the same kernels read over PCIe. Both hold
+/// byte-identical bytes, so the numerics are unchanged and only the physical
+/// location differs — which is why this is one match over one parameter rather
+/// than two dispatch tables (the historical device reader plus a host twin).
 ///
-/// `fallback` covers the quant types that dequantize to f32 instead of uploading
-/// raw codes. Only the device reader implements it; the offloaded reader refuses,
-/// because the f32 path has no host upload and would otherwise quietly consume
-/// the VRAM the offload exists to free.
-fn load_weight_tensor_raw_with<U, F>(
+/// The f32-dequant arms (`_ =>`) route through [`dequant_weight_raw`], which
+/// fails closed under [`MemoryTarget::HostMapped`] because the f32 path has no
+/// host upload and would otherwise quietly consume the VRAM the offload exists
+/// to free.
+fn load_weight_tensor_raw_with(
+    gpu: &mut Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
-    mut up: U,
-    fallback: F,
-) -> HipResult<WeightTensor>
-where
-    U: FnMut(&[u8], &[usize]) -> HipResult<GpuTensor>,
-    F: FnOnce(u8, &[u8], usize, usize) -> HipResult<WeightTensor>,
-{
+    target: MemoryTarget,
+) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G256,
@@ -188,7 +186,7 @@ where
             })
         }
         7 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G128,
@@ -203,7 +201,7 @@ where
             })
         }
         8 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ6G256,
@@ -218,7 +216,7 @@ where
             })
         }
         11 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ3G256,
@@ -233,7 +231,7 @@ where
             })
         }
         12 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ3G128,
@@ -249,7 +247,7 @@ where
         }
         13 => {
             // MQ4-G256
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256,
@@ -265,7 +263,7 @@ where
         }
         14 => {
             // MQ8-G256
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ8G256,
@@ -281,7 +279,7 @@ where
         }
         15 => {
             // MQ6-G256
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256,
@@ -297,7 +295,7 @@ where
         }
         17 => {
             // MQ3-G256
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256,
@@ -313,7 +311,7 @@ where
         }
         18 => {
             // MQ2-G256
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256,
@@ -329,7 +327,7 @@ where
         }
         19 => {
             // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook (72 bytes/group)
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256Lloyd,
@@ -345,7 +343,7 @@ where
         }
         20 => {
             // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook (112 bytes/group)
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256Lloyd,
@@ -362,7 +360,7 @@ where
         30 => {
             // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook (160 bytes/group)
             // Renumbered from qt 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256Lloyd,
@@ -381,7 +379,7 @@ where
             // Opaque raw buffer, same pattern as MQ4(13)/MQ6(15); the GEMV
             // dispatch FWHT-rotates x at use. AWQ sidecar attached by the
             // caller via DType::supports_awq_sidecar (already includes MQ5G256).
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ5G256,
@@ -404,7 +402,7 @@ where
                 k % 256 == 0,
                 "HFP4G32 v1 lm_head has K={k} but kernel requires K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFP4G32,
@@ -425,7 +423,7 @@ where
                 k % 256 == 0,
                 "MFP4G32 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32,
@@ -445,7 +443,7 @@ where
                 k % 256 == 0,
                 "MFP4G32Lloyd lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32Lloyd,
@@ -466,7 +464,7 @@ where
                 k % 256 == 0,
                 "MFP4G32P lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32P,
@@ -487,7 +485,7 @@ where
                 k % 256 == 0,
                 "MFP4G32E8 lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32E8,
@@ -508,7 +506,7 @@ where
                 k % 256 == 0,
                 "MFP3G32E8 has K={k} but FWHT requires K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP3G32E8,
@@ -529,7 +527,7 @@ where
                 k % 256 == 0,
                 "MFP2G32E8 has K={k} but FWHT requires K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP2G32E8,
@@ -563,7 +561,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
@@ -587,7 +585,7 @@ where
             let mut centered = data.to_vec();
             hipfire_runtime::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
                 .map_err(|e| HipError::new(0, &e))?;
-            let buf = up(&centered, &[centered.len()])?;
+            let buf = upload_codes(gpu, target, &centered, &[centered.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2Lloyd,
@@ -629,7 +627,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4CG256,
@@ -666,7 +664,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ6G256V2,
@@ -701,7 +699,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ5G256V2,
@@ -736,7 +734,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256V2,
@@ -771,7 +769,7 @@ where
                     ),
                 ));
             }
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256V2,
@@ -802,7 +800,7 @@ where
                 k % 256 == 0,
                 "MQ2G256GL has K={k} but the SoA region split requires K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ2G256GL,
@@ -824,7 +822,7 @@ where
                 k % 256 == 0,
                 "MQ3G256GL has K={k} but the SoA region split requires K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
@@ -839,7 +837,7 @@ where
             })
         }
         40 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::TQ2G128,
@@ -854,7 +852,7 @@ where
             })
         }
         41 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BQ1G128,
@@ -869,7 +867,7 @@ where
             })
         }
         3 => {
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::Q8_0,
@@ -884,7 +882,7 @@ where
             })
         }
         1 => match f16_lm_head_mode_from_config() {
-            F16LmHeadMode::Native => fallback(quant_type, data, m, k),
+            F16LmHeadMode::Native => dequant_weight_raw(gpu, quant_type, data, m, k, target),
             F16LmHeadMode::F32 => {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
@@ -893,7 +891,7 @@ where
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
-                let buf = up(bytes, &[m, k])?;
+                let buf = upload_codes(gpu, target, bytes, &[m, k])?;
                 Ok(WeightTensor {
                     buf,
                     gpu_dtype: DType::F32,
@@ -913,7 +911,7 @@ where
             // bytes uploaded as-is; the engine forwards through gemv_f32 /
             // gemm_f32_batched / attention_f32. Part of the F1 native-bf16
             // reference path (no quantization).
-            let buf = up(data, &[m, k])?;
+            let buf = upload_codes(gpu, target, data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -931,7 +929,7 @@ where
             // Native BF16 storage, F32 accumulation. This is source-exact for
             // BF16 checkpoints while retaining the two-byte memory traffic;
             // the unified dispatcher routes it through GemvBf16.
-            let buf = up(data, &[m, k])?;
+            let buf = upload_codes(gpu, target, data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BF16,
@@ -951,7 +949,7 @@ where
                 k % 256 == 0,
                 "MFP4G32E8SOA lm_head has K={k} but kernel + FWHT both require K%256==0"
             );
-            let buf = up(data, &[data.len()])?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MFP4G32E8SOA,
@@ -965,7 +963,7 @@ where
                 lloyd_lut_c16: None,
             })
         }
-        _ => fallback(quant_type, data, m, k),
+        _ => dequant_weight_raw(gpu, quant_type, data, m, k, target),
     }
 }
 
@@ -992,62 +990,46 @@ where
 /// the VL-friendly nested name) where qwen2 uses flat `model.{...}`.
 /// Pull into `hipfire_runtime::transformer::weights` with the prefix
 /// as a parameter during consolidation.
-/// Device-resident projection weight (VRAM). The historical path.
-fn load_weight_tensor_raw(
-    gpu: &Gpu,
-    quant_type: u8,
+/// Upload weight codes to `target`: VRAM, or pinned system RAM the same kernels
+/// read over PCIe. One helper for the whole per-quant match, so the match stays a
+/// single copy and placement is a parameter rather than a second dispatch table.
+fn upload_codes(
+    gpu: &mut Gpu,
+    target: MemoryTarget,
     data: &[u8],
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    load_weight_tensor_raw_with(
-        quant_type,
-        data,
-        m,
-        k,
-        |bytes, shape| gpu.upload_raw(bytes, shape),
-        |qt, d, mm, kk| dequant_weight_raw(gpu, qt, d, mm, kk),
-    )
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
+    match target {
+        MemoryTarget::Device => gpu.upload_raw(data, shape),
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(data, shape),
+    }
 }
 
-/// Offloaded projection weight: codes live in host memory, not VRAM.
+/// Projection weight codes → `WeightTensor [m, k]` at `target`.
 ///
-/// Needs `&mut Gpu` because host-locating a tensor registers its host-mapped owner
-/// on the Gpu (so the registry can `hipHostFree` it) — which is exactly why this is
-/// a separate entry point rather than a flag on [`load_weight_tensor_raw`]. Quant
-/// types that fall back to the f32 dequant path are refused rather than silently
-/// placed on the device.
-fn load_weight_tensor_raw_host(
+/// One entry point for both placements: the device path uploads to VRAM, the
+/// host path registers a host-mapped owner on the `Gpu` and uploads there.
+/// Quant types that fall back to the f32 dequant path are refused under
+/// [`MemoryTarget::HostMapped`] rather than silently placed on the device.
+fn load_weight_tensor_raw(
     gpu: &mut Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
-    load_weight_tensor_raw_with(
-        quant_type,
-        data,
-        m,
-        k,
-        |bytes, shape| gpu.upload_raw_host(bytes, shape),
-        |_, _, _, _| {
-            Err(HipError::new(
-                0,
-                "quantized weight falls back to the f32 dequant path, which has no \
-                 host-localized upload; refusing to silently place it in device memory \
-                 inside an offloaded layer",
-            ))
-        },
-    )
+    load_weight_tensor_raw_with(gpu, quant_type, data, m, k, target)
 }
 
 pub fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
     // straight from the page-cache-backed slice — no heap staging copy.
@@ -1059,13 +1041,13 @@ pub fn load_weight_tensor(
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k, target)?);
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
+                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, target)?);
                 matched = Some(candidate);
                 break;
             }
@@ -1119,7 +1101,7 @@ pub fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
@@ -1141,98 +1123,6 @@ pub fn load_weight_tensor(
     }
 }
 
-/// Offloaded twin of [`load_weight_tensor`]: same name resolution, same AWQ
-/// sidecar, but the quantized codes land in host-mapped system RAM instead of VRAM.
-///
-/// The AWQ scale deliberately stays on the device — it is a 1-D f16 vector of
-/// length K (kilobytes), so host-locating it would cost PCIe bandwidth on the
-/// hot path to save nothing. Only the multi-megabyte code blob is spilled.
-///
-/// Takes `&mut Gpu` (the `read_proj_host` contract) because the host upload
-/// registers its host-mapped owner for later `hipHostFree`;
-/// [`load_weight_tensor`] cannot, which is why these are
-/// two entry points over one shared match rather than one function and a flag.
-pub fn load_weight_tensor_host(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-    candidates: fn(&str) -> Vec<String>,
-) -> HipResult<WeightTensor> {
-    #[cfg(unix)]
-    {
-        let mut wt: Option<WeightTensor> = None;
-        let mut matched: Option<String> = None;
-        let mut qt_logged = 0u8;
-        for candidate in candidates(name) {
-            if let Some((info, data)) = hfq.tensor_data(&candidate) {
-                qt_logged = info.quant_type;
-                wt = Some(load_weight_tensor_raw_host(
-                    gpu,
-                    info.quant_type,
-                    data,
-                    m,
-                    k,
-                )?);
-                matched = Some(candidate);
-                break;
-            }
-            if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
-                qt_logged = info.quant_type;
-                wt = Some(load_weight_tensor_raw_host(
-                    gpu,
-                    info.quant_type,
-                    &buf,
-                    m,
-                    k,
-                )?);
-                matched = Some(candidate);
-                break;
-            }
-        }
-        let mut wt = wt.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?;
-        if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
-            let p = wt.buf.buf.as_ptr() as usize;
-            eprintln!(
-                "[offload-debug] host tensor '{name}' qt={qt_logged} bytes={} va=0x{p:x}..0x{:x}",
-                wt.buf.byte_size(),
-                p + wt.buf.byte_size(),
-            );
-        }
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            let gpu_ref: &Gpu = gpu;
-            if let Some(matched_name) = matched.as_deref() {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, matched_name, k)
-                    .or_else(|| load_awq_scale_for(hfq, gpu_ref, name, k));
-            } else {
-                wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, name, k);
-            }
-        }
-        return Ok(wt);
-    }
-    #[cfg(not(unix))]
-    {
-        let (info, data, matched_name) = {
-            let mut found = None;
-            for candidate in candidates(name) {
-                if let Some((info, data)) = hfq.tensor_data(&candidate) {
-                    found = Some((info, data, candidate));
-                    break;
-                }
-            }
-            found.ok_or_else(|| HipError::new(0, &format!("tensor not found: {name}")))?
-        };
-        let mut wt = load_weight_tensor_raw_host(gpu, info.quant_type, data, m, k)?;
-        let gpu_ref: &Gpu = gpu;
-        if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale_for(hfq, gpu_ref, &matched_name, k)
-                .or_else(|| load_awq_scale_for(hfq, gpu_ref, name, k));
-        }
-        Ok(wt)
-    }
-}
-
 /// REAP keep variant of [`load_weight_tensor`]: gather the tensor's first-axis
 /// rows (one row per original expert) down to `keep` BEFORE quant decode, then
 /// build the `WeightTensor` from the gathered bytes with `m = keep.len()`.
@@ -1248,7 +1138,7 @@ pub fn load_weight_tensor_host(
 /// row selection does not touch it.
 fn load_weight_tensor_keep(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
@@ -1340,7 +1230,7 @@ fn load_weight_tensor_keep(
             ),
         ));
     }
-    let mut wt = load_weight_tensor_raw(gpu, info.quant_type, &sub, m, k)?;
+    let mut wt = load_weight_tensor_raw(gpu, info.quant_type, &sub, m, k, MemoryTarget::Device)?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         // The AWQ sidecar is indexed by K and remains unchanged by row
         // gathering. Resolve under the original source name.
@@ -2688,7 +2578,7 @@ pub use hipfire_runtime::model_load::Layout;
 
 // ── CPU-exec offload coverage report ──────────────────────────────────────
 
-/// The load-time CPU-exec coverage line for `memory.offload_exec=cpu`.
+/// The load-time CPU-exec coverage line for `memory.offload_exec=cpu|passback`.
 ///
 /// Reads the *file's* tensor index rather than the loaded weights: the question
 /// is which quant formats the spilled prefix contains, which is a property of
@@ -2699,48 +2589,130 @@ pub use hipfire_runtime::model_load::Layout;
 ///
 /// Follows the same silence contract as the residency report in
 /// [`super::config::apply_offload_policy`]: nothing is printed unless
-/// `memory.offload_exec` was actually configured to `cpu`, so a stock-vs-branch
-/// log diff stays readable.
-pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
-    use hipfire_config::memory::{offload_exec, OffloadExec};
+/// `memory.offload_exec` was actually configured to `cpu`/`passback` — except for
+/// one informational line when a pass-back share is set in a mode that cannot
+/// read it (the key is inert, not misconfigured; see
+/// [`hipfire_config::memory::stray_passback_share_configured`]).
+pub fn report_cpu_exec_coverage(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    placement: Option<&hipfire_runtime::offload::Placement>,
+) {
+    use hipfire_config::memory::{
+        offload_exec, offload_passback_share, stray_passback_share_configured, OffloadExec,
+    };
+    use hipfire_runtime::offload::{ExpertResidency, WeightResidency};
     use std::collections::BTreeSet;
 
-    if offload_exec() != OffloadExec::Cpu {
+    if stray_passback_share_configured() {
+        eprintln!(
+            "passback: memory.offload_passback_share is set but memory.offload_exec is not \
+             passback; ignored"
+        );
+    }
+
+    let mode = offload_exec();
+    if !matches!(mode, OffloadExec::Cpu | OffloadExec::Passback) {
         return;
     }
-    let spilled = config.i_gpu_start;
-    if spilled == 0 {
+    if mode == OffloadExec::Passback {
         eprintln!(
-            "cpu exec: memory.offload_exec=cpu but nothing is spilled \
-             (memory.gpu_layer_budget leaves every layer resident) — every step stays on the GPU"
+            "passback: memory.offload_exec=passback is non-deterministic by design — its CPU/GPU \
+             row split is scheduled per process, so generated tokens may change across runs; \
+             choose cpu or pcie for reproducible output"
+        );
+    }
+    // The loaded placement is the only honest statement of what spilled: a
+    // config-level mirror would be 0 for an experts-only spill and report
+    // "nothing is spilled" while every routed expert sits in host RAM. The `None`
+    // route is the pre-placement one, where nothing is spilled.
+    let (host_layers, expert_layers): (Vec<usize>, Vec<usize>) = match placement {
+        Some(p) => (
+            (0..config.n_layers)
+                .filter(|l| p.layer(*l) == WeightResidency::HostMapped)
+                .collect(),
+            (0..config.n_layers)
+                .filter(|l| p.experts(*l) == ExpertResidency::HostMapped)
+                .collect(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    // The layer knob dominates: a host-placed layer's expert axis reads
+    // `HostMapped` even when the model has no routed experts (a dense layer's
+    // expert bytes are zero). Only a model that has an expert tier can have
+    // expert steps on the PCIe path; without one the layer is the whole story.
+    let expert_layers = if config.num_experts == 0 {
+        Vec::new()
+    } else {
+        expert_layers
+    };
+    if host_layers.is_empty() && expert_layers.is_empty() {
+        eprintln!(
+            "cpu exec: memory.offload_exec={mode} but nothing is spilled \
+             (memory.gpu_layer_budget / memory.moe_expert_budget leave every weight resident) — \
+             every step stays on the GPU"
         );
         return;
     }
 
+    let mut spilled: BTreeSet<usize> = host_layers.iter().copied().collect();
+    spilled.extend(expert_layers.iter().copied());
+
+    // The expert splice is the same model-level decision the loader made
+    // (`memory.offload_exec=cpu|passback` + the `HIPFIRE_MOE_CPU_EXPERTS`
+    // kill-switch), so when it is armed a host-placed layer's routed FFN runs on
+    // the CPU too.
+    let expert_cpu = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled();
     let mut covered = 0usize;
+    let mut splittable = 0usize;
     let mut uncovered: BTreeSet<String> = BTreeSet::new();
-    for layer in 0..spilled {
+    for layer in &spilled {
+        let own_host = host_layers.contains(layer);
+        let experts_host = expert_layers.contains(layer);
         let mut layer_covered = true;
-        for t in hfq.tensors() {
-            if crate::serve_engine::tensor_layer_index(&t.name) != Some(layer) {
-                continue;
+        // Only a host-placed layer's own weights are split by `passback`; a
+        // layer that spilled only its routed experts runs them on the CPU splice.
+        let mut layer_splittable = own_host;
+        // A host-placed layer's own weights run through the generic CPU seam;
+        // check that every one of its tensors has a CPU decoder.
+        if own_host {
+            for t in hfq.tensors() {
+                if crate::serve_engine::tensor_layer_index(&t.name) != Some(*layer) {
+                    continue;
+                }
+                // Resolve through the *loader's own* map, not the passthrough table:
+                // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
+                // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
+                // family, PARO), and a tensor skipped here would be reported as
+                // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
+                // covered because the loader host-decodes them to f32 at load time.
+                let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
+                    continue;
+                };
+                if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
+                    layer_covered = false;
+                    uncovered.insert(format!("{dtype:?}"));
+                }
+                // A splittable layer additionally needs the CPU's *vector* row dot:
+                // with the scalar decoder the CPU rate is far below the GPU's PCIe
+                // read rate, so the best split is all-GPU and `passback` would only
+                // add launches (see `offload_split`'s feasibility gate).
+                if !hipfire_dispatch::passback_capable_format(dtype) {
+                    layer_splittable = false;
+                }
             }
-            // Resolve through the *loader's own* map, not the passthrough table:
-            // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
-            // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
-            // family, PARO), and a tensor skipped here would be reported as
-            // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
-            // covered because the loader host-decodes them to f32 at load time.
-            let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
-                continue;
-            };
-            if hipfire_dispatch::cpu_quant_for(dtype).is_none() {
-                layer_covered = false;
-                uncovered.insert(format!("{dtype:?}"));
-            }
+        }
+        // Routed experts are covered only when the splice is armed; otherwise they
+        // stay on the GPU reading host bytes over PCIe.
+        if experts_host && !expert_cpu {
+            layer_covered = false;
+            uncovered.insert("routed-experts (PCIe)".to_string());
         }
         if layer_covered {
             covered += 1;
+        }
+        if layer_splittable {
+            splittable += 1;
         }
     }
     let list = if uncovered.is_empty() {
@@ -2748,12 +2720,107 @@ pub fn report_cpu_exec_coverage(hfq: &HfqFile, config: &Qwen35Config) {
     } else {
         uncovered.into_iter().collect::<Vec<_>>().join(", ")
     };
+    // A dense model has no expert tier; printing an expert clause would describe a
+    // tier that does not exist.
+    let expert_clause = if expert_layers.is_empty() {
+        String::new()
+    } else if expert_cpu {
+        format!(
+            "; routed-expert FFN of {} layers recomputed on the CPU for single-token decode and \
+             narrow verify/rollback batches (wide prompt prefill keeps the GPU grouped PCIe read)",
+            expert_layers.len()
+        )
+    } else {
+        format!(
+            "; routed-expert steps of {} layers stay on the PCIe path",
+            expert_layers.len()
+        )
+    };
     eprintln!(
-        "cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: {list}"
+        "cpu exec: {covered}/{} spilled layers fully covered by the CPU seam{expert_clause}; \
+         uncovered quants: {list}",
+        spilled.len(),
     );
+    if mode == OffloadExec::Passback {
+        let min_mib = hipfire_dispatch::offload_split::MIN_SPLIT_BYTES / (1 << 20);
+        eprintln!(
+            "passback: {splittable}/{} spilled layers splittable; share {}; min step {min_mib} MiB",
+            spilled.len(),
+            offload_passback_share(),
+        );
+    }
 }
 
 // ── load_weights (thin assembler over runtime orchestrator) ───────────────
+
+/// Count and total size of the routed-expert tensors that left VRAM.
+///
+/// Counted from the *packed owners*, whose `GpuTensor`s carry the host-mapped
+/// ownership tag; the per-expert views are `sub_offset` slices and always report
+/// `Borrowed`, never `HostMapped`, so counting views would report zero.
+///
+/// Public so the loader can key its MTP-over-spill policy on the resolved
+/// placement (host-mapped count) instead of on MoE-ness.
+pub fn host_mapped_expert_accounting(layers: &[LayerWeights]) -> (usize, u64) {
+    let mut tensors = 0usize;
+    let mut bytes = 0u64;
+    let mut tally = |owner: &GpuTensor| {
+        if owner.buf.is_host_mapped() {
+            tensors += 1;
+            bytes += owner.byte_size() as u64;
+        }
+    };
+    for layer in layers {
+        let ffn = match layer {
+            LayerWeights::DeltaNetMoe(l) => &l.ffn,
+            LayerWeights::FullAttnMoe(l) => &l.ffn,
+            _ => continue,
+        };
+        if let Some(owners) = &ffn.packed_expert_owners {
+            for owner in owners.gate_up.iter().chain(owners.down.iter()) {
+                tally(owner);
+            }
+        } else {
+            for expert in &ffn.experts {
+                tally(&expert.gate_up.buf);
+                tally(&expert.down.buf);
+            }
+        }
+    }
+    (tensors, bytes)
+}
+
+/// Per-layer byte census for the placement search, from the source's own index.
+///
+/// Routed experts are recognised by the arch's own classifier
+/// ([`is_routed_expert_weight`]); everything else a name's `layers.<N>` belongs
+/// to is that layer's non-expert bytes, and every global tensor (embedding,
+/// language head, final norm, vision tower) is always-resident. The shared
+/// placement module never parses a tensor name.
+pub fn qwen35_layer_bytes(hfq: &HfqFile, config: &Qwen35Config) -> LayerBytes {
+    let n = config.n_layers;
+    let mut non_expert = vec![0u64; n];
+    let mut expert = vec![0u64; n];
+    let mut always_resident = 0u64;
+    for info in hfq.tensor_infos() {
+        let bytes = info.data_size as u64;
+        match crate::serve_engine::tensor_layer_index(&info.name) {
+            Some(layer) if layer < n => {
+                if crate::qwen35::weights::is_routed_expert_weight(&info.name) {
+                    expert[layer] += bytes;
+                } else {
+                    non_expert[layer] += bytes;
+                }
+            }
+            _ => always_resident += bytes,
+        }
+    }
+    LayerBytes {
+        non_expert,
+        expert,
+        always_resident,
+    }
+}
 
 /// Drive a qwen35 `WeightSource` over the device slice (runtime orchestrator),
 /// then assemble `Qwen35Weights`. `pager` is always `None` here; paged-experts
@@ -2816,6 +2883,17 @@ fn load_weights_inner(
         PACKED_READ_MS.load(Ordering::Relaxed),
         PACKED_UPLOAD_MS.load(Ordering::Relaxed),
     );
+    // Honest accounting: how many routed-expert tensors actually left VRAM. A
+    // configured spill that host-locates nothing must be visible on the load line
+    // rather than silent — that is what turns "forgot to thread the residency"
+    // into a readable symptom instead of a quiet no-op.
+    let (host_expert_tensors, host_expert_bytes) = host_mapped_expert_accounting(&layers);
+    if host_expert_tensors > 0 {
+        eprintln!(
+            "  moe offload: {host_expert_tensors} expert tensors ({:.2} GiB) host-mapped",
+            host_expert_bytes as f64 / (1u64 << 30) as f64,
+        );
+    }
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -2850,15 +2928,9 @@ impl WeightSource for HfqSource<'_> {
         self.hfq.mq4v2_symmetric()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
-        // Partial GPU offload: this source is where the spilled prefix is
-        // placed, so the MoE / multi-device refusal backstops daemon admission
-        // here, and the residency line prints only once placement is applied.
-        if let Some(refusal) = super::config::offload_topology_refusal(self.c, 1, n_devices) {
-            return Err(HipError::new(0, &refusal));
-        }
-        if let Some(line) = super::config::offload_residency_report(self.c) {
-            eprintln!("{line}");
-        }
+        // Partial GPU offload is resolved by the loader (see
+        // `hipfire_runtime::offload`), which also prints the residency line; this
+        // source no longer decides or announces placement.
         // Keep the mmap alive on discrete GPUs (the carrier cleared
         // `evict_page_cache` there): weight uploads DMA straight out of
         // page-cache pages with no heap staging copy — measured 11–16 GB/s
@@ -2926,12 +2998,26 @@ impl WeightSource for HfqSource<'_> {
             |gpu| {
                 let (lm_info, lm_data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
                     .ok_or_else(|| HipError::new(0, "lm_head present"))?;
-                load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
+                load_weight_tensor_raw(
+                    gpu,
+                    lm_info.quant_type,
+                    &lm_data,
+                    c.vocab_size,
+                    c.dim,
+                    MemoryTarget::Device,
+                )
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
                     .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
-                dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
+                dequant_weight_raw(
+                    gpu,
+                    embd_meta.quant_type,
+                    &embd_data,
+                    c.vocab_size,
+                    c.dim,
+                    MemoryTarget::Device,
+                )
             },
         )?;
         attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
@@ -2958,10 +3044,87 @@ impl WeightSource for HfqSource<'_> {
             output.lloyd_lut_f16 = Some(f16);
             output.lloyd_lut_c16 = Some(c16);
         }
+        // Dev lever: requantize a Q8_0 (typically tied-embedding) output to
+        // HFQ4G256 so the logits GEMV reads ~half the bytes. The embedding
+        // table keeps its original buffer; only this projection switches.
+        static LM_HEAD_HFQ: std::sync::LazyLock<Option<&'static str>> =
+            std::sync::LazyLock::new(|| {
+                if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ2")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq2")
+                } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ3")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq3")
+                } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq4")
+                } else {
+                    None
+                }
+            });
+        let lm_head_hfq_mode = *LM_HEAD_HFQ;
+        if output.gpu_dtype == DType::Q8_0 {
+            match lm_head_hfq_mode {
+                Some("hfq2") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ2G256 (HIPFIRE_LM_HEAD_HFQ2=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq2g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ2G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                Some("hfq3") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ3G256 (HIPFIRE_LM_HEAD_HFQ3=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq3g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ3G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                Some("hfq4") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ4G256 (HIPFIRE_LM_HEAD_HFQ4=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq4g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ4G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
+                _ => {}
+            }
+        }
         Ok((output, aliases))
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
         let c = self.c;
         let is_moe = c.num_experts > 0;
         eprintln!(
@@ -2972,7 +3135,7 @@ impl WeightSource for HfqSource<'_> {
         );
         let p = format!("layers.{layer_idx}");
         let page = self.hfq.layer_data_range(&p);
-        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu)?;
+        let lw = load_layer_into(self.hfq, c, layer_idx, &p, gpu, residency)?;
         if let Some((start, end)) = page {
             self.hfq.drop_pages_range(start, end - start);
         }
@@ -3076,7 +3239,15 @@ impl WeightSource for ParoSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        _residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
+        // ParoQuant loads through `ParoBackend`, which has no host-upload path:
+        // it never honours a spill, and the loader refuses a configured spill on
+        // this source before it reaches here.
         let c = self.c;
         eprintln!(
             "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
@@ -3105,7 +3276,7 @@ fn qwen35_hfq_backend<'a>(
     hfq: &'a HfqFile,
     gpu: &'a mut Gpu,
     layer: usize,
-    host_local: bool,
+    residency: WeightResidency,
 ) -> HfqBackend<'a> {
     HfqBackend {
         hfq,
@@ -3114,11 +3285,10 @@ fn qwen35_hfq_backend<'a>(
         candidates: qwen35_tensor_name_candidates,
         read_proj: load_weight_tensor,
         layer,
-        // Offload plumbing. `host_local` drives `norm`/`raw_f32`/`bias`; `proj` routes
-        // through `read_proj_host`, which — unlike `read_proj` — receives `&mut Gpu` and
-        // can therefore register a host-mapped owner. Both default to the resident path.
-        host_local,
-        read_proj_host: Some(load_weight_tensor_host),
+        // Offload plumbing: the layer's resolved storage tier. It selects the
+        // `MemoryTarget` handed to `read_proj` and the host uploader for
+        // `norm`/`raw_f32`/`bias`; `Resident` is the zero-diff default.
+        residency,
     }
 }
 
@@ -3149,14 +3319,22 @@ fn load_layer_into(
     layer_idx: usize,
     p: &str,
     gpu: &mut Gpu,
+    residency: LayerResidency,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
-    // Partial GPU offload: layers before the resident-tail split point load their
-    // weights into host-mapped system RAM. `i_gpu_start` defaults to 0, so an unset
-    // budget keeps every layer device-resident (the zero-diff regression guard).
-    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, layer_idx < config.i_gpu_start);
+    // Partial GPU offload: the loader resolved this layer's storage tier once.
+    // `LayerResidency::DEVICE` (the unset default) keeps every tensor
+    // device-resident — the zero-diff regression guard.
+    let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, residency.weights);
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
-        load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
+        load_moe_ffn(
+            bk.hfq,
+            bk.gpu,
+            &format!("layers.{li}"),
+            cfg,
+            li as u16,
+            residency,
+        )
     };
     let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
     if let LayerWeights::DeltaNet(dn) = &mut layer {
@@ -4041,10 +4219,11 @@ fn load_weight_tensor_dense_tp(
             ),
         }
     };
-    let mut weight = match load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k) {
-        Ok(w) => w,
-        Err(e) => return Err(e),
-    };
+    let mut weight =
+        match load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k, MemoryTarget::Device) {
+            Ok(w) => w,
+            Err(e) => return Err(e),
+        };
     let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate);
     let sidecar = format!("{stem}.awq_scale.weight");
     if let Some((info, data)) = hfq.tensor_data_pread(&sidecar) {
@@ -4309,7 +4488,14 @@ pub fn load_weights_dense_tp_rank(
             |gpu| {
                 let (info, data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
                     .ok_or_else(|| HipError::new(0, "lm_head.weight not found"))?;
-                load_weight_tensor_raw(gpu, info.quant_type, &data, config.vocab_size, dim)
+                load_weight_tensor_raw(
+                    gpu,
+                    info.quant_type,
+                    &data,
+                    config.vocab_size,
+                    dim,
+                    MemoryTarget::Device,
+                )
             },
             |gpu| {
                 let (info, data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
@@ -4747,24 +4933,81 @@ fn e8_soa_experts() -> bool {
     })
 }
 
-/// Quant types that share the 136 B/group stride and can be packed into
-/// layer-level blobs via `try_load_packed_mq4_experts`. All three have
-/// identical byte layout for concatenation purposes — only the 8-byte group
-/// header interpretation differs, which is handled by kernel dispatch on
-/// `gpu_dtype`. qt=30 (MQ4G256Lloyd, 160 B/group) and qt=47 (MQ6G256V2,
-/// 200 B/group) are excluded because their strides differ.
-fn packable_mq4_dtype(qt: u8) -> Option<DType> {
+/// Uniform raw layouts supported by the existing indexed expert dispatch.
+/// Device packing retains the validated MQ4 family. Host packing additionally
+/// admits raw uniform expert formats: projection strides come from HFQ byte
+/// counts, not MQ4's group size, and views retain their exact dtype.
+fn packable_expert_dtype(qt: u8, target: MemoryTarget) -> Option<DType> {
     match qt {
         13 => Some(DType::MQ4G256),
         44 => Some(DType::MQ4G256V2),
         45 => Some(DType::MQ4CG256),
+        15 if target == MemoryTarget::HostMapped => Some(DType::MQ6G256),
+        19 if target == MemoryTarget::HostMapped => Some(DType::MQ2G256Lloyd),
+        31 if target == MemoryTarget::HostMapped => Some(DType::MQ5G256),
+        34 if target == MemoryTarget::HostMapped => Some(DType::MFP4G32E8),
         _ => None,
     }
 }
 
-struct PackedMq4ExpertSpec {
+struct PackedExpertSpec {
     gate_up_name: String,
     down_name: String,
+}
+
+/// One routed expert's container facts — tensor names plus the quant type and
+/// byte stride of each projection — resolved before any packer commits to a
+/// layer layout.
+struct ResolvedExpert {
+    gate_up_name: String,
+    down_name: String,
+    gate_up_qt: u8,
+    down_qt: u8,
+    gate_up_bytes: usize,
+    down_bytes: usize,
+}
+
+/// The per-expert layout a routed-expert layer admits: one shared
+/// `(dtype, gate_up stride, down stride)` triple across every routed expert,
+/// or anything else ([`ExpertLayerLayout::Mixed`]).
+#[derive(Debug, PartialEq, Eq)]
+enum ExpertLayerLayout {
+    Uniform(DType),
+    Mixed,
+}
+
+/// Route one routed-expert layer to a packer, given its experts' container
+/// facts and the placement the layer is being loaded into.
+///
+/// `Uniform` is the only layout the uniform packer can serve. Everything else
+/// — an expert the uniform packer does not admit on this placement, an expert
+/// of a different dtype, or a different projection stride anywhere in the
+/// layer — is `Mixed`, which `try_load_graded_host_experts` serves on a host
+/// placement and the literal per-expert path serves on the device.
+///
+/// Conflating `Mixed` with "no packer applies" is a load failure, not a
+/// fallback: a host-placed graded layer (`.mq4p`, whose expert 0 can be MQ6
+/// ahead of an MQ4 expert 1) reaches the graded packer only through here.
+fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> ExpertLayerLayout {
+    let mut shape: Option<(DType, usize, usize)> = None;
+    for expert in experts {
+        let admitted = packable_expert_dtype(expert.gate_up_qt, target)
+            .zip(packable_expert_dtype(expert.down_qt, target))
+            .filter(|(gate_dt, down_dt)| gate_dt == down_dt)
+            .map(|(gate_dt, _)| (gate_dt, expert.gate_up_bytes, expert.down_bytes));
+        let Some(admitted) = admitted else {
+            return ExpertLayerLayout::Mixed;
+        };
+        match shape {
+            None => shape = Some(admitted),
+            Some(seen) if seen == admitted => {}
+            Some(_) => return ExpertLayerLayout::Mixed,
+        }
+    }
+    match shape {
+        Some((dtype, _, _)) => ExpertLayerLayout::Uniform(dtype),
+        None => ExpertLayerLayout::Mixed,
+    }
 }
 
 /// Restrict expert packing to the gfx11 family where both dGPU residency and
@@ -4777,11 +5020,6 @@ struct PackedMq4ExpertSpec {
 fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_rdna3()
 }
-
-/// Pack a uniform MQ4 routed-expert layer into two GPU allocations while
-/// preserving one `WeightTensor` view and one device pointer-table entry per
-/// expert. Returns `None` for every non-uniform/non-MQ4 layout so mixed tiers,
-/// ParoQuant, paged experts, and EP streaming retain their literal behavior.
 
 /// Host-side byte source for a packed blob: either a borrowed mmap slice
 enum HostBlob<'a> {
@@ -4822,13 +5060,19 @@ fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -
     hfq.data_range(first.data_offset, expect - first.data_offset)
 }
 
-fn try_load_packed_mq4_experts(
+/// Pack a uniform routed-expert layer into two allocations while preserving
+/// one `WeightTensor` view and one device pointer-table entry per expert.
+/// Non-uniform host layouts use the graded packer; device layouts outside
+/// the validated MQ4 family retain their literal behavior.
+
+fn try_load_packed_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     p: &str,
     expert_ids: &[usize],
     mi: usize,
     dim: usize,
+    target: MemoryTarget,
 ) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -4836,10 +5080,7 @@ fn try_load_packed_mq4_experts(
         return Ok(None);
     }
 
-    let mut specs = Vec::with_capacity(expert_ids.len());
-    let mut gate_up_stride = None;
-    let mut down_stride = None;
-    let mut expert_dtype: Option<DType> = None;
+    let mut resolved = Vec::with_capacity(expert_ids.len());
     for &expert_id in expert_ids {
         let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
         let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
@@ -4862,38 +5103,31 @@ fn try_load_packed_mq4_experts(
         else {
             return Ok(None);
         };
-        let Some(gu_dt) = packable_mq4_dtype(gate_up_qt) else {
-            return Ok(None);
-        };
-        let Some(dn_dt) = packable_mq4_dtype(down_qt) else {
-            return Ok(None);
-        };
-        if gu_dt != dn_dt {
-            return Ok(None);
-        }
-        match expert_dtype {
-            None => expert_dtype = Some(gu_dt),
-            Some(dt) if dt == gu_dt => {}
-            Some(_) => return Ok(None),
-        }
-        match gate_up_stride {
-            None => gate_up_stride = Some(gate_up_bytes),
-            Some(stride) if stride == gate_up_bytes => {}
-            Some(_) => return Ok(None),
-        }
-        match down_stride {
-            None => down_stride = Some(down_bytes),
-            Some(stride) if stride == down_bytes => {}
-            Some(_) => return Ok(None),
-        }
-        specs.push(PackedMq4ExpertSpec {
+        resolved.push(ResolvedExpert {
             gate_up_name,
             down_name,
+            gate_up_qt,
+            down_qt,
+            gate_up_bytes,
+            down_bytes,
         });
     }
-
-    let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
-    let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
+    let ExpertLayerLayout::Uniform(expert_dtype) = classify_expert_layer(&resolved, target) else {
+        // A layer that is not uniform belongs to the graded host packer, which
+        // declines a device placement (that placement keeps its literal
+        // per-expert tensors). Never one host tensor per expert — each pays
+        // `HOST_TAIL_PAD_BYTES` (see the caller's refusal).
+        return try_load_graded_host_experts(hfq, gpu, p, expert_ids, mi, dim, target);
+    };
+    let gate_up_stride = resolved[0].gate_up_bytes;
+    let down_stride = resolved[0].down_bytes;
+    let specs: Vec<PackedExpertSpec> = resolved
+        .into_iter()
+        .map(|expert| PackedExpertSpec {
+            gate_up_name: expert.gate_up_name,
+            down_name: expert.down_name,
+        })
+        .collect();
     // Zero-copy fast path: when every expert's tensor lies contiguous in-file
     // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
     // mmap is alive (dGPU, no overlay), upload both blobs straight from the
@@ -4927,7 +5161,7 @@ fn try_load_packed_mq4_experts(
                     HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 tensor disappeared: {}",
+                            "qwen35: packed tensor disappeared: {}",
                             spec.gate_up_name
                         ),
                     )
@@ -4936,7 +5170,7 @@ fn try_load_packed_mq4_experts(
                     return Err(HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 gate_up stride changed for {}: {} != {gate_up_stride}",
+                            "qwen35: packed gate_up stride changed for {}: {} != {gate_up_stride}",
                             spec.gate_up_name,
                             bytes.len()
                         ),
@@ -4949,14 +5183,14 @@ fn try_load_packed_mq4_experts(
                 let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
                     HipError::new(
                         0,
-                        &format!("qwen35: packed MQ4 tensor disappeared: {}", spec.down_name),
+                        &format!("qwen35: packed tensor disappeared: {}", spec.down_name),
                     )
                 })?;
                 if bytes.len() != down_stride {
                     return Err(HipError::new(
                         0,
                         &format!(
-                            "qwen35: packed MQ4 down stride changed for {}: {} != {down_stride}",
+                            "qwen35: packed down stride changed for {}: {} != {down_stride}",
                             spec.down_name,
                             bytes.len()
                         ),
@@ -4970,13 +5204,13 @@ fn try_load_packed_mq4_experts(
         let jobs = [
             HfqReadJob::packed(
                 hfq,
-                format!("{p}.packed_mq4_gate_up"),
+                format!("{p}.packed_gate_up"),
                 specs.iter().map(|spec| spec.gate_up_name.as_str()),
             )
             .map_err(|e| HipError::new(0, &format!("qwen35: plan packed gate_up: {e}")))?,
             HfqReadJob::packed(
                 hfq,
-                format!("{p}.packed_mq4_down"),
+                format!("{p}.packed_down"),
                 specs.iter().map(|spec| spec.down_name.as_str()),
             )
             .map_err(|e| HipError::new(0, &format!("qwen35: plan packed down: {e}")))?,
@@ -4985,8 +5219,8 @@ fn try_load_packed_mq4_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
-            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
+            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
+            HostBlob::Owned(results.next().expect("two packed expert jobs").data),
         )
     };
     let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
@@ -4994,9 +5228,16 @@ fn try_load_packed_mq4_experts(
         matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
     let t_upload = Instant::now();
 
-    let gate_up_owner = gpu.upload_raw(gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
+    let upload = |gpu: &mut Gpu, bytes: &[u8], shape: &[usize]| match target {
+        MemoryTarget::Device => gpu.upload_raw(bytes, shape),
+        // Host-mapped layer blob: one allocation per blob, read over PCIe. This
+        // is the only host expert path — a per-expert host tensor would pay
+        // `HOST_TAIL_PAD_BYTES` each (see the caller's packing refusal).
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(bytes, shape),
+    };
+    let gate_up_owner = upload(gpu, gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match gpu.upload_raw(down_host.as_ref(), &[specs.len(), down_stride]) {
+    let down_owner = match upload(gpu, down_host.as_ref(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -5014,7 +5255,6 @@ fn try_load_packed_mq4_experts(
         );
     }
 
-    let expert_dtype = expert_dtype.expect("non-empty packed MQ4 expert list");
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
@@ -5049,8 +5289,276 @@ fn try_load_packed_mq4_experts(
     Ok(Some((
         experts,
         PackedExpertOwners {
-            gate_up: gate_up_owner,
-            down: down_owner,
+            gate_up: vec![gate_up_owner],
+            down: vec![down_owner],
+        },
+    )))
+}
+
+/// Graded (mixed-dtype) host packer: one blob per distinct `(gate_up, down)`
+/// tag bucket, host-only (`target` must be `HostMapped`; the device path
+/// keeps literal per-expert tensors and the merged tag kernel).
+///
+/// Partitioning key is [`mixed_expert_tag`]: the same authority the resident
+/// path uses, so an unmapped pair (GL, qt52 LUTs, unknown V2 mixes) returns
+/// `None` here exactly as it fails device-side — never a silent collapse.
+/// AWQ sidecars are NOT packed: graded files carry none, and a sidecar here
+/// would ride the wrong kernel path, so any sidecar returns `None`.
+///
+/// Layout: per bucket, gate_up experts concatenated in slot order, then the
+/// same for down; one owner blob per bucket per projection. Expert views are
+/// `sub_offset` slices of their bucket owner, and the pointer tables are
+/// built from the views exactly as the uniform path does — the merged
+/// tag-branched kernels dereference `expert_ptrs[expert_id]` plus
+/// `dtype_tags[expert_id]`, so no new kernel shape is needed.
+fn try_load_graded_host_experts(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    p: &str,
+    expert_ids: &[usize],
+    mi: usize,
+    dim: usize,
+    target: MemoryTarget,
+) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
+    use std::collections::BTreeMap;
+    if target != MemoryTarget::HostMapped || expert_ids.is_empty() {
+        return Ok(None);
+    }
+    struct GradedSpec {
+        gate_up_name: String,
+        down_name: String,
+        gate_dt: DType,
+        down_dt: DType,
+        tag: u8,
+        gate_bytes: usize,
+        down_bytes: usize,
+    }
+    let mut specs: Vec<(usize, GradedSpec)> = Vec::with_capacity(expert_ids.len());
+    for (slot, &expert_id) in expert_ids.iter().enumerate() {
+        let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
+        let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
+        let Some((gate_up_name, gate_up_qt, gate_up_bytes)) =
+            qwen35_tensor_name_candidates(&gate_up_bare)
+                .into_iter()
+                .find_map(|name| {
+                    hfq.find_tensor_info(&name)
+                        .map(|info| (name, info.quant_type, info.data_size))
+                })
+        else {
+            return Ok(None);
+        };
+        let Some((down_name, down_qt, down_bytes)) = qwen35_tensor_name_candidates(&down_bare)
+            .into_iter()
+            .find_map(|name| {
+                hfq.find_tensor_info(&name)
+                    .map(|info| (name, info.quant_type, info.data_size))
+            })
+        else {
+            return Ok(None);
+        };
+        let (Ok(gate_dt), Ok(down_dt)) = (
+            super::weights::dtype_from_quant_type(gate_up_qt),
+            super::weights::dtype_from_quant_type(down_qt),
+        ) else {
+            return Ok(None);
+        };
+        if matches!(
+            gate_dt,
+            DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+        ) || matches!(
+            down_dt,
+            DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+        ) {
+            return Ok(None);
+        }
+        let Ok(tag) = super::weights::mixed_expert_tag(gate_dt, down_dt) else {
+            return Ok(None);
+        };
+        specs.push((
+            slot,
+            GradedSpec {
+                gate_up_name,
+                down_name,
+                gate_dt,
+                down_dt,
+                tag,
+                gate_bytes: gate_up_bytes,
+                down_bytes: down_bytes,
+            },
+        ));
+    }
+    let uniform = specs.iter().all(|(_, s)| {
+        s.gate_dt == specs[0].1.gate_dt
+            && s.down_dt == specs[0].1.down_dt
+            && s.gate_bytes == specs[0].1.gate_bytes
+            && s.down_bytes == specs[0].1.down_bytes
+    });
+    if uniform {
+        return Ok(None);
+    }
+    let mut buckets: BTreeMap<u8, Vec<usize>> = BTreeMap::new();
+    for (idx, (_, spec)) in specs.iter().enumerate() {
+        buckets.entry(spec.tag).or_default().push(idx);
+    }
+    let gate_up_names: Vec<&str> = specs.iter().map(|(_, s)| s.gate_up_name.as_str()).collect();
+    let down_names: Vec<&str> = specs.iter().map(|(_, s)| s.down_name.as_str()).collect();
+    let read_all = |names: &[&str], label: &str| -> HipResult<Vec<u8>> {
+        if hfq.has_overlay() {
+            let mut out = Vec::new();
+            for name in names {
+                let Some((_, bytes)) = hfq.tensor_data_pread(name) else {
+                    return Err(HipError::new(
+                        0,
+                        &format!("qwen35: graded host tensor gone: {name}"),
+                    ));
+                };
+                out.extend_from_slice(&bytes);
+            }
+            return Ok(out);
+        }
+        let job = HfqReadJob::packed(hfq, format!("{p}.{label}"), names.iter().copied())
+            .map_err(|e| HipError::new(0, &format!("qwen35: plan graded {label}: {e}")))?;
+        let mut results = read_hfq_jobs_ordered(hfq, &[job])
+            .map_err(|e| HipError::new(0, &format!("qwen35: graded {label} read: {e}")))?
+            .into_iter();
+        Ok(results.next().expect("one graded job").data)
+    };
+    let gate_flat = read_all(&gate_up_names, "graded_host_gate_up")?;
+    let down_flat = read_all(&down_names, "graded_host_down")?;
+    let mut gate_off = Vec::with_capacity(specs.len());
+    let mut down_off = Vec::with_capacity(specs.len());
+    let mut cursor = 0usize;
+    for (_, spec) in &specs {
+        gate_off.push(cursor);
+        cursor += spec.gate_bytes;
+    }
+    if gate_flat.len() != cursor {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: graded gate_up bytes {} != sum of strides {cursor}",
+                gate_flat.len()
+            ),
+        ));
+    }
+    cursor = 0;
+    for (_, spec) in &specs {
+        down_off.push(cursor);
+        cursor += spec.down_bytes;
+    }
+    if down_flat.len() != cursor {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: graded down bytes {} != sum of strides {cursor}",
+                down_flat.len()
+            ),
+        ));
+    }
+    let mut gate_owners: Vec<GpuTensor> = Vec::with_capacity(buckets.len());
+    let mut down_owners: Vec<GpuTensor> = Vec::with_capacity(buckets.len());
+    let mut gate_view: Vec<GpuTensor> = Vec::with_capacity(specs.len());
+    let mut down_view: Vec<GpuTensor> = Vec::with_capacity(specs.len());
+    for _ in 0..specs.len() {
+        gate_view.push(GpuTensor::null_for_test());
+        down_view.push(GpuTensor::null_for_test());
+    }
+    let mut experts_meta: Vec<(DType, DType)> = vec![(DType::F32, DType::F32); specs.len()];
+    for bucket in buckets.values() {
+        let first = &specs[bucket[0]].1;
+        let gu_stride = first.gate_bytes;
+        let dn_stride = first.down_bytes;
+        for &idx in bucket {
+            let spec = &specs[idx].1;
+            if spec.gate_bytes != gu_stride || spec.down_bytes != dn_stride {
+                for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(HipError::new(
+                    0,
+                    "qwen35: graded host bucket has mixed strides for one tag; refusing",
+                ));
+            }
+        }
+        let mut gu_blob = Vec::with_capacity(gu_stride * bucket.len());
+        for &idx in bucket {
+            gu_blob.extend_from_slice(&gate_flat[gate_off[idx]..gate_off[idx] + gu_stride]);
+        }
+        let mut dn_blob = Vec::with_capacity(dn_stride * bucket.len());
+        for &idx in bucket {
+            dn_blob.extend_from_slice(&down_flat[down_off[idx]..down_off[idx] + dn_stride]);
+        }
+        let gu_owner = gpu.upload_raw_host_mapped(&gu_blob, &[bucket.len(), gu_stride])?;
+        let dn_owner = match gpu.upload_raw_host_mapped(&dn_blob, &[bucket.len(), dn_stride]) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let _ = gpu.free_tensor(gu_owner);
+                for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                    let _ = gpu.free_tensor(owner);
+                }
+                return Err(error);
+            }
+        };
+        let gu_base = gate_owners.len();
+        let dn_base = down_owners.len();
+        gate_owners.push(gu_owner);
+        down_owners.push(dn_owner);
+        for (pos, &idx) in bucket.iter().enumerate() {
+            let slot = specs[idx].0;
+            gate_view[slot] = gate_owners[gu_base].sub_offset(pos * gu_stride, gu_stride);
+            down_view[slot] = down_owners[dn_base].sub_offset(pos * dn_stride, dn_stride);
+            experts_meta[slot] = (specs[idx].1.gate_dt, specs[idx].1.down_dt);
+        }
+    }
+    drop(gate_flat);
+    drop(down_flat);
+    let mut experts = Vec::with_capacity(specs.len());
+    for slot in 0..specs.len() {
+        let (gate_dt, down_dt) = experts_meta[slot];
+        if load_awq_scale_for(hfq, gpu, &specs[slot].1.gate_up_name, dim).is_some() {
+            for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                let _ = gpu.free_tensor(owner);
+            }
+            return Ok(None);
+        }
+        if load_awq_scale_for(hfq, gpu, &specs[slot].1.down_name, mi).is_some() {
+            for owner in gate_owners.drain(..).chain(down_owners.drain(..)) {
+                let _ = gpu.free_tensor(owner);
+            }
+            return Ok(None);
+        }
+        experts.push(ExpertWeights {
+            gate_up: WeightTensor {
+                buf: std::mem::replace(&mut gate_view[slot], GpuTensor::null_for_test()),
+                gpu_dtype: gate_dt,
+                m: 2 * mi,
+                k: dim,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            },
+            down: WeightTensor {
+                buf: std::mem::replace(&mut down_view[slot], GpuTensor::null_for_test()),
+                gpu_dtype: down_dt,
+                m: dim,
+                k: mi,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            },
+        });
+    }
+    Ok(Some((
+        experts,
+        PackedExpertOwners {
+            gate_up: gate_owners,
+            down: down_owners,
         },
     )))
 }
@@ -5103,6 +5611,11 @@ pub(crate) struct PendingMoeFfn {
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub(crate) expert_gate_up_ptrs: Option<GpuTensor>,
     pub(crate) expert_down_ptrs: Option<GpuTensor>,
+    /// `memory.offload_exec=cpu` armed the host-side routed-expert splice on this
+    /// host-placed packed layer. Decode and the narrow (`<= 4`-row) batched
+    /// forwards defer the routed FFN to that splice; wide prefill keeps the GPU
+    /// grouped read.
+    pub(crate) cpu_deferred_experts: bool,
     pub(crate) expert_down_awq_ptrs: Option<GpuTensor>,
     pub(crate) expert_dtype_tags: Option<GpuTensor>,
     pub(crate) paro_shared: Option<MoeParoSidecars>,
@@ -5123,6 +5636,7 @@ impl PendingMoeFfn {
             packed_expert_owners: None,
             expert_gate_up_ptrs: None,
             expert_down_ptrs: None,
+            cpu_deferred_experts: false,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             paro_shared: None,
@@ -5157,8 +5671,9 @@ impl PendingMoeFfn {
                 expert.gate_up.free_metadata_only(gpu);
                 expert.down.free_metadata_only(gpu);
             }
-            let _ = gpu.free_tensor(owners.gate_up);
-            let _ = gpu.free_tensor(owners.down);
+            for owner in owners.gate_up.into_iter().chain(owners.down) {
+                let _ = gpu.free_tensor(owner);
+            }
         } else {
             for expert in self.experts.drain(..) {
                 expert.gate_up.free_all(gpu);
@@ -5233,6 +5748,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5260,6 +5776,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending MoE shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending MoE gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending MoE down pointer table"),
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5343,6 +5860,7 @@ impl PendingMoeFfn {
             packed_expert_owners,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             paro_shared,
@@ -5374,6 +5892,7 @@ impl PendingMoeFfn {
             shared_expert_gate: shared_gate_scalar.expect("pending EP shared gate scalar"),
             expert_gate_up_ptrs: expert_gate_up_ptrs.expect("pending EP gate/up pointer table"),
             expert_down_ptrs: expert_down_ptrs.expect("pending EP down pointer table"),
+            cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
             layer_idx,
@@ -5398,7 +5917,12 @@ pub(crate) fn load_moe_ffn(
     p: &str,
     config: &Qwen35Config,
     layer_idx: u16,
+    residency: LayerResidency,
 ) -> HipResult<MoeFfnWeights> {
+    // The layer's own MoE weights (router, shared expert) follow the layer's
+    // residency; only the routed experts follow `memory.moe_expert_budget`.
+    let moe_target = memory_target(residency.weights);
+    let expert_target = expert_memory_target(residency.experts);
     let n_exp = config.num_experts;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
@@ -5494,6 +6018,7 @@ pub(crate) fn load_moe_ffn(
             n_exp,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5507,6 +6032,7 @@ pub(crate) fn load_moe_ffn(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5520,6 +6046,7 @@ pub(crate) fn load_moe_ffn(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5533,6 +6060,7 @@ pub(crate) fn load_moe_ffn(
             config.dim,
             smi,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5546,6 +6074,7 @@ pub(crate) fn load_moe_ffn(
             1,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5553,14 +6082,44 @@ pub(crate) fn load_moe_ffn(
     );
 
     let expert_ids = source_expert_ids;
-    let packed = match try_load_packed_mq4_experts(hfq, gpu, p, &expert_ids, mi, config.dim) {
+    let packed = match try_load_packed_experts(
+        hfq,
+        gpu,
+        p,
+        &expert_ids,
+        mi,
+        config.dim,
+        expert_target,
+    ) {
         Ok(packed) => packed,
         Err(error) => return Err(pending.rollback(gpu, error)),
     };
+    if packed.is_none() && residency.experts_host() {
+        // No packer covered this layer (uniform host packing needs an admitted
+        // dtype and shared projection strides; graded packing needs one
+        // tag-mapped pair per expert with no AWQ/LUT/GL sidecars). Literal
+        // host tensors each pay `HOST_TAIL_PAD_BYTES` (1 MiB) — ~512 MiB per
+        // layer against a ~430 MB payload — so fail closed and name the layer.
+        return Err(pending.rollback(
+            gpu,
+            HipError::new(
+                0,
+                &format!(
+                    "qwen35: layer {layer_idx} routed experts are host-placed \
+                     (memory.moe_expert_budget) but expert packing does not apply: uniform packing needs \
+                     one supported raw dtype and shared projection strides, and graded host packing needs every \
+                     expert on a tag-mapped (gate, down) pair with no AWQ/LUT/GL sidecars. Refusing a \
+                     per-expert host fallback, which would cost ~512 MiB \
+                     of tail pad per layer"
+                ),
+            ),
+        ));
+    }
     if let Some((experts, owners)) = packed {
         if layer_idx == 0 {
+            let n_blobs = owners.gate_up.len() + owners.down.len();
             eprintln!(
-                "  routed MQ4 expert packing: {} per-expert weight buffers -> 2 layer blobs",
+                "  routed expert packing: {} per-expert weight buffers -> {n_blobs} layer blobs",
                 table_len
             );
         }
@@ -5575,6 +6134,7 @@ pub(crate) fn load_moe_ffn(
                 fused_mi,
                 config.dim,
                 qwen35_tensor_name_candidates,
+                expert_target,
             ) {
                 Ok(weight) => weight,
                 Err(error) => return Err(pending.rollback(gpu, error)),
@@ -5586,6 +6146,7 @@ pub(crate) fn load_moe_ffn(
                 config.dim,
                 mi,
                 qwen35_tensor_name_candidates,
+                expert_target,
             ) {
                 Ok(weight) => weight,
                 Err(error) => {
@@ -5678,6 +6239,63 @@ pub(crate) fn load_moe_ffn(
     };
     if let Err(error) = down_copy {
         return Err(pending.rollback(gpu, error));
+    }
+    // CPU expert splice: only on the CPU arm (`memory.offload_exec=cpu`) and only
+    // on a host-placed packed layer, so the PCIe arm is genuinely PCIe and
+    // resident loads are byte-identical. `HIPFIRE_MOE_CPU_EXPERTS=0` is the
+    // kill-switch. Splice arming is computed before the tag table exists (it is
+    // built below): the CPU arm over a host-placed packed layer with no AWQ
+    // sidecar. The loader writes the **real** expert tables (every forward path
+    // reads them); the splice records only that decode and the narrow (`<= 4`
+    // row) batched forwards defer their routed FFN to the CPU, so the sealed
+    // program skips the routed GPU stages entirely instead of reading a sink.
+    //
+    // Single-token decode and the narrow batched forwards that share the CPU
+    // target arithmetic (the `<=4`-row speculative verify and its accepted-prefix
+    // rollback replay) defer, and the CPU recomputes the whole FFN (gate_up +
+    // SiLU + down) from the intact host blobs per (token, rank). Ordinary prompt
+    // prefill keeps the real tables and the GPU grouped PCIe read — the CPU
+    // expert FFN is compute-bound and loses to it by >10x at chunk sizes.
+    //
+    // Graded (mixed-dtype) layers are spliced too: the executor resolves each
+    // selected expert's own `(quant, bucket owner, byte offset)` from the packed
+    // buckets and decodes at its own dtype/stride, so cold-tier experts are no
+    // longer mis-decoded. The tag table and real tables are still written for
+    // the GPU arms (ordinary wide prefill). AWQ layers stay refused: a bare
+    // `gemv` would ignore the per-expert scale on either projection.
+    let packed_host = residency.experts_host() && pending.packed_expert_owners.is_some();
+    let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+        && packed_host
+        // An unsupported CPU format keeps the existing GPU-over-host-RAM
+        // route. Arming the splice would fail only after loading the model.
+        && pending.experts.iter().all(|e| {
+            hipfire_dispatch::cpu_exec::cpu_quant_for(e.gate_up.gpu_dtype).is_some()
+                && hipfire_dispatch::cpu_exec::cpu_quant_for(e.down.gpu_dtype).is_some()
+        })
+        && matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_none() && e.down.awq_scale.is_none());
+    // Fail closed rather than silently leave host-placed AWQ experts on the
+    // PCIe read while the coverage line claims the CPU. A bare `gemv` would
+    // ignore the per-expert scale, so the CPU expert splice cannot handle
+    // AWQ on either projection — and MoE-AWQ is on by default, so this
+    // combination is reachable.
+    let awq_sidecar = matches!(pending.experts.first(), Some(e) if e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some());
+    if hipfire_dispatch::cpu_exec_enabled() && packed_host && awq_sidecar {
+        return Err(pending.rollback(
+            gpu,
+            HipError::new(
+                0,
+                "qwen35: memory.offload_exec=cpu with host-placed packed AWQ experts is refused — \
+                 the CPU expert splice cannot apply the per-expert AWQ scale, so the experts would \
+                 silently run on the GPU over PCIe. Keep them resident (raise \
+                 memory.moe_expert_budget) or set memory.offload_exec=pcie",
+            ),
+        ));
+    }
+    pending.cpu_deferred_experts = cpu_expert_splice;
+    if cpu_expert_splice && layer_idx == 0 {
+        eprintln!(
+            "  [moe-cpu-expert] layer {layer_idx}: routed FFN deferred to the CPU splice; wide prefill keeps the PCIe grouped read"
+        );
     }
 
     let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
@@ -6019,6 +6637,10 @@ pub(crate) fn load_moe_ffn_ep(
     let fused_mi = mi
         .checked_mul(2)
         .ok_or_else(|| HipError::new(0, "qwen35: fused expert dimension overflows"))?;
+    // EP is deliberately NOT offloadable: an expert is pinned to one rank, so a
+    // spill would break that rank's ownership. Every weight here stays on the
+    // device.
+    let moe_target = MemoryTarget::Device;
     // REAP was refused at the driver, so source ids are the identity map.
     let source_expert_ids: Vec<usize> = (0..n_exp).collect();
     let source_records = qwen35_hfq_expert_sources(hfq, p, config, &source_expert_ids)?;
@@ -6131,6 +6753,7 @@ pub(crate) fn load_moe_ffn_ep(
             n_exp,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6144,6 +6767,7 @@ pub(crate) fn load_moe_ffn_ep(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6157,6 +6781,7 @@ pub(crate) fn load_moe_ffn_ep(
             smi,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6170,6 +6795,7 @@ pub(crate) fn load_moe_ffn_ep(
             config.dim,
             smi,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6183,6 +6809,7 @@ pub(crate) fn load_moe_ffn_ep(
             1,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6198,6 +6825,7 @@ pub(crate) fn load_moe_ffn_ep(
             fused_mi,
             config.dim,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => return Err(pending.rollback(gpu, error)),
@@ -6209,6 +6837,7 @@ pub(crate) fn load_moe_ffn_ep(
             config.dim,
             mi,
             qwen35_tensor_name_candidates,
+            moe_target,
         ) {
             Ok(weight) => weight,
             Err(error) => {
@@ -6516,7 +7145,7 @@ fn load_weights_ep_rank_inner(
             // backend), so the layer would be half-offloaded and an `offloaded=N` count
             // would still report it as spilled — the silent-partial shape the design doc
             // flags. Pin resident until MoE offload is designed deliberately.
-            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx, false);
+            let mut backend = qwen35_hfq_backend(hfq, gpu, layer_idx, WeightResidency::Resident);
             crate::layer_driver::load_layer(&mut backend, config, layer_idx, |bk, cfg, li| {
                 load_moe_ffn_ep(
                     bk.hfq,
@@ -7300,6 +7929,7 @@ mod direct_load_fault_tests {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{EmbeddingFormat, KvCache, WeightTensor};
     use hipfire_runtime::model_load::WeightSource;
+    use hipfire_runtime::offload::LayerResidency;
     use rdna_compute::{Gpu, GpuTensor};
 
     /// Env var naming the real dense-Qwen35 fixture for the fault-seam tests
@@ -7594,7 +8224,12 @@ mod direct_load_fault_tests {
             ) -> HipResult<(WeightTensor, bool)> {
                 unreachable!("source must not run without devices")
             }
-            fn read_layer(&mut self, _gpu: &mut Gpu, _layer_idx: usize) -> HipResult<Self::Layer> {
+            fn read_layer(
+                &mut self,
+                _gpu: &mut Gpu,
+                _layer_idx: usize,
+                _residency: LayerResidency,
+            ) -> HipResult<Self::Layer> {
                 unreachable!("source must not run without devices")
             }
             fn free_layer(&mut self, _gpu: &mut Gpu, _layer: Self::Layer) {
@@ -7631,5 +8266,281 @@ mod direct_load_fault_tests {
             format!("{err:?}").contains("at least one device"),
             "production route changed validation: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod packed_host_expert_tests {
+    use super::*;
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::cpu_exec::{cpu_quant_for, moe_cpu_experts, CpuMoeExpert};
+    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
+    use hipfire_dispatch::types::DispatchError;
+
+    fn resolved(gu_qt: u8, dn_qt: u8, gate_up_bytes: usize, down_bytes: usize) -> ResolvedExpert {
+        ResolvedExpert {
+            gate_up_name: format!("layers.0.mlp.experts.0.gate_up_proj.weight.{gu_qt}"),
+            down_name: format!("layers.0.mlp.experts.0.down_proj.weight.{dn_qt}"),
+            gate_up_qt: gu_qt,
+            down_qt: dn_qt,
+            gate_up_bytes,
+            down_bytes,
+        }
+    }
+
+    /// The shipped `.mq4p` graded tiers must reach the graded host packer.
+    /// Layer 8 of `qwen3.6-35b-a3b.mq4p` leads with an MQ6 expert (qt 15)
+    /// followed by an MQ4 expert (qt 13); with the uniform packer admitting
+    /// qt 15 for host placements, an in-loop `Ok(None)` on the second expert
+    /// skipped the graded packer and the caller failed the whole load closed.
+    #[test]
+    fn mixed_admitted_tiers_route_to_the_graded_packer() {
+        let host = MemoryTarget::HostMapped;
+        let device = MemoryTarget::Device;
+        let mq4 = || resolved(13, 13, 8 << 20, 4 << 20);
+        let mq6 = || resolved(15, 15, 12 << 20, 6 << 20);
+
+        // The regression: expert 0 admitted-and-different from expert 1.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq4()], host),
+            ExpertLayerLayout::Mixed
+        );
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq4()], device),
+            ExpertLayerLayout::Mixed
+        );
+        // MQ3-Lloyd cold tiers were already Mixed on both placements.
+        assert_eq!(
+            classify_expert_layer(&[resolved(20, 20, 7 << 20, 7 << 20), mq4()], host),
+            ExpertLayerLayout::Mixed
+        );
+        // One shared stride as well as one shared dtype.
+        assert_eq!(
+            classify_expert_layer(&[mq4(), resolved(13, 13, 8 << 20, 5 << 20)], host),
+            ExpertLayerLayout::Mixed
+        );
+        // A layer that is uniform in an admitted dtype keeps the uniform packer.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq6()], host),
+            ExpertLayerLayout::Uniform(DType::MQ6G256)
+        );
+        assert_eq!(
+            classify_expert_layer(&[mq4(), mq4(), mq4()], device),
+            ExpertLayerLayout::Uniform(DType::MQ4G256)
+        );
+        // qt 15 is host-only: the same uniform layer on the device is not.
+        assert_eq!(
+            classify_expert_layer(&[mq6(), mq6()], device),
+            ExpertLayerLayout::Mixed
+        );
+    }
+
+    /// Real loader views must preserve numerical output at nonzero offsets,
+    /// repeated expert selections, and accepted-prefix replay widths.
+    #[test]
+    #[ignore = "requires HIP GPU and HIPFIRE_MOE_PARITY_FIXTURE"]
+    fn packed_host_experts_preserve_multirow_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::var("HIPFIRE_MOE_PARITY_FIXTURE")?;
+        let hfq = HfqFile::open(std::path::Path::new(&path))?;
+        let config = super::super::config_from_hfq(&hfq)?;
+        let (dim, mi) = (config.dim, config.moe_intermediate_size);
+        let mut gpu = Gpu::init()?;
+        // Reverse, nonadjacent source ids exercise the ordered-read path and
+        // prevent an expert-zero or contiguous-file assumption from passing.
+        let ids = [3usize, 0];
+        let (experts, owners) = try_load_packed_experts(
+            &hfq,
+            &mut gpu,
+            "layers.0",
+            &ids,
+            mi,
+            dim,
+            MemoryTarget::HostMapped,
+        )?
+        .ok_or("uniform fixture was not host-packable")?;
+        let gemv = GemvFamily::new();
+        let mut original = Vec::new();
+        for (slot, &id) in ids.iter().enumerate() {
+            let mut raw = Vec::new();
+            for (projection, view) in [
+                ("gate_up_proj", &experts[slot].gate_up),
+                ("down_proj", &experts[slot].down),
+            ] {
+                let bare = format!("layers.0.mlp.experts.{id}.{projection}.weight");
+                let name = qwen35_tensor_name_candidates(&bare)
+                    .into_iter()
+                    .find(|name| hfq.find_tensor_info(name).is_some())
+                    .ok_or("fixture projection missing")?;
+                let bytes = hfq
+                    .tensor_data_pread(&name)
+                    .map(|(_, bytes)| bytes.to_vec())
+                    .ok_or("fixture bytes missing")?;
+                let resident = load_weight_tensor(
+                    &hfq,
+                    &mut gpu,
+                    &name,
+                    view.m,
+                    view.k,
+                    qwen35_tensor_name_candidates,
+                    MemoryTarget::Device,
+                )?;
+                let x_host: Vec<f32> = (0..view.k)
+                    .map(|i| ((i * 17 + slot * 31) % 257) as f32 / 256.0 - 0.5)
+                    .collect();
+                let x = gpu.upload_f32(&x_host, &[view.k])?;
+                let y_host = gpu.zeros(&[view.m], DType::F32)?;
+                let y_device = gpu.zeros(&[view.m], DType::F32)?;
+                for (weight, y) in [(view, &y_host), (&resident, &y_device)] {
+                    let wr = WeightRef {
+                        buf: &weight.buf,
+                        dtype: weight.gpu_dtype,
+                        m: weight.m,
+                        k: weight.k,
+                        row_stride: weight.row_stride,
+                        rotation: None,
+                        awq_scale: weight.awq_scale.as_ref(),
+                        lloyd_lut_e4m3: weight.lloyd_lut_e4m3,
+                        lloyd_lut_f16: weight.lloyd_lut_f16,
+                        lloyd_lut_c16: weight.lloyd_lut_c16,
+                    };
+                    gemv.run_auto(&DispatchCtx::new(&gpu), &mut gpu, &wr, &x, y)?;
+                }
+                let bits =
+                    |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(gpu.download_f32(&y_host)?),
+                    bits(gpu.download_f32(&y_device)?),
+                    "packed host {projection} expert {id} changed GPU output",
+                );
+                gpu.free_tensor(resident.buf)?;
+                if let Some(scale) = resident.awq_scale {
+                    gpu.free_tensor(scale)?;
+                }
+                for tensor in [x, y_host, y_device] {
+                    gpu.free_tensor(tensor)?;
+                }
+                raw.push(bytes);
+            }
+            original.push(raw);
+        }
+
+        if let Some(q) = cpu_quant_for(experts[0].gate_up.gpu_dtype) {
+            const ROWS: usize = 4;
+            const TOP_K: usize = 2;
+            let indices = [0usize, 1, 1, 1, 1, 0, 0, 0];
+            let weights = [0.6f32, 0.4, 0.25, 0.75, 0.7, 0.3, 0.5, 0.5];
+            let seed: Vec<f32> = (0..ROWS * dim).map(|i| (i % 7) as f32 * 0.01).collect();
+            let mut xr: Vec<f32> = (0..ROWS * dim)
+                .map(|i| ((i * 13) % 251) as f32 / 250.0 - 0.5)
+                .collect();
+            for row in xr.chunks_exact_mut(dim) {
+                hipfire_cpu::quant::rotate_x(row);
+            }
+            let mut reference = seed.clone();
+            for row in 0..ROWS {
+                for rank in 0..TOP_K {
+                    let slot = row * TOP_K + rank;
+                    let e = indices[slot];
+                    let mut gu = vec![0.0f32; 2 * mi];
+                    hipfire_cpu::gemv::gemv(
+                        q,
+                        &original[e][0],
+                        2 * mi,
+                        dim,
+                        &xr[row * dim..(row + 1) * dim],
+                        &mut gu,
+                    );
+                    let mut hidden = vec![0.0f32; mi];
+                    hipfire_cpu::epilogue::silu_mul(&gu, &mut hidden);
+                    hipfire_cpu::quant::rotate_x(&mut hidden);
+                    let mut down = vec![0.0f32; dim];
+                    hipfire_cpu::gemv::gemv(q, &original[e][1], dim, mi, &hidden, &mut down);
+                    for i in 0..dim {
+                        reference[row * dim + i] += weights[slot] * down[i];
+                    }
+                }
+            }
+            let x = gpu.upload_f32(&xr, &[ROWS * dim])?;
+            let index_bits: Vec<f32> = indices
+                .iter()
+                .map(|&id| f32::from_bits(id as u32))
+                .collect();
+            let idx = gpu.upload_f32(&index_bits, &[ROWS * TOP_K])?;
+            let w = gpu.upload_f32(&weights, &[ROWS * TOP_K])?;
+            fn owner_slice<'a>(
+                gpu: &Gpu,
+                view: &GpuTensor,
+                owner: &'a GpuTensor,
+            ) -> Result<&'a [u8], DispatchError> {
+                let bytes = gpu
+                    .host_bytes(owner)
+                    .ok_or_else(|| DispatchError::Hip("owner not host-mapped".into()))?;
+                let offset = (view.buf.as_ptr() as usize)
+                    .checked_sub(owner.buf.as_ptr() as usize)
+                    .ok_or_else(|| DispatchError::Hip("view before owner".into()))?;
+                bytes
+                    .get(offset..offset + view.byte_size())
+                    .ok_or_else(|| DispatchError::Hip("view outside owner".into()))
+            }
+            // Run wide verify, then its accepted prefix, then single-row decode.
+            // Spare tensor capacity must not be interpreted as active rows.
+            for rows in [ROWS, 2, 1] {
+                let residual = gpu.upload_f32(&seed, &[ROWS * dim])?;
+                moe_cpu_experts(
+                    &gpu,
+                    dim,
+                    mi,
+                    rows,
+                    TOP_K,
+                    &x,
+                    &idx,
+                    &w,
+                    &residual,
+                    false,
+                    |e| {
+                        Ok(CpuMoeExpert {
+                            gate_up_quant: q,
+                            gate_up: owner_slice(
+                                &gpu,
+                                &experts[e].gate_up.buf,
+                                &owners.gate_up[0],
+                            )?,
+                            down_quant: q,
+                            down: owner_slice(&gpu, &experts[e].down.buf, &owners.down[0])?,
+                        })
+                    },
+                )?;
+                let got = gpu.download_f32(&residual)?;
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(
+                    bits(&got[..rows * dim]),
+                    bits(&reference[..rows * dim]),
+                    "CPU width {rows} changed output bits"
+                );
+                assert_eq!(
+                    bits(&got[rows * dim..]),
+                    bits(&seed[rows * dim..]),
+                    "CPU width {rows} overwrote spare rows"
+                );
+                gpu.free_tensor(residual)?;
+            }
+            for tensor in [x, idx, w] {
+                gpu.free_tensor(tensor)?;
+            }
+        }
+        for expert in experts {
+            for weight in [expert.gate_up, expert.down] {
+                if let Some(scale) = weight.awq_scale {
+                    gpu.free_tensor(scale)?;
+                }
+            }
+        }
+        for owner in owners.gate_up.into_iter().chain(owners.down) {
+            gpu.free_tensor(owner)?;
+        }
+        eprintln!(
+            "PACKED_HOST_EXPERT_PARITY PASS: {path} (GPU bits; CPU widths 4/2/1 when supported)"
+        );
+        Ok(())
     }
 }

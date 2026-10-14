@@ -39,6 +39,13 @@
 // Run:   cb_verify_gemm_oracle --model <path> --out <abs dir> [--ops a,b]
 //          [--seeds 1,2,3] [--n-max 128] [--tests t,..] [--cands prod,k32]
 //          [--reps 30] [--mode eager|graph|both]
+// Sampled head: --model <real-27B-path> --out <absolute-dir>
+//   --tests sampled-head --seeds 1,2,3 --mode eager|graph|both --reps 30
+// Run HIPFIRE_CB_VERIFY_PM=1 and =0 in separate fresh processes. Partitions
+// are internal and independent of --ops/--n-max. Timings with whole-head=false
+// exclude rotation but include the public head's conversion/zero-init work;
+// they are not pure kernel-only timings. Private CB refusal/owner fallback
+// remains an integration-state-oracle obligation, explicitly printed below.
 
 use hip_bridge::KernargBlob;
 use hipfire_arch_qwen35::load_qwen35_bundle;
@@ -832,6 +839,225 @@ fn parse_args() -> R<Args> {
     Ok(a)
 }
 
+/// Product is deliberately dispatched at each lane's original b, never at S.
+fn sampled_head_call(
+    gpu: &mut Gpu, case: &Case, head: &hipfire_runtime::llama::WeightTensor,
+    hidden: &GpuTensor, rotated: &GpuTensor, y: &[GpuTensor],
+    partition: &[usize], exact: bool, residual: bool, rotate: bool,
+) -> R<()> {
+    let total: usize = partition.iter().sum();
+    let mut offset = 0;
+    let counts = if exact { vec![total] } else { partition.to_vec() };
+    for n in counts {
+        let x = hidden.sub_offset(offset * case.k, n * case.k);
+        let xr = rotated.sub_offset(offset * case.k, n * case.k);
+        let out = y[0].sub_offset(offset * case.ms[0], n * case.ms[0]);
+        if rotate {
+            hipfire_runtime::llama::rotate_x_mq_batched_for(gpu, head, &x, &xr, case.k, n)?;
+            gpu.invalidate_fp16_cache();
+            gpu.scratch.invalidate_x_caches_for(xr.buf.as_ptr());
+        }
+        if residual {
+            if exact {
+                gpu.gemm_mq4g256v2_residual_verify_exact(case.w[0], &xr, &out, case.ms[0], case.k, n)?;
+            } else {
+                gpu.gemm_hfq4g256_residual_mq4v2(case.w[0], &xr, &out, case.ms[0], case.k, n)?;
+            }
+        } else if exact {
+            gpu.gemm_mq4g256v2_lmhead_verify_exact(case.w[0], &xr, &out, case.ms[0], case.k, n)?;
+        } else {
+            gpu.gemm_mq4g256v2_batched_lmhead(case.w[0], &xr, &out, case.ms[0], case.k, n)?;
+        }
+        offset += n;
+    }
+    Ok(())
+}
+
+fn sampled_picks(bytes: &[u8], m: usize, n: usize) -> Vec<usize> {
+    bytes[..n * m * 4].chunks_exact(m * 4).map(|row| {
+        let mut best = f32::NEG_INFINITY;
+        let mut pick = 0;
+        for (i, word) in row.chunks_exact(4).enumerate() {
+            let v = f32::from_le_bytes(word.try_into().unwrap());
+            if v > best { best = v; pick = i; }
+        }
+        pick
+    }).collect()
+}
+
+fn sampled_head(
+    gpu: &mut Gpu, case: &Case, head: &hipfire_runtime::llama::WeightTensor,
+    args: &Args, rep: &mut Report,
+) -> R<()> {
+    if head.gpu_dtype != DType::MQ4G256V2 || case.k == 0 || case.k % 256 != 0 {
+        return Err("sampled-head requires the real model's MQ4G256V2 head with positive K divisible by 256".into());
+    }
+    // IU4 prefill (default on) only engages at >= 64 rows outside the IU4
+    // verify scope (`Gpu::iu4_*_active`); the per-lane Product reference runs
+    // at b <= 16 and the exact head API never consults it. So only the verify
+    // scope itself (any batch) and an A8 route active at a reference b refuse.
+    if !gpu.mq4_verify_singleton_chain() || gpu.flags.cb_verify_fp8 || gpu.iu4_verify_scope
+        || (2..=16).any(|b| gpu.a8_prefill_active(b, case.k))
+    {
+        return Err("sampled-head requires admitted normal gfx1201 F16/head/batch-tiles policy without FP8/A8/IU4 verify scope".into());
+    }
+    let mut partitions: Vec<Vec<usize>> = (2..=16).map(|b| vec![b; 2]).collect();
+    partitions.push(vec![8; 8]);
+    partitions.push(vec![16; 8]);
+    for total in [16, 17, 32, 33, 48, 49, 63, 64, 65, 96, 128] {
+        let mut left = total;
+        let mut p = Vec::new();
+        while left > 16 {
+            let b = if left == 17 { 15 } else { 16 };
+            p.push(b);
+            left -= b;
+        }
+        p.push(left);
+        partitions.push(p);
+    }
+    partitions.push(vec![2, 3, 5, 7, 8, 9, 14, 16]);
+    let hidden = gpu.zeros(&[NMAX * case.k], DType::F32)?;
+    let rotated = gpu.zeros(&[NMAX * case.k], DType::F32)?;
+    // Backend policy only: the private CB owner predicate needs the state oracle.
+    for fixture in ["arch", "fp16", "head", "tiles", "lds"] {
+        let mut flags = (*gpu.flags).clone();
+        let arch = if fixture == "arch" { "gfx1100" } else { "gfx1201" };
+        match fixture {
+            "fp16" => flags.fp16_disabled = true,
+            "head" => flags.lm_head_wmma_disabled = true,
+            "tiles" => flags.wmma_batch_tiles = false,
+            "lds" => flags.hfq4g256_ldsstage_wmma = true,
+            _ => {}
+        }
+        rep.checks += 1;
+        let refused = !Gpu::mq4_verify_singleton_chain_for(arch, &flags);
+        if !refused { rep.fails += 1; }
+        rep.line(format!("{} sampled-head backend-policy refusal={fixture}", if refused { "PASS" } else { "FAIL" }));
+    }
+    let refusal = alloc_outs(gpu, case, 1, false)?;
+    reset(gpu, &refusal)?;
+    let result = prod(gpu, case, true, &hidden, &refusal.y, 0, 129);
+    rep.checks += 1;
+    if result.is_ok() {
+        rep.fails += 1;
+        rep.line("FAIL sampled-head exact S=129 not refused".into());
+    } else {
+        rep.line("PASS sampled-head exact S=129 refused".into());
+    }
+    rep.cmp("sampled-head exact S=129 no writes", &read(gpu, &refusal)?, &refusal.init, &case.ms);
+    free_outs(gpu, refusal)?;
+    rep.line("UNEXERCISED private CB fallback/owner admission for b1, FP8/IU4/A8 scope, recording/G0; requires integration state oracle".into());
+    for &seed in &args.seeds {
+        let bits = gen_x(seed, case.k);
+        for permuted in [false, true] {
+            let input: Vec<u8> = (0..NMAX).flat_map(|r| {
+                let source = if permuted { (r * 37 + 11) % NMAX } else { r };
+                bits[source * case.k..(source + 1) * case.k].iter()
+                    .flat_map(|&h| f16_to_f32(h).to_le_bytes()).collect::<Vec<_>>()
+            }).collect();
+            gpu.hip.memcpy_htod(&hidden.buf, &input)?;
+            // b1 is intentionally run only through the unchanged generic path:
+            // its scalar GEMV chain is outside the sampled packed contract.
+            let scalar = alloc_outs(gpu, case, seed, true)?;
+            reset(gpu, &scalar)?;
+            sampled_head_call(gpu, case, head, &hidden, &rotated, &scalar.y, &[1], false, false, true)?;
+            let scalar_want = read(gpu, &scalar)?;
+            reset(gpu, &scalar)?;
+            sampled_head_call(gpu, case, head, &hidden, &rotated, &scalar.y, &[1], false, false, true)?;
+            let scalar_ok = rep.cmp("sampled-head b1 old-Product rerun (not exact admission)", &read(gpu, &scalar)?, &scalar_want, &case.ms);
+            rep.line(format!("{} sampled-head b1 old-Product only", if scalar_ok { "PASS" } else { "FAIL" }));
+            // The comparator itself must detect an output bit and a canary bit.
+            for index in [0, scalar_want[0].len() - 1] {
+                let mut changed = scalar_want.clone();
+                changed[0][index] ^= 1;
+                rep.checks += 1;
+                if first_diff(&changed, &scalar_want, &case.ms).is_none() {
+                    rep.fails += 1;
+                    rep.line(format!("FAIL sampled-head negative comparator byte={index}"));
+                } else {
+                    rep.line(format!("PASS sampled-head negative comparator byte={index} detected"));
+                }
+            }
+            free_outs(gpu, scalar)?;
+            for partition in &partitions {
+                let total: usize = partition.iter().sum();
+                for residual in [false, true] {
+                    let reference = alloc_outs(gpu, case, seed, !residual)?;
+                    let candidate = alloc_outs(gpu, case, seed, !residual)?;
+                    reset(gpu, &reference)?;
+                    sampled_head_call(gpu, case, head, &hidden, &rotated, &reference.y, partition, false, residual, true)?;
+                    let want = read(gpu, &reference)?;
+                    reset(gpu, &candidate)?;
+                    sampled_head_call(gpu, case, head, &hidden, &rotated, &candidate.y, partition, true, residual, true)?;
+                    let got = read(gpu, &candidate)?;
+                    let tag = format!("sampled-head seed={seed} perm={permuted} b={partition:?} S={total} residual={residual}");
+                    let mut ok = rep.cmp(&tag, &got, &want, &case.ms);
+                    // Independently verify untouched padding and canaries in both arms.
+                    for (name, bytes, init) in [("Product", &want, &reference.init), ("exact", &got, &candidate.init)] {
+                        let cut = total * case.ms[0] * 4;
+                        rep.checks += 1;
+                        if bytes[0][cut..] != init[0][cut..] {
+                            rep.fails += 1; ok = false;
+                            rep.line(format!("FAIL {tag} {name} padding/canary"));
+                        }
+                    }
+                    rep.checks += 1;
+                    if sampled_picks(&got[0], case.ms[0], total) != sampled_picks(&want[0], case.ms[0], total) {
+                        rep.fails += 1; ok = false;
+                        rep.line(format!("FAIL {tag} argmax"));
+                    }
+                    if args.mode != "eager" {
+                        let stream = gpu.hip.stream_create()?;
+                        gpu.active_stream = Some(stream);
+                        reset(gpu, &candidate)?;
+                        gpu.invalidate_fp16_cache();
+                        let dev = gpu.device_id;
+                        gpu.graphs.begin_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                        let launch = sampled_head_call(gpu, case, head, &hidden, &rotated, &candidate.y, partition, true, residual, true);
+                        let end = gpu.graphs.end_graph_capture(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap());
+                        launch?; end?;
+                        ok &= rep.cmp(&format!("{tag} capture-not-executed"), &read(gpu, &candidate)?, &candidate.init, &case.ms);
+                        for replay in 0..3 {
+                            reset(gpu, &candidate)?;
+                            gpu.graphs.graph_launch(&gpu.hip, dev, gpu.active_stream.as_ref().unwrap())?;
+                            ok &= rep.cmp(&format!("{tag} replay={replay}"), &read(gpu, &candidate)?, &want, &case.ms);
+                        }
+                        gpu.graphs.drop_captured_graph(&gpu.hip, dev);
+                        let captured_stream = gpu.active_stream.take().unwrap();
+                        gpu.hip.stream_destroy(captured_stream)?;
+                    }
+                    rep.line(format!("{} {tag} digest={:016x}", if ok { "PASS" } else { "FAIL" }, fnv(&got[0])));
+                    if !permuted && !residual && args.reps > 0 {
+                        for exact in [false, true] {
+                            for rotate in [false, true] {
+                                let e0 = gpu.hip.event_create()?;
+                                let e1 = gpu.hip.event_create()?;
+                                let mut times = Vec::new();
+                                for i in 0..args.reps + 3 {
+                                    reset(gpu, &candidate)?;
+                                    gpu.hip.event_record(&e0, None)?;
+                                    sampled_head_call(gpu, case, head, &hidden, &rotated, &candidate.y, partition, exact, false, rotate)?;
+                                    gpu.hip.event_record(&e1, None)?;
+                                    gpu.hip.event_synchronize(&e1)?;
+                                    if i >= 3 { times.push(gpu.hip.event_elapsed_ms(&e0, &e1)? as f64); }
+                                }
+                                rep.line(format!("time {tag} exact={exact} whole-head={rotate} median_ms={:.6}", median(&mut times)));
+                                gpu.hip.event_destroy(e0)?;
+                                gpu.hip.event_destroy(e1)?;
+                            }
+                        }
+                    }
+                    free_outs(gpu, reference)?;
+                    free_outs(gpu, candidate)?;
+                }
+            }
+        }
+    }
+    gpu.free_tensor(hidden)?;
+    gpu.free_tensor(rotated)?;
+    Ok(())
+}
+
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v[v.len() / 2]
@@ -913,6 +1139,14 @@ fn run() -> R<usize> {
         }
         if c.k % 256 != 0 {
             return Err(format!("{}: K {} not a multiple of 256", c.name, c.k).into());
+        }
+    }
+    if has("sampled-head") {
+        sampled_head(&mut gpu, &all[6], &b.weights.output, &args, &mut rep)?;
+        if args.tests.len() == 1 {
+            rep.line(if rep.fails == 0 { "VERDICT PASS".into() } else { "VERDICT FAIL".into() });
+            std::fs::write(format!("{}/report.txt", args.out), &rep.text)?;
+            return Ok(rep.fails);
         }
     }
     let cases: Vec<&Case> = all.iter().filter(|c| args.ops.iter().any(|o| o == c.name)).collect();

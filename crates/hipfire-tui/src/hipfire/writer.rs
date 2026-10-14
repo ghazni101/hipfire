@@ -131,11 +131,27 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
             max: 65536,
         },
     },
+    FieldSpec {
+        key: "moe_expert_budget",
+        kind: FieldKind::Int {
+            min: -1,
+            max: 65536,
+        },
+    },
     // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
     // which is also what its own field validates against, so the two cannot drift.
     FieldSpec {
         key: "offload_exec",
         kind: FieldKind::Enum(hipfire_config::OFFLOAD_EXECS),
+    },
+    // A free string rather than an enum: the share is `auto` or a *continuum*
+    // (0, 0.5], which a fixed list cannot express. The schema's `PassbackShare`
+    // rule is the validator, so a typed `0.6` is rejected by `write_value`.
+    FieldSpec {
+        key: "offload_passback_share",
+        kind: FieldKind::FreeStr {
+            require_existing_file: false,
+        },
     },
     FieldSpec {
         key: "flash_mode",

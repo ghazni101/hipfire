@@ -22,20 +22,35 @@ function body never requires a regen.
 
 Usage:
     scripts/check-crate-maps.py <crate>...        generate/refresh those maps
-    scripts/check-crate-maps.py --check [crate...]  fail on drift
+    scripts/check-crate-maps.py --check [crate...]  fail on drift or broken links
         (no crate named = every map.md present under crates/)
 
+--check validates two things per map.md:
+  1. The generated block matches the tree (modules from actual src/**/*.rs
+     files, exports, dependencies, reverse dependencies, link hrefs).
+  2. Every local markdown link in the WHOLE file -- inside and outside the
+     markers, even when the generated block is otherwise fresh -- resolves to
+     an existing path. Inline links, images and reference definitions are
+     checked; targets are relative to the crate directory (a leading `/` is
+     relative to the repo root), `#fragment` / `?query` suffixes are stripped
+     before the lookup, and fragment-only links, external schemes (https:,
+     mailto:, ...) and `//host` links are ignored. Fenced code, inline code and
+     HTML comments are not scanned. Anchors themselves are not verified.
+
 Exit codes in --check mode (mirrors scripts/check-env-docs.py):
-    0 - every checked map matches the tree
-    1 - drift found (details printed, one line per finding)
+    0 - every checked map matches the tree and all local links resolve
+    1 - drift or a broken local link found (details printed, one line per
+        finding, with the map.md line number for link problems)
     2 - usage error or a named crate has no map.md
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 CRATES = ROOT / "crates"
@@ -58,6 +73,21 @@ PUB_ITEM = re.compile(
     r"(fn|struct|enum|trait|type|const|static|mod|use)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 
+# Local-link validation. Code is masked first so examples such as `[x](y)` in
+# prose or fences are not mistaken for real links.
+FENCED_CODE = re.compile(
+    r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*\1[`~]*[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+# `[text](target "title")`, also images; target may be `<...>`-wrapped.
+INLINE_LINK = re.compile(
+    r"\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>\n]*>|[^)\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)"
+)
+REF_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]*>|\S+)", re.MULTILINE)
+URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
 
 def public_items(path: Path) -> list[str]:
     names: list[str] = []
@@ -76,6 +106,7 @@ def module_inventory(crate: Path) -> list[tuple[str, list[str]]]:
     return [
         (rs.relative_to(crate).as_posix(), public_items(rs))
         for rs in sorted(src.rglob("*.rs"))
+        if rs.is_file()
     ]
 
 
@@ -175,6 +206,10 @@ def parse_block_modules(block: str) -> dict[str, set[str]]:
     return out
 
 
+def parse_block_hrefs(block: str) -> dict[str, str]:
+    return dict(re.findall(r"^- \[`(src/[^`]+)`\]\(([^)]*)\): ", block, re.MULTILINE))
+
+
 def parse_block_deps(block: str) -> set[str]:
     deps: set[str] = set()
     in_deps = False
@@ -196,6 +231,54 @@ def parse_block_revdeps(block: str) -> set[str]:
     return set(re.findall(r"`([^`]+)`", m.group(0)))
 
 
+def mask_non_link_text(text: str) -> str:
+    """Blank out fenced code, HTML comments and inline code spans, keeping
+    every offset and newline so line numbers of the remaining text survive."""
+
+    def blank(m: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    for pattern in (FENCED_CODE, HTML_COMMENT, INLINE_CODE):
+        text = pattern.sub(blank, text)
+    return text
+
+
+def local_link_path(target: str) -> str | None:
+    """Filesystem part of a link target, or None when it is not a local file
+    link (external scheme, protocol-relative, or fragment/query-only)."""
+    target = target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    if not target or target.startswith("//") or URL_SCHEME.match(target):
+        return None
+    path = re.split(r"[#?]", target, maxsplit=1)[0]
+    return unquote(path) or None
+
+
+def check_links(crate: Path, text: str) -> list[str]:
+    """Every local markdown link in the whole map.md (inside and outside the
+    generated markers) must resolve to an existing path. Targets are relative
+    to the crate directory; a leading `/` is relative to the repo root."""
+    problems: list[str] = []
+    masked = mask_non_link_text(text)
+    for pattern in (INLINE_LINK, REF_DEFINITION):
+        for m in pattern.finditer(masked):
+            target = m.group(1)
+            path = local_link_path(target)
+            if path is None:
+                continue
+            resolved = ROOT / path.lstrip("/") if path.startswith("/") else crate / path
+            if resolved.exists():
+                continue
+            line = text.count("\n", 0, m.start(1)) + 1
+            shown = os.path.normpath(resolved).replace(os.sep, "/")
+            problems.append(
+                f"{crate.name}: map.md:{line}: link target does not exist: "
+                f"{target.strip()} (resolved to {shown})"
+            )
+    return problems
+
+
 def check_crate(crate: Path) -> list[str]:
     map_path = crate / "map.md"
     if not map_path.is_file():
@@ -203,10 +286,11 @@ def check_crate(crate: Path) -> list[str]:
     text = map_path.read_text(encoding="utf-8", errors="ignore")
     if BEGIN not in text or END not in text:
         return [f"{crate.name}: map.md is missing the generated-block markers"]
+    link_problems = check_links(crate, text)
     old_block = text[text.index(BEGIN):text.index(END) + len(END)]
     fresh = generated_block(crate)
     if old_block == fresh:
-        return []
+        return link_problems
 
     problems: list[str] = []
     old_modules = parse_block_modules(old_block)
@@ -235,12 +319,18 @@ def check_crate(crate: Path) -> list[str]:
     for name in sorted(new_rev - old_rev):
         problems.append(f"{crate.name}: reverse dependency missing from map: {name}")
 
+    for rel, href in sorted(parse_block_hrefs(old_block).items()):
+        if href != rel and rel in new_modules:
+            problems.append(
+                f"{crate.name}: map link for {rel} points at {href}, expected {rel}"
+            )
+
     if not problems:
         problems.append(
             f"{crate.name}: generated block is stale — "
             f"run scripts/check-crate-maps.py {crate.name}"
         )
-    return problems
+    return problems + link_problems
 
 
 def generate_crate(crate: Path) -> bool:
@@ -307,7 +397,7 @@ def main(argv: list[str]) -> int:
             problems.extend(check_crate(crate))
         without = len(list(CRATES.glob("*/Cargo.toml"))) - len(crates)
         if problems:
-            print("crate maps have drifted from the tree:")
+            print("crate maps have drifted from the tree or contain broken links:")
             for p in problems:
                 print(f"  {p}")
             return 1

@@ -10,6 +10,7 @@
 //! is value-only: it owns validated declarations and a source seal, but never
 //! allocates GPU memory or starts a reader worker.
 
+use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
@@ -23,7 +24,7 @@ use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::external_row_stride;
-use rdna_compute::DType;
+use rdna_compute::{DType, Gpu};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -1163,6 +1164,222 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
         source_identity,
         ple_rows,
     })
+}
+
+/// Suffix of a trunk layer's packed routed gate/up expert tensor.
+const ROUTED_GATE_UP_SUFFIX: &str = ".experts.gate_up_proj";
+/// Suffix of a trunk layer's packed routed down expert tensor.
+const ROUTED_DOWN_SUFFIX: &str = ".experts.down_proj";
+
+/// Decode an IEEE binary16 bit pattern exactly (the GPU checker's
+/// `(float)__builtin_bit_cast(_Float16, ..)`).
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exp = u32::from((bits >> 10) & 0x1f);
+    let frac = u32::from(bits & 0x3ff);
+    match exp {
+        0 => {
+            // Zero and subnormals: frac * 2^-24 is exact in f32.
+            let magnitude = frac as f32 * (1.0 / 16_777_216.0);
+            if sign != 0 {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        0x1f => f32::from_bits(sign | 0x7f80_0000 | (frac << 13)),
+        _ => f32::from_bits(sign | ((exp + 112) << 23) | (frac << 13)),
+    }
+}
+
+/// The symmetric-grid predicate of `qwen4_moe_sym_check.gfx1201.hip` for one
+/// K128 header (`sc` = low half, `zp` = high half of the little-endian word):
+/// both finite and `zp == -8 * sc` in f32.
+fn header_symmetric(scale_bits: u16, zero_bits: u16) -> bool {
+    let scale = f16_bits_to_f32(scale_bits);
+    let zero = f16_bits_to_f32(zero_bits);
+    scale.is_finite() && zero.is_finite() && zero == -8.0f32 * scale
+}
+
+/// Every K128 header of a packed payload of `group_bytes` groups: QT44 groups
+/// (136 B) carry two headers at byte 0 and 4, QT53 groups (68 B) one at byte 0.
+fn payload_symmetric(bytes: &[u8], group_bytes: usize) -> bool {
+    let headers = group_bytes / 68;
+    bytes.chunks_exact(group_bytes).all(|group| {
+        (0..headers).all(|header| {
+            let at = 4 * header;
+            header_symmetric(
+                u16::from_le_bytes([group[at], group[at + 1]]),
+                u16::from_le_bytes([group[at + 2], group[at + 3]]),
+            )
+        })
+    })
+}
+
+/// Scan the payloads on every available core, stopping at the first
+/// violation. `jobs` are `(payload, group_bytes)`.
+fn payloads_symmetric(jobs: &[(&[u8], usize)]) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let symmetric = AtomicBool::new(true);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(jobs.len())
+        .max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while symmetric.load(Ordering::Relaxed) {
+                    let Some(&(bytes, group_bytes)) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    if !payload_symmetric(bytes, group_bytes) {
+                        symmetric.store(false, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    symmetric.load(Ordering::Relaxed)
+}
+
+/// [`routed_headers_symmetric`] over the named packed routed tensors.
+fn routed_tensors_symmetric(hfq: &HfqFile, names: &[&str]) -> Result<bool, Qwen4ArtifactError> {
+    let mut gate_up = 0usize;
+    let mut down = 0usize;
+    let mut jobs: Vec<(&[u8], usize)> = Vec::with_capacity(names.len());
+    for &name in names {
+        // QT44 gate/up reduces over K256 groups of 136 bytes, QT53 down over
+        // K128 groups of 68 bytes: the only formats the symmetric route reads.
+        let (quant_type, values_per_group, group_bytes) = if name.ends_with(ROUTED_GATE_UP_SUFFIX) {
+            gate_up += 1;
+            (QWEN4_QT_MQ4G256V2, 256usize, 136usize)
+        } else if name.ends_with(ROUTED_DOWN_SUFFIX) {
+            down += 1;
+            (QWEN4_QT_MQ4G128V2, 128usize, 68usize)
+        } else {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: {name} is not a packed routed expert tensor"
+            )));
+        };
+        let info = hfq.find_tensor_info(name).ok_or_else(|| {
+            Qwen4ArtifactError::new(format!("qwen4: routed expert tensor {name} is missing"))
+        })?;
+        if info.quant_type != quant_type {
+            // BF16 or another tier: not the symmetric grid the route reads.
+            return Ok(false);
+        }
+        let [experts, rows, k] = info.shape[..] else {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: routed expert tensor {name} shape {:?} is not [experts, rows, K]",
+                info.shape
+            )));
+        };
+        let (experts, rows, k) = (experts as usize, rows as usize, k as usize);
+        let expected = k
+            .checked_div(values_per_group)
+            .filter(|_| k % values_per_group == 0)
+            .and_then(|groups| experts.checked_mul(rows)?.checked_mul(groups))
+            .and_then(|groups| groups.checked_mul(group_bytes))
+            .ok_or_else(|| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: routed expert tensor {name} shape {:?} is not a whole number of \
+                     {values_per_group}-value groups",
+                    info.shape
+                ))
+            })?;
+        let (_, bytes) = hfq.tensor_data(name).ok_or_else(|| {
+            Qwen4ArtifactError::new(format!(
+                "qwen4: routed expert tensor {name} payload is not readable"
+            ))
+        })?;
+        if bytes.len() != expected {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: routed expert tensor {name} payload is {} bytes, expected {expected}",
+                bytes.len()
+            )));
+        }
+        jobs.push((bytes, group_bytes));
+    }
+    if gate_up == 0 || gate_up != down {
+        return Ok(false);
+    }
+    Ok(payloads_symmetric(&jobs))
+}
+
+/// Whether every trunk routed expert header of the artifact is on the
+/// symmetric grid (`zp == -8 * sc`, both finite) the symmetric IU4 MoE route
+/// requires, read from the actual payload bytes, not metadata labels.  Mirrors
+/// `kernels/src/qwen4_moe_sym_check.gfx1201.hip` exactly: QT44 gate/up and QT53
+/// down only, both QT44 subheaders of every group, every expert and row.
+///
+/// A short or malformed payload is an error; a finite asymmetric header, a
+/// non-QT44/QT53 tier, or an inventory without routed experts returns `false`.
+pub fn routed_headers_symmetric(
+    hfq: &HfqFile,
+    manifest: &Qwen4Manifest,
+) -> Result<bool, Qwen4ArtifactError> {
+    let names = manifest
+        .weights
+        .iter()
+        .filter(|entry| {
+            entry.layer.is_some()
+                && (entry.name.ends_with(ROUTED_GATE_UP_SUFFIX)
+                    || entry.name.ends_with(ROUTED_DOWN_SUFFIX))
+        })
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    routed_tensors_symmetric(hfq, &names)
+}
+
+/// Whether every PLE key/value projection runs as BF16 weights: the manifest
+/// declares them BF16 and no `HIPFIRE_QWEN4_REQUANT` rule matches them (the
+/// load-time requantization would turn them into a quantized matrix).
+pub fn ple_key_value_bf16(manifest: &Qwen4Manifest) -> bool {
+    let requant = hipfire_config::developer_var("HIPFIRE_QWEN4_REQUANT").ok();
+    let mut seen = false;
+    for entry in &manifest.weights {
+        if !entry.name.contains(".ple.")
+            || !(entry.name.ends_with(".key_proj.weight")
+                || entry.name.ends_with(".value_proj.weight"))
+        {
+            continue;
+        }
+        seen = true;
+        if entry.dtype != DType::BF16 {
+            return false;
+        }
+        let requantized = requant.as_deref().is_some_and(|spec| {
+            spec.split(';')
+                .filter(|rule| !rule.trim().is_empty())
+                .filter_map(|rule| rule.split_once('='))
+                .any(|(pattern, _)| entry.name.contains(pattern.trim()))
+        });
+        if requantized {
+            return false;
+        }
+    }
+    seen
+}
+
+/// The forward scratch plan one artifact is admitted to, decided from the
+/// actual source payload before any placement or allocation: the selector's
+/// cheap arch/flag checks run first, and the routed-header scan only when
+/// they could select the compact plan.  Every real-model caller (the loader
+/// and the oracle examples) charges and attaches exactly this mode.
+pub fn source_forward_scratch_mode(
+    gpu: &Gpu,
+    hfq: &HfqFile,
+    config: &Qwen4Config,
+    manifest: &Qwen4Manifest,
+) -> Result<Qwen4ForwardScratchMode, Qwen4ArtifactError> {
+    if qwen4_forward_scratch_mode(gpu, config, true, true) == Qwen4ForwardScratchMode::Full {
+        return Ok(Qwen4ForwardScratchMode::Full);
+    }
+    let ple_bf16 = ple_key_value_bf16(manifest);
+    let symmetric = ple_bf16 && routed_headers_symmetric(hfq, manifest)?;
+    Ok(qwen4_forward_scratch_mode(gpu, config, symmetric, ple_bf16))
 }
 
 /// The geometry facts of a PLE table header that admission checks against the
@@ -2728,5 +2945,180 @@ mod tests {
             .expect_err("synthetic geometry without the marker is not admitted")
             .to_string();
         assert!(error.contains("config admission failed"), "{error}");
+    }
+
+    const SYM_GATE_UP: &str = "model.language_model.layers.0.mlp.experts.gate_up_proj";
+    const SYM_DOWN: &str = "model.language_model.layers.0.mlp.experts.down_proj";
+    /// f16 bit patterns: 1.0, -8.0, -1.0, 8.0, 2.0, -2.0, +inf, quiet NaN.
+    const F16_ONE: u16 = 0x3C00;
+    const F16_NEG_EIGHT: u16 = 0xC800;
+    const F16_NEG_ONE: u16 = 0xBC00;
+    const F16_EIGHT: u16 = 0x4800;
+    const F16_NEG_TWO: u16 = 0xC000;
+    const F16_INF: u16 = 0x7C00;
+    const F16_NAN: u16 = 0x7E00;
+
+    #[test]
+    fn f16_decode_matches_ieee_binary16() {
+        assert_eq!(f16_bits_to_f32(F16_ONE), 1.0);
+        assert_eq!(f16_bits_to_f32(F16_NEG_EIGHT), -8.0);
+        assert_eq!(f16_bits_to_f32(0x0001), 2.0f32.powi(-24));
+        assert_eq!(f16_bits_to_f32(0x03FF), 1023.0 * 2.0f32.powi(-24));
+        assert_eq!(f16_bits_to_f32(0x0400), 2.0f32.powi(-14));
+        assert_eq!(f16_bits_to_f32(0x7BFF), 65504.0);
+        assert!(f16_bits_to_f32(0x8000).is_sign_negative());
+        assert_eq!(f16_bits_to_f32(0x8000), 0.0);
+        assert!(f16_bits_to_f32(F16_INF).is_infinite());
+        assert!(f16_bits_to_f32(F16_NAN).is_nan());
+    }
+
+    #[test]
+    fn header_predicate_matches_the_gpu_checker() {
+        assert!(header_symmetric(F16_ONE, F16_NEG_EIGHT));
+        // A negative scale pairs with a positive zero point.
+        assert!(header_symmetric(F16_NEG_ONE, F16_EIGHT));
+        // Signed zero: zp != -8*sc is an IEEE compare, so +0/-0 both pass.
+        assert!(header_symmetric(0x0000, 0x0000));
+        assert!(header_symmetric(0x0000, 0x8000));
+        assert!(header_symmetric(0x8000, 0x0000));
+        assert!(header_symmetric(0x8000, 0x8000));
+        // Finite but off the grid.
+        assert!(!header_symmetric(F16_ONE, F16_NEG_TWO));
+        assert!(!header_symmetric(F16_ONE, F16_ONE));
+        // Non-finite scale or zero point, even where the product would match.
+        assert!(!header_symmetric(F16_INF, F16_INF));
+        assert!(!header_symmetric(F16_NAN, F16_NAN));
+        assert!(!header_symmetric(F16_ONE, F16_INF));
+        assert!(!header_symmetric(F16_NAN, F16_NEG_EIGHT));
+    }
+
+    /// One packed group: `headers` (scale, zero) pairs at the group start, then
+    /// payload filler that must never be read as a header.
+    fn sym_group(group_bytes: usize, headers: &[(u16, u16)]) -> Vec<u8> {
+        let mut group = vec![0xA5u8; group_bytes];
+        for (index, (scale, zero)) in headers.iter().enumerate() {
+            group[4 * index..4 * index + 2].copy_from_slice(&scale.to_le_bytes());
+            group[4 * index + 2..4 * index + 4].copy_from_slice(&zero.to_le_bytes());
+        }
+        group
+    }
+
+    const SYM_OK: (u16, u16) = (F16_ONE, F16_NEG_EIGHT);
+
+    /// `[experts, rows, K]` gate/up (QT44, K=256: one two-header group per
+    /// row) and down (QT53, K=256: two one-header groups per row), the groups
+    /// supplied in storage order.
+    fn sym_fixture(
+        name: &str,
+        gate_up_groups: &[Vec<u8>],
+        down_groups: &[Vec<u8>],
+        down_quant_type: u8,
+    ) -> (PathBuf, HfqFile) {
+        let path = fixture_path(name);
+        let tensors = vec![
+            HfqMemTensor {
+                name: SYM_GATE_UP.to_string(),
+                quant_type: QWEN4_QT_MQ4G256V2,
+                shape: vec![2, 2, 256],
+                group_size: 256,
+                data: gate_up_groups.concat(),
+            },
+            HfqMemTensor {
+                name: SYM_DOWN.to_string(),
+                quant_type: down_quant_type,
+                shape: vec![2, 2, 256],
+                group_size: 128,
+                data: down_groups.concat(),
+            },
+        ];
+        write_hfqm_package_mem(&path, ARCH_ID, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        (path, hfq)
+    }
+
+    fn sym_cleanup(path: PathBuf, hfq: HfqFile) {
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    /// Four rows (2 experts x 2 rows) of gate/up, eight QT53 groups of down.
+    fn sym_all_ok() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            vec![sym_group(136, &[SYM_OK, SYM_OK]); 4],
+            vec![sym_group(68, &[SYM_OK]); 8],
+        )
+    }
+
+    #[test]
+    fn routed_header_scan_accepts_a_symmetric_payload() {
+        let (gate_up, down) = sym_all_ok();
+        let (path, hfq) = sym_fixture("sym-ok", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+    }
+
+    #[test]
+    fn routed_header_scan_checks_both_qt44_subheaders_and_every_qt53_group() {
+        // Only the second K128 header of the last gate/up group is off-grid.
+        let (mut gate_up, down) = sym_all_ok();
+        gate_up[3] = sym_group(136, &[SYM_OK, (F16_ONE, F16_NEG_TWO)]);
+        let (path, hfq) = sym_fixture("sym-gate-up-sub", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+
+        // Only the last down group is off-grid.
+        let (gate_up, mut down) = sym_all_ok();
+        down[7] = sym_group(68, &[(F16_ONE, F16_NEG_TWO)]);
+        let (path, hfq) = sym_fixture("sym-down-last", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+    }
+
+    #[test]
+    fn routed_header_scan_rejects_non_finite_headers_and_accepts_signed_zero() {
+        let (mut gate_up, down) = sym_all_ok();
+        gate_up[0] = sym_group(136, &[(F16_INF, F16_INF), SYM_OK]);
+        let (path, hfq) = sym_fixture("sym-inf", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+
+        let (gate_up, mut down) = sym_all_ok();
+        down[2] = sym_group(68, &[(F16_NAN, F16_NAN)]);
+        let (path, hfq) = sym_fixture("sym-nan", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+
+        let (mut gate_up, mut down) = sym_all_ok();
+        gate_up[1] = sym_group(136, &[(0x8000, 0x0000), (0x0000, 0x8000)]);
+        down[5] = sym_group(68, &[(F16_NEG_ONE, F16_EIGHT)]);
+        let (path, hfq) = sym_fixture("sym-zero", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+    }
+
+    #[test]
+    fn routed_header_scan_refuses_short_payloads_and_other_tiers() {
+        // One byte short on down: an invalid payload is an error, not `false`.
+        let (gate_up, mut down) = sym_all_ok();
+        down[7].pop();
+        let (path, hfq) = sym_fixture("sym-short", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        let error = routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN])
+            .expect_err("a short routed payload is invalid");
+        assert!(error.to_string().contains("expected"), "{error}");
+        sym_cleanup(path, hfq);
+
+        // A finite tier other than QT53 down is not the symmetric route's.
+        let (gate_up, down) = sym_all_ok();
+        let (path, hfq) = sym_fixture("sym-tier", &gate_up, &down, QWEN4_QT_MQ6G256V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP, SYM_DOWN]).unwrap());
+        sym_cleanup(path, hfq);
+
+        // No routed experts, or gate/up without its down: nothing to prove.
+        let (gate_up, down) = sym_all_ok();
+        let (path, hfq) = sym_fixture("sym-unpaired", &gate_up, &down, QWEN4_QT_MQ4G128V2);
+        assert!(!routed_tensors_symmetric(&hfq, &[]).unwrap());
+        assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP]).unwrap());
+        sym_cleanup(path, hfq);
     }
 }

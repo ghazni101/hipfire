@@ -62,10 +62,10 @@
 //! this process and restores the prior perf level on exit; `NPU_FCLK_GUARD=off` skips the check (loud warning).
 use npu_tools::coop_gpu::{self, PublishRecord};
 use railgun::npu::hip_runtime::{HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
-use pm_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
-use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::gemm_g80::design_g80;
-use pm_npu::kernels::ring::{empty_persistent, patch_seq, persistent_with, Bodies, RingLayout, SlotPlan, DONE_MAGIC};
+use peacemaker_npu::kernels::gemm_array::{apply_epilogue, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
+use peacemaker_npu::kernels::gemm_core::Control;
+use peacemaker_npu::kernels::gemm_g80::design_g80;
+use peacemaker_npu::kernels::ring::{empty_persistent, patch_seq, persistent_with, Bodies, RingLayout, SlotPlan, DONE_MAGIC};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 

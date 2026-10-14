@@ -1,6 +1,13 @@
 # Dense Qwen3.8-27B A4 error correction: concentration study (C1 kill gate)
 
-A4ErrorCorrection, 2026-10-03, branch `npu/a4-ec`. This is the §3 stage-1 experiment of `docs/npu-uses-brainstorm.md` (C1/C2) on **real dense-27B activations**.
+> **Lifecycle: historical dark research record (2026-10-03); verdict KILL, not a shipped path.**
+> The selective-A8 NPU correction route (C1) was killed by this study and never implemented in
+> serving. All figures are measured on the dated capture below (one model, one prompt, one
+> GPU) or are labelled estimates, and are not current performance or quality claims. This is
+> unrelated to the 0.4.2 Flash-Next NPU trunk (BF16-direct only, calibration schema 4, input
+> projections only; out-projection unwired); see [`npu-trunk.md`](npu-trunk.md) for the current route.
+
+Dated 2026-10-03 (workspace branch `npu/a4-ec`, not in this repository). This is the §3 stage-1 experiment of `docs/npu/npu-uses-brainstorm.md` (C1/C2) on **real dense-27B activations**.
 
 Labels: **M** = measured on the capture; **E** = estimate (model arithmetic on measured constants).
 
@@ -8,15 +15,15 @@ Labels: **M** = measured on the capture; **E** = estimate (model arithmetic on m
 
 | item | value |
 |---|---|
-| model | `qwen3.8-27b.mq4-xts`, sha256 `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae` (re-verified), local copy `/home/kaden/qcal/release-0.4.0/fp8-final/models/` |
+| model | `qwen3.8-27b.mq4-xts`, sha256 `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae` (re-verified), local copy not in this repository |
 | prompt | `tools/npu/a4-ec/prompt-wt2.txt` (WT2 excerpt), md5 `25508dd28676158c804a4881dc846a51`; 5416 tokens, first T = 4096 used, `tokens.u32` md5 `7ed43f55681553053f2a263858f127be` |
-| device | local card E, `GPU-05f92432f2312a0e`, **gfx1201** (R9700), hipfire `wt-land-041m` f7960b4e8 (read-only), producers built with `-DIU4_A4_CANDIDATES=2` |
+| device | local card E (device UUID elided), **gfx1201** (R9700), hipfire 0.4.1 beta snapshot f7960b4e8 (read-only), producers built with `-DIU4_A4_CANDIDATES=2` |
 | layers | GDN 2, 21, 42, 61; FA 11, 31, 51, 63 |
 | tags | `attn` (GDN wqkv/wz/w_beta/w_alpha; FA wq/wk/wv), `o` (wo), `mlp` (w_gate/w_up), `down` (w_down) |
 | files | per (L, tag): `xrot.f32` = exact pre-quant f32 `x'` (`0.0625·s2⊙FWHT256(s1⊙x/awq)`) and `a4.bin` = device `block_i4_128` bytes (token-order, `HIPFIRE_A4_SLAB=0`); plus signs, tokens, `manifest.json` with every file's md5 |
-| location | `/home/kaden/qcal/release-0.4.1/a4-ec/capture/` (4.8 GB, not in git); manifest md5 `becd31362ad3985d2f460c6e072c1488` |
+| location | workspace-local `a4-ec/capture/` (4.8 GB, not in git); manifest md5 `becd31362ad3985d2f460c6e072c1488` |
 
-The capture comes from the out-of-tree probe `tools/npu/a4-ec/probe` (path deps on wt-land-041m, no hipfire edits, no HIP written). Its binary md5 is `1a91ae6fcf077783c0786466f907bef5`; the run took 34.7 s under `lockrun.sh E` behind `hostmem-flashnext.lock`.
+The capture comes from the out-of-tree probe `tools/npu/a4-ec/probe` (path deps on the 0.4.1 beta snapshot, no hipfire edits, no HIP written). Its binary md5 is `1a91ae6fcf077783c0786466f907bef5`; the run took 34.7 s under the host's per-GPU lock wrapper (card E) and a host-memory lock.
 
 hipfire has no GEMM-input or Xq dump hook, so the probe:
 1. runs `forward_prefill_batch_with_pbs_opts(max_layer = L)` and `(L+1)` as one T = 4096 chunk;
@@ -48,7 +55,7 @@ Checks:
 - Randomized SVD at 8 vs 24 iterations differs by at most 1.0e-3.
 - 7 unit tests.
 
-Run: 229 s on 64 threads. Binary md5 `c5763fac6c34cdeafe8d4f07eda64598`. Outputs `/home/kaden/qcal/release-0.4.1/a4-ec/results.json` (md5 `deb530200ccfdedba717d8fa9cfa1df4`) and `tables.md` (md5 `0ffe1190dae01a8fd8a1140a7a303fb0`). Those two files hold the full per layer × tag × weight tables.
+Run: 229 s on 64 threads. Binary md5 `c5763fac6c34cdeafe8d4f07eda64598`. Outputs `results.json` (md5 `deb530200ccfdedba717d8fa9cfa1df4`) and `tables.md` (md5 `0ffe1190dae01a8fd8a1140a7a303fb0`). Those two files hold the full per layer × tag × weight tables.
 
 ### Concentration: static top-20% blocks, exact correction, held-out (M)
 
@@ -132,16 +139,16 @@ The only near-complete correction is a full-K A8 plane (0.984), which is a full 
 ## 6. Reproduce
 
 ```
-export CARGO_TARGET_DIR=/home/kaden/qcal/npu-agents/ec/target-probe   # probe
+export CARGO_TARGET_DIR=<scratch-target-dir>   # probe
 cd tools/npu/a4-ec/probe && cargo build --release --offline
-flock /home/kaden/qcal/locks/hostmem-flashnext.lock env HIPFIRE_LOCK_DIR=$(mktemp -d) \
-  /home/kaden/qcal/release-0.4.0/integration/lockrun.sh E GPU-05f92432f2312a0e \
-  env HIPFIRE_DEVICES=GPU-05f92432f2312a0e ROCR_VISIBLE_DEVICES=GPU-05f92432f2312a0e \
+# optional: serialize with other jobs using your site's host-memory / per-GPU lock wrapper
+env HIPFIRE_LOCK_DIR=$(mktemp -d) \
+  env HIPFIRE_DEVICES=<gpu-uuid> ROCR_VISIBLE_DEVICES=<gpu-uuid> \
       HIPFIRE_A4_SLAB=0 HIPFIRE_PREFILL_MAX_BATCH=4096 \
   $CARGO_TARGET_DIR/release/a4-ec-probe MODEL tools/npu/a4-ec/prompt-wt2.txt OUTDIR --t 4096 \
   --model-sha256 3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae --card E \
-  --card-uuid GPU-05f92432f2312a0e --commit f7960b4e846f5206b03aec6ddc177a82baec6fec
-export CARGO_TARGET_DIR=/home/kaden/qcal/npu-agents/ec/target-ec      # CPU model
+  --card-uuid <gpu-uuid> --commit f7960b4e846f5206b03aec6ddc177a82baec6fec
+export CARGO_TARGET_DIR=<scratch-target-dir>      # CPU model
 cd tools/npu/a4-ec && cargo test --release --offline
-cargo run --release --offline -- run --capture OUTDIR --model MODEL --out /home/kaden/qcal/release-0.4.1/a4-ec
+cargo run --release --offline -- run --capture OUTDIR --model MODEL --out <results-dir>
 ```

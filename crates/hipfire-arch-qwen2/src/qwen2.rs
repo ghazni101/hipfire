@@ -38,7 +38,7 @@ use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTe
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
-    HfqBackend, WeightBackend,
+    HfqBackend, MemoryTarget, WeightBackend, WeightResidency,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -413,6 +413,7 @@ fn load_lm_head(
                 cfg.vocab_size,
                 cfg.hidden_size,
                 flat_name_candidates,
+                MemoryTarget::Device,
             )
         },
         // qwen2 is single-GPU; the reupload arm is never taken.
@@ -437,8 +438,7 @@ fn load_layer(
         read_proj: load_weight_tensor,
         layer: i,
         // qwen2 is always fully resident — no offload support.
-        host_local: false,
-        read_proj_host: None,
+        residency: WeightResidency::Resident,
     };
 
     Ok(Qwen2LayerWeights {
@@ -491,15 +491,16 @@ fn load_norm_weight_raw(
 /// implementation.
 fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     for cand in candidates(name) {
         if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
-            return dequant_weight_raw(gpu, info.quant_type, &data, m, k);
+            return dequant_weight_raw(gpu, info.quant_type, &data, m, k, target);
         }
     }
     panic!("qwen2: tensor not found: {name}");

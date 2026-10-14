@@ -37,6 +37,13 @@
           inherit hipfire hipfire-kernels;
         };
 
+        checks = lib.optionalAttrs pkgs.stdenv.isLinux {
+          dflash-config = import ./nix/tests/dflash-config.nix {
+            inherit pkgs lib system;
+            nixosSystem = nixpkgs.lib.nixosSystem;
+          };
+        };
+
         devShells.default = pkgs.callPackage ./nix/dev-shell.nix {
           rust-bin = pkgs.rust-bin;
           rocmSupport = true;

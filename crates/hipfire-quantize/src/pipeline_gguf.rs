@@ -632,7 +632,7 @@ pub(crate) fn run_gguf_pipeline(
                 }
                 GgufFormat::Binary => {
                     // Terminal low-bit format — promotion is a no-op.
-                    // Direct BQ1G128 semantics: scale-only binary g128, 18 B/blk (1.14 bpw).
+                    // Direct BQ1G128 semantics: scale-only binary g128, 18 B/blk (1.125 bpw).
                     let q = quantize_bq1g128(&f32_data);
                     (q, QuantType::BQ1G128, 128u32, "BQ1G128")
                 }
@@ -928,7 +928,7 @@ pub(crate) fn run_gguf_pipeline(
                     (q, QuantType::TQ2G128, 128u32, "TQ2G128")
                 }
                 GgufFormat::Binary => {
-                    // Direct low-bit: scale-only binary g128, 18 B per 128 (1.14 bpw).
+                    // Direct low-bit: scale-only binary g128, 18 B per 128 (1.125 bpw).
                     let q = quantize_bq1g128(&f32_data);
                     (q, QuantType::BQ1G128, 128u32, "BQ1G128")
                 }

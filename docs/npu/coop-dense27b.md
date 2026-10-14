@@ -1,17 +1,21 @@
 # Dense 27B IU4 prefill: GPU + NPU co-op integration (IEF15)
 
+> **Historical research note: superseded by the 0.4.2 serving route.** This file records a design study (no hardware run) for splitting dense 27B IU4 prefill GEMM columns between the GPU and the NPU, whose mixed-mode numeric contract uses IEF15 on the NPU columns from the 2026-10 NPU research cycle. It is not current guidance, and any figure in it is a dated fixture-bound measurement or an explicitly labelled historical estimate, not a product claim. The shipped 0.4.2 NPU route is the Flash-Next gfx1151 trunk input projection described in [npu-trunk.md](npu-trunk.md): `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` (default `auto`, effectively `off` on every architecture except gfx1151), calibration schema 4, BF16-direct only. There is **no I32 serving contract** (no int32 partial, combine or fold exists in the product route). The out-projection program exists but is **not wired** into serving; `qsa.o` and the GDN o-projection are **not shipped**. Environment-variable names and flag syntax below are historical proposals or experiment switches, not supported configuration.
+>
+> Nothing here was implemented as a serving route; the measured prototypes that followed ([coop-down27.md](coop-down27.md), [coop-epi-fuse.md](coop-epi-fuse.md)) were killed. The `W:` source references point at the 0.4.1 beta checkout. The GPU-side switches named below (`HIPFIRE_V2B_ADDEPI`, `HIPFIRE_V2B_ZBA_SCATTER`) are developer-only GPU kernel selectors of that checkout and are not NPU configuration.
+
 Design only, 2026-10-03. No hardware, builds or tests were run for this document. Scope is dense 27B pp8192 on Halo (gfx1151); Flash-Next is out of scope.
 
-Path conventions: `W:` = `/home/kaden/ClaudeCode/warpfront/wt-land-041m` (read-only). Bare paths are under `/home/kaden/qcal/npu-agents/coop`. `FC` = `/home/kaden/qcal/npu-agents/fold/docs/fold-contract.md`. `D27` = `docs/dense27b.md`. `LOG` = `logs/coop/coop-w2-0fe69f9.log`.
+Path conventions: `W:` = the 0.4.1 hipfire beta checkout (read-only). Bare paths are relative to the NPU research workspace (this directory holds its design notes; `logs/` and `tools/` are as in that workspace). `FC` = [fold-contract.md](fold-contract.md). `D27` = `docs/dense27b.md`. `LOG` = `logs/coop/coop-w2-0fe69f9.log`.
 
 **MEASURED** means a recorded observation with a log citation. **ESTIMATE** is derived arithmetic or an assumed parameter. Every modelled quantity below is ESTIMATE, including each time, tok/s and saving figure.
 
 **New-IEF geometry status.** The TM64/TN32 IEF15 NPU tile has no measured rate, tile cost or wave geometry yet; nor has the column-windowed current-fold GPU entry (§1). Everything about them below is pending. Rates are borrowed from the V8 busy rate on a different kernel (see §4).
 
-**Contract: mixed mode (under user decision, 2026-10-03).** G0 is **KILLED on measurement**: the IEF15 GPU route ran at 1.565–1.571× the incumbent (`exp/ief15-g0` @ 7559ee957; `FC` §1), so the GPU does **not** adopt IEF15. The plan is mixed: the **GPU keeps the incumbent fold** (`fmaf(RN(sc·d), C_e, sum)`, `D27` §2) on its columns, and the **NPU runs IEF15** (`FC` §3) on its own columns. Consequently:
+**Contract: mixed mode (project decision, 2026-10-03).** G0 is **KILLED on measurement**: the IEF15 GPU route ran at 1.565–1.571× the incumbent (`exp/ief15-g0` @ 7559ee957; `FC` §1), so the GPU does **not** adopt IEF15. The plan is mixed: the **GPU keeps the incumbent fold** (`fmaf(RN(sc·d), C_e, sum)`, `D27` §2) on its columns, and the **NPU runs IEF15** (`FC` §3) on its own columns. Consequently:
 - The **fixed column-split map** is **part of numeric identity** (`FC` §4): bind exact sorted per-projection ranges, paired g/u cuts, K segments, output layout, contract/final-pack version and model/weight identity into NPU program/tape, graph-capture, prefill-cache and run keys. No runtime load/thermal/adaptive repartition within that identity; a capture under one map never replays under another.
 - **Fallback fails closed or recomputes the same columns under IEF15.** If the NPU path is unavailable, either the step errors (no silent switch) or the NPU-owned columns are recomputed under IEF15 on another engine (e.g. the measured-slower GPU IEF15 entry) so the output bytes are unchanged. Falling back to the incumbent fold on NPU columns would change the numeric identity and is forbidden.
-- Modelled payoff of this mode: `/home/kaden/qcal/npu-agents/fold/tools/fold-model/payoff.json` (md5 f844e93bee923c9b32d7a5d8f19f4ebd), §4.
+- Modelled payoff of this mode: `tools/npu/fold-model/payoff.json` (md5 f844e93bee923c9b32d7a5d8f19f4ebd), §4.
 
 ## 1. Column split per GEMM
 
@@ -24,7 +28,7 @@ NPU owns **whole output features** (weight rows), statically per GEMM, as a lead
 | FA q (16) | 8192×12288×5120, 13.722 | `:8108-8123`; `gemm.rs:32630-32655` | n=2560 | SET. `wq.m = 2·q_dim` includes the output gate (`batch.rs:101,350`). Windows must hold **complete head windows** of Q+gate. [INFERENCE] 5 heads × 512 rows for head_dim 256; confirm against `batch.rs:101,350` |
 | FA k,v (32) | 8192×1024×5120, 1.386 | `:8108-8123` | none (n=0) | stays on GPU |
 | o_proj (64) | 8192×5120×6144, 6.706 | `:243-262,8816-8817` | n=1024 | SET `delta`, then the GPU deferred `RN(x+delta)` fold |
-| gate_up (64) | 8192×34816 (two 17408 halves)×5120, 38.547 | `:7428-7456,9658-9686`; `gemm.rs:33869-34000` | n=7168 total = G[0,3584) + U[0,3584) | NPU emits **separate f32 pre-SiLU g and u**. The GPU applies the unchanged f32 SiLU `silu(g)*u` (`W:crates/hipfire-isa/src/kernels/iu4_v2b.rs:753-758`). No Flash BF16 path |
+| gate_up (64) | 8192×34816 (two 17408 halves)×5120, 38.547 | `:7428-7456,9658-9686`; `gemm.rs:33869-34000` | n=7168 total = G[0,3584) + U[0,3584) | NPU emits **separate f32 pre-SiLU g and u**. The GPU applies the unchanged f32 SiLU `silu(g)*u` (`W:crates/peacemaker-isa/src/kernels/iu4_v2b.rs:753-758`). No Flash BF16 path |
 | down (64) | 8192×5120×17408, 18.939 | `:7829-7836,10049-10056`; `gemm.rs:35772-35781` | n=1024 | NPU delta f32. The GPU does `RN(old + delta)` **once** into `x_batch` |
 
 (All numbers are the measured Halo trace of `D27` §1 except the windows, which are the ESTIMATE optimum of §4.)
@@ -45,7 +49,7 @@ NPU owns **whole output features** (weight rows), statically per GEMM, as a lead
 - The current A4/V2B fast path is eager-only (`W:gemm.rs:20523-20535`), not graph-capturable. Graph/replay stays unchanged for the current route; **the windowed entry must explicitly admit capture/replay**, keyed by the split map.
 
 **V8 K and N slicing (existing NPU kernel, pre-IEF).**
-- V8 `MAX_KC=160` chunks of 64 (K ≤ 10240; `crates/pm-npu/src/kernels/gemm_array.rs:313-314,614-615`). Down K=17408 is therefore **two K segments of 8704 (136 chunks each)** that **preserve the same int64 state**. Per-segment f32 rounding is forbidden (`FC` §3: sum integer states before rounding). The state spills to DDR between the two commands (**ESTIMATE** 16 B per output in H, §4).
+- V8 `MAX_KC=160` chunks of 64 (K ≤ 10240; `crates/peacemaker-npu/src/kernels/gemm_array.rs:313-314,614-615`). Down K=17408 is therefore **two K segments of 8704 (136 chunks each)** that **preserve the same int64 state**. Per-segment f32 rounding is forbidden (`FC` §3: sum integer states before rounding). The state spills to DDR between the two commands (**ESTIMATE** 16 B per output in H, §4).
 - With 8192 tokens, V8 waves = 16·ceil(n/512) ≤ 256 (`gemm_array.rs:313,616-618`, `design_v8` `:1865`) ⇒ **n ≤ 8192 features per command**; larger windows slice N (`j = ceil(n/8192)`).
 - The new TM64/TN32 IEF array has **no measured rate or wave geometry**. If its wave is inferred as 256×256, the 256-wave cap gives max 2048 columns per command. That is a sensitivity (§4), not an existing API.
 - New-core memory (`FC` §8 M0): TM64/TN32 = 36 KiB live + 25.5 KiB S/D at E136 + 192 B a/b = **61.6875 KiB** (rounded 61.7 KiB). The frozen metadata offsets are `0x9000..0xf600`, a/b `0xf600..0xf6c0`; layout/locks/routes remain a proof gate, not measured capacity credit.
@@ -58,7 +62,7 @@ Transport (**MEASURED**): anonymous host pages, pinned by amdxdna as a **userptr
 
 | Buffer | Writer → reader | Layout | Lifetime / memory type | Ownership rule |
 |---|---|---|---|---|
-| MQ4 weights (QT44) and A4 `xq` (`block_i4_128`, 72 B) | load / GPU producer → GPU, packers | `[K/128][token]` token-fastest (`W:scratch.rs:669-686`) | model / per-layer; device memory | **Immutable** under IEF15; same-agent ordering. Stale-handle check `W:dispatch.rs:3670-3678` |
+| MQ4 weights (QT44) and A4 `xq` (`block_i4_128`, 72 B) | load / GPU producer → GPU, packers | `[K/128][token]` token-fastest (`W:scratch.rs:669-686`) | model / per-layer; device memory | **Immutable** under IEF15; same-device ordering. Stale-handle check `W:dispatch.rs:3670-3678` |
 | Weight sidecars `S` (u16 `[local_feature][K/128]`), `a` (i16 `[local_feature]`) | CPU load → NPU B packer / NPU | `FC` §3 ABI | model lifetime; written once before use | Only NPU-owned weight windows. Immutable; no GPU current-fold consumer |
 | Activation sidecars `D` (u16 `[K/128][token]`), `b` (i16 `[token]`) | GPU metadata pass → NPU packer / NPU | `FC` §3 | per layer/projection | Generated **after every A4 write** for admitted NPU work; GPU current-fold entry reads original Xq, not D/b |
 | Packed NPU B (int8-expanded window of weights) | CPU → NPU | NPU-packed | model lifetime; NPU BO | ESTIMATE **4,982,833,152 B** across layers at the fast cuts (Σ n·K·calls, int8). Immutable |
@@ -136,7 +140,7 @@ The 3.13 µs is a round trip, not 3 µs each way. The model charges **6 µs per 
 
 **Excluded rates.** The lean-TXN expert rates (30.18 / 32.88 TOPS, `report.md:780-781`) were measured at M=4096 expert shapes, not dense K. The G80 28.75 TOPS has N=1280 only. Neither is imported. The 50 µs prologue replaces the old 215 µs only as a conservative extra bound (V8P is already an elapsed rate, so adding a prologue is deliberate pessimism, not a measured pure-compute figure).
 
-**Mixed-contract payoff (ESTIMATE, FoldContract model).** `/home/kaden/qcal/npu-agents/fold/tools/fold-model/payoff.json` (md5 f844e93bee923c9b32d7a5d8f19f4ebd), contract mode `mixed-current-gpu-ief15-npu` (GPU fold ratio 1.0: incumbent GPU fold unchanged), Halo baseline 6810.69 ms:
+**Mixed-contract payoff (ESTIMATE, FoldContract model).** `tools/npu/fold-model/payoff.json` (md5 f844e93bee923c9b32d7a5d8f19f4ebd), contract mode `mixed-current-gpu-ief15-npu` (GPU fold ratio 1.0: incumbent GPU fold unchanged), Halo baseline 6810.69 ms:
 
 | assumed NPU raw TOPS | NPU traffic 2.44 B/kop (V8): gain, NPU ops share | 3.05 B/kop (25% retile): gain, share |
 |---:|---|---|
@@ -197,7 +201,7 @@ Savings are additive in the full step (remainder is common).
 | α=1.0 (no contention) | 6301.277 | 6165.247 | +8.08% / +10.47% |
 | α=1.059 | 6496.768 | 6375.760 | +4.83% / +6.82% |
 | α=1.101 | 6604.895 | 6498.250 | +3.12% / +4.81% |
-| α=1.113 (main) | 6628.341 | 6533.247 | +2.75% / +4.25% |
+| α=1.113 (primary) | 6628.341 | 6533.247 | +2.75% / +4.25% |
 | γ=1.03 on all GEMMs | 6708.532 | 6619.903 | +1.52% / +2.88% |
 | prologue 215 µs | 6651.418 | 6543.726 | +2.39% / +4.08% |
 | replicated V8 A (int8 A repeated per 512-feature N wave: `gemm_array.rs:675-699`) | 6795.134 | 6768.103 | +0.229% / +0.629% |
@@ -205,7 +209,7 @@ Savings are additive in the full step (remainder is common).
 
 The replicated-A rows replace `pack` with `(M·K·72/128 + M·K·ceil(n/512))/200e9`. The 256×256 row uses `ceil(n/256)` replication and `j = ceil(n/2048)`. Current V8 packing repeats A for every N wave (`gemm_array.rs:675-699`); the compact-A model assumes the new IEF array can reuse one A stream, which is unmeasured. The +4.2% fast result therefore **depends on a packing design that does not exist yet**.
 
-**Halo +10% / +15% answer.** No promise. The only row above +10% tok/s is the no-contention optimistic case (α=1, fast cuts): +10.47% tok/s, which is **9.48% time**. That α is contradicted by the drift-flagged measurement (α 1.059–1.113). No row reaches +15% in tok/s or in time. Throughput gain and time reduction are not interchangeable: +10.47% tok/s ≙ −9.48% time. Main's plan: Halo ≥10% is killed as a promised result (`FC` §1).
+**Halo +10% / +15% answer.** No promise. The only row above +10% tok/s is the no-contention optimistic case (α=1, fast cuts): +10.47% tok/s, which is **9.48% time**. That α is contradicted by the drift-flagged measurement (α 1.059–1.113). No row reaches +15% in tok/s or in time. Throughput gain and time reduction are not interchangeable: +10.47% tok/s ≙ −9.48% time. The plan: Halo ≥10% is killed as a promised result (`FC` §1).
 
 **gfx1152 / Krackan (conditional ESTIMATE, not a port proof).** Public spec: AMD's [Ryzen AI 7 350](https://www.amd.com/en/products/processors/laptop/ryzen/ai-300-series/amd-ryzen-ai-7-350.html) lists Radeon 860M **8 CUs, up to 3.0 GHz, two memory channels, LPDDR5x-8000 / DDR5-5600, 50 NPU TOPS and 66 overall TOPS**. Two 64-bit channels imply theoretical **128 / 89.6 GB/s**, not sustained bandwidth. [RDNA3 WMMA](https://gpuopen.com/learn/wmma_on_rdna3/) gives 1024 IU4 ops/CU/clock: peak 24.576 TOPS, assumed 70% efficiency ≈17.2 useful TOPS. The assumed .225 throughput ratio versus Halo scales GPU g by s=4.444444 (`FC` §7); γ remains the current-strided cost ratio. NPU rate/β/α transfer from Halo, and the remainder scales r=2 (bandwidth) or 4.444 (compute).
 
@@ -214,7 +218,7 @@ The replicated-A rows replace `pack` with `(M·K·72/128 + M·K·ceil(n/512))/20
 | 2 | 26546.155 (308.6) | 16297.805 / 15565.421 | 502.644 / 526.295 | 62.882% / 70.546% | 38.606% / 41.365% |
 | 4.444 | 30269.733 (270.6) | 20021.384 / 19288.999 | 409.163 / 424.698 | 51.187% / 56.927% | 33.857% / 36.276% |
 
-`FC` §7's **mixed** model reaches +48.91–72.06% gfx1152 tok/s under its 256-row cuts, .215 ms submit and 55 GB/s cap. Its separate **full-IEF15** sensitivity transfers the killed Halo 1.57× GPU cost and yields +29.29–48.58%; that is not a gfx1152 measurement or a revived route. gfx1152 is **excluded from the relevant IU4 prefill/A4/V2B admissions** (`W:feature_flags.rs:1023-1026,1097-1100`, `W:gemm.rs:20535-20551,31544-31567`, `W:iu4_v2b.rs:78-82`); explicit admission and a bundle are required. Retile traffic, shared power and memory capacity (27B plus ~5 GB NPU B) can erase the gain. Marketing TOPS and Halo data do not promote gfx1152.
+`FC` §7's **mixed** model reaches +48.91–72.06% gfx1152 tok/s under its 256-row cuts, .215 ms submit and 55 GB/s cap. Its separate **full-IEF15** sensitivity transfers the killed Halo 1.57× GPU cost and yields +29.29–48.58%; that is not a gfx1152 measurement or a revived route. gfx1152 is **excluded from the relevant IU4 prefill/A4/V2B admissions** (`W:feature_flags.rs:1023-1026,1097-1100`, `W:gemm.rs:20535-20551,31544-31567`, `W:iu4_v2b.rs:78-82`); explicit admission and a bundle are required. Retile traffic, shared power and memory capacity (27B plus ~5 GB NPU B) can erase the gain. Vendor-rated TOPS and Halo data do not promote gfx1152.
 
 ## 5. Gates and kill points, in order
 

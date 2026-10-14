@@ -78,7 +78,7 @@ COPY --from=builder /hipfire/kernels/compiled /opt/hipfire/bin/kernels/compiled
 COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
-    HIPFIRE_DIR=/root/.hipfire
+    HIPFIRE_HOME=/root/.hipfire
 
 # Models and the JIT kernel cache persist across runs via named volumes.
 VOLUME ["/root/.hipfire/models", "/var/cache/hipfire"]
@@ -99,7 +99,7 @@ RUN pip install --no-cache-dir --break-system-packages pytest numpy
 COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/hipfire/target/release/daemon \
-    HIPFIRE_DIR=/root/.hipfire \
+    HIPFIRE_HOME=/root/.hipfire \
     MODELS_DIR=/root/.hipfire/models
 
 WORKDIR /hipfire
@@ -107,6 +107,6 @@ WORKDIR /hipfire
 # (scripts/coherence-gate.sh) is retired AND absent from the checkout, so it
 # execed as "no such file" (127). Fail closed with guidance instead; pick a
 # route from docs/VALIDATION.md and pass it explicitly, e.g.
-#   podman run ... hipfire-gate scripts/serve-multiturn-gate.sh
-ENTRYPOINT ["/bin/bash"]
-CMD ["-c", "echo '[hipfire-gate] no gate command given.' >&2; echo 'There is no universal gate. Select a validation route from docs/VALIDATION.md and pass it explicitly, e.g.:' >&2; echo '  scripts/serve_harness.py battery --model <model>' >&2; echo '  scripts/redline_daemon_harness.py   # kernel/dispatch/graph/Redline changes' >&2; exit 2"]
+#   podman run ... hipfire-gate python3 scripts/serve_harness.py battery --model <model>
+ENTRYPOINT []
+CMD ["/bin/bash", "-c", "echo '[hipfire-gate] no gate command given.' >&2; echo 'There is no universal gate. Select a validation route from docs/VALIDATION.md and pass it explicitly, e.g.:' >&2; echo '  python3 scripts/serve_harness.py battery --model <model>' >&2; echo '  python3 scripts/redline_daemon_harness.py   # kernel/dispatch/graph/Redline changes' >&2; exit 2"]

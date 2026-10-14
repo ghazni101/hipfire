@@ -1,9 +1,22 @@
 # G80 implementation and small-M expert-wave feasibility
 
+> **Lifecycle: historical paper/simulator feasibility record (2026-10-02/03); not a current
+> admission.** The G80 int8 and (simulator-only) int32 epilogues here are lab designs. The
+> int32-partials contract with a GPU fold was dropped: the 0.4.2 Flash-Next gfx1151 NPU trunk
+> uses the G80 direct BF16 program (`Epilogue::Bf16`, input projections only, calibration
+> schema 4, BF16-direct only, no I32 contract; out-projection program exists but is not
+> wired). See [`npu-trunk.md`](npu-trunk.md) for the current route and schema. All ticks,
+> TOPS and byte figures below are dated simulator or paper-model values (or estimates
+> explicitly labelled as such), not current performance. `report.md:N`, `J:N` and `F:N`
+> citations are line pointers into the NPU workspace's copies at the time of writing and
+> are not stable against this repository; treat them as section pointers.
+
 G80 is an explicit opt-in Rust-emitted int8 GEMM for XDNA2: `gemm_g80::design_g80(m,n,k,epi,ctl)` and
 `npu-gemm --variant G80`. It uses 32 cores, 128x80 core tiles and a 256x1280 array wave. N must equal 1280;
 K must be a positive multiple of 64 no greater than 2560; positive M is padded to 256-row waves (at most 256 waves).
-Only the int8 floor/shift/saturate epilogue is supported, with shift 0..31 and fixed core layout 0.
+The default epilogue is the int8 floor/shift/saturate SRS (shift 0..31); an opt-in simulator-only int32 epilogue
+(`Epilogue::I32`, `npu-gemm --variant G80 --epi i32`, no `--shift`) is described in "I32 epilogue (simulator-only)".
+Both use the fixed core layout 0.
 Fast, slow control, serial, nocompute and repeat probes use the existing pair-lock protocol.
 Nocompute/repeat are timing probes, not ordinary GEMM results.
 
@@ -16,13 +29,13 @@ its one-wave expert interface accepts M 1..256. Default `--design V9` behavior i
 
 No hardware was accessed. Functional simulator ticks below are not silicon cycles or performance measurements.
 The retained paper analysis uses source arithmetic and offline Rust/Bun experiments, including the standalone
-emitter in `/home/kaden/qcal/npu-agents/levers-paper/emitter/cand.rs` and its captured `out_full.txt`.
+emitter (`cand.rs`) and its captured `out_full.txt`, both workspace-local and not in this repository.
 The +3.5% normalized bank-model regression remains a risk, not a veto; the measured-baseline extrapolation still
 fails the 50-TOPS budget (§7). Smaller TM32/TM64 waves remain paper-only candidates, not implemented replacements.
 
-Source abbreviations: **C** = `crates/pm-npu/src/kernels/gemm_core.rs`; **G** = `crates/pm-npu/src/kernels/gemm_array.rs`;
-**D** = `crates/pm-npu/src/dma.rs`; **R** = `crates/pm-npu/src/route.rs`; **J** =
-`/home/kaden/qcal/npu/docs/levers-joint.md`; **F** = `/home/kaden/qcal/npu/docs/levers-fable.md`.
+Source abbreviations: **C** = `crates/peacemaker-npu/src/kernels/gemm_core.rs`; **G** = `crates/peacemaker-npu/src/kernels/gemm_array.rs`;
+**D** = `crates/peacemaker-npu/src/dma.rs`; **R** = `crates/peacemaker-npu/src/route.rs`; **J** =
+`docs/npu/levers-joint.md`; **F** = `docs/npu/levers-fable.md`.
 All byte counts use signed int8 inputs and int8 SRS output, not the GPU's int4 storage or BF16 epilogue.
 MiB/KiB mean powers of two. Geometry comes from J:121-145 and F:58-63, and expert dimensions from `report.md:79-80`.
 
@@ -82,7 +95,7 @@ The nonworse shared bound is `748*1280/1024 = 935`; even the minimum has `968/93
 normalized model pressure. A separate exhaustive full-map 1-KiB-grid search covered 55440 placements and found
 no nonworse map. Single-PADDS C-skip sensitivity also had minimum 968.
 These are **model reservation counts, not elapsed cycles**. The minimum is not claimed over different schedules
-or noncontiguous C layouts. The revised parent decision supersedes F:63's strict model veto: lever 2 removed
+or noncontiguous C layouts. The revised project decision supersedes F:63's strict model veto: lever 2 removed
 1024 peer-A collisions and 512 split-port slots yet the measured V9 slope went 1323→1345
 (`report.md:514-532`). No model slot is credited as a cycle saving or added as a measured stall.
 Evidence: `levers-paper/g80_bank_model_all.txt:1-124,155-175` and `g80_bank_model_skip1_min.txt:74-95`.
@@ -168,7 +181,7 @@ Each B MM2S queues 2 tasks, B S2MM 1 task, within the four-task queue; repeat 40
 An abstract asymmetric-consumer readiness model exercised kc=1/2/40, waves=1/2/3/16 and three seeds
 (36 cases): no read of an unfilled chunk, no premature immutable replay, final ready credits zero.
 This is **not** a full DMA simulator gate. The specific two-BD finite-chain repeat/iteration interaction
-and context reuse must still be exercised in `pm-npu-sim` before any real design is accepted.
+and context reuse must still be exercised in `peacemaker-npu-sim` before any real design is accepted.
 
 Shim contracts at gate_up: B MM2S0 in each of 8 columns reads 409600 B; A MM2S1 in columns 0..3 reads
 `16*40*4096 = 2621440` B each, and is absent in columns 4..7. Each C S2MM0/1 reads two row tiles per wave:
@@ -266,7 +279,7 @@ Per-section sizes of the tight TN80 program (bytes; from emitter program counter
 Static-loop proof (what makes the 355-bundle chunk legal), all asserted/executed in the candidate:
 
 * The 1315-cycle schedule is 160-periodic: for every start `s` in `37..=159` the 7 windows `[s+160i, s+160(i+1))`, i=0..6, are
-  byte-identical (both overwrite and accumulate wavefronts). `s=37` is the earliest (matches the parent's "periodic from
+  byte-identical (both overwrite and accumulate wavefronts). `s=37` is the earliest (matches the assignment's "periodic from
   cycle 37"), giving prefix 37 + 7·160 + suffix 158. **8 windows is impossible** (no `s` has 8 equal windows): the last window
   would lack the next period's prologue loads (up to 12 cycles early) and 37 + 8·160 = 1317 > 1315.
 * Peel contents (cycles `[0,37)`) are the prologue loads and the missing "period −1" spill (C-skip `PADDS` of the previous
@@ -335,7 +348,7 @@ Interpreter validated on the baseline: reproduces `PAIR_CHUNK_CYCLES[0] = [1131,
 | issue cycles per output element (kc=40) | 5.570 | 5.469 | −1.8 % |
 
 So per-chunk fixed control is unchanged (1387−1315 = 72 ping, 64 pong, same as baseline), and the issue-bound gain over the
-baseline is only ≈1.8 % per output element (control amortisation). Parent budget: measured stall-inflated compute slope
+baseline is only ≈1.8 % per output element (control amortisation). Assigned budget: measured stall-inflated compute slope
 1323–1337 cycles/chunk scaled x1.25 → **1654–1671 cycles/chunk**; this document does not claim that the cycle gate passes —
 it only shows the size gate is not the binding one. Not modelled: DMA, bank arbitration (gate-1 +3.5 % risk), phase drift.
 One TN80-specific serialisation to include in the cycle budget (model estimate from the `gemm_core.rs:66` 4 B/cycle/channel
@@ -362,9 +375,9 @@ per wave, ≈4.6 % of the 55 640 kc=40 chunk issue cycles), whereas the baseline
 * Silicon behaviour (no hardware).
 * DMA channel execution, same-context reset and numeric whole-array correctness remain untested.
 * Gate 7 below evaluates the cycle budget; the size/rules proof alone does not authorize Phase 2.
-* Source citations used: `crates/pm-npu/src/kernels/gemm_core.rs` — Assembler `242-333`, `wavefront 413-471`, `chunk 483-517`,
+* Source citations used: `crates/peacemaker-npu/src/kernels/gemm_core.rs` — Assembler `242-333`, `wavefront 413-471`, `chunk 483-517`,
   `epilogue_wavefront/epilogue 801-847`, `program_pair 855-896`, `PAIR_CHUNK_CYCLES 702`, `PAIR_EPILOGUE_CYCLES 705`,
-  `MODIFIERS 397`; `crates/pm-npu/src/isa.rs:224-234` (`Program::try_finish/finish`); `crates/pm-npu/src/isa/rules.rs` (rules table,
+  `MODIFIERS 397`; `crates/peacemaker-npu/src/isa.rs:224-234` (`Program::try_finish/finish`); `crates/peacemaker-npu/src/isa/rules.rs` (rules table,
   `check`); `report.md:514-535,614-616` (lever 2 stall attribution).
 
 ## Gate 6 — two-stream prefix startup: paper passes; latency is estimated
@@ -394,7 +407,7 @@ The measured repeat-slope range is **1323–1337 cycles per 1024 VMACs**
 (`report.md:527-528,542-543,613-616`). Scaling by `1280/1024 = 1.25` gives
 **1653.75–1671.25 cycles for the larger compute region**, already over budget by
 143.80–161.30 cycles even with zero epilogue, drain or startup cost.
-This scaling is the parent-requested **estimate**, not a measured G80 timing law.
+This scaling is the requested **estimate**, not a measured G80 timing law.
 
 The slope is a repeated compute-region measurement, not the full DMA/control loop.
 Existing later compute issue is 1067 cycles (C:11-13), while the mean whole-chunk issue is
@@ -432,7 +445,7 @@ capacity/ISA feasibility is not killed, and no silicon verdict is made.
 
 ## Shipped-shape applicability, utilisation and bytes/op
 
-Shapes and row distribution are now required by `report.md:571-574` / Main's routed-row-spread directive.
+Shapes and row distribution are now required by the 2026-10-02 23:44 UTC shipped-shape entry of `report.md` (routed-row-spread directive).
 Expert gate_up is N1280/K2560, down N2560/K640 (`report.md:79-80`).
 The average row count is `8192*10/512 = 160` (J:242 and `report.md:573`).
 The following arithmetic must not be read as an implemented constructor.
@@ -458,7 +471,7 @@ the gate_up-only design and have no schedule/cycle acceptance. V9 GU additionall
 `1280/1536 = 83.333%`; multiply this by its row utilisation to obtain actual arithmetic utilisation.
 For example, M160 V9's total is 26.042%, versus G80's 62.5%; those are MAC ceilings, not throughput.
 
-Dense dimensions are `/home/kaden/qcal/release-0.4.1/iu4-roofline/tops.md:26-32`;
+Dense dimensions are the Halo roofline trace `tops.md:26-32` (also tabulated in `dense27b.md` §1);
 M8192 is the widened one-chunk acceptance in `report.md:574`.
 The requested z+β+α N6400 is retained below: the cited GPU source row is N6240, so 6400 is the requested
 test/padded width, not a claim that the source kernel's logical width changed.
@@ -482,7 +495,7 @@ would need a new proof. None is silently substituted here. Full-model GPU epilog
 
 ## Additional paper gate — 64-/128-row waves for small routed experts
 
-The parent/Main addition asks whether reducing the 512-row expert floor is more useful than G80 at M4096.
+The follow-up addition asks whether reducing the 512-row expert floor is more useful than G80 at M4096.
 Evaluate 32 cores with the same `(c,r)→(r/2,2c+r%2)` mapping but TM32 or TM64, TN80.
 Wave rows are `2*TM = 64/128`; N width remains1280. GU K2560 still needs 40 chunks.
 This is **not** obtained by giving the existing TM128 program fewer `tiles`: its 32-group wavefront,
@@ -579,11 +592,11 @@ This is a priority judgment, not a proof that TM32 cannot ever win at M64 or at 
 (G:43-56,87-96). Its read-only necessary time is **141.96µs**, write14.51µs;
 scaled compute with3 epilogues is89.1–90.0µs, so compute alone is not its expert-time estimate.
 Observed V9 M512 was361.9µs/submit (`report.md:585`); subtracting the approximate old215µs intercept
-gives146.9µs, consistent with that read floor. The parent's rough110µs floor would read A once,
+gives146.9µs, consistent with that read floor. The assignment's rough110µs floor would read A once,
 but V9 reads it three times; it is not the V9 byte contract.
 
 For E experts sharing a lean launch, add **(40..70)/E µs per expert** to both candidates and V9.
-The40–70µs interval is the parent's new planning input, **not measured here**, and grouping does not erase B DDR traffic.
+The40–70µs interval is the assignment's new planning input, **not measured here**, and grouping does not erase B DDR traffic.
 At E4 this is10–17.5µs: the TM64/M160 pipeline estimate becomes106.5–114.0µs versus approximately
 156.9–164.4µs for grouped V9 using its measured-array146.9µs estimate.
 These are scheduling estimates, not benchmark improvements; a fixed group E4 is an example, not the launch ABI.
@@ -651,6 +664,69 @@ more material. No new numeric GEMM, ABI, grouped-expert refill protocol or small
 In particular, overlapping the next expert's B fill with old expert replays would require independent
 retirement/EMPTY proofs; grouping a launch by itself does not authorize overwriting the400-KiB resident segment.
 
+## I32 epilogue (simulator-only; historical, superseded by the BF16-direct trunk)
+
+> The int32-C / GPU-fold trunk contract this section was a candidate for was dropped
+> before 0.4.2 (calibration schema 4 is BF16-direct only). `Epilogue::I32` remains in
+> the emitter as a lab epilogue only. The "accepted design", gate and B/kop figures
+> below are historical model values, not a product contract or an admission.
+
+`gemm_g80::design_g80(m,n,k,Epilogue::I32,ctl)` and `npu-gemm M 1280 K --variant G80 --epi i32` (`--shift` rejected,
+V9/V10 still int8-only) store the exact int32 C instead of SRS int8 tiles. This is a simulator-level design: no
+hardware was accessed and no silicon validation or silicon rate is claimed. The int8 default is unchanged.
+
+Design contract (the emitted source is authoritative where it differs):
+
+- There is no SRS and no `Cout`. The core's C accumulator `[0, 0xa000)` is drained as two 20480 B stripes on BD4 then
+  BD5 then BD4 again. The core acquires `C_FULL` only for the first stripe and returns `C_EMPTY` only for the second.
+- The memtile holds a single slot per row at `0x4000 + r*0x5000`, ending at `0x18000`.
+- Finite producer chains (S2MM per core row, two BDs, stripe 0 then stripe 1) use BD IDs `[0,1]`, `[24,25]`, `[2,3]`,
+  `[26,27]` for rows 0..3 with task `repeat = mw`. Finite drains (MM2S0 rows 0/1, MM2S3 rows 2/3) use BDs `6..9` /
+  `32..35`: row 0 stripe 0 and 1, then row 1 stripe 0 and 1, also `repeat = mw`.
+- Locks are `8 + 2r` empty and `9 + 2r` full (range `8..15`); the bank split is even `< 24`, odd `>= 24`. Memtile BDs
+  10/11 and shim BDs 4/5/6 are untouched. Because the finite C tasks end idle and balanced, a lean TXN needs no int8
+  odd-wave C repair; it requeues the four producers and two drains (`repeat = mw`) on every submit.
+- Host C layout (little-endian int32, 4 B per output): column, then stream (row pair), then wave, then row parity,
+  then tile `(mb, nb)` of 8x8. `ArrayDesign::unpack_out` returns row-major `m*n` and drops M padding; B is read once
+  per submit.
+
+`npu-gemm` compares every element of `unpack_out` with `ArrayDesign::reference` (the plain int32 GEMM for `I32`) exactly
+as for V8.
+
+ESTIMATE (a model, never a measurement; the 4 B/cycle stream rate is an [INFERENCE], and no silicon guarantee is made):
+`gemm_g80::estimate` has no epilogue body and no overlap credit for I32. One 20480 B slot per row serialises every
+stripe hand-off, each phase `P = 20480 / 4 = 5120` cycles, and six serial phases (`30720` cycles per wave) are exposed
+before the core regains `C_EMPTY`, plus one final `5120`-cycle drain phase at the end. The int8 path instead pays the
+`663`-cycle epilogue plus the `2560`-cycle `Cout` drain (`3223` per wave) and overlaps the memtile-to-shim transfer.
+The I32 model is therefore `27497` cycles per wave longer than int8. At K = 2560 that lowers modelled throughput by
+roughly 25-27% versus int8; this cost is not hidden, and the six-phase count is an upper-end estimate of the drain.
+
+Observed simulator functional ticks (Fast control; not silicon cycles, not a performance measurement):
+
+| shape | waves | int8 ticks | I32 ticks | I32 - int8 per wave |
+|---|---:|---:|---:|---:|
+| 64x1280x2560 | 1 | 113393 | 140888 | 27495 |
+| 512x1280x2560 | 2 | 171948 (85974/wave) | 226923 (113461.5/wave) | 27487.5 |
+| 512x1280x64 | 2 | 18685 | 73154 | 27234.5 |
+
+The per-wave deltas (27234.5..27495) agree with the modelled `27497` to within about 1%. K = 2560 fits the I32 design
+with no fallback.
+
+This simple contiguous stripe layout was the accepted design at the time of writing. The then-next hardware
+promotion gate (never exercised; superseded with the I32 contract) was bit-exact output, at most 1.26 B/kop, and at least 20 TOPS in co-run. The earlier kill
+criterion of a drain penalty above 10% is dropped for the bytes-first pipeline.
+
+Declared shim accounting for the single-panel trunk shape M8192 N1280 K2560 (formula from the design's byte counts only;
+not a physical DRAM measurement and not hardware evidence): reads `24248320` B (A `20971520` + B `3276800`, B once per
+submit), writes `41943040` B (I32 C, 4 B per output), useful ops `2*8192*1280*2560 = 53687091200`. That is
+`66191360 / 53687091.2 kop = 1.23291015625` B/kop (about 1.233), the figure the 1.26 B/kop gate above is measured against.
+
+Exercised (CPU simulator only, no hardware): `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo test -p peacemaker-npu --release --test g80
+--test golden_bytes --test lean --test ring -- --nocapture` passed: g80 84 tests (95.56 s), golden_bytes 1 (0.72 s),
+lean 27 (122.04 s), ring 15 (13.99 s). `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo build -p npu-tools --release --bin npu-gemm`
+passed (0.04 s). The all-bin build was blocked by the separately in-flight FP probe's missing module registration,
+not by G80; no all-bin build pass is claimed.
+
 ## Verification and final disposition
 
 The retained Phase1 offline proofs cover bank-model searches, reverse-SRS overlap/floor/saturation, legal routes,
@@ -665,13 +741,14 @@ The image was 441056 B; full/lean TXNs were 49424 B/22576 B. The smoke source an
 Offline CLI smoke exercised G80 M64/M160 groups and the M256 ring group without opening a device:
 E3 gate_up used 76176 B instructions, or 77412 B with the ring (two patch sites), with a 441056 B PDI.
 Per expert, packed A/B/C were 655360 B/3276800 B/327680 B. Default and explicit V9 offline output matched exactly.
-G80 down, M257, invalid design, i32 epilogue, wrong N and `--b-prefix` were rejected with exit 2.
+G80 down, M257, invalid design, wrong N and `--b-prefix` were rejected with exit 2; that smoke predates the I32 epilogue
+(its then-rejected i32 request is superseded by the section "I32 epilogue (simulator-only)").
 
 Compatibility gates passed: golden_bytes 1, levers3 10, lean 27, ring 11 and experts 14 tests.
-`cargo test --release -p pm-npu -- --skip vendor_decode_oracle_roundtrip` passed 105 tests
+`cargo test --release -p peacemaker-npu -- --skip vendor_decode_oracle_roundtrip` passed 105 tests
 (the known missing-LLVM oracle was skipped); `cargo build --release -p npu-gemm` passed.
 
-`cargo test --release -p pm-npu-sim --test g80 -- --nocapture` passed all 51 tests in 44.54 s.
+`cargo test --release -p peacemaker-npu-sim --test g80 -- --nocapture` passed all 51 tests in 44.54 s.
 Every requested shape was CPU-exact with unchanged inputs and exact per-channel shim byte totals.
 The suite also covers padded M200/M513, signed extrema with floor/shift/saturation, three changing seeds at odd/even
 `kc*waves`, full/lean interleaves, forced ring-channel repair, and equal retained state snapshots versus fresh full runs.

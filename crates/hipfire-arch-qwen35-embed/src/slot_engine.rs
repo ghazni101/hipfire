@@ -96,13 +96,25 @@ impl EmbedEngineConfig {
 /// the window off (batch only what is already queued when the engine is free),
 /// which is the right setting for a latency-sensitive single-request
 /// deployment; a large value batches harder at the cost of a fixed delay.
+///
+/// Read through the process snapshot (`developer_var`): the value is captured
+/// at process start like every other `HIPFIRE_*` knob, not consulted live.
+/// The parsing lives in [`parse_batch_window`] so it stays unit-testable —
+/// the snapshot freezes on first read, so a test cannot drive it through the
+/// environment.
 fn batch_window_from_env() -> Duration {
-    match std::env::var("HIPFIRE_EMBED_BATCH_WINDOW_US") {
-        Ok(v) => match v.trim().parse::<u64>() {
+    parse_batch_window(hipfire_config::developer_var("HIPFIRE_EMBED_BATCH_WINDOW_US").ok().as_deref())
+}
+
+/// Parse one `HIPFIRE_EMBED_BATCH_WINDOW_US` value: microseconds, or the
+/// default when unset or unparseable.
+fn parse_batch_window(v: Option<&str>) -> Duration {
+    match v {
+        Some(v) => match v.trim().parse::<u64>() {
             Ok(us) => Duration::from_micros(us),
             Err(_) => BATCH_WINDOW,
         },
-        Err(_) => BATCH_WINDOW,
+        None => BATCH_WINDOW,
     }
 }
 
@@ -303,8 +315,7 @@ fn serve_batch(
             if let Some(d) = req.dims {
                 if d != 0 {
                     errs.push(Some(format!(
-                        "{}: `dims` ({d}) is not supported on this encoder — it is \
-                         multi-vector with a fixed {}-d head",
+                        "{}: `dims` ({d}) is not supported on this encoder — it is                          multi-vector with a fixed {}-d head",
                         req.request_tag, bundle.config.dense_out_features
                     )));
                     continue;
@@ -359,7 +370,7 @@ fn serve_batch(
         .map(|errs| errs.into_iter().map(|e| e.map(Err)).collect())
         .collect();
 
-    let trace = std::env::var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
     if trace {
         eprintln!(
             "[engine] batch: {} cmds -> {} requests -> {} groups {:?} (assemble {:.1} ms)",
@@ -513,6 +524,7 @@ mod tests {
             is_vl: true,
             vl_path: None,
             mtp_k: 0,
+            mtp_mode: hipfire_config::MtpMode::Off,
             kv_mode_raw: String::new(),
             kv_backend: "legacy".into(),
             prefix_cache: false,
@@ -540,7 +552,8 @@ mod tests {
         // truncates each input at the length it was trained at, inside
         // `assemble_input`, so a second cap could only be wrong.
         assert_ne!(cfg.max_batch_rows, 8192);
-        assert!(!cfg.batch_window.is_zero());
+        // `batch_window` is the process snapshot's answer and freezes on
+        // first read; its parsing is covered by the parser test above.
     }
 
     #[test]
@@ -558,13 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn the_batch_window_can_be_turned_off_for_a_latency_sensitive_deployment() {
-        std::env::set_var("HIPFIRE_EMBED_BATCH_WINDOW_US", "0");
-        assert!(batch_window_from_env().is_zero());
-        std::env::set_var("HIPFIRE_EMBED_BATCH_WINDOW_US", "50000");
-        assert_eq!(batch_window_from_env(), Duration::from_micros(50000));
-        std::env::set_var("HIPFIRE_EMBED_BATCH_WINDOW_US", "not-a-number");
-        assert_eq!(batch_window_from_env(), BATCH_WINDOW);
-        std::env::remove_var("HIPFIRE_EMBED_BATCH_WINDOW_US");
+    fn the_batch_window_parses_microseconds_and_falls_back_to_the_default() {
+        // The reader freezes with the process snapshot, so the parser — the
+        // part with behavior — is tested directly.
+        assert!(parse_batch_window(Some("0")).is_zero());
+        assert_eq!(parse_batch_window(Some("50000")), Duration::from_micros(50000));
+        assert_eq!(parse_batch_window(Some(" 2000 ")), Duration::from_micros(2000));
+        assert_eq!(parse_batch_window(Some("not-a-number")), BATCH_WINDOW);
+        assert_eq!(parse_batch_window(None), BATCH_WINDOW);
     }
 }

@@ -10,7 +10,7 @@
 //! * `overlap`: submit A and B back to back, then wait both (concurrent only if the firmware runs both partitions).
 //! Every output is compared with the exact CPU reference.
 use super::*;
-use pm_npu::kernels::gemm_i8::{cpu_reference, design, Design};
+use peacemaker_npu::kernels::gemm_i8::{cpu_reference, design, Design};
 
 struct Side<'d> { ctx: HwCtx<'d>, _pdi: Bo, insts: Bo, inp: Bo, out: Bo, cmd: Bo }
 

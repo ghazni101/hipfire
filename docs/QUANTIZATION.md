@@ -24,22 +24,30 @@ describes the math and wire contracts.
 
 Production defaults for day-to-day use:
 
-| CLI / extension | Wire type | Bits | Bytes / 256 el | When |
-|---|---|---|---|---|
-| `mq4` / `.mq4` | **`MQ4G256V2` (qt 44)** | 4 | 136 (8 hdr dual-fp16 per-128 + 128 data) | Qwen 3.5+ safetensors default; **`--format mq4` → V2** |
-| `mq4v1` / `mq4g256` / `magnum` | `MQ4G256` (qt 13) | 4 | 136 (8 hdr f32 scale+min + 128 data) | Legacy Magnum v1 only — not the `mq4` alias |
-| `mq6` / `.mq6` | `MQ6G256` (qt 15) | 6 | 200 | Qwen 3.5+ higher quality (v1 body) |
-| `mq6v2` … `mq2v2` | V2 family qt 47/48/49/50 | 6…2 | 200/168/104/72 | Dense Magnum V2 ladder bodies — see below |
-| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 136 | Dense GGUF default; Llama-style dense |
-| `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 200 | Dense, higher quality |
-| `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
-| `q8` | `Q8F16` (qt 3) | 8 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
+| CLI / extension | Wire type | Nominal bits | Stored bpw (bytes × 8 ÷ weights) | Bytes / 256 el | When |
+|---|---|---:|---:|---|---|
+| `mq4` / `.mq4` | **`MQ4G256V2` (qt 44)** | 4 | 4.25 | 136 (8 hdr dual-fp16 per-128 + 128 data) | Qwen 3.5+ safetensors default; **`--format mq4` → V2** |
+| `mq4v1` / `mq4g256` / `magnum` | `MQ4G256` (qt 13) | 4 | 4.25 | 136 (8 hdr f32 scale+min + 128 data) | Legacy Magnum v1 only — not the `mq4` alias |
+| `mq6` / `.mq6` | `MQ6G256` (qt 15) | 6 | 6.25 | 200 | Qwen 3.5+ higher quality (v1 body) |
+| `mq6v2` … `mq2v2` | V2 family qt 47/48/49/50 | 6…2 | 6.25 / 5.25 / 3.25 / 2.25 | 200/168/104/72 | Dense Magnum V2 ladder bodies — see below |
+| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 4.25 | 136 | Dense GGUF default (**GGUF weight input deprecated since 0.4.0, removal in 0.5.0**); Llama-style dense |
+| `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
+| `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
+| `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
+
+**Nominal bitwidth is not bpw.** The “bits” column is the payload width only.
+Stored bpw is the exact group arithmetic and includes the per-group header:
+every G256 affine row above spends 8 header bytes per 256 weights (+0.25 bpw
+over nominal), and Q8F16 spends 2 scale bytes per 32 weights (+0.5 bpw). These are
+wire/codec costs only. Whole-model bpw is higher still (embeddings, lm_head and
+role lifts sit above the base width; see [ladder.md](quant-formats/ladder.md)), and
+none of these figures is a performance or quality claim.
 
 Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
 (Q4-grade embedding error compounds). 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
-### Magnum V2 family (qt 44 / 47–50 / 52) and MQ4C (qt 45)
+### Magnum V2 family (qt 44 / 47–50 / 52), MQ4C (qt 45) and MQ4G128V2 (qt 53)
 
 Magnum V2 uses a neutral-size **8 B dual half `fp16 scale + fp16 zero` header
 per 128 weights**, with payload packing unchanged from the matching v1 bit
@@ -50,57 +58,104 @@ zero padding at `[4..8)`, and the 4-bit payload at `+8`. qt=52
 and adds a per-tensor F32[16] `lloyd_levels` sidecar (see
 [mq4-v2.md](quant-formats/mq4-v2.md) Lloyd section).
 
-| `--format` | qt | `DType` | B/group | Product note |
-|---|---:|---|---:|---|
-| `mq4` *(alias)*, `mq4v2` | **44** | `MQ4G256V2` | 136 | Default MQ4 body; dense Qwen3.8 ladder evidence |
-| `mq4c` | **45** | `MQ4CG256` | 136 | v1.5 pad (fp16 header @+0, zero pad +4..8, nibbles @+8) |
-| `mq6v2` | **47** | `MQ6G256V2` | 200 | Dense product candidate (ladder) |
-| `mq5v2` | **48** | `MQ5G256V2` | 168 | Dense product candidate (ladder) |
-| `mq3v2` | **49** | `MQ3G256V2` | 104 | Dense product candidate (ladder) |
-| `mq2v2` | **50** | `MQ2G256V2` | 72 | **Wire + runtime supported; product quality-rejected** |
-| `mq4v2-lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
+| `--format` | qt | `DType` | B/group | Stored bpw | Product note |
+|---|---:|---|---:|---:|---|
+| `mq4` *(alias)*, `mq4v2` | **44** | `MQ4G256V2` | 136 | 4.25 | Default MQ4 body; dense Qwen3.8 ladder evidence |
+| `mq4c` | **45** | `MQ4CG256` | 136 | 4.25 | v1.5 pad (fp16 header @+0, zero pad +4..8, nibbles @+8) |
+| `mq6v2` | **47** | `MQ6G256V2` | 200 | 6.25 | Dense product candidate (ladder) |
+| `mq5v2` | **48** | `MQ5G256V2` | 168 | 5.25 | Dense product candidate (ladder) |
+| `mq3v2` | **49** | `MQ3G256V2` | 104 | 3.25 | Dense product candidate (ladder) |
+| `mq2v2` | **50** | `MQ2G256V2` | 72 | 2.25 | **Wire + runtime supported; product quality-rejected** |
+| `mq4v2-lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` (`QuantType::MQ4G256V2L`) | 136 + `lloyd_levels` | 4.25 + per-tensor 64 B codebook | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
+| *(Qwen4 producer; no thin-CLI `--format`)* | **53** | `MQ4G128V2` | 68 per 128 | 4.25 | Row-local per-128 group (`ceil(K/128)` groups per row, 68 B each: fp16 scale, fp16 zero, 64 B nibbles; final partial group zero-padded before the FWHT). FWHT-128 rotation, sign seeds 43 / 1043. Written by the Flash-Next producer for routed-expert `down_proj` (K = 640, which a 256-wide group cannot tile); never interpret it as qt 44 |
+
+Stored bpw counts the group header only. Qwen4 routed experts therefore store at
+4.25 bpw in both qt 44 (gate/up, `K % 256 == 0`) and qt 53 (down, row-local
+128-wide groups); whole-model bpw is higher.
 
 **Wire implementation ≠ product admission.** MQ2V2 loads, decodes, and passes
-parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).
+parity, but its measured Qwen3.8 ladder KLD is catastrophic (12.44–14.20 on WT2
+and v6sel in the [ladder.md](quant-formats/ladder.md) table; that table owns the KLD
+protocol and unit).
 **Do not call MQ2V2 a shipping product body.** MQ3–MQ6 V2 cells are measured
 candidates on the product ladder, not automatic registry cards. Full contracts:
+[mq4-v2.md](quant-formats/mq4-v2.md), [mq-v2-family.md](quant-formats/mq-v2-family.md),
+[ladder.md](quant-formats/ladder.md).
 
 Qwen3.x MoE runtime support covers routed `MQ4G256V2` and `MQ6G256V2`
 experts for indexed decode, batched decode, grouped prefill, shared experts,
 slots, and expert-parallel execution. Uniform and frozen mixed V1/V2 expert
 tables preserve the exact per-projection dtype tag. This runtime support does
 not relax the quantizer's direct-MoE output gate for non-MQ4 V2 formats.
-
-[mq4-v2.md](quant-formats/mq4-v2.md), [mq-v2-family.md](quant-formats/mq-v2-family.md),
-[ladder.md](quant-formats/ladder.md).
+Qwen4 (Flash-Next) routed experts use a different pairing, qt 44 for gate/up
+and qt 53 for down; see [Shipped XTS artifacts](#shipped-xts-artifacts).
 
 Product names (`mq4`, `mq4-xt`, `mq4 pro`, …) are **bpw-class + role-lift**
 labels owned by the ladder, separate from codec generation (`V2`, `C`) and
 from wire ids. A product row must satisfy measured model bpw ∈ [N, N+1).
 
+### Shipped XTS artifacts
+
+Two MQ4 XTS artifacts are the canonical pinned fixtures. Both are identified by
+file size and SHA-256, never by file name; the pin tables live in
+[AGENTS.md](../AGENTS.md) §5 (“Pinned Hugging Face bench fixture” and “Pinned
+Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
+
+| Artifact | Registry tag | Canonical file | Size (B) | SHA-256 |
+|---|---|---|---:|---|
+| Dense Qwen3.8-27B | `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14987185152 | `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae` |
+| Qwen3.8-Flash-Next (arch 16) | `qwen3.8:flash-next-mq4-xts` (also `qwen3.8:flash-next`, `-mq4`, `-gptq3`) | `qwen3.8-flash-next.mq4-xts` | 125288544792 | `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972` |
+
+- **Dense XTS** is the symmetric MQ4V2 XT body (qt 44) of the H2 checkpoint. The
+  file `qwen3.8-27b.mq4-xt` has exactly the same size, so only the digest tells
+  them apart.
+- **Flash-Next XTS** per its pin: trunk and language head MQ6G256V2 (qt 47), routed
+  experts MQ4G256V2 (qt 44, gate/up) + MQ4G128V2 (qt 53, down), Q8F16 (qt 3)
+  embedding, MTP attention and PLE n-gram rows, with the raw-I64 metadata
+  records tagged qt 54. The old wire file name `qwen3.8-flash-next-gptq3.mq4`
+  is a byte-identical legacy alias of the canonical name; clients normalize the
+  exact repo/size/SHA-256 pin to `qwen3.8-flash-next.mq4-xts`.
+  Its zab trunk tier ships as a separate `<model>.trunk-overlay` sidecar and its
+  PLE rows can be read from `.ple-q4` / `.ple-q8` sidecars (see
+  [QUANTIZE.md](QUANTIZE.md#qwen4-flash-next-streaming-producer)).
+
+**Historical sweep vs current registry.** The `mq4-xt` / `mq4` / `mq4 pro` ladder
+cells in [ladder.md](quant-formats/ladder.md) are the 2026-08 candidate sweep on
+dense Qwen3.8-27B (a measurement grid, not registry cards). The shipped XTS
+files above are the current registry pins; a file in the sweep that happens to
+share a product name or byte size with a pinned file is not comparable unless its
+digest matches. [ladder.md](quant-formats/ladder.md) owns the sweep results and
+the current-quality-methodology note for shipped XTS trunks.
+
 ### Bonsai (ternary / 1-bit)
 
-| Type | qt | Notes |
-|---|---:|---|
-| `TQ2G128` | 40 | PrismML Bonsai ternary — passthrough |
-| `BQ1G128` | 41 | PrismML Bonsai 1-bit — passthrough; won qt=41 adjudication 2026-08-18 |
+| Type | qt | Bytes/group | Stored bpw | Notes |
+|---|---:|---|---:|---|
+| `TQ2G128` | 40 | 34 per 128 | 2.125 | PrismML Bonsai ternary — passthrough; `[fp16 d][32 B 2-bit codes]` |
+| `BQ1G128` | 41 | 18 per 128 | 1.125 | PrismML Bonsai 1-bit — passthrough; `[fp16 d][16 B sign bits]`; won qt=41 adjudication 2026-08-18 |
 
 ### Sub-4-bit and research formats (v1 / Lloyd / FP4)
 
-| Type | qt | Bytes/group | Truth state (INDEX) |
-|---|---|---|---|
-| `MQ3G256` | 17 | 104 | **shipped / ref-pinned** encoder + decode/prefill paths; quality degrades below ~9B (historical local battery — see below) |
-| `MQ2G256` | 18 | 72 | **shipped / ref-pinned** encoder; reserved product use — uniform 4-level codebook collapses; needs `--allow-mq2` / `HIPFIRE_ALLOW_MQ2=1` (research opt-in qualifier) |
-| `MQ2G256Lloyd` | 19 | 72 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq2-lloyd`) — not a product default |
-| `MQ3G256Lloyd` | 20 | 112 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq3-lloyd`) — not a product default |
-| `MQ4G256Lloyd` | 30 | 160 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq4-lloyd`) — qt renumbered 21→30; pre-renumber artifacts must be re-quantized |
-| `MQ5G256` | 31 | 168 | **shipped / ref-pinned** encoder present (5-bit FWHT, 5.25 bpw) |
-| `MQ2G256GL` / `MQ3G256GL` | 38 / 39 | GL SoA | **shipped / ref-pinned** Magnum GL passthrough |
-| `HFP4G32` | 21 | row layout | **shipped / ref-pinned** FP4 family (see hfp4.md) |
-| `MFP4G32` | 24 | same as HFP4 + FWHT flag | **shipped / ref-pinned** drop-in MQ4-class FP4+FWHT |
-| `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` / SoA / `MFP3G32E8` / `MFP2G32E8` | 32–37 | row layouts | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier; MoE cold-tier recipes — not CLI defaults |
-| `PARO4G128` / `PARO4G128T` | 28 / 29 | Paro buffers | **shipped / ref-pinned** load/probe path for ParoQuant imports |
-| `MQ2G256V2` | 50 | 72 | **wire/runtime supported; product quality-rejected** — see V2 family section |
+“Stored bpw” is group bytes × 8 ÷ weights (header included); rows of the FP4/E8
+families add a 16 B row header (128 / K bpw) and `MFP4G32Lloyd` a 32 B per-tensor
+codebook, so their per-weight cost depends on K.
+
+| Type | qt | Bytes/group | Stored bpw | Truth state (INDEX) |
+|---|---|---|---:|---|
+| `MQ3G256` | 17 | 104 | 3.25 | **shipped / ref-pinned** encoder + decode/prefill paths; quality degrades below ~9B (historical local battery — see below) |
+| `MQ2G256` | 18 | 72 | 2.25 | **shipped / ref-pinned** encoder; reserved product use — uniform 4-level codebook collapses; needs `--allow-mq2` / `HIPFIRE_ALLOW_MQ2=1` (research opt-in qualifier) |
+| `MQ2G256Lloyd` | 19 | 72 | 2.25 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq2-lloyd`) — not a product default |
+| `MQ3G256Lloyd` | 20 | 112 | 3.5 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq3-lloyd`) — not a product default |
+| `MQ4G256Lloyd` | 30 | 160 | 5.0 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq4-lloyd`) — qt renumbered 21→30; pre-renumber artifacts must be re-quantized |
+| `MQ5G256` | 31 | 168 | 5.25 | **shipped / ref-pinned** encoder present (5-bit FWHT) |
+| `MQ2G256GL` / `MQ3G256GL` | 38 / 39 | 66 / 98 (GL SoA: indices + fp16 scale) | 2.0625 / 3.0625 | **shipped / ref-pinned** Magnum GL passthrough; one tensor-global codebook, not counted here |
+| `MQ2G256LloydU` | 51 | 72 | 2.25 | passthrough; Maple native-ternary: byte layout of qt 19 but **unrotated** (no FWHT at pack time, so the runtime must not rotate `x` for it) |
+| `HFP4G32` | 21 | 17 per 32 | 4.25 + 128 / K | **shipped / ref-pinned** FP4 family (see hfp4.md) |
+| `MFP4G32` | 24 | 17 per 32 | 4.25 + 128 / K | **shipped / ref-pinned** drop-in MQ4-class FP4+FWHT |
+| `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` / SoA / `MFP3G32E8` / `MFP2G32E8` | 32–37 | 17 / 17 / 17 / 17 / 13 / 9 per 32 | 4.25 / 4.25 / 4.25 / ≈4.25 / 3.25 / 2.25 (each + row overhead) | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier; MoE cold-tier recipes — not CLI defaults. The SoA layout (qt 35) pads its scale block to 16 B per row |
+| `MFP4G32E8G128` | 42 | 17 per 32 | 4.25 + 128 / K | arch-loaded (Qwen4 expert load path): wire layout byte-identical to qt 34, but the encoder rotates in 128-wide segments (sign seeds 43 / 1043) because a 256-wide segment cannot tile K = 640; the rotation width is not in the bytes |
+| `PARO4G128` / `PARO4G128T` | 28 / 29 | Paro buffers | varies | **shipped / ref-pinned** load/probe path for ParoQuant imports |
+| `MQ2G256V2` | 50 | 72 | 2.25 | **wire/runtime supported; product quality-rejected** — see V2 family section |
 
 **Historical quality note (not a live admission):** uniform MQ3/MQ2 local
 battery on **gfx1100** (7900 XTX), **Qwen 3.5 / 3.6**, master ref **`c448d5e`**
@@ -157,14 +212,17 @@ arithmetic; **fp32** mixed-precision paths accumulate rounding drift (typically
 below per-block quantization error, but not bit-exact identity).
 
 **Why it matters:** outliers spread across the group, narrowing dynamic range
-before 4-bit (or lower) quantization. The rotation was calibrated against Qwen
-3.5 / 3.6 (DeltaNet hybrid) weight distributions — MQ4 targeting Q8-class quality
-at Q4 bandwidth on that family is the central product claim.
+before 4-bit (or lower) quantization. The rotation was designed around Qwen
+3.5 / 3.6 (DeltaNet hybrid) weight distributions, which is why MQ is the
+recipe for that family.
 
-On Llama-style dense models the math still cancels, but there is typically **no
-quality lift** over plain HFQ4 — only the extra `rotate_x_mq` cost. Practical
-rule: **MQ for Qwen 3.5+; HFQ for everything else.** CLI defaults match
-(`safetensors` → `mq4`, GGUF → `hf4`).
+On Llama-style dense models the math still cancels, but the rotation adds
+`rotate_x_mq` cost on the activation side. Recipe guidance: **MQ for Qwen
+3.5+; HFQ for other dense families** — treat this as a starting point, not a
+guarantee: whether MQ helps or HFQ suffices is model-specific and needs
+validation per model. CLI defaults follow the guidance (`safetensors` → `mq4`;
+GGUF → `hf4`, GGUF weight input is **deprecated since 0.4.0, removal in
+0.5.0**; see [QUANTIZE.md](QUANTIZE.md)).
 
 ## Header layout (HFQ/MQ G256 affine blocks)
 
@@ -204,9 +262,9 @@ already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
 |---|---|---|---|
 | `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
 | `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 (H24/Hkv4/D256, single GPU, no adaptive/CASK) |
-| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts → better DFlash acceptance |
-| `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Legacy spellings** | Q8_0 | On Qwen they are aliases: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the Givens constructors |
-| `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Legacy**; Qwen `--kv-k` only; degrades DFlash acceptance vs fwht* |
+| `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts |
+| `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Deprecated spellings** (since 0.4.0, removal in 0.5.0; spell `fwhtN` or `q8`) | Q8_0 | On Qwen they are aliases that resolve to the supported FWHT K path: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the legacy Givens constructors (deprecated route, removal in 0.5.0) |
+| `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Deprecated since 0.4.0, removal in 0.5.0** (fwht3 supersedes Givens asym KV); Qwen `--kv-k` only |
 
 **Default resolution** (`load_params` in `crates/hipfire-cli/src/main.rs`,
 then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
@@ -299,20 +357,25 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 39 | MQ3G256GL | Magnum GL 3-bit — passthrough |
 | 40 | TQ2G128 | Bonsai ternary — passthrough |
 | 41 | BQ1G128 | Bonsai 1-bit — passthrough |
-| 44 | MQ4G256V2 | **Default `mq4` body** — dual-fp16 per-128 header, 136 B |
+| 42 | MFP4G32E8G128 | mfp4-E8 with a 128-wide FWHT rotation group — arch-loaded (Qwen4 expert load path); wire layout byte-identical to qt 34 (16 B header + (K/32) × 17 B), 4.25 bpw + 128 / K; split from qt 34 because its 256-wide segments cannot tile K = 640 |
+| 44 | MQ4G256V2 | **Default `mq4` body** — dual-fp16 per-128 header, 136 B (4.25 bpw) |
 | 45 | MQ4CG256 | MQ4 v1.5 pad — 136 B |
 | 47 | MQ6G256V2 | Magnum 6-bit V2 — 200 B |
 | 48 | MQ5G256V2 | Magnum 5-bit V2 — 168 B |
 | 49 | MQ3G256V2 | Magnum 3-bit V2 — 104 B |
 | 50 | MQ2G256V2 | Magnum 2-bit V2 — 72 B; **wire OK, product rejected** |
-| 51 | MQ2G256LloydU | Maple Lloyd-U passthrough (register) |
+| 51 | MQ2G256LloydU | Maple native-ternary: unrotated MQ2-Lloyd, same 72 B layout as qt 19 — passthrough |
 | 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
+| 53 | MQ4G128V2 | Row-local MQ4 V2, per-128 groups of 68 B (4.25 bpw) — passthrough; Qwen4 routed-expert `down_proj` |
+| 54 | QwenI64 | **Reserved in the register; not a quantized weight and no `QuantType` variant.** Raw signed-I64 metadata record (the three PLE hash arrays: multipliers, vocab sizes, prefix offsets) written by the Qwen4 producer |
 
-**Current reserved wire IDs:** 23 and 25–27 only. IDs **22, 29, and 30 were
-reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt **42–43 and 46** are not
-live product rows in the register (43 burned by retired SEL; 46 is hierarchical
-`mq4_k` design-only). Do not invent slots — edit `qt-register.txt` to claim a
-number.
+**Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
+held in the register with disposition `reserved` for the Qwen4 I64 metadata
+record described above; it is not an encoded weight type. IDs **22, 29, and 30
+were reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt 42 and 53 are now live
+rows (above); qt **43 and 46** have no register row (43 is burned by the retired
+SEL codebook, 46 is the design-only hierarchical `mq4_k`). Do not invent slots —
+edit `qt-register.txt` to claim a number.
 
 ### PARO4G128 probe payload
 
@@ -340,11 +403,11 @@ Verify imports with `python3 scripts/astrea.py paro-oracle --source PARO_SAFE_DI
 
 ## Why a custom format
 
-llama.cpp GGUF Q4_K_M is similar on disk size and in-place GEMV cost. hipfire’s
-gains are engineering, not a new algorithm class:
+hipfire stores weights in its own HFQM container with in-place GEMV kernels
+and engineering-level runtime paths rather than a new quantization algorithm class:
 
 1. **Fused projections** — QKV / QKVZA / gate+up fused launches for HFQ4/MQ4
-   (and siblings) cut launch overhead on decode.
+   (and siblings) reduce the number of kernel launches on decode.
 2. **WMMA prefill** — batched GEMM on RDNA3+ WMMA for MQ/HFQ (and MQ3/HFP on
    eligible arches) amortizes dequant across prompt tokens.
 

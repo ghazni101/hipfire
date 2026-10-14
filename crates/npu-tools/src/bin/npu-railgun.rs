@@ -95,11 +95,11 @@
 //!     exits 0 without building a mutated program.
 //!
 //! Output ends with `RESULT: PASS|FAIL`; exit status 0 pass, 1 fail, 2 bad usage/shape.
-use pm_npu::dma::Location;
-use pm_npu::txn::Txn;
-use pm_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
-use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::gemm_i8::ArgKind;
+use peacemaker_npu::dma::Location;
+use peacemaker_npu::txn::Txn;
+use peacemaker_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v9, ArrayDesign, V8_DEFAULT_EPILOGUE};
+use peacemaker_npu::kernels::gemm_core::Control;
+use peacemaker_npu::kernels::gemm_i8::ArgKind;
 use railgun::npu::tape::{verify_fresh, verify_patch, BindingKind, CacheOutcome, ConfigKey, ProgramCache, ProgramSpec, Tape, TapeEntry, Transition};
 use railgun::npu::{encode_start_cu, Bo, Chain, Device, HwCtx, PatchBo, PatchSite, Prepared, ERT_STATE_COMPLETED};
 use std::time::Instant;

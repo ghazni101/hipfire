@@ -72,7 +72,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.2.1
+PIN=v0.4.1
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -80,7 +80,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -95,6 +95,18 @@ The bin directory can be added to `PATH`; reload the shell afterward.
 
 GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
 they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
+
+Other `install.sh` options (`bash install.sh --help` lists them all; the ones
+marked "setup" are forwarded to `hipfire setup`):
+
+| Option | Effect |
+|---|---|
+| `--branch NAME`, `--ref REF`, `--tag TAG`, `--commit SHA` | Source revision; at most one. `HIPFIRE_INSTALL_REF` is a generic `--ref` for automation |
+| `--compile-kernels`, `--kernel-pack-url URL` | Skip or relocate the [prebuilt kernel pack](#prebuilt-kernel-packs) (setup) |
+| `--rocm-root PATH`, `--hipcc PATH`, `--strict-rocm` | Pin the ROCm root, the device compiler, or require the compiler under the selected root (setup) |
+| `--gpu-arch ARCH` | Override the detected GPU architecture (setup) |
+| `--profile auto\|hip\|redline` | Replay profile; `auto` leaves `replay.backend=auto` (setup) |
+| `--yes`, `-y`, `--non-interactive` | Do not prompt, for example for the source channel |
 
 ### Prebuilt kernel packs
 
@@ -137,7 +149,9 @@ restore kernels on a machine without hipcc.
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
 attaches the assets to the release. The default image is
-`docker.io/rocm/dev-ubuntu-26.04:10.1.0-full@sha256:4f5ed1bf6532a4b9920400401b0ad0f706af356dae61e40afefbfd6c8073f0ce`
+`docker.io/rocm/dev-ubuntu-26.04` (image tag `10.1.0-full`, pinned by the digest
+`sha256:4f5ed1bf6532a4b9920400401b0ad0f706af356dae61e40afefbfd6c8073f0ce`; the
+full reference is `<image>:<tag>@<digest>`)
 (ROCm 10.1.0 packages `10.1.0-3`, HIP 7.16.26385, clang 24), so its packs admit
 ROCm [10.1, 11.0). A pack only installs where the local hipcc, if any, is the
 build that compiled it: a host whose hipcc differs (for example ROCm 10.0)
@@ -215,8 +229,8 @@ What differs from native Linux until each piece is certified on WSL hardware:
   KFD topology), so `hardware.devices` is refused; select cards with
   `HIP_VISIBLE_DEVICES`. AMD does not support multi-GPU under WSL.
 - The retained Redline PM4 default falls back to the HIP graph with one
-  `[redline] retained default refused` log line (about 4–6% slower decode on
-  the routes that default to PM4), and an explicit `replay.backend=redline`
+  `[redline] retained default refused` log line (historically measured about
+  4–6% slower decode on the routes that default to PM4), and an explicit `replay.backend=redline`
   is refused. `HIPFIRE_UNSAFE_WSL_REDLINE=1` lifts this; it is **unsafe
   until certified**.
 - The KV cache uses the legacy backend; an explicit `kv_backend=vmm` is
@@ -243,7 +257,7 @@ iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/inst
 For a reviewed, pinned installation:
 
 ```powershell
-$Pin = "v0.2.1"
+$Pin = "v0.4.1"
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/$Pin/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
@@ -251,7 +265,7 @@ notepad "$env:TEMP\hipfire-install.ps1"
 & "$env:TEMP\hipfire-install.ps1" -Ref $Pin
 ```
 
-PowerShell also accepts `-Branch beta`, `-Tag v0.2.1`, and `-Commit <sha>`.
+PowerShell also accepts `-Branch beta`, `-Tag v0.4.1`, and `-Commit <sha>`.
 The native `hipfire update` command remains Linux-only because Windows cannot
 atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
@@ -273,8 +287,9 @@ Native Windows is best-effort: it builds and runs, but it is slower and
 narrower than WSL2 on the same card. Known limits:
 
 - **No Redline PM4.** The Windows HIP SDK ships no ROCr (`libhsa-runtime64`),
-  so decode runs on the HIP graph: about 4–6% slower than the Linux/WSL PM4
-  default (gfx1201 Qwen3.8 27B tg128 at 8K: ≈38.2 instead of 40.3 tok/s).
+  so decode runs on the HIP graph: historically measured about 4–6% slower than the
+  Linux/WSL PM4 default (one gfx1201 Qwen3.8 27B tg128 at 8K measurement,
+  ≈38.2 instead of 40.3 tok/s; not a current baseline).
   An explicit `replay.backend=redline` is refused.
 - **Legacy KV only.** HIP VMM growth is not certified on Windows; automatic
   KV selects legacy and `kv_backend=vmm` is refused.
@@ -347,7 +362,7 @@ and config overrides.
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.2.1
+hipfire update --tag v0.4.1
 hipfire update --commit <sha>
 ```
 
@@ -387,6 +402,8 @@ hipfire stop                   # graceful stop of the tracked daemon
 
 Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
 
+`hipfire serve --ui` also serves the embedded chat UI at `/ui` on the same listener (`--open` launches it in the default browser and implies `--ui`).
+
 > **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
 
 Force a one-shot daemon and skip HTTP:
@@ -411,7 +428,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
 | `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
@@ -424,7 +441,7 @@ hipfire pull qwen3.5:9b-draft
 hipfire config set dflash_mode auto    # or on / per-model
 ```
 
-`auto` uses a pulled draft when present; `on` fails the load without it.
+`auto` uses a pulled draft when present; `on` fails the load without it. Qwen3.8-27B paired tiers already resolve `auto` from the registry, so no `config set` is needed there.
 `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` override the registry sidecar.
 Several tags can share one draft file — `hipfire rm` keeps that sidecar while
 another installed target still declares it (see [CLI.md](CLI.md)).
@@ -435,6 +452,20 @@ Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
 pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
 eviction is deprecated and will be removed in 0.5.0 — off by default, not
 supported, and not a recommended route to long context.
+
+**YaRN context extension (0.4.2, Qwen3.8-Flash-Next only).** The engine can
+apply YaRN RoPE scaling at load through `attention.yarn_factor` (env
+`HIPFIRE_YARN_FACTOR`): unset/`null` keeps the checkpoint's own
+`rope_parameters`, a value above 1 extends the admitted context to
+`factor × original` positions, and `1` disables a checkpoint's YaRN. It is
+static scaling, so it also changes outputs at short context: set it only for
+long-context loads. Other families ignore it.
+
+```bash
+hipfire config qwen3.8:flash-next set attention.yarn_factor 4
+```
+
+Admitted `max_seq` and measured reach: [CONFIG.md](CONFIG.md#attention).
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 
@@ -447,6 +478,26 @@ tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
 regression.
 
+## Flash-Next on 0.4.2 (beta)
+
+These behaviors are on the 0.4.2 line (CHANGELOG "Unreleased (0.4.2)"); the
+latest tagged release is v0.4.1. Install them with `--branch beta` until 0.4.2
+is tagged.
+
+- **Strix Halo NPU trunk (gfx1151).** `fusions.npu_trunk` /
+  `HIPFIRE_QWEN4_NPU_TRUNK` (`off|auto|on|emulate`) defaults to `auto`. Auto
+  arms only with an open XDNA2 NPU and a matching calibration; otherwise it
+  logs one reason and runs GPU-only. Every other architecture resolves auto
+  silently to off. `off` is the kill switch; timings are fixture-bound and live
+  in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
+- **EP2 owner-routed prefill and expert staging (gfx1201, two cards).** With
+  `topology.ep = 2`, `HIPFIRE_EP_OWNER_ROUTED_PREFILL` and
+  `HIPFIRE_EP_EXPERT_STAGE` default on when every admission condition holds;
+  the exact value `0` disables each. EP4 owner-routed prefill is refused at
+  admission (`EP4 owner-routed prefill not yet gated`) and keeps the full-table
+  chunk route; single-card runs are unchanged. Setup and gates:
+  [multi-gpu.md](multi-gpu.md); variable semantics: [env-vars.md](env-vars.md).
+
 ## If something fails
 
 | Symptom | What to try |
@@ -455,7 +506,7 @@ regression.
 | HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
-| Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
+| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present, else only MTP runs) |
 | Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash
@@ -472,6 +523,8 @@ tail -f ~/.hipfire/serve.log
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
+| [multi-gpu.md](multi-gpu.md) | Tensor / expert parallel setup and the Flash-Next EP2 route |
+| [env-vars.md](env-vars.md) | Environment variables (developer/diagnostic levers) |
 | [CONFIG.md](CONFIG.md) | All config keys |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

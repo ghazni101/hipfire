@@ -862,6 +862,60 @@ impl HipRuntime {
         Ok(reg)
     }
 
+    /// System-release events for foreign-device handoff (never timing-only events).
+    pub fn system_event(&self) -> Result<HipEvent, String> {
+        let p = resolve(self.shared.api.lib, ["hipEventCreateWithFlags"], RUNTIME_PREFIX)?;
+        let create: unsafe extern "C" fn(*mut Handle, u32) -> HipStatus = unsafe { core::mem::transmute(p[0]) };
+        let mut handle = core::ptr::null_mut();
+        self.shared.check("hipEventCreateWithFlags", "system release event", unsafe {
+            create(&mut handle, 0x8000_0000 | 2)
+        })?;
+        Ok(HipEvent { shared: Rc::clone(&self.shared), handle })
+    }
+
+    /// Raw-stream counterpart of `record_on`, for streams owned by the hipfire GPU runtime.
+    /// The stream must be live and belong to this GPU.
+    pub unsafe fn record_raw(&self, event: &HipEvent, stream: *mut c_void) -> Result<(), String> {
+        self.owns(&event.shared, "record event")?;
+        self.shared.check("hipEventRecord", "foreign stream event", unsafe {
+            (self.shared.gpu.event_record)(event.handle, stream)
+        })
+    }
+
+    /// Order a foreign producer stream after the last consumer of its arena.
+    pub unsafe fn wait_raw(&self, event: &HipEvent, stream: *mut c_void) -> Result<(), String> {
+        self.owns(&event.shared, "wait event")?;
+        let p = resolve(self.shared.api.lib, ["hipStreamWaitEvent"], RUNTIME_PREFIX)?;
+        let wait: unsafe extern "C" fn(Handle, Handle, u32) -> HipStatus =
+            unsafe { core::mem::transmute(p[0]) };
+        self.shared.check("hipStreamWaitEvent", "foreign stream retire wait", unsafe {
+            wait(stream, event.handle, 0)
+        })
+    }
+
+    /// Resolve only the relay's thread-safe entry points. No Rc-owned HIP object crosses threads.
+    pub(crate) fn relay_api(&self) -> Result<RelayApi, String> {
+        let p = resolve(self.shared.api.lib, ["hipEventQuery", "hipStreamWaitValue32"], RUNTIME_PREFIX)?;
+        Ok(RelayApi {
+            device: self.shared.device,
+            set_device: self.shared.api.set_device,
+            query: unsafe { core::mem::transmute(p[0]) },
+            wait: unsafe { core::mem::transmute(p[1]) },
+        })
+    }
+
+    /// Bounded event completion; unlike hipEventSynchronize this cannot wait forever.
+    pub fn wait_event_timeout(&self, event: &HipEvent, timeout: std::time::Duration) -> Result<(), String> {
+        self.owns(&event.shared, "wait event")?;
+        let api = self.relay_api()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if api.query(event.raw())? { return Ok(()); }
+            if std::time::Instant::now() >= deadline { return Err("HIP event timed out".into()); }
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+    }
+
     /// A resource must come from this runtime, not another `load_for_pci` call.
     fn owns(&self, other: &Rc<Shared>, what: &str) -> Result<(), String> {
         if Rc::ptr_eq(&self.shared, other) {
@@ -1009,6 +1063,10 @@ pub struct HipEvent {
     handle: Handle,
 }
 
+impl HipEvent {
+    pub(crate) fn raw(&self) -> usize { self.handle as usize }
+}
+
 impl Drop for HipEvent {
     fn drop(&mut self) {
         unsafe { (self.shared.gpu.event_destroy)(self.handle) };
@@ -1021,8 +1079,40 @@ pub struct HipStream {
     handle: Handle,
 }
 
+impl HipStream {
+    pub fn raw(&self) -> *mut c_void { self.handle }
+}
+
 impl Drop for HipStream {
     fn drop(&mut self) {
         unsafe { (self.shared.gpu.stream_destroy)(self.handle) };
+    }
+}
+
+/// Function pointers are immutable and the library stays loaded for the process.
+/// The relay selects the original GPU on its own thread before querying events.
+#[derive(Clone, Copy)]
+pub(crate) struct RelayApi {
+    device: i32,
+    set_device: unsafe extern "C" fn(i32) -> HipStatus,
+    query: unsafe extern "C" fn(Handle) -> HipStatus,
+    wait: unsafe extern "C" fn(Handle, Handle, u32, u32, u32) -> HipStatus,
+}
+
+impl RelayApi {
+    pub fn select(&self) -> Result<(), String> {
+        let code = unsafe { (self.set_device)(self.device) };
+        if code == 0 { Ok(()) } else { Err(format!("relay hipSetDevice: status {code}")) }
+    }
+    pub fn query(&self, event: usize) -> Result<bool, String> {
+        match unsafe { (self.query)(event as Handle) } {
+            0 => Ok(true),
+            600 => Ok(false),
+            code => Err(format!("relay hipEventQuery: status {code}")),
+        }
+    }
+    pub unsafe fn wait_value(&self, stream: Handle, ptr: u64, value: u32) -> Result<(), String> {
+        let code = unsafe { (self.wait)(stream, ptr as Handle, value, 0, u32::MAX) };
+        if code == 0 { Ok(()) } else { Err(format!("hipStreamWaitValue32: status {code}")) }
     }
 }

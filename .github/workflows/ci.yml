@@ -91,9 +91,13 @@ jobs:
         # crates' integration tests are GPU-free (GPU ones are #[ignore]).
         run: >-
           cargo test --locked --tests
-          -p hipfire-engine -p hipfire-generate -p hipfire-isa -p peacemaker-lift
+          -p hipfire-engine -p hipfire-generate -p peacemaker-isa -p peacemaker-lift
           -p redline-dispatch -p hipfire-arch-qwen35-vl -p hipfire-detect
           -p hipfire-daemon -p saddle-quant -p hipfire-tui
+      - name: Run builder-kernel CPU emulation test (no GPU)
+        # Moved from peacemaker-isa: compares the builder device-accept kernel
+        # with the rdna-compute host twin on the CPU interpreter.
+        run: cargo test --locked -p rdna-compute --test dflash_accept_emu
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 

@@ -7,6 +7,12 @@
 //!
 //! Usage:
 //!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32]
+//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> --mq4v2 --mq4v2-symmetric
+//!     dflash_convert --input <dir_or_hf_id> --output <file.hfq> --mq3v2 --mq3v2-symmetric
+//!
+//! `--mq4v2-symmetric` / `--mq3v2-symmetric` (each requires its format flag) write the
+//! per-128 symmetric grid (zero = -8*d / -4*d, shared with the main quantizer via
+//! `hipfire_quantize::mq_symmetric`) in the same qt=44 / qt=49 wire format.
 //!
 //! Reads a single-file safetensors dump (the z-lab/Qwen3.5-*-DFlash draft
 //! layout — no shards in practice at 1-4B params) and rewrites the tensors
@@ -207,14 +213,22 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     }
     output
 }
-/// MagnumQuant MQ4G256 v2 (qt=44): per-128 asymmetric, fp16 header, G256 layout.
+/// MagnumQuant MQ4G256 v2 (qt=44): per-128 asymmetric (or, with `symmetric`, the
+/// shared symmetric grid of `hipfire_quantize::mq_symmetric`), fp16 header, G256 layout.
 ///
 /// Lifted from hipfire-quantize/main.rs `quantize_mq4g256v2`. 136 B/group:
 /// `[0..2)` fp16 scale h0, `[2..4)` fp16 zero h0, `[4..6)` fp16 scale h1,
 /// `[6..8)` fp16 zero h1, `[8..136)` packed nibbles (same order as MQ4-G256).
 const MQ4V2_GROUP_BYTES: usize = 136;
 
-fn quantize_mq4g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+fn quantize_mq4g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
     // m,k are the logical 2D shape; encoding is linear over w (API parity with main).
     let _ = (m, k);
     let group_size = 256;
@@ -231,48 +245,56 @@ fn quantize_mq4g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f
         cpu_fwht_256(&mut group, signs1, signs2);
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
-        for h in 0..2 {
-            let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
-            let z_bits = f32_to_f16(lo);
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        let mut q = [0u8; 256];
+        if symmetric {
+            for h in 0..2 {
+                let off = h * 128;
+                let (s, z) = hipfire_quantize::mq_symmetric::quantize_symmetric_half(
+                    &group[off..off + 128],
+                    15,
+                    &mut q[off..off + 128],
+                );
+                scales[h] = s;
+                zeros[h] = z;
+            }
+        } else {
+            let mut sts = [0.0f32; 2];
+            let mut zs = [0.0f32; 2];
+            let mut degenerate = [false; 2];
+            for h in 0..2 {
+                let off = h * 128;
+                let slice = &group[off..off + 128];
+                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+                let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+                let z_bits = f32_to_f16(lo);
+                scales[h] = sc_bits;
+                zeros[h] = z_bits;
+                let st = f16_to_f32(sc_bits);
+                let z = f16_to_f32(z_bits);
+                sts[h] = st;
+                zs[h] = z;
+                degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+            }
+            for h in 0..2 {
+                let off = h * 128;
+                if !degenerate[h] {
+                    let st = sts[h];
+                    let z = zs[h];
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        let v = group[off + i];
+                        q[off + i] = ((v - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
+                    }
+                }
+            }
         }
         let out_off = b * block_bytes;
         output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
         output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
         output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
         output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
-                for i in 0..128 {
-                    q[off + i] = 0;
-                }
-            } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
-                    q[off + i] = qq;
-                }
-            }
-        }
         for i in 0..128 {
             let lo_q = q[2 * i];
             let hi_q = q[2 * i + 1];
@@ -469,7 +491,14 @@ fn quantize_mq5g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f
     output
 }
 
-fn quantize_mq3g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+fn quantize_mq3g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ3G256V2 requires K%256==0");
     assert_eq!(w.len(), m * k);
     let gpr = k / 256;
@@ -483,44 +512,54 @@ fn quantize_mq3g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f
         cpu_fwht_256(&mut group, signs1, signs2);
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
-        for h in 0..2 {
-            let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
-            let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
-            let zb = f32_to_f16(lo);
-            scales[h] = sc;
-            zeros[h] = zb;
-            sts[h] = f16_to_f32(sc);
-            zs[h] = f16_to_f32(zb);
-            degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+        let mut q = [0u8; 256];
+        if symmetric {
+            for h in 0..2 {
+                let off = h * 128;
+                let (s, z) = hipfire_quantize::mq_symmetric::quantize_symmetric_half(
+                    &group[off..off + 128],
+                    7,
+                    &mut q[off..off + 128],
+                );
+                scales[h] = s;
+                zeros[h] = z;
+            }
+        } else {
+            let mut sts = [0.0f32; 2];
+            let mut zs = [0.0f32; 2];
+            let mut degenerate = [false; 2];
+            for h in 0..2 {
+                let off = h * 128;
+                let slice = &group[off..off + 128];
+                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let step = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+                let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
+                let zb = f32_to_f16(lo);
+                scales[h] = sc;
+                zeros[h] = zb;
+                sts[h] = f16_to_f32(sc);
+                zs[h] = f16_to_f32(zb);
+                degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+            }
+            for h in 0..2 {
+                let off = h * 128;
+                if !degenerate[h] {
+                    let st = sts[h];
+                    let z = zs[h];
+                    let inv = 1.0 / st;
+                    for i in 0..128 {
+                        q[off + i] =
+                            ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    }
+                }
+            }
         }
         let out_off = b * block_bytes;
         output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
         output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
         output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
         output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
-                for i in 0..128 {
-                    q[off + i] = 0;
-                }
-            } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
-                }
-            }
-        }
         for chunk in 0..32 {
             let ci = chunk * 8;
             let mut qq = [0u8; 8];
@@ -775,6 +814,21 @@ fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+fn validate_symmetric_flags(
+    use_mq4v2: bool,
+    use_mq3v2: bool,
+    mq4v2_symmetric: bool,
+    mq3v2_symmetric: bool,
+) -> Result<(), &'static str> {
+    if mq4v2_symmetric && !use_mq4v2 {
+        return Err("--mq4v2-symmetric requires --mq4v2");
+    }
+    if mq3v2_symmetric && !use_mq3v2 {
+        return Err("--mq3v2-symmetric requires --mq3v2");
+    }
+    Ok(())
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -790,6 +844,8 @@ fn main() {
     let mut use_mq5v2 = false;
     let mut use_mq3v2 = false;
     let mut use_mq2v2 = false;
+    let mut mq4v2_symmetric = false;
+    let mut mq3v2_symmetric = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -838,9 +894,17 @@ fn main() {
                 use_mq2v2 = true;
                 i += 1;
             }
+            "--mq4v2-symmetric" => {
+                mq4v2_symmetric = true;
+                i += 1;
+            }
+            "--mq3v2-symmetric" => {
+                mq3v2_symmetric = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq4v2 | --mq6 | --mq6v2 | --mq5v2 | --mq3v2 | --mq2v2]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq4v2 [--mq4v2-symmetric] | --mq6 | --mq6v2 | --mq5v2 | --mq3v2 [--mq3v2-symmetric] | --mq2v2]"
                 );
                 std::process::exit(0);
             }
@@ -863,6 +927,13 @@ fn main() {
         eprintln!("--keep-f32, --mq3, --mq4, --mq4v2, --mq6, --mq6v2, --mq5v2, --mq3v2, --mq2v2 are mutually exclusive");
         std::process::exit(1);
     }
+    if let Err(error) =
+        validate_symmetric_flags(use_mq4v2, use_mq3v2, mq4v2_symmetric, mq3v2_symmetric)
+    {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+    let symmetric = mq4v2_symmetric || mq3v2_symmetric;
 
     let input_dir = input_dir.expect("--input required");
     let output_path = output_path.expect("--output required");
@@ -1049,6 +1120,10 @@ fn main() {
     // layer_types / sliding_window stay available so runtime can pick Windowed
     // with last-layer window = W (all-sliding DFlash2).
     if let Some(obj) = dflash_meta.as_object_mut() {
+        if symmetric {
+            // Wire format and draft_dtype are unchanged (affine fp16 header, zero = -mid*scale).
+            obj.insert("draft_symmetric".into(), serde_json::Value::Bool(true));
+        }
         if dflash_cfg
             .as_object()
             .map(|o| !o.is_empty())
@@ -1153,7 +1228,7 @@ fn main() {
         } else if use_mq4v2 && meta.shape.len() == 2 && n_elements >= 256 {
             let m = meta.shape[0];
             let k = meta.shape[1];
-            let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+            let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2, mq4v2_symmetric);
             (QuantType::MQ4G256V2, 256u32, q)
         } else if use_mq6 && n_elements >= 256 {
             let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
@@ -1174,7 +1249,7 @@ fn main() {
         } else if use_mq3v2 && meta.shape.len() == 2 && n_elements >= 256 {
             let m = meta.shape[0];
             let k = meta.shape[1];
-            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2, mq3v2_symmetric);
             (QuantType::MQ3G256V2, 256u32, q)
         } else if use_mq2v2 && meta.shape.len() == 2 && n_elements >= 256 {
             let m = meta.shape[0];
@@ -1220,4 +1295,69 @@ fn main() {
     .expect("write_hfq failed");
 
     eprintln!("  wrote: {}", output_path.display());
+}
+
+#[cfg(test)]
+mod symmetric_tests {
+    use super::*;
+
+    #[test]
+    fn symmetric_flags_require_matching_format() {
+        for (mq4, mq3) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(validate_symmetric_flags(mq4, mq3, false, false), Ok(()));
+            assert_eq!(
+                validate_symmetric_flags(mq4, mq3, true, false),
+                if mq4 { Ok(()) } else { Err("--mq4v2-symmetric requires --mq4v2") },
+            );
+            assert_eq!(
+                validate_symmetric_flags(mq4, mq3, false, true),
+                if mq3 { Ok(()) } else { Err("--mq3v2-symmetric requires --mq3v2") },
+            );
+            assert!(validate_symmetric_flags(mq4, mq3, true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn symmetric_converter_headers_and_codes_match_shared_grid() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        for zero in [true, false] {
+            let weights: Vec<f32> = (0..1024)
+                .map(|i| if zero { 0.0 } else { (i as f32 * 0.017).sin() * 0.42 })
+                .collect();
+            for bits in [4usize, 3] {
+                let blob = if bits == 4 {
+                    quantize_mq4g256v2(&weights, 2, 512, &signs1, &signs2, true)
+                } else {
+                    quantize_mq3g256v2(&weights, 2, 512, &signs1, &signs2, true)
+                };
+                let stride = 8 + 256 * bits / 8;
+                assert_eq!(blob.len(), 4 * stride);
+                for (input, packed) in weights.chunks_exact(256).zip(blob.chunks_exact(stride)) {
+                    let mut rotated = [0.0f32; 256];
+                    rotated.copy_from_slice(input);
+                    cpu_fwht_256(&mut rotated, &signs1, &signs2);
+                    let mut codes = [0u8; 256];
+                    for h in 0..2 {
+                        let off = h * 128;
+                        let (scale, zero) = hipfire_quantize::mq_symmetric::quantize_symmetric_half(
+                            &rotated[off..off + 128],
+                            (1 << bits) - 1,
+                            &mut codes[off..off + 128],
+                        );
+                        assert_eq!(&packed[h * 4..h * 4 + 2], &scale.to_le_bytes());
+                        assert_eq!(&packed[h * 4 + 2..h * 4 + 4], &zero.to_le_bytes());
+                    }
+                    for (i, &expected) in codes.iter().enumerate() {
+                        let mut code = 0;
+                        for b in 0..bits {
+                            let bit = i * bits + b;
+                            code |= ((packed[8 + bit / 8] >> (bit % 8)) & 1) << b;
+                        }
+                        assert_eq!(code, expected, "bits={bits}, index={i}");
+                    }
+                }
+            }
+        }
+    }
 }

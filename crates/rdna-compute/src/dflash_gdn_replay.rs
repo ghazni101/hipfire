@@ -131,9 +131,12 @@ pub struct GdnLayerTableFrom {
     pub ef_src: u64,
 }
 
-/// Byte view of a `#[repr(C)]` table of plain `u64`s for one `memcpy_htod`.
+/// Byte view of a padding-free `#[repr(C)]` table of plain integers for one
+/// `memcpy_htod`: the all-`u64` replay rows above and the lane rows
+/// (`GdnLaneTable` / `GdnLaneTableFrom` in `lane_gdn.rs`: those rows plus two
+/// trailing `u32`, 80 B / 104 B, 8-aligned, no padding bytes).
 pub fn table_bytes<T: Copy>(rows: &[T]) -> &[u8] {
-    // SAFETY: callers pass the repr(C) all-u64 row types above.
+    // SAFETY: callers pass the padding-free repr(C) row types above.
     unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, std::mem::size_of_val(rows)) }
 }
 

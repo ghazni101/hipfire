@@ -831,7 +831,7 @@
       "size_gb": 11.78,
       "min_vram_gb": 13,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ3V2 XT tier. Teacher KLD WT2 0.248 / v6sel 1.412. Smallest admitted V2 cell; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ3V2 XT tier. Teacher KLD WT2 0.248 / v6sel 1.412. Smallest admitted V2 cell; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -839,7 +839,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -849,7 +849,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -878,7 +878,7 @@
       "size_gb": 12.62,
       "min_vram_gb": 14,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ3V2 base tier. Teacher KLD WT2 0.154 / v6sel 1.032. Compact V2 SKU; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ3V2 base tier. Teacher KLD WT2 0.154 / v6sel 1.032. Compact V2 SKU; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -886,7 +886,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -896,7 +896,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -925,7 +925,7 @@
       "size_gb": 13.18,
       "min_vram_gb": 15,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ3V2 Pro tier. Teacher KLD WT2 0.130 / v6sel 0.925. Role-lifted MQ3V2; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ3V2 Pro tier. Teacher KLD WT2 0.130 / v6sel 0.925. Role-lifted MQ3V2; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -933,7 +933,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -943,7 +943,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -972,7 +972,7 @@
       "size_gb": 14.99,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.048 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.048 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -980,7 +980,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -990,7 +990,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -1029,7 +1029,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1039,7 +1039,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -1066,7 +1066,7 @@
       "size_gb": 15.66,
       "min_vram_gb": 17,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 base tier (default). Teacher KLD WT2 0.039 / v6sel 0.545. Quality trunk; native 262K context, xhigh thinking. Pair with qwen3.8:27b-draft (MQ4); same-bit draft alternatives available.",
+      "desc": "Qwen3.8 27B MQ4V2 base tier (default). Teacher KLD WT2 0.039 / v6sel 0.545. Quality trunk; native 262K context, medium default thinking effort (xhigh selectable). Pair with qwen3.8:27b-draft (MQ4); same-bit draft alternatives available.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1074,7 +1074,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1084,7 +1084,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -1113,7 +1113,7 @@
       "size_gb": 16.46,
       "min_vram_gb": 18,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 Pro tier. Teacher KLD WT2 0.032 / v6sel 0.484. Role-lifted MQ4V2; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ4V2 Pro tier. Teacher KLD WT2 0.032 / v6sel 0.484. Role-lifted MQ4V2; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1121,7 +1121,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1131,7 +1131,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "dflash": {
@@ -1160,7 +1160,7 @@
       "size_gb": 18.18,
       "min_vram_gb": 20,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ5V2 XT tier. Teacher KLD WT2 0.015 / v6sel 0.441. Native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ5V2 XT tier. Teacher KLD WT2 0.015 / v6sel 0.441. Native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1168,7 +1168,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1178,7 +1178,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1202,7 +1202,7 @@
       "size_gb": 18.71,
       "min_vram_gb": 20,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ5V2 base tier. Teacher KLD WT2 0.010 / v6sel 0.278. Native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ5V2 base tier. Teacher KLD WT2 0.010 / v6sel 0.278. Native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1210,7 +1210,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1220,7 +1220,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1244,7 +1244,7 @@
       "size_gb": 19.32,
       "min_vram_gb": 21,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ5V2 Pro tier. Teacher KLD WT2 0.009 / v6sel 0.238. Role-lifted MQ5V2; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ5V2 Pro tier. Teacher KLD WT2 0.009 / v6sel 0.238. Role-lifted MQ5V2; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1252,7 +1252,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1262,7 +1262,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1286,7 +1286,7 @@
       "size_gb": 21.39,
       "min_vram_gb": 23,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ6V2 XT tier. Teacher KLD WT2 0.0044 / v6sel 0.221. Native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ6V2 XT tier. Teacher KLD WT2 0.0044 / v6sel 0.221. Native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1294,7 +1294,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1304,7 +1304,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1328,7 +1328,7 @@
       "size_gb": 21.75,
       "min_vram_gb": 23,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ6V2 base tier. Teacher KLD WT2 0.0028 / v6sel 0.153. Highest-quality admitted V2 base; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ6V2 base tier. Teacher KLD WT2 0.0028 / v6sel 0.153. Highest-quality admitted V2 base; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1336,7 +1336,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1346,7 +1346,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1370,7 +1370,7 @@
       "size_gb": 22.17,
       "min_vram_gb": 24,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ6V2 Pro tier. Teacher KLD WT2 0.0022 / v6sel 0.137. Top admitted V2 cell; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ6V2 Pro tier. Teacher KLD WT2 0.0022 / v6sel 0.137. Top admitted V2 cell; native 262K context, medium default thinking effort (xhigh selectable).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1378,7 +1378,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -1388,7 +1388,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         }
       },
       "mtp": {
@@ -1467,6 +1467,22 @@
       },
       "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
       "size_bytes": 125288544792,
+      "arch_id": 16,
+      "quant": "mq4"
+    },
+    "qwen3.8:flash-next-mq4-xts-zab": {
+      "repo": "",
+      "file": "qwen3.8-flash-next.mq4-xts-zab",
+      "size_gb": 125.1,
+      "min_vram_gb": 128,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS ZAB / Qwen4 experimental HFQM (arch 16). LOCAL-ONLY staged artifact, NOT uploaded/pullable; naming lineage hipfire-models/qwen3.8-flash-next. Replaces 108 GDN z/a/b projections with symmetric QT44; non-zab bytes unchanged from the stock MQ4 XTS artifact. Top-level marker qwen4_trunk_iu4_default=gfx1151-zab-v1 enables the artifact-scoped A4 default for gdn.z,gdn.a,gdn.b on exact gfx1151 only. HIPFIRE_QWEN4_TRUNK_IU4=0 disables A4 while keeping QT44 weights; byte-exact rollback requires the stock artifact. Stock artifacts and other GPU architectures retain their existing defaults. Sampling remains stock temperature=1.0/top_p=0.95/top_k=20; no numerical admission claimed.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "sha256": "a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa",
+      "size_bytes": 125144775192,
       "arch_id": 16,
       "quant": "mq4"
     },
@@ -2147,7 +2163,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -2157,7 +2173,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         },
         "coding": {
           "temperature": 0.6,
@@ -2178,7 +2194,7 @@
           "reasoning_effort": "none"
         }
       },
-      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE. Low/medium/xhigh effort steering defaults to medium in hipfire (the official template default, xhigh, remains selectable) and has no implicit think-token cap.",
       "sha256": "f329b497eb8684d889c184a0dcf1388ab6171f99a1c72052d7e2a3bee4f5934b",
       "size_bytes": 19020296510,
       "arch_id": 6,
@@ -2205,7 +2221,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh"
+        "reasoning_effort": "medium"
       },
       "sampling_profiles": {
         "general": {
@@ -2215,7 +2231,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh"
+          "reasoning_effort": "medium"
         },
         "coding": {
           "temperature": 0.6,
@@ -2236,7 +2252,7 @@
           "reasoning_effort": "none"
         }
       },
-      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap.",
+      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to medium in hipfire (the official template default, xhigh, remains selectable) and has no implicit think-token cap.",
       "arch_id": 6,
       "quant": "mq4r"
     },

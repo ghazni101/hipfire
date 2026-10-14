@@ -2,18 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Live cross-check of `hipfire_cpu`'s transcription of the canonical weight
-//! decoder, over the **real** tensors of the on-disk fixtures.
+//! Live cross-check of the host-side weight decoder over the **real** tensors of
+//! the on-disk fixtures.
 //!
-//! `hipfire-cpu` is a dependency leaf (its tests run in the GPU-free gate with
-//! no GPU stack linked) so it cannot call
-//! `hipfire_runtime::weight_backend::dequantize_to_f32` — it reimplements the
-//! byte layouts instead. This test is what holds the two copies together: for
-//! every tensor of every fixture whose `quant_type` maps to a
-//! [`CpuQuant`], `hipfire_cpu::quant::dequant_group` must reproduce the
-//! canonical decoder **bit for bit**. A sign or normalization drift in the FWHT
-//! un-rotation is the "token soup" attractor failure mode, so equality here is
-//! exact, not approximate.
+//! `weight_backend::dequantize_to_f32` now delegates every block-quantized
+//! format to `hipfire_cpu::quant::dequant_group`, so for those formats this test
+//! compares the canonical decoder to itself. Its remaining two-sided value is
+//! the formats `dequantize_to_f32` still decodes locally (qt 1/2/3/14/16). The
+//! independent bit-exact oracle for the delegated formats is `hipfire-cpu`'s own
+//! `EXPECTED_*` table test (`quant.rs`), whose tables were generated from the
+//! canonical decoder before the cutover — keep both green.
 //!
 //! Not part of `scripts/no-gpu-ci.sh`'s curated list (it needs model files), and
 //! it decodes real tensors, so run it optimized:
@@ -43,12 +41,14 @@ use hipfire_runtime::weight_backend::dequantize_weight_to_f32;
 
 /// Registry fixtures, smallest first. The 2B variants are the per-format
 /// fixtures (`mq3` = qt 17, `mq6` = qt 15, `hf6` = qt 8, `mq4` = qt 13).
-const FIXTURES: [&str; 5] = [
+const FIXTURES: [&str; 7] = [
     "qwen3.5-2b.mq4",
     "qwen3.5-2b.mq3",
     "qwen3.5-2b.mq6",
     "qwen3.5-2b.hf6",
     "qwen3.5-9b.mq4",
+    "qwen3.8-27b.mq4",
+    "ornith-1.5-35b-a3b.mq4",
 ];
 
 fn models_dir() -> PathBuf {
@@ -109,7 +109,7 @@ fn dequant_group_matches_the_canonical_decoder_on_real_tensors() {
             };
             let k = elems / m;
             let (ge, gb) = (q.group_elems(), q.group_bytes());
-            let rb = (k / ge) * gb;
+            let rb = hipfire_cpu::gemv::row_bytes(q, k);
 
             let rows = m.min(CHECK_ROWS);
             let mut got = vec![0.0f32; k];
@@ -121,7 +121,15 @@ fn dequant_group_matches_the_canonical_decoder_on_real_tensors() {
 
                 // … versus the transcription, group by group.
                 for g in 0..k / ge {
-                    dequant_group(q, &row_bytes[g * gb..], &mut got[g * ge..(g + 1) * ge]);
+                    if q.row_header_bytes() == 0 {
+                        dequant_group(q, &row_bytes[g * gb..], &mut got[g * ge..(g + 1) * ge]);
+                    } else {
+                        // E8 keeps its row scale once, before all FWHT groups.
+                        let mut group = [0u8; 152];
+                        group[..16].copy_from_slice(&row_bytes[..16]);
+                        group[16..].copy_from_slice(&row_bytes[16 + g * gb..16 + (g + 1) * gb]);
+                        dequant_group(q, &group, &mut got[g * ge..(g + 1) * ge]);
+                    }
                 }
 
                 for (i, (a, b)) in got.iter().zip(&want).enumerate() {

@@ -244,7 +244,7 @@ cached_tokens: 0 → 89 → 192 → 265 → 346
 `hipfire run --spec mtp` on gfx1101 logs:
 
 ```
-MTP head loaded (sidecar /home/ghazni/.hipfire/models/qwen3.5-4b.mtp): n_embd=2560 vocab=248320
+MTP head loaded (sidecar <models-dir>/qwen3.5-4b.mtp): n_embd=2560 vocab=248320
 qwen35 MTP speculator enabled (compressed-serial, K=3)
 ```
 

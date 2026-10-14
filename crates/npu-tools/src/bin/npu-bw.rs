@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-bw: shim DMA bandwidth probe (`pm_npu::kernels::bw_probe`) on the NPU through railgun::npu.
+//! npu-bw: shim DMA bandwidth probe (`peacemaker_npu::kernels::bw_probe`) on the NPU through railgun::npu.
 //!
 //! usage: npu-bw --cols C --read R --write W --bytes N[K|M|G] [--burst E] [--axcache V] [--axqos V] [--iters I] [--timeout-ms T]
 //!        npu-bw --sweep [--iters I] [--timeout-ms T]
@@ -49,8 +49,8 @@
 //! A timeout / submit error prints the state and continues with the next configuration. Exit status is non-zero if
 //! any configuration failed (bad arguments exit 2).
 use railgun::npu::hip_runtime::{HipDmabufA, HipMemoryKind};
-use pm_npu::dma::ShimAxi;
-use pm_npu::kernels::bw_probe::{
+use peacemaker_npu::dma::ShimAxi;
+use peacemaker_npu::kernels::bw_probe::{
     concurrency_design, design, BwConfig, BwDesign, ConcurrencyConfig, ConcurrencyDesign, WriteCheck, AIE_HZ,
 };
 use railgun::npu::{Bo, Device, HwCtx, ERT_STATE_COMPLETED};
@@ -143,7 +143,7 @@ impl ProbeConfig {
     }
     fn build(&self, hazardous: bool) -> ProbeDesign {
         match self {
-            ProbeConfig::Classic(c) => ProbeDesign::Classic(if hazardous { pm_npu::kernels::bw_probe::design_for_hazardous_probe(*c) } else { design(*c) }),
+            ProbeConfig::Classic(c) => ProbeDesign::Classic(if hazardous { peacemaker_npu::kernels::bw_probe::design_for_hazardous_probe(*c) } else { design(*c) }),
             ProbeConfig::Concurrency(c) => ProbeDesign::Concurrency(concurrency_design(c.config())),
         }
     }

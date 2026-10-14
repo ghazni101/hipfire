@@ -10,40 +10,70 @@ not product admission: a compiled path or runtime gate is not certification.
 
 ## Workspace map
 
-Workspace members (`Cargo.toml`):
+Workspace members (`Cargo.toml`), grouped by role. Directory order is not
+layering; the layer table below is. The list tracks `Cargo.toml` and is
+deliberately uncounted: count members from the manifest, not this page.
 
 ```text
 crates/
-├── hip-bridge/              # dlopen HIP FFI (libamdhip64)
-├── hsa-bridge/              # thin public HSA queue/AQL helpers
-├── rdna-compute/            # Gpu, kernel compile/cache, HIP launch families
-├── radiowave/               # signal/scheduling support for the compute layer
-├── saddle-core/             # the substrate: grammar, KV, caps, sampling policy
-├── hipfire-runtime/         # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
-├── hipfire-loader/          # Carrier registry, load_model, LoadedModel, batch staging
-├── hipfire-engine/          # arch-free serve engine: scheduler, terminal, emit, prompt
-├── hipfire-generate/        # generation bodies: ar, qwen, dense, vision, batch, redline fixtures
-├── hipfire-daemon/          # the product binary — [[bin]] name = "daemon", no required-features
-├── hipfire-dispatch/        # dtype/arch family tables + MoE/attn pipelines
-├── hipfire-dispatch-tests/  # dispatch coverage tests
-├── hipfire-arch-*/          # per-family config/weights/state/forward (12)
-├── hipfire-ds4-parent/      # DeepSeek-V4 parent/teacher tooling (name provisional)
-├── hipfire-pflash/          # PFlash prefill compression — retained legacy research, default off
-├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
-├── hipfire-detect/          # observational JSONL behavior detectors
-├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
-├── hipfire-config/          # typed TOML config + migration
-├── hipfire-registry/        # strict bundled/dynamic model registry
-├── hipfire-client/          # daemon JSONL + OpenAI HTTP/SSE client
-├── hipfire-cli/             # native operator and HTTP service
-├── hipfire-tui/             # terminal UI
-├── hipfire-reap/            # utility crate
-├── saddle-lab/              # research examples and one-off harnesses
-├── redline/                 # experimental direct-KMD / bare-libdrm research
-├── redline-dispatch/        # retained-tape record/replay + plan selection
-├── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
-├── pm-npu/                  # XDNA2/AIE2P program builder + CPU simulator — experimental, dark
-└── npu-tools/               # XDNA2 NPU binaries (railgun --features npu) — experimental, dark
+├── hip-bridge/               # dlopen HIP FFI (libamdhip64); VMM arenas and retired-VA accounting
+├── hsa-bridge/               # thin public HSA queue/AQL helpers
+├── va-bridge/                # dlopen VA-API (VCN JPEG) decode for VL images
+├── rdna-compute/             # Gpu, kernel compile/cache, HIP launch families, replay controller
+├── radiowave/                # policy-driven HIP compiler + AMDGPU code-object inspector
+├── peacemaker-ir/            # typed RDNA machine-code representation, gfx12 instruction tables
+├── peacemaker-lift/          # ELF/bundle/metadata lifter for typed AMDGPU programs
+├── peacemaker-author/        # typed kernel-authoring core (targets, LDS regions, wait tokens)
+├── peacemaker-isa/           # checked instruction Builder (wait ledger, LDS, hazards) + peacemaker tooling
+├── peacemaker-rip/           # standalone `.rip` kernel-script front end onto the peacemaker-isa builder
+├── railgun/                  # certified dispatch-program model, gfx12 plan/lowering, shadow diff; feature `npu`: XDNA2 runtime
+├── railgun-cert/             # offline certifier: kernarg facts as a receipt `railgun` section
+├── railgun-corpus/           # runtime-side reader for railgun fact records / JIT receipt corpus
+├── railgun-jitcorpus/        # offline JIT receipt corpus builder and coverage check
+├── saddle-core/              # the substrate: grammar, KV, caps, sampling policy
+├── saddle-quant/             # quantization-quality toolkit (KLD references, Hessians, imatrices, scores)
+├── saddle-lab/               # archived research examples and one-off harnesses
+├── hipfire-runtime/          # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
+├── hipfire-cpu/              # CPU execution core for host-mapped (spilled) quantized weights
+├── hipfire-dispatch/         # dtype/arch family tables + MoE/attn pipelines
+├── hipfire-dispatch-tests/   # dispatch coverage tests
+├── hipfire-arch-llama/       # facade for dense LLaMA/Mistral/plain Qwen3 (ids 0/1)
+├── hipfire-arch-qwen2/       # Qwen2 text (id 7)
+├── hipfire-arch-qwen35/      # Qwen3.5/3.6/3.8 hybrid DeltaNet, dense and MoE (ids 5/6)
+├── hipfire-arch-qwen35-vl/   # vision tower attached to Qwen3.5 ids 5/6
+├── hipfire-arch-qwen4/       # Qwen3.8-Flash-Next / Qwen4 (id 16)
+├── hipfire-arch-dots-ocr/    # dots.ocr (id 8)
+├── hipfire-arch-deepseek4/   # DeepSeek V4 Flash (id 9)
+├── hipfire-arch-minimax/     # MiniMax-M2 (id 10)
+├── hipfire-arch-lfm2moe/     # LFM2.5 / LFM2.5-MoE (id 11)
+├── hipfire-arch-lfm2-vl/     # LFM2-VL SigLIP2-NaFlex tower + projector (rides id 11)
+├── hipfire-arch-cohere2moe/  # Cohere2-MoE (id 12)
+├── hipfire-arch-gemma4/      # Gemma 4 text (id 13)
+├── hipfire-arch-muse-glimmer/# Muse Glimmer dense text (id 14)
+├── hipfire-arch-maple/       # Maple-Preview natively-ternary MoE (id 15)
+├── hipfire-arch-diffusion/   # FLUX.1 / FLUX.2 image-generation components (ids 40/45)
+├── hipfire-arch-toy/         # template only (0xFF); never dispatched
+├── hipfire-ds4-parent/       # DeepSeek V4 parent-checkpoint calibration oracle
+├── hipfire-pflash/           # PFlash prefill compression — deprecated since 0.4.0, removal in 0.5.0
+├── hipfire-loader/           # Carrier registry, load_model, LoadedModel, batch staging
+├── hipfire-engine/           # arch-free serve engine: scheduler, terminal, emit, prompt
+├── hipfire-generate/         # generation bodies: ar, qwen, dense, vision, batch, img, redline fixtures
+├── hipfire-daemon/           # the product binary — [[bin]] name = "daemon"
+├── hipfire-quantize/         # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-detect/           # observational JSONL behavior detectors
+├── hipfire-atlas/            # Kernel Atlas schema + emit helpers
+├── hipfire-config/           # typed TOML config + migration
+├── hipfire-registry/         # strict bundled/dynamic model registry
+├── hipfire-client/           # daemon JSONL + OpenAI HTTP/SSE client
+├── hipfire-cli/              # native operator and HTTP service
+├── hipfire-tui/              # terminal UI
+├── hipfire-reap/             # model-agnostic REAP expert pruning + selective re-quant overlay
+├── redline/                  # experimental direct-KMD / bare-libdrm research
+├── redline-dispatch/         # retained-tape record/replay + plan selection
+├── redline-rocr/             # public ROCr/HSA ABI + PM4 packet builders
+├── hipfire-xdna/             # minimal raw amdxdna ioctl control plane (opt-in, exact gfx1151)
+├── peacemaker-npu/           # XDNA2/AIE2P program builder, kernel designs, CPU simulator
+└── npu-tools/                # XDNA2 NPU diagnostics and measurement binaries (railgun feature npu)
 ```
 
 HIP sources live under `kernels/src/`; there is no JavaScript/TypeScript
@@ -55,7 +85,7 @@ operator runtime.
 |---|---|---|
 | Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
 | Product binary | `hipfire-daemon` | `[[bin]] name = "daemon"`. Message dispatch and process lifetime only |
-| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, `img`, plus the Redline fixtures |
+| Generation | `hipfire-generate` | The generate bodies: `ar` (route selector + dispatch), `qwen`, `dense`, `vision`, `batch`/`fn_batch`/`vmm_conv`, `img`, plus the Redline fixtures |
 | Serve engine | `hipfire-engine` | Scheduler, terminal control, emit, prompt. **Zero arch dependencies** |
 | Composition root | `hipfire-loader` | Carrier registry, single `load_model` dispatch, `LoadedModel`, continuous-batch staging |
 | Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
@@ -65,9 +95,12 @@ operator runtime.
 | Device FFI | `hip-bridge`, `hsa-bridge` | HIP runtime; optional HSA AQL helpers |
 | Encode | `hipfire-quantize` | No GPU deps; CI-safe quantizer |
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
-| Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline path (see below) |
-| Direct-KMD research | `redline`, `saddle-lab`, `hipfire-pflash` | Not the serving transport |
-| NPU research (dark) | `pm-npu`, `railgun` feature `npu`, `npu-tools` | XDNA2/AIE2P emitter, simulator, direct-amdxdna runtime and probes; no daemon/engine path calls them ([`npu/README.md`](npu/README.md)) |
+| Kernel compile policy | `radiowave` | Policy-driven hipcc invocation and AMDGPU code-object inspection behind `rdna-compute`'s compile path |
+| Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
+| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. Authoring and validation, **not** the retained transport (see railgun below) |
+| Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
+| Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
+| NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
 
@@ -79,12 +112,13 @@ saddle-core → hipfire-runtime → hipfire-loader → hipfire-engine
 Two invariants hold today and are worth keeping:
 
 - **`saddle-core` never depends upward.** Its only dependencies are
-  `rdna-compute`, `hip-bridge` and `serde`; `cargo tree -p saddle-core -e normal`
+  `rdna-compute`, `hip-bridge` and `serde_json`; `cargo tree -p saddle-core -e normal`
   matches nothing under `hipfire-{runtime,loader,engine,generate,daemon,arch-*}`.
 - **`hipfire-engine` declares no arch crate at all.** The daemon reaches an
   architecture only through `hipfire-loader`'s `Carrier` and the
-  `hipfire-generate` entry points; `main.rs` names no `hipfire_arch_*` type,
-  in shipped code or tests.
+  `hipfire-generate` entry points; `crates/hipfire-daemon/src/main.rs` names no
+  `hipfire_arch_*` type (the daemon manifest lists only `hipfire-arch-qwen35`
+  and `hipfire-arch-qwen35-vl`, for slot support).
 
 `hipfire-runtime` lists the arch crates under `[dev-dependencies]` for its own
 examples. That is not a cycle — dev-dependencies do not participate in the
@@ -121,9 +155,96 @@ The grouped symmetric IU4 MoE prefill route (`HIPFIRE_QWEN4_MOE_SYM_IU4`) is
 **on by default** on gfx1151 and gfx1201 for layers whose routed-expert
 headers verify symmetric at load (a symmetric requant such as GPTQ3); shipped
 asymmetric artifacts fail that check and stay on the F16 WMMA route.
-`HIPFIRE_QWEN4_MOE_SYM_IU4=0` opts out and keeps the F16 route, preserving its
-lower KLD (gfx1151 GPTQ3: 0.0661 vs 0.1027 on the IU4 route; see
-[`env-vars.md`](env-vars.md)).
+`HIPFIRE_QWEN4_MOE_SYM_IU4=0` opts out and keeps the F16 route, which has the
+lower KLD but the slower prefill; the measured trade for each architecture is
+recorded with the knob in [`env-vars.md`](env-vars.md).
+
+### Qwen4 expert-parallel mesh (Flash-Next, EP2/EP4)
+
+`topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes `1`, `2` or `4`; `HIPFIRE_QWEN4_EP=0`
+forces `1`. Qwen4 admits expert parallelism only with `pp = 1`, `tp = 1`, on
+exact gfx1201 on every rank, with the peers directly accessible from each
+other (`qwen4_ep_geometry_refusal`, `qwen4_ep_preflight` in
+`crates/hipfire-loader/src/admission.rs`; checked before rank 0 allocates).
+Routed experts shard by id; every rank runs the unchanged single-device
+program.
+
+The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
+`crates/hipfire-arch-qwen4/src/ep.rs`): peers are bundles on persistent worker
+threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
+model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
+than `generate_ep`. EP refuses what the replicated program does not run
+(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK,
+PFlash, an experts-per-token override, a non-Single compute placement; lane
+steps never run under EP), and native MTP attaches under EP only on an explicit
+`--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
+
+Two EP levers are **default-on under EP2**, each with an exact-`0` kill switch
+(`gpu_forward.rs`):
+
+- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE. A prefill chunk of
+  at least 512 rows whose MoE layers verified symmetric on every rank computes
+  only its owned expert tiles and pulls the other ranks' down rows over P2P,
+  instead of computing every expert on every rank. It also needs gfx1201, the
+  Flash-Next profile and the symmetric IU4 route requested.
+- `HIPFIRE_EP_EXPERT_STAGE`: Flash-Next long-prefill expert staging. It exists
+  only when owner-routed prefill is admitted, so it is never created with
+  that lever off.
+
+**EP4 is refused for both levers.** The transport is rank-generic and the mesh
+itself admits four ranks, but `Qwen4TileRoute::admit` refuses with
+`EP4 owner-routed prefill not yet gated`, so EP4 keeps the full-table chunk
+route (and never stages). Exact figures, memory arithmetic and the
+hardware-validation record live in [`multi-gpu.md`](multi-gpu.md) and
+[`env-vars.md`](env-vars.md), not here.
+
+### Qwen4 long context, trunk overlay and PLE rows
+
+- **YaRN.** `attention.yarn_factor` (`HIPFIRE_YARN_FACTOR`) overrides the
+  checkpoint's RoPE scaling at load (`hipfire_runtime::rope`): unset follows
+  the checkpoint's `rope_parameters`, above `1` applies static YaRN over the
+  original context, `1` disables it. It is wired for Qwen4 only. Admission
+  bounds `max_seq` by the config's `context_limit()` (native positions, or the
+  YaRN-extended factor × original) and `QWEN4_MAX_CONTEXT`
+  (`crates/hipfire-arch-qwen4/src/config.rs`); semantics in
+  [`CONFIG.md`](CONFIG.md).
+- **zab trunk overlay.** A `<model>.trunk-overlay` sidecar (an HFQM container
+  of pre-encoded QT44 `linear_attn.in_proj_{z,a,b}` tensors, bound to the exact
+  base by length and header/index sha256) replaces the base's MQ6 tensors and
+  arms the `gfx1151-zab-v1` trunk default
+  (`crates/hipfire-arch-qwen4/src/trunk_overlay.rs`).
+  `HIPFIRE_QWEN4_TRUNK_OVERLAY` is `auto` by default: applied only on exact
+  gfx1151. The client pins the stock-artifact overlay; see
+  [`MODELS.md`](MODELS.md) and [`env-vars.md`](env-vars.md).
+- **PLE rows.** The per-layer-embedding rows are not uploaded wholesale. They
+  come from the embedded Q8 rows, `<model>.ple-q8`, or the 4-bit Lloyd-Max
+  `<model>.ple-q4` (`memory.ple_format` / `HIPFIRE_PLE_FORMAT`). `auto` picks
+  **q4 on gfx1151** (unified-memory APU) and q8 elsewhere, never deriving or
+  downloading: `resolve_qwen4_ple_rows` runs at admission and `hipfire run`
+  ensures the sidecar before spawning the daemon.
+
+### Qwen4 NPU trunk (XDNA2)
+
+The Flash-Next family-B MQ6 trunk can run its projections on the XDNA2 NPU.
+This is **not** dark: `hipfire-arch-qwen4` depends on `peacemaker-npu` (panel
+programs, numerical reference) and, on Linux, on `railgun` with feature `npu`
+(amdxdna runtime), and `Qwen4Bundle` prepares the route at load
+(`prepare_npu_trunk`, `crates/hipfire-arch-qwen4/src/npu_trunk/`).
+
+The mode is `fusions.npu_trunk` / `HIPFIRE_QWEN4_NPU_TRUNK`
+(`off|auto|on|emulate`) and **defaults to `auto`**. `auto` resolves silently to
+`off` on every architecture except gfx1151, with no NPU, index or calibration
+I/O. On gfx1151 it arms only for a single-device Flash-Next load (hidden size
+2560, stock MQ6G256V2 trunk projections, full 8192-row prefill scratch) when
+the NPU opens and a matching calibration
+(`HIPFIRE_QWEN4_NPU_TRUNK_CAL` / `fusions.npu_trunk_calibration`, else the
+compiled-in measured one) selects a nonempty family set; a load refusal logs one
+reason and stays GPU-only, while request-time errors stay fail-closed. `off` is
+the kill switch; forced `on`/`emulate` refuse other architectures. Details:
+[`npu/npu-trunk.md`](npu/npu-trunk.md), [`CONFIG.md`](CONFIG.md),
+[`env-vars.md`](env-vars.md). The rest of the NPU stack (`npu-tools`,
+`hipfire-xdna`, the AIE2P simulator, co-op prototypes) is experimental
+([`npu/README.md`](npu/README.md)).
 
 ## Request lifecycle
 
@@ -135,10 +256,11 @@ Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
     forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
-    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--spec`/`--speculation`,
-    `--model-draft`, `--draft-max`, `--dspark-conf-threshold` is passed
-    (`force_local` in `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream`
-    ride the HTTP route and do not force local)
+    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--tp` (> 1), `--max-seq`,
+    `--head`, `--vision`, `--spec`/`--speculation`, `--model-draft`,
+    `--draft-max`, `--dspark-conf-threshold` is passed
+    (`run_should_force_local` in `crates/hipfire-cli/src/main.rs`;
+    `--json`/`--no-stream` ride the HTTP route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │
@@ -150,15 +272,16 @@ Daemon (crates/hipfire-daemon/src/main.rs)
 hipfire-loader
   ModelSource::from_path  →  HfqFile  |  SafetensorsSource dir
   Carrier registry probe on arch_id (+ is_dir namespace)
-  carrier.load → LoadedModel { arch_id, state: ModelState::…, tokenizer, … }
-  optional: draft/speculator, VL weights, EP/PP scaffolding
+  carrier.load → LoadedModel { arch_id, state: Option<Box<dyn ArchModel>>, tokenizer, … }
+  optional: draft/speculator, VL weights, EP/PP scaffolding (Qwen4 EP2/EP4 mesh rides rank 0's bundle)
   Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
         │
         ▼
-generate(…) ladder (daemon.rs)
-  EP? → generate_ep
-  else arch short-circuits (7/8/9/10/11/12) or qwen35/llama body
-  (DFlash/spec, PP generate_multi, VL, …)
+generate(…) ladder (`hipfire_generate::ar::generate`)
+  select_generation_route (tool/stop gating) → early routes 13 Gemma4, 14 Muse Glimmer
+  → route match: Qwen4 (16, no `m.ep`), EP (`m.ep`: 9/10, Qwen3.5 5/6),
+    Qwen2 / DS4 / LFM / Cohere / Maple (AR only) / MiniMax / dots.ocr,
+    PP `generate_mesh_carrier`, else qwen35/llama body (DFlash/spec, MTP, VL, …)
         │
         ▼
 Arch forward (hipfire-arch-*/src)
@@ -217,27 +340,38 @@ one** matching carrier (zero → error; two → ambiguous error).
 | Carrier | Claims `arch_id` | Arch crate / notes |
 |---|---|---|
 | `LlamaCarrier` | 0, 1 | `hipfire-arch-llama` (dense LLaMA/Mistral/plain Qwen3) |
-| `Qwen2Carrier` | 7 | `hipfire-arch-qwen2` (Q/K/V attention bias path) |
 | `Qwen35Carrier` | 5, 6 | `hipfire-arch-qwen35` (+ optional `hipfire-arch-qwen35-vl`) |
+| `Qwen2Carrier` | 7 | `hipfire-arch-qwen2` (Q/K/V attention bias path) |
 | `DotsOcrCarrier` | 8 | `hipfire-arch-dots-ocr` (vision + Qwen2 text decoder fields) |
 | `Deepseek4Carrier` | 9 | `hipfire-arch-deepseek4` |
 | `MinimaxCarrier` | 10 | `hipfire-arch-minimax` |
 | `Lfm2MoeCarrier` | 11 | `hipfire-arch-lfm2moe` |
 | `Cohere2MoeCarrier` | 12 | `hipfire-arch-cohere2moe` |
+| `Gemma4Carrier` | 13, 22 | `hipfire-arch-gemma4`; 13 is the primary target, 22 is the EAGLE-drafter sidecar and is excluded from the early generate route |
+| `MuseGlimmerCarrier` | 14 | `hipfire-arch-muse-glimmer`; bundle type lives in `hipfire-loader` |
+| `MapleCarrier` | 15 | `hipfire-arch-maple`; plain AR only (no spec/MTP/DFlash route) |
+| `Qwen4Carrier` | 16 (HFQM artifacts only) | `hipfire-arch-qwen4` (Flash-Next); claims no safetensors directory, so a dir is a conversion input and fails closed |
+| `FluxDiffusionCarrier` | 40, 45 | `hipfire-arch-diffusion` (FLUX.1 / FLUX.2 components) |
 
 Canonical numeric registry: [`architecture-ids.md`](architecture-ids.md).
 
-`LoadedModel.state` is a closed `ModelState` enum
-(`Qwen2 | Qwen35 | Llama | Lfm2Moe | Minimax | Cohere2Moe | Deepseek4`).
-dots.ocr keeps config/weights on dedicated `LoadedModel` fields and reuses
-`qwen2_state`. EP (expert-parallel) for DeepSeek4 / MiniMax stores rank state
-in `LoadedModel.ep`, not `state`.
+`LoadedModel.state` is `Option<Box<dyn ArchModel>>`
+(`hipfire_runtime::arch_model::ArchModel`), not a closed enum: each
+architecture's bundle implements the trait in its own crate and owns its GPU
+teardown (`free_gpu`), so adding an architecture edits no central match.
+Consumers use typed `LoadedModel` accessors (`qwen35()`, `qwen4()`, `llama()`,
+`gemma4()`, `gemma4_lowered_mut()`, `muse_glimmer()`, `maple()`, `lfm2moe()`,
+`minimax()`, `cohere2moe()`, `deepseek4()`, `dots_ocr()`, `flux_pipe()`) that
+downcast through `Any`. Gemma 4 is one of two mutually exclusive bundles:
+eager `Gemma4Bundle` or lowered `Gemma4LoweredBundle`. EP (expert-parallel)
+for DeepSeek4 / MiniMax stores rank state in `LoadedModel.ep`, not `state`;
+Qwen4's EP mesh lives inside rank 0's `Qwen4Bundle`.
 
 ### Multi-device load variants
 
 | API | Scope |
 |---|---|
-| `load_model` | Single GPU (and Qwen3.5 PP when `pp > 1` inside the carrier) |
+| `load_model` | Single GPU (Qwen3.5 PP when `pp > 1` inside the carrier; the Qwen4 carrier also attaches its EP2/EP4 mesh here, `attach_qwen4_ep_peers`) |
 | `load_model_ep` | Expert-parallel: arch_id 9 and 10 only; staging reclaims completed/pushed ranks on failure (constructor-mid-failure can still leak that rank’s partial allocs) |
 
 ## Architecture crates
@@ -255,15 +389,25 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-qwen2` | Standalone Qwen2 text |
 | `hipfire-arch-qwen35` | Hybrid DeltaNet + full attention; dense (5) and MoE/A3B (6); DFlash/MTP hooks |
 | `hipfire-arch-qwen35-vl` | Vision tower attached to Qwen3.5 ids 5/6 |
+| `hipfire-arch-qwen4` | Qwen3.8-Flash-Next / Qwen4 (16): hybrid GatedDeltaNet + QSA sparse attention, PLE, 512-expert MoE, native MTP, EP2/EP4, NPU trunk |
 | `hipfire-arch-dots-ocr` | dots.ocr / Qwen2-VL-class OCR |
 | `hipfire-arch-deepseek4` | DeepSeek V4 Flash (HC, compressed-KV indexer, optional MTP/DSpark) |
 | `hipfire-arch-minimax` | MiniMax-M2 MoE |
 | `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
+| `hipfire-arch-lfm2-vl` | LFM2-VL SigLIP2-NaFlex vision tower + projector on the arch-11 carrier |
 | `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
+| `hipfire-arch-gemma4` | Gemma 4 hybrid sliding/full attention text (13), eager dense and lowered/MoE bundles; EAGLE drafter id 22 |
+| `hipfire-arch-muse-glimmer` | Muse Glimmer dense text (14): 3:1 sliding/NoPE-full attention; DFlash drafter id 23 |
+| `hipfire-arch-maple` | Maple-Preview natively-ternary 256-expert MoE (15), plain AR |
 | `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
+<<<<<<< HEAD
 | `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb. Under `serve.multi_slot` its own engine merges concurrent requests into one batched forward (`slot_engine.rs`); the trait hook is the defaulted `SlotEngineHandle::encode`, so the generation engine is untouched. |
 | `hipfire-arch-embeddinggemma2` | EmbeddingGemma 2 single-vector embedding encoder (18) — bidirectional Gemma-4-family encoder (sliding/full hybrid, PLE, per-layer head dims, 768-d Matryoshka head, mean pooling + L2); served only via the non-chat `embed` verb with the arch-17 slot-engine shape. Text-only: multimodal inputs are refused, the towers are not loaded. |
+| `hipfire-arch-embeddinggemma2` | EmbeddingGemma 2 single-vector embedding encoder (18) — bidirectional Gemma-4-family encoder (sliding/full hybrid, PLE, per-layer head dims, 768-d Matryoshka head, mean pooling + L2); served only via the non-chat `embed` verb with the arch-17 slot-engine shape. Text-only: multimodal inputs are refused, the towers are not loaded. |
 
+=======
+| `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb |
+>>>>>>> upstream/beta
 | `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 
 Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
@@ -344,18 +488,40 @@ Some arch crates also ship crate-local HIP (registered through their own
 
 ## Serve / generate path
 
-Composition root: `crates/hipfire-daemon/src/main.rs`.
+Composition root: `crates/hipfire-daemon/src/main.rs`; the generate bodies and
+the route selector live in `crates/hipfire-generate/src/ar.rs`.
 
 After `load_model`, request handling builds sampling defaults
 (request → HFQ `generation_config` recommendations → arch ladder) and enters
-`generate`:
+`hipfire_generate::ar::generate`:
 
-1. **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks).
-2. **Arch short-circuits** with optional n-gram/spec when a `Speculator` is
-   loaded and temp policy allows: ids 7, 9, 11, 12, 10, 8.
-3. **Qwen3.5 / LLaMA body**: PP (`generate_multi`), DFlash/spec
-   (`generate_dflash` / `generate_spec` / MTP), VL (`generate_vl`), else dense
-   AR loops.
+1. **Producer route.** `select_generation_route` (a pure function of
+   `GenerationRouteInputs`) names the producer first; the name gates tools and
+   stop sequences per route.
+2. **Early routes** (`hipfire_loader::generation_early_route`, exact id match):
+   `13` → Gemma 4 (eager dense `generate_gemma4`, or `generate_gemma4_lowered`
+   for the lowered/MoE bundle), `14` → Muse Glimmer (`generate_muse_glimmer`).
+   Arch 22 maps to no early route: it is a drafter sidecar, never a primary
+   generate target.
+3. **Route match** on the selected route:
+   - **Qwen4 (16)** → `Qwen4Spec` when native MTP is attached and the request
+     fits it (greedy, or sampled with `speculation.mtp_sampled`), else
+     `Qwen4Ar`. Qwen4 never takes the `m.ep` branch: its EP mesh sits inside
+     the bundle.
+   - **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks and
+     Qwen3.5 5/6 mesh loads).
+   - **Per-arch bodies** with optional n-gram/spec when a `Speculator` is
+     loaded and temp policy allows: ids 7, 9, 11, 12, 10, 8. **Maple (15)** is
+     plain AR: it declares no DFlash or MTP and has no verify path, so a
+     speculator never changes its route.
+   - **Qwen3.5 / LLaMA body**: PP (`generate_mesh_carrier`), DFlash/spec
+     (`generate_dflash` / MTP), VL, else dense AR loops.
+
+Continuous batching is a separate exact-id staging route
+(`hipfire_loader::continuous_batch_route`): Qwen3.5 (5/6) and Flash-Next
+(16). Qwen4 batches only as exact AR lanes through the VMM branch
+(`serve.vmm_batch`; there is no fixed-lane Qwen4 body), and its lane steps are
+refused under expert parallelism. LFM2 (11) has no servable batch path.
 
 Capability examples that are **implemented** but not automatically
 “product-certified”:
@@ -365,8 +531,9 @@ Capability examples that are **implemented** but not automatically
 - DFlash draft resolution is CLI-side path/auto-match; daemon loads the path it
   is given. Mode toggles and MoE caveats: config/env owners, not this page.
 
-Speculation inventory snapshot: [`speculation-support-inventory.md`](speculation-support-inventory.md)
-(historical — verify in source before claims).
+Speculation inventory: [`speculation-support-inventory.md`](speculation-support-inventory.md)
+is a source-derived capability inventory, not product admission; verify in
+source before claims.
 
 ## Redline roles (capability vs certification)
 
@@ -414,6 +581,34 @@ Do not describe Redline as “future only”: retained record/replay and ROCr PM
 paths are **implemented**; what remains gated is **route certification and
 default product claims**.
 
+### railgun: typed authoring and validation, not transport
+
+Do not conflate railgun with Redline. **Redline** is the retained transport:
+it records launches, retains the tape and replays it as PM4/AQL through ROCr.
+**railgun** is the typed authoring and validation side:
+
+- `railgun` models a *certified dispatch program*: host words and affine
+  formulas, resources (including pointer tables), copy and kernel nodes typed
+  from certified facts, hazard edges, the gfx12 cache table, the PM4 boundary
+  plan and a shadow diff (`crates/railgun/src/{lib,kernel,plan,shadow}.rs`).
+- `railgun-cert` lifts a code object with `peacemaker-lift` and writes kernarg
+  facts as a receipt `railgun` section; `railgun-jitcorpus` builds the offline
+  receipt corpus of runtime-JIT modules and checks coverage; `railgun-corpus` is
+  the runtime's read-only view of those records.
+- Kernel authoring and instruction validation sit beneath it in
+  `peacemaker-ir`, `peacemaker-lift`, `peacemaker-author`, `peacemaker-isa` and
+  `peacemaker-rip`.
+
+Its product-tree integration is developer-only and opt-in, and certifies no
+route: `HIPFIRE_RAILGUN_SHADOW` diffs railgun's lowering against Redline's
+recorded tape without submitting it; `HIPFIRE_RAILGUN_CHECK` byte-compares a
+prepared PM4 replay against its HIP twin and poisons the route on a difference;
+`HIPFIRE_RAILGUN_BACKEND=railgun` makes the gfx12 single-IB tape execute
+railgun's lowering, and any refusal fails closed to HIP, never to the Redline
+planner. Knobs and procedure: [`REDLINE.md`](REDLINE.md),
+[`env-vars.md`](env-vars.md). The `npu` feature of `railgun` is the unrelated
+XDNA2 runtime used by the Qwen4 NPU trunk above.
+
 ## KV cache (shared policy)
 
 Resolved by `hipfire_runtime::kv_mode` per load-site policy (aliases and
@@ -424,14 +619,20 @@ accepted sets differ by carrier). Concrete modes include:
 | `q8` | Q8_0 K and V |
 | `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
-| `asym2` / `asym3` / `asym4` | **Legacy** Givens-rotated Lloyd K + Q8 V. On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
+| `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
 exact `gfx1201` when the load is native-eligible (H24/Hkv4/D256, single GPU,
-no adaptive, no CASK); **q8/q8** everywhere else, gfx1100 and gfx1151
+no adaptive, no CASK (deprecated since 0.4.0, removal in 0.5.0)); **q8/q8** everywhere else, gfx1100 and gfx1151
 included. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 `--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
+
+**Flash-Next (Qwen4, arch 16)** has its own `kv_cache` table for the QSA
+full-attention K/V arenas: `auto` is `fp8` on exact gfx1201 (for a head
+geometry the kernels implement) and the exact `bf16` state elsewhere; `q8` is
+opt-in on gfx11/gfx12; `fwhtN`/`asymN` are refused. The GatedDeltaNet state is
+separate. Table and sizes: [`CONFIG.md`](CONFIG.md).
 
 **Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
 `legacy` \| `vmm`. Omitted request is **automatic** and prefers **VMM** on
@@ -454,21 +655,19 @@ recurrent state instead of FA KV for those layers.
 **VMM virtual-address lifetime:** a released `VmmArena` unmaps its segments and
 frees its physical handles, but never returns its virtual range to the driver
 (`hipMemAddressFree` is not called). The range stays reserved for the life of
-the process and is counted by `hip_bridge::retired_va_bytes()`. On ROCm 10.0 (HIP 7.15), a VA can
-keep translating to its first backing after `hipMemUnmap` + `hipMemMap` of
-another handle: kernels read stale pages even after `hipDeviceSynchronize`.
-In the 80 × 2 MiB repro that is every page on gfx1201 (R9700), 84% on gfx1100
-(7900 XTX), and none on gfx1151 (Strix Halo). The exact
-trigger is not isolated; a replay of hipfire's own release → re-reserve
-sequence got the same VA back but read no stale pages. A hint-less `hipMemAddressReserve` after a free
-returns exactly the freed range, so without retirement every unload → load in
-one daemon (model swap, serve idle eviction, `max_seq` change, failed-load
-retry) would re-map VAs the GPU had translated before. Retired VA is cheap:
-Qwen3.8-27B at `max_seq` 4096 retires 192 MiB per load (about 8 GiB at 256K).
-New reservations are refused with a restart hint once 64 TiB is retired, half
-of the 128 TiB user VA space. Growth inside a live arena only ever maps
-fresh offsets. A failed access reset in `map_next` poisons the arena instead of
-letting a retry map a new handle at the address it just unmapped.
+the process and is counted by `hip_bridge::retired_va_bytes()`. The reason is a
+driver behavior seen on ROCm 7.14+ with gfx1201: a VA that was mapped,
+unmapped and mapped again to another handle kept translating to its first
+backing, so kernels read the previous owner's pages (`crates/hip-bridge/src/vmm.rs`
+module docs). A hint-less `hipMemAddressReserve` after a free returns exactly
+the freed range, so without retirement every unload → load in one daemon
+(model swap, serve idle eviction, `max_seq` change, failed-load retry) would
+re-map VAs the GPU had translated before. New reservations are refused with a
+restart hint once the retired total would exceed the `RETIRED_VA_CAP_BYTES`
+cap of 64 TiB, half of the 47-bit (128 TiB) user VA space. Growth inside a
+live arena only ever maps fresh offsets. A failed access reset in `map_next`
+poisons the arena instead of letting a retry map a new handle at the address it
+just unmapped.
 
 ### Qwen4 session cache and live continuation
 

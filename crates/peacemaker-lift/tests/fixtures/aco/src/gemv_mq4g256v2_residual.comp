@@ -4,7 +4,7 @@
 //
 // P0 gate shader #2 (PM-ACO-PARITY.md section 6, P0): MQ4-G256 v2 residual GEMV, the real
 // incumbent kernel `gemv_mq4g256v2_residual` (kernels/src/gemv_mq4g256v2_residual.hip, builder twin
-// crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs), expressed as
+// crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs), expressed as
 // compiler INPUT (SPIR-V), not as post-RA assembly.
 //
 //   y[row] += A[row] . x          (A: HFQ4-G256, 136 bytes per 256-weight group)

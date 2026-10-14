@@ -2,19 +2,19 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// SP3 Task 3 — the correctness gate for `forward_batch_slots` (SP3 Task 2).
-// Task 2 was build-only: nothing before this harness has checked that the
-// N-slot forward produces the same numbers as the existing single-sequence
-// path. This is that check.
+// SP3 Task 3 — strict fixture/hardware-specific logits diagnostic for
+// `forward_batch_slots` (SP3 Task 2), not a universal correctness gate.
+// Slots are opt-in and not singleton-exact; this fixture-specific oracle
+// does not assert product-wide singleton-exactness.
 //
 // COMPARISON IS ON LOGITS, NOT TOKENS. Sampling makes runs diverge, and
 // greedy decoding on a quantised model can diverge on a near-tie even when
 // both paths are correct — token-level equivalence is not a sound check
 // here. For `n_slots` in 1..=4, with per-slot prompts of differing length,
-// each slot's full step sequence (one prefill + a few decodes) is run twice:
-// once alone through the existing single-sequence `forward_prefill_batch`,
-// and once as part of an n_slots-wide batch through `forward_batch_slots`.
-// Per-step logits are compared with a tolerance-based `assert_close` —
+// compare per-slot prefill logits from `forward_prefill_batch` (reference)
+// with `forward_batch_slots` (candidate). `DECODE_STEPS` is currently 0,
+// so the positive sweep has no decode coverage. `assert_close` uses
+// the unchanged tolerance `1e-3 * max(abs(reference), 1.0)` —
 // copied from `rdna-compute/examples/test_batched_attn_slots.rs` (SP1's
 // harness) rather than reinvented, including its two hard-won guards: a
 // finiteness check (two independently-NaN arrays would otherwise "agree" at
@@ -28,12 +28,11 @@
 // (`KvCacheExt::from_mode_with_backend`), and the candidate arm builds its
 // `SlotKvTier` tables with the same seeds as the sequential constructors
 // (`gen_givens_angles(42,·)` / `gen_fwht_signs(42|1042,·)`), which is the
-// bit-identical-packed-bytes contract `kv_write_slots` rests on. f16 is NOT
-// in the matrix: it is a slots-only tier by design (no sequential qwen35
-// f16 constructor exists to reference against). fp8 is not either: it
-// resolves cleanly through the slots policy but the kernels are
-// gfx1201-only (`#error` below gfx1201) and the rig gate refuses it on
-// every other arch — this gfx1101 host cannot exercise it. The `asymN`
+// bit-identical-packed-bytes contract `kv_write_slots` rests on. f16 is
+// skipped: it is a slots-only tier with no sequential qwen35 constructor
+// to reference against. fp8 is admitted only on exact gfx1201 and can be
+// requested explicitly through the slots policy; it is excluded from the
+// default sweep. bf16 is also an explicit, non-default mode. The `asymN`
 // names resolve to their post-0.4.0 `fwhtN` aliases.
 //
 // NEGATIVE CONTROL. `run_negative_control` redirects one row's `row_slot`
@@ -60,22 +59,29 @@
 //
 // SCOPE. `forward_batch_slots` admits dense and MoE layers per SITE via
 // `plan_proj_group` (mixed tier/fixed-tier recipes included; see its module
-// doc), so any DENSE Qwen3.5/3.6 checkpoint works here — uniform Q8_0, MQ4,
-// MQ4V2 or a mixed recipe. MoE checkpoints also load but are exercised by
-// the serve harnesses instead. Verified against `qwen3.5-4b-q8.hf4` (Q8)
-// and `qwen3.6-27b.mq4` (MQ4, 64 layers). If a different model is passed
-// that doesn't meet that bar, `forward_batch_slots` returns a precise
-// `HipError` describing exactly which requirement failed, which this
-// harness surfaces via `.expect(..)` rather than papering over.
+// doc), including dense Qwen3.5/3.6 Q8_0, MQ4, MQ4V2 and mixed recipes.
+// Admission does not guarantee strict logits equivalence for every hardware/
+// recipe: production kernel families and reduction orders may differ.
+// This is a fixture-specific oracle, not a singleton-exact product promise.
+// Historically verified fixtures were `qwen3.5-4b-q8.hf4` (Q8) and
+// `qwen3.6-27b.mq4` (MQ4, 64 layers), not guarantees for other fixtures.
+// MoE checkpoints also load but are exercised by the serve harnesses instead.
+// If per-site admission fails, `forward_batch_slots` returns a precise
+// `HipError` describing the failed requirement, which this harness surfaces
+// via `.expect(..)` rather than papering over.
 //
 // Usage:
-//   cargo run --release -p hipfire-runtime --features deltanet,arch-qwen35 \
+//   cargo run --release -p saddle-lab --features deltanet,arch-qwen35 \
 //     --example test_forward_slots_golden -- <model.hf4> [kv-modes]
 //
 //   kv-modes  comma list from {q8,asym2,asym3,asym4,fwht2,fwht3,fwht4,
-//             bf16,f16}; default: all of them.
-//   SLOTS_GOLDEN_PAGED=1  run the whole matrix against a paged pool
-//             (PagePool block tables) instead of the legacy slab pool.
+//             fp8,bf16,f16}; default: q8,fwht2,fwht3,fwht4.
+//             fp8 (exact gfx1201 only) and bf16 are explicit; f16 is skipped
+//             because there is no sequential reference constructor.
+//   SLOTS_GOLDEN_PAGED=1  use a paged pool (PagePool block tables) instead of
+//             the legacy slab pool; q8 is still skipped because its paged
+//             and sequential reference numerical families do not match,
+//             not because the paged q8 kernel is broken.
 //
 // Run only through `scripts/run-bounded.sh`, and only when no daemon holds a
 // model resident and MemAvailable is comfortably above what this harness
@@ -748,7 +754,8 @@ fn main() {
         eprintln!(
             "Usage: test_forward_slots_golden <model.hf4> [kv-modes]  (a DENSE \
              Qwen3.5 checkpoint; kv-modes: comma list from q8,asym2,asym3,asym4,\
-             fwht2,fwht3,fwht4,bf16,f16 — default all)"
+             fwht2,fwht3,fwht4,fp8,bf16,f16 — default q8,fwht2,fwht3,fwht4; \
+             fp8 requires exact gfx1201; f16 skipped: no sequential reference)"
         );
         std::process::exit(1);
     });

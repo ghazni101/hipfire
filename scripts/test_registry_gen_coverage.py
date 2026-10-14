@@ -110,6 +110,34 @@ def test_flash_next_xts_wire_contract():
     assert all("gptq3" not in entry["desc"].lower() for entry in models.values())
 
 
+def test_flash_next_zab_local_only_quant():
+    file = "qwen3.8-flash-next.mq4-xts-zab"
+    assert rg.quant_for(file) == "mq4"
+    assert rg.arch_id_for("qwen3.8:flash-next-mq4-xts-zab", {"file": file}) == 16
+    assert rg.quant_for("unrelated.mq4-xts-zab") is None
+
+
+def test_flash_next_zab_local_identity_roundtrip(monkeypatch):
+    curated = _load(REPO_ROOT / "registry" / "models.json")
+    tag = "qwen3.8:flash-next-mq4-xts-zab"
+    entry = curated["models"][tag]
+    assert entry["repo"] == ""
+    assert "hipfire-models/qwen3.8-flash-next" in entry["desc"]
+    assert "NOT uploaded/pullable" in entry["desc"]
+
+    def no_remote_probe(repo, token):
+        raise AssertionError(f"local-only artifact must not probe {repo}")
+
+    monkeypatch.setattr(rg, "repo_tree", no_remote_probe)
+    built, errors = rg.build_registry({"models": {tag: entry}, "aliases": {}}, None)
+    assert not errors, "\n".join(errors)
+    result = built["models"][tag]
+    assert result["sha256"] == entry["sha256"]
+    assert result["size_bytes"] == entry["size_bytes"]
+    assert result["arch_id"] == 16
+    assert result["quant"] == "mq4"
+
+
 @pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-rtn-asym"])
 def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
     v1 = _load(REPO_ROOT / "registry" / "v1.json")

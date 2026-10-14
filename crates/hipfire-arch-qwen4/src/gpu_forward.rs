@@ -25,15 +25,16 @@ use crate::program::{
 };
 use crate::projection::{row_stride, ProjectionView};
 use crate::weights::{
-    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4FfnWeights,
-    Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
+    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4EpPlacement,
+    Qwen4FfnWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
-    MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedWeights, MoeStageTables, RoutedExpertWeights,
+    MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeRowGather, MoeSharedDecode,
+    MoeSharedDtypes, MoeSharedWeights, MoeStageTables, MoeTileExchange, MoeTileExchangeParams,
+    RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
@@ -50,13 +51,19 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
+use rdna_compute::moe::Qwen4EpOwnerTables;
 use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
 use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+#[path = "npu_trunk/forward.rs"]
+mod npu_forward;
 
 pub(crate) const EPSILON: f32 = 1.0e-6;
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
@@ -116,11 +123,118 @@ pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
 }
 
+/// Allocation plan of one [`Qwen4GpuForwardScratch`].
+///
+/// `Full` is the historical plan: one dedicated allocation per field, every
+/// MoE buffer sized for `max_chunk` rows of the widest (F32) route.
+/// `FnSymGfx1201` is the proven-route plan of a gfx1201 Flash-Next artifact
+/// whose routed headers are all symmetric: the MoE buffers are sized for the
+/// symmetric IU4 prefill route plus a [`QWEN4_COMPACT_FALLBACK_ROWS`]-row F32
+/// fallback, and eight phase-disjoint fields borrow their storage from an
+/// owner (see [`Qwen4GpuForwardScratch::plan`]).  Both modes run identical
+/// arithmetic; the mode only changes where intermediates live, so it must be
+/// decided before expert placement and frozen for the forward's lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen4ForwardScratchMode {
+    Full,
+    FnSymGfx1201,
+}
+
+/// Identical native trunk padding scope for sequential and paired prefill.
+fn native_trunk_prefill_scope(prefill: bool, iu4: bool, arch: &str, mode: Qwen4ForwardScratchMode) -> bool {
+    prefill && iu4 && arch == "gfx1151" && mode == Qwen4ForwardScratchMode::Full
+}
+
+/// Rows the `FnSymGfx1201` plan sizes the F32 fallback MoE buffers for.  A
+/// larger MoE invocation that is not on the symmetric IU4 route has no buffer
+/// to run in; dispatch refuses it before its first launch.
+pub const QWEN4_COMPACT_FALLBACK_ROWS: usize = 512;
+
+/// Storage-only opt-in for the compact scratch (`1` on, default off; `0`
+/// leaves the IU4 math enabled and only keeps the full allocation plan).
+pub const QWEN4_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_QWEN4_COMPACT_SCRATCH";
+
+/// Pure predicate of [`qwen4_forward_scratch_mode`]: every term must hold
+/// for the compact plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompactScratchTerms {
+    pub knob: bool,
+    pub exact_gfx1201: bool,
+    pub grouped_gemm: bool,
+    pub sym_iu4_requested: bool,
+    pub source_symmetric: bool,
+    pub ple_key_value_bf16: bool,
+    pub flash_next_profile: bool,
+}
+
+impl CompactScratchTerms {
+    /// Exactly gfx1201: no other arch, and no family prefix match.
+    pub(crate) fn is_exact_gfx1201(arch: &str) -> bool {
+        arch == "gfx1201"
+    }
+
+    pub(crate) fn mode(self) -> Qwen4ForwardScratchMode {
+        if self.knob
+            && self.exact_gfx1201
+            && self.grouped_gemm
+            && self.sym_iu4_requested
+            && self.source_symmetric
+            && self.ple_key_value_bf16
+            && self.flash_next_profile
+        {
+            Qwen4ForwardScratchMode::FnSymGfx1201
+        } else {
+            Qwen4ForwardScratchMode::Full
+        }
+    }
+}
+
+/// The device, flag and profile terms of [`qwen4_forward_scratch_mode`]
+/// with the artifact-dependent terms assumed true.  `false` means the mode is
+/// `Full` whatever the artifact holds, so a caller can skip its payload
+/// header scan.
+pub fn qwen4_compact_scratch_possible(gpu: &Gpu, config: &Qwen4Config) -> bool {
+    qwen4_forward_scratch_mode(gpu, config, true, true) == Qwen4ForwardScratchMode::FnSymGfx1201
+}
+
+/// The scratch plan a load takes: `FnSymGfx1201` only for the opted-in exact
+/// gfx1201 Flash-Next symmetric-IU4 route.  `source_symmetric` is the proof
+/// from the artifact's actual routed payload headers
+/// ([`crate::artifact::routed_headers_symmetric`]), not metadata;
+/// `ple_key_value_bf16` states that the PLE key/value projections are BF16.
+/// Cheap arch/flag checks come first so a caller may skip its header scan
+/// when this would be `Full` regardless.  [`Qwen4GpuForward::new`] still
+/// confirms the symmetric proof on the loaded payloads and refuses a
+/// `FnSymGfx1201` forward the GPU check does not fully confirm.
+pub fn qwen4_forward_scratch_mode(
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    source_symmetric: bool,
+    ple_key_value_bf16: bool,
+) -> Qwen4ForwardScratchMode {
+    static KNOB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, false));
+    CompactScratchTerms {
+        knob: *KNOB,
+        exact_gfx1201: CompactScratchTerms::is_exact_gfx1201(&gpu.arch),
+        grouped_gemm: gpu.flags.moe_grouped_gemm,
+        sym_iu4_requested: gpu.qwen4_moe_sym_iu4_requested(),
+        source_symmetric,
+        ple_key_value_bf16,
+        flash_next_profile: matches!(config.profile, crate::config::Qwen4Profile::FlashNext),
+    }
+    .mode()
+}
+
 /// Device bytes of the forward resources that scale with the chunk: the
 /// reusable scratch for `rows` rows plus the speculative logits and argmax.
 /// Load admission and the auto expert placement reserve size against this.
-pub fn qwen4_forward_device_bytes(config: &Qwen4Config, rows: usize) -> Option<u64> {
-    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows).ok()?;
+pub fn qwen4_forward_device_bytes(
+    config: &Qwen4Config,
+    rows: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Option<u64> {
+    let scratch = Qwen4GpuForwardScratch::device_bytes(config, rows, mode).ok()?;
     let spec = qwen4_spec_logit_rows(rows)
         .checked_mul(config.vocab_size.checked_mul(4)?.checked_add(4)?)?;
     scratch.checked_add(spec as u64)
@@ -145,15 +259,23 @@ pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
 /// smaller ones, decode and verify keep the mapped reads.
 pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS";
 
+/// Whether a long forward that captures wide hidden rows (the native-MTP
+/// prompt fill's trunk tiles) stages like any other long forward. `0` keeps
+/// those tiles on the mapped reads; unset or `1` stages them. The capture
+/// only copies the trunk's output streams after the program has run, on the
+/// compute stream, and never reads an expert, so it is byte-identical either
+/// way. Verify forwards capture too but stay below the row threshold.
+pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE";
+
 /// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
 /// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
 /// and the restore that was not hidden cost 18 ms of that chunk. Smaller
 /// forwards keep the mapped path (K3: 1536 rows expose the DMA).
 const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 
-/// One Flash-Next layer's routed experts: 512 QT44 gate/up, 512 QT53 down.
-const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 512 * 1_740_800;
-const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 512 * 870_400;
+/// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
+const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
+const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
 
 fn qwen4_expert_stage_min_rows() -> usize {
     hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
@@ -688,6 +810,9 @@ pub(crate) fn layer_desc<'a>(
                 expert_down_entries: &moe.expert_down_entries,
                 layer_idx: layer.layer as u16,
                 norm_topk_prob: config.norm_topk_prob,
+                row_gather: None,
+                shared_down_out: None,
+                tile_exchange: None,
             })
         }
         _ => {
@@ -713,6 +838,7 @@ pub(crate) struct Qwen4ExpertView {
 struct ExpertViewSet<'a> {
     experts: &'a [Qwen4ExpertView],
     identity: u64,
+    host_mapped: bool,
 }
 
 impl RoutedExpertWeights for ExpertViewSet<'_> {
@@ -731,7 +857,7 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
     }
 
     fn host_mapped(&self) -> bool {
-        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+        self.host_mapped
     }
 }
 
@@ -767,6 +893,10 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// [`MoeRouteCapability::Qt44Qt53GroupedSymmetric`]. False unless the
     /// opt-in route was requested.
     symmetric: bool,
+    /// Whether this rank's own (local) resident expert tensors of the layer
+    /// are host-mapped: a layer-level property, so an EP rank reports the
+    /// same residency single would, never that of a dummy or a peer view.
+    host_mapped: bool,
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -785,17 +915,788 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     }
 
     fn host_mapped(&self) -> bool {
-        self.experts.first().is_some_and(|expert| expert.gate_up.host_mapped)
+        self.host_mapped
+    }
+}
+
+/// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers and
+/// parity `2 + j % 2` for the MTP head, each `QWEN4_EP_GATHER_MAX_ROWS *
+/// num_experts_per_tok * hidden` F32.
+pub const QWEN4_EP_GATHER_BUFFERS: usize = 4;
+
+/// Most rows a few-row forward (verify / replay / takeover) may carry through
+/// the EP table + row gather; larger chunks run the full (P2P) table.
+pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
+
+/// Which EP gather buffer a MoE invocation uses: trunk layer `L` uses
+/// `L % 2`; the MTP head (a layer index at or past the trunk layer count)
+/// uses `2 + (layer_idx - trunk_layers) % 2`.
+pub(crate) fn qwen4_ep_buffer_index(layer_idx: usize, trunk_layers: usize) -> usize {
+    if layer_idx >= trunk_layers {
+        2 + (layer_idx - trunk_layers) % 2
+    } else {
+        layer_idx % 2
+    }
+}
+
+/// Device pointers and byte lengths of one rank's compact routed-expert
+/// tensors of one MoE layer (`512 / ranks` experts, local index `e / ranks`).
+/// The same shape describes the per-rank zero dummy expert (one expert).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4PeerExpertSource {
+    pub gate_up_base: usize,
+    pub gate_up_bytes: usize,
+    pub down_base: usize,
+    pub down_bytes: usize,
+}
+
+/// How one rank's per-layer expert pointer table is populated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Qwen4ExpertTableLayout<'a> {
+    /// Every expert from the layer's resident tensors (one device).
+    Single,
+    /// EP decode table: owned experts name the compact local tensors,
+    /// every other expert names the rank's zero dummy expert.
+    Ep {
+        placement: Qwen4EpPlacement,
+        dummy: Qwen4PeerExpertSource,
+    },
+    /// EP chunk table: owned experts name the local compact tensors, every
+    /// other expert names the owning peer's compact tensors (P2P), `peers`
+    /// indexed by rank.
+    Full {
+        placement: Qwen4EpPlacement,
+        peers: &'a [Qwen4PeerExpertSource],
+    },
+}
+
+/// The allocation one expert-table entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4ExpertOrigin {
+    /// This rank's resident (compact) expert tensors.
+    Local,
+    /// This rank's zero dummy expert.
+    Dummy,
+    /// The compact expert tensors of the named peer rank.
+    Peer(usize),
+}
+
+/// Host pointer entries of one expert in the gate/up and down tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Qwen4ExpertEntry {
+    pub(crate) origin: Qwen4ExpertOrigin,
+    pub(crate) gate_up_ptr: usize,
+    pub(crate) down_ptr: usize,
+}
+
+fn validate_ep_placement(
+    placement: Qwen4EpPlacement,
+    num_experts: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    if placement.ranks == 0 || placement.rank >= placement.ranks {
+        return Err(invalid(format!(
+            "EP placement rank {} is outside {} ranks",
+            placement.rank, placement.ranks
+        )));
+    }
+    if num_experts % placement.ranks != 0 {
+        return Err(invalid(format!(
+            "{num_experts} experts do not shard evenly over {} EP ranks",
+            placement.ranks
+        )));
+    }
+    Ok(())
+}
+
+impl Qwen4ExpertTableLayout<'_> {
+    /// Experts the layer's own resident tensors hold under this layout.
+    fn local_experts(&self, num_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
+        match self {
+            Self::Single => Ok(num_experts),
+            Self::Ep { placement, .. } | Self::Full { placement, .. } => {
+                validate_ep_placement(*placement, num_experts)?;
+                Ok(num_experts / placement.ranks)
+            }
+        }
+    }
+}
+
+/// Device address of expert slot `index` of a tensor `(base, total)` bytes
+/// long holding `expert_bytes` per slot; the whole slot must lie inside the
+/// tensor.
+fn expert_slot_ptr(
+    what: &str,
+    base: usize,
+    total: usize,
+    index: usize,
+    expert_bytes: usize,
+) -> Result<usize, Qwen4GpuForwardError> {
+    let offset = index
+        .checked_mul(expert_bytes)
+        .ok_or_else(|| invalid(format!("{what} expert {index} offset overflows")))?;
+    let end = offset
+        .checked_add(expert_bytes)
+        .ok_or_else(|| invalid(format!("{what} expert {index} end overflows")))?;
+    if base == 0 {
+        return Err(invalid(format!("{what} base pointer is null")));
+    }
+    if end > total {
+        return Err(invalid(format!(
+            "{what} expert slot {index} [{offset}, {end}) exceeds the {total}-byte tensor"
+        )));
+    }
+    base.checked_add(offset)
+        .ok_or_else(|| invalid(format!("{what} expert {index} address overflows")))
+}
+
+/// Pure arithmetic behind every expert pointer table: the host entry of each
+/// global expert under `layout`. `local` names this rank's own resident
+/// tensors (all experts under `Single`, the compact `num_experts / ranks`
+/// under EP). Nothing here touches a device.
+pub(crate) fn qwen4_expert_table_entries(
+    layout: &Qwen4ExpertTableLayout<'_>,
+    local: Qwen4PeerExpertSource,
+    num_experts: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError> {
+    let mut entries = Vec::with_capacity(num_experts);
+    match layout {
+        Qwen4ExpertTableLayout::Single => {
+            for expert in 0..num_experts {
+                entries.push(Qwen4ExpertEntry {
+                    origin: Qwen4ExpertOrigin::Local,
+                    gate_up_ptr: expert_slot_ptr(
+                        "gate/up",
+                        local.gate_up_base,
+                        local.gate_up_bytes,
+                        expert,
+                        gate_up_expert_bytes,
+                    )?,
+                    down_ptr: expert_slot_ptr(
+                        "down",
+                        local.down_base,
+                        local.down_bytes,
+                        expert,
+                        down_expert_bytes,
+                    )?,
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::Ep { placement, dummy } => {
+            let per_rank = layout.local_experts(num_experts)?;
+            check_exact_compact(local, per_rank, gate_up_expert_bytes, down_expert_bytes)?;
+            if dummy.gate_up_bytes != gate_up_expert_bytes || dummy.down_bytes != down_expert_bytes
+            {
+                return Err(invalid(format!(
+                    "EP dummy expert holds {}+{} bytes, one expert is {gate_up_expert_bytes}+{down_expert_bytes}",
+                    dummy.gate_up_bytes, dummy.down_bytes
+                )));
+            }
+            for expert in 0..num_experts {
+                entries.push(if placement.owns(expert) {
+                    let slot = placement.local_index(expert);
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Local,
+                        gate_up_ptr: expert_slot_ptr(
+                            "gate/up",
+                            local.gate_up_base,
+                            local.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "down",
+                            local.down_base,
+                            local.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                } else {
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Dummy,
+                        gate_up_ptr: expert_slot_ptr(
+                            "dummy gate/up",
+                            dummy.gate_up_base,
+                            dummy.gate_up_bytes,
+                            0,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "dummy down",
+                            dummy.down_base,
+                            dummy.down_bytes,
+                            0,
+                            down_expert_bytes,
+                        )?,
+                    }
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::Full { placement, peers } => {
+            let per_rank = layout.local_experts(num_experts)?;
+            check_exact_compact(local, per_rank, gate_up_expert_bytes, down_expert_bytes)?;
+            if peers.len() != placement.ranks {
+                return Err(invalid(format!(
+                    "EP full table needs {} peer sources, got {}",
+                    placement.ranks,
+                    peers.len()
+                )));
+            }
+            if peers[placement.rank] != local {
+                return Err(invalid(format!(
+                    "EP peer source of rank {} does not name this rank's own expert tensors",
+                    placement.rank
+                )));
+            }
+            for expert in 0..num_experts {
+                let owner = expert % placement.ranks;
+                let slot = expert / placement.ranks;
+                entries.push(if owner == placement.rank {
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Local,
+                        gate_up_ptr: expert_slot_ptr(
+                            "gate/up",
+                            local.gate_up_base,
+                            local.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "down",
+                            local.down_base,
+                            local.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                } else {
+                    let peer = peers[owner];
+                    Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Peer(owner),
+                        gate_up_ptr: expert_slot_ptr(
+                            "peer gate/up",
+                            peer.gate_up_base,
+                            peer.gate_up_bytes,
+                            slot,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "peer down",
+                            peer.down_base,
+                            peer.down_bytes,
+                            slot,
+                            down_expert_bytes,
+                        )?,
+                    }
+                });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// An EP rank's resident tensors hold exactly `per_rank` experts.
+fn check_exact_compact(
+    local: Qwen4PeerExpertSource,
+    per_rank: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    let gate_up = checked_bytes(per_rank, gate_up_expert_bytes)?;
+    let down = checked_bytes(per_rank, down_expert_bytes)?;
+    if local.gate_up_bytes != gate_up || local.down_bytes != down {
+        return Err(invalid(format!(
+            "EP compact expert tensors hold {}+{} bytes, expected exactly {per_rank} experts = {gate_up}+{down}",
+            local.gate_up_bytes, local.down_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// A non-owning whole-allocation window over a peer rank's expert tensor,
+/// only ever cut into per-expert views (never freed by this rank).
+fn foreign_packed_source(base: usize, bytes: usize, dtype: DType) -> GpuTensor {
+    GpuTensor {
+        // SAFETY: `base` names a live peer allocation of `bytes` bytes (the
+        // peer's resident expert tensor, P2P-mapped before any launch), and
+        // the wrapper is `Borrowed`, so neither this rank's `free_tensor`
+        // nor a drop releases it.
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes) },
+        shape: vec![bytes],
+        dtype,
+    }
+}
+
+/// One per-rank zero-filled expert in the routed format (QT44 gate/up, QT53
+/// down), shared by every layer's EP decode table for the experts the rank
+/// does not own.
+///
+/// All-zero bytes dequantize to exactly 0, so the producers (which run
+/// unchanged on all ten slots) emit zero rows for non-owned slots, which the
+/// row gather then overwrites with the owner's bits:
+/// * gate/up (`qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip`): the
+///   group header is f16 `sc`, f16 `zp` read from bytes `[0,4)` / `[4,8)`;
+///   every weight is `sc * nibble + zp` = `0 * 0 + 0` = +0.0 in f32, so each
+///   product is `+-0 * x` (x is a finite rotated activation) and every
+///   accumulator (initialised to +0.0) stays +0.0;
+/// * down (`gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip`):
+///   `scale`, `zero` are the f16 at group bytes `[0,2)` / `[2,4)`; the same
+///   arithmetic gives `acc = +0.0`, written to the expanded row.
+/// No division, reciprocal or NaN/inf source exists in either dequant.
+pub(crate) struct Qwen4EpDummyExpert {
+    gate_up: GpuTensor,
+    down: GpuTensor,
+}
+
+impl Qwen4EpDummyExpert {
+    /// Encoded bytes of one routed expert `(gate_up, down)`.
+    fn expert_bytes(config: &Qwen4Config) -> Result<(usize, usize), Qwen4GpuForwardError> {
+        let gate_up = checked_bytes(
+            2 * config.moe_intermediate_size,
+            row_stride(DType::MQ4G256V2, config.hidden_size),
+        )?;
+        let down = checked_bytes(
+            config.hidden_size,
+            row_stride(DType::MQ4G128V2, config.moe_intermediate_size),
+        )?;
+        if gate_up % 4 != 0 || down % 4 != 0 {
+            return Err(invalid("EP dummy expert byte size is not a multiple of 4"));
+        }
+        Ok((gate_up, down))
+    }
+
+    fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, Qwen4GpuForwardError> {
+        let (gate_up_bytes, down_bytes) = Self::expert_bytes(config)?;
+        let gate_up = gpu.zeros(&[gate_up_bytes / 4], DType::F32)?;
+        let down = match gpu.zeros(&[down_bytes / 4], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(gate_up);
+                return Err(error.into());
+            }
+        };
+        Ok(Self { gate_up, down })
+    }
+
+    fn source(&self) -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: self.gate_up.buf.as_ptr() as usize,
+            gate_up_bytes: self.gate_up.buf.size(),
+            down_base: self.down.buf.as_ptr() as usize,
+            down_bytes: self.down.buf.size(),
+        }
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.gate_up, self.down] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// The forward's row gather and gather buffers, lent to the rank's MTP head
+/// for one call (buffers `2 + j % 2` carry the head's MoE rows, see
+/// [`qwen4_ep_buffer_index`]).
+#[derive(Clone, Copy)]
+pub(crate) struct MtpEpGather<'a> {
+    pub(crate) hook: &'a (dyn MoeRowGather + Send + Sync),
+    pub(crate) buffers: [&'a GpuTensor; QWEN4_EP_GATHER_BUFFERS],
+}
+
+/// `HIPFIRE_EP_BALANCED_OWNERS` (default on under EP; `=0` disables): per-call
+/// balanced expert ownership on the host-mapped trunk MoE layers of an EP rank.
+/// Only the exact value `0` is off (unset or any other value is on), and off
+/// builds nothing (no tables, no buffer, no stage, no kernel load).
+pub const QWEN4_EP_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_BALANCED_OWNERS";
+
+fn qwen4_ep_balanced_owners_enabled() -> bool {
+    hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
+}
+
+/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2; `=0` is the kill switch): owner-routed
+/// chunk MoE (rank-generic code; EP4 is still refused at admission). A prefill chunk of at least
+/// 512 rows whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the
+/// compact (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
+/// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`) instead
+/// of computing every expert on every rank. Every other chunk keeps the full-table route. Only
+/// the exact value `0` is off (unset or any other value is on, like `HIPFIRE_EP_BALANCED_OWNERS`);
+/// every other admission condition still applies, and off allocates nothing, lowers no stage and
+/// loads no kernel.
+pub const QWEN4_EP_OWNER_ROUTED_PREFILL_ENV: &str = "HIPFIRE_EP_OWNER_ROUTED_PREFILL";
+
+/// The shared EP lever rule: default on, exact `0` off.
+fn ep_lever_on(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
+    ep_lever_on(hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).ok().as_deref())
+}
+
+/// Rank counts the owner-routed chunk MoE admits: EP2 and EP4, matching the mesh
+/// (`attach_ep_mesh`) and the four-source launcher ABI.
+const fn tile_ranks_supported(ranks: usize) -> bool {
+    matches!(ranks, 2 | 4)
+}
+
+/// The `experts` little-endian i32 owners (`expert % ranks`) the launcher reads.
+fn tile_owner_table_bytes(experts: usize, ranks: usize) -> Vec<u8> {
+    (0..experts)
+        .flat_map(|expert| ((expert % ranks) as i32).to_le_bytes())
+        .collect()
+}
+
+/// Per-rank donor mirror bytes of one G2 stage layer (`[gate/up, down]`): a rank hosts
+/// `experts / ranks` experts of each kind.
+fn stage_donor_bytes(experts: usize, ranks: usize) -> [usize; 2] {
+    let local_experts = experts / ranks;
+    [
+        local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
+        local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
+    ]
+}
+
+/// Redirect the entries of the experts this rank owns (`e % ranks == rank`) into its donor
+/// buffer at `base`, slot `e / ranks`; every other entry keeps its pointer.
+fn redirect_owned_entries(
+    placement: Qwen4EpPlacement,
+    base: usize,
+    stride: usize,
+    entries: &[usize],
+) -> Vec<u8> {
+    entries.iter().enumerate().flat_map(|(expert, &pointer)| {
+        let pointer = if expert % placement.ranks == placement.rank {
+            base + (expert / placement.ranks) * stride
+        } else {
+            pointer
+        };
+        pointer.to_ne_bytes()
+    }).collect()
+}
+
+/// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
+/// (before the mesh enables peers, so a peer-mapped allocation never lags the mapping);
+/// the hook is installed once every rank agreed on the per-layer symmetric verdicts.
+pub(crate) struct Qwen4TileRoute {
+    /// Owner rank of every expert (`i32` per expert, `e % ranks`): the mask and the pull
+    /// read it as an input.
+    owner_table: GpuTensor,
+    /// The masked tile ids gate/up and down read (`i32` per tile of the padded capacity).
+    tile_ids_owned: GpuTensor,
+    /// Padded tile capacity the exchange is registered for.
+    max_tiles: usize,
+    /// Per layer: the compact layer's symmetric verdict, taken on the full tables in
+    /// `attach_ep`. Empty until then.
+    verdicts: Vec<bool>,
+    /// The installed transport (`None` until the mesh agreed).
+    hook: Option<Arc<dyn MoeTileExchange + Send + Sync>>,
+}
+
+impl Qwen4TileRoute {
+    /// Admit the lever for this load or log why not and return `None` (nothing allocated).
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        scratch: &Qwen4GpuForwardScratch,
+        mode: Qwen4ForwardScratchMode,
+        max_chunk: usize,
+        flash_next: bool,
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        let refuse = |reason: &str| {
+            eprintln!(
+                "qwen4 EP rank {}/{}: owner-routed prefill not admitted ({reason}); chunks keep the full-table route",
+                placement.rank, placement.ranks
+            );
+            Ok(None)
+        };
+        if !tile_ranks_supported(placement.ranks) {
+            return refuse("needs 2 or 4 ranks");
+        }
+        if placement.ranks == 4 {
+            // The transport and the 4-source pull are rank-generic and CPU-tested, but the EP4
+            // exactness cells have not run on hardware: EP4 keeps the full-table route.
+            return refuse("EP4 owner-routed prefill not yet gated");
+        }
+        if gpu.arch != "gfx1201" {
+            return refuse("needs gfx1201");
+        }
+        if !flash_next {
+            return refuse("needs the Flash-Next profile");
+        }
+        if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
+            return refuse("the symmetric IU4 route is not requested");
+        }
+        if mode != Qwen4ForwardScratchMode::Full {
+            // The compact plan lends `y_down_grouped` to a phase-disjoint field the peer
+            // would be reading.
+            return refuse("the compact scratch plan aliases y_down_grouped");
+        }
+        // Sym scratch before the mesh enables peers (the grouped-row buffer and the masked
+        // ids are allocated now; ROCm does not map later allocations).
+        gpu.reserve_qwen4_moe_sym(
+            max_chunk,
+            config.num_experts_per_tok,
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+        )?;
+        let word = std::mem::size_of::<i32>();
+        let tile_bytes = 16 * config.hidden_size * DType::BF16.size();
+        let tile_capacity = scratch.moe_expert_tile_ids.buf.size() / word;
+        let max_tiles = tile_capacity.min(scratch.moe_y_down_grouped.buf.size() / tile_bytes);
+        if max_tiles == 0 {
+            return refuse("no tile capacity");
+        }
+        let owners = tile_owner_table_bytes(config.num_experts, placement.ranks);
+        let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
+        let sentinels = vec![0xFFu8; tile_capacity * word];
+        let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(owner_table);
+                return Err(error.into());
+            }
+        };
+        Ok(Some(Self {
+            owner_table,
+            tile_ids_owned,
+            max_tiles,
+            verdicts: Vec::new(),
+            hook: None,
+        }))
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.owner_table, self.tile_ids_owned] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// One host-mapped trunk MoE layer under balanced ownership: the rank's *live*
+/// expert runtime. It is the layer's full (P2P) addressing
+/// ([`Qwen4MoeLayerRuntime::from_moe_full`]); `qwen4_ep_owner_assign` rewrites
+/// its two pointer tables every call (owned routed experts keep their full
+/// address, every other entry names the rank's zero dummy expert), and the
+/// routed producers read those tables in place of the static EP decode table.
+pub(crate) struct Qwen4BalancedLayer {
+    live: Qwen4MoeLayerRuntime,
+    /// The layer's label (`layer.layer`, what the dispatch hook is called with).
+    label: usize,
+    tables: Qwen4EpOwnerTables,
+}
+
+/// What the row-gather hook needs of a rank's balanced layers: the owner-assign
+/// table addresses per layer label and a non-owning view of the rank's
+/// `slot_owner` buffer (owned by [`Qwen4ForwardEp`], freed with it).
+pub(crate) struct Qwen4BalancedPlan {
+    pub(crate) layers: Vec<(usize, Qwen4EpOwnerTables)>,
+    pub(crate) slot_owner: GpuTensor,
+}
+
+/// Expert-parallel state of one rank's forward (present iff the bundle's
+/// weights carry an EP placement).
+struct Qwen4ForwardEp {
+    placement: Qwen4EpPlacement,
+    dummy: Qwen4EpDummyExpert,
+    /// Per-layer full (P2P) tables for chunk forwards; empty until
+    /// [`Qwen4GpuForward::attach_ep`].
+    moe_full: Vec<Qwen4MoeLayerRuntime>,
+    /// Expanded-row exchange buffers, see [`qwen4_ep_buffer_index`].
+    buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS],
+    /// Row gather the one-row and few-row forwards install, once attached.
+    gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
+    /// Balanced-ownership state per MoE ordinal (`Some` for every host-mapped
+    /// trunk layer); empty when `HIPFIRE_EP_BALANCED_OWNERS=0` at
+    /// [`Qwen4GpuForward::attach_ep`].
+    balanced: Vec<Option<Qwen4BalancedLayer>>,
+    /// The rank's `QWEN4_EP_GATHER_MAX_ROWS * k` i32 slot owners, shared by the
+    /// balanced layers (stream-ordered: a call's assignment writes it and the
+    /// same call's gather reads it before the next layer's assignment).
+    slot_owner: Option<GpuTensor>,
+    /// Owner-routed chunk MoE state (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, admitted at
+    /// construction); `None` when the lever is off or refused.
+    tile: Option<Qwen4TileRoute>,
+}
+
+impl Qwen4ForwardEp {
+    fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        validate_ep_placement(placement, config.num_experts)?;
+        let elements = QWEN4_EP_GATHER_MAX_ROWS
+            .checked_mul(config.num_experts_per_tok)
+            .and_then(|slots| slots.checked_mul(config.hidden_size))
+            .ok_or_else(|| invalid("EP gather buffer size overflows"))?;
+        let dummy = Qwen4EpDummyExpert::new(gpu, config)?;
+        let mut buffers = Vec::with_capacity(QWEN4_EP_GATHER_BUFFERS);
+        for _ in 0..QWEN4_EP_GATHER_BUFFERS {
+            match gpu.zeros(&[elements], DType::F32) {
+                Ok(tensor) => buffers.push(tensor),
+                Err(error) => {
+                    for tensor in buffers {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    let _ = dummy.free_gpu(gpu);
+                    return Err(error.into());
+                }
+            }
+        }
+        let buffers: [GpuTensor; QWEN4_EP_GATHER_BUFFERS] = match buffers.try_into() {
+            Ok(buffers) => buffers,
+            Err(_) => return Err(invalid("EP gather buffer count")),
+        };
+        let state = Self {
+            placement,
+            dummy,
+            moe_full: Vec::new(),
+            buffers,
+            gather: None,
+            balanced: Vec::new(),
+            slot_owner: None,
+            tile: None,
+        };
+        // The zero fills are stream-ordered; peers read the buffers over P2P
+        // on their own streams.
+        if let Err(error) = gpu.hip.device_synchronize() {
+            let _ = state.free_gpu(gpu);
+            return Err(error.into());
+        }
+        Ok(state)
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for layer in self.moe_full {
+            if let Some(error) = layer.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        for layer in self.balanced.into_iter().flatten() {
+            if let Some(error) = layer.live.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(route) = self.tile {
+            if let Some(error) = route.free_gpu(gpu) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(tensor) = self.slot_owner {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        for tensor in self.buffers {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(error) = self.dummy.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        first
     }
 }
 
 impl Qwen4MoeLayerRuntime {
+    /// Single-device runtime: the layer's resident tensors hold every expert.
     pub(crate) fn from_moe(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         moe: &MoeWeights,
         layer_label: usize,
         config: &Qwen4Config,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Single,
+            None,
+        )
+    }
+
+    /// EP decode runtime: the resident expert tensors are this rank's compact
+    /// `num_experts / ranks` experts; owned experts name them, every other
+    /// expert names `dummy`.
+    pub(crate) fn from_moe_ep(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        dummy: &Qwen4EpDummyExpert,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy.source(),
+            },
+            Some(dummy),
+        )
+    }
+
+    /// EP chunk runtime: owned experts name the local compact tensors, every
+    /// other expert names the owning peer's compact tensors
+    /// (`peers_for_layer[rank]`).
+    pub(crate) fn from_moe_full(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers_for_layer: &[Qwen4PeerExpertSource],
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: peers_for_layer,
+            },
+            None,
+        )
+    }
+
+    /// Every table is one single-owner (rank 0 of 1) dispatch table whose
+    /// views mirror the host pointer entries; EP tables differ only in which
+    /// allocation an entry names, so dispatch validates and seals them like
+    /// the single-device table.
+    fn build(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        layout: Qwen4ExpertTableLayout<'_>,
+        dummy: Option<&Qwen4EpDummyExpert>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -830,8 +1731,9 @@ impl Qwen4MoeLayerRuntime {
         let down_row_stride = row_stride(down_dtype, config.moe_intermediate_size);
         let gate_up_expert_bytes = checked_bytes(gate_up_rows, gate_up_row_stride)?;
         let down_expert_bytes = checked_bytes(config.hidden_size, down_row_stride)?;
-        let expected_gate_up_bytes = checked_bytes(config.num_experts, gate_up_expert_bytes)?;
-        let expected_down_bytes = checked_bytes(config.num_experts, down_expert_bytes)?;
+        let source_experts = layout.local_experts(config.num_experts)?;
+        let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
+        let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
         if gate_up_source.buf.size() < expected_gate_up_bytes {
             return Err(invalid(format!(
                 "layer {} gate/up packed bytes {} < expected {}",
@@ -848,6 +1750,20 @@ impl Qwen4MoeLayerRuntime {
                 expected_down_bytes
             )));
         }
+        // EP: owned experts keep this rank's residency. A host-mapped compact
+        // tensor is device-visible exactly as in the single route, a non-owned
+        // expert names the device dummy (decode) or the owner's compact tensor
+        // (chunk). Peer pointers into pinned host memory rely on ROCm's UVA:
+        // pinned host allocations are device-visible from every GPU, so a
+        // peer's host-mapped compact tensor is read through the same address.
+        let local_host_mapped = gate_up_source.buf.is_host_mapped();
+        if matches!(layout, Qwen4ExpertTableLayout::Ep { .. })
+            && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
+        {
+            return Err(invalid(format!(
+                "layer {layer_label} EP dummy expert is QT44/QT53 but the experts are {gate_up_dtype:?}/{down_dtype:?}"
+            )));
+        }
 
         let (gate_up_source_name, down_source_name) = match &moe.expert_source_layout {
             ExpertSourceLayout::PackedFused { gate_up, down, .. } => {
@@ -860,13 +1776,70 @@ impl Qwen4MoeLayerRuntime {
                 )));
             }
         };
+        let local = Qwen4PeerExpertSource {
+            gate_up_base: gate_up_source.buf.as_ptr() as usize,
+            gate_up_bytes: gate_up_source.buf.size(),
+            down_base: down_source.buf.as_ptr() as usize,
+            down_bytes: down_source.buf.size(),
+        };
+        let table_entries = qwen4_expert_table_entries(
+            &layout,
+            local,
+            config.num_experts,
+            gate_up_expert_bytes,
+            down_expert_bytes,
+        )
+        .map_err(|error| match error {
+            Qwen4GpuForwardError::Invalid(message) => {
+                invalid(format!("layer {layer_label}: {message}"))
+            }
+            other => other,
+        })?;
+        // Whole-tensor windows over each peer rank's compact experts; the
+        // per-expert views below are cut from them. `qwen4_expert_table_entries`
+        // proved every slot lies inside its window.
+        let peer_sources: Vec<(GpuTensor, GpuTensor)> = match layout {
+            Qwen4ExpertTableLayout::Full { peers, .. } => peers
+                .iter()
+                .map(|peer| {
+                    (
+                        foreign_packed_source(peer.gate_up_base, peer.gate_up_bytes, gate_up_dtype),
+                        foreign_packed_source(peer.down_base, peer.down_bytes, down_dtype),
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut experts = Vec::with_capacity(config.num_experts);
         let mut metadata = Vec::with_capacity(config.num_experts);
-        for expert in 0..config.num_experts {
-            let gate_up_offset = expert * gate_up_expert_bytes;
-            let down_offset = expert * down_expert_bytes;
+        for (expert, entry) in table_entries.iter().enumerate() {
+            let (gate_up_backing, gate_up_offset, down_backing, down_offset) = match entry.origin {
+                Qwen4ExpertOrigin::Local => (
+                    gate_up_source,
+                    entry.gate_up_ptr - local.gate_up_base,
+                    down_source,
+                    entry.down_ptr - local.down_base,
+                ),
+                Qwen4ExpertOrigin::Dummy => {
+                    let dummy = dummy.ok_or_else(|| {
+                        invalid(format!("layer {layer_label}: EP table without a dummy expert"))
+                    })?;
+                    (&dummy.gate_up, 0, &dummy.down, 0)
+                }
+                Qwen4ExpertOrigin::Peer(rank) => {
+                    let (peer_gate_up, peer_down) = peer_sources.get(rank).ok_or_else(|| {
+                        invalid(format!("layer {layer_label}: peer rank {rank} has no source"))
+                    })?;
+                    (
+                        peer_gate_up,
+                        entry.gate_up_ptr - peer_gate_up.buf.as_ptr() as usize,
+                        peer_down,
+                        entry.down_ptr - peer_down.buf.as_ptr() as usize,
+                    )
+                }
+            };
             let gate_up = ProjectionView::from_packed(
-                gate_up_source,
+                gate_up_backing,
                 gate_up_offset,
                 gate_up_expert_bytes,
                 gate_up_dtype,
@@ -874,13 +1847,20 @@ impl Qwen4MoeLayerRuntime {
                 config.hidden_size,
             );
             let down = ProjectionView::from_packed(
-                down_source,
+                down_backing,
                 down_offset,
                 down_expert_bytes,
                 down_dtype,
                 config.hidden_size,
                 config.moe_intermediate_size,
             );
+            if gate_up.tensor.buf.as_ptr() as usize != entry.gate_up_ptr
+                || down.tensor.buf.as_ptr() as usize != entry.down_ptr
+            {
+                return Err(invalid(format!(
+                    "layer {layer_label} expert {expert} view disagrees with its table entry"
+                )));
+            }
             experts.push(Qwen4ExpertView { gate_up, down });
 
             let gate_up_resource = ExpertResource::new(
@@ -967,6 +1947,7 @@ impl Qwen4MoeLayerRuntime {
         let expert_views = ExpertViewSet {
             experts: &experts,
             identity,
+            host_mapped: local_host_mapped,
         };
         if let Err(error) = cache.bind_live(
             &table,
@@ -998,6 +1979,7 @@ impl Qwen4MoeLayerRuntime {
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
             symmetric: false,
+            host_mapped: local_host_mapped,
         })
     }
 
@@ -1076,6 +2058,9 @@ enum DonorState {
 pub(crate) struct Qwen4ExpertStage {
     /// Forwards of at least this many rows stage.
     min_rows: usize,
+    /// Long forwards with a wide-hidden capture stage too
+    /// ([`QWEN4_EXPERT_STAGE_CAPTURE_ENV`]).
+    capture: bool,
     /// Donor trunk layer per parity.
     donors: [usize; 2],
     /// Borrowed device views of each donor's gate/up and down experts,
@@ -1086,6 +2071,14 @@ pub(crate) struct Qwen4ExpertStage {
     /// Static per-expert pointer tables into each donor's gate/up and down
     /// VRAM, parity-major. They never replace a layer's bound mapped tables.
     tables: Vec<GpuTensor>,
+    /// EP tables preserve non-owned pointers from the runtime being bound.
+    compact_tables: Vec<GpuTensor>,
+    compact_keys: Vec<usize>,
+    full_keys: Vec<std::cell::OnceCell<usize>>,
+    compact_bound: Vec<std::cell::Cell<bool>>,
+    first_host: usize,
+    placement: Option<Qwen4EpPlacement>,
+    bytes: [usize; 2],
     copy_stream: hip_bridge::Stream,
     ready: Vec<hip_bridge::Event>,
     free: Vec<hip_bridge::Event>,
@@ -1095,6 +2088,32 @@ pub(crate) struct Qwen4ExpertStage {
 }
 
 impl Qwen4ExpertStage {
+    const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
+
+    /// Per-forward admission: full EP (EP2/EP4) chunk tables read other ranks' donor VRAM
+    /// and must never stage. S1 supplies true only when every trunk MoE layer
+    /// binds the compact owner-routed route. Single-card admission is unchanged.
+    ///
+    /// Entering a compact staged chunk after a full chunk is safe: the donor
+    /// overwrite waits on local `free`, recorded after this chunk's local
+    /// waits on peer ready; peer ready follows the previous forward in the
+    /// peer compute stream, so its earlier donor reads have completed.
+    fn begin_forward(&self, ep_compact_all_layers: bool) -> bool {
+        self.placement.is_none() || ep_compact_all_layers
+    }
+
+    /// Before any full-table EP chunk, S1 calls this on EVERY rank, then
+    /// crosses its host barrier before ANY rank launches that chunk. `join`
+    /// marks donors Resident after enqueueing restore waits, not host completion,
+    /// so even Resident donors must be drained before peers can read them.
+    fn ep_quiesce(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if gpu.active_stream.as_ref().map(|stream| gpu.hip.stream_is_capturing(stream)).transpose()?.unwrap_or(false) {
+            return Err(invalid("G2 EP quiescence cannot run during capture"));
+        }
+        gpu.hip.device_synchronize()?;
+        self.restore_blocking(gpu)
+    }
+
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
@@ -1132,9 +2151,12 @@ impl Qwen4ExpertStage {
         }
         let mut donors = [first_host - 2, first_host - 1];
         donors.sort_by_key(|layer| layer % 2);
-        let layer_bytes = QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES;
-        let mirror_bytes =
-            2 * layer_bytes as u64 + 4 * crate::expert_residency::HOST_MAPPED_PAD_BYTES;
+        let placement = bundle.weights.ep_placement();
+        let ranks = placement.map_or(1, |placement| placement.ranks);
+        let bytes = stage_donor_bytes(config.num_experts, ranks);
+        let layer_bytes = bytes.iter().sum::<usize>();
+        let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
+            .map_err(invalid)?;
         let admitted = crate::expert_residency::check_host_ram(
             mirror_bytes,
             rdna_compute::kv_slots::mem_available_bytes(),
@@ -1158,13 +2180,13 @@ impl Qwen4ExpertStage {
                 Ok([
                     (
                         &weights.experts_gate_up,
+                        bytes[0],
                         QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
-                        1_740_800,
                     ),
                     (
                         &weights.experts_down,
+                        bytes[1],
                         QWEN4_EXPERT_STAGE_DOWN_BYTES,
-                        870_400,
                     ),
                 ])
             };
@@ -1189,10 +2211,24 @@ impl Qwen4ExpertStage {
         gpu.ensure_capture_stream()?;
         let mut stage = Self {
             min_rows: qwen4_expert_stage_min_rows(),
+            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors,
             donor_views: Vec::with_capacity(4),
             mirrors: Vec::with_capacity(4),
             tables: Vec::with_capacity(4),
+            compact_tables: Vec::new(),
+            compact_keys: if placement.is_some() {
+                moe.iter().map(|runtime| runtime.expert_gate_up_ptrs.buf.as_ptr() as usize).collect()
+            } else { Vec::new() },
+            full_keys: if placement.is_some() {
+                (0..moe.len()).map(|_| std::cell::OnceCell::new()).collect()
+            } else { Vec::new() },
+            compact_bound: if placement.is_some() {
+                (0..moe.len()).map(|_| std::cell::Cell::new(false)).collect()
+            } else { Vec::new() },
+            first_host,
+            placement,
+            bytes,
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
@@ -1219,17 +2255,27 @@ impl Qwen4ExpertStage {
                     stage.mirrors.push(gpu.upload_raw_host_mapped(&host, &[bytes])?);
                     drop(host);
                     let base = view.buf.as_ptr() as usize;
-                    let entries = (0..config.num_experts)
-                        .flat_map(|expert| (base + expert * stride).to_ne_bytes())
-                        .collect::<Vec<_>>();
-                    stage
-                        .tables
-                        .push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
-                    gpu.memcpy_htod_auto(
-                        &stage.tables.last().expect("table just allocated").buf,
-                        &entries,
-                    )?;
+                    if placement.is_none() {
+                        let entries = (0..config.num_experts)
+                            .flat_map(|expert| (base + expert * stride).to_ne_bytes())
+                            .collect::<Vec<_>>();
+                        stage.tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                        gpu.memcpy_htod_auto(
+                            &stage.tables.last().expect("table just allocated").buf,
+                            &entries,
+                        )?;
+                    }
                     stage.donor_views.push(view);
+                }
+            }
+            if placement.is_some() {
+                for (layer, runtime) in moe.iter().enumerate().skip(first_host) {
+                    for (kind, entries) in [&runtime.expert_gate_up_entries, &runtime.expert_down_entries].into_iter().enumerate() {
+                        let redirected = stage.redirect_entries(layer, kind, entries);
+                        stage.compact_tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                        gpu.memcpy_htod_auto(&stage.compact_tables.last().expect("allocated").buf, &redirected)?;
+                        stage.tables.push(gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?);
+                    }
                 }
             }
             Ok::<(), Qwen4GpuForwardError>(())
@@ -1239,12 +2285,13 @@ impl Qwen4ExpertStage {
             return Err(error);
         }
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies)",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies; wide-hidden capture forwards {})",
             stage.min_rows,
             moe.len(),
             donors[0],
             donors[1],
-            2 * layer_bytes >> 20
+            2 * layer_bytes >> 20,
+            if stage.capture { "stage" } else { "mapped" }
         );
         Ok(Some(stage))
     }
@@ -1252,11 +2299,67 @@ impl Qwen4ExpertStage {
     /// The stage tables a host `layer` reads from on a staged forward.
     fn tables(&self, layer: usize) -> MoeStageTables<'_> {
         let parity = layer % 2;
+        if self.placement.is_some() && self.compact_bound[layer].get() {
+            return self.tables_compact(layer);
+        }
+        let index = if self.placement.is_some() { layer - self.first_host } else { parity };
         MoeStageTables {
-            gate_up: &self.tables[2 * parity],
-            down: &self.tables[2 * parity + 1],
+            gate_up: &self.tables[2 * index],
+            down: &self.tables[2 * index + 1],
             free: &self.free[parity],
         }
+    }
+
+    /// S1 binds this accessor when its compact owner-routed runtime is used.
+    fn tables_compact(&self, layer: usize) -> MoeStageTables<'_> {
+        if self.placement.is_none() {
+            return self.tables(layer);
+        }
+        let index = 2 * (layer - self.first_host);
+        MoeStageTables {
+            gate_up: &self.compact_tables[index],
+            down: &self.compact_tables[index + 1],
+            free: &self.free[layer % 2],
+        }
+    }
+
+    fn redirect_entries(&self, layer: usize, kind: usize, entries: &[usize]) -> Vec<u8> {
+        let placement = self.placement.expect("EP tables");
+        let base = self.donor_views[2 * (layer % 2) + kind].buf.as_ptr() as usize;
+        let stride = [QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES][kind];
+        redirect_owned_entries(placement, base, stride, entries)
+    }
+
+    /// Initialize a full EP table once, before any capture/tape. Compact
+    /// tables are built at load and remain separate from peer-mapped tables.
+    fn prepare_runtime(
+        &self,
+        gpu: &Gpu,
+        layer: usize,
+        runtime: Option<&Qwen4MoeLayerRuntime>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.placement.is_none() || layer < self.first_host {
+            return Ok(());
+        }
+        let runtime = runtime.ok_or_else(|| invalid("G2 staged EP runtime missing"))?;
+        let key = runtime.expert_gate_up_ptrs.buf.as_ptr() as usize;
+        let compact = key == self.compact_keys[layer];
+        self.compact_bound[layer].set(compact);
+        if compact {
+            return Ok(());
+        }
+        if let Some(&prepared) = self.full_keys[layer].get() {
+            return if prepared == key { Ok(()) } else { Err(invalid("G2 full runtime changed")) };
+        }
+        if gpu.active_stream.as_ref().map(|stream| gpu.hip.stream_is_capturing(stream)).transpose()?.unwrap_or(false) {
+            return Err(invalid("G2 EP stage table initialization cannot run during capture"));
+        }
+        for (kind, entries) in [&runtime.expert_gate_up_entries, &runtime.expert_down_entries].into_iter().enumerate() {
+            let redirected = self.redirect_entries(layer, kind, entries);
+            gpu.memcpy_htod_auto(&self.tables[2 * (layer - self.first_host) + kind].buf, &redirected)?;
+        }
+        self.full_keys[layer].set(key).map_err(|_| invalid("G2 full runtime initialized twice"))?;
+        Ok(())
     }
 
     fn set_state(&self, parity: usize, value: DonorState) {
@@ -1310,7 +2413,7 @@ impl Qwen4ExpertStage {
     ) -> Result<(), Qwen4GpuForwardError> {
         for (kind, (source, bytes)) in sources
             .into_iter()
-            .zip([QWEN4_EXPERT_STAGE_GATE_UP_BYTES, QWEN4_EXPERT_STAGE_DOWN_BYTES])
+            .zip(self.bytes)
             .enumerate()
         {
             gpu.hip.memcpy_htod_async(
@@ -1430,7 +2533,7 @@ impl Qwen4ExpertStage {
                 first.get_or_insert(error);
             }
         }
-        for tensor in self.tables.into_iter().chain(self.mirrors) {
+        for tensor in self.tables.into_iter().chain(self.compact_tables).chain(self.mirrors) {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
             }
@@ -1519,6 +2622,7 @@ pub(crate) fn seal_moe_decode<'a>(
     input: &'a GpuTensor,
     output: &'a GpuTensor,
     scratch: Qwen4MoeScratch<'a>,
+    row_gather: Option<&'a dyn MoeRowGather>,
 ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
@@ -1570,6 +2674,7 @@ pub(crate) fn seal_moe_decode<'a>(
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
+        cpu_deferred_experts: false,
         ep_mode: MoeEpMode::None,
         layer_idx: layer_index as u16,
         x_norm: input,
@@ -1606,6 +2711,7 @@ pub(crate) fn seal_moe_decode<'a>(
         topk_indices: scratch.topk_indices,
         topk_weights: scratch.topk_weights,
         down_expanded: scratch.down_expanded,
+        ep_row_gather: row_gather,
     };
     let bound = BoundMoeExperts::from_cache(&runtime.table, &runtime.cache)
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("bound MoE experts: {error:?}")))?;
@@ -1616,10 +2722,246 @@ pub(crate) fn seal_moe_decode<'a>(
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))
 }
 
+/// Every device field of [`Qwen4GpuForwardScratch`], in allocation order.
+/// The order is the plan's index: `plan` refuses to push a slot out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScratchField {
+    TokenIds,
+    EmbeddingRot,
+    Embeddings,
+    Streams,
+    HcNormalized,
+    HcLow,
+    HcUp,
+    HcMixed,
+    HcGates,
+    Rotation,
+    Projection,
+    Projection2,
+    GdnA,
+    GdnB,
+    GdnGate,
+    GdnBeta,
+    GdnRecurrentOutput,
+    GdnBf16,
+    GdnZ,
+    GdnOutput,
+    QsaIndex,
+    QsaQgate,
+    QsaK,
+    QsaV,
+    QsaOutput,
+    QsaSelected,
+    AttentionOutput,
+    PleStaged,
+    PleRows,
+    PleKey,
+    PleValue,
+    PleQuery,
+    PleGated,
+    PleNormed,
+    PleOutput,
+    RouterLogits,
+    MoeXRot,
+    MoeGateUp,
+    MoeGate,
+    MoeUp,
+    MoeHidden,
+    FfnOutput,
+    MoeSharedOutput,
+    MoeGateBatch,
+    MoeUpBatch,
+    MoeRotBatch,
+    MoeTopkIndices,
+    MoeTopkWeights,
+    MoeDownExpanded,
+    MoeScalar,
+    MoeExpertTokenCounts,
+    MoeExpertOffsets,
+    MoeSortedSlotIndex,
+    MoeExpertTileIds,
+    MoeInversePerm,
+    MoeYGateUpGrouped,
+    MoeYDownGrouped,
+    Logits,
+}
+
+impl ScratchField {
+    pub(crate) const COUNT: usize = Self::Logits as usize + 1;
+    const ALL: [Self; Self::COUNT] = [
+        Self::TokenIds, Self::EmbeddingRot, Self::Embeddings, Self::Streams,
+        Self::HcNormalized, Self::HcLow, Self::HcUp, Self::HcMixed, Self::HcGates,
+        Self::Rotation, Self::Projection, Self::Projection2,
+        Self::GdnA, Self::GdnB, Self::GdnGate, Self::GdnBeta,
+        Self::GdnRecurrentOutput, Self::GdnBf16, Self::GdnZ, Self::GdnOutput,
+        Self::QsaIndex, Self::QsaQgate, Self::QsaK, Self::QsaV, Self::QsaOutput,
+        Self::QsaSelected, Self::AttentionOutput, Self::PleStaged, Self::PleRows,
+        Self::PleKey, Self::PleValue, Self::PleQuery, Self::PleGated,
+        Self::PleNormed, Self::PleOutput, Self::RouterLogits, Self::MoeXRot,
+        Self::MoeGateUp, Self::MoeGate, Self::MoeUp, Self::MoeHidden,
+        Self::FfnOutput, Self::MoeSharedOutput, Self::MoeGateBatch,
+        Self::MoeUpBatch, Self::MoeRotBatch, Self::MoeTopkIndices,
+        Self::MoeTopkWeights, Self::MoeDownExpanded, Self::MoeScalar,
+        Self::MoeExpertTokenCounts, Self::MoeExpertOffsets, Self::MoeSortedSlotIndex,
+        Self::MoeExpertTileIds, Self::MoeInversePerm, Self::MoeYGateUpGrouped,
+        Self::MoeYDownGrouped, Self::Logits,
+    ];
+
+    /// Pair execution splits before the mixer: prepare's HC read cannot fuse
+    /// with its HC write, so only `HcMixed` survives that split. MLP HC fusions
+    /// remain wholly inside a fragment. Keep this exhaustive when adding fields.
+    fn npu_bank_lifetime(self) -> NpuBankLifetime {
+        use NpuBankLifetime as L;
+        match self {
+            Self::TokenIds | Self::EmbeddingRot | Self::Embeddings | Self::PleStaged => L::Initialize,
+            Self::Streams => L::Residual,
+            Self::HcMixed => L::PreparedInput,
+            Self::PleRows => L::StagedRows,
+            Self::HcNormalized | Self::HcLow | Self::HcUp | Self::Rotation | Self::GdnBf16
+            | Self::PleKey | Self::PleValue | Self::PleQuery | Self::PleGated
+            | Self::PleNormed | Self::PleOutput => L::PrepareAndFragment,
+            Self::HcGates | Self::Projection | Self::Projection2
+            | Self::GdnA | Self::GdnB | Self::GdnGate | Self::GdnBeta
+            | Self::GdnRecurrentOutput | Self::GdnZ | Self::GdnOutput
+            | Self::QsaIndex | Self::QsaQgate | Self::QsaK | Self::QsaV
+            | Self::QsaOutput | Self::QsaSelected | Self::AttentionOutput
+            | Self::RouterLogits
+            | Self::MoeXRot | Self::MoeGateUp | Self::MoeGate | Self::MoeUp
+            | Self::MoeHidden | Self::FfnOutput | Self::MoeSharedOutput
+            | Self::MoeGateBatch | Self::MoeUpBatch | Self::MoeRotBatch
+            | Self::MoeTopkIndices | Self::MoeTopkWeights | Self::MoeDownExpanded
+            | Self::MoeScalar | Self::MoeExpertTokenCounts | Self::MoeExpertOffsets
+            | Self::MoeSortedSlotIndex | Self::MoeExpertTileIds | Self::MoeInversePerm
+            | Self::MoeYGateUpGrouped | Self::MoeYDownGrouped => L::Fragment,
+            Self::Logits => L::Finish,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpuBankLifetime {
+    Initialize,
+    Residual,
+    PreparedInput,
+    StagedRows,
+    PrepareAndFragment,
+    Fragment,
+    Finish,
+}
+
+impl NpuBankLifetime {
+    fn private(self) -> bool {
+        matches!(self, Self::Residual | Self::PreparedInput | Self::StagedRows)
+    }
+}
+
+/// Which pair executor owns bank B. Under `Npu` the in-projection outputs live
+/// in the per-bank NPU C arenas across the switch; under `Emulated` the GPU
+/// twin projection writes them into scratch one layer ahead of their Core, so
+/// bank B keeps its own copies instead of sharing bank A's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpuBankKind {
+    Npu,
+    Emulated,
+}
+
+impl NpuBankKind {
+    /// Whether bank B owns `field` (rather than borrowing bank A's).
+    fn owns(self, field: ScratchField) -> bool {
+        use ScratchField as F;
+        field.npu_bank_lifetime().private()
+            || (self == Self::Emulated
+                && matches!(
+                    field,
+                    F::Projection | F::GdnA | F::GdnB | F::GdnZ
+                        | F::QsaIndex | F::QsaQgate | F::QsaK | F::QsaV
+                ))
+    }
+}
+
+/// One field of a scratch plan.
+///
+/// `owner == None`: the field owns a device allocation of `elements` of
+/// `dtype`.  `owner == Some(o)`: the field is a borrowed, never-freed view of
+/// `o`'s allocation from offset zero with the same `dtype` and an honest
+/// `elements`; `o` itself always owns its allocation.
+///
+/// `pitch` is set for every member of an alias set (the owner included, except
+/// a pure-capacity owner such as the grouped-down buffer): the row pitch in
+/// elements that a lane segment base uses.  All members of one alias set share
+/// the owner's pitch, so segments of different members that are live at once
+/// occupy disjoint, identically addressed row ranges (see
+/// [`Qwen4GpuForwardScratch::segment_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScratchSlot {
+    pub elements: usize,
+    pub dtype: DType,
+    pub owner: Option<ScratchField>,
+    pub pitch: Option<usize>,
+}
+
+impl ScratchSlot {
+    fn bytes(&self) -> Result<usize, Qwen4GpuForwardError> {
+        self.elements
+            .checked_mul(self.dtype.size())
+            .ok_or_else(|| invalid("scratch field byte size overflows"))
+    }
+}
+
+fn scratch_mul(a: usize, b: usize) -> Result<usize, Qwen4GpuForwardError> {
+    a.checked_mul(b)
+        .ok_or_else(|| invalid("scratch size arithmetic overflows"))
+}
+
+/// `(offset, len)` in elements of lane segment `[begin, begin + rows)` of an
+/// alias-set member whose owner row pitch is `pitch` (`logical_width <=
+/// pitch` elements per row are live) inside an owner view of `owner_numel`
+/// elements.  The base is `begin * pitch`, never `begin * logical_width`, so
+/// two members of one set that are live for the same segment address the
+/// same rows and segments of different sizes cannot overlap.  The returned
+/// length is the segment's whole reservation, `rows * pitch`.
+pub(crate) fn owner_pitch_extent(
+    pitch: usize,
+    owner_numel: usize,
+    begin: usize,
+    rows: usize,
+    logical_width: usize,
+) -> Result<(usize, usize), Qwen4GpuForwardError> {
+    if logical_width > pitch {
+        return Err(invalid(format!(
+            "lane segment row width {logical_width} exceeds its owner row pitch {pitch}"
+        )));
+    }
+    let offset = scratch_mul(begin, pitch)?;
+    let len = scratch_mul(rows, pitch)?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| invalid("lane segment reservation overflows"))?;
+    if end > owner_numel {
+        return Err(invalid(format!(
+            "lane segment rows {begin}..{} at owner pitch {pitch} exceed the {owner_numel}-element owner",
+            begin.saturating_add(rows)
+        )));
+    }
+    Ok((offset, len))
+}
+
 /// Device buffers shared by one forward object.  All allocations happen in
-/// `new`; token/chunk execution only creates borrowed subviews.
+/// `new`/`new_npu_bank`; token/chunk execution only creates borrowed subviews.
+///
+/// In [`Qwen4ForwardScratchMode::FnSymGfx1201`] eight fields are borrowed
+/// views of another field's allocation (see [`Self::plan`]); only owners are
+/// allocated, charged by [`Self::device_bytes`] and freed.
 pub struct Qwen4GpuForwardScratch {
     pub max_chunk: usize,
+    pub mode: Qwen4ForwardScratchMode,
+    /// The plan this scratch was built from, in [`ScratchField`] order.
+    pub(crate) slots: Vec<ScratchSlot>,
+    /// NPU bank B borrows every layer-local field from bank A; only the
+    /// bank-private lifetimes (and, under `emulate`, the in-projection outputs
+    /// its twin projection writes ahead of the consuming Core) are owned here.
+    /// Bank A outlives this view.
+    bank_kind: Option<NpuBankKind>,
     pub token_ids: GpuTensor,
     pub embedding_rot: GpuTensor,
     pub embeddings: GpuTensor,
@@ -1686,12 +3028,34 @@ pub struct Qwen4GpuForwardScratch {
 }
 
 impl Qwen4GpuForwardScratch {
-    /// Every device allocation of a `max_chunk`-row scratch as
-    /// `(elements, dtype)` in field order, plus the host PLE staging bytes.
+    /// Every field of a `max_chunk`-row scratch in [`ScratchField`] order
+    /// (allocation or borrowed view, with its dtype and element count), plus
+    /// the host PLE staging bytes.
+    ///
+    /// `Full` is one dedicated allocation per field.  `FnSymGfx1201` applies,
+    /// on top of the same field list, with `n = max_chunk`, `c = min(n,
+    /// QWEN4_COMPACT_FALLBACK_ROWS)` and `G(r)` the tile-padded grouped rows of
+    /// `r` rows:
+    /// - gate/up/rot batches: `c * top_k * moe_intermediate` F32;
+    /// - expanded down: `max(c*top_k*hidden*4, n*hidden*4, n*top_k*8)` bytes
+    ///   (the shared-down F32 fallback and combine-order bytes are reserved
+    ///   regardless of dtype or flags);
+    /// - grouped gate/up: `max(G(c)*2*moe*4, G(n)*moe*2)` bytes and grouped
+    ///   down `max(G(c)*hidden*4, G(n)*hidden*2)` bytes, kept as F32-typed
+    ///   facades of `bytes / 4` elements (the IU4 kernels read the pointers as
+    ///   BF16 storage);
+    /// - phase aliases: `hc_normalized`, `ple_query` -> `projection`;
+    ///   `hc_up`, `ple_key` -> `projection2`; `ple_gated` -> `rotation`;
+    ///   `ple_output` -> `moe_y_down_grouped`; `ple_value` ->
+    ///   `moe_shared_output`; `gdn_recurrent_output` -> `qsa_qgate`.
+    ///   `ple_normed` stays dedicated: partial verify rollback reads it after
+    ///   the forward.
     fn plan(
         config: &Qwen4Config,
         max_chunk: usize,
-    ) -> Result<(Vec<(usize, DType)>, usize), Qwen4GpuForwardError> {
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
+        use ScratchField as F;
         if max_chunk == 0 {
             return Err(invalid("max_chunk is zero"));
         }
@@ -1745,209 +3109,534 @@ impl Qwen4GpuForwardScratch {
         let tile_i32_bytes = (grouped_bound / 16)
             .checked_mul(i32_bytes)
             .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
-        let mut plan = Vec::new();
-        let mut alloc = |shape: &[usize], dtype: DType| -> Result<(), Qwen4GpuForwardError> {
+        let rows = |width: usize| scratch_mul(max_chunk, width);
+        let routed_width = scratch_mul(config.num_experts_per_tok, config.moe_intermediate_size)?;
+        let mut slots: Vec<ScratchSlot> = Vec::with_capacity(ScratchField::COUNT);
+        let mut alloc = |field: ScratchField,
+                         elements: usize,
+                         dtype: DType|
+         -> Result<(), Qwen4GpuForwardError> {
+            if slots.len() != field as usize {
+                return Err(invalid(format!(
+                    "scratch plan field {field:?} is out of order"
+                )));
+            }
             // Every planned buffer holds at least one element: MoE-only
             // extents are zero for a dense FFN.
-            plan.push((shape.iter().product::<usize>().max(1), dtype));
+            slots.push(ScratchSlot {
+                elements: elements.max(1),
+                dtype,
+                owner: None,
+                pitch: None,
+            });
             Ok(())
         };
         let result = (|| {
-            alloc(&[max_chunk * std::mem::size_of::<i32>()], DType::Raw)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * config.hc_lowrank], DType::F32)?;
-            alloc(&[max_chunk * wide], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * config.hc_count], DType::F32)?;
-            alloc(&[max_chunk * max_rotation], DType::F32)?;
-            alloc(&[max_chunk * max_projection], DType::F32)?;
-            alloc(&[max_chunk * max_projection], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * config.linear_num_value_heads], DType::F32)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[gdn_value.max(hidden).max(config.hc_lowrank)], DType::BF16)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[max_chunk * gdn_value], DType::F32)?;
-            alloc(&[max_chunk * qsa_index], DType::F32)?;
-            alloc(&[max_chunk * qsa_qgate], DType::F32)?;
+            alloc(F::TokenIds, rows(std::mem::size_of::<i32>())?, DType::Raw)?;
+            alloc(F::EmbeddingRot, rows(hidden)?, DType::F32)?;
+            alloc(F::Embeddings, rows(hidden)?, DType::F32)?;
+            alloc(F::Streams, rows(wide)?, DType::F32)?;
+            alloc(F::HcNormalized, rows(wide)?, DType::F32)?;
+            alloc(F::HcLow, rows(config.hc_lowrank)?, DType::F32)?;
+            alloc(F::HcUp, rows(wide)?, DType::F32)?;
+            alloc(F::HcMixed, rows(hidden)?, DType::F32)?;
+            alloc(F::HcGates, rows(config.hc_count)?, DType::F32)?;
+            alloc(F::Rotation, rows(max_rotation)?, DType::F32)?;
+            alloc(F::Projection, rows(max_projection)?, DType::F32)?;
+            alloc(F::Projection2, rows(max_projection)?, DType::F32)?;
+            alloc(F::GdnA, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnB, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnGate, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnBeta, rows(config.linear_num_value_heads)?, DType::F32)?;
+            alloc(F::GdnRecurrentOutput, rows(gdn_value)?, DType::F32)?;
+            alloc(F::GdnBf16, gdn_value.max(hidden).max(config.hc_lowrank), DType::BF16)?;
+            alloc(F::GdnZ, rows(gdn_value)?, DType::F32)?;
+            alloc(F::GdnOutput, rows(gdn_value)?, DType::F32)?;
+            alloc(F::QsaIndex, rows(qsa_index)?, DType::F32)?;
+            alloc(F::QsaQgate, rows(qsa_qgate)?, DType::F32)?;
             alloc(
-                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                F::QsaK,
+                rows(scratch_mul(config.num_key_value_heads, config.head_dim)?)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.num_key_value_heads * config.head_dim],
+                F::QsaV,
+                rows(scratch_mul(config.num_key_value_heads, config.head_dim)?)?,
                 DType::F32,
             )?;
-            alloc(&[max_chunk * q_width], DType::F32)?;
-            alloc(&[qsa_selected_bytes], DType::Raw)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * ple_embed_dim], DType::BF16)?;
-            alloc(&[max_chunk * ple_embed_dim.max(hidden)], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
-            alloc(&[max_chunk * ple_channels], DType::F32)?;
+            alloc(F::QsaOutput, rows(q_width)?, DType::F32)?;
+            alloc(F::QsaSelected, qsa_selected_bytes, DType::Raw)?;
+            alloc(F::AttentionOutput, rows(hidden)?, DType::F32)?;
+            alloc(F::PleStaged, rows(ple_embed_dim)?, DType::BF16)?;
+            alloc(F::PleRows, rows(ple_embed_dim.max(hidden))?, DType::F32)?;
+            alloc(F::PleKey, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleValue, rows(hidden)?, DType::F32)?;
+            alloc(F::PleQuery, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleGated, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleNormed, rows(ple_channels)?, DType::F32)?;
+            alloc(F::PleOutput, rows(ple_channels)?, DType::F32)?;
             // Viewed as `[rows, router_columns]` by every forward (one
             // placeholder column for a dense FFN).
-            alloc(&[max_chunk * router_columns(dims)], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * 2 * config.moe_intermediate_size], DType::F32)?;
+            alloc(F::RouterLogits, rows(router_columns(dims))?, DType::F32)?;
+            alloc(F::MoeXRot, rows(hidden)?, DType::F32)?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeGateUp,
+                rows(2 * config.moe_intermediate_size)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeGate,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeUp,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
-            alloc(&[max_chunk * hidden], DType::F32)?;
+            alloc(
+                F::MoeHidden,
+                rows(config.shared_expert_intermediate_size)?,
+                DType::F32,
+            )?;
+            alloc(F::FfnOutput, rows(hidden)?, DType::F32)?;
+            alloc(F::MoeSharedOutput, rows(hidden)?, DType::F32)?;
             // Batched gate/up rows: routed slots * routed intermediate for a
             // MoE profile, rows * intermediate for a dense FFN (exactly one of
             // the two extents is nonzero); `Step::DenseFfn` borrows both.
-            alloc(&[ffn_batch_rows], DType::F32)?;
-            alloc(&[ffn_batch_rows], DType::F32)?;
+            alloc(F::MoeGateBatch, ffn_batch_rows, DType::F32)?;
+            alloc(F::MoeUpBatch, ffn_batch_rows, DType::F32)?;
+            alloc(F::MoeRotBatch, rows(routed_width)?, DType::F32)?;
+            alloc(F::MoeTopkIndices, route_i32_bytes, DType::Raw)?;
             alloc(
-                &[max_chunk * config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32,
-            )?;
-            alloc(&[route_i32_bytes], DType::Raw)?;
-            alloc(&[max_chunk * config.num_experts_per_tok], DType::F32)?;
-            alloc(
-                &[max_chunk * config.num_experts_per_tok * hidden],
+                F::MoeTopkWeights,
+                rows(config.num_experts_per_tok)?,
                 DType::F32,
             )?;
             alloc(
-                &[max_chunk * config.shared_expert_intermediate_size],
+                F::MoeDownExpanded,
+                rows(scratch_mul(config.num_experts_per_tok, hidden)?)?,
                 DType::F32,
             )?;
-            alloc(&[expert_i32_bytes], DType::Raw)?;
-            alloc(&[expert_offsets_bytes], DType::Raw)?;
-            alloc(&[grouped_i32_bytes], DType::Raw)?;
-            alloc(&[tile_i32_bytes], DType::Raw)?;
-            alloc(&[route_i32_bytes], DType::Raw)?;
             alloc(
-                &[grouped_bound * 2 * config.moe_intermediate_size],
+                F::MoeScalar,
+                rows(config.shared_expert_intermediate_size)?,
                 DType::F32,
             )?;
-            alloc(&[grouped_bound * hidden], DType::F32)?;
-            alloc(&[config.vocab_size], DType::F32)?;
+            alloc(F::MoeExpertTokenCounts, expert_i32_bytes, DType::Raw)?;
+            alloc(F::MoeExpertOffsets, expert_offsets_bytes, DType::Raw)?;
+            alloc(F::MoeSortedSlotIndex, grouped_i32_bytes, DType::Raw)?;
+            alloc(F::MoeExpertTileIds, tile_i32_bytes, DType::Raw)?;
+            alloc(F::MoeInversePerm, route_i32_bytes, DType::Raw)?;
+            alloc(
+                F::MoeYGateUpGrouped,
+                scratch_mul(grouped_bound, 2 * config.moe_intermediate_size)?,
+                DType::F32,
+            )?;
+            alloc(
+                F::MoeYDownGrouped,
+                scratch_mul(grouped_bound, hidden)?,
+                DType::F32,
+            )?;
+            alloc(F::Logits, config.vocab_size, DType::F32)?;
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         result?;
-        Ok((plan, max_ple_bytes))
+        if slots.len() != ScratchField::COUNT {
+            return Err(invalid("scratch plan does not cover every field"));
+        }
+        if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+            if ple_channels != wide {
+                return Err(invalid(
+                    "compact scratch requires PLE channels equal to the hyper-connection width",
+                ));
+            }
+            let f32_bytes = std::mem::size_of::<f32>();
+            let bf16_bytes = DType::BF16.size();
+            let top_k = config.num_experts_per_tok;
+            let moe = config.moe_intermediate_size;
+            let fallback_rows = max_chunk.min(QWEN4_COMPACT_FALLBACK_ROWS);
+            let fallback_grouped = crate::program::grouped_m_total_bound(
+                scratch_mul(fallback_rows, top_k)?,
+                config.num_experts,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+            // Elements of an F32-typed facade over `bytes` of storage.
+            let facade = |bytes: usize| bytes.div_ceil(f32_bytes);
+            let fallback_batch = scratch_mul(fallback_rows, routed_width)?;
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                slots[field as usize].elements = fallback_batch;
+            }
+            let hidden_f32_bytes = scratch_mul(hidden, f32_bytes)?;
+            let expanded_bytes = scratch_mul(scratch_mul(fallback_rows, top_k)?, hidden_f32_bytes)?
+                .max(scratch_mul(max_chunk, hidden_f32_bytes)?)
+                .max(scratch_mul(scratch_mul(max_chunk, top_k)?, 8)?);
+            slots[F::MoeDownExpanded as usize].elements = facade(expanded_bytes);
+            let gate_up_f32 =
+                scratch_mul(fallback_grouped, scratch_mul(2 * moe, f32_bytes)?)?;
+            let gate_up_bf16 = scratch_mul(grouped_bound, scratch_mul(moe, bf16_bytes)?)?;
+            slots[F::MoeYGateUpGrouped as usize].elements = facade(gate_up_f32.max(gate_up_bf16));
+            let down_f32 = scratch_mul(fallback_grouped, hidden_f32_bytes)?;
+            let down_bf16 = scratch_mul(grouped_bound, scratch_mul(hidden, bf16_bytes)?)?;
+            slots[F::MoeYDownGrouped as usize].elements = facade(down_f32.max(down_bf16));
+
+            // `owner_pitch`: row pitch of the owner's lane segments (`None`
+            // for a pure-capacity owner); `view_pitch`: the views' pitch.
+            let mut bind = |owner: F,
+                            owner_pitch: Option<usize>,
+                            view_pitch: usize,
+                            views: &[F]|
+             -> Result<(), Qwen4GpuForwardError> {
+                let owner_slot = slots[owner as usize];
+                if owner_slot.owner.is_some() {
+                    return Err(invalid(format!(
+                        "scratch alias owner {owner:?} is itself a view"
+                    )));
+                }
+                if let Some(pitch) = owner_pitch {
+                    if owner_slot.elements < scratch_mul(max_chunk, pitch)? {
+                        return Err(invalid(format!(
+                            "scratch alias owner {owner:?} is smaller than {max_chunk} rows of pitch {pitch}"
+                        )));
+                    }
+                    slots[owner as usize].pitch = Some(pitch);
+                }
+                for &view in views {
+                    let slot = slots[view as usize];
+                    if slot.owner.is_some() || slot.dtype != owner_slot.dtype {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} cannot alias {owner:?}"
+                        )));
+                    }
+                    if slot.elements > owner_slot.elements {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} ({} elements) exceeds its owner {owner:?} ({} elements)",
+                            slot.elements, owner_slot.elements
+                        )));
+                    }
+                    if slot.elements > scratch_mul(max_chunk, view_pitch)? {
+                        return Err(invalid(format!(
+                            "scratch field {view:?} is wider than its owner pitch {view_pitch}"
+                        )));
+                    }
+                    slots[view as usize].owner = Some(owner);
+                    slots[view as usize].pitch = Some(view_pitch);
+                }
+                Ok(())
+            };
+            bind(
+                F::Projection,
+                Some(max_projection),
+                max_projection,
+                &[F::HcNormalized, F::PleQuery],
+            )?;
+            bind(
+                F::Projection2,
+                Some(max_projection),
+                max_projection,
+                &[F::HcUp, F::PleKey],
+            )?;
+            bind(F::Rotation, Some(max_rotation), max_rotation, &[F::PleGated])?;
+            bind(F::MoeYDownGrouped, None, ple_channels, &[F::PleOutput])?;
+            bind(F::MoeSharedOutput, Some(hidden), hidden, &[F::PleValue])?;
+            bind(
+                F::QsaQgate,
+                Some(qsa_qgate),
+                qsa_qgate,
+                &[F::GdnRecurrentOutput],
+            )?;
+        }
+        Ok((slots, max_ple_bytes))
     }
 
-    /// Device bytes [`Self::new`] allocates for `max_chunk` rows.
+    /// Device bytes [`Self::new`] allocates for `max_chunk` rows: the owning
+    /// slots only; borrowed views are not charged.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
     ) -> Result<u64, Qwen4GpuForwardError> {
-        let (plan, _) = Self::plan(config, max_chunk)?;
-        Ok(plan
+        let (slots, _) = Self::plan(config, max_chunk, mode)?;
+        slots
             .iter()
-            .map(|&(elements, dtype)| (elements * dtype.size()) as u64)
-            .sum())
+            .filter(|slot| slot.owner.is_none())
+            .try_fold(0u64, |total, slot| {
+                total
+                    .checked_add(slot.bytes()? as u64)
+                    .ok_or_else(|| invalid("scratch device bytes overflow"))
+            })
     }
 
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
-        let (plan, max_ple_bytes) = Self::plan(config, max_chunk)?;
-        let mut allocated = Vec::with_capacity(plan.len());
-        for &(elements, dtype) in &plan {
-            match gpu.zeros(&[elements], dtype) {
-                Ok(tensor) => allocated.push(tensor),
+        Self::allocate(gpu, config, max_chunk, mode, None)
+    }
+
+    /// Allocate only state live across the A/B switch. All borrowed pointers
+    /// remain owned by `bank_a`, which must outlive this bank and GPU work.
+    fn new_npu_bank(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        bank_a: &Self,
+        emulated: bool,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        if bank_a.mode != Qwen4ForwardScratchMode::Full {
+            return Err(invalid("NPU shared bank requires full scratch"));
+        }
+        let kind = if emulated { NpuBankKind::Emulated } else { NpuBankKind::Npu };
+        Self::allocate(gpu, config, bank_a.max_chunk, bank_a.mode, Some((bank_a, kind)))
+    }
+
+    #[cfg(test)]
+    fn npu_bank_device_bytes(
+        config: &Qwen4Config,
+        max_chunk: usize,
+    ) -> Result<u64, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan(config, max_chunk, Qwen4ForwardScratchMode::Full)?;
+        Self::npu_bank_plan_bytes(&slots, false)
+    }
+
+    fn npu_bank_plan_bytes(slots: &[ScratchSlot], emulated: bool) -> Result<u64, Qwen4GpuForwardError> {
+        let kind = if emulated { NpuBankKind::Emulated } else { NpuBankKind::Npu };
+        slots.iter().enumerate().try_fold(0u64, |total, (index, slot)| {
+            // The exhaustive field table is shared by allocation and freeing.
+            let private = kind.owns(ScratchField::ALL[index]);
+            total.checked_add(if private { slot.bytes()? as u64 } else { 0 })
+                .ok_or_else(|| invalid("NPU bank device bytes overflow"))
+        })
+    }
+
+    fn allocate(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        bank: Option<(&Self, NpuBankKind)>,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let bank_a = bank.map(|(bank_a, _)| bank_a);
+        let bank_kind = bank.map(|(_, kind)| kind);
+        let (slots, max_ple_bytes) = Self::plan(config, max_chunk, mode)?;
+        // Owners first; a view needs its owner's pointer.
+        let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.owner.is_some()
+                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
+            {
+                tensors.push(None);
+                continue;
+            }
+            match gpu.zeros(&[slot.elements], slot.dtype) {
+                Ok(tensor) => tensors.push(Some(tensor)),
                 Err(error) => {
-                    for tensor in allocated {
+                    // Only owners are present: each is freed exactly once.
+                    for tensor in tensors.into_iter().flatten() {
                         let _ = gpu.free_tensor(tensor);
                     }
                     return Err(error.into());
                 }
             }
         }
-        let mut next = || allocated.remove(0);
+        for (index, slot) in slots.iter().enumerate() {
+            if let Some(owner) = slot.owner {
+                let view = tensors[owner as usize]
+                    .as_ref()
+                    .expect("plan validated that a view's owner owns its allocation")
+                    .sub_offset(0, slot.elements);
+                tensors[index] = Some(view);
+            }
+        }
+        if let Some(bank_a) = bank_a {
+            for (index, slot) in slots.iter().enumerate() {
+                let field = ScratchField::ALL[index];
+                if !bank_kind.expect("a borrowed bank has a kind").owns(field) {
+                    tensors[index] = Some(bank_a.field_tensor(field).sub_offset(0, slot.elements));
+                }
+            }
+        }
+        let mut take = |field: ScratchField| {
+            tensors[field as usize]
+                .take()
+                .expect("every scratch field is bound exactly once")
+        };
+        use ScratchField as F;
+        let scratch = Self {
+            max_chunk,
+            mode,
+            bank_kind,
+            token_ids: take(F::TokenIds),
+            embedding_rot: take(F::EmbeddingRot),
+            embeddings: take(F::Embeddings),
+            streams: take(F::Streams),
+            hc_normalized: take(F::HcNormalized),
+            hc_low: take(F::HcLow),
+            hc_up: take(F::HcUp),
+            hc_mixed: take(F::HcMixed),
+            hc_gates: take(F::HcGates),
+            rotation: take(F::Rotation),
+            projection: take(F::Projection),
+            projection2: take(F::Projection2),
+            gdn_a: take(F::GdnA),
+            gdn_b: take(F::GdnB),
+            gdn_gate: take(F::GdnGate),
+            gdn_beta: take(F::GdnBeta),
+            gdn_recurrent_output: take(F::GdnRecurrentOutput),
+            gdn_bf16: take(F::GdnBf16),
+            gdn_z: take(F::GdnZ),
+            gdn_output: take(F::GdnOutput),
+            qsa_index: take(F::QsaIndex),
+            qsa_qgate: take(F::QsaQgate),
+            qsa_k: take(F::QsaK),
+            qsa_v: take(F::QsaV),
+            qsa_output: take(F::QsaOutput),
+            qsa_selected: take(F::QsaSelected),
+            attention_output: take(F::AttentionOutput),
+            ple_staged: take(F::PleStaged),
+            ple_rows: take(F::PleRows),
+            ple_key: take(F::PleKey),
+            ple_value: take(F::PleValue),
+            ple_query: take(F::PleQuery),
+            ple_gated: take(F::PleGated),
+            ple_normed: take(F::PleNormed),
+            ple_output: take(F::PleOutput),
+            router_logits: take(F::RouterLogits),
+            moe_x_rot: take(F::MoeXRot),
+            moe_gate_up: take(F::MoeGateUp),
+            moe_gate: take(F::MoeGate),
+            moe_up: take(F::MoeUp),
+            moe_hidden: take(F::MoeHidden),
+            ffn_output: take(F::FfnOutput),
+            moe_shared_output: take(F::MoeSharedOutput),
+            moe_gate_batch: take(F::MoeGateBatch),
+            moe_up_batch: take(F::MoeUpBatch),
+            moe_rot_batch: take(F::MoeRotBatch),
+            moe_topk_indices: take(F::MoeTopkIndices),
+            moe_topk_weights: take(F::MoeTopkWeights),
+            moe_down_expanded: take(F::MoeDownExpanded),
+            moe_scalar: take(F::MoeScalar),
+            moe_expert_token_counts: take(F::MoeExpertTokenCounts),
+            moe_expert_offsets: take(F::MoeExpertOffsets),
+            moe_sorted_slot_index: take(F::MoeSortedSlotIndex),
+            moe_expert_tile_ids: take(F::MoeExpertTileIds),
+            moe_inverse_perm: take(F::MoeInversePerm),
+            moe_y_gate_up_grouped: take(F::MoeYGateUpGrouped),
+            moe_y_down_grouped: take(F::MoeYDownGrouped),
+            logits: take(F::Logits),
+            slots,
+        };
         Ok((
-            Self {
-                max_chunk,
-                token_ids: next(),
-                embedding_rot: next(),
-                embeddings: next(),
-                streams: next(),
-                hc_normalized: next(),
-                hc_low: next(),
-                hc_up: next(),
-                hc_mixed: next(),
-                hc_gates: next(),
-                rotation: next(),
-                projection: next(),
-                projection2: next(),
-                gdn_a: next(),
-                gdn_b: next(),
-                gdn_gate: next(),
-                gdn_beta: next(),
-                gdn_recurrent_output: next(),
-                gdn_bf16: next(),
-                gdn_z: next(),
-                gdn_output: next(),
-                qsa_index: next(),
-                qsa_qgate: next(),
-                qsa_k: next(),
-                qsa_v: next(),
-                qsa_output: next(),
-                qsa_selected: next(),
-                attention_output: next(),
-                ple_staged: next(),
-                ple_rows: next(),
-                ple_key: next(),
-                ple_value: next(),
-                ple_query: next(),
-                ple_gated: next(),
-                ple_normed: next(),
-                ple_output: next(),
-                router_logits: next(),
-                moe_x_rot: next(),
-                moe_gate_up: next(),
-                moe_gate: next(),
-                moe_up: next(),
-                moe_hidden: next(),
-                ffn_output: next(),
-                moe_shared_output: next(),
-                moe_gate_batch: next(),
-                moe_up_batch: next(),
-                moe_rot_batch: next(),
-                moe_topk_indices: next(),
-                moe_topk_weights: next(),
-                moe_down_expanded: next(),
-                moe_scalar: next(),
-                moe_expert_token_counts: next(),
-                moe_expert_offsets: next(),
-                moe_sorted_slot_index: next(),
-                moe_expert_tile_ids: next(),
-                moe_inverse_perm: next(),
-                moe_y_gate_up_grouped: next(),
-                moe_y_down_grouped: next(),
-                logits: next(),
-            },
+            scratch,
             vec![0; max_chunk * std::mem::size_of::<i32>()],
             vec![0; max_ple_bytes],
         ))
     }
 
+    /// The tensor of `field`: an owner's allocation or a borrowed view.
+    pub(crate) fn field_tensor(&self, field: ScratchField) -> &GpuTensor {
+        use ScratchField as F;
+        match field {
+            F::TokenIds => &self.token_ids,
+            F::EmbeddingRot => &self.embedding_rot,
+            F::Embeddings => &self.embeddings,
+            F::Streams => &self.streams,
+            F::HcNormalized => &self.hc_normalized,
+            F::HcLow => &self.hc_low,
+            F::HcUp => &self.hc_up,
+            F::HcMixed => &self.hc_mixed,
+            F::HcGates => &self.hc_gates,
+            F::Rotation => &self.rotation,
+            F::Projection => &self.projection,
+            F::Projection2 => &self.projection2,
+            F::GdnA => &self.gdn_a,
+            F::GdnB => &self.gdn_b,
+            F::GdnGate => &self.gdn_gate,
+            F::GdnBeta => &self.gdn_beta,
+            F::GdnRecurrentOutput => &self.gdn_recurrent_output,
+            F::GdnBf16 => &self.gdn_bf16,
+            F::GdnZ => &self.gdn_z,
+            F::GdnOutput => &self.gdn_output,
+            F::QsaIndex => &self.qsa_index,
+            F::QsaQgate => &self.qsa_qgate,
+            F::QsaK => &self.qsa_k,
+            F::QsaV => &self.qsa_v,
+            F::QsaOutput => &self.qsa_output,
+            F::QsaSelected => &self.qsa_selected,
+            F::AttentionOutput => &self.attention_output,
+            F::PleStaged => &self.ple_staged,
+            F::PleRows => &self.ple_rows,
+            F::PleKey => &self.ple_key,
+            F::PleValue => &self.ple_value,
+            F::PleQuery => &self.ple_query,
+            F::PleGated => &self.ple_gated,
+            F::PleNormed => &self.ple_normed,
+            F::PleOutput => &self.ple_output,
+            F::RouterLogits => &self.router_logits,
+            F::MoeXRot => &self.moe_x_rot,
+            F::MoeGateUp => &self.moe_gate_up,
+            F::MoeGate => &self.moe_gate,
+            F::MoeUp => &self.moe_up,
+            F::MoeHidden => &self.moe_hidden,
+            F::FfnOutput => &self.ffn_output,
+            F::MoeSharedOutput => &self.moe_shared_output,
+            F::MoeGateBatch => &self.moe_gate_batch,
+            F::MoeUpBatch => &self.moe_up_batch,
+            F::MoeRotBatch => &self.moe_rot_batch,
+            F::MoeTopkIndices => &self.moe_topk_indices,
+            F::MoeTopkWeights => &self.moe_topk_weights,
+            F::MoeDownExpanded => &self.moe_down_expanded,
+            F::MoeScalar => &self.moe_scalar,
+            F::MoeExpertTokenCounts => &self.moe_expert_token_counts,
+            F::MoeExpertOffsets => &self.moe_expert_offsets,
+            F::MoeSortedSlotIndex => &self.moe_sorted_slot_index,
+            F::MoeExpertTileIds => &self.moe_expert_tile_ids,
+            F::MoeInversePerm => &self.moe_inverse_perm,
+            F::MoeYGateUpGrouped => &self.moe_y_gate_up_grouped,
+            F::MoeYDownGrouped => &self.moe_y_down_grouped,
+            F::Logits => &self.logits,
+        }
+    }
+
+    /// Rows `[begin, begin + rows)` of `field` for one lane segment, each
+    /// row `logical_width` live elements wide.
+    ///
+    /// A dedicated field (no pitch) is addressed contiguously at its logical
+    /// width from row `begin` to its end.  An alias-set member is addressed at
+    /// its allocation owner's row pitch ([`owner_pitch_extent`]) and the view
+    /// is the segment's whole `rows * pitch` reservation, so every member of a
+    /// set maps one segment to the same rows of one owner.  The returned view
+    /// is an ordinary contiguous tensor: kernels get no strided ABI.
+    pub(crate) fn segment_view(
+        &self,
+        field: ScratchField,
+        begin: usize,
+        rows: usize,
+        logical_width: usize,
+    ) -> Result<GpuTensor, Qwen4GpuForwardError> {
+        let tensor = self.field_tensor(field);
+        let numel = tensor.numel();
+        match self.slots[field as usize].pitch {
+            None => {
+                let offset = scratch_mul(begin, logical_width)?;
+                if offset > numel {
+                    return Err(invalid("lane row view starts past its scratch tensor"));
+                }
+                Ok(tensor.sub_offset(offset, numel - offset))
+            }
+            Some(pitch) => {
+                let (offset, len) = owner_pitch_extent(pitch, numel, begin, rows, logical_width)?;
+                Ok(tensor.sub_offset(offset, len))
+            }
+        }
+    }
+
+    /// Free the owners.  Borrowed views are never freed: their allocation is
+    /// freed once, through its owner.
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let slots = self.slots;
+        let bank_kind = self.bank_kind;
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -2008,8 +3697,14 @@ impl Qwen4GpuForwardScratch {
             self.moe_y_down_grouped,
             self.logits,
         ];
+        debug_assert_eq!(tensors.len(), slots.len());
         let mut first = None;
-        for tensor in tensors {
+        for (index, (tensor, slot)) in tensors.into_iter().zip(slots).enumerate() {
+            if slot.owner.is_some()
+                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
+            {
+                continue;
+            }
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
                     first = Some(error);
@@ -2107,6 +3802,12 @@ pub struct Qwen4GpuForward {
     token_readback: Option<TokenReadback>,
     pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
     expert_stage: Option<Qwen4ExpertStage>,
+    /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
+    /// placement): the zero dummy expert, the full per-layer tables for chunk
+    /// forwards, the row-gather buffers and the installed gather. Under EP
+    /// `moe` holds the per-layer decode tables, there is no G2 expert stage,
+    /// and no forward records or replays a retained body.
+    ep: Option<Qwen4ForwardEp>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -2137,6 +3838,8 @@ pub struct Qwen4GpuForward {
     /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
+    #[cfg(target_os = "linux")]
+    npu_trunk: Option<npu_forward::NpuForward>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -2159,7 +3862,7 @@ struct RouteTrace {
     out: std::io::BufWriter<std::fs::File>,
 }
 
-/// Opt-in dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
+/// Dense IU4 trunk (`HIPFIRE_QWEN4_TRUNK_IU4=<mask>`, see
 /// [`rdna_compute::Qwen4TrunkMask`]) over a trunk that may mix symmetric
 /// MQ4G256V2 (QT44) and other tiers (MQ6 ...) per tensor: check on the device
 /// that every MQ4G256V2 trunk projection (GDN qkv/z/a/b/out, QSA
@@ -2170,7 +3873,11 @@ struct RouteTrace {
 /// original tensors stay for decode). Arms `gpu.qwen4_trunk_iu4` iff at least
 /// one trunk tensor is MQ4G256V2 and in the mask (A4 projections > 0) and
 /// every MQ4 one verified. Returns the folds
-/// and the per-layer A4 mask bits (empty when not armed). A bad mask value
+/// and the per-layer A4 mask bits (empty when not armed). The mask is the
+/// `HIPFIRE_QWEN4_TRUNK_IU4` override when that variable is set (`0` = off),
+/// else the artifact's embedded `qwen4_trunk_iu4_default` default on its exact
+/// architecture ([`rdna_compute::qwen4_trunk_iu4_route`]); an unmarked
+/// artifact is off unless the variable selects a mask. A bad mask value
 /// fails the load even when the route cannot arm; nothing else runs unless
 /// the route was requested.
 fn prepare_trunk_iu4(
@@ -2178,11 +3885,27 @@ fn prepare_trunk_iu4(
     bundle: &Qwen4Bundle,
 ) -> Result<(Vec<Option<GpuTensor>>, Vec<u16>), Qwen4GpuForwardError> {
     gpu.qwen4_trunk_iu4 = false;
-    let mask = rdna_compute::qwen4_trunk_iu4_mask().map_err(invalid)?;
+    let route = rdna_compute::qwen4_trunk_iu4_route(&gpu.arch, bundle.config.trunk_iu4_default)
+        .map_err(invalid)?;
+    let mask = &route.mask;
     mask.check_layers(bundle.weights.layer_refs.len())
         .map_err(|error| invalid(format!("HIPFIRE_QWEN4_TRUNK_IU4: {error}")))?;
     let mut folds = Vec::new();
-    if !gpu.qwen4_trunk_iu4_requested() {
+    if !gpu.qwen4_trunk_iu4_requested(mask) {
+        // A marked artifact on its exact arch whose default the env switched
+        // off (`0` / empty): say so, so the kill is visible at load. Unmarked
+        // artifacts and other arches return silently, as before.
+        if let Some(default) = bundle.config.trunk_iu4_default {
+            if route.source == rdna_compute::TrunkIu4MaskSource::Env
+                && mask.is_empty()
+                && gpu.arch == default.arch()
+            {
+                eprintln!(
+                    "  qwen4 IU4 trunk: mask=off (env override), artifact default {} disabled; QT44 trunk weights stay resident, stock route",
+                    default.marker()
+                );
+            }
+        }
         return Ok((folds, Vec::new()));
     }
     let weights = &bundle.weights;
@@ -2227,8 +3950,14 @@ fn prepare_trunk_iu4(
         }
     }
     eprintln!(
-        "  qwen4 IU4 trunk: mask={} MQ4 {verified}/{mq4} verified symmetric, A4 {a4} projections, MQ6/other {other}",
-        mask.canonical()
+        "  qwen4 IU4 trunk: mask={} ({}) MQ4 {verified}/{mq4} verified symmetric, A4 {a4} projections, MQ6/other {other}",
+        mask.canonical(),
+        match route.source {
+            rdna_compute::TrunkIu4MaskSource::Env => "env override".to_owned(),
+            rdna_compute::TrunkIu4MaskSource::ArtifactDefault(default) =>
+                format!("artifact default {}", default.marker()),
+            rdna_compute::TrunkIu4MaskSource::Off => "off".to_owned(),
+        }
     );
     if mq4 == 0 || verified != mq4 || a4 == 0 {
         return Ok((folds, Vec::new()));
@@ -2303,27 +4032,95 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::new_inner(
+            gpu, bundle, max_chunk, mode,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Prepare the stock MQ6 trunk before the bundle swaps any overlay tensors.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_npu_trunk(
+        gpu: &mut Gpu, bundle: &Qwen4Bundle, pre_overlay: bool, rows: usize, mode: Qwen4ForwardScratchMode,
+    ) -> Result<Option<npu_forward::PreparedTrunk>, Qwen4GpuForwardError> {
+        npu_forward::NpuForward::prepare_stock(gpu, bundle, pre_overlay, rows, mode)
+    }
+
+    pub(crate) fn new_inner(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        #[cfg(target_os = "linux")]
+        npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let flash_next = bundle.config.profile.is_flash_next();
         let (scratch, host_token_bytes, host_ple_bytes) =
-            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk)?;
+            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk, mode)?;
         let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut expert_stage = None;
+        let mut ep: Option<Qwen4ForwardEp> = None;
         let mut trunk_zba = Vec::new();
         let mut trunk_a4 = Vec::new();
+        #[cfg(target_os = "linux")]
+        let mut npu_trunk = None;
         let result = (|| {
-            for layer in &bundle.weights.layer_refs {
-                if let Some(weights) = layer.ffn.moe() {
-                    moe.push(Qwen4MoeLayerRuntime::from_moe(
-                        gpu,
-                        &bundle.weights,
-                        weights,
-                        layer.layer,
-                        &bundle.config,
-                    )?);
+            if let Some(placement) = bundle.weights.ep_placement() {
+                let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(weights) = layer.ffn.moe() {
+                        moe.push(Qwen4MoeLayerRuntime::from_moe_ep(
+                            gpu,
+                            &bundle.weights,
+                            weights,
+                            layer.layer,
+                            &bundle.config,
+                            placement,
+                            &state.dummy,
+                        )?);
+                    }
+                }
+            } else {
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(weights) = layer.ffn.moe() {
+                        moe.push(Qwen4MoeLayerRuntime::from_moe(
+                            gpu,
+                            &bundle.weights,
+                            weights,
+                            layer.layer,
+                            &bundle.config,
+                        )?);
+                    }
+                }
+            }
+            let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
+            if compact {
+                // The compact plan was admitted before any weight was
+                // loaded; it is valid only for the exact route it sized.
+                if gpu.arch != "gfx1201"
+                    || !gpu.flags.moe_grouped_gemm
+                    || !gpu.qwen4_moe_sym_iu4_requested()
+                {
+                    return Err(invalid(
+                        "compact scratch requires gfx1201 with the grouped MoE GEMM and the \
+                         symmetric IU4 route requested",
+                    ));
+                }
+                for layer in &bundle.weights.layer_refs {
+                    if let Some(ple) = layer.ple.as_ref() {
+                        let ple = ple_desc(&bundle.weights, ple)?;
+                        if ple.key.dtype != DType::BF16 || ple.value.dtype != DType::BF16 {
+                            return Err(invalid(
+                                "compact scratch requires BF16 PLE key/value projections",
+                            ));
+                        }
+                    }
                 }
             }
             // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`, default on for
@@ -2332,7 +4129,24 @@ impl Qwen4GpuForward {
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new
             // module loads) unless the route was requested.
-            if !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+            // (An EP rank verifies its full chunk tables in `attach_ep`, once
+            // every peer's experts are mapped.)
+            // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
+            // buffer, masked tile ids and sym scratch exist before the mesh enables peers.
+            if let Some(state) = ep.as_mut() {
+                if qwen4_ep_owner_routed_prefill_enabled() {
+                    state.tile = Qwen4TileRoute::admit(
+                        gpu,
+                        &bundle.config,
+                        state.placement,
+                        &scratch,
+                        mode,
+                        max_chunk,
+                        flash_next,
+                    )?;
+                }
+            }
+            if ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
                 for layer in &mut moe {
                     verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
@@ -2341,6 +4155,15 @@ impl Qwen4GpuForward {
                     "  qwen4 symmetric IU4 MoE: {verified}/{} layers verified symmetric",
                     moe.len()
                 );
+                // The compact scratch has no buffer for the F32 route of a
+                // layer that is not symmetric: never run it silently.
+                if compact && verified != moe.len() {
+                    return Err(invalid(format!(
+                        "compact scratch was selected from the artifact's source headers, but \
+                         the GPU check verified only {verified}/{} layers symmetric",
+                        moe.len()
+                    )));
+                }
                 if verified > 0 {
                     gpu.reserve_qwen4_moe_sym(
                         max_chunk,
@@ -2353,10 +4176,17 @@ impl Qwen4GpuForward {
             }
             if flash_next {
                 (trunk_zba, trunk_a4) = prepare_trunk_iu4(gpu, bundle)?;
-                expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
+                if ep.is_none()
+                    || (ep_lever_on(hipfire_config::developer_var(Qwen4ExpertStage::EP_ENV).ok().as_deref())
+                        && ep.as_ref().is_some_and(|state| state.tile.is_some()))
+                {
+                    expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
+                }
             } else {
                 gpu.qwen4_trunk_iu4 = false;
             }
+            #[cfg(target_os = "linux")]
+            { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, &scratch, max_chunk, mode, npu_prepared)?; }
             // The Q8_0 decode copies are the Flash-Next decode recipe (they
             // re-quantize its shared-expert and HC matrices); a developer
             // profile decodes the source BF16 weights, so decode and prefill
@@ -2412,11 +4242,16 @@ impl Qwen4GpuForward {
             Ok::<(), Qwen4GpuForwardError>(())
         })();
         if let Err(error) = result {
+            #[cfg(target_os = "linux")]
+            if let Some(npu) = npu_trunk { let _ = npu.free(gpu); }
             if let Some(stage) = expert_stage {
                 let _ = stage.free_gpu(gpu);
             }
             for layer in moe {
                 let _ = layer.free_gpu(gpu);
+            }
+            if let Some(ep) = ep {
+                let _ = ep.free_gpu(gpu);
             }
             gpu.qwen4_trunk_iu4 = false;
             for tensor in decode_q8.into_iter().chain(trunk_zba.into_iter().flatten()) {
@@ -2430,6 +4265,7 @@ impl Qwen4GpuForward {
         }
         Ok(Self {
             expert_stage,
+            ep,
             scratch,
             host_token_bytes,
             uploaded_id_rows: 0,
@@ -2452,7 +4288,53 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             lane_scope: false,
             prefill_scope: false,
+            #[cfg(target_os = "linux")]
+            npu_trunk,
         })
+    }
+
+    /// Whether planned pairs run layer-major through the pair executor (`on`,
+    /// `auto`, and `emulate` with a bank-B scratch): the capture capacity covers
+    /// both banks of a group.
+    pub(crate) fn npu_trunk_pipelined(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.as_ref().is_some_and(|n|n.pipelined()) }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    pub(crate) fn npu_trunk_planned(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.is_some() }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+
+    pub(crate) fn begin_npu_trunk_request(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu)=&mut self.npu_trunk { npu.begin_request(); }
+    }
+
+    pub(crate) fn plan_npu_trunk_request(&mut self, rows: usize, position: usize) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = &mut self.npu_trunk { npu.plan_request(rows, position); }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (rows, position);
+    }
+
+    /// Rows of banks A and B of the pair the plan starts at `position`.
+    pub(crate) fn npu_trunk_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
+        #[cfg(target_os = "linux")]
+        { self.npu_trunk.as_ref().and_then(|n| n.selected_pair(position, remaining, chunk)) }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (position, remaining, chunk); None }
+    }
+
+    pub(crate) fn note_npu_trunk_pair(&mut self, rows: [usize; 2], position: usize) {
+        #[cfg(target_os = "linux")]
+        if let Some(npu)=&mut self.npu_trunk {npu.note_pair(rows,position);}
+        #[cfg(not(target_os = "linux"))]
+        let _=(rows,position);
     }
 
     /// Before a forward that is not this owner's chunk program (the lane
@@ -2463,6 +4345,345 @@ impl Qwen4GpuForward {
             Some(stage) => stage.restore_blocking(gpu),
             None => Ok(()),
         }
+    }
+
+    /// This rank's expert-parallel placement, `None` on the single-device route.
+    pub(crate) fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
+        self.ep.as_ref().map(|ep| ep.placement)
+    }
+
+    /// Device pointers of this rank's compact routed-expert tensors, one per
+    /// trunk MoE layer in layer order (what every peer's full table names).
+    pub(crate) fn ep_expert_sources(
+        &self,
+        bundle: &Qwen4Bundle,
+    ) -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+        if self.ep.is_none() {
+            return Err(invalid("EP expert sources of a forward without an EP placement"));
+        }
+        let mut sources = Vec::with_capacity(self.moe.len());
+        for layer in &bundle.weights.layer_refs {
+            if let Some(weights) = layer.ffn.moe() {
+                let gate_up = bundle.weights.resident(&weights.experts_gate_up)?;
+                let down = bundle.weights.resident(&weights.experts_down)?;
+                sources.push(Qwen4PeerExpertSource {
+                    gate_up_base: gate_up.buf.as_ptr() as usize,
+                    gate_up_bytes: gate_up.buf.size(),
+                    down_base: down.buf.as_ptr() as usize,
+                    down_bytes: down.buf.size(),
+                });
+            }
+        }
+        if sources.len() != self.moe.len() {
+            return Err(invalid(format!(
+                "EP expert sources cover {} layers, the forward has {}",
+                sources.len(),
+                self.moe.len()
+            )));
+        }
+        Ok(sources)
+    }
+
+    /// The expanded-row gather buffers, indexed by [`qwen4_ep_buffer_index`].
+    pub(crate) fn ep_gather_buffers(&self) -> Option<[&GpuTensor; QWEN4_EP_GATHER_BUFFERS]> {
+        self.ep
+            .as_ref()
+            .map(|ep| std::array::from_fn(|index| &ep.buffers[index]))
+    }
+
+    /// This rank's EP binding for a head MoE runtime: its placement and the
+    /// zero dummy expert (`None` on the single-device route).
+    pub(crate) fn ep_binding(&self) -> Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)> {
+        self.ep.as_ref().map(|ep| (ep.placement, &ep.dummy))
+    }
+
+    /// What an EP rank's MTP head borrows from this forward at call time: the
+    /// row gather and the gather buffers (`None` outside EP or before
+    /// `attach_ep`).
+    pub(crate) fn mtp_ep_gather(&self) -> Option<MtpEpGather<'_>> {
+        let ep = self.ep.as_ref()?;
+        Some(MtpEpGather {
+            hook: ep.gather.as_deref()?,
+            buffers: std::array::from_fn(|index| &ep.buffers[index]),
+        })
+    }
+
+    /// What the rank's row-gather hook needs to run balanced ownership: `None`
+    /// when `HIPFIRE_EP_BALANCED_OWNERS=0` was set at [`Self::attach_ep`]
+    /// (default on under EP) or no trunk MoE layer is host-mapped. The
+    /// `slot_owner` view is non-owning; this forward frees the buffer.
+    pub(crate) fn balanced_plan(&self) -> Option<Qwen4BalancedPlan> {
+        let ep = self.ep.as_ref()?;
+        let owners = ep.slot_owner.as_ref()?;
+        let layers: Vec<(usize, Qwen4EpOwnerTables)> = ep
+            .balanced
+            .iter()
+            .flatten()
+            .map(|layer| (layer.label, layer.tables))
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        Some(Qwen4BalancedPlan {
+            layers,
+            slot_owner: GpuTensor {
+                // SAFETY: a `Borrowed` alias of the buffer `Qwen4ForwardEp`
+                // owns until `free_gpu`; the hook that holds it lives inside
+                // that forward and is never used after the forward is freed.
+                buf: unsafe { owners.buf.alias() },
+                shape: owners.shape.clone(),
+                dtype: owners.dtype,
+            },
+        })
+    }
+
+    /// After every rank is loaded and P2P is enabled on every rank: build this
+    /// rank's full (P2P) chunk tables from all ranks' sources
+    /// (`peers[rank][moe_layer]`), take the symmetric-IU4 verdict a single
+    /// device takes at construction, and install the row gather the one-row and few-row
+    /// forwards use.
+    pub(crate) fn attach_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        peers: &[Vec<Qwen4PeerExpertSource>],
+        gather: Arc<dyn MoeRowGather + Send + Sync>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let layers = self.moe.len();
+        let max_chunk = self.scratch.max_chunk;
+        // The EP decode runtime's route-selecting properties per MoE ordinal
+        // (host-mapped, symmetric, all-MQ4 gate/up): a balanced layer's live
+        // runtime must select the same sealed route.
+        let moe_traits: Vec<(bool, bool, bool)> = self
+            .moe
+            .iter()
+            .map(|moe| (moe.host_mapped, moe.symmetric, moe.experts_all_gate_up_mq4))
+            .collect();
+        let Some(ep) = self.ep.as_mut() else {
+            return Err(invalid("attach_ep on a forward without an EP placement"));
+        };
+        if !ep.moe_full.is_empty() || ep.gather.is_some() {
+            return Err(invalid("EP is already attached"));
+        }
+        let placement = ep.placement;
+        if peers.len() != placement.ranks {
+            return Err(invalid(format!(
+                "attach_ep got {} peer source sets for {} ranks",
+                peers.len(),
+                placement.ranks
+            )));
+        }
+        for (rank, sources) in peers.iter().enumerate() {
+            if sources.len() != layers {
+                return Err(invalid(format!(
+                    "attach_ep rank {rank} lists {} MoE layers, expected {layers}",
+                    sources.len()
+                )));
+            }
+        }
+        let config = &bundle.config;
+        let balanced_on = qwen4_ep_balanced_owners_enabled();
+        let dummy = ep.dummy.source();
+        let layer_peers_of = |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+            peers
+                .iter()
+                .map(|sources| {
+                    sources.get(ordinal).copied().ok_or_else(|| {
+                        invalid(format!("attach_ep is missing MoE layer {ordinal}"))
+                    })
+                })
+                .collect()
+        };
+        let mut full: Vec<Qwen4MoeLayerRuntime> = Vec::with_capacity(layers);
+        let mut balanced: Vec<Option<Qwen4BalancedLayer>> = Vec::new();
+        let mut slot_owner: Option<GpuTensor> = None;
+        let result = (|| -> Result<(), Qwen4GpuForwardError> {
+            let mut ordinal = 0usize;
+            for layer in &bundle.weights.layer_refs {
+                if let Some(weights) = layer.ffn.moe() {
+                    let layer_peers = layer_peers_of(ordinal)?;
+                    full.push(Qwen4MoeLayerRuntime::from_moe_full(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer.layer,
+                        config,
+                        placement,
+                        &layer_peers,
+                    )?);
+                    ordinal += 1;
+                }
+            }
+            // The single-device construction's symmetric-IU4 verdict, taken
+            // on the full tables so a chunk forward takes the same route
+            // (symmetric IU4 or F16) as one device.
+            if !full.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+                let mut verified = 0usize;
+                for layer in &mut full {
+                    verified += usize::from(layer.verify_symmetric(gpu, config)?);
+                }
+                eprintln!(
+                    "  qwen4 symmetric IU4 MoE (ep rank {}/{}): {verified}/{} layers verified symmetric",
+                    placement.rank,
+                    placement.ranks,
+                    full.len()
+                );
+                if verified > 0 {
+                    gpu.reserve_qwen4_moe_sym(
+                        max_chunk,
+                        config.num_experts_per_tok,
+                        config.num_experts,
+                        config.hidden_size,
+                        config.moe_intermediate_size,
+                    )?;
+                }
+            }
+            // Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): every
+            // host-mapped trunk layer gets a live runtime of the same full
+            // addressing, whose tables the per-call owner assignment
+            // rewrites. Nothing is built, allocated or loaded when off.
+            if balanced_on {
+                let mut ordinal = 0usize;
+                for layer in &bundle.weights.layer_refs {
+                    let Some(weights) = layer.ffn.moe() else {
+                        continue;
+                    };
+                    let (host_mapped, symmetric, all_mq4) = moe_traits[ordinal];
+                    if !host_mapped {
+                        balanced.push(None);
+                        ordinal += 1;
+                        continue;
+                    }
+                    let owners = match slot_owner.as_ref() {
+                        Some(owners) => owners.buf.as_ptr() as usize,
+                        None => {
+                            let tensor = gpu.zeros(
+                                &[QWEN4_EP_GATHER_MAX_ROWS * config.num_experts_per_tok],
+                                DType::F32,
+                            )?;
+                            let address = tensor.buf.as_ptr() as usize;
+                            slot_owner = Some(tensor);
+                            address
+                        }
+                    };
+                    let live = Qwen4MoeLayerRuntime::from_moe_full(
+                        gpu,
+                        &bundle.weights,
+                        weights,
+                        layer.layer,
+                        config,
+                        placement,
+                        &layer_peers_of(ordinal)?,
+                    )?;
+                    if live.symmetric != symmetric
+                        || live.host_mapped != host_mapped
+                        || live.experts_all_gate_up_mq4 != all_mq4
+                    {
+                        let _ = live.free_gpu(gpu);
+                        return Err(invalid(format!(
+                            "layer {} balanced runtime selects a different sealed route than the EP decode runtime",
+                            layer.layer
+                        )));
+                    }
+                    let tables = Qwen4EpOwnerTables {
+                        full_gate_up: full[ordinal].expert_gate_up_ptrs.buf.as_ptr() as usize,
+                        full_down: full[ordinal].expert_down_ptrs.buf.as_ptr() as usize,
+                        live_gate_up: live.expert_gate_up_ptrs.buf.as_ptr() as usize,
+                        live_down: live.expert_down_ptrs.buf.as_ptr() as usize,
+                        slot_owner: owners,
+                        dummy_gate_up: dummy.gate_up_base,
+                        dummy_down: dummy.down_base,
+                    };
+                    balanced.push(Some(Qwen4BalancedLayer {
+                        live,
+                        label: layer.layer,
+                        tables,
+                    }));
+                    ordinal += 1;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for layer in full {
+                let _ = layer.free_gpu(gpu);
+            }
+            for layer in balanced.into_iter().flatten() {
+                let _ = layer.live.free_gpu(gpu);
+            }
+            if let Some(tensor) = slot_owner {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(error);
+        }
+        if balanced_on {
+            eprintln!(
+                "qwen4 EP rank {}/{}: balanced ownership on {} host-mapped MoE layers",
+                placement.rank,
+                placement.ranks,
+                balanced.iter().flatten().count()
+            );
+        }
+        if let Some(route) = ep.tile.as_mut() {
+            // The compact table carries no verdict of its own under EP (the verification
+            // above ran on the full tables; same experts, same bytes): the mesh compares
+            // all ranks' vectors before anything is propagated to the compact layers.
+            route.verdicts = full.iter().map(|layer| layer.symmetric).collect();
+        }
+        ep.moe_full = full;
+        ep.balanced = balanced;
+        ep.slot_owner = slot_owner;
+        ep.gather = Some(gather);
+        Ok(())
+    }
+
+    /// This rank's grouped-row buffer (the peer reads it) and the tile capacity the
+    /// exchange is registered for, or `None` when not admitted.
+    pub(crate) fn ep_tile_registration(&self) -> Option<(&GpuTensor, usize)> {
+        let route = self.ep.as_ref()?.tile.as_ref()?;
+        Some((&self.scratch.moe_y_down_grouped, route.max_tiles))
+    }
+
+    /// The per-layer symmetric verdicts taken in `attach_ep` (`None` when not admitted).
+    pub(crate) fn ep_tile_verdicts(&self) -> Option<Vec<bool>> {
+        Some(self.ep.as_ref()?.tile.as_ref()?.verdicts.clone())
+    }
+
+    /// A non-owning view of the rank's owner table for the transport hook (owned by the
+    /// forward, freed with it; the hook is never used after the forward is freed).
+    pub(crate) fn ep_tile_owner_table_view(&self) -> Option<GpuTensor> {
+        let table = &self.ep.as_ref()?.tile.as_ref()?.owner_table;
+        Some(GpuTensor {
+            // SAFETY: a `Borrowed` alias of the buffer `Qwen4TileRoute` owns until
+            // `free_gpu`; the hook that holds it lives inside this forward.
+            buf: unsafe { table.buf.alias() },
+            shape: table.shape.clone(),
+            dtype: table.dtype,
+        })
+    }
+
+    /// Install the agreed transport: every layer's compact runtime takes the symmetric
+    /// verdict (same experts, same bytes as the full tables it was taken on), so a chunk of
+    /// at least 512 rows binds the compact table with the tile exchange. Refused unless
+    /// every layer verified symmetric (the mesh checked every rank agrees).
+    pub(crate) fn install_tile_exchange(
+        &mut self,
+        hook: Arc<dyn MoeTileExchange + Send + Sync>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let layers = self.moe.len();
+        let Some(route) = self.ep.as_mut().and_then(|ep| ep.tile.as_mut()) else {
+            return Err(invalid("owner-routed prefill was not admitted on this rank"));
+        };
+        if route.verdicts.len() != layers || !route.verdicts.iter().all(|&symmetric| symmetric) {
+            return Err(invalid(
+                "owner-routed prefill needs every layer verified symmetric on the full tables",
+            ));
+        }
+        route.hook = Some(hook);
+        for layer in &mut self.moe {
+            layer.symmetric = true;
+        }
+        Ok(())
     }
 
     /// Name the tokens that follow the next forward (at most one chunk is
@@ -2483,22 +4704,29 @@ impl Qwen4GpuForward {
             host_ple,
             moe,
             expert_stage,
+            ep,
             token_readback,
             decode_q8,
             route_trace,
             trunk_zba,
+            #[cfg(target_os = "linux")]
+            npu_trunk,
             ..
         } = self;
         // Drain both streams before releasing stage tables, events or scratch.
         // A donor a failed forward left overwritten is not restored: the
         // bundle attaches its forward once and frees it only right before
         // the weights (`Qwen4Bundle::free_gpu`), so nothing reads it again.
-        if expert_stage.is_some() {
+        if expert_stage.is_some() || ep.is_some() {
             gpu.hip.device_synchronize()?;
         }
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = npu_trunk {
+            if let Err(e) = npu.free(gpu) { first.get_or_insert(e); }
+        }
         if let Some(error) = scratch.free_gpu(gpu) {
             first.get_or_insert(error);
         }
@@ -2534,6 +4762,11 @@ impl Qwen4GpuForward {
                 if first.is_none() {
                     first = Some(error);
                 }
+            }
+        }
+        if let Some(ep) = ep {
+            if let Some(error) = ep.free_gpu(gpu) {
+                first.get_or_insert(error);
             }
         }
         first.map_or(Ok(()), Err)
@@ -2778,6 +5011,7 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_rows,
         )?;
+        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
         // Start the first tile's PLE rows now, ahead of the output-resource
         // preflight.
         self.prefetch_first_tile_ple(bundle, tokens);
@@ -2799,6 +5033,21 @@ impl Qwen4GpuForward {
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
         while offset < tokens.len() {
+            // A planned pair (`on`, `auto` and `emulate` alike) runs layer-major
+            // through the pair executor; everything else is an ordinary tile.
+            #[cfg(target_os = "linux")]
+            if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
+            {
+                let rows=banks[0]+banks[1];
+                self.note_npu_trunk_pair(banks,bundle.state.position);
+                let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                let output=if output_rows==Qwen4OutputRows::All || final_pair {
+                    Qwen4OutputPolicy::Rows(output_rows)
+                } else { Qwen4OutputPolicy::None };
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,Some(logits),top1,wide_hidden_capture,output)?;
+                offset+=rows;
+                continue;
+            }
             let rows = (tokens.len() - offset).min(max_chunk);
             // The caller's lookahead belongs to the final tile; earlier tiles
             // look ahead to the next tile.
@@ -2879,6 +5128,7 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
         self.validate_tokens(bundle, tokens)?;
+        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         if let Some((capture, wide)) = wide_hidden_capture.zip(capture_width) {
             let expected = tokens
@@ -2895,6 +5145,16 @@ impl Qwen4GpuForward {
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
         while offset < tokens.len() {
+            #[cfg(target_os = "linux")]
+            if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
+            {
+                let rows=banks[0]+banks[1];
+                self.note_npu_trunk_pair(banks,bundle.state.position);
+                self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                offset+=rows;
+                continue;
+            }
             let rows = (tokens.len() - offset).min(max_chunk);
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
             let capture_chunk = wide_hidden_capture
@@ -3007,6 +5267,16 @@ impl Qwen4GpuForward {
             && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
             && gpu.arch == "gfx1151";
         let prior_invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
+        // The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to max_chunk
+        // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
+        // contains live tokens. Compact scratch may alias live fields: never
+        // arm its in-place padding, even if a facade appears large enough.
+        let ragged_scope = native_trunk_prefill_scope(
+            self.prefill_scope, gpu.qwen4_trunk_iu4, &gpu.arch, self.scratch.mode,
+        );
+        let prior_ragged = std::mem::replace(
+            &mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope,
+        );
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -3019,6 +5289,7 @@ impl Qwen4GpuForward {
         );
         gpu.qwen4_scope = scope;
         gpu.prefill_invariant_scope = prior_invariant;
+        gpu.qwen4_trunk_iu4_prefill_scope = prior_ragged;
         result
     }
 
@@ -3128,7 +5399,7 @@ impl Qwen4GpuForward {
                 ))
             })?;
         if gpu.route_rows(n) >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
-            if let Some(qsa) = bundle.state.qsa.first() {
+            if let Some(qsa) = bundle.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
                     qsa.format,
@@ -3240,20 +5511,101 @@ impl Qwen4GpuForward {
         // The row count every routing decision below sees (`n` unless the
         // invariant prefill profile is on); launch extents keep `n`.
         let route_n = gpu.route_rows(n);
+        // Expert parallelism picks the MoE table per forward by routing row
+        // count, identically on every rank: one row, or a few-row forward
+        // (`2..=QWEN4_EP_GATHER_MAX_ROWS` rows that are also the routing rows:
+        // verify / replay / takeover), runs the rank's decode table with the
+        // row gather installed and a parity gather buffer as the expanded-row
+        // scratch; larger chunks run the full (P2P) table, no gather.
+        let ep = self.ep.as_ref();
+        let ep_few_rows = ep.is_some()
+            && (2..=QWEN4_EP_GATHER_MAX_ROWS).contains(&route_n)
+            && route_n == n;
+        if let Some(ep) = ep {
+            if route_n == 1 {
+                if n != 1 {
+                    return Err(invalid("an EP decode forward carries exactly one row"));
+                }
+                if ep.gather.is_none() {
+                    return Err(invalid(
+                        "EP decode forward before attach_ep: the row gather is not installed",
+                    ));
+                }
+            } else if ep_few_rows {
+                if ep.gather.is_none() {
+                    return Err(invalid(
+                        "EP few-row forward before attach_ep: the row gather is not installed",
+                    ));
+                }
+            } else if ep.moe_full.len() != self.moe.len() {
+                return Err(invalid(
+                    "EP chunk forward before attach_ep: the full expert tables are not built",
+                ));
+            }
+        }
+        let ep_gathered = route_n == 1 || ep_few_rows;
+        let ep_gather: Option<&dyn MoeRowGather> = ep
+            .filter(|_| ep_gathered)
+            .and_then(|ep| ep.gather.as_deref().map(|gather| gather as &dyn MoeRowGather));
+        let ep_scratches: Option<[Qwen4LayerScratch<'_>; QWEN4_EP_GATHER_BUFFERS]> =
+            ep.filter(|_| ep_gathered).map(|ep| {
+                std::array::from_fn(|parity| Qwen4LayerScratch {
+                    moe_down_expanded: &ep.buffers[parity],
+                    ..layer_scratch(&self.scratch, &router_logits)
+                })
+            });
+        // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, hook installed by
+        // the mesh): a chunk on the symmetric IU4 route (>= 512 routing rows that are the
+        // launch rows) binds each layer's compact table plus the tile exchange; every
+        // other chunk keeps the full-table route exactly as without the lever.
+        let tile_route = ep
+            .filter(|_| route_n > 1 && !ep_few_rows)
+            .and_then(|ep| ep.tile.as_ref())
+            .filter(|route| route.hook.is_some());
+        let tile_active =
+            tile_route.is_some() && route_n == n && gpu.qwen4_moe_sym_iu4_applies(route_n);
+        if let Some(route) = tile_route.filter(|_| !tile_active) {
+            // A full-table chunk also writes `y_down_grouped`: it may start only after the
+            // peer finished pulling this rank's rows of the last exchange.
+            if let Some(hook) = route.hook.as_ref() {
+                hook.before_down(gpu)
+                    .map_err(|error| invalid(format!("EP tile exchange: {error}")))?;
+            }
+        }
+        let tile_route = tile_route.filter(|_| tile_active);
+        // G2 expert stage under EP: a full-table chunk reads another rank's donor VRAM, so every
+        // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
+        if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active {
+            // A stage is only ever USED (donors overwritten) on forwards that bind the compact
+            // route, which needs the installed exchange; without its hook no forward staged, so
+            // there is nothing to drain.
+            let hook = ep
+                .and_then(|ep| ep.tile.as_ref())
+                .and_then(|route| route.hook.as_ref());
+            if let (Some(stage), Some(hook)) = (self.expert_stage.as_ref(), hook) {
+                stage.ep_quiesce(gpu)?;
+                hook.host_barrier()
+                    .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;
+            }
+        }
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
                 "Qwen4 generic layer program inline capacity exhausted",
             ));
         }
-        // Decode, small chunks and MTP's wide-hidden verify keep mapped reads.
-        // The parity observer also keeps its historical unsplit transport. A
-        // stream capture keeps them too: a staged forward forks a copy stream
-        // and its failure recovery synchronizes the device.
-        let expert_stage = match self.expert_stage.as_ref() {
+        // Decode, small chunks and MTP's few-row wide-hidden verify keep
+        // mapped reads (below `min_rows`). A long forward that captures wide
+        // hidden rows (the MTP prompt fill) stages unless
+        // `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE=0`: the capture is a copy of
+        // the output streams after the program, on the compute stream. The
+        // parity observer keeps its historical unsplit transport. A stream
+        // capture keeps mapped reads too: a staged forward forks a copy
+        // stream and its failure recovery synchronizes the device.
+        let expert_stage = match self.expert_stage.as_ref().filter(|stage| stage.begin_forward(tile_active)) {
             Some(stage)
                 if n >= stage.min_rows
-                    && wide_hidden_capture.is_none()
+                    && (stage.capture || wide_hidden_capture.is_none())
                     && self.qsa_tap.is_none() =>
             {
                 let capturing = match gpu.active_stream.as_ref() {
@@ -3272,6 +5624,9 @@ impl Qwen4GpuForward {
         // the BF16 key/value projections (decided once; the step op and the
         // staging closure agree on it).
         let mut ple_rows_f16 = false;
+        // `HIPFIRE_CHUNK_DUMP_DIR` (developer diagnostic; off by default).
+        let chunk_dump = crate::chunk_dump::config().filter(|_| route_n > 1);
+        let mut dump_ends: Vec<(usize, usize, bool)> = Vec::new();
         for layer_index in 0..config.num_hidden_layers {
             let layer = &bundle.weights.layer_refs[layer_index];
             if ple_layer_index == Some(layer_index) {
@@ -3326,15 +5681,61 @@ impl Qwen4GpuForward {
                 }));
             }
 
-            let description = layer_desc(
+            // Balanced ownership: a host-mapped trunk layer of a gathered EP
+            // forward (one row, or few rows) binds its live runtime, whose
+            // tables the layer's owner assignment rewrites after routing.
+            // Every other layer keeps the static EP table (or the full table
+            // for chunk forwards). `ep.balanced` is empty unless the env
+            // lever was on at attach, so off binds exactly what it always did.
+            let balanced_live = ep
+                .filter(|_| ep_gathered)
+                .and_then(|ep| ep.balanced.get(layer_index))
+                .and_then(Option::as_ref)
+                .map(|balanced| &balanced.live);
+            let layer_moe = match (balanced_live, ep) {
+                (Some(live), _) => Some(live),
+                (None, Some(ep)) if route_n > 1 && !ep_few_rows => {
+                    if tile_route.is_some() {
+                        self.moe.get(layer_index)
+                    } else {
+                        ep.moe_full.get(layer_index)
+                    }
+                }
+                _ => self.moe.get(layer_index),
+            };
+            if let Some(stage) = expert_stage {
+                stage.prepare_runtime(gpu, layer_index, layer_moe)?;
+            }
+            let mut description = layer_desc(
                 &bundle.weights,
                 layer,
-                self.moe.get(layer_index),
+                layer_moe,
                 &config,
                 &self.decode_q8,
                 route_n,
-                expert_stage,
+                // Staged expert tables never replace the live table.
+                expert_stage.filter(|_| balanced_live.is_none()),
             )?;
+            if let (Some(gather), Qwen4FfnBinding::Moe(binding)) =
+                (ep_gather, &mut description.ffn)
+            {
+                binding.row_gather = Some(gather);
+                if ep_few_rows {
+                    // The gather buffer is the combine's `down_expanded`; the
+                    // unfused shared down writes the ordinary scratch.
+                    binding.shared_down_out = Some(&self.scratch.moe_down_expanded);
+                }
+            }
+            if let (Some(route), Qwen4FfnBinding::Moe(binding)) =
+                (tile_route, &mut description.ffn)
+            {
+                if let Some(hook) = route.hook.as_deref() {
+                    binding.tile_exchange = Some(MoeTileExchangeParams {
+                        exchange: hook,
+                        tile_ids_owned: &route.tile_ids_owned,
+                    });
+                }
+            }
             let attn_read = &description.attn_hyper.read;
             if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
                 return Err(invalid(
@@ -3450,6 +5851,8 @@ impl Qwen4GpuForward {
                             raw_index_keys: &state.raw_index_keys,
                             pooled_keys: &state.pooled_keys,
                             selected_indices: &state.selected_indices,
+                            // Decode and speculative verify never consume the arena.
+                            f16_arena: if self.prefill_scope { state.f16_arena_ref() } else { None },
                             full_capacity: state.full_capacity,
                             raw_capacity: state.raw_capacity,
                             pooled_capacity: state.pooled_capacity,
@@ -3480,6 +5883,7 @@ impl Qwen4GpuForward {
                         kv_heads: dims.num_key_value_heads,
                         head_dim: dims.head_dim,
                         rotary_dim: config.rotary_dim(),
+                        rope: config.rope(),
                         input_width: dims.hidden,
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                         phase: MixerPhase::Whole,
@@ -3538,7 +5942,9 @@ impl Qwen4GpuForward {
                         &ctx,
                         dims,
                         *moe,
-                        &scratch_desc,
+                        ep_scratches.as_ref().map_or(&scratch_desc, |parity| {
+                            &parity[qwen4_ep_buffer_index(layer_index, config.num_hidden_layers)]
+                        }),
                         n,
                         route_n,
                     )
@@ -3584,6 +5990,11 @@ impl Qwen4GpuForward {
                 branches: dims.hc_count,
                 hidden: config.hidden_size,
             }));
+            if chunk_dump.is_some_and(|dump| dump.wants(layer_index)) {
+                let bf16_grouped =
+                    layer_moe.is_some_and(|moe| moe.symmetric) && gpu.qwen4_moe_sym_iu4_applies(route_n);
+                dump_ends.push((layer_index, steps.len(), bf16_grouped));
+            }
         }
         validate_steps(gpu, &steps).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight Qwen4 typed program: {error:?}"))
@@ -3789,7 +6200,7 @@ impl Qwen4GpuForward {
                     gpu.hip.event_synchronize(&readback.event)?;
                     let mut bytes = [0u8; 4];
                     gpu.hip
-                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, &readback.stream)?;
+                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, Some(&readback.stream))?;
                     gpu.hip.stream_synchronize(&readback.stream)?;
                     let token = i32::from_ne_bytes(bytes) as u32;
                     if token as usize >= vocab {
@@ -3893,6 +6304,7 @@ impl Qwen4GpuForward {
             // recorded on tiny-dense-dev-gpu, card B) and the per-row GDN conv
             // carries a position kernarg linear AQL cannot rebind.
             let eligible = n == 1
+                && self.ep.is_none()
                 && config.profile.is_flash_next()
                 && !self.lane_scope
                 && !gpu.prefill_invariant_scope
@@ -4013,7 +6425,36 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                if let Some(tap) = self.qsa_tap.as_mut() {
+                if !dump_ends.is_empty() && expert_stage.is_none() && self.qsa_tap.is_none() {
+                    // `HIPFIRE_CHUNK_DUMP_DIR`: run the chunk in segments that end after
+                    // each selected layer and dump that boundary (diagnostic only).
+                    let dump = chunk_dump.expect("dump ends imply the dump is enabled");
+                    let mut start = 0;
+                    for index in 0..steps.len() {
+                        if ple_split == Some(index) {
+                            execute(gpu, &steps[start..index])?;
+                            stage_ple(gpu)?;
+                            start = index;
+                        }
+                        if let Some(&(layer, _, bf16_grouped)) =
+                            dump_ends.iter().find(|(_, end, _)| *end == index + 1)
+                        {
+                            execute(gpu, &steps[start..=index])?;
+                            start = index + 1;
+                            dump.dump_layer(
+                                gpu,
+                                &self.scratch,
+                                &config,
+                                layer,
+                                bundle.state.position,
+                                n,
+                                bf16_grouped,
+                            )
+                            .map_err(|error| invalid(format!("chunk dump: {error}")))?;
+                        }
+                    }
+                    execute(gpu, &steps[start..])?;
+                } else if let Some(tap) = self.qsa_tap.as_mut() {
                     // Parity tap: run up to and including each QSA step, then
                     // let the observer read that layer's scratch and state.
                     let mut start = 0;
@@ -4204,6 +6645,7 @@ impl Qwen4GpuForward {
                     state.pooled_len = pooled_len;
                     state.selected_len = selected_len;
                     state.position = position;
+                    state.clamp_f16_valid();
                 }
                 let mut next_history = next_history;
                 for token in tokens.iter().copied() {
@@ -4244,6 +6686,7 @@ impl Qwen4GpuForward {
                 Ok(())
             }
             Err(error) => {
+                bundle.state.invalidate_f16_arenas();
                 // A staged forward that failed before its join may have left
                 // a donor overwritten; nothing may read it until restored.
                 let error = match self.expert_stage.as_ref().map(|stage| stage.restore_blocking(gpu)) {
@@ -4424,8 +6867,617 @@ mod capture_census_tests {
 }
 
 #[cfg(test)]
+mod ep_table_tests {
+    use super::{
+        qwen4_ep_buffer_index, qwen4_expert_table_entries, Qwen4EpPlacement, Qwen4ExpertEntry,
+        Qwen4ExpertOrigin, Qwen4ExpertTableLayout, Qwen4GpuForwardError, Qwen4PeerExpertSource,
+        QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
+    };
+
+    const EXPERTS: usize = 512;
+    const GATE_UP: usize = 1_740_800;
+    const DOWN: usize = 870_400;
+
+    fn compact(base: usize, gate_up_base: usize, experts: usize) -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: gate_up_base + base,
+            gate_up_bytes: experts * GATE_UP,
+            down_base: 0x4000_0000 + base,
+            down_bytes: experts * DOWN,
+        }
+    }
+
+    fn dummy() -> Qwen4PeerExpertSource {
+        Qwen4PeerExpertSource {
+            gate_up_base: 0x9000_0000,
+            gate_up_bytes: GATE_UP,
+            down_base: 0x9800_0000,
+            down_bytes: DOWN,
+        }
+    }
+
+    fn entries(
+        layout: &Qwen4ExpertTableLayout<'_>,
+        local: Qwen4PeerExpertSource,
+    ) -> Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError> {
+        qwen4_expert_table_entries(layout, local, EXPERTS, GATE_UP, DOWN)
+    }
+
+    fn message(result: Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError>) -> String {
+        match result {
+            Err(Qwen4GpuForwardError::Invalid(message)) => message,
+            other => panic!("expected an Invalid error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gather_buffer_index_alternates_over_the_trunk_and_isolates_the_mtp_head() {
+        assert_eq!(QWEN4_EP_GATHER_BUFFERS, 4);
+        assert_eq!(QWEN4_EP_GATHER_MAX_ROWS, 8);
+        assert_eq!(qwen4_ep_buffer_index(0, 48), 0);
+        assert_eq!(qwen4_ep_buffer_index(1, 48), 1);
+        assert_eq!(qwen4_ep_buffer_index(2, 48), 0);
+        assert_eq!(qwen4_ep_buffer_index(47, 48), 1);
+        assert_eq!(qwen4_ep_buffer_index(48, 48), 2);
+        assert_eq!(qwen4_ep_buffer_index(49, 48), 3);
+        assert_eq!(qwen4_ep_buffer_index(50, 48), 2);
+        assert_eq!(qwen4_ep_buffer_index(1001, 48), 3);
+    }
+
+    #[test]
+    fn single_table_is_the_contiguous_expert_walk() {
+        let local = compact(0, 0x1000_0000, EXPERTS);
+        let table = entries(&Qwen4ExpertTableLayout::Single, local).unwrap();
+        assert_eq!(table.len(), EXPERTS);
+        for (expert, entry) in table.iter().enumerate() {
+            assert_eq!(entry.origin, Qwen4ExpertOrigin::Local);
+            assert_eq!(entry.gate_up_ptr, local.gate_up_base + expert * GATE_UP);
+            assert_eq!(entry.down_ptr, local.down_base + expert * DOWN);
+        }
+    }
+
+    #[test]
+    fn single_table_refuses_a_short_tensor() {
+        let mut local = compact(0, 0x1000_0000, EXPERTS);
+        local.down_bytes -= 1;
+        let text = message(entries(&Qwen4ExpertTableLayout::Single, local));
+        assert!(text.contains("down expert slot 511") && text.contains("exceeds"), "{text}");
+    }
+
+    #[test]
+    fn ep_table_maps_owned_to_compact_local_and_the_rest_to_the_dummy() {
+        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 0), (4, 3)] {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let local = compact(0, 0x1000_0000, EXPERTS / ranks);
+            let layout = Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy(),
+            };
+            let table = entries(&layout, local).unwrap();
+            assert_eq!(table.len(), EXPERTS);
+            let mut owned = 0;
+            for (expert, entry) in table.iter().enumerate() {
+                if expert % ranks == rank {
+                    owned += 1;
+                    assert_eq!(entry.origin, Qwen4ExpertOrigin::Local);
+                    assert_eq!(
+                        entry.gate_up_ptr,
+                        local.gate_up_base + (expert / ranks) * GATE_UP
+                    );
+                    assert_eq!(entry.down_ptr, local.down_base + (expert / ranks) * DOWN);
+                } else {
+                    assert_eq!(entry.origin, Qwen4ExpertOrigin::Dummy);
+                    assert_eq!(entry.gate_up_ptr, dummy().gate_up_base);
+                    assert_eq!(entry.down_ptr, dummy().down_base);
+                }
+            }
+            assert_eq!(owned, EXPERTS / ranks);
+        }
+    }
+
+    #[test]
+    fn ep_table_requires_exactly_the_compact_expert_count_and_one_dummy_expert() {
+        let placement = Qwen4EpPlacement { rank: 1, ranks: 4 };
+        let layout = Qwen4ExpertTableLayout::Ep {
+            placement,
+            dummy: dummy(),
+        };
+        // A single-device tensor (all 512 experts) is not a compact source.
+        let text = message(entries(&layout, compact(0, 0x1000_0000, EXPERTS)));
+        assert!(text.contains("exactly 128 experts"), "{text}");
+        // One expert short.
+        let text = message(entries(&layout, compact(0, 0x1000_0000, 127)));
+        assert!(text.contains("exactly 128 experts"), "{text}");
+        let mut big_dummy = dummy();
+        big_dummy.down_bytes += 4;
+        let layout = Qwen4ExpertTableLayout::Ep {
+            placement,
+            dummy: big_dummy,
+        };
+        let text = message(entries(&layout, compact(0, 0x1000_0000, 128)));
+        assert!(text.contains("dummy expert"), "{text}");
+    }
+
+    #[test]
+    fn ep_placement_must_shard_evenly() {
+        let local = compact(0, 0x1000_0000, EXPERTS / 4);
+        for placement in [
+            Qwen4EpPlacement { rank: 4, ranks: 4 },
+            Qwen4EpPlacement { rank: 0, ranks: 0 },
+            Qwen4EpPlacement { rank: 0, ranks: 3 },
+        ] {
+            let layout = Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy(),
+            };
+            assert!(entries(&layout, local).is_err(), "{placement:?}");
+        }
+    }
+
+    fn peers(ranks: usize) -> Vec<Qwen4PeerExpertSource> {
+        (0..ranks)
+            .map(|rank| {
+                let mut source = compact(0, 0x1000_0000 + rank * 0x1_0000_0000, EXPERTS / ranks);
+                source.down_base += rank * 0x1_0000_0000;
+                source
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_table_maps_owned_local_and_non_owned_into_the_owner_peer() {
+        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 2)] {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let peers = peers(ranks);
+            let layout = Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: &peers,
+            };
+            let table = entries(&layout, peers[rank]).unwrap();
+            assert_eq!(table.len(), EXPERTS);
+            for (expert, entry) in table.iter().enumerate() {
+                let owner = expert % ranks;
+                let slot = expert / ranks;
+                let expected_origin = if owner == rank {
+                    Qwen4ExpertOrigin::Local
+                } else {
+                    Qwen4ExpertOrigin::Peer(owner)
+                };
+                assert_eq!(entry.origin, expected_origin, "expert {expert}");
+                assert_eq!(
+                    entry.gate_up_ptr,
+                    peers[owner].gate_up_base + slot * GATE_UP,
+                    "expert {expert}"
+                );
+                assert_eq!(
+                    entry.down_ptr,
+                    peers[owner].down_base + slot * DOWN,
+                    "expert {expert}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_table_refuses_inconsistent_or_short_peers() {
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        let good = peers(2);
+        let layout = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &good,
+        };
+        // Peer list for the wrong rank count.
+        let wrong_count = &good[..1];
+        let layout_count = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: wrong_count,
+        };
+        let text = message(entries(&layout_count, good[0]));
+        assert!(text.contains("needs 2 peer sources"), "{text}");
+        // `peers[rank]` must be this rank's own tensors.
+        let text = message(entries(&layout, good[1]));
+        assert!(text.contains("does not name this rank's own"), "{text}");
+        // A peer whose tensor is one expert short is caught by the slot bounds.
+        let mut short = good.clone();
+        short[1].gate_up_bytes -= GATE_UP;
+        let layout_short = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &short,
+        };
+        let text = message(entries(&layout_short, short[0]));
+        assert!(text.contains("peer gate/up expert slot 255") && text.contains("exceeds"), "{text}");
+        // A null peer base is refused rather than mapped.
+        let mut null = good.clone();
+        null[1].down_base = 0;
+        let layout_null = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &null,
+        };
+        let text = message(entries(&layout_null, null[0]));
+        assert!(text.contains("null"), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::uploaded_ids_range;
+    use super::{
+        owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows, uploaded_ids_range,
+        CompactScratchTerms, Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch,
+        ScratchField as F, ScratchSlot, QWEN4_COMPACT_FALLBACK_ROWS,
+    };
+    use crate::config::{compact_test_config, Qwen4Config};
+
+    fn fn_config() -> Qwen4Config {
+        compact_test_config()
+    }
+
+    fn scratch_bytes(rows: usize, mode: Mode) -> u64 {
+        Scratch::device_bytes(&fn_config(), rows, mode).expect("FN scratch bytes")
+    }
+
+    fn plan(rows: usize, mode: Mode) -> Vec<ScratchSlot> {
+        Scratch::plan(&fn_config(), rows, mode).expect("FN scratch plan").0
+    }
+
+    fn field_bytes(slots: &[ScratchSlot], field: F) -> u64 {
+        slots[field as usize].bytes().expect("field bytes") as u64
+    }
+
+    fn owned_bytes(slots: &[ScratchSlot]) -> u64 {
+        slots
+            .iter()
+            .filter(|slot| slot.owner.is_none())
+            .map(|slot| slot.bytes().expect("slot bytes") as u64)
+            .sum()
+    }
+
+    /// `G(r)`: tile-padded grouped rows of `r` rows, top-10 of 512 experts.
+    fn grouped_rows(rows: u64) -> u64 {
+        let slots = 10 * rows;
+        (slots + 15 * slots.min(512)).div_ceil(16) * 16
+    }
+
+    #[test]
+    fn npu_bank_sharing_covers_every_field_and_never_crosses_a_bank_switch() {
+        use super::NpuBankLifetime as L;
+        // Event order from pair_scoped, for two layers with PLE on layer 1:
+        // initialize A/B, prepare(0,A/B), G(0,A), prepare(1,A), G(0,B),
+        // prepare(1,B), G(1,A/B), finish A/B. Each event is a complete
+        // same-stream sequence; an interval is one produced value's lifetime,
+        // not the lifetime of its allocation.
+        let banks = [0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1];
+        let local_init = [(0, 0), (1, 1)];
+        let residual = [(0, 10), (1, 11)];
+        let input = [(2, 4), (3, 6), (5, 8), (7, 9)];
+        let ple_rows = [(0, 5), (1, 7)];
+        let prepare_and_fragment = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
+            (7, 7), (8, 8), (9, 9), (10, 10), (11, 11)];
+        let fragments = [(4, 4), (6, 6), (8, 8), (9, 9)];
+        let finish = [(10, 10), (11, 11)];
+        // This independent data-flow table is also the full private/shared
+        // inventory. HC prepare cannot pair its gates with a write outside
+        // its step slice; fragment-local HC fusions consume their gates before
+        // returning. PLE normed rows are retained only for verify rollback,
+        // not prompt pairs; session capture copies fixed state, not this field.
+        let rules: &[(L, &[F], &[(usize, usize)])] = &[
+            (L::Initialize, &[F::TokenIds, F::EmbeddingRot, F::Embeddings, F::PleStaged], &local_init),
+            (L::Residual, &[F::Streams], &residual),
+            (L::PreparedInput, &[F::HcMixed], &input),
+            (L::StagedRows, &[F::PleRows], &ple_rows),
+            (L::PrepareAndFragment, &[F::HcNormalized, F::HcLow, F::HcUp,
+                F::Rotation, F::GdnBf16, F::PleKey, F::PleValue, F::PleQuery,
+                F::PleGated, F::PleNormed, F::PleOutput], &prepare_and_fragment),
+            (L::Fragment, &[F::HcGates, F::Projection, F::Projection2, F::GdnA,
+                F::GdnB, F::GdnGate, F::GdnBeta, F::GdnRecurrentOutput, F::GdnZ,
+                F::GdnOutput, F::QsaIndex, F::QsaQgate, F::QsaK, F::QsaV,
+                F::QsaOutput, F::QsaSelected, F::AttentionOutput, F::RouterLogits,
+                F::MoeXRot, F::MoeGateUp, F::MoeGate, F::MoeUp, F::MoeHidden,
+                F::FfnOutput, F::MoeSharedOutput, F::MoeGateBatch, F::MoeUpBatch,
+                F::MoeRotBatch, F::MoeTopkIndices, F::MoeTopkWeights,
+                F::MoeDownExpanded, F::MoeScalar, F::MoeExpertTokenCounts,
+                F::MoeExpertOffsets, F::MoeSortedSlotIndex, F::MoeExpertTileIds,
+                F::MoeInversePerm, F::MoeYGateUpGrouped, F::MoeYDownGrouped], &fragments),
+            (L::Finish, &[F::Logits], &finish),
+        ];
+        let mut seen = [false; F::COUNT];
+        for &(lifetime, fields, intervals) in rules {
+            let crosses_bank = intervals.iter().any(|&(first, last)|
+                banks[first..=last].iter().any(|&bank| bank != banks[first]));
+            for &field in fields {
+                assert!(!std::mem::replace(&mut seen[field as usize], true), "{field:?} repeated");
+                assert_eq!(field.npu_bank_lifetime(), lifetime, "{field:?}");
+                assert_eq!(field.npu_bank_lifetime().private(), crosses_bank, "{field:?}");
+            }
+        }
+        assert!(seen.into_iter().all(|field| field));
+        for (index, field) in F::ALL.into_iter().enumerate() {
+            assert_eq!(field as usize, index);
+        }
+        assert_eq!(F::ALL.into_iter().filter(|field| field.npu_bank_lifetime().private())
+            .collect::<Vec<_>>(), [F::Streams, F::HcMixed, F::PleRows]);
+    }
+
+    #[test]
+    fn npu_private_bank_bytes_are_pinned_at_full_and_partial_rows() {
+        let config = fn_config();
+        for rows in [512, 8151, 8192] {
+            let private = Scratch::npu_bank_device_bytes(&config, rows).unwrap();
+            let slots = plan(rows, Mode::Full);
+            let expected = [F::Streams, F::HcMixed, F::PleRows].into_iter()
+                .map(|field| field_bytes(&slots, field)).sum::<u64>();
+            assert_eq!(private, expected);
+            assert_eq!(private, rows as u64 * (4 * 2560 + 2560 + 2560) * 4);
+        }
+        let private = Scratch::npu_bank_device_bytes(&config, 8192).unwrap();
+        assert_eq!(private, 503_316_480);
+        assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_682_500);
+    }
+
+    #[test]
+    fn fn_scratch_bytes_are_pinned() {
+        assert_eq!(scratch_bytes(4096, Mode::Full), 4_538_503_044);
+        assert_eq!(scratch_bytes(8192, Mode::Full), 8_957_998_980);
+        assert_eq!(scratch_bytes(4096, Mode::FnSymGfx1201), 2_314_473_348);
+        assert_eq!(scratch_bytes(8192, Mode::FnSymGfx1201), 4_511_905_668);
+        assert_eq!(
+            scratch_bytes(4096, Mode::Full) - scratch_bytes(4096, Mode::FnSymGfx1201),
+            2_224_029_696
+        );
+        assert_eq!(
+            scratch_bytes(8192, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
+            4_446_093_312
+        );
+        // The 8192-row compact scratch is smaller than today's 4096-row one.
+        assert!(scratch_bytes(8192, Mode::FnSymGfx1201) <= scratch_bytes(4096, Mode::Full));
+        assert_eq!(
+            scratch_bytes(4096, Mode::Full) - scratch_bytes(8192, Mode::FnSymGfx1201),
+            26_597_376
+        );
+        // The estimator adds the same 64-row speculative logits to either plan.
+        let config = fn_config();
+        let spec = |rows: usize| qwen4_spec_logit_rows(rows) as u64 * (248_320 * 4 + 4);
+        for (rows, mode) in [
+            (4096, Mode::Full),
+            (8192, Mode::Full),
+            (4096, Mode::FnSymGfx1201),
+            (8192, Mode::FnSymGfx1201),
+        ] {
+            assert_eq!(
+                qwen4_forward_device_bytes(&config, rows, mode),
+                Some(scratch_bytes(rows, mode) + spec(rows))
+            );
+        }
+        assert!(
+            qwen4_forward_device_bytes(&config, 8192, Mode::FnSymGfx1201)
+                <= qwen4_forward_device_bytes(&config, 4096, Mode::Full)
+        );
+    }
+
+    #[test]
+    fn compact_route_buffers_follow_the_frozen_capacities() {
+        // (rows, gate/up/rot batch, expanded down, grouped gate/up, grouped down)
+        for (rows, batch, expanded, gate_up, down) in [
+            (4096usize, 13_107_200u64, 52_428_800u64, 65_536_000u64, 249_036_800u64),
+            (8192, 13_107_200, 83_886_080, 114_688_000, 458_752_000),
+        ] {
+            let slots = plan(rows, Mode::FnSymGfx1201);
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                assert_eq!(field_bytes(&slots, field), batch, "{field:?} at {rows}");
+            }
+            assert_eq!(field_bytes(&slots, F::MoeDownExpanded), expanded);
+            assert_eq!(field_bytes(&slots, F::MoeYGateUpGrouped), gate_up);
+            assert_eq!(field_bytes(&slots, F::MoeYDownGrouped), down);
+        }
+        // Today's plan at 8192: 200/200/200/800/437.5/875 MiB.
+        let full = plan(8192, Mode::Full);
+        for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+            assert_eq!(field_bytes(&full, field), 209_715_200);
+        }
+        assert_eq!(field_bytes(&full, F::MoeDownExpanded), 838_860_800);
+        assert_eq!(field_bytes(&full, F::MoeYGateUpGrouped), 458_752_000);
+        assert_eq!(field_bytes(&full, F::MoeYDownGrouped), 917_504_000);
+    }
+
+    #[test]
+    fn compact_aliases_borrow_one_owner_each_and_ple_normed_stays_dedicated() {
+        let full = plan(8192, Mode::Full);
+        assert_eq!(full.len(), F::COUNT);
+        assert!(full.iter().all(|slot| slot.owner.is_none() && slot.pitch.is_none()));
+        let compact = plan(8192, Mode::FnSymGfx1201);
+        let owner = |field: F| compact[field as usize].owner;
+        assert_eq!(owner(F::HcNormalized), Some(F::Projection));
+        assert_eq!(owner(F::PleQuery), Some(F::Projection));
+        assert_eq!(owner(F::HcUp), Some(F::Projection2));
+        assert_eq!(owner(F::PleKey), Some(F::Projection2));
+        assert_eq!(owner(F::PleGated), Some(F::Rotation));
+        assert_eq!(owner(F::PleOutput), Some(F::MoeYDownGrouped));
+        assert_eq!(owner(F::PleValue), Some(F::MoeSharedOutput));
+        assert_eq!(owner(F::GdnRecurrentOutput), Some(F::QsaQgate));
+        assert_eq!(owner(F::PleNormed), None);
+        assert_eq!(compact.iter().filter(|slot| slot.owner.is_some()).count(), 8);
+        // Only owners are charged; no view's owner is itself a view and every
+        // view fits inside its owner.
+        assert_eq!(owned_bytes(&compact), scratch_bytes(8192, Mode::FnSymGfx1201));
+        assert_eq!(owned_bytes(&full), scratch_bytes(8192, Mode::Full));
+        for slot in compact.iter().filter(|slot| slot.owner.is_some()) {
+            let owner = compact[slot.owner.unwrap() as usize];
+            assert!(owner.owner.is_none());
+            assert_eq!(owner.dtype, slot.dtype);
+            assert!(slot.elements <= owner.elements);
+        }
+        // Alias-set members share the owner's row pitch.
+        let pitch = |field: F| compact[field as usize].pitch;
+        for field in [F::Projection, F::HcNormalized, F::PleQuery] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::Projection2, F::HcUp, F::PleKey] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::QsaQgate, F::GdnRecurrentOutput] {
+            assert_eq!(pitch(field), Some(12_288), "{field:?}");
+        }
+        for field in [F::Rotation, F::PleGated, F::PleOutput] {
+            assert_eq!(pitch(field), Some(10_240), "{field:?}");
+        }
+        for field in [F::MoeSharedOutput, F::PleValue] {
+            assert_eq!(pitch(field), Some(2_560), "{field:?}");
+        }
+        assert_eq!(pitch(F::MoeYDownGrouped), None);
+        assert_eq!(pitch(F::PleNormed), None);
+    }
+
+    #[test]
+    fn compact_layout_holds_at_the_boundary_rows() {
+        for rows in [1usize, 8, 9, 64, 511, 512, 513, 4096, 8192] {
+            let full = plan(rows, Mode::Full);
+            let compact = plan(rows, Mode::FnSymGfx1201);
+            assert_eq!(owned_bytes(&full), scratch_bytes(rows, Mode::Full), "rows {rows}");
+            assert_eq!(
+                owned_bytes(&compact),
+                scratch_bytes(rows, Mode::FnSymGfx1201),
+                "rows {rows}"
+            );
+            assert!(owned_bytes(&compact) < owned_bytes(&full), "rows {rows}");
+
+            let n = rows as u64;
+            let c = rows.min(QWEN4_COMPACT_FALLBACK_ROWS) as u64;
+            for field in [F::MoeGateBatch, F::MoeUpBatch, F::MoeRotBatch] {
+                assert_eq!(field_bytes(&compact, field), c * 10 * 640 * 4);
+            }
+            assert_eq!(
+                field_bytes(&compact, F::MoeDownExpanded),
+                (c * 10 * 2560 * 4).max(n * 2560 * 4).max(n * 80)
+            );
+            assert_eq!(
+                field_bytes(&compact, F::MoeYGateUpGrouped),
+                (grouped_rows(c) * 1280 * 4).max(grouped_rows(n) * 640 * 2)
+            );
+            let down = field_bytes(&compact, F::MoeYDownGrouped);
+            assert_eq!(
+                down,
+                (grouped_rows(c) * 2560 * 4).max(grouped_rows(n) * 2560 * 2)
+            );
+            // The borrowed PLE output must fit inside the grouped-down owner.
+            assert!(down >= n * 10_240 * 4, "rows {rows}");
+            if rows <= QWEN4_COMPACT_FALLBACK_ROWS {
+                for field in [
+                    F::MoeGateBatch,
+                    F::MoeUpBatch,
+                    F::MoeRotBatch,
+                    F::MoeDownExpanded,
+                    F::MoeYGateUpGrouped,
+                    F::MoeYDownGrouped,
+                ] {
+                    assert_eq!(
+                        field_bytes(&compact, field),
+                        field_bytes(&full, field),
+                        "{field:?} at {rows} rows is the full F32 size"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_plan_refuses_zero_rows_and_overflow() {
+        let config = fn_config();
+        for mode in [Mode::Full, Mode::FnSymGfx1201] {
+            assert!(Scratch::device_bytes(&config, 0, mode).is_err());
+            assert!(Scratch::device_bytes(&config, usize::MAX, mode).is_err());
+            assert!(Scratch::device_bytes(&config, usize::MAX / 2, mode).is_err());
+            assert_eq!(qwen4_forward_device_bytes(&config, 0, mode), None);
+            assert_eq!(qwen4_forward_device_bytes(&config, usize::MAX, mode), None);
+        }
+    }
+
+    #[test]
+    fn compact_mode_needs_every_term() {
+        let all = CompactScratchTerms {
+            knob: true,
+            exact_gfx1201: true,
+            grouped_gemm: true,
+            sym_iu4_requested: true,
+            source_symmetric: true,
+            ple_key_value_bf16: true,
+            flash_next_profile: true,
+        };
+        assert_eq!(all.mode(), Mode::FnSymGfx1201);
+        let off = [
+            CompactScratchTerms { knob: false, ..all },
+            CompactScratchTerms { exact_gfx1201: false, ..all },
+            CompactScratchTerms { grouped_gemm: false, ..all },
+            CompactScratchTerms { sym_iu4_requested: false, ..all },
+            CompactScratchTerms { source_symmetric: false, ..all },
+            CompactScratchTerms { ple_key_value_bf16: false, ..all },
+            CompactScratchTerms { flash_next_profile: false, ..all },
+        ];
+        for terms in off {
+            assert_eq!(terms.mode(), Mode::Full, "{terms:?}");
+        }
+    }
+
+    #[test]
+    fn compact_mode_is_exact_gfx1201_only() {
+        assert!(CompactScratchTerms::is_exact_gfx1201("gfx1201"));
+        for arch in [
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx940", "gfx941", "gfx942", "gfx12010", "gfx1201x", "gfx120", "",
+        ] {
+            assert!(!CompactScratchTerms::is_exact_gfx1201(arch), "{arch}");
+        }
+    }
+
+    #[test]
+    fn owner_pitch_segments_are_disjoint_and_bounded() {
+        let pitch = 12_288usize;
+        let numel = 8192 * pitch;
+        // Many small invocations (aggregate well past 512 rows) of unequal
+        // sizes, then one large segment, at nonzero row starts.
+        let mut segments = Vec::new();
+        let mut begin = 0usize;
+        for index in 0..700usize {
+            let rows = if index % 7 == 0 { 8 } else { 1 };
+            segments.push((begin, rows));
+            begin += rows;
+        }
+        segments.push((begin, 1500));
+        assert!(begin + 1500 > QWEN4_COMPACT_FALLBACK_ROWS);
+        for width in [12_288usize, 10_240, 6_144] {
+            let mut previous_end = 0usize;
+            for &(begin, rows) in &segments {
+                let (offset, len) = owner_pitch_extent(pitch, numel, begin, rows, width).unwrap();
+                assert_eq!(offset, begin * pitch);
+                assert_eq!(len, rows * pitch);
+                assert!(offset >= previous_end, "segment at row {begin} overlaps its predecessor");
+                previous_end = offset + len;
+            }
+            assert!(previous_end <= numel);
+        }
+        // Past the owner, wider than the pitch, or overflowing: refused.
+        assert!(owner_pitch_extent(pitch, numel, 8191, 2, 10_240).is_err());
+        assert!(owner_pitch_extent(pitch, numel, 0, 1, pitch + 1).is_err());
+        assert!(owner_pitch_extent(usize::MAX, usize::MAX, 2, 1, 1).is_err());
+        assert!(owner_pitch_extent(pitch, usize::MAX, usize::MAX, 1, 1).is_err());
+    }
+
+    #[test]
+    fn logical_width_bases_collide_where_owner_pitch_bases_do_not() {
+        // Two members of one alias set with different logical widths (a
+        // 12288-wide and a 10240-wide field) serving neighbouring segments
+        // A = rows 9..12 and B = row 12.
+        let (a_begin, a_rows, b_begin) = (9usize, 3usize, 12usize);
+        // Negative control: bases at each field's own logical width overlap.
+        let a_logical = (a_begin * 12_288, (a_begin + a_rows) * 12_288);
+        let b_logical_start = b_begin * 10_240;
+        assert!(a_logical.0 <= b_logical_start && b_logical_start < a_logical.1);
+        // Owner pitch: the same segments are disjoint.
+        let pitch = 12_288usize;
+        let numel = 64 * pitch;
+        let (a_offset, a_len) = owner_pitch_extent(pitch, numel, a_begin, a_rows, 12_288).unwrap();
+        let (b_offset, _) = owner_pitch_extent(pitch, numel, b_begin, 1, 10_240).unwrap();
+        assert!(a_offset + a_len <= b_offset);
+    }
 
     fn bytes(ids: &[u32]) -> Vec<u8> {
         ids.iter()
@@ -4535,7 +7587,8 @@ mod tests {
         let config = crate::config::compact_test_config();
         for rows in [1, 16, 1536] {
             assert_eq!(
-                super::Qwen4GpuForwardScratch::device_bytes(&config, rows).unwrap(),
+                super::Qwen4GpuForwardScratch::device_bytes(&config, rows, super::Qwen4ForwardScratchMode::Full)
+                    .unwrap(),
                 flash_next_plan_bytes(&config, rows),
                 "rows {rows}"
             );
@@ -4558,24 +7611,27 @@ mod tests {
     fn dense_scratch_is_profile_derived_and_never_empty() {
         let config = tiny_dense();
         let rows = 4;
-        let (plan, ple_bytes) = super::Qwen4GpuForwardScratch::plan(&config, rows).unwrap();
-        assert!(plan.iter().all(|&(elements, _)| elements >= 1));
+        let (plan, ple_bytes) =
+            super::Qwen4GpuForwardScratch::plan(&config, rows, super::Qwen4ForwardScratchMode::Full)
+                .unwrap();
+        assert!(plan.iter().all(|slot| slot.elements >= 1));
         let ple = config.ple.as_ref().unwrap();
         let embed = ple.head_count * ple.row_width;
         assert_eq!(ple_bytes, rows * embed * 2);
-        // Field order: gdn_bf16, ple_staged, ple_key, moe_gate_batch, moe_up_batch.
+        use super::ScratchField as F;
+        let slot = |field: F| (plan[field as usize].elements, plan[field as usize].dtype);
         let gdn_value = config.linear_num_value_heads * config.linear_value_head_dim;
         assert_eq!(
-            plan[17],
+            slot(F::GdnBf16),
             (
                 gdn_value.max(config.hidden_size).max(config.hc_lowrank),
                 rdna_compute::DType::BF16
             )
         );
-        assert_eq!(plan[27], (rows * embed, rdna_compute::DType::BF16));
-        assert_eq!(plan[29].0, rows * config.hidden_size * config.hc_count);
-        assert_eq!(plan[43].0, rows * 8);
-        assert_eq!(plan[44].0, rows * 8);
+        assert_eq!(slot(F::PleStaged), (rows * embed, rdna_compute::DType::BF16));
+        assert_eq!(slot(F::PleKey).0, rows * config.hidden_size * config.hc_count);
+        assert_eq!(slot(F::MoeGateBatch).0, rows * 8);
+        assert_eq!(slot(F::MoeUpBatch).0, rows * 8);
     }
 
     #[test]
@@ -4594,9 +7650,11 @@ mod tests {
         // plan holds no PLE staging bytes (every buffer still has an element).
         config.ple = None;
         super::Qwen4GpuForward::admit_profile(&config).expect("no PLE is admitted");
-        let (plan, ple_bytes) = super::Qwen4GpuForwardScratch::plan(&config, 4).unwrap();
+        let (plan, ple_bytes) =
+            super::Qwen4GpuForwardScratch::plan(&config, 4, super::Qwen4ForwardScratchMode::Full)
+                .unwrap();
         assert_eq!(ple_bytes, 0);
-        assert!(plan.iter().all(|&(elements, _)| elements >= 1));
+        assert!(plan.iter().all(|slot| slot.elements >= 1));
     }
 
     #[test]
@@ -4622,5 +7680,164 @@ mod tests {
         let layout = crate::program::Qwen4ScratchLayout::for_rows(flash, 4).unwrap();
         assert_eq!(layout.dense_rows, 0);
         assert_eq!(layout.routed_rows, 4 * 10 * 640);
+    }
+}
+
+/// The session cache's next pending snapshot boundary and the one after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionBoundaries {
+    pub next: Option<usize>,
+    pub after: Option<usize>,
+}
+
+/// A shared deterministic singleton/MTP schedule. A planned pair covers
+/// `min(remaining, 2 * chunk)` rows. One interior session boundary rides the
+/// in-bank Core sub-launch; a second interior boundary ends the group at the
+/// first one, as an ordinary sequential bank.
+pub(crate) fn qwen4_prefill_segment_rows(
+    position: usize, prompt_end: usize, chunk: usize,
+    boundaries: SessionBoundaries, planned: bool,
+) -> usize {
+    let remaining = prompt_end.saturating_sub(position);
+    let pair = planned && chunk == 8192 && remaining > chunk;
+    let rows = if pair { remaining.min(2 * chunk) } else { remaining.min(chunk) };
+    let Some(boundary) = boundaries.next else { return rows; };
+    if boundary <= position { return remaining.min(chunk); }
+    let distance = boundary - position;
+    if pair {
+        if distance < rows && boundaries.after.is_some_and(|next| next < position + rows) {
+            return distance.min(chunk);
+        }
+        return rows;
+    }
+    rows.min(distance)
+}
+
+/// Where in a pair group the session snapshot row falls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutSite {
+    /// No interior snapshot row (the group end is published by the driver).
+    None,
+    /// Exactly the A/B boundary: bank A runs whole, state staged after it.
+    Split,
+    /// Inside `bank` at its local `row`: that bank's Core runs as two launches.
+    Bank { bank: usize, row: usize },
+}
+
+/// Bank and sub-launch geometry of one pair group: two banks and the group-local
+/// row of an interior session snapshot. Both the executor and the numerical twin
+/// derive their chunking from this, so they cut at identical rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PairShape {
+    pub rows: [usize; 2],
+    pub cut: Option<usize>,
+}
+
+impl PairShape {
+    /// `cut` is the session boundary `boundary` made group-local at `position`;
+    /// only a boundary strictly inside the group is a cut.
+    pub(crate) fn new(rows: [usize; 2], position: usize, boundary: Option<usize>) -> Self {
+        let total = rows[0] + rows[1];
+        let cut = boundary.filter(|&b| b > position && b < position + total).map(|b| b - position);
+        Self { rows, cut }
+    }
+
+    pub(crate) fn total(&self) -> usize { self.rows[0] + self.rows[1] }
+
+    pub(crate) fn site(&self) -> CutSite {
+        match self.cut {
+            None => CutSite::None,
+            Some(cut) if cut == self.rows[0] => CutSite::Split,
+            Some(cut) if cut < self.rows[0] => CutSite::Bank { bank: 0, row: cut },
+            Some(cut) => CutSite::Bank { bank: 1, row: cut - self.rows[0] },
+        }
+    }
+
+    /// Group-local row ranges of the sequential chunks the numerical twin runs:
+    /// the banks, further split at the cut (a sub-launch is a chunk boundary).
+    pub(crate) fn pieces(&self) -> Vec<std::ops::Range<usize>> {
+        let mut points = vec![0, self.rows[0], self.total()];
+        points.extend(self.cut);
+        points.sort_unstable();
+        points.dedup();
+        points.windows(2).map(|w| w[0]..w[1]).collect()
+    }
+}
+
+#[cfg(test)]
+mod ep_rank_generic_tests {
+    use super::*;
+
+    /// Default on, exact `0` is the kill switch, anything else leaves it on.
+    #[test]
+    fn ep_levers_are_default_on_with_an_exact_zero_kill_switch() {
+        assert!(ep_lever_on(None));
+        assert!(ep_lever_on(Some("1")));
+        assert!(ep_lever_on(Some("")));
+        assert!(ep_lever_on(Some("true")));
+        assert!(!ep_lever_on(Some("0")));
+    }
+
+    fn owners(table: &[u8]) -> Vec<i32> {
+        table
+            .chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn owner_routed_prefill_admits_exactly_ep2_and_ep4() {
+        for ranks in [2usize, 4] {
+            assert!(tile_ranks_supported(ranks), "{ranks}");
+        }
+        for ranks in [0usize, 1, 3, 5, 6, 8] {
+            assert!(!tile_ranks_supported(ranks), "{ranks}");
+        }
+    }
+
+    #[test]
+    fn owner_table_is_expert_modulo_ranks_and_balanced() {
+        for ranks in [2usize, 4] {
+            let table = owners(&tile_owner_table_bytes(512, ranks));
+            assert_eq!(table.len(), 512);
+            assert!(table.iter().enumerate().all(|(e, &o)| o == (e % ranks) as i32));
+            for rank in 0..ranks {
+                assert_eq!(table.iter().filter(|&&o| o == rank as i32).count(), 512 / ranks);
+            }
+        }
+    }
+
+    #[test]
+    fn stage_donor_bytes_split_by_every_rank_and_total_the_full_layer() {
+        let full = 512 * (QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES);
+        for ranks in [1usize, 2, 4] {
+            let [gate_up, down] = stage_donor_bytes(512, ranks);
+            assert_eq!(gate_up, 512 / ranks * QWEN4_EXPERT_STAGE_GATE_UP_BYTES);
+            assert_eq!(down, 512 / ranks * QWEN4_EXPERT_STAGE_DOWN_BYTES);
+            assert_eq!((gate_up + down) * ranks, full);
+        }
+    }
+
+    #[test]
+    fn ep4_donor_redirect_covers_each_expert_once_and_keeps_peer_pointers() {
+        let ranks = 4usize;
+        let stride = QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
+        let base = 0x10_0000usize;
+        let entries: Vec<usize> = (0..512).map(|e| 0x9000_0000 + e).collect();
+        let mut claimed = vec![0usize; 512];
+        for rank in 0..ranks {
+            let placement = Qwen4EpPlacement { rank, ranks };
+            let bytes = redirect_owned_entries(placement, base, stride, &entries);
+            for (expert, word) in bytes.chunks_exact(std::mem::size_of::<usize>()).enumerate() {
+                let pointer = usize::from_ne_bytes(word.try_into().unwrap());
+                if expert % ranks == rank {
+                    assert_eq!(pointer, base + (expert / ranks) * stride, "rank {rank} expert {expert}");
+                    claimed[expert] += 1;
+                } else {
+                    assert_eq!(pointer, entries[expert], "rank {rank} expert {expert}");
+                }
+            }
+        }
+        assert!(claimed.iter().all(|&count| count == 1));
     }
 }

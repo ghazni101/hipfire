@@ -14,10 +14,12 @@ use crate::model_source::{
     SourceReader, SourceReaderImpl,
 };
 use crate::ple_sidecar::PleRowsFile;
+use crate::offload::LayerResidency;
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
-    reupload_f16_as_f32, HfqBackend, WeightBackend,
+    reupload_f16_as_f32, upload_decoded_bytes, HfqBackend, MemoryTarget, WeightBackend,
 };
+use crate::weight_manifest::WeightResidency;
 use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2484,11 +2486,12 @@ pub fn load_lloyd_lut(
 /// Load a weight tensor (quantized or F16) onto GPU.
 pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     let st_name = candidates(name)
         .into_iter()
@@ -2509,7 +2512,7 @@ pub(crate) fn load_weight_tensor(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, bytes, &[m, k])?;
             Ok::<WeightTensor, HipError>(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -2530,12 +2533,12 @@ pub(crate) fn load_weight_tensor(
                 let mut centered = data.to_vec();
                 crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
-                decode_raw_codec(gpu, c, &centered, m, k, &st_name)
+                decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
             None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
         },
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name),
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
                 &format!("unsupported quant_type {other} for weight {st_name}"),
@@ -2570,11 +2573,12 @@ pub(crate) fn load_weight_tensor(
 /// before loading (e.g. the DSpark qwen3 sidecar loader on UMA).
 pub fn load_weight_tensor_pread(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     let st_name = candidates(name)
         .into_iter()
@@ -2594,7 +2598,7 @@ pub fn load_weight_tensor_pread(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, bytes, &[m, k])?;
             Ok::<WeightTensor, HipError>(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -2614,12 +2618,12 @@ pub fn load_weight_tensor_pread(
                 let mut centered = data;
                 crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
-                decode_raw_codec(gpu, c, &centered, m, k, &st_name)
+                decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
             None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
         },
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name),
+            Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
                 &format!("unsupported quant_type {other} for weight {st_name}"),
@@ -2691,6 +2695,7 @@ impl WeightSource for LlamaHfqSource<'_> {
                     cfg.vocab_size,
                     cfg.dim,
                     flat_name_candidates,
+                    MemoryTarget::Device,
                 )
             },
             |gpu| {
@@ -2703,7 +2708,12 @@ impl WeightSource for LlamaHfqSource<'_> {
         )
     }
 
-    fn read_layer(&mut self, gpu: &mut Gpu, i: usize) -> HipResult<LayerWeights> {
+    fn read_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        i: usize,
+        _residency: LayerResidency,
+    ) -> HipResult<LayerWeights> {
         let cfg = self.cfg;
         let q_out_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -2716,8 +2726,7 @@ impl WeightSource for LlamaHfqSource<'_> {
             read_proj: load_weight_tensor,
             layer: i,
             // Generic llama-family reader is always fully resident — no offload support.
-            host_local: false,
-            read_proj_host: None,
+            residency: WeightResidency::Resident,
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }

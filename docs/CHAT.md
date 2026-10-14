@@ -3,9 +3,11 @@
 hipfire provides two native Rust chat surfaces:
 
 - `hipfire tui` (or bare `hipfire`) opens the full ratatui application and its
-  Chat tab.
+  Chat tab. This requires the `hipfire-tui` binary; when it is not installed
+  the command exits with an error that names the build command.
 - `hipfire chat [model]` is a lightweight line-oriented multi-turn client for
-  terminals and scripts.
+  terminals and scripts. It is part of the `hipfire` binary and does not need
+  `hipfire-tui`.
 
 Both use the native OpenAI-compatible service documented in
 [`SERVE.md`](SERVE.md).
@@ -21,11 +23,29 @@ hipfire tui
 Open the Chat tab, select a downloaded model in Models, or use `/model <tag>`.
 The TUI supports streaming, multiline input (`Ctrl+O`), cancellation, saved
 sessions, model/system/sampling commands, regeneration/edit/copy actions, and
-live serve status. Run `/help` in Chat for the current command list.
+live serve status.
 
-The TUI asks the native CLI to start a detached service when the configured
-endpoint is offline. Config, registry, model lifecycle, and HTTP calls all use
-the shared Rust crates; there is no separate script runtime.
+Chat-tab slash commands run locally and never send a message (a message whose
+text must begin with `/` is sent as `//text`, which transmits `/text`):
+
+| Command | Effect |
+|---|---|
+| `/model [tag]` (`/m`) | Show the active model, or switch to `tag`. The tag must be a known registry/local entry or alias, otherwise the command reports `unknown model`. |
+| `/system [text]` (`/sys`) | Set the system prompt; with no text, clear it. |
+| `/temp [value\|off]` | Per-session temperature override, `0..=2`; no value or `off` returns to the serve default. |
+| `/top_p [value\|off]` | Per-session nucleus override, `0..=1`; no value or `off` returns to the serve default. |
+| `/clear` | Clear the whole conversation. |
+| `/save <name>`, `/load <name>` | Save the current conversation as a named session, or replace the conversation with a saved one. |
+| `/sessions` (`/ls`), `/delete <name>` (`/del`) | List saved session names, or delete one. |
+| `/regen` (`/retry`) | Drop the last reply and regenerate from the last user turn. |
+| `/edit` | Pull the last user turn back into the input (dropping its reply) for editing and resending. |
+| `/copy` | Copy the last non-empty assistant reply to the clipboard (OSC 52 escape; replies over 100 KB are refused). |
+| `/help` | Show the command list in the status line. |
+
+When the configured endpoint is offline, sending a message makes the TUI start
+`hipfire serve -d` and keeps your prompt; retry once the live serve status shows
+online. Config, registry, model lifecycle, and HTTP calls all use the shared
+Rust crates; there is no separate script runtime.
 
 ## Lightweight chat command
 
@@ -40,15 +60,18 @@ you> /clear
 you> /exit
 ```
 
-Supported local commands are `/clear`, `/exit`, and `/quit`. Flags:
+Supported local commands are `/clear` (drops every message except the system
+message), `/exit`, and `/quit`. Flags:
 
 | Flag | Purpose |
 |---|---|
-| `-t, --temp <f>` | Explicit temperature for this session |
-| `--top-p <f>` | Explicit nucleus probability |
-| `-n, --max-tokens <n>` | Per-turn generation cap |
+| `-t, --temp <f>` | Explicit temperature for this session, `0..=2` |
+| `--top-p <f>` | Explicit nucleus probability, `(0, 1]` |
+| `-n, --max-tokens <n>` | Per-turn generation cap, `1..=393216`; default `generation.max_tokens` |
 | `--system <text>` | Initial system message |
 | `--no-color` | Compatibility flag; the line client emits no ANSI color |
+
+`[model]` is optional and defaults to the configured `serve.default_model`.
 
 If no healthy service exists, the command starts a tracked detached native
 service on the configured host/port with lazy model loading. That service

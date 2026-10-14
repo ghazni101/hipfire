@@ -631,6 +631,60 @@ for line in sys.stdin:
         })
     elif ty == "generate":
         handle_generate(req)
+    elif ty == "decide":
+        qs = req.get("questions") or {}
+        state = req.get("state")
+        messages = req.get("messages")
+        # Spec §12.1: exactly one of state / messages.
+        if (state is None) == (messages is None):
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422,
+                           "message": "exactly one of state or messages is required"}})
+            continue
+        if messages is not None:
+            valid = isinstance(messages, list) and bool(messages) and bool(qs)
+        else:
+            valid = isinstance(state, (str, dict, list)) and bool(qs)
+        if not valid:
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422, "message": "state/messages/questions invalid"}})
+            continue
+        # A prompt past the loaded max_seq: serve must return this 422 as-is,
+        # required_max_seq included, without reloading.
+        if state == "t-needs-huge-ctx":
+            out({"type": "decided", "id": req.get("id"),
+                 "error": {"status": 422, "message": "prompt needs 10000000 tokens",
+                           "required_max_seq": 10000000}})
+            continue
+        # Task 8 review round 1: delays the reply so a test can prove the
+        # HTTP-side admission guard is held for the full daemon round trip,
+        # not released the instant the client disconnects.
+        if state == "t-slow":
+            time.sleep(1)
+        answers = {}
+        for name, q in qs.items():
+            t = q.get("type")
+            if t == "choice":
+                keys = list((q.get("criteria") or {}).keys())
+                p = 1.0 / len(keys)
+                answers[name] = {"type": "choice", "choice": keys[0],
+                                 "probabilities": {k: p for k in keys}, "confidence": 0.0}
+            elif t == "score":
+                n = len(q.get("criteria") or [])
+                answers[name] = {"type": "score", "score": (n - 1) / 2,
+                                 "probabilities": {str(i): 1.0 / n for i in range(n)},
+                                 "confidence": 1.0 / n}
+            else:
+                answers[name] = {"type": "noul", "noul": 0.5}
+        timing = {"prefix_tokens": 8, "total_ms": 1.0}
+        if messages is not None:
+            # Echo what serve forwarded so route tests can see the projection.
+            timing.update({"mode": "session",
+                           "session_roles": [m.get("role") for m in messages],
+                           "session_tools": len(req.get("tools") or [])})
+        out({"type": "decided", "id": req.get("id"), "answers": answers,
+             "usage": {"input_tokens": 10 * len(qs), "output_tokens": 0},
+             "timing": timing})
     elif ty == "unload":
         out({"type": "unloaded"})
         sys.exit(0)

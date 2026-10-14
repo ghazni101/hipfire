@@ -28,12 +28,14 @@ cargo check --workspace --examples
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
 cargo test -p hipfire-cpu --lib
+cargo test -p hipfire-engine --lib decide
+cargo test -p hipfire-generate --lib decide
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
 cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
 # peacemaker audit: lds_store_unwaited_at_barrier on committed code objects (no ROCm).
-cargo test -p hipfire-isa --features toolchain --lib audit::
+cargo test -p peacemaker-isa --features toolchain --lib audit::
 # Advisory Peacemaker schedule lint: deterministic CPU-only calibration, no GPU.
-cargo test -j 8 -p hipfire-isa --features toolchain --lib cost_lint::
+cargo test -j 8 -p peacemaker-isa --features toolchain --lib cost_lint::
 # PM typed core and its runtime driver, including the trybuild compile-fail
 # race tests: their pinned rustc diagnostics catch API changes that alter them.
 cargo test -p peacemaker-author
@@ -57,6 +59,7 @@ else
     exit 1
 fi
 python3 -m unittest tools.redline.tests.test_product_bench tools.redline.tests.test_golden tools.redline.tests.test_serve_diff tools.redline.tests.test_lower tools.redline.tests.test_dispatch_profile
+python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'
 python3 scripts/test_install_revision.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh

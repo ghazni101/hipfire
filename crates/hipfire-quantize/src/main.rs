@@ -37,14 +37,16 @@ mod ple_hot_pack;
 mod ple_hot_rank;
 mod qwen4;
 mod reap_overlay;
+mod trunk_overlay;
 
 fn main() {
-    // `ple-hot-rank` and `ple-hot-pack` are standalone offline tools with their
+    // `ple-hot-rank`, `ple-hot-pack` and `trunk-overlay` are standalone offline tools with their
     // own flags; they never enter the quantize pipeline's argument surface.
     let mut argv = std::env::args().skip(1);
     match argv.next().as_deref() {
         Some("ple-hot-rank") => std::process::exit(ple_hot_rank::run(argv.collect())),
         Some("ple-hot-pack") => std::process::exit(ple_hot_pack::run(argv.collect())),
+        Some("trunk-overlay") => std::process::exit(trunk_overlay::run(argv.collect())),
         _ => {}
     }
     pipeline::run();

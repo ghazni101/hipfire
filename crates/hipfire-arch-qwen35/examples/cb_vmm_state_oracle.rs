@@ -1849,7 +1849,10 @@ fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ar_refs: &[Trace]) -> Resul
     let max_prefix = fx.iter().map(|f| f.prefix).max().unwrap_or(0);
     let cap = max_prefix + args.steps + 64;
     let head = load_mtp_head(&head_path, &mut gpu, cap)?;
-    let k = hipfire_runtime::config::get().mtp_k.clamp(1, 10);
+    let k = hipfire_runtime::config::get()
+        .mtp_k
+        .unwrap_or(hipfire_config::MTP_K_DEFAULT)
+        .clamp(1, 10);
     let mut d = Qwen35MtpDrafter::new(head, k, cap);
     let budget = args.steps + 1;
     let eos = slot.config.eos_token;
@@ -2644,8 +2647,8 @@ fn ring_span(gpu: &Gpu, t: &GpuTensor, row_bytes: usize, rows: usize, modulus: u
 /// ring cursors and live rows in logical order, `TargetHiddenLog` cursors and
 /// absolute positions, valid spans of the draft context rings
 /// (`target_hidden`, projection, per-layer K/V, windowed full-layer K/V),
-/// host-shadow length, and checkpoint positions. Never the unwritten parts of
-/// an allocation.
+/// context capacity / block size, and checkpoint positions. Never the
+/// unwritten parts of an allocation.
 fn df_arrays(gpu: &Gpu, df: &DflashState, ckpt: &[usize]) -> Result<Named> {
     gpu.hip.device_synchronize()?;
     let mut out: Named = Vec::new();
@@ -2685,7 +2688,7 @@ fn df_arrays(gpu: &Gpu, df: &DflashState, ckpt: &[usize]) -> Result<Named> {
         out.push(("draft.k_full".into(), ring_span(gpu, k, kvd * 4, full, wf)?));
         out.push(("draft.v_full".into(), ring_span(gpu, v, kvd * 4, full, wf)?));
     }
-    out.push(("draft.sizes".into(), le_u64s(&[df.target_hidden_host.len() as u64, df.ctx_capacity as u64, df.block_size as u64])));
+    out.push(("draft.sizes".into(), le_u64s(&[df.ctx_capacity as u64, df.block_size as u64])));
     out.push(("checkpoints.positions".into(), le_u64s(&ckpt.iter().map(|&p| p as u64).collect::<Vec<_>>())));
     Ok(out)
 }
@@ -4446,7 +4449,7 @@ fn dflash_probe_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ack: &Value) -> Res
         kv.quant_q8 && !kv.quant_fwht && !kv.quant_asym2 && !kv.quant_asym3 && !kv.quant_asym4 && matches!(kv.v_mode, hipfire_runtime::llama::VMode::Q8)
     };
     let draft_str = draft_path.to_str().ok_or("--dflash-draft is not UTF-8")?;
-    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, true, false, args.dflash_block)?;
+    let df = load_dflash_state(draft_str, ctx_cap, &slot.config, &slot.dn_state, &mut gpu, None, None, false, &slot.weights, kv_q8, slot.kv_cache.uses_vmm_backend(), slot.scratch.flash_partials.numel(), true, false, args.dflash_block)?;
     eprintln!(
         "gate0: DFlash draft loaded: layers={} hidden={} block={} runtime_block={}",
         df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size, df.block_size

@@ -419,11 +419,11 @@ fn sampled_spec_target_law_matches_ar_distribution() {
             c.min_p,
         )
         .expect("softmax_temp_topp_batched_into_f32");
-        let fast = FastTargetRows {
-            probs: gpu.download_f32(&probs_gpu).unwrap(),
-            tau: gpu.download_f32(&tau_gpu).unwrap(),
-            z: gpu.download_f32(&z_gpu).unwrap(),
-        };
+        let fast = FastTargetRows::dense(
+            gpu.download_f32(&probs_gpu).unwrap(),
+            gpu.download_f32(&tau_gpu).unwrap(),
+            gpu.download_f32(&z_gpu).unwrap(),
+        );
 
         let law = ar_law(&logits, c);
         let support: HashSet<u32> = law.iter().map(|&(t, _)| t).collect();

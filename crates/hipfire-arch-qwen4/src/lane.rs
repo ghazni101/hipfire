@@ -27,7 +27,9 @@ use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_exec::LanePhase;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
 use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy, PendingWindow};
-use crate::mtp_spec::{mtp_batched_fill_enabled, native_mtp_row_capture, Qwen4PromotionParts};
+use crate::mtp_spec::{
+    mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture, Qwen4PromotionParts,
+};
 use crate::state::{Qwen4State, Qwen4StateFormat};
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::slot_batch::RequestEpoch;
@@ -490,8 +492,8 @@ pub(crate) struct SpecStore {
     pub draft_top1: GpuTensor,
     /// Host mirror of `draft_top1`.
     pub draft_top1_host: Vec<u8>,
-    /// Shared prompt-fill append scratch (`None` when batched fill is off or
-    /// unsupported).
+    /// Shared prompt-fill append scratch (`None` when neither batched fill nor
+    /// the DET prompt fill wants it, or the head does not support it).
     pub append_scratch: Option<MtpAppendScratch>,
     pub cost: LaneCostModel,
     pub routes: LabRoutes,
@@ -531,7 +533,8 @@ impl SpecStore {
                 return Err(format!("lane store: draft top-1: {error}"));
             }
         };
-        let append_scratch = if mtp_batched_fill_enabled() && bundle.mtp_append_rows_supported(gpu)
+        let append_scratch = if mtp_fill_scratch_wanted(gpu)
+            && bundle.mtp_append_rows_supported(gpu)
         {
             let rows = MTP_FILL_ROWS.min(bundle.spec_chunk_rows().unwrap_or(1).max(1));
             // Prompt-id rows = append rows: a tile of at most `rows` rows
@@ -730,7 +733,7 @@ impl Qwen4LaneStore {
                 .checked_add(MtpGpuState::device_bytes(config, context)?)?
                 .checked_add(ring)?
                 .checked_add(wide.checked_mul(f32_bytes)?)?;
-            let append = if mtp_batched_fill_enabled() {
+            let append = if mtp_fill_scratch_requested() {
                 MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).unwrap_or(0)
             } else {
                 0

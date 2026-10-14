@@ -133,6 +133,11 @@ impl Model {
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
         let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
+        // to this base while it is open and applied by `attach_forward`.
+        let trunk_overlay =
+            hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
+                .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
         // A rank-order table is served through its store (no shard
         // descriptors); every other source reads through 128 descriptors.
         let rank_table = receipt.ple_rows.rank_table().is_some();
@@ -175,6 +180,15 @@ impl Model {
         if let Some(note) = &choice.note {
             eprintln!("qwen4_kld: ple rows: {note}");
         }
+        // The loader's forward scratch plan, decided from the actual payload
+        // while the mapping is readable.
+        let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+            &gpu,
+            &hfq,
+            &receipt.config,
+            &receipt.manifest,
+        )
+        .map_err(|e| e.to_string())?;
         if gpu.is_uma() {
             hfq.drop_mmap();
         }
@@ -199,6 +213,7 @@ impl Model {
                 ),
                 (None, _) => None,
             };
+        let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
         let transaction = fulfill_manifest_from_payloads(
             &receipt.manifest.weights,
@@ -237,8 +252,14 @@ impl Model {
             backend,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
+        bundle.attach_npu_trunk_identity(npu_identity);
+        if let Some(overlay) = trunk_overlay {
+            bundle
+                .attach_trunk_overlay(overlay)
+                .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+        }
         bundle
-            .attach_forward(&mut gpu, n_ctx)
+            .attach_forward(&mut gpu, n_ctx, scratch_mode)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
         if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
             bundle

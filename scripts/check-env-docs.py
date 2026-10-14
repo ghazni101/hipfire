@@ -37,6 +37,9 @@ BOOTSTRAP_ENV = {
     # hipfire-runtime ple_q4.rs #[cfg(test)]; never read by runtime code.
     "HIPFIRE_PROBE_MODEL",
     "HIPFIRE_PROBE_ROWS",
+    # Test-only fixture path of the #[ignore]d packed-host-expert parity check in
+    # hipfire-arch-qwen35 qwen35/load.rs #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_MOE_PARITY_FIXTURE",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").

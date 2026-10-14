@@ -233,6 +233,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "gfx1100" => add!("gemv_hfq4g256_rdna3", kernels::GEMV_HFQ4G256_GFX1100_SRC, ["gemv_hfq4g256"]),
         _ => add!("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC, ["gemv_hfq4g256"]),
     }
+    if arch == "gfx1201" {
+        add!("fused_gate_up_mq4g256v2_k5120_gfx1201", kernels::fused_gate_up_mq4g256v2_k5120_gfx1201_src(), ["fused_gate_up_mq4g256v2_k5120_gfx1201"]);
+    }
     if arch == "gfx1100" {
         add!("fused_gate_up_mq4g256v2_k5120_gfx1100", kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(), ["fused_gate_up_mq4g256v2_k5120_gfx1100"]);
         // Default gfx1100 precompile branches (dispatch.rs:4944-4962,5304-5308).
@@ -274,6 +277,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("kv_cache_write_q8_0_independent_masked", prepend_kv_slot_desc(kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC), ["kv_cache_write_q8_0_independent_masked"]);
     add!("attention_flash_q8_0_tile", kernels::ATTENTION_FLASH_Q8_0_TILE_SRC, ["attention_flash_q8_0_tile"]);
     add!("attention_flash_q8_0_reduce", kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, ["attention_flash_q8_0_reduce"]);
+    // Gemma 4 decode twins of the two modules above (attention.rs
+    // `attention_flash_q8_0_windowed_impl` with `gemma_tiles`).
+    add!("attention_flash_q8_0_tile_swa", kernels::ATTENTION_FLASH_Q8_0_TILE_SWA_SRC, ["attention_flash_q8_0_tile_swa"]);
+    add!("attention_flash_q8_0_reduce_skip", kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC, ["attention_flash_q8_0_reduce_skip"]);
     // Multi-slot (slot-descriptor) launches of the q8 and asym3 KV routes run
     // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
     // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
@@ -410,12 +417,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_norm_mq_rotate_f16", crate::mq_f16_residual_producers::GATED_NORM_F16_SRC, ["gated_norm_mq_rotate_awq_f16_batched_gfx1100", "gated_norm_mq_rotate_f16_batched_gfx1100"]);
         add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
         add!("sigmoid_mul_mq_rotate_f16", crate::mq_f16_residual_producers::SIGMOID_MUL_F16_SRC, ["sigmoid_mul_mq_rotate_awq_f16_batched_gfx1100", "sigmoid_mul_mq_rotate_f16_batched_gfx1100"]);
+        add!("fused_rmsnorm_mq_rotate_awq_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
+        add!("fused_rmsnorm_mq_rotate_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
+        add!("dflash_gdn_pre_gfx1100", crate::dflash_gdn_pre::DFLASH_GDN_PRE_GFX1100_SRC, ["dflash_gdn_pre_capture_gfx1100", "dflash_gdn_pre_replay_gfx1100"]);
+        add!("qwen35_fa_prep_batched_gfx1100", crate::qwen35_fa_batch::FA_PREP_BATCHED_SRC, ["qwen35_fa_prep_batched_gfx1100"]);
+        add!("kv_cache_write_q8_0_pair_batched_gfx1100", crate::qwen35_fa_batch::KV_PAIR_BATCHED_SRC, ["kv_cache_write_q8_0_pair_batched_gfx1100"]);
         add!("dflash_gdn_replay_pre_ml_from", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC, ["dflash_gdn_replay_pre_ml_from"]);
         add!("gated_delta_net_q8_fast_ml_from", crate::dflash_gdn_replay::GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC, ["gated_delta_net_q8_fast_ml_from"]);
         add!("attention_verify_gqa_gfx1201", kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC, ["attention_verify_gqa_q8_gfx1201", "attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]);
         add!("attention_flash_fp8_e4m3_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC), ["attention_flash_fp8_e4m3_tile_batched", "attention_flash_q8_0_tile_batched"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
         add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
+        add!("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC, ["attention_fp8_e4m3_fa2_gqa_gfx1201", "attention_fp8_e4m3_fa2_gqa_merge_gfx1201", "attention_fp8_e4m3_fa2_gqa_partial_gfx1201", "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201", "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201"]);
         add!("dflash_gdn_replay_pre_ml", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_SRC, ["dflash_gdn_replay_pre_ml"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv"]);
         add!("fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast", kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC, ["fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast"]);
@@ -432,6 +445,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen35_fa_prep_fp8q_nogate_batched_gfx1201", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1201_SRC, ["qwen35_fa_prep_batched_gfx1201", "qwen35_fa_prep_fp8q_batched_gfx1201", "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"]);
         add!("select_regrid", crate::select_regrid::SELECT_REGRID_SRC, ["argmax_f32_batched_regrid", "topk_values_regrid_f32"]);
         add!("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SLAB_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]);
+        add!("sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab", kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC, ["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"]);
         add!("topk_values_fixup_f32", crate::select_regrid::TOPK_VALUES_FIXUP_SRC, ["topk_values_fixup_f32"]);
     }
     if arch == "gfx1100" {
@@ -439,7 +453,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100", kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC, ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100"]);
         add!("attention_flash_q8_0_tile_batched", assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC), ["attention_flash_q8_0_tile_batched"]);
         add!("attention_flash_q8_0_tile_gqa_gfx1100", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, ["attention_flash_q8_0_tile_gqa_gfx1100"]);
-        add!("attention_q8_0_fa2_gqa_gfx1100", q8_fa2_gqa_gfx1100_source(), ["attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_gfx1100"]);
+        add!("attention_q8_0_fa2_gqa_gfx1100", q8_fa2_gqa_gfx1100_source(), ["attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_gfx1100", "attention_q8_0_fa2_gqa_partial_gfx1100", "attention_q8_0_fa2_gqa_merge_gfx1100"]);
         add!("conv1d_silu_split_qknorm_b256_scalar_prep", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC, ["conv1d_silu_split_qknorm_b256_scalar_prep"]);
         add!("dflash_gdn_pre_gfx1100", crate::dflash_gdn_pre::DFLASH_GDN_PRE_GFX1100_SRC, ["dflash_gdn_pre_capture_gfx1100", "dflash_gdn_pre_replay_gfx1100"]);
         add!("dflash_hidden_commit5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
@@ -448,6 +462,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("dynamic_conv_residual_gfx1100", crate::dflash_draft_fusion::COLLAPSE_SRC, ["dynamic_conv_residual_gfx1100", "gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100", "gemm_ksplit_det_overwrite_finalize_dflash_gfx1100", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8", "mq_rotate_x_f16_dflash_gfx1100", "rmsnorm_residual_dual_gfx1100"]);
         add!("fused_rmsnorm_mq_rotate_awq_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_b8"]);
+        add!("fused_rmsnorm_mq_rotate_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
         add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
         add!("gated_delta_net_q8_compact3_b2", kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, ["gated_delta_net_q8_compact3_b2", "gated_delta_net_q8_fast_independent_masked"]);
         add!("gated_norm_mq_rotate_awq_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1100_v2"]);
@@ -472,20 +487,38 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     if arch == "gfx1151" {
         add!("attention_flash_q8_0_tile_gqa_gfx1151", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC, ["attention_flash_q8_0_tile_gqa_gfx1151"]);
+        add!("attention_flash_q8_0_tile_gqa_gemma_gfx1151", kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC, ["attention_flash_q8_0_tile_gqa_d256g2_gfx1151", "attention_flash_q8_0_tile_gqa_d512g8_gfx1151"]);
         add!("attention_flash_reduce_dsplit_gfx1151", kernels::ATTENTION_FLASH_REDUCE_DSPLIT_GFX1151_SRC, ["attention_flash_reduce_dsplit_gfx1151"]);
         add!("attention_q8_0_fa2_gqa_gfx1151", kernels::ATTENTION_Q8_0_FA2_GQA_GFX1151_SRC, ["attention_fa2_q_preconvert_gfx1151", "attention_q8_0_fa2_gqa_gfx1151"]);
         add!("conv1d_silu_split_qknorm_b256", kernels::CONV1D_SILU_SPLIT_QKNORM_B256_SRC, ["conv1d_silu_split_qknorm_b256"]);
         add!("deinterleave_q_rmsnorm_f32_batched", kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC, ["deinterleave_q_rmsnorm_f32_batched"]);
+        // Exact-gfx1151 pure byte-copy DFlash/DeltaNet helpers; same module and
+        // symbol names, source and recipe as gfx1100/gfx1201 (HIPFIRE_DN_SNAPSHOT_BULK_OFF,
+        // HIPFIRE_HIDDEN_SCATTER_FUSE_OFF kill switches unchanged).
+        add!("dflash_hidden_commit5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("dflash_hidden_scatter5_gfx1100", crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC, ["dflash_hidden_commit5_gfx1100", "dflash_hidden_scatter5_gfx1100"]);
+        add!("dflash_state_bulk_copy_gfx1100", crate::dflash_state_copy::DFLASH_STATE_BULK_COPY_GFX1100_SRC, ["dflash_state_bulk_copy_gfx1100"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_fold_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_fold_b8"]);
         // Qwen4 chunked-GDN inline-Q8 recurrence (opt-in `HIPFIRE_QWEN4_GDN_Q8_INLINE`, exact gfx1151; tensor_ops.rs gated_delta_step_gate_wmma_arms).
         add!("gated_delta_chunk_q8_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_Q8_WMMA_SRC, ["gated_delta_chunk_gate_q8_wmma"]);
+        add!("gated_delta_chunk_wmma_arena", crate::tensor_ops::npu_arena::CHUNK_ARENA_SRC, ["gated_delta_chunk_gate_wmma_arena"]);
+        add!("gated_delta_chunk_q8_wmma_arena", crate::tensor_ops::npu_arena::CHUNK_Q8_ARENA_SRC, ["gated_delta_chunk_gate_q8_wmma_arena"]);
+        add!("npu_trunk_consumers", crate::tensor_ops::npu_arena::ARENA_SRC, [
+            "gated_delta_conv_batched_arena", "gated_delta_conv_qknorm_batched_arena",
+            "gated_delta_params_batched_arena", "gated_delta_gate_arena",
+            "gated_delta_gate_batched_arena", "indexed_attention_norm_rope_batch_arena",
+            "gated_delta_gate_batched_rotate_arena",
+            "indexed_attention_cache_append_q8_batch_arena",
+        ]);
         add!("gated_norm_mq_rotate_awq_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1151_v2"]);
         add!("gdn_chunk_scan_gfx1151", kernels::GDN_CHUNK_SCAN_GFX1151_SRC, ["gdn_chunk_scan_gfx1151"]);
         add!("gemm_mq4g256v2_residual_iu4_v2b_gfx11", kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC, ["gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_add_touch_swz_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11", "gemm_mq4g256v2_residual_iu4_v2b_set_zba_gfx11"]);
         add!("gemm_mq4g256v2_residual_mmq_iu4", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "quantize_int4_mmq_ds128"]);
         add!("gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_x5_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_x5_col_gfx1151_symfold", "quantize_int4_mmq_ds128"]);
         add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC, ["gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold", "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold", "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec", "quantize_int4_mmq_ds128"]);
+        // Exact-gfx1151 1..=16-row MQ4V2 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernels).
+        add!("gemm_mq4g256v2_wmma_gfx1151_xlds", kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds", "gemm_mq4g256v2_residual_wmma_gfx1151_xlds", "gemm_qkv_mq4g256v2_wmma_gfx1151_xlds", "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds"]);
         add!("gemm_mqv2_wmma_gfx1151_mw_lds", kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, ["gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"]);
         add!("gemv_hfq4g256_multirow_default_mq4v2", kernels::GEMV_MQ4G256V2_MULTIROW_SRC, ["gemv_mq4g256v2_multirow_r2", "gemv_mq4g256v2_multirow_r4", "gemv_mq4g256v2_multirow_r8"]);
         add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
@@ -505,6 +538,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // every kernel the arch's object defines.
     if matches!(arch, "gfx1201" | "gfx1100" | "gfx1151") {
         add!("copy_f32_buffer", kernels::COPY_F32_BUFFER_SRC, ["copy_f32_buffer", "copy_f32_strided_slot_buffer"]);
+        add!("ep_gather_rows_by_owner", kernels::EP_GATHER_ROWS_BY_OWNER_SRC, ["ep_gather_rows_by_owner"]);
+        add!("ep_gather_rows_by_slot_owner", kernels::EP_GATHER_ROWS_BY_SLOT_OWNER_SRC, ["ep_gather_rows_by_slot_owner"]);
         add!("gemm_bf16_xf32_multirow", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
             "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
         ]);
@@ -571,6 +606,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen4_gemv_mq6g256v2", kernels::QWEN4_GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4"]);
         add!("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, [
             "gemv_q8_0_k2560_staged", "gemv_q8_0_k2560_staged_pair", "gemv_q8_0_k2560_staged_rows", "gemv_q8_0_k2560_staged_rows_tiled",
+            "gemv_q8_0_k2560_staged_rows_x2",
             "gemv_q8_0_k320_staged",
             "gemv_q8_0_k320_staged_rows", "gemv_q8_0_k8", "gemv_q8_0_k8_rows_r2", "gemv_q8_0_k8_rows_r3", "gemv_q8_0_k8_rows_r4",
             "gemv_q8_0_k8_rows_r5", "gemv_q8_0_k8_rows_r6", "gemv_q8_0_k8_rows_r7", "gemv_q8_0_k8_rows_r8", "quantize_bf16_q8_0",
@@ -596,6 +632,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_delta_chunk_wmma", crate::tensor_ops::GATED_DELTA_CHUNK_WMMA_SRC, ["gated_delta_chunk_gate_wmma"]);
         add!("gemm_mq4g128v2_moe_grouped_wmma_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC, [
             "gemm_mq4g128v2_moe_grouped_wmma_gfx1151", "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out",
+            "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out",
         ]);
         add!("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
             "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
@@ -727,6 +764,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen4_wmma_lds_64_128_32_64_k64_p_s2", "qwen4_wmma_lds_64_128_32_64_k64_p_s4", "qwen4_wmma_lds_64_128_32_64_k64_p_s8",
             "qwen4_wmma_lds_64_128_32_64_k64_s4", "qwen4_wmma_lds_64_64_32_32_k64_p_s4", "qwen4_wmma_lds_64_64_32_64_k64_p",
             "qwen4_wmma_lds_64_64_32_64_k64_p_s2", "qwen4_wmma_lds_64_64_32_64_k64_p_s4", "qwen4_wmma_lds_reduce",
+            // Arch17 pitched projections: gfx1201-only, unsplit ascending K.
+            "qwen4_wmma_lds_64_64_32_64_k64_p_ld",
+            "qwen4_wmma_lds_64_128_32_64_k64_p_ld",
+            "qwen4_wmma_lds_128_128_32_64_k64_ld",
+            "qwen4_wmma_lds_128_256_32_64_k64_ld",
         ]);
         add!("hyper_read_up_wmma_gfx1201", crate::tensor_ops::HYPER_READ_UP_WMMA_GFX1201_SRC, [
             "hyper_read_up_wmma_bf16_gfx1201", "hyper_read_up_wmma_bf16_gfx1201_t128",
@@ -991,6 +1033,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemm_mq4g256v2_moe_grouped_wmma_k2", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
             "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
             "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out",
+        ]);
+        add!("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4", kernels::QWEN4_GEMM_MQ4G256V2_MOE_GROUPED_WMMA_K2_SRC, [
+            "gemm_mq4g256v2_moe_grouped_wmma_k2", "gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out",
+            "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out", "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4",
         ]);
         add!("gemm_mq4g256v2_residual_mmq_iu4_gridspec", kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC, [
             "gemm_mq4g256v2_residual_mmq_iu4", "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec", "gemm_mq4g256v2_residual_mmq_iu4_full_add",
@@ -1284,6 +1330,7 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("attention_flash_reduce_dsplit_gfx1201", &["attention_flash_reduce_dsplit_gfx1201"]),
     ("attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201"]),
     ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201"]),
+    ("attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201", &["attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"]),
     ("attention_fp8_e4m3_kv_batched", &["attention_fp8_e4m3_kv_batched"]),
     ("attention_verify_gqa_gfx1201", &["attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]),
     ("conv1d_silu_split_qknorm_b256", &["conv1d_silu_split_qknorm_b256"]),
@@ -1338,6 +1385,7 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("sample_top_p_parallel_w64", &["sample_apply_repeat_penalty_w64", "sample_topk_partial_w64", "sample_topk_finalize_w64"]),
     ("sigmoid_mul", &["sigmoid_mul_f32"]),
     ("sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab", &["sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab"]),
+    ("sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab", &["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"]),
 ];
 
 /// Native-MTP additions to [`QWEN36_27B_GFX1201_AR_HIP`] for the sidecar
@@ -1448,6 +1496,10 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
                 symbols: QWEN36_27B_GFX1201_B1S_SYMBOLS,
             };
             let mut embedded = vec![b1s];
+            if mtp {
+                let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
+                embedded.push(PlannedKernel::Embedded { module, image, radiowave_json: None, symbols });
+            }
             // VMM exact route projections/lm_head: the accepted PM
             // multi-column objects under pm_decode, else the hipcc x-batch
             // GEMV their launchers fall back to (residual/multirow fall back
@@ -1703,6 +1755,27 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_fa2_split_verifier_is_compiler_free_packaged() {
+        let entry = lookup("gfx1100", "attention_q8_0_fa2_gqa_gfx1100", "").unwrap();
+        for symbol in [
+            "attention_fa2_q_preconvert_gfx1100",
+            "attention_q8_0_fa2_gqa_gfx1100",
+            "attention_q8_0_fa2_gqa_partial_gfx1100",
+            "attention_q8_0_fa2_gqa_merge_gfx1100",
+        ] {
+            assert!(entry.symbols.contains(&symbol), "missing {symbol}");
+        }
+        for arch in ["gfx1151", "gfx1201"] {
+            let symbols = entries(arch, "")
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.module == "attention_q8_0_fa2_gqa_gfx1100")
+                .map(|candidate| candidate.symbols);
+            assert!(symbols.is_none(), "{arch} packaged gfx1100 split verifier");
+        }
+    }
+
+    #[test]
     fn gfx11_residual_mmq_fallback_preserves_runtime_identity() {
         let module = "gemm_mq4g256v2_residual_mmq";
         for arch in ["gfx1100", "gfx1151"] {
@@ -1724,6 +1797,28 @@ mod tests {
         }
         for arch in ["gfx1201", "gfx906", "gfx942"] {
             assert!(lookup(arch, module, "").is_err(), "{arch}: admitted RDNA3-only MMQ");
+        }
+    }
+
+    #[test]
+    fn mq4v2_k5120_gfx1201_inventory_preserves_cache_policy() {
+        let module = "fused_gate_up_mq4g256v2_k5120_gfx1201";
+        let registry = entries("gfx1201", "").unwrap();
+        let candidate = registry.iter().find(|e| e.module == module).unwrap();
+        assert_eq!(candidate.symbols, [module]);
+        let body = candidate.source().strip_prefix(
+            "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_k5120_gfx1201\n"
+        ).unwrap();
+        assert_eq!(
+            body.replace("const int groups_per_row = 20;", "const int groups_per_row = K / 256;"),
+            kernels::FUSED_GATE_UP_MQ4G256V2_SRC
+        );
+        assert!(registry.iter().any(|e| e.symbols.contains(&"fused_gate_up_mq4g256v2")));
+        for arch in ["gfx1100", "gfx1151", "gfx906", "gfx942"] {
+            assert!(!entries(arch, "").unwrap().iter().any(|e| e.module == module));
+        }
+        for arch in ["gfx1101", "gfx1200"] {
+            assert!(matches!(entries(arch, ""), Err(RegistryError::UnsupportedArch(_))));
         }
     }
 
@@ -1756,10 +1851,18 @@ mod tests {
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
         // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
         // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
-        // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
-        // helpers and the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
-        // modules. Those 136 keys are additional to P0's 92.
-        assert_eq!(registry.len(), count + 136, "unexpected gfx1201 inventory size");
+        // prepass `logit_penalty_table`, plus thirteen dense 27B DFlash cold
+        // helpers, the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
+        // modules, the Flash-Next expert-parallel row gather
+        // `ep_gather_rows_by_owner` and its balanced-ownership copy
+        // `ep_gather_rows_by_slot_owner` (the ownership assignment kernel is a
+        // builder module, not a hipcc entry), and the 27B AR route's plain q8
+        // Q-resident v2 attention and `_gil_` slab sigmoid producer (ragged
+        // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 145 keys plus the
+        // opt-in exact-K5120 gate/up twin and the Gemma 4 decode twins
+        // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
+        // are additional to P0's 92.
+        assert_eq!(registry.len(), count + 148, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -1898,6 +2001,11 @@ mod tests {
             "gated_norm_mq_rotate_f16",
             "fused_silu_mul_mq_rotate_f16",
             "sigmoid_mul_mq_rotate_f16",
+            "fused_rmsnorm_mq_rotate_awq_f16",
+            "fused_rmsnorm_mq_rotate_f16",
+            "dflash_gdn_pre_gfx1100",
+            "qwen35_fa_prep_batched_gfx1100",
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
         ];
         for module in cross_admitted {
             let entry = lookup("gfx1201", module, "").unwrap();
@@ -1926,10 +2034,32 @@ mod tests {
             let other = if arch == "gfx1201" { "gfx1100" } else { "gfx1201" };
             assert!(lookup(other, module, "").is_err());
         }
+        // Pure byte-copy DFlash helpers are also admitted on exact gfx1151 with
+        // the identical module name, source, symbols and compile recipe.
+        let gfx1151_byte_copy = [
+            "dflash_hidden_commit5_gfx1100",
+            "dflash_hidden_scatter5_gfx1100",
+            "dflash_state_bulk_copy_gfx1100",
+        ];
+        for module in gfx1151_byte_copy {
+            let entry = lookup("gfx1151", module, "").unwrap();
+            let original = lookup("gfx1100", module, "").unwrap();
+            assert_eq!(entry.source(), original.source(), "{module}");
+            assert_eq!(entry.symbols, original.symbols, "{module}");
+            let recipe = KernelCompiler::recipe_for_source("gfx1151", module, entry.source(), "");
+            assert_eq!(entry.flags, recipe.flags, "{module}");
+            assert_eq!(entry.scheduler_profile, recipe.scheduler_profile, "{module}");
+            for arch in ["gfx906", "gfx942"] {
+                assert!(lookup(arch, module, "").is_err(), "{arch}: leaked {module}");
+            }
+        }
         let modules = cross_admitted.into_iter()
             .chain(exact.into_iter().map(|(_, module, _, _)| module));
         for module in modules {
             for arch in ["gfx1151", "gfx906", "gfx942"] {
+                if arch == "gfx1151" && gfx1151_byte_copy.contains(&module) {
+                    continue;
+                }
                 assert!(lookup(arch, module, "").is_err(), "{arch}: leaked {module}");
             }
             let arch = if module == "attention_verify_gqa_gfx1100" { "gfx1100" } else { "gfx1201" };
@@ -1975,5 +2105,57 @@ mod tests {
     #[test]
     fn qwen35_trace_is_packaged() {
         assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
+    }
+
+    #[test]
+    fn native_mtp_plans_pm_fill_before_ready() {
+        use crate::DType;
+        let mut owned: Vec<(String, DType, Vec<usize>)> = vec![
+            ("lm_head.weight".into(), DType::MQ4G256V2, vec![248320, 5120]),
+            ("model.language_model.embed_tokens.weight".into(), DType::Q8_0, vec![248320, 5120]),
+        ];
+        for layer in 0..64 {
+            let p = format!("model.language_model.layers.{layer}");
+            for name in ["gate", "up", "down"] {
+                owned.push((format!("{p}.mlp.{name}_proj.weight"), DType::MQ4G256V2, vec![17408, 5120]));
+            }
+            if layer % 4 == 3 {
+                for name in ["q", "k", "v", "o"] {
+                    owned.push((format!("{p}.self_attn.{name}_proj.weight"), DType::MQ4G256V2, vec![12288, 5120]));
+                }
+            } else {
+                for name in ["qkv", "z", "a", "b"] {
+                    owned.push((format!("{p}.linear_attn.in_proj_{name}.weight"), DType::MQ4G256V2, vec![10240, 5120]));
+                }
+                owned.push((format!("{p}.linear_attn.out_proj.weight"), DType::MQ4G256V2, vec![5120, 5120]));
+            }
+        }
+        for (name, shape) in [
+            ("eh_proj", [5120, 10240]), ("wq", [12288, 5120]),
+            ("wk", [1024, 5120]), ("wv", [1024, 5120]), ("wo", [5120, 6144]),
+            ("ffn_gate", [17408, 5120]), ("ffn_up", [17408, 5120]), ("ffn_down", [5120, 17408]),
+        ] {
+            owned.push((name.into(), DType::MQ4G256, shape.to_vec()));
+        }
+        let tensors: Vec<_> = owned.iter().map(|(name, dtype, shape)|
+            KernelTensorMeta { name, dtype: *dtype, shape }).collect();
+        for pm_decode in [false, true] {
+            let mut flags = default_feature_flags("gfx1201").unwrap();
+            flags.pm_decode = pm_decode;
+            let mut input = RouteKernelInput {
+                arch: "gfx1201", model_arch: 5, tensors: &tensors,
+                n_heads: 24, n_kv_heads: 4, head_dim: 256, max_seq: 16448,
+                prefill_chunk_rows: 512, kv_k: "fp8", kv_v: "fp8", state_quant: "q8",
+                spec: KernelSpecRoute::NativeMtp, host_mapped_experts: false,
+                retained_decode: false, hipcc_extra_flags: "", flags: &flags,
+            };
+            let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
+            let plan = route_entries(&input).expect("native MTP closed route");
+            assert!(plan.entries.iter().any(|e| matches!(e, PlannedKernel::Embedded {
+                module: m, image: i, symbols: s, ..
+            } if *m == module && *i == image && *s == symbols)));
+            input.spec = KernelSpecRoute::Ar;
+            assert!(!route_entries(&input).unwrap().entries.iter().any(|e| e.module() == module));
+        }
     }
 }

@@ -73,7 +73,7 @@
 //! use FP16_OVFL=0, and on gfx1151 use IEEE_MODE=1/DX10_CLAMP=1; `State::new` checks it.
 //! F8_MODE has no descriptor field: FP8 conversion assumes the normal launch default
 //! F8_MODE=0. No opcode in the semantic table changes MODE.
-use super::{convert, Result, State};
+use super::{convert, Result, State, Wide};
 use crate::{
     operand::{Dpp, InlineConst, Omod, Operand},
     Arch, FormFields, Inst,
@@ -243,13 +243,54 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     }
     match name {
         "v_readfirstlane_b32" => readfirstlane(i, s),
-        _ if name.starts_with("v_wmma") => super::wmma::execute(arch,name,i,s),
+        "v_nop" => Ok(()),
+        "v_readlane_b32" => readlane(i, s),
+        "v_writelane_b32" => writelane(i, s),
+        _ if name.starts_with("v_wmma") || name.starts_with("v_swmmac") => super::wmma::execute(arch, name, i, s),
+        _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),
+        _ if super::wide::handles(name) => super::wide::execute(arch, name, i, s),
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
         _ => lanes(arch, name, i, s),
     }
+}
+
+/// A 16-bit result needs a true16 destination half; the other half's policy is not specified.
+fn half_dst(o: &[Operand]) -> Result<()> {
+    if matches!(o.first(), Some(Operand::Half(..))) {
+        Ok(())
+    } else {
+        Err("16-bit destination without a true16 half selector: upper-half policy not specified".into())
+    }
+}
+
+/// 16-bit opcodes take no DPP and no omod; `float` keeps neg/abs, integer forms reject them.
+fn plain_16(i: &Inst, d: Src0, float: bool) -> Result<()> {
+    let m = &i.mods;
+    if !matches!(d, Src0::Plain) || m.dpp.is_some() || m.sdwa.is_some() {
+        return Err("DPP/SDWA on a 16-bit opcode is not modeled".into());
+    }
+    if m.omod != Omod::None || (!float && m.neg | m.abs != 0) {
+        return Err("omod, or neg/abs on a 16-bit integer or conversion opcode, is not modeled".into());
+    }
+    Ok(())
+}
+
+/// `[0, 1]` clamp of a binary16 result (-0 clamps to +0).
+fn clamp_f16(h: u16) -> u16 {
+    convert::f32_to_f16(clamp01(f32::from_bits(convert::f16_to_f32(h))).to_bits())
+}
+
+/// Post-modifier f16 source `n` widened exactly to f32 bits; a NaN half is not measured.
+fn f16_operand(s: &State, o: &[Operand], i: &Inst, lane: usize, n: usize) -> Result<u32> {
+    let h = u32::from(half_src(s, o.get(n + 1).ok_or("missing vector operand")?, i, lane, n)?);
+    let h = sgn(h << 16, i.mods.abs >> n & 1 != 0, i.mods.neg >> n & 1 != 0) >> 16;
+    if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 {
+        return Err("NaN half operand: payload handling not specified".into());
+    }
+    Ok(convert::f16_to_f32(h as u16))
 }
 
 fn store(s: &mut State, dst: &Operand, lane: usize, v: Val) -> Result<()> {
@@ -306,6 +347,21 @@ fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
     let lane = if s.exec == 0 { 0 } else { s.exec.trailing_zeros() as usize };
     let v = s.read(&i.operands[1], lane, 0)?;
     s.put(&i.operands[0], 0, 0, v)
+}
+
+/// `v_readlane_b32 sdst, vsrc, lane`: reads the lane selected by the low five bits of the third
+/// operand whatever EXEC says.
+fn readlane(i: &Inst, s: &mut State) -> Result<()> {
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let v = s.read(&i.operands[1], lane, 0)?;
+    s.put(&i.operands[0], 0, 0, v)
+}
+
+/// `v_writelane_b32 vdst, ssrc, lane`: writes one lane of `vdst`, whatever EXEC says.
+fn writelane(i: &Inst, s: &mut State) -> Result<()> {
+    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let v = s.read(&i.operands[1], 0, 0)?;
+    s.put(&i.operands[0], lane, 0, v)
 }
 
 fn dpp_fi(i: &Inst) -> bool {
@@ -666,6 +722,8 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
             (Class::Select, f(pick)?)
         }
         "v_add_nc_u32" | "v_dual_add_nc_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?)),
+        // Lanes below this one set in the wave32 mask `src0`, plus `src1`.
+        "v_mbcnt_lo_u32_b32" => (Class::Int, raw(1)?.wrapping_add((raw(0)? & ((1u32 << lane) - 1)).count_ones())),
         "v_sub_nc_u32" => (Class::Int, raw(0)?.wrapping_sub(raw(1)?)),
         "v_subrev_nc_u32" => (Class::Int, raw(1)?.wrapping_sub(raw(0)?)),
         "v_add3_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?).wrapping_add(raw(2)?)),
@@ -826,6 +884,68 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
                 }
                 (Class::Own, if half_result { u32::from(convert::f32_to_f16(r)) } else { r })
             }
+        }
+        "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
+            let byte = u32::from(stem(name).as_bytes()[stem(name).len() - 1] - b'0');
+            (Class::F32, (((raw(0)? >> (8 * byte)) & 0xff) as f32).to_bits())
+        }
+        // D = number of leading bits equal to the sign bit (the sign bit itself not counted), -1 if all 32 are equal.
+        "v_cls_i32" | "v_ffbh_i32" => {
+            let x = raw(0)? as i32;
+            (Class::Int, if x == 0 || x == -1 { u32::MAX } else { (x ^ (x >> 31)).leading_zeros() })
+        }
+        "v_xad_u32" => (Class::Int, (raw(0)? ^ raw(1)?).wrapping_add(raw(2)?)),
+        "v_mad_i32_i24" => {
+            let sext = |x: u32| ((x << 8) as i32) >> 8;
+            (Class::Int, sext(raw(0)?).wrapping_mul(sext(raw(1)?)).wrapping_add(raw(2)? as i32) as u32)
+        }
+        "v_cvt_u32_u16" => (Class::Int, u32::from(half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?)),
+        // D.f16 = i16_to_f16(S0.i16): an i16 is exact in binary32, so one rounding to binary16.
+        "v_cvt_f16_i16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let x = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)? as i16;
+            let mut h = convert::f32_to_f16(f32::from(x).to_bits());
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        // D.f16 = S0.f16 * S1.f16: the binary32 product of two halves is exact, so one rounding to binary16.
+        // NaN operands and 0 * inf are not measured.
+        "v_mul_f16" => {
+            half_dst(o)?;
+            plain_16(i, d, true)?;
+            let (a, b) = (f16_operand(s, o, i, lane, 0)?, f16_operand(s, o, i, lane, 1)?);
+            let p = f32::from_bits(a) * f32::from_bits(b);
+            if p.is_nan() {
+                return Err("NaN f16 product (0 * inf): the default NaN encoding is not measured".into());
+            }
+            let mut h = convert::f32_to_f16(p.to_bits());
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        // 16-bit integer: D.u16 = S0.u16 - S1.u16 / S0.u16 * S1.u16 (low bits); CLAMP saturates in the unsigned domain.
+        "v_sub_nc_u16" | "v_mul_lo_u16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let a = i64::from(half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?);
+            let b = i64::from(half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?);
+            let wide = if stem(name) == "v_sub_nc_u16" { a - b } else { a * b };
+            (Class::Own, (if m.clamp { wide.clamp(0, 0xffff) } else { wide & 0xffff }) as u32)
+        }
+        // tmp[15:0] = f32_to_f16(S0), tmp[31:16] = f32_to_f16(S1), both rounded toward zero. NaN not measured.
+        "v_cvt_pk_rtz_f16_f32" | "v_cvt_pkrtz_f16_f32" => {
+            if m.omod != Omod::None || m.clamp {
+                return Err("omod/clamp on v_cvt_pk_rtz_f16_f32 is not modeled".into());
+            }
+            let (a, b) = (f(0)?, f(1)?);
+            if is_nan(a) || is_nan(b) {
+                return Err(NAN_IN.into());
+            }
+            (Class::Own, u32::from(convert::f32_to_f16_rtz(a)) | u32::from(convert::f32_to_f16_rtz(b)) << 16)
         }
         "v_exp_f32" | "v_rcp_f32" | "v_rcp_iflag_f32" | "v_log_f32" | "v_rsq_f32" | "v_sqrt_f32" => {
             if !matches!(arch,Arch::Gfx1151|Arch::Gfx1201) {return Err(format!("unqualified numerical architecture {arch:?}"));}
@@ -1154,7 +1274,8 @@ fn ord_test<T: Ord>(p: Pred, a: T, b: T) -> Option<bool> {
     })
 }
 
-fn float_test(p: Pred, a: f32, b: f32) -> Option<bool> {
+fn float_test<T: PartialOrd>(p: Pred, a: T, b: T) -> Option<bool> {
+    let unordered = a.partial_cmp(&a).is_none() || b.partial_cmp(&b).is_none();
     Some(match p {
         Pred::F => false,
         Pred::Tru => true,
@@ -1164,8 +1285,8 @@ fn float_test(p: Pred, a: f32, b: f32) -> Option<bool> {
         Pred::Gt => a > b,
         Pred::Ge => a >= b,
         Pred::Lg => a < b || a > b,
-        Pred::O => !a.is_nan() && !b.is_nan(),
-        Pred::U => a.is_nan() || b.is_nan(),
+        Pred::O => !unordered,
+        Pred::U => unordered,
         Pred::Nge => !(a >= b),
         Pred::Nlg => !(a < b || a > b),
         Pred::Ngt => !(a > b),
@@ -1176,25 +1297,58 @@ fn float_test(p: Pred, a: f32, b: f32) -> Option<bool> {
     })
 }
 
-/// `v_cmp_*` / `v_cmpx_*` over u32/i32/f32 and `class_f32`. Lanes that are inactive or
-/// disabled by DPP write a zero bit.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Ty {
+    F16,
+    F32,
+    F64,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+}
+
+/// f16 compare source widened exactly to f32 (abs then neg act on the half's sign bit; a NaN keeps its payload,
+/// which a compare never observes).
+fn cmp_half(s: &State, op: &Operand, i: &Inst, lane: usize, n: usize) -> Result<u32> {
+    let h = u32::from(half_src(s, op, i, lane, n)?);
+    let h = sgn(h << 16, i.mods.abs >> n & 1 != 0, i.mods.neg >> n & 1 != 0) >> 16;
+    Ok(convert::f16_to_f32(h as u16))
+}
+
+/// `v_cmp_*` / `v_cmpx_*` over f16/f32/f64, i16/u16/i32/u32/i64/u64 and `class_f32`. Lanes that are inactive or
+/// disabled by DPP write a zero bit. 16-bit and 64-bit compares take no DPP.
 fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let m = &i.mods;
     let cmpx = name.starts_with("v_cmpx_");
     let rest = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")).ok_or("not a compare")?;
     let rest = rest.strip_suffix("_e64").or_else(|| rest.strip_suffix("_e32")).or_else(|| rest.strip_suffix("_dpp")).unwrap_or(rest);
-    let (p, ty) = rest.rsplit_once('_').ok_or_else(|| format!("unsupported compare {name}"))?;
+    let (p, ty_name) = rest.rsplit_once('_').ok_or_else(|| format!("unsupported compare {name}"))?;
     let p = pred(p).ok_or_else(|| format!("unsupported compare {name}"))?;
-    let float = ty == "f32";
-    if !float && ty != "u32" && ty != "i32" {
-        return Err(format!("unsupported compare {name}"));
-    }
-    if float != matches!(p, Pred::Lg | Pred::O | Pred::U | Pred::Nge | Pred::Nlg | Pred::Ngt | Pred::Nle | Pred::Neq | Pred::Nlt | Pred::Class)
-        && !matches!(p, Pred::F | Pred::Tru | Pred::Eq | Pred::Lt | Pred::Le | Pred::Gt | Pred::Ge | Pred::Ne)
-        || matches!(p, Pred::Ne) && float
-        || matches!(p, Pred::Class) && !float
-    {
+    let ty = match ty_name {
+        "f16" => Ty::F16,
+        "f32" => Ty::F32,
+        "f64" => Ty::F64,
+        "i16" => Ty::I16,
+        "u16" => Ty::U16,
+        "i32" => Ty::I32,
+        "u32" => Ty::U32,
+        "i64" => Ty::I64,
+        "u64" => Ty::U64,
+        _ => return Err(format!("unsupported compare {name}")),
+    };
+    let float = matches!(ty, Ty::F16 | Ty::F32 | Ty::F64);
+    // The ISA spells the integer not-equal compare `lg`, LLVM `ne`: one predicate.
+    let p = if !float && matches!(p, Pred::Lg) { Pred::Ne } else { p };
+    let valid = if float {
+        !matches!(p, Pred::Ne) && (!matches!(p, Pred::Class) || ty == Ty::F32)
+    } else {
+        matches!(p, Pred::F | Pred::Tru | Pred::Eq | Pred::Ne | Pred::Lt | Pred::Le | Pred::Gt | Pred::Ge)
+    };
+    if !valid {
         return Err(format!("unsupported compare {name}"));
     }
     if m.omod != Omod::None || (!float && m.neg | m.abs != 0) {
@@ -1205,6 +1359,9 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     }
     let (a_op, b_op) = (&o[o.len() - 2], &o[o.len() - 1]);
     let dpp = m.dpp;
+    if dpp.is_some() && !matches!(ty, Ty::F32 | Ty::I32 | Ty::U32) {
+        return Err(format!("{name}: DPP on a 16-bit or 64-bit compare is not modeled"));
+    }
     let fi = dpp_fi(i);
     let mut mask = 0u32;
     for lane in active(s) {
@@ -1215,20 +1372,36 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             },
             None => Src0::Plain,
         };
-        let a = read_src(s, a_op, lane, d)?;
-        let b = s.read(b_op, lane, 0)?;
-        let yes = if let Pred::Class = p {
-            // Modifiers apply to S0 only; S1 is the integer class mask.
-            let class = f32_class(sgn(a, m.abs & 1 != 0, m.neg & 1 != 0));
-            Some(b & (1 << class) != 0)
-        } else if float {
-            let x = f32::from_bits(sgn(a, m.abs & 1 != 0, m.neg & 1 != 0));
-            let y = f32::from_bits(sgn(b, m.abs & 2 != 0, m.neg & 2 != 0));
-            float_test(p, x, y)
-        } else if ty == "i32" {
-            ord_test(p, a as i32, b as i32)
-        } else {
-            ord_test(p, a, b)
+        let yes = match ty {
+            Ty::F32 | Ty::I32 | Ty::U32 => {
+                let a = read_src(s, a_op, lane, d)?;
+                let b = s.read(b_op, lane, 0)?;
+                if let Pred::Class = p {
+                    // Modifiers apply to S0 only; S1 is the integer class mask.
+                    let class = f32_class(sgn(a, m.abs & 1 != 0, m.neg & 1 != 0));
+                    Some(b & (1 << class) != 0)
+                } else if ty == Ty::F32 {
+                    let x = f32::from_bits(sgn(a, m.abs & 1 != 0, m.neg & 1 != 0));
+                    let y = f32::from_bits(sgn(b, m.abs & 2 != 0, m.neg & 2 != 0));
+                    float_test(p, x, y)
+                } else if ty == Ty::I32 {
+                    ord_test(p, a as i32, b as i32)
+                } else {
+                    ord_test(p, a, b)
+                }
+            }
+            Ty::F16 => float_test(p, f32::from_bits(cmp_half(s, a_op, i, lane, 0)?), f32::from_bits(cmp_half(s, b_op, i, lane, 1)?)),
+            Ty::I16 | Ty::U16 => {
+                let (x, y) = (half_src(s, a_op, i, lane, 0)?, half_src(s, b_op, i, lane, 1)?);
+                if ty == Ty::I16 { ord_test(p, x as i16, y as i16) } else { ord_test(p, x, y) }
+            }
+            Ty::I64 => ord_test(p, s.read_wide(a_op, lane, Wide::Signed)? as i64, s.read_wide(b_op, lane, Wide::Signed)? as i64),
+            Ty::U64 => ord_test(p, s.read_wide(a_op, lane, Wide::Unsigned)?, s.read_wide(b_op, lane, Wide::Unsigned)?),
+            Ty::F64 => {
+                let x = f64::from_bits(sgn64(s.read_wide(a_op, lane, Wide::Float)?, m.abs & 1 != 0, m.neg & 1 != 0));
+                let y = f64::from_bits(sgn64(s.read_wide(b_op, lane, Wide::Float)?, m.abs & 2 != 0, m.neg & 2 != 0));
+                float_test(p, x, y)
+            }
         };
         if yes.ok_or_else(|| format!("unsupported compare {name}"))? {
             mask |= 1 << lane;
@@ -1243,6 +1416,12 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.vcc = mask;
         Ok(())
     }
+}
+
+/// Source modifiers of a double: absolute value first, negate after.
+fn sgn64(v: u64, abs: bool, neg: bool) -> u64 {
+    let v = if abs { v & !(1 << 63) } else { v };
+    if neg { v ^ (1 << 63) } else { v }
 }
 
 /// `v_cmp_class_f32` class index: 0 sNaN, 1 qNaN, 2 -inf, 3 -normal, 4 -denorm, 5 -0,
@@ -1333,6 +1512,30 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_min_u32" => (a.min(b), Some(a < b)),
         "s_max_u32" => (a.max(b), Some(a >= b)),
         "s_ctz_i32_b32" => (if a == 0 { u32::MAX } else { a.trailing_zeros() }, None),
+        "s_sext_i32_i8" => (a as u8 as i8 as i32 as u32, None),
+        "s_nor_b32" => nonzero(!(a | b)),
+        // D0.u32[S0.u32[4:0]] = 1: the destination is read-modify-write, SCC is untouched.
+        "s_bitset1_b32" => (rd(s, 0)? | 1 << (a & 31), None),
+        // D = { S1[31:16], S0[15:0] }.
+        "s_pack_lh_b32_b16" => ((b & 0xffff_0000) | (a & 0xffff), None),
+        // tmp = (S0.i32 >> S1[4:0]) & ((1 << S1[22:16]) - 1); D = signext_from_bit(tmp, S1[22:16]); SCC = D != 0.
+        // The ISA leaves a width of 32 or more undefined (the shift count is 7 bits wide): hard error.
+        "s_bfe_i32" => {
+            let width = (b >> 16) & 0x7f;
+            if width >= 32 {
+                return Err(format!("s_bfe_i32 width {width}: the ISA pseudocode shifts a 32-bit constant by a count of 32 or more"));
+            }
+            let field = (((a as i32) >> (b & 31)) as u32) & ((1u32 << width) - 1);
+            nonzero(if width == 0 { 0 } else { (((field << (32 - width)) as i32) >> (32 - width)) as u32 })
+        }
+        // gfx1151 scalar float: D = f16_to_f32(S0.f16) of the low/high half. NaN payload handling is not measured.
+        "s_cvt_f32_f16" | "s_cvt_hi_f32_f16" => (f16_in((if name == "s_cvt_hi_f32_f16" { a >> 16 } else { a }) as u16)?, None),
+        // D = fma(S0.f32, S1.f32, SIMM32.f32); NaN operands and invalid results are not measured.
+        "s_fmaak_f32" => {
+            let k = if o.len() > 3 { rd(s, 3)? } else { i.literal.ok_or("s_fmaak_f32: missing literal constant")? };
+            (fin(num(a)?.mul_add(num(b)?, num(k)?))?, None)
+        }
+        "s_bcnt1_i32_b32" => nonzero(a.count_ones()),
         _ => return Err(format!("unsupported scalar opcode {name}")),
     };
     s.put(&o[0], 0, 0, value)?;
@@ -2464,5 +2667,447 @@ mod tests {
         let mut st = state();
         st.exec = 0;
         assert!(run("v_madeup_f32_e32", &i, &mut st).is_err());
+    }
+
+    // ---- opcode-fill rows: scalar deltas, conversions, 16/64-bit integer, f64, compares, carries ----
+    fn sreg(n: u16) -> Operand {
+        reg(Kind::S, n, 1)
+    }
+    fn pair(kind: Kind, n: u16) -> Operand {
+        reg(kind, n, 2)
+    }
+    fn set64(st: &mut State, base: usize, lane: usize, x: u64) {
+        st.v[base][lane] = x as u32;
+        st.v[base + 1][lane] = (x >> 32) as u32;
+    }
+    fn get64(st: &State, base: usize, lane: usize) -> u64 {
+        u64::from(st.v[base][lane]) | u64::from(st.v[base + 1][lane]) << 32
+    }
+
+    /// `name` with destination `s0` (preset to `dst`) and sources `s1..`; SCC starts as `scc`.
+    fn scalar_on(arch: Arch, name: &str, srcs: &[u32], dst: u32, scc: bool) -> std::result::Result<(u32, bool), String> {
+        let i = insn_on(arch, name, (0..=srcs.len() as u16).map(sreg).collect());
+        let mut st = state();
+        st.s[0] = dst;
+        st.scc = scc;
+        for (n, x) in srcs.iter().enumerate() {
+            st.s[n + 1] = *x;
+        }
+        execute(arch, name, &i, &mut st).map(|_| (st.s[0], st.scc))
+    }
+
+    #[test]
+    fn scalar_sext_nor_bitset_and_pack_follow_the_isa_pseudocode() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            // D = signext(S0[7:0]); SCC is untouched.
+            assert_eq!(scalar_on(arch, "s_sext_i32_i8", &[0x1ff80], 0, true), Ok((0xffff_ff80, true)));
+            assert_eq!(scalar_on(arch, "s_sext_i32_i8", &[0xabcd_ef7f], 0, false), Ok((0x7f, false)));
+        }
+        // D = ~(S0 | S1); SCC = D != 0.
+        assert_eq!(scalar_on(Arch::Gfx1201, "s_nor_b32", &[0xf0f0_f0f0, 0x0f0f_0000], 0, false), Ok((0x0000_0f0f, true)));
+        assert_eq!(scalar_on(Arch::Gfx1201, "s_nor_b32", &[0xffff_0000, 0x0000_ffff], 7, true), Ok((0, false)));
+        // D[S0[4:0]] = 1 on the old D; SCC is untouched.
+        assert_eq!(scalar_on(Arch::Gfx1201, "s_bitset1_b32", &[31], 0x0000_0001, true), Ok((0x8000_0001, true)));
+        assert_eq!(scalar_on(Arch::Gfx1201, "s_bitset1_b32", &[0x25], 0, false), Ok((1 << 5, false)));
+        // D = { S1[31:16], S0[15:0] }.
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            assert_eq!(scalar_on(arch, "s_pack_lh_b32_b16", &[0x1111_2222, 0x3333_4444], 0, true), Ok((0x3333_2222, true)));
+        }
+    }
+
+    #[test]
+    fn scalar_bfe_i32_sign_extends_from_the_field_width_and_sets_scc() {
+        let f = |data: u32, offset: u32, width: u32| scalar_on(Arch::Gfx1100, "s_bfe_i32", &[data, offset | width << 16], 0xdead, false);
+        assert_eq!(f(0xf0, 4, 4), Ok((0xffff_ffff, true)));
+        assert_eq!(f(0x70, 4, 4), Ok((7, true)));
+        assert_eq!(f(0xffff_ffff, 3, 0), Ok((0, false)));
+        assert_eq!(f(0x10, 4, 1), Ok((0xffff_ffff, true)));
+        // The arithmetic shift fills the field above bit 31: offset 28, width 8 of 0x80000000.
+        assert_eq!(f(0x8000_0000, 28, 8), Ok((0xffff_fff8, true)));
+        assert_eq!(f(0x0123_4567, 0, 31), Ok((0x0123_4567, true)));
+        assert_eq!(f(0xffff_ffff, 0, 1), Ok((0xffff_ffff, true)));
+        // 1 << width is undefined for width >= 32.
+        assert!(f(1, 0, 32).is_err());
+        assert!(f(1, 0, 127).is_err());
+    }
+
+    #[test]
+    fn gfx1151_scalar_float_deltas_cvt_and_fmaak() {
+        let arch = Arch::Gfx1151;
+        assert_eq!(scalar_on(arch, "s_cvt_f32_f16", &[0xffff_3c00], 0, true), Ok((1f32.to_bits(), true)));
+        assert_eq!(scalar_on(arch, "s_cvt_hi_f32_f16", &[0xc000_3c00], 0, false), Ok(((-2f32).to_bits(), false)));
+        // A half denormal widens exactly.
+        assert_eq!(scalar_on(arch, "s_cvt_f32_f16", &[0x0001], 0, false), Ok((2f32.powi(-24).to_bits(), false)));
+        assert!(scalar_on(arch, "s_cvt_f32_f16", &[0x7e00], 0, false).is_err());
+        let r = crate::isa::gfx1151().iter().find(|r| r.name == "s_fmaak_f32").unwrap();
+        let build = |k: f32| Inst::from_parts(arch, r.op, r.form, Default::default(), vec![sreg(0), sreg(1), sreg(2)].into_iter().collect(), Default::default(), Some(k.to_bits()), Default::default()).unwrap();
+        let mut st = state();
+        st.s[1] = 2f32.to_bits();
+        st.s[2] = 3f32.to_bits();
+        execute(arch, "s_fmaak_f32", &build(1f32), &mut st).unwrap();
+        assert_eq!(st.s[0], 7f32.to_bits());
+        // Fused: 0x1p-25 * 0x1p-25 exactly cancels nothing, but a single rounding keeps the tiny product.
+        st.s[1] = (1.0f32 + f32::EPSILON).to_bits();
+        st.s[2] = (1.0f32 - f32::EPSILON).to_bits();
+        execute(arch, "s_fmaak_f32", &build(-1f32), &mut st).unwrap();
+        assert_eq!(st.s[0], (-(f32::EPSILON * f32::EPSILON)).to_bits());
+        st.s[1] = f32::NAN.to_bits();
+        assert!(execute(arch, "s_fmaak_f32", &build(1f32), &mut st).is_err());
+    }
+
+    #[test]
+    fn integer_and_byte_conversions_cls_xad_and_mad24() {
+        // v_cvt_f32_ubyte{1,2,3}: byte n of S0 as an unsigned integer.
+        for (n, want) in [(1u32, 0xcc), (2, 0xbb), (3, 0xaa)] {
+            let name = format!("v_cvt_f32_ubyte{n}_e32");
+            assert_eq!(lane_on(Arch::Gfx1100, &name, &[0xaabb_ccdd], 0, |_| {}), Ok((want as f32).to_bits()), "{name}");
+        }
+        // v_cls_i32: leading bits equal to the sign (sign bit not counted); -1 if all bits are equal.
+        for (x, want) in [(0u32, u32::MAX), (u32::MAX, u32::MAX), (1, 31), (0x4000_0000, 1), (0xc000_0000, 2), (0x8000_0000, 1), (0xffff_fffe, 31)] {
+            assert_eq!(lane_on(Arch::Gfx1201, "v_cls_i32_e32", &[x], 0, |_| {}), Ok(want), "{x:#x}");
+        }
+        assert_eq!(lane_on(Arch::Gfx1151, "v_xad_u32", &[5, 3, 7], 0, |_| {}), Ok(13));
+        assert_eq!(lane_on(Arch::Gfx1151, "v_xad_u32", &[u32::MAX, 0, 2], 0, |_| {}), Ok(1));
+        // v_mad_i32_i24: signed 24-bit operands, wrapping 32-bit product and sum.
+        assert_eq!(lane_on(Arch::Gfx1201, "v_mad_i32_i24", &[0xff_ffff, 3, 10], 0, |_| {}), Ok(7));
+        assert_eq!(lane_on(Arch::Gfx1201, "v_mad_i32_i24", &[0x80_0000, 2, 0], 0, |_| {}), Ok((-16_777_216i32) as u32));
+        assert_eq!(lane_on(Arch::Gfx1201, "v_mad_i32_i24", &[0x7f_ffff, 0x7f_ffff, 1], 0, |_| {}), Ok((0x7f_ffffi64 * 0x7f_ffff + 1) as u32));
+        // The ubyte conversions are F32 class: CLAMP applies to the result.
+        assert_eq!(lane_on(Arch::Gfx1100, "v_cvt_f32_ubyte1_e32", &[0x100], 0, |i| i.mods.clamp = true), Ok(1f32.to_bits()));
+        // Integer opcodes refuse neg/abs/omod/clamp.
+        assert!(lane_on(Arch::Gfx1201, "v_cls_i32_e32", &[1], 0, |i| i.mods.clamp = true).is_err());
+    }
+
+    #[test]
+    fn cvt_pk_rtz_truncates_and_saturates_to_the_largest_half() {
+        let name = "v_cvt_pk_rtz_f16_f32_e32";
+        let pack = |a: f32, b: f32| lane_on(Arch::Gfx1100, name, &[a.to_bits(), b.to_bits()], 0, |_| {});
+        // 1.0018 is above the 0x3c01/0x3c02 midpoint: RNE rounds up, RTZ stays at 0x3c01.
+        assert_eq!(convert::f32_to_f16(1.0018f32.to_bits()), 0x3c02);
+        assert_eq!(pack(1.0018, 1.0), Ok(0x3c00_3c01));
+        assert_eq!(pack(1.0, -70000.0), Ok(0xfbff_3c00));
+        assert_eq!(pack(70000.0, f32::INFINITY), Ok(0x7c00_7bff));
+        // 1.9 * 2^-24 truncates to the smallest half denormal; below 2^-24 is zero with the sign kept.
+        assert_eq!(pack(1.9 * 2f32.powi(-24), -(0.9 * 2f32.powi(-24))), Ok(0x8000_0001));
+        assert_eq!(pack(f32::from_bits(1), 65504.0), Ok(0x7bff_0000));
+        assert!(pack(f32::NAN, 1.0).is_err());
+        assert_eq!(convert::f32_to_f16_rtz(0x7f80_0000), 0x7c00);
+        assert_eq!(convert::f32_to_f16_rtz(0x477f_e000), 0x7bff);
+        assert_eq!(convert::f32_to_f16_rtz(0x477f_f000), 0x7bff);
+        assert_eq!(convert::f32_to_f16_rtz(0x4780_0000), 0x7bff);
+    }
+
+    #[test]
+    fn sixteen_bit_integer_rows_write_only_the_selected_half() {
+        let run16 = |name: &str, a: u32, b: u32, clamp: bool| {
+            let mut i = insn_on(Arch::Gfx1201, name, vec![half(0, Half::Lo), half(1, Half::Lo), half(2, Half::Hi)]);
+            i.mods.clamp = clamp;
+            let mut st = state();
+            st.exec = 1;
+            (st.v[0][0], st.v[1][0], st.v[2][0]) = (0xdead_beef, a, b << 16);
+            execute(Arch::Gfx1201, name, &i, &mut st).map(|_| st.v[0][0])
+        };
+        assert_eq!(run16("v_sub_nc_u16", 3, 5, false), Ok(0xdead_fffe));
+        assert_eq!(run16("v_sub_nc_u16", 3, 5, true), Ok(0xdead_0000));
+        assert_eq!(run16("v_sub_nc_u16", 0x1_0003, 2, false), Ok(0xdead_0001));
+        assert_eq!(run16("v_mul_lo_u16", 0x100, 0x100, false), Ok(0xdead_0000));
+        assert_eq!(run16("v_mul_lo_u16", 0x100, 0x100, true), Ok(0xdead_ffff));
+        assert_eq!(run16("v_mul_lo_u16", 0xffff, 0xffff, false), Ok(0xdead_0001));
+        assert_eq!(run16("v_mul_lo_u16", 7, 6, true), Ok(0xdead_002a));
+        // A 16-bit result into a whole register has an unspecified upper half: hard error.
+        let i = insn_on(Arch::Gfx1201, "v_mul_lo_u16", vec![v(0), half(1, Half::Lo), half(2, Half::Lo)]);
+        assert!(execute(Arch::Gfx1201, "v_mul_lo_u16", &i, &mut state()).is_err());
+        // v_cvt_u32_u16: zero-extend the selected half.
+        let i = insn_on(Arch::Gfx1201, "v_cvt_u32_u16_e32", vec![v(0), half(1, Half::Hi)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0xabcd_1234;
+        execute(Arch::Gfx1201, "v_cvt_u32_u16_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xabcd);
+    }
+
+    #[test]
+    fn f16_from_i16_and_f16_multiply_round_once() {
+        let cvt = |x: u32| {
+            let i = insn_on(Arch::Gfx1201, "v_cvt_f16_i16_e32", vec![half(0, Half::Hi), half(1, Half::Lo)]);
+            let mut st = state();
+            st.exec = 1;
+            (st.v[0][0], st.v[1][0]) = (0x1234, x);
+            execute(Arch::Gfx1201, "v_cvt_f16_i16_e32", &i, &mut st).map(|_| st.v[0][0])
+        };
+        assert_eq!(cvt(0xfffd), Ok(0xc200_1234));
+        assert_eq!(cvt(2049), Ok(0x6800_1234));
+        assert_eq!(cvt(2051), Ok(0x6802_1234));
+        assert_eq!(cvt(32767), Ok(0x7800_1234));
+        assert_eq!(cvt(0x8000), Ok(0xf800_1234));
+        assert_eq!(cvt(0), Ok(0x0000_1234));
+        let mul = |name: &str, a: u32, b: u32, tweak: &dyn Fn(&mut Inst)| {
+            let mut i = insn_on(Arch::Gfx1201, name, vec![half(0, Half::Lo), half(1, Half::Lo), half(2, Half::Lo)]);
+            tweak(&mut i);
+            let mut st = state();
+            st.exec = 1;
+            (st.v[0][0], st.v[1][0], st.v[2][0]) = (0xbeef_0000, a, b);
+            execute(Arch::Gfx1201, name, &i, &mut st).map(|_| st.v[0][0])
+        };
+        let plain = |_: &mut Inst| {};
+        for name in ["v_mul_f16_e32", "v_mul_f16_e64"] {
+            assert_eq!(mul(name, 0x3e00, 0x4000, &plain), Ok(0xbeef_4200), "{name}");
+            // 3 * 2^-24 * 0.5 = 1.5 * 2^-24 ties to the even 0x0002; 1 * 2^-24 * 0.5 ties to zero.
+            assert_eq!(mul(name, 0x0003, 0x3800, &plain), Ok(0xbeef_0002));
+            assert_eq!(mul(name, 0x0001, 0x3800, &plain), Ok(0xbeef_0000));
+            assert_eq!(mul(name, 0x8001, 0x3800, &plain), Ok(0xbeef_8000));
+            assert_eq!(mul(name, 0x7bff, 0x4000, &plain), Ok(0xbeef_7c00));
+            assert_eq!(mul(name, 0x7c00, 0x3c00, &plain), Ok(0xbeef_7c00));
+            assert!(mul(name, 0x7e00, 0x3c00, &plain).is_err());
+            assert!(mul(name, 0x7c00, 0x0000, &plain).is_err());
+        }
+        // VOP3 neg/abs act on the half; CLAMP saturates to [0, 1] and turns -0 into +0.
+        let neg0 = |i: &mut Inst| i.mods.neg = 1;
+        assert_eq!(mul("v_mul_f16_e64", 0x3e00, 0x4000, &neg0), Ok(0xbeef_c200));
+        let abs1 = |i: &mut Inst| i.mods.abs = 2;
+        assert_eq!(mul("v_mul_f16_e64", 0x3e00, 0xc000, &abs1), Ok(0xbeef_4200));
+        let clamp = |i: &mut Inst| i.mods.clamp = true;
+        assert_eq!(mul("v_mul_f16_e64", 0x4000, 0x4000, &clamp), Ok(0xbeef_3c00));
+        assert_eq!(mul("v_mul_f16_e64", 0x4000, 0xc000, &clamp), Ok(0xbeef_0000));
+        let omod = |i: &mut Inst| i.mods.omod = Omod::Mul2;
+        assert!(mul("v_mul_f16_e64", 0x3c00, 0x3c00, &omod).is_err());
+    }
+
+    #[test]
+    fn lshrrev_b64_masks_the_count_and_sign_extends_inline_constants() {
+        let name = "v_lshrrev_b64";
+        let run = |count: u32, src: Operand, data: u64| {
+            let i = insn_on(Arch::Gfx1201, name, vec![pair(Kind::V, 0), v(2), src]);
+            let mut st = state();
+            st.exec = 0b11;
+            st.v[2][0] = count;
+            st.v[2][1] = count + 64;
+            set64(&mut st, 4, 0, data);
+            set64(&mut st, 4, 1, data);
+            set64(&mut st, 0, 2, 0x1111_2222_3333_4444);
+            execute(Arch::Gfx1201, name, &i, &mut st).map(|_| [get64(&st, 0, 0), get64(&st, 0, 1), get64(&st, 0, 2)])
+        };
+        let x = 0xdead_beef_0123_4567u64;
+        // Count bits [5:0]: 36 and 100 are the same shift; the inactive lane keeps its register.
+        assert_eq!(run(36, pair(Kind::V, 4), x), Ok([x >> 36, x >> 36, 0x1111_2222_3333_4444]));
+        assert_eq!(run(0, pair(Kind::V, 4), x), Ok([x, x, 0x1111_2222_3333_4444]));
+        assert_eq!(run(63, pair(Kind::V, 4), x), Ok([1, 1, 0x1111_2222_3333_4444]));
+        // The inline integer -1 is sign-extended to 64 bits.
+        assert_eq!(run(4, Operand::Inline(InlineConst::Integer(-1)), 0), Ok([u64::MAX >> 4, u64::MAX >> 4, 0x1111_2222_3333_4444]));
+    }
+
+    #[test]
+    fn borrow_ops_write_exact_masks_with_zero_inactive_lanes() {
+        // v_subrev_co_u32: D = S1 - S0, carry-out = S0 > S1; SDST receives the whole wave32 mask.
+        let i = insn_on(Arch::Gfx1201, "v_subrev_co_u32", vec![v(0), pair(Kind::S, 10), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 0xf;
+        st.s[10] = u32::MAX;
+        for (lane, (a, b)) in [(1u32, 4u32), (5, 2), (3, 3), (0, 0)].into_iter().enumerate() {
+            (st.v[1][lane], st.v[2][lane]) = (a, b);
+        }
+        st.v[0][5] = 0x77;
+        execute(Arch::Gfx1201, "v_subrev_co_u32", &i, &mut st).unwrap();
+        assert_eq!(&st.v[0][..4], &[3, (-3i32) as u32, 0, 0]);
+        assert_eq!(st.s[10], 0b0010);
+        assert_eq!(st.v[0][5], 0x77);
+        // v_sub_co_ci_u32: D = S0 - S1 - VCC_in; VCC_out = S1 + VCC_in > S0 (VCC is replaced).
+        let i = insn_on(Arch::Gfx1201, "v_sub_co_ci_u32_e32", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 0xf;
+        st.vcc = 0xffff_0000 | 0b0101;
+        for (lane, (a, b)) in [(5u32, 3u32), (1, 3), (3, 3), (0, 0)].into_iter().enumerate() {
+            (st.v[1][lane], st.v[2][lane]) = (a, b);
+        }
+        execute(Arch::Gfx1201, "v_sub_co_ci_u32_e32", &i, &mut st).unwrap();
+        assert_eq!(&st.v[0][..4], &[1, (-2i32) as u32, u32::MAX, 0]);
+        assert_eq!(st.vcc, 0b0110);
+        // Borrow-in chain of a 64-bit subtraction lo/hi.
+        let (lo, hi) = (|| { let mut st = state(); st.exec = 1; st.v[1][0] = 0; st.v[2][0] = 1; execute(Arch::Gfx1201, "v_sub_co_ci_u32_e32", &i, &mut st).unwrap(); (st.v[0][0], st.vcc) })();
+        assert_eq!((lo, hi), (u32::MAX, 1));
+    }
+
+    #[test]
+    fn double_precision_add_min_and_conversions_are_exact_ieee() {
+        let dp = |name: &str, a: f64, b: f64, tweak: &dyn Fn(&mut Inst)| {
+            let mut i = insn_on(Arch::Gfx1100, name, vec![pair(Kind::V, 0), pair(Kind::V, 2), pair(Kind::V, 4)]);
+            tweak(&mut i);
+            let mut st = state();
+            st.exec = 1;
+            set64(&mut st, 2, 0, a.to_bits());
+            set64(&mut st, 4, 0, b.to_bits());
+            execute(Arch::Gfx1100, name, &i, &mut st).map(|_| get64(&st, 0, 0))
+        };
+        let plain = |_: &mut Inst| {};
+        assert_eq!(dp("v_add_f64", 1.5, 2.25, &plain), Ok(3.75f64.to_bits()));
+        assert_eq!(dp("v_add_f64", f64::from_bits(1), f64::from_bits(1), &plain), Ok(2));
+        assert_eq!(dp("v_add_f64", 1e308, 1e308, &plain), Ok(f64::INFINITY.to_bits()));
+        // 1 + 2^-53 ties to even (1.0); 1 + 3*2^-53 rounds up.
+        assert_eq!(dp("v_add_f64", 1.0, 2f64.powi(-53), &plain), Ok(1f64.to_bits()));
+        assert_eq!(dp("v_add_f64", 1.0, 3.0 * 2f64.powi(-53), &plain), Ok((1.0 + 2f64.powi(-51)).to_bits()));
+        assert_eq!(dp("v_add_f64", 1.5, 2.25, &|i| i.mods.neg = 2), Ok((-0.75f64).to_bits()));
+        assert_eq!(dp("v_add_f64", -1.5, 2.25, &|i| i.mods.abs = 1), Ok(3.75f64.to_bits()));
+        assert_eq!(dp("v_add_f64", 0.5, 0.75, &|i| i.mods.clamp = true), Ok(1f64.to_bits()));
+        assert_eq!(dp("v_add_f64", -0.0, -0.0, &|i| i.mods.clamp = true), Ok(0));
+        assert!(dp("v_add_f64", f64::NAN, 1.0, &plain).is_err());
+        assert!(dp("v_add_f64", f64::INFINITY, f64::NEG_INFINITY, &plain).is_err());
+        assert!(dp("v_add_f64", 1.0, 1.0, &|i| i.mods.omod = Omod::Mul2).is_err());
+        assert_eq!(dp("v_min_f64", 1.0, 2.0, &plain), Ok(1f64.to_bits()));
+        assert_eq!(dp("v_min_f64", -3.0, -2.0, &plain), Ok((-3f64).to_bits()));
+        assert_eq!(dp("v_min_f64", 0.0, -0.0, &plain), Ok((-0f64).to_bits()));
+        assert_eq!(dp("v_min_f64", -0.0, 0.0, &plain), Ok((-0f64).to_bits()));
+        assert!(dp("v_min_f64", 1.0, f64::NAN, &plain).is_err());
+
+        let cvt = |name: &str, dst: Operand, src: Operand, x: u64| {
+            let i = insn_on(Arch::Gfx1100, name, vec![dst, src]);
+            let mut st = state();
+            st.exec = 1;
+            set64(&mut st, 4, 0, x);
+            st.v[6][0] = x as u32;
+            execute(Arch::Gfx1100, name, &i, &mut st).map(|_| get64(&st, 0, 0))
+        };
+        let d = pair(Kind::V, 0);
+        assert_eq!(cvt("v_cvt_f64_i32_e32", d.clone(), v(6), (-5i32) as u32 as u64), Ok((-5f64).to_bits()));
+        assert_eq!(cvt("v_cvt_f64_u32_e32", d.clone(), v(6), 0xffff_ffff), Ok(4294967295f64.to_bits()));
+        assert_eq!(cvt("v_cvt_f64_f32_e32", d.clone(), v(6), 0.1f32.to_bits() as u64), Ok(f64::from(0.1f32).to_bits()));
+        assert_eq!(cvt("v_cvt_f64_f32_e32", d.clone(), v(6), 1), Ok(f64::from(f32::from_bits(1)).to_bits()));
+        assert!(cvt("v_cvt_f64_f32_e32", d, v(6), f32::NAN.to_bits() as u64).is_err());
+        // f64 -> f32 rounds to nearest even; 2^24 + 1 is a tie.
+        assert_eq!(cvt("v_cvt_f32_f64_e32", v(0), pair(Kind::V, 4), 16777217f64.to_bits()), Ok(16777216f32.to_bits() as u64));
+        assert_eq!(cvt("v_cvt_f32_f64_e32", v(0), pair(Kind::V, 4), 1e300f64.to_bits()), Ok(f32::INFINITY.to_bits() as u64));
+        assert!(cvt("v_cvt_f32_f64_e32", v(0), pair(Kind::V, 4), f64::NAN.to_bits()).is_err());
+        // f64 -> i32 truncates toward zero, saturates (infinity included) and maps NaN to zero.
+        for (x, want) in [(3.99f64, 3i32), (-3.99, -3), (1e10, i32::MAX), (-1e10, i32::MIN), (f64::INFINITY, i32::MAX), (f64::NEG_INFINITY, i32::MIN), (f64::NAN, 0)] {
+            assert_eq!(cvt("v_cvt_i32_f64_e32", v(0), pair(Kind::V, 4), x.to_bits()), Ok(u64::from(want as u32)), "{x}");
+        }
+    }
+
+    /// One compare over per-lane 64-bit operand pairs: returns the destination mask register.
+    fn cmp64(name: &str, arch: Arch, lanes: &[(u64, u64)], ops: Vec<Operand>) -> Result<(u32, u32, u32)> {
+        let i = insn_on(arch, name, ops);
+        let mut st = state();
+        st.exec = (1u64 << lanes.len()).wrapping_sub(1) as u32;
+        st.s[10] = u32::MAX;
+        st.vcc = u32::MAX;
+        for (lane, (a, b)) in lanes.iter().enumerate() {
+            set64(&mut st, 4, lane, *a);
+            set64(&mut st, 6, lane, *b);
+        }
+        execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
+    }
+
+    #[test]
+    fn sixty_four_bit_compares_use_all_64_bits_with_signed_and_unsigned_orders() {
+        let big = 0x1_0000_0000u64;
+        let lanes = [(big, 0xffff_ffff), (0xffff_ffff, big), (u64::MAX, 0), (0, u64::MAX), (7, 7), (1 << 63, 1)];
+        let m = |f: &dyn Fn(u64, u64) -> bool| lanes.iter().enumerate().map(|(l, (a, b))| u32::from(f(*a, *b)) << l).sum::<u32>();
+        let (e64, e32) = (vec![pair(Kind::S, 10), pair(Kind::V, 4), pair(Kind::V, 6)], vec![Operand::Special(Special::VccLo), pair(Kind::V, 4), pair(Kind::V, 6)]);
+        assert_eq!(cmp64("v_cmp_eq_u64_e64", Arch::Gfx1100, &lanes, e64.clone()).map(|r| r.0), Ok(m(&|a, b| a == b)));
+        assert_eq!(cmp64("v_cmp_eq_u64_e32", Arch::Gfx1100, &lanes, e32.clone()).map(|r| r.1), Ok(m(&|a, b| a == b)));
+        assert_eq!(cmp64("v_cmp_ne_u64_e32", Arch::Gfx1201, &lanes, e32.clone()).map(|r| r.1), Ok(m(&|a, b| a != b)));
+        assert_eq!(cmp64("v_cmp_le_u64_e32", Arch::Gfx1100, &lanes, e32.clone()).map(|r| r.1), Ok(m(&|a, b| a <= b)));
+        assert_eq!(cmp64("v_cmp_gt_u64_e32", Arch::Gfx1100, &lanes, e32.clone()).map(|r| r.1), Ok(m(&|a, b| a > b)));
+        assert_eq!(cmp64("v_cmp_lt_i64_e32", Arch::Gfx1100, &lanes, e32.clone()).map(|r| r.1), Ok(m(&|a, b| (a as i64) < (b as i64))));
+        // CMPX forms have no destination operand and replace EXEC.
+        let x = vec![pair(Kind::V, 4), pair(Kind::V, 6)];
+        assert_eq!(cmp64("v_cmpx_gt_i64_e64", Arch::Gfx1100, &lanes, x.clone()).map(|r| r.2), Ok(m(&|a, b| (a as i64) > (b as i64))));
+        assert_eq!(cmp64("v_cmpx_le_u64_e64", Arch::Gfx1201, &lanes, x.clone()).map(|r| r.2), Ok(m(&|a, b| a <= b)));
+        assert_eq!(cmp64("v_cmpx_gt_u64_e64", Arch::Gfx1100, &lanes, x.clone()).map(|r| r.2), Ok(m(&|a, b| a > b)));
+        assert_eq!(cmp64("v_cmpx_lt_i64_e32", Arch::Gfx1100, &lanes, x.clone()).map(|r| r.2), Ok(m(&|a, b| (a as i64) < (b as i64))));
+        assert_eq!(cmp64("v_cmpx_eq_u64_e32", Arch::Gfx1201, &lanes, x.clone()).map(|r| r.2), Ok(m(&|a, b| a == b)));
+        assert_eq!(cmp64("v_cmpx_gt_u64_e32", Arch::Gfx1201, &lanes, x).map(|r| r.2), Ok(m(&|a, b| a > b)));
+        // Inline constants sign-extend: -1 as S0 equals u64::MAX and is below 0 as a signed value.
+        let mut i = insn_on(Arch::Gfx1100, "v_cmp_lt_i64_e32", vec![Operand::Special(Special::VccLo), Operand::Inline(InlineConst::Integer(-1)), pair(Kind::V, 6)]);
+        let mut st = state();
+        st.exec = 0b11;
+        set64(&mut st, 6, 0, 0);
+        set64(&mut st, 6, 1, u64::MAX);
+        execute(Arch::Gfx1100, "v_cmp_lt_i64_e32", &i, &mut st).unwrap();
+        assert_eq!(st.vcc, 0b01);
+        i = insn_on(Arch::Gfx1100, "v_cmp_eq_u64_e32", vec![Operand::Special(Special::VccLo), Operand::Inline(InlineConst::Integer(-1)), pair(Kind::V, 6)]);
+        execute(Arch::Gfx1100, "v_cmp_eq_u64_e32", &i, &mut st).unwrap();
+        assert_eq!(st.vcc, 0b10);
+    }
+
+    #[test]
+    fn sixteen_bit_and_float_predicate_compares_cover_nan_and_signedness() {
+        let half_cmp = |arch: Arch, name: &str, a: u32, b: u32, a_op: Operand, b_op: Operand, dst: Vec<Operand>| {
+            let mut ops = dst;
+            ops.extend([a_op, b_op]);
+            let i = insn_on(arch, name, ops);
+            let mut st = state();
+            st.exec = 1;
+            st.s[10] = u32::MAX;
+            st.vcc = u32::MAX;
+            st.v[1][0] = a;
+            st.v[2][0] = b;
+            execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
+        };
+        let mask = vec![pair(Kind::S, 10)];
+        let neq = |a: u32, b: u32| half_cmp(Arch::Gfx1100, "v_cmp_neq_f16_e64", a, b, half(1, Half::Lo), half(2, Half::Lo), mask.clone()).map(|r| r.0);
+        // !(a == b): true for NaN, false for -0 == +0.
+        assert_eq!(neq(0x0000, 0x8000), Ok(0));
+        assert_eq!(neq(0x7e00, 0x7e00), Ok(1));
+        assert_eq!(neq(0x3c00, 0x4000), Ok(1));
+        assert_eq!(neq(0x3c00, 0x3c00), Ok(0));
+        // op_sel picks the high halves of a VGPR source.
+        let r = half_cmp(Arch::Gfx1100, "v_cmp_neq_f16_e64", 0x3c00_0000, 0x3c00_0000, half(1, Half::Hi), half(2, Half::Hi), mask.clone());
+        assert_eq!(r.map(|r| r.0), Ok(0));
+        // i16 vs u16 ordering.
+        let gt = |a: u32, b: u32| half_cmp(Arch::Gfx1201, "v_cmp_gt_i16_e64", a, b, half(1, Half::Lo), half(2, Half::Lo), mask.clone()).map(|r| r.0);
+        assert_eq!(gt(0x7fff, 0x8000), Ok(1));
+        assert_eq!(gt(0x8000, 1), Ok(0));
+        assert_eq!(gt(0xffff, 0), Ok(0));
+        let ex = |name: &str, a: u32, b: u32| half_cmp(Arch::Gfx1100, name, a, b, Operand::Inline(InlineConst::Integer(1)), half(2, Half::Lo), vec![]).map(|r| r.2);
+        assert_eq!(ex("v_cmpx_eq_u16_e32", 0, 1), Ok(1));
+        assert_eq!(ex("v_cmpx_eq_u16_e32", 0, 0x1_0001), Ok(1));
+        assert_eq!(ex("v_cmpx_eq_u16_e32", 0, 2), Ok(0));
+        assert_eq!(ex("v_cmpx_ne_u16_e32", 0, 2), Ok(1));
+        assert_eq!(ex("v_cmpx_ne_u16_e32", 0, 1), Ok(0));
+        // f32 negated predicates: NaN makes every `n*` compare true.
+        let f32c = |arch: Arch, name: &str, a: f32, b: f32, dst: Vec<Operand>| {
+            let mut ops = dst;
+            ops.extend([v(1), v(2)]);
+            let i = insn_on(arch, name, ops);
+            let mut st = state();
+            st.exec = 1;
+            st.s[10] = u32::MAX;
+            st.vcc = u32::MAX;
+            (st.v[1][0], st.v[2][0]) = (a.to_bits(), b.to_bits());
+            execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
+        };
+        let nan = f32::NAN;
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            assert_eq!(f32c(arch, "v_cmp_nlg_f32_e64", 1.0, 1.0, mask.clone()).map(|r| r.0), Ok(1));
+            assert_eq!(f32c(arch, "v_cmp_nlg_f32_e64", 1.0, 2.0, mask.clone()).map(|r| r.0), Ok(0));
+            assert_eq!(f32c(arch, "v_cmp_nlg_f32_e64", nan, 2.0, mask.clone()).map(|r| r.0), Ok(1));
+        }
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            assert_eq!(f32c(arch, "v_cmp_nle_f32_e64", 3.0, 2.0, mask.clone()).map(|r| r.0), Ok(1));
+            assert_eq!(f32c(arch, "v_cmp_nle_f32_e64", 2.0, 2.0, mask.clone()).map(|r| r.0), Ok(0));
+            assert_eq!(f32c(arch, "v_cmp_nle_f32_e64", nan, 2.0, mask.clone()).map(|r| r.0), Ok(1));
+            assert_eq!(f32c(arch, "v_cmp_nle_f32_e32", 1.0, 2.0, vec![Operand::Special(Special::VccLo)]).map(|r| r.1), Ok(0));
+            assert_eq!(f32c(arch, "v_cmpx_le_f32_e32", 1.0, 2.0, vec![]).map(|r| r.2), Ok(1));
+            assert_eq!(f32c(arch, "v_cmpx_le_f32_e32", nan, 2.0, vec![]).map(|r| r.2), Ok(0));
+            assert_eq!(f32c(arch, "v_cmpx_nlg_f32_e32", 2.0, 2.0, vec![]).map(|r| r.2), Ok(1));
+            assert_eq!(f32c(arch, "v_cmpx_ngt_f32_e32", nan, 2.0, vec![]).map(|r| r.2), Ok(1));
+            assert_eq!(f32c(arch, "v_cmpx_ngt_f32_e32", 3.0, 2.0, vec![]).map(|r| r.2), Ok(0));
+        }
+        assert_eq!(f32c(Arch::Gfx1201, "v_cmp_nlg_f32_e32", nan, 1.0, vec![Operand::Special(Special::VccLo)]).map(|r| r.1), Ok(1));
+        // 32-bit integer CMPX and VOPC rows added for gfx12.
+        let int = |arch: Arch, name: &str, a: u32, b: u32, dst: Vec<Operand>| {
+            let mut ops = dst;
+            ops.extend([v(1), v(2)]);
+            let i = insn_on(arch, name, ops);
+            let mut st = state();
+            st.exec = 1;
+            (st.v[1][0], st.v[2][0]) = (a, b);
+            execute(arch, name, &i, &mut st).map(|_| st.exec)
+        };
+        assert_eq!(int(Arch::Gfx1201, "v_cmpx_ge_i32_e32", 0xffff_ffff, 0, vec![]), Ok(0));
+        assert_eq!(int(Arch::Gfx1201, "v_cmpx_ge_u32_e32", 0xffff_ffff, 0, vec![]), Ok(1));
+        assert_eq!(int(Arch::Gfx1100, "v_cmpx_lt_i32_e64", 0xffff_ffff, 0, vec![]), Ok(1));
+        assert_eq!(int(Arch::Gfx1100, "v_cmpx_eq_u32_e64", 5, 5, vec![]), Ok(1));
+        assert_eq!(int(Arch::Gfx1100, "v_cmpx_eq_u32_e64", 5, 6, vec![]), Ok(0));
     }
 }

@@ -5,6 +5,7 @@ pub mod gptq;
 pub mod hessian_io;
 pub mod hfhs_diag;
 pub mod hfqm;
+pub mod mq_symmetric;
 pub mod safetensors_file;
 pub mod vision_sidecar;
 

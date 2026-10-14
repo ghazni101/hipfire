@@ -1,8 +1,16 @@
 # Signed int8 GEMM on AIE2P
 
-The Rust kernel is `pm_npu::kernels::gemm_i8`. It emits `isa::Program`
+> **Lifecycle: historical kernel/bring-up note (2026-10-02), plus a dma-buf import source
+> review.** It documents the single-core `gemm_i8` design and the first int8 plumbing,
+> not the 0.4.2 serving route. Where it says a step is "offline" or awaits a hardware gate,
+> that was the status of that day; silicon results are in [`report.md`](report.md). The
+> int8/int32 epilogues here are lab designs; the 0.4.2 Flash-Next gfx1151 NPU trunk is
+> BF16-direct only (calibration schema 4, no I32 contract, input projections only;
+> out-projection unwired). See [`npu-trunk.md`](npu-trunk.md) for the current route.
+
+The Rust kernel is `peacemaker_npu::kernels::gemm_i8`. It emits `isa::Program`
 bytes directly; neither build nor execution invokes a vendor compiler. This
-slice is offline. NpuProbe owns the subsequent Halo execution gate.
+slice was offline when written; the Halo execution gate followed (see `report.md`).
 
 ## Instruction and layout contract
 
@@ -83,10 +91,10 @@ memtile BD banks. Memtile DMA own-memory addresses add0x80000; own-lock
 DMA IDs add64. Shim routing uses the NOC mux/demux through South3 slave
 (MM2S0) and South2 master (S2MM0), not nonexistent shim DMA switch ports.
 
-The plan uses `NpuDma`'s structural `Bd`, `Task`, `Location`, lock writes,
+The plan uses the DMA slice's structural `Bd`, `Task`, `Location`, lock writes,
 `route::Circuit`, and `route::ShimDma` APIs. Shim addresses are supplied
-by the caller; mapping/DDR patching and device submission remain NpuProbe's
-responsibility. Cyclic tile/memtile tasks persist until configuration reset;
+by the caller; mapping/DDR patching and device submission remained the
+runtime slice's responsibility. Cyclic tile/memtile tasks persist until configuration reset;
 only finite shim output tasks issue completion tokens.
 
 ## Runnable single-core deployment
@@ -104,7 +112,7 @@ core, initializes semaphore locks, programs/starts the tile BD rings,
 and configures all circuit/NOC routes. TXN programs contiguous shim BDs,
 patches arguments0/1, queues transfers, and waits for the output token.
 The shim TILE_CTRL packet route to SOUTH0 is included; without it data
-can arrive while SYNC waits forever (NpuProbe's npu-hello hardware finding).
+can arrive while SYNC waits forever (the npu-hello hardware finding).
 Use a fresh configuration/context per submission: the core runs once,
 and cyclic tile DMA rings remain active afterward.
 
@@ -135,13 +143,13 @@ concurrent-GPU performance has been measured by this slice.
 
 ## Offline gates
 
-- `cargo test -p pm-npu gemm_i8 -- --nocapture`: independent oracle bytes,
+- `cargo test -p peacemaker-npu gemm_i8 -- --nocapture`: independent oracle bytes,
   signed packing/reference, and labelled peak-model output.
-- `cargo test -p pm-npu-sim gemm_i8_27_shapes_dma_cpu_exact -- --nocapture`:
+- `cargo test -p peacemaker-npu-sim gemm_i8_27_shapes_dma_cpu_exact -- --nocapture`:
   all27 combinations M,N,K in{64,128,256}, executing encoded core programs,
   semaphore locks, cyclic tile DMA, bounded stream FIFOs, and shim transfers;
   every output word is compared bit-exactly with the CPU reference.
-- `cargo run -p pm-npu-sim -- gemm 64` and `-- gemm 256`: actual CLI
+- `cargo run -p peacemaker-npu-sim -- gemm 64` and `-- gemm 256`: actual CLI
   smokes of3 jobs each, including odd-job and cross-job ping/pong transitions.
 
 Additional offline smoke exercised `pack_columns` through all 32 cores'
@@ -149,7 +157,7 @@ encoded programs and gathered every output for all 27 array shapes: CPU-exact.
 Each emitted array plan had 432 distinct BD assignments and 256 conflict-free
 circuit masters; CDO and TXN emission also completed.
 
-The exact single-core Design PDI/TXN was loaded by NpuSim's configuration
+The exact single-core Design PDI/TXN was loaded by the simulator's configuration
 interpreter and submitted with packed host arguments for M=N=64 and
 K=64/128/256. All 4,096 output words matched CPU in each case:
 
@@ -218,8 +226,7 @@ are unchanged. HIP memory and its fd outlive all imported BOs/contexts.
 
 ### Evidence chain
 
-Local kernel citations below are relative to
-`ref/amdxdna/linux-source-7.0.0/`:
+Kernel citations below are relative to the Linux 7.0 kernel source tree (a local reference checkout that is not part of this repository):
 
 - `drivers/accel/amdxdna/amdxdna_pci_drv.c:249` installs the custom
   `gem_prime_import` hook (not the generic driver's default implementation).
@@ -238,7 +245,7 @@ Local kernel citations below are relative to
   mapping already pins (`amdxdna_gem.c:869-870`). Our
   `crates/railgun/src/npu/mod.rs`, `HwCtx::submit`, embeds each `Bo::dev_addr()` into
   firmware bo0..bo4 and separately passes argument handles. V8's shim DDR
-  patches use arg0=A (`crates/pm-npu/src/kernels/gemm_array.rs:50-58,80-83`).
+  patches use arg0=A (`crates/peacemaker-npu/src/kernels/gemm_array.rs:50-58,80-83`).
 - The NPU is non-cache-coherent; SYNC_BO flushes an imported SG table
   (`amdxdna_gem.c:977-982,1007-1012`). The probe flushes the imported CPU
   mapping but never writes it. Explicit HIP synchronization is required;
@@ -265,7 +272,7 @@ headers identify this baseline), available from
 
 HIP/ROCR citations are from
 [ROCm/rocm-systems d1cf05c0dfbd3b63a7e637422294c4e864e44d56](https://github.com/ROCm/rocm-systems/tree/d1cf05c0dfbd3b63a7e637422294c4e864e44d56),
-with ABI checked against hipx HIP 7.15.26333 / ROCm core 10.0.0 headers:
+with ABI checked against HIP 7.15.26333 / ROCm core 10.0.0 headers:
 
 - `projects/clr/hipamd/src/hip_memory.cpp:402-483,830-851` distinguishes
   host fine-grain allocations from device Finegrained/Uncached flags.

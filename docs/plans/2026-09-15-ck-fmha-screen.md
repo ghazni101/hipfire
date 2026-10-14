@@ -12,7 +12,7 @@ Is Composable Kernel's `ck_tile` FMHA **forward** competitive with hipfire's
 | Item | Value |
 |---|---|
 | Incumbent symbol | `attention_q8_0_fa2_gqa_gfx11` |
-| Incumbent reference | **7.0 ms/call** at pp8192 mean context (~4352), batch **512** query rows, **48** Q heads / **8** KV heads, **hd=128**, causal (`docs/plans/2026-09-15-halo-gap-levers-max.md:26-27`) |
+| Incumbent reference | **7.0 ms/call** at pp8192 mean context (~4352), batch **512** query rows, **48** Q heads / **8** KV heads, **hd=128**, causal (the 2026-09-15 Halo gap-levers plan (internal)) |
 | Screen dtype | CK pure **fp16** Q/K/V/O (example default) |
 | Screen shapes | `batch=1`, `seqlen_q=512`, `seqlen_k ∈ {8192, 32768}`, `nhead=48`, `nhead_k=8`, `hdim=128`, causal |
 | **Kill threshold** | CK median ms/call must be **≤ 7.0 / 1.5 = 4.667 ms** at the **8192** shape (i.e. **≥ 1.5× faster** than 7.0 ms). If slower or within noise of 7.0 ms, **do not** open an integration track. |
@@ -304,8 +304,8 @@ Kernel header contract: `kernels/src/attention_q8_0_fa2_gqa.gfx11.hip:64-72,115-
 
 ### hipfire tree (read-only)
 - `kernels/src/attention_q8_0_fa2_gqa.gfx11.hip` — FA2 contract, Q8/fwht3, 7.0 ms context  
-- `docs/plans/2026-09-15-halo-gap-levers-max.md` — 7.0 ms/call citation  
-- `docs/plans/2026-09-15-halo-gap-plan.md` — hardware owner hipx  
+- the 2026-09-15 Halo gap-levers plan (internal) — 7.0 ms/call citation  
+- the 2026-09-15 Halo gap plan (internal) — hardware owner hipx  
 - `experiments/flash-attn-ck-sidecar/README.md` — prior CK sidecar, gfx1100 e2e, D256  
 - `experiments/flash-attn-ck-sidecar/build_sidecar.sh` — offline hipcc recipe, gfx1151 case  
 - `experiments/flash-attn-ck-sidecar/gfx11_ck_recipe.patch` — historical gfx11 factory patch (pre-upstream gfx115 split)  

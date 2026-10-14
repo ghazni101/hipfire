@@ -174,7 +174,7 @@ fn h2d_async(gpu: &Gpu, dst: &GpuTensor, src: &[u8]) -> HipResult<()> {
 fn d2h_sync(gpu: &Gpu, dst: &mut [u8], src: &GpuTensor) -> HipResult<()> {
     match gpu.active_stream.as_ref() {
         Some(stream) => {
-            gpu.hip.memcpy_dtoh_async(dst, &src.buf, stream)?;
+            gpu.hip.memcpy_dtoh_async(dst, &src.buf, Some(stream))?;
             gpu.hip.stream_synchronize(stream)
         }
         None => gpu.hip.memcpy_dtoh(dst, &src.buf),

@@ -7,7 +7,7 @@
 //! (`/home/kaden/qcal/release-0.4.1/pm-kernel-lang-design.md` §4, §12 M0).
 //!
 //! Kernel source is ordinary Rust run at build time. This crate puts types
-//! in front of a lowering backend (`hipfire-isa`'s checked `Builder`, which
+//! in front of a lowering backend (`peacemaker-isa`'s checked `Builder`, which
 //! keeps its wait ledger, LDS slot machine, hazard model and loop fixpoint
 //! as the second evaluator):
 //! - targets and capabilities as types (`target`);

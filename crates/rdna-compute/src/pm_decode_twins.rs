@@ -24,7 +24,7 @@
 //! the arithmetic. Under `-ffp-contract=fast` the backend's FMA fusion of the
 //! group dot depends on the surrounding code, so an edit elsewhere in the
 //! kernel can change its output bytes while the twin keeps the old ones (see
-//! `hipfire_isa::kernels::pm_decode`).
+//! `peacemaker_isa::kernels::pm_decode`).
 
 use sha2::{Digest, Sha256};
 

@@ -195,6 +195,7 @@ fn main() {
             ModelFootprint {
                 weights_bytes: 0,
                 kv_bytes_per_token: 0,
+                pinned_host_bytes: 0,
             },
             u64::MAX,
         );

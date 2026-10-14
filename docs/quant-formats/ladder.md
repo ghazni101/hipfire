@@ -161,8 +161,7 @@ a native 4-bit quant, even at equal bytes — and reclassifying it hides that.
 It loses anyway, on two grounds:
 
 1. **An oversize suffix breaks the only checkable promise.** `mq4 pro xl` at
-   5.16 bpw means the leading digit no longer predicts size. That is precisely
-   the llama.cpp failure mode, with a warning label attached — and the people
+   5.16 bpw means the leading digit no longer predicts size. The people
    most harmed by the zoo are the ones who do not decode suffixes. A class
    defined by measured bpw cannot drift: growth reclassifies.
 2. **Lineage does not need to live in the name.** At equal class the KLD column
@@ -179,7 +178,7 @@ Every published product row carries, per model:
 | column | why |
 |---|---|
 | model bpw | the § 1 promise; machine-checked |
-| KLD vs pinned f16 teacher | the axis hipfire can publish and ggml structurally cannot |
+| KLD vs pinned f16 teacher | the quality axis hipfire publishes against a pinned reference |
 | base codec + qt | lineage — distinguishes a native N-bit from a lifted (N−1)-bit at equal class |
 | rung | which roles are held above base width |
 
@@ -187,10 +186,38 @@ Rows are filled from the routes in [`../VALIDATION.md`](../VALIDATION.md). A run
 without a measured KLD on a given model is not publishable for that model. Do
 not infer a KLD from a sibling model or a sibling codec.
 
-### Measured grid — Qwen3.8-27B MQ V2 family (2026-08-20)
+### Current quality methodology
 
-Authoritative evidence: hiptrx `ssh://hiptrx/home/kaden/qcal/ladder-v2/`
-(`summary.md` / `summary.json` / `summary.csv`), generated
+Current quality pins are defined in [`../../AGENTS.md`](../../AGENTS.md) § 5
+(Pinned Hugging Face bench fixture and Quality pins), not by the historical
+table below. The scorer is teacher-forced `eval_hipfire --scoring-mode prefill
+--max-chunks 24` with `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0`, and a
+fresh `HOME` and kernel cache. The public WT2 and heldout-code24 reference
+digests are recorded in `AGENTS.md`. A bit-exact claim requires reproducing the
+arch's `.kldseq` byte for byte. Public reproduction instructions are in
+[`kld/VERIFY.md`](https://huggingface.co/hipfire-models/qwen3.8-27b/blob/main/kld/VERIFY.md)
+on the model's Hugging Face repo.
+
+**Shipped XTS trunks (separate from the August `xt` grid).** The canonical
+dense registry tag `qwen3.8:27b-mq4-xts` resolves to
+`qwen3.8-27b.mq4-xts`: an H2 symmetric MQ4V2 XT trunk (qt44) with per-group AWQ
+alpha and three GPTQ scale-refit rounds. Its size and SHA-256 pin is in
+`AGENTS.md` § 5 (`3e38ccba…f6f8ae`). The canonical Flash-Next registry artifact
+is `qwen3.8-flash-next.mq4-xts` (tag `qwen3.8:flash-next-mq4-xts`), which uses
+qt44 and qt53 expert roles; its pin is also in `AGENTS.md` § 5, and its
+file-name constants are `FLASH_NEXT_XTS_*` in
+`crates/hipfire-registry/src/lib.rs`. These XTS artifacts are not rows of the
+historical `mq4-xt` grid below: the grid's `mq4-xt` cell is a different, August
+artifact.
+
+### Historical August sweep — Qwen3.8-27B MQ V2 family (2026-08-20)
+
+**Historical, fixture-bound evidence.** Everything in this subsection, through
+the DFlash control table, comes from one August 2026 sweep. It is not the current
+quality-pin set above and does not by itself say which candidates ship today.
+Full record (immutable checkpoint):
+[`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md).
+Sweep generated
 `2026-08-20T14:13:16Z`, commit `bfe3cfead5856c5ee85e972b609712b0badbd1b1`,
 params **26,895,998,464**. Host: 4×gfx1201, ROCm/HIP 7.14. KLD protocol: WT2 +
 v6sel, 24 chunks, prefill scoring, kv-mode q8. Prompt fixture
@@ -206,7 +233,7 @@ v6sel, 24 chunks, prefill scoring, kv-mode q8. Prompt fixture
 **Status is evidence status, not registry publication.** No cell below is
 declared shipping or registry-published from this table alone. AR acceptance is
 `null` (`unavailable_in_native_generate_v1`) for every cell — never derived.
-DFlash τ is recorded in the remote summary; acceptance remains unavailable.
+DFlash τ is recorded in the linked checkpoint; acceptance remains unavailable.
 
 | product | rung | model bpw | class | KLD WT2 | KLD v6sel | base codec | qt | AR dec/pre tok/s | status |
 |---|---|---:|---:|---:|---:|---|---:|---|---|
@@ -230,7 +257,7 @@ Every row satisfies § 1: measured bpw ∈ [N, N+1) for product `mqN`.
 
 **`mq2` rejection (product admission, not measurement failure).** All three
 `mq2` cells were built, KLD-scored, AR-benched, and serve-probed. WT2/v6sel KLD
-is catastrophic (~12–14 nats). Decoded serve text is coherent enough to read
+is catastrophic (~12–14 KLD on both corpora). Decoded serve text is coherent enough to read
 but degraded/repetitive (`serve-mq2.json`: no attractor/empty flags; content
 quality is not shipping-grade). **Do not call MQ2V2 a shipping product.** The
 rows stay on the grid so the class is defined and the failure is dated.
@@ -261,7 +288,7 @@ in `summary.json`):
 | mq6-base | `…/qwen3.8-27b.mq6v2.base.hfq` | `b798ea1166fc03a568f6daf8090b20b7d6314af7429951c03d86540385568db8` | 21750254592 | `ae18a5d9e7926474064586387126aa5c` |
 | mq6-pro | `…/qwen3.8-27b.mq6v2.pro.hfq` | `58ac3ee645ede2bad2f6f833db1d4abbfdc1850047fdadef036d35a023bb9401` | 22174333952 | `aac76dcc771b424d605e813b0b4aa1c1` |
 
-Paths are under `/home/kaden/qcal/ladder-v2/artifacts/` on hiptrx.
+Artifact paths and per-cell rows are recorded in the linked checkpoint.
 
 #### DFlash same-bit vs mq4 control (decode tok/s median)
 

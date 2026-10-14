@@ -13,8 +13,13 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 use crate::{DType, Gpu, GpuTensor};
 use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 
+#[path = "npu_trunk_consumers.rs"]
+pub(crate) mod npu_arena;
+pub use npu_arena::*;
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
 pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
@@ -58,6 +63,12 @@ static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 /// hipcc kernels.  Read once.
 static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
+});
+/// Persistent per-QSA-layer F16 K/V for exact gfx1151 F32-state prefill.
+/// Opt-in (`HIPFIRE_QWEN4_QSA_F16_ARENA=1`); off keeps per-launch
+/// conversion. Resolved once at load; decode keeps the F32 state.
+static QWEN4_QSA_F16_ARENA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_F16_ARENA", false)
 });
 /// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
 /// unless `0`) use the certified builder rows16 F32/BF16 score and
@@ -2439,6 +2450,8 @@ pub struct IndexedAttentionNormRope<'a> {
     pub head_stride: usize,
     pub position: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_norm_rope(
@@ -2482,6 +2495,7 @@ pub fn indexed_attention_norm_rope(
     args.push_i32(head_stride);
     args.push_i32(position);
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32",
@@ -2503,6 +2517,8 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub head_stride: usize,
     pub position_start: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 /// Storage format of a QSA layer's state: the full K/V caches and the
@@ -2583,6 +2599,129 @@ impl QsaKvFormat {
     }
 }
 
+/// Context storage of one QSA layer, including the optional derived F16
+/// arena. A bare [`QsaKvFormat`] describes the unchanged state without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QsaStateLayout {
+    pub kv: QsaKvFormat,
+    /// Persistent F16 K and block-transposed V arenas
+    /// ([`QsaF16ArenaRef`]); each holds `qsa_f16_arena_rows(max_seq)` rows of
+    /// `kv_heads * head_dim` F16 elements.
+    pub f16_arena: bool,
+}
+
+impl QsaStateLayout {
+    /// The exact F32 reference state with no extra storage.
+    pub const F32: Self = Self::new(QsaKvFormat::F32);
+
+    pub const fn new(kv: QsaKvFormat) -> Self {
+        Self {
+            kv,
+            f16_arena: false,
+        }
+    }
+
+    /// Dtype of the raw and pooled index-key arenas.
+    pub const fn index_dtype(self) -> DType {
+        self.kv.index_dtype()
+    }
+
+    /// Bytes per cached token of both F16 arenas (K and V, 2 bytes per
+    /// channel), `0` without them.
+    pub const fn f16_arena_bytes_per_token(self, kv_heads: usize, head_dim: usize) -> usize {
+        if self.f16_arena {
+            2 * kv_heads * head_dim * 2
+        } else {
+            0
+        }
+    }
+}
+
+impl From<QsaKvFormat> for QsaStateLayout {
+    fn from(kv: QsaKvFormat) -> Self {
+        Self::new(kv)
+    }
+}
+
+/// Rows an F16 arena of `tokens` cached tokens holds: V is block-transposed
+/// in four-token blocks, so its last block is written whole.
+pub const fn qsa_f16_arena_rows(tokens: usize) -> usize {
+    tokens.div_ceil(4).saturating_mul(4)
+}
+
+/// Load-time arena admission: enabled unless opted out, exact gfx1151,
+/// F32 K/V, head_dim 256, and the gathered prefill route enabled.
+pub fn qsa_f16_arena_enabled(gpu: &Gpu, format: QsaKvFormat, head_dim: usize) -> bool {
+    *QWEN4_QSA_F16_ARENA
+        && format == QsaKvFormat::F32
+        && head_dim == 256
+        && gpu.arch_caps.is_gfx1151()
+        && qsa_gathered_wmma_enabled(gpu, format)
+}
+
+
+/// Whether the gathered route's shared F16 workspace is still needed: the
+/// route is enabled for `format` and the QSA layers do not keep their own F16
+/// arena (`f16_arena`; the MTP head never takes the gathered route, its
+/// attention rows stay below `QWEN4_F16_WMMA_MIN_TOKENS`).
+pub fn qsa_gather_workspace_needed(gpu: &Gpu, format: QsaKvFormat, f16_arena: bool) -> bool {
+    !f16_arena && qsa_gathered_wmma_enabled(gpu, format)
+}
+
+/// Host watermark for a derived arena. It travels with its F32/F16 owners,
+/// is never snapshotted, and only the successful converter advances it.
+#[derive(Default)]
+pub struct QsaF16ValidLen(std::sync::atomic::AtomicUsize);
+
+impl QsaF16ValidLen {
+    pub fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn valid(&self, committed: usize) -> usize {
+        self.get().min(committed)
+    }
+
+    pub fn clamp(&self, committed: usize) {
+        self.0.fetch_min(committed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn invalidate(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn converted(&self, end: usize) {
+        self.0.store(end, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Conversion starts at a four-token boundary to preserve the existing
+/// block-transposed V layout; at most three valid rows are reread.
+fn qsa_f16_arena_start(valid: usize, committed: usize) -> usize {
+    valid.min(committed) & !3
+}
+
+/// A QSA layer's persistent F16 arena as the gathered attention reads it:
+/// `keys` is F16 `[token][kv_heads * 256]` and `values` the block-transposed
+/// F16 `[token / 4][kv_heads * 256][token % 4]`
+/// (`indexed_attention_kv_f16vb`'s layout), both sized for
+/// [`qsa_f16_arena_rows`] of the cache capacity. `valid_len` counts the
+/// leading tokens whose F16 rows are known to equal the F32 cache's; the owner
+/// clamps it whenever cache rows are rewritten or rewound.
+#[derive(Clone, Copy)]
+pub struct QsaF16ArenaRef<'a> {
+    pub keys: &'a GpuTensor,
+    pub values: &'a GpuTensor,
+    pub valid_len: &'a QsaF16ValidLen,
+}
+
+impl QsaF16ArenaRef<'_> {
+    /// Leading tokens that are valid while the F32 cache holds `committed`.
+    pub fn valid(&self, committed: usize) -> usize {
+        self.valid_len.valid(committed)
+    }
+}
+
 /// Refuse a format the device or head geometry has no kernels for, and K/V
 /// tensors that are not in its dtype.
 fn check_qsa_format(
@@ -2640,6 +2779,9 @@ pub struct IndexedAttentionDecodePrologue<'a> {
     pub position: usize,
     pub rows: usize,
     pub format: QsaKvFormat,
+    /// [`crate::rope::Rope::yarn`] at the prologue's rotary width
+    /// (`min(dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_decode_prologue(
@@ -2723,6 +2865,7 @@ pub fn indexed_attention_decode_prologue(
     // Declared dynamic field: replay re-derives the position (angles and
     // both cache rows follow it).
     let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -2768,6 +2911,8 @@ pub struct IndexedAttentionAppendPrologue<'a> {
     pub position: usize,
     pub rows: usize,
     pub format: QsaKvFormat,
+    /// See [`IndexedAttentionDecodePrologue::yarn`].
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_append_prologue(
@@ -2850,6 +2995,7 @@ pub fn indexed_attention_append_prologue(
     // Declared dynamic field: replay re-derives the position (angles and
     // both cache rows follow it).
     let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -2932,6 +3078,7 @@ pub fn indexed_attention_norm_rope_batch(
     // base; the kernel adds the row index itself.
     let position_offset = args.len() - 4;
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -3951,6 +4098,9 @@ pub struct IndexedAttentionPoolRope<'a> {
     /// instead uses `ceil(rows / compress)` (capped by this bound), which is
     /// also position-independent.
     pub grid_bound: usize,
+    /// [`crate::rope::Rope::yarn`] at the pooled keys' rotary width
+    /// (`min(index_dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_pool_rope(
@@ -4072,6 +4222,7 @@ fn indexed_attention_pool_rope_impl(
     args.push_i32(checked_i32(first_block, "QSA pool/RoPE first block")?);
     // Declared dynamic too when incremental: `position_start / compress`.
     let first_block_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let addend = u32::try_from(p.position.map_or(0, |position| position.rows))
         .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
@@ -4401,7 +4552,7 @@ pub fn indexed_attention_gathered_batch(
     if pm && !qsa_gathered_pm_fits(p) {
         return Err(HipError::new(0, "QSA PM gathered route does not cover this shape"));
     }
-    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+    qsa_gathered_wmma_launch_with(gpu, p, end_position, max_selected, pm, None)
 }
 
 /// `allow_fast` admits the grouped hg4 kernel and the dense F16 WMMA route;
@@ -4410,6 +4561,28 @@ fn indexed_attention_attention_batch_impl(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
     allow_fast: bool,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_arena(gpu, p, allow_fast, None)
+}
+
+/// [`indexed_attention_attention_batch`] for a layer that keeps a persistent
+/// F16 K/V `arena` (F32 state only; `None` = the shared per-launch
+/// workspace). The gathered route first brings the arena up to this launch's
+/// rows ([`qsa_f16_arena_sync`]), then attends from it; every other route
+/// ignores it.
+pub fn indexed_attention_attention_batch_with_arena(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    arena: Option<&QsaF16ArenaRef<'_>>,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_arena(gpu, p, true, arena)
+}
+
+fn indexed_attention_attention_batch_arena(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    allow_fast: bool,
+    arena: Option<&QsaF16ArenaRef<'_>>,
 ) -> HipResult<()> {
     for tensor in [p.q_with_gate, p.output] {
         ensure_f32(tensor)?;
@@ -4480,7 +4653,7 @@ fn indexed_attention_attention_batch_impl(
         ));
     }
     if allow_fast && qsa_gathered_wmma_applies(gpu, p) {
-        return qsa_gathered_wmma(gpu, p, end_position, max_selected);
+        return qsa_gathered_wmma(gpu, p, end_position, max_selected, arena);
     }
     // Live (unrecorded) launches reserve LDS for this chunk's longest row
     // only; a recorded launch keeps the position-independent shape bound.
@@ -4843,9 +5016,10 @@ fn qsa_gathered_wmma(
     p: &IndexedAttentionAttentionBatch<'_>,
     end_position: usize,
     max_selected: usize,
+    arena: Option<&QsaF16ArenaRef<'_>>,
 ) -> HipResult<()> {
     let pm = *QWEN4_QSA_PM && qsa_gathered_pm_fits(p);
-    qsa_gathered_wmma_launch(gpu, p, end_position, max_selected, pm)
+    qsa_gathered_wmma_launch_with(gpu, p, end_position, max_selected, pm, arena)
 }
 
 /// Whether the builder module covers `p`: its raw buffer offsets are 32-bit,
@@ -4867,16 +5041,16 @@ pub(crate) fn qsa_gathered_pm_shape_fits(
         && n_kv_heads * 2048 < 1 << 24
 }
 
-/// The gathered route's producer and attention launches: the hipcc kernels,
-/// or with `pm` the certified builder module (`kernels::QSA_GATHER_PM_*`).
-/// The builder module has no q8 producer: q8 converts with the hipcc kernel
-/// and attends through either (the attend reads only the F16 workspace).
-fn qsa_gathered_wmma_launch(
+/// The existing hipcc/PM producer and gathered attention launches. An arena
+/// replaces only the per-launch F16 workspace; all attend arguments and
+/// kernels are unchanged. The quantized formats retain their converters.
+fn qsa_gathered_wmma_launch_with(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
     end_position: usize,
     max_selected: usize,
     pm: bool,
+    arena: Option<&QsaF16ArenaRef<'_>>,
 ) -> HipResult<()> {
     // (module, hipcc source or the builder image, kernel).
     type Code = (&'static str, Result<&'static str, &'static [u8]>, &'static str);
@@ -4914,19 +5088,11 @@ fn qsa_gathered_wmma_launch(
         ),
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
-    let k_elements = checked_product(end_position, width, "QSA gathered K")?;
-    let bytes = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, end_position)
-        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
-    // Reserved for the whole cache (one stable address per model), mapped
-    // over this forward's prefix.
-    let reserve = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, p.full_capacity.max(end_position))
-        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
-    let k16 = gpu.qsa_gather_scratch(bytes, reserve)?;
-    // V follows K: whole four-token blocks, the last one padded.
-    let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
-    let tokens = checked_i32(end_position, "QSA gathered tokens")?;
-    let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
-    for (module, code, kernel) in [convert, attend] {
+    // The persistent arena has no per-launch convert kernel to ensure.
+    for (module, code, kernel) in [convert, attend]
+        .into_iter()
+        .skip(usize::from(arena.is_some()))
+    {
         match code {
             Ok(src) => {
                 gpu.ensure_kernel_public(module, src, kernel)?;
@@ -4937,22 +5103,59 @@ fn qsa_gathered_wmma_launch(
         }
     }
     let (convert, attend) = (convert.2, attend.2);
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.full_keys.buf.as_ptr());
-    args.push_ptr(p.full_values.buf.as_ptr());
-    args.push_ptr(k16);
-    args.push_ptr(vb16);
-    args.push_i32(tokens);
-    args.push_i32(kv_heads);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        convert,
-        [checked_u32(end_position, "QSA gathered token grid")?, p.n_kv_heads as u32, 1],
-        [256, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
+    let (k16, vb16) = match arena {
+        // The persistent arena already holds every cache row below the ones
+        // this op appended; convert only those (and the partial block they
+        // continue), then attend straight from it.
+        Some(arena) => {
+            if p.format != QsaKvFormat::F32 {
+                return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+            }
+            qsa_f16_arena_sync(
+                gpu,
+                p.full_keys,
+                p.full_values,
+                arena,
+                p.n_kv_heads,
+                p.position_start,
+                end_position,
+                pm,
+            )?;
+            (arena.keys.buf.as_ptr(), arena.values.buf.as_ptr())
+        }
+        None => {
+            let k_elements = checked_product(end_position, width, "QSA gathered K")?;
+            let bytes = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, end_position)
+                .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+            // Reserved for the whole cache (one stable address per model), mapped
+            // over this forward's prefix.
+            let reserve =
+                qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, p.full_capacity.max(end_position))
+                    .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+            let k16 = gpu.qsa_gather_scratch(bytes, reserve)?;
+            // V follows K: whole four-token blocks, the last one padded.
+            let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
+            let tokens = checked_i32(end_position, "QSA gathered tokens")?;
+            let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
+            let mut args = KernargBlob::new();
+            args.push_ptr(p.full_keys.buf.as_ptr());
+            args.push_ptr(p.full_values.buf.as_ptr());
+            args.push_ptr(k16);
+            args.push_ptr(vb16);
+            args.push_i32(tokens);
+            args.push_i32(kv_heads);
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                convert,
+                [checked_u32(end_position, "QSA gathered token grid")?, p.n_kv_heads as u32, 1],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )?;
+            (k16, vb16)
+        }
+    };
     let mut args = KernargBlob::new();
     args.push_ptr(p.q_with_gate.buf.as_ptr());
     args.push_ptr(k16);
@@ -4987,6 +5190,109 @@ fn qsa_gathered_wmma_launch(
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+
+/// Bring a QSA layer's persistent F16 arena up to `end_tokens` cache rows:
+/// the F32 cache rows `[align_down4(valid), end_tokens)` through the
+/// unchanged `indexed_attention_kv_f16vb` converter, where `valid` is the
+/// arena's valid prefix while the cache holds `committed` unchanged rows
+/// ([`QsaF16ArenaRef::valid`]). The converter's block-transposed V index uses
+/// the token's offset inside its grid, so starting the grid at a four-token
+/// boundary and offsetting the F32 inputs by `start * width * 4` bytes, the
+/// K output by `start * width * 2` and the V output by `start / 4` blocks of
+/// `width * 8` bytes makes the local layout equal the global one; at most
+/// three already-valid rows are reread. Records `end_tokens` as the valid
+/// prefix. Direct (unrecorded, uncaptured) launches only: the host start and
+/// length are baked into the launch.
+/// `pm` chooses the already-certified producer; callers must provide mapped
+/// F32 sources and F16 destinations. The byte oracle also uses this helper
+/// with an empty watermark for its independent whole-prefix reference.
+pub fn qsa_f16_arena_sync(
+    gpu: &mut Gpu,
+    full_keys: &GpuTensor,
+    full_values: &GpuTensor,
+    arena: &QsaF16ArenaRef<'_>,
+    n_kv_heads: usize,
+    committed: usize,
+    end_tokens: usize,
+    pm: bool,
+) -> HipResult<()> {
+    let valid = arena.valid(committed);
+    if end_tokens <= valid {
+        return Ok(());
+    }
+    if !gpu.arch_caps.is_gfx1151() || gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        return Err(HipError::new(
+            0,
+            "QSA F16 arena sync needs a direct launch on gfx1151",
+        ));
+    }
+    ensure_f32(full_keys)?;
+    ensure_f32(full_values)?;
+    let width = checked_product(n_kv_heads, 256, "QSA F16 arena KV width")?;
+    let rows = checked_product(qsa_f16_arena_rows(end_tokens), width, "QSA F16 arena rows")?;
+    let source = checked_product(end_tokens, width, "QSA F16 arena source")?;
+    let arena_bytes = checked_product(rows, 2, "QSA F16 arena bytes")?;
+    let source_bytes = checked_product(source, 4, "QSA F16 arena source bytes")?;
+    if n_kv_heads == 0
+        || arena.keys.dtype != DType::F16
+        || arena.values.dtype != DType::F16
+        || arena.keys.numel() < rows
+        || arena.values.numel() < rows
+        || full_keys.numel() < source
+        || full_values.numel() < source
+        || full_keys.buf.size() < source_bytes
+        || full_values.buf.size() < source_bytes
+        || arena.keys.buf.size() < arena_bytes
+        || arena.values.buf.size() < arena_bytes
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let start = qsa_f16_arena_start(valid, committed);
+    let tokens = checked_i32(end_tokens - start, "QSA F16 arena tokens")?;
+    let kv_heads = checked_i32(n_kv_heads, "QSA F16 arena KV heads")?;
+    let offset = |base: *mut std::ffi::c_void, bytes: usize| -> HipResult<*mut std::ffi::c_void> {
+        Ok(unsafe { (base as *mut u8).add(bytes) } as *mut std::ffi::c_void)
+    };
+    let f32_offset = checked_product(start, width * 4, "QSA F16 arena source offset")?;
+    let k_offset = checked_product(start, width * 2, "QSA F16 arena K offset")?;
+    let v_offset = checked_product(start / 4, width * 8, "QSA F16 arena V offset")?;
+    let kernel = if pm {
+        let kernel = "indexed_attention_kv_f16vb_pm_gfx1151";
+        gpu.ensure_embedded_kernel(
+            "qsa_gather_pm_gfx1151",
+            crate::kernels::QSA_GATHER_PM_GFX1151,
+            kernel,
+        )?;
+        kernel
+    } else {
+        let kernel = "indexed_attention_kv_f16vb";
+        gpu.ensure_kernel_public(
+            "indexed_attention_gathered_wmma",
+            INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+            kernel,
+        )?;
+        kernel
+    };
+    let mut args = KernargBlob::new();
+    args.push_ptr(offset(full_keys.buf.as_ptr(), f32_offset)?);
+    args.push_ptr(offset(full_values.buf.as_ptr(), f32_offset)?);
+    args.push_ptr(offset(arena.keys.buf.as_ptr(), k_offset)?);
+    args.push_ptr(offset(arena.values.buf.as_ptr(), v_offset)?);
+    args.push_i32(tokens);
+    args.push_i32(kv_heads);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [checked_u32(end_tokens - start, "QSA F16 arena token grid")?, n_kv_heads as u32, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    arena.valid_len.converted(end_tokens);
+    Ok(())
+}
+
 
 pub struct IndexedAttentionPool<'a> {
     pub raw_keys: &'a GpuTensor,
@@ -5123,6 +5429,47 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_f16_arena_sizing_and_alignment() {
+        let arena = QsaStateLayout { f16_arena: true, ..QsaStateLayout::F32 };
+        assert_eq!(QsaStateLayout::F32.f16_arena_bytes_per_token(2, 256), 0);
+        assert_eq!(arena.f16_arena_bytes_per_token(2, 256), 2048);
+        for tokens in [0usize, 1, 2, 3, 4, 5, 8191, 8192, 8193, 262144] {
+            let rows = qsa_f16_arena_rows(tokens);
+            assert_eq!(rows % 4, 0);
+            assert!(rows >= tokens && rows - tokens < 4);
+        }
+        for committed in 0..1024 {
+            for valid in [0, committed, committed + 17] {
+                let start = qsa_f16_arena_start(valid, committed);
+                assert_eq!(start % 4, 0);
+                assert!(start <= valid.min(committed));
+                assert!(valid.min(committed) - start < 4);
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_f16_arena_watermark_clamp_invalidate_and_move() {
+        let mark = QsaF16ValidLen::default();
+        assert_eq!(mark.get(), 0);
+        mark.converted(8193);
+        assert_eq!(mark.valid(8192), 8192);
+        mark.clamp(8191);
+        assert_eq!(mark.get(), 8191);
+        mark.clamp(9000); // A decode append does not claim converted rows.
+        assert_eq!(mark.get(), 8191);
+        assert_eq!(qsa_f16_arena_start(mark.get(), 8191), 8188);
+        mark.converted(9000);
+        let moved = mark; // Watermark moves with the storage owner.
+        assert_eq!(moved.get(), 9000);
+        moved.invalidate(); // Replaced prefix, reset, or failed append.
+        assert_eq!(moved.valid(9000), 0);
+        moved.converted(3);
+        moved.clamp(0);
+        assert_eq!(moved.get(), 0);
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok()
@@ -7729,6 +8076,7 @@ mod tests {
                     rows,
                 }),
                 grid_bound: blocks,
+                yarn: crate::rope::RopeYarn::OFF,
             },
         )
         .expect("QSA pool/RoPE");
@@ -7841,6 +8189,7 @@ mod tests {
                     rows: inc_rows,
                 }),
                 grid_bound: 65_536,
+                yarn: crate::rope::RopeYarn::OFF,
             },
         )
         .expect("incremental QSA pool/RoPE");
@@ -8076,6 +8425,7 @@ mod tests {
                         rows: 1,
                     }),
                     grid_bound: max_blocks,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool/RoPE");
@@ -8545,6 +8895,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: bound,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool/RoPE");
@@ -8584,6 +8935,7 @@ mod tests {
                 index_dim,
                 position,
                 grid_bound: inc_capacity,
+                yarn: crate::rope::RopeYarn::OFF,
             };
             match position {
                 Some(_) => indexed_attention_pool_rope_incremental(gpu, &p),
@@ -9121,7 +9473,7 @@ mod tests {
         fn gathered(&self, gpu: &mut Gpu, pm: bool) -> Vec<u8> {
             gpu.hip.memset(&self.output.buf, 0x7f, self.output.byte_size()).expect("poison");
             let end = self.position_start + self.rows;
-            qsa_gathered_wmma_launch(gpu, &self.params(), end, GATHERED_CAPACITY, pm)
+            qsa_gathered_wmma_launch_with(gpu, &self.params(), end, GATHERED_CAPACITY, pm, None)
                 .expect("gathered QSA");
             gpu.hip.device_synchronize().expect("sync");
             let mut bytes = vec![0u8; self.output.byte_size()];
@@ -9167,7 +9519,7 @@ mod tests {
             let p = case.params();
             indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
             let reference = gpu.download_f32(&case.output).expect("reference download");
-            qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity).expect("gathered QSA");
+            qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity, None).expect("gathered QSA");
             let gathered = gpu.download_f32(&case.output).expect("gathered download");
             let rel = rel_l2(&reference, &gathered);
             eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
@@ -9738,7 +10090,6 @@ mod tests {
         const HEAD_DIM: usize = 256;
         const HEAD_STRIDE: usize = 2 * HEAD_DIM;
         const ROTARY_DIM: usize = 64;
-        const POSITION: usize = 11;
         let mut input = vec![0.0f32; HEADS * HEAD_STRIDE];
         for head in 0..HEADS {
             for channel in 0..HEAD_DIM {
@@ -9748,57 +10099,67 @@ mod tests {
                     1000.0 + (head * HEAD_DIM + channel) as f32;
             }
         }
-        let values = gpu
-            .upload_f32(&input, &[input.len()])
-            .expect("query/gate upload");
         let norm = gpu
             .zeros(&[HEAD_DIM], DType::BF16)
             .expect("zero norm allocation");
-        indexed_attention_norm_rope(
-            &mut gpu,
-            &IndexedAttentionNormRope {
-                values: &values,
-                norm: &norm,
-                heads: HEADS,
-                head_dim: HEAD_DIM,
-                head_stride: HEAD_STRIDE,
-                position: POSITION,
-                rotary_dim: ROTARY_DIM,
-            },
-        )
-        .expect("QSA norm/RoPE");
-        let actual = gpu.download_f32(&values).expect("query/gate download");
-        let mut expected = input.clone();
-        for head in 0..HEADS {
-            let start = head * HEAD_STRIDE;
-            let inv = (input[start..start + HEAD_DIM]
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                / HEAD_DIM as f32
-                + 1.0e-6)
-                .sqrt()
-                .recip();
-            for channel in 0..HEAD_DIM {
-                expected[start + channel] = input[start + channel] * inv;
+        // Plain RoPE at a short position, and the Qwen3.8 README YaRN override
+        // (factor 4 over 262144) against the host HF reference, at a position
+        // where interpolated pairs and the cos/sin factor are both visible.
+        use crate::rope::{Rope, RopeScaling, Yarn};
+        let yarn = RopeScaling::Yarn(Yarn::new(4.0, 262_144, None, None, None, None));
+        for (scaling, position, tolerance) in [(RopeScaling::None, 11, 1.0e-4), (yarn, 4099, 2.0e-3)]
+        {
+            let rope = Rope { theta: 10_000_000.0, scaling };
+            let values = gpu
+                .upload_f32(&input, &[input.len()])
+                .expect("query/gate upload");
+            indexed_attention_norm_rope(
+                &mut gpu,
+                &IndexedAttentionNormRope {
+                    values: &values,
+                    norm: &norm,
+                    heads: HEADS,
+                    head_dim: HEAD_DIM,
+                    head_stride: HEAD_STRIDE,
+                    position,
+                    rotary_dim: ROTARY_DIM,
+                    yarn: rope.yarn(ROTARY_DIM),
+                },
+            )
+            .expect("QSA norm/RoPE");
+            let actual = gpu.download_f32(&values).expect("query/gate download");
+            gpu.free_tensor(values).expect("free query/gate");
+            let (inv_freq, mscale) = rope.inv_freq(ROTARY_DIM);
+            let mut expected = input.clone();
+            for head in 0..HEADS {
+                let start = head * HEAD_STRIDE;
+                let inv = (input[start..start + HEAD_DIM]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    / HEAD_DIM as f32
+                    + 1.0e-6)
+                    .sqrt()
+                    .recip();
+                for channel in 0..HEAD_DIM {
+                    expected[start + channel] = input[start + channel] * inv;
+                }
+                for channel in 0..ROTARY_DIM / 2 {
+                    let (sine, cosine) = (position as f64 * inv_freq[channel]).sin_cos();
+                    let (sine, cosine) = ((sine * mscale) as f32, (cosine * mscale) as f32);
+                    let first = input[start + channel] * inv;
+                    let second = input[start + ROTARY_DIM / 2 + channel] * inv;
+                    expected[start + channel] = first * cosine - second * sine;
+                    expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+                }
             }
-            for channel in 0..ROTARY_DIM / 2 {
-                let angle = POSITION as f32
-                    / 10_000_000.0f32.powf(2.0 * channel as f32 / ROTARY_DIM as f32);
-                let (sine, cosine) = angle.sin_cos();
-                let first = input[start + channel] * inv;
-                let second = input[start + ROTARY_DIM / 2 + channel] * inv;
-                expected[start + channel] = first * cosine - second * sine;
-                expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+            for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "QSA norm/RoPE {scaling:?} mismatch at {index}: got {got}, expected {want}"
+                );
             }
         }
-        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
-            assert!(
-                (got - want).abs() <= 1.0e-4,
-                "QSA norm/RoPE mismatch at {index}: got {got}, expected {want}"
-            );
-        }
-        gpu.free_tensor(values).expect("free query/gate");
         gpu.free_tensor(norm).expect("free norm");
     }
 
@@ -9963,6 +10324,7 @@ mod tests {
                     position,
                     rows,
                     format,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA prologue");
@@ -10267,6 +10629,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: block_count,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool");

@@ -27,7 +27,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MODEL: &str = "/home/kaden/fold-flash-next/models/qwen3.8-flash-next.mq4";
-const BDF: &str = "0000:bf:00.0";
 const POLL: Duration = Duration::from_millis(50);
 const CLEANUP_POLL: Duration = Duration::from_millis(20);
 
@@ -451,7 +450,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             .collect();
         let extra = [
             ("HOME", out.join("home").into_os_string()),
-            ("HIPFIRE_DEVICES", BDF.into()),
+            ("HIPFIRE_DEVICES", railgun::npu::fclk::igpu_pci().into()),
             ("ROCR_VISIBLE_DEVICES", "1".into()),
             ("HIPFIRE_LOCK_DIR", d.join("lockdir").into_os_string()),
             ("HIPFIRE_GRAPH", "1".into()),

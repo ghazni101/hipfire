@@ -190,7 +190,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "3f12e2b85e2ca4d5c265a538dbf9f26e64bd1efe62e3df7f916695c8f830659d",
+      "sha256": "4206f421af1a8bd2b331bb77952516e0689179d046896b9e381b7afe3b2b1ad9",
       "symbols": [
         "gated_delta_chunk_gate_wmma"
       ],
@@ -287,7 +287,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "4f8d0281b3ef56e159091f7261f05d4b5a40f1a14f845430a46806efba563b75",
+      "sha256": "98d58c8aaf5ce7efbc7fac58eedd80427a95187f59ceda9c580f7d7619110a52",
       "symbols": [
         "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
       ],
@@ -331,7 +331,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "37edcf445f9cca4b598aca475ee49f8565914c72f781aa8d7b15abf2aebd2b7e",
+      "sha256": "61f00e9594d7eb98b78b6d1f9a6f2b5e396e5ff1df356e13c72a395836d62240",
       "symbols": [
         "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
       ],
@@ -1953,7 +1953,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
+      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -2386,7 +2386,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "7a93b324ece49ab6503bd183c0b84a1d7e2a3f9877f40698ba065a6879a95edf",
+      "sha256": "3f99bfca12fef6bf392bfa9f4686f8300e4c0ebfcc44b2c2c1075b52b8608e2b",
       "symbols": [
         "dflash_gdn_pre_capture_gfx1100",
         "dflash_gdn_pre_replay_gfx1100"

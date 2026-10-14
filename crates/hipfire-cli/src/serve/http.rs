@@ -957,16 +957,14 @@ async fn handle_request(
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {
-            let (uptime, model) = {
+            let body = {
                 let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-                (meta.started.elapsed().as_secs(), meta.current_model.clone())
+                shared.metrics.render(
+                    &meta,
+                    shared.admission.inflight(),
+                    shared.admission.capacity(),
+                )
             };
-            let body = shared.metrics.render(
-                shared.admission.inflight(),
-                shared.admission.capacity(),
-                uptime,
-                model.as_deref(),
-            );
             let mut resp = Response::builder()
                 .status(200)
                 .header(
@@ -1094,6 +1092,7 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = embeddings_error_status(&message);
+                    // /v1/embeddings answers in the OpenAI error shape.
                     RequestFailure::new(message, status)
                         .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
@@ -1176,6 +1175,44 @@ async fn handle_request(
                         .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
             }
+        }
+        (Method::POST, "/v1/systemone") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+
+            // Same exclusive admission as non-batch chat: the single-daemon
+            // backend serialises decide against chat traffic. The
+            // CancellationToken lets a client disconnect while queued abort
+            // the wait promptly; once acquired, `guard` moves into
+            // `handle_decide`'s spawn_blocking and is held until the daemon
+            // call finishes, not merely until this future is dropped.
+            let mut cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.token();
+            let guard = match shared.admission.acquire_async(cancel.clone()).await {
+                Ok(g) => g,
+                Err(e) => {
+                    return admission_error_response(WireApi::ChatCompletions, &shared.metrics, &e)
+                }
+            };
+            let response = crate::serve::decide::handle_decide(shared, body_val, guard).await;
+            cancel_guard.disarm();
+            response
         }
         _ => openai_error("not found", 404),
     }
@@ -1310,9 +1347,9 @@ async fn handle_embeddings(
             ))
         }
     };
-    // One input per request (the daemon encodes serially; batching is a
-    // follow-up). A list of length 1 is accepted; anything else refuses
-    // rather than silently dropping inputs.
+    // One input per HTTP request; the multi-slot engine batches concurrent
+    // requests behind this endpoint. A list of length 1 is accepted; longer
+    // lists refuse rather than silently dropping inputs.
     let input = body
         .get("input")
         .ok_or_else(|| "input is required".to_string())?;
@@ -1334,37 +1371,40 @@ async fn handle_embeddings(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    // Admission class. On the standard route a non-streaming request takes the
-    // exclusive class — exactly one in flight, nothing sharing the GPU with it.
-    // A multi-slot backend exists to run several requests at once, and an
-    // embedding request is exactly the kind of work that shares the engine:
-    // taking the exclusive class there would serialize the batches the engine
-    // forms, one round trip per request, and leave every one of them a batch of
-    // one. So on a multi-slot serve the sharing class is the honest one.
-    let multi_slot = shared
-        .capabilities
-        .get("multi_slot")
-        .and_then(|v| v.as_bool())
-        == Some(true);
-    let admitted = if multi_slot {
-        shared
-            .admission
-            .acquire_for_async(true, None, CancellationToken::new())
-            .await
-    } else {
-        shared
-            .admission
-            .acquire_async(CancellationToken::new())
-            .await
+    // Exclusive admission serialized exactly the requests a multi-slot serve
+    // exists to batch; admit the sharing (batch-eligible) class whenever the
+    // serve advertises multi_slot, the same gate the chat route applies. The
+    // request names the resident model (enforced below), so the admission
+    // lease keys on it like a chat request's.
+    let is_eligible = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        runtime.multi_slot_enabled
     };
-    let _guard = match admitted {
-        Ok(guard) => guard,
-        Err(error) => {
-            return Ok(admission_error_response(
-                WireApi::ChatCompletions,
-                &shared.metrics,
-                &error,
-            ))
+    let _guard = if is_eligible {
+        match shared
+            .admission
+            .acquire_for_async(true, request_model.as_deref(), CancellationToken::new())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
+        }
+    } else {
+        match shared.admission.acquire_async(CancellationToken::new()).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
         }
     };
 
@@ -1376,7 +1416,10 @@ async fn handle_embeddings(
     // with "no model loaded" while chat (which always names a model) kept
     // working.
     let (engine, loaded_model) = {
-        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if runtime.current_path.is_none() {
             let name = request_model
                 .clone()
@@ -1514,6 +1557,7 @@ async fn handle_images_generations(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
 ) -> Result<Response<BoxBody>, String> {
+    let started = Instant::now();
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -1695,6 +1739,9 @@ async fn handle_images_generations(
         let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
         meta.requests_served += 1;
     }
+    shared
+        .metrics
+        .observe_request(started.elapsed().as_secs_f64() * 1000.0);
     let response = serde_json::json!({
         "created": unix_timestamp(),
         "model": model_echo,

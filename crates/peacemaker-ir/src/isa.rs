@@ -78,7 +78,9 @@ fn family(form: Form) -> Family {
         Form::Vop1 | Form::Vop1Dpp => Family::Vop1, Form::Vop2 | Form::Vop2Dpp => Family::Vop2, Form::Vopc => Family::Vopc,
         Form::Vop3 => Family::Vop3, Form::Vop3p => Family::Vop3p,
         Form::Vopd => Family::Vopd, Form::Vinterp => Family::Vinterp, Form::Ds => Family::Ds,
-        Form::Vmem(_) => Family::Vmem, Form::Export => Family::Export,
+        Form::Vmem(VmemForm::Global) => Family::VmemGlobal, Form::Vmem(VmemForm::Scratch) => Family::VmemScratch,
+        Form::Vmem(VmemForm::Flat) => Family::VmemFlat, Form::Vmem(VmemForm::Buffer) => Family::VmemBuffer,
+        Form::Vmem(VmemForm::Image) => Family::VmemImage, Form::Export => Family::Export,
     }
 }
 /// Tab-separated: `name form opcode grammar defs uses implicit counter sample words field-rules`.

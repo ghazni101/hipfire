@@ -334,7 +334,9 @@ available. v2 is the best point **at 136 B**.
 
 ## 6 · Measured throughput
 
-hipx + k9lin, interleaved sample-by-sample, device hipEvent timing, ≥32 warmups, 100 iters,
+Historical benchmark evidence, measured on the five architectures in the table below (gfx1201 /
+RX 9070, gfx1100 / RX 7900 XTX, gfx1151 / Radeon 8060S, gfx1010 / RX 5700 XT, gfx1030 / RX 6950 XT):
+interleaved sample-by-sample, device hipEvent timing, ≥32 warmups, 100 iters,
 3 runs. Ratio = v2 / v1; > 1 is slower. Each arch's **shipping default R** is the only row
 that matters, per `ArchCaps::gemv_rows_default()` =
 `if is_wave64_native || is_rdna2 || is_rdna3_dgpu { 1 } else { 2 }`.
@@ -525,8 +527,6 @@ files, where the launcher plumbing amortises.
 
 | artifact | what |
 |---|---|
-| `/home/kaden/v2k.hip` | early v2 port of `gemv_hfq4g256_multirow.hip`, entries `gemv_mq4v2_multirow_r{2,4,8}`; 0 leftover f32 header reads, 15 half-wave selects |
-| `/home/kaden/v2_single.hip` | early v2 port of `gemv_hfq4g256.hip` (single-row, R=1); 7 header pairs; **`HIPFIRE_HFQ4G256_XBATCH_KERNEL` excluded, not ported** |
 | `tools/quant-design/` | GPU codec sweep harness (14 configs in 2.9 s) |
 | `crates/hipfire-quantize/examples/mq_composable_bench.rs` | quality metrics per variant, self-checked to 0.11% |
 | `crates/rdna-compute/examples/bench_gemv_paired_throughput.rs` | paired device-side GEMV throughput |

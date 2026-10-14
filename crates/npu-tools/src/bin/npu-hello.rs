@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-hello: milestone 1 of railgun::npu / PM-npu.
+//! npu-hello: milestone 1 of railgun::npu / peacemaker-npu.
 //!
 //! Compute tile (col 0, row 2) runs a hand-encoded AIE2P program: write N words
 //! `BASE + i` into its data memory, release lock 0, `done`. Its MM2S0 DMA (BD0 waits on lock 0)
@@ -10,7 +10,7 @@
 //! submission is raw amdxdna ioctls via railgun::npu.
 //!
 //! usage: npu-hello query | dump <dir> | run [--repeat K]
-use pm_npu::{cdo::Cdo, dma, isa::*, pdi, regs, regs::tile, txn::Txn};
+use peacemaker_npu::{cdo::Cdo, dma, isa::*, pdi, regs, regs::tile, txn::Txn};
 use railgun::npu::{Device, HwCtx, ERT_STATE_COMPLETED};
 
 const N: u32 = 64;

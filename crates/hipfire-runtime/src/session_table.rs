@@ -423,6 +423,7 @@ mod tests {
             ModelFootprint {
                 weights_bytes: GIB,
                 kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
             },
             32 * GIB,
         );
@@ -769,12 +770,17 @@ mod tests {
     }
 
     /// Budget that fits the weights plus exactly `n` sessions of `ctx`.
-    fn rig_budget(n_slots: usize, ctx: usize, n: u64) -> (SlotPool, AdmissionController, SessionTable) {
+    fn rig_budget(
+        n_slots: usize,
+        ctx: usize,
+        n: u64,
+    ) -> (SlotPool, AdmissionController, SessionTable) {
         let pool = SlotPool::new(n_slots, 4096, PPB).unwrap();
         let adm = AdmissionController::new(
             ModelFootprint {
                 weights_bytes: GIB,
                 kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
             },
             GIB + n * ctx as u64 * 1024 + 1,
         );

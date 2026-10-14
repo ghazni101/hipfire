@@ -1744,6 +1744,9 @@ pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
     arch.is_some_and(saddle_core::caps::arch_replays_history_reasoning)
 }
 
+/// Largest `max_tokens` a chat request may ask for.
+pub(crate) const MAX_TOKENS_CEILING: u64 = 393_216;
+
 /// Project the HTTP body into the typed request contract. `multi_slot` is the
 /// route: the multi-slot engine adds its field refusals and sampling-range
 /// checks and honors `response_format` (json_schema); the standard route
@@ -1762,7 +1765,7 @@ pub(crate) fn project_request_contract(
         Some(max_tokens) => max_tokens,
         None => config_u64(resolved, "generation.max_tokens")?,
     };
-    if max_tokens == 0 || max_tokens > 393_216 {
+    if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
         bail_invalid!("max_tokens must be between 1 and 393216");
     }
     validate_single_choice(body)?;
@@ -2227,8 +2230,14 @@ pub(crate) fn complete_request_attempt(
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
+        // A reasoning token is a generated token. Counting only `token` made
+        // TTFT on a thinking model the time to the first answer token, and TPOT
+        // would spread only the answer span over all of `done.tokens`.
         if first_token_at.get().is_none()
-            && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            && matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("token" | "reasoning")
+            )
         {
             first_token_at.set(Some(attempt_started.elapsed()));
         }
@@ -2711,8 +2720,8 @@ pub(crate) fn complete_request_attempt(
     // Same payload the gateway already had; previously only `tok_s` survived, as a
     // scalar overwritten by the next request. Distributions are what make a stall
     // visible.
-    shared.metrics.observe_done(&done);
-    shared.metrics.observe_timing(
+    shared.metrics.observe_done(
+        &done,
         first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
         attempt_started.elapsed().as_secs_f64() * 1000.0,
     );
@@ -4348,8 +4357,9 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_default["reasoning_effort"], "xhigh");
-        assert_eq!(res_default.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(qwen_default["reasoning_effort"], "medium");
+        assert_eq!(res_default.effective_effort.as_deref(), Some("medium"));
+        assert!(res_default.warnings.is_empty());
         let mut qwen_capped = serde_json::json!({});
         let res_capped = apply_http_reasoning_request(
             &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
@@ -4629,10 +4639,10 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_unknown["reasoning_effort"], "xhigh");
+        assert_eq!(qwen_unknown["reasoning_effort"], "medium");
         assert_eq!(
             qwen_unknown_resolution.effective_effort.as_deref(),
-            Some("xhigh")
+            Some("medium")
         );
         assert!(!qwen_unknown_resolution.warnings.is_empty());
         assert!(apply_http_reasoning_request(
@@ -4673,7 +4683,7 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
+        assert_eq!(qwen_high["reasoning_effort"], "medium");
         assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),
@@ -4697,7 +4707,7 @@ mod tests {
         let json = completion_json(&completion);
         assert_eq!(json["hipfire"]["reasoning"]["contract"], "qwen_jinja");
         assert_eq!(json["hipfire"]["reasoning"]["mode"], "enabled");
-        assert_eq!(json["hipfire"]["reasoning"]["effort"], "xhigh");
+        assert_eq!(json["hipfire"]["reasoning"]["effort"], "medium");
         assert_eq!(
             json["hipfire"]["config_warnings"],
             serde_json::json!(res_default.warnings)
@@ -4709,6 +4719,239 @@ mod tests {
             terminal["hipfire"]["config_warnings"],
             serde_json::json!(res_default.warnings)
         );
+    }
+
+    fn qwen_effort_resolved(
+        layers: Vec<(hipfire_config::ConfigSource, &str)>,
+    ) -> hipfire_config::ResolvedConfig {
+        use hipfire_config::{resolve, ConfigLayer, NamedLayer};
+        resolve(
+            layers
+                .into_iter()
+                .map(|(source, effort)| {
+                    let mut layer = ConfigLayer::default();
+                    layer.set_cli("reasoning.effort", effort).unwrap();
+                    NamedLayer { source, layer }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn qwen_effort_request(
+        body: serde_json::Value,
+        resolved: &hipfire_config::ResolvedConfig,
+    ) -> (serde_json::Value, crate::ReasoningResolution) {
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut request = serde_json::json!({});
+        let resolution = apply_http_reasoning_request(
+            &body,
+            resolved,
+            &mut request,
+            saddle_core::caps::ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        (request, resolution)
+    }
+
+    #[test]
+    fn qwen_effort_native_default_and_auto_resolve_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (unset, unset_res) = qwen_effort_request(serde_json::json!({}), &builtin);
+        assert_eq!(unset["reasoning_effort"], "medium");
+        assert_eq!(unset_res.effective_effort.as_deref(), Some("medium"));
+        assert!(unset_res.warnings.is_empty());
+        // Request-level `auto` and config-level `auto` are both "no preference".
+        let (auto_body, auto_body_res) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &builtin);
+        assert_eq!(auto_body["reasoning_effort"], "medium");
+        assert_eq!(auto_body_res.effective_effort.as_deref(), Some("medium"));
+        let auto_cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "auto",
+        )]);
+        let (auto_config, auto_config_res) = qwen_effort_request(serde_json::json!({}), &auto_cfg);
+        assert_eq!(auto_config["reasoning_effort"], "medium");
+        assert_eq!(auto_config_res.effective_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn qwen_effort_resolution_order_config_cli_request() {
+        use hipfire_config::ConfigSource;
+        let global = || ConfigSource::GlobalUser {
+            path: std::path::PathBuf::from("config.toml"),
+        };
+        let one_shot = || ConfigSource::OneShot {
+            argument: "--set reasoning.effort".into(),
+        };
+        // Explicit config wins over the built-in medium default.
+        for effort in ["low", "xhigh"] {
+            let cfg = qwen_effort_resolved(vec![(global(), effort)]);
+            let (req, res) = qwen_effort_request(serde_json::json!({}), &cfg);
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert!(res.warnings.is_empty());
+        }
+        // An explicit medium config is also honoured (not just the default).
+        let medium_cfg = qwen_effort_resolved(vec![(global(), "medium")]);
+        let (req_medium, _) = qwen_effort_request(serde_json::json!({}), &medium_cfg);
+        assert_eq!(req_medium["reasoning_effort"], "medium");
+        // One-shot CLI layer beats the global user config.
+        let layered = qwen_effort_resolved(vec![(global(), "low"), (one_shot(), "xhigh")]);
+        let (req_cli, res_cli) = qwen_effort_request(serde_json::json!({}), &layered);
+        assert_eq!(req_cli["reasoning_effort"], "xhigh");
+        assert_eq!(res_cli.effective_effort.as_deref(), Some("xhigh"));
+        // HTTP request beats the resolved config / CLI layer.
+        let (req_body, res_body) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "low" }), &layered);
+        assert_eq!(req_body["reasoning_effort"], "low");
+        assert_eq!(res_body.effective_effort.as_deref(), Some("low"));
+        // Request `auto` is no preference; the explicit config / CLI layer wins.
+        let (req_auto, _) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &layered);
+        assert_eq!(req_auto["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn qwen_effort_thinking_off_and_non_native_drop_effort() {
+        use hipfire_config::{resolve, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (off, off_res) = qwen_effort_request(
+            serde_json::json!({ "enable_thinking": false }),
+            &builtin,
+        );
+        assert!(off.get("reasoning_effort").is_none());
+        assert_eq!(off["thinking_enabled"], false);
+        assert_eq!(off_res.effective_mode, "disabled");
+        assert_eq!(off_res.effective_effort, None);
+        let cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "xhigh",
+        )]);
+        let (off_cfg, off_cfg_res) = qwen_effort_request(
+            serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low" }),
+            &cfg,
+        );
+        assert!(off_cfg.get("reasoning_effort").is_none());
+        assert_eq!(off_cfg_res.effective_effort, None);
+        // Non-effort-native Qwen keeps dropping the dial instead of defaulting it.
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &builtin,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert_eq!(res36.effective_effort, None);
+        assert!(res36.warnings.is_empty());
+        // Other contracts keep their own `high` default.
+        for contract in [
+            ReasoningContract::DeepSeek4,
+            ReasoningContract::MuseGlimmer,
+        ] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({}),
+                &builtin,
+                &mut req,
+                contract,
+                true,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], "high");
+            assert_eq!(res.effective_effort.as_deref(), Some("high"));
+        }
+    }
+
+    /// Raw-template layer stays `xhigh` when the variable is undefined; the
+    /// CLI resolver supplies a concrete `medium`, which must render exactly like
+    /// an explicit `reasoning_effort: "medium"` request and differently from
+    /// the raw (undefined) xhigh default.
+    #[test]
+    fn qwen_effort_resolved_medium_renders_like_explicit_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
+        use hipfire_runtime::tokenizer::Tokenizer;
+        const TEMPLATE: &str = "\
+{%- set instructions = '' -%}\
+{%- if enable_thinking is undefined or enable_thinking is true -%}\
+{%- set resolved = reasoning_effort|default('xhigh') -%}\
+{%- if resolved not in ('xhigh', 'medium', 'low') -%}\
+{{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '.') -}}\
+{%- endif -%}\
+{%- set instructions = resolved|upper -%}\
+{%- endif -%}\
+{%- if instructions %}[I:{{ instructions }}]{%- endif -%}\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
+{%- endif -%}";
+        let tokenizer = Tokenizer::from_hf_json(
+            r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#,
+        )
+        .unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        // Mirrors the slot route: the resolved request carries the concrete
+        // rung; the frame receives it verbatim when thinking is enabled.
+        let render = |request: &serde_json::Value| {
+            let enabled = request["thinking_enabled"].as_bool().unwrap();
+            JinjaChatFrame {
+                tokenizer: &tokenizer,
+                template: TEMPLATE,
+                system: None,
+                user: "",
+                enable_thinking: enabled,
+                bos_token: Some(""),
+                reasoning_strength: None,
+                reasoning_effort: request
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+            }
+            .render_messages(&messages, None, None)
+            .unwrap()
+        };
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (default_req, _) = qwen_effort_request(serde_json::json!({}), &builtin);
+        let (explicit_req, _) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "medium" }), &builtin);
+        assert_eq!(default_req["reasoning_effort"], "medium");
+        let default_render = render(&default_req);
+        assert_eq!(default_render, render(&explicit_req));
+        assert!(default_render.contains("[I:MEDIUM]"));
+        // Raw template default (effort undefined) is untouched: xhigh.
+        let raw_render = render(&serde_json::json!({ "thinking_enabled": true }));
+        assert!(raw_render.contains("[I:XHIGH]"));
+        assert_ne!(default_render, raw_render);
+        // Thinking off: effort omitted, closed think block, no instructions.
+        let (off_req, _) = qwen_effort_request(
+            serde_json::json!({ "enable_thinking": false }),
+            &builtin,
+        );
+        let off_render = render(&off_req);
+        assert!(!off_render.contains("[I:"));
+        assert!(off_render.ends_with("<think>\n\n</think>\n\n"));
     }
 
     #[test]

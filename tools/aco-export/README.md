@@ -82,7 +82,7 @@ After the producer/reference steps, build `pm-raw-census`, `aco_hsa_emit` (featu
 `pm_aco_oracle` (feature `lab`) with GPUs hidden and `-j 12`:
 
 ```sh
-ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p hipfire-isa --features toolchain --example aco_hsa_emit
+ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p peacemaker-isa --features toolchain --example aco_hsa_emit
 ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 cargo build --release --offline -j 12 --manifest-path $W/Cargo.toml -p rdna-compute --features lab --example pm_aco_oracle
 ```
 

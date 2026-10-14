@@ -86,7 +86,7 @@
 //!
 //! Run (EVERY GPU command flock-wrapped):
 //! ```sh
-//! HIPFIRE_QWEN35_FIXTURE=$HOME/.hipfire/models/qwen3.8-27b.mq4-xt \
+//! HIPFIRE_QWEN35_FIXTURE=$HOME/.hipfire/models/qwen3.8-27b.mq4-xts \
 //! HIPFIRE_ORNITH_FIXTURE=$HOME/.hipfire/models/ornith-1.5-35b-a3b.mq4r \
 //! HIPFIRE_HAVE_2_GPU=1 HIP_VISIBLE_DEVICES=0,1,2,3 \
 //! flock -w 3600 /tmp/hipfire-gpu.lock \
@@ -121,8 +121,9 @@ const N_DECODE: usize = 12;
 const TIER: &str = "fwht3";
 const STATE_QUANT: &str = "q8";
 const PROMPT: &str = "Write a one-sentence greeting.";
-const DENSE_SIZE: u64 = 14_980_361_216;
-const DENSE_SHA256: &str = "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7";
+// Canonical `qwen3.8:27b-mq4-xts` (registry/v1.json).
+const DENSE_SIZE: u64 = 14_987_185_152;
+const DENSE_SHA256: &str = "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae";
 const MOE_SIZE: u64 = 18_700_570_368;
 const MOE_SHA256: &str = "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6";
 // Absolute logit bounds for the bounded dense relationships. Set from measured
@@ -162,7 +163,7 @@ fn emulated_single_gfx1151_ep4(gpus: &Gpus) -> bool {
 fn dense_fixture() -> String {
     std::env::var("HIPFIRE_QWEN35_FIXTURE").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.hipfire/models/qwen3.8-27b.mq4-xt")
+        format!("{home}/.hipfire/models/qwen3.8-27b.mq4-xts")
     })
 }
 

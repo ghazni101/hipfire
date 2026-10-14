@@ -5,7 +5,7 @@
 
 ## Purpose
 
-Facade for dense LLaMA / Mistral / plain Qwen3 (`arch_id` 0 dense LLaMA, 1 Mistral/plain-Qwen3). Implements the `Architecture` bring-up triple and re-exports the canonical forward path `hipfire_runtime::llama` (shared transformer infrastructure — `KvCache`, `WeightTensor`, GEMV helpers, dequantisers, sampler) under [`src/llama`](src/llama.rs) so call sites can use the arch-named import consistently. The rationale is the `//!` docs in [`src/lib.rs`](src/lib.rs) — the body stays in runtime as `hipfire-arch-qwen35` depends on it for its plain-LLaMA drafter branch.
+Facade for dense LLaMA / Mistral / plain Qwen3 (`arch_id` 0 dense LLaMA, 1 Mistral/plain-Qwen3). Implements the `Architecture` bring-up triple and re-exports the canonical forward path `hipfire_runtime::llama` (shared transformer infrastructure — `KvCache`, `WeightTensor`, GEMV helpers, dequantisers, sampler) under [`src/lib.rs`](src/lib.rs) so call sites can use the arch-named import consistently. The rationale is the `//!` docs in [`src/lib.rs`](src/lib.rs) — the body stays in runtime as `hipfire-arch-qwen35` depends on it for its plain-LLaMA drafter branch.
 
 ## Gotchas
 

@@ -5,7 +5,7 @@
 //!
 //! Shape: `down` 8192 tokens x 5120 features x K 17408 with the ADD epilogue `x = RN(x + Y)`. The NPU owns the leading
 //! feature window `[0, n)` (fixed column map, part of numeric identity) and runs the measured-exact IEF15 N0 kernel
-//! (`pm_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3); the GPU owns `[n, 5120)` on the incumbent route, the
+//! (`peacemaker_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3); the GPU owns `[n, 5120)` on the incumbent route, the
 //! certified PM V2B ADD entry `gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151` (bytes vendored from hipfire wt-land-041m,
 //! `native/*.hxaco`), launched on the window by pointer offset (`A + n*row_bytes`, `Y + n*4`), the true row stride
 //! `M = 5120` and a row-tile grid of `(5120 - n)/256` tiles (`M` is only the Y stride in that kernel). Output columns of
@@ -36,9 +36,9 @@ mod parts;
 
 use npu_tools::coop_gpu;
 use railgun::npu::hip_runtime::{HipBuffer, HipEvent, HipFunction, HipModule, HipRuntime, HostRegistration};
-use pm_npu::kernels::gemm_core::Control;
-use pm_npu::kernels::iu4::{Acts, Weights};
-use pm_npu::kernels::iu4_ief15::{self, Ief15Gemm};
+use peacemaker_npu::kernels::gemm_core::Control;
+use peacemaker_npu::kernels::iu4::{Acts, Weights};
+use peacemaker_npu::kernels::iu4_ief15::{self, Ief15Gemm};
 use railgun::npu::{clflush, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::Instant;
 

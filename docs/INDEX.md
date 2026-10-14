@@ -5,10 +5,11 @@ Domain prose lives in the linked owners; this file does not duplicate it.
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-09-07 |
+| Inventory date | 2026-09-07 (rows not named in the entry re-audit below) |
 | Working branch | `beta` |
-| Audited source ref | `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb` |
+| Audited source ref | `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb` (rows not named in the entry re-audit below) |
 | Comparison base | `origin/beta` @ `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb` |
+| Entry re-audit (2026-10-13) | `GETTING_STARTED.md` (install, quickstart and tag claims) and this file's file-presence coverage of `docs/`, checked against `origin/beta` @ `c7a732ad5b921706519cdba30fdb43a7e62aa2d4` (0.4.2 line). Row states for the 0.4.2 Flash-Next route defaults and for the pages and collections added in that pass are new; every other row state was not re-audited. |
 | Integrated commit / tree / source hashes | Supplied externally by Git/CI after cutover. Never self-referenced here. |
 
 ## Truth states
@@ -67,7 +68,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Docs navigation, lifecycle labels, ownership map | [`docs/INDEX.md`](INDEX.md) | shipped / ref-pinned | This file. |
 | Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Sole route selector. |
 | Machine admission registry | [`docs/admissions.yml`](admissions.yml) | shipped / ref-pinned | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). |
-| Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
+| Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Install, first run, uninstall; points at the 0.4.2 beta Flash-Next sections without owning their facts. |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
 | Copyable TOML config profiles | [`docs/configs/`](configs/README.md) | shipped / ref-pinned | User, developer, and retained-PM4 examples. |
@@ -93,8 +94,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Golden Redline fixture reproduction and client setup | [`docs/GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed measured fixtures; does not create admission. |
 | Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | shipped / ref-pinned | Must not fork policy from `REDLINE.md`. |
 | Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
-| Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Inventory snapshot; verify in source before product claims. |
-| Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated fixture/tables report. |
+| Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. Capability is not admission or a performance floor; verify in source before product claims. |
+| Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 fixture/tables report; not current validation. |
 | Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
 | Dependency adoption log | [`docs/dependency-adoption-log.md`](dependency-adoption-log.md) | historical | |
@@ -109,11 +110,18 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Design-time architecture drafts | [`docs/design/`](design/) | planned | Directory policy is planned intent. Member exceptions: some branch-implemented LFM/Redline designs and measured baseline notes may coexist; none are product defaults. Historical member bodies stay disposition-only. |
 | Implementation plans and PRDs | [`docs/plans/`](plans/) | planned | Directory policy is planned intent. Member exceptions: measured results ledgers may appear; recency ≠ authority. |
 | Narrow specs | [`docs/specs/`](specs/) | planned | Intent/spec records; promote only via shipped owners. |
-| Shared-prefix serving integration | [`docs/specs/2026-09-05-serving-cache-scheduler-spec.md`](specs/2026-09-05-serving-cache-scheduler-spec.md) | planned | vLLM/SGLang-inspired paged ownership, hybrid-state reuse, fair scheduling and structured generation; extends the multi-slot spec, not a runtime admission. |
+| Shared-prefix serving integration | [`docs/specs/2026-09-05-serving-cache-scheduler-spec.md`](specs/2026-09-05-serving-cache-scheduler-spec.md) | planned | Paged ownership, hybrid-state reuse, fair scheduling and structured generation; extends the multi-slot spec, not a runtime admission. |
 | Investigations | [`docs/investigations/`](investigations/) | historical | Discovery trails including measured research; not product defaults. |
 | Reviews | [`docs/reviews/`](reviews/) | historical | Review archives. |
 | Lessons learned | [`docs/lessons_learned/`](lessons_learned/) | historical | Postmortems. |
 | Superpowers nested plans/specs | [`docs/superpowers/`](superpowers/) | planned | Nested plans/specs only. Not an executable skill root. |
+| Flash-Next 0.4.2 route defaults (YaRN `attention.yarn_factor`, Strix Halo NPU trunk `fusions.npu_trunk`, EP2 owner-routed prefill and expert staging) | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Present on the audited beta ref, not in the tagged v0.4.1. EP2 setup and gates: [`multi-gpu.md`](multi-gpu.md); variable semantics: [`env-vars.md`](env-vars.md). EP4 owner-routed prefill is refused. Defaults are not admissions. |
+| Named subsystems and attribution pointers | [`docs/GLOSSARY.md`](GLOSSARY.md) | shipped / ref-pinned | Origination records live in `PRIOR-ART.md`, `NOTICE`, `CREDITS.md`, not here. |
+| Per-crate maps (`crates/<name>/map.md`) | [`docs/crate-maps.md`](crate-maps.md) | shipped / ref-pinned | Convention and generator markers; checked by `scripts/check-crate-maps.py`. |
+| VL quantization design specs | [`docs/qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md), [`docs/lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) | historical | Design specs retained for provenance; not current procedure or product authority. |
+| Historical GEMMA4 E-series validation records | [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md), [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md), [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md) | historical | Dated provenance records; not current policy, default, or admission. Current env and config semantics stay in [`env-vars.md`](env-vars.md) and [`CONFIG.md`](CONFIG.md). |
+| Unclassified top-level pages: [`SCS-SUITE.md`](SCS-SUITE.md), [`jit-g0-inventory.md`](jit-g0-inventory.md) | — | **unknown** | Listed for discovery only; not audited. Treat none as authority, floor, default or admission. |
+| Unclassified collections: [`npu/`](npu/README.md), [`pm-union/`](pm-union/OWNERS.md) | — | **unknown** | Listed for discovery only; not audited. The product NPU trunk route is a `CONFIG.md` concern (`fusions.npu_trunk`), not defined by `npu/`. |
 | Universal replacement gate for all GPU changes | — | **BLOCKED** | No universal gate. Route per [`VALIDATION.md`](VALIDATION.md). |
 | Inferred model/route admissions without registry rows | — | **BLOCKED** | [`admissions.yml`](admissions.yml) schema v2 forbids inferred/wildcard rows; only the exact earned record is admitted. |
 | Stitching manual Redline capture to product timed-arm proof | — | **BLOCKED** | See `REDLINE.md` certification ladder; fail closed. |
@@ -146,12 +154,21 @@ Every current top-level page, exactly once.
 | [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
 | [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
-| [`speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Speculation inventory snapshot. |
-| [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated durability fixture/tables. |
+| [`speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. |
+| [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 durability fixture/tables report. |
 | [`dependency-adoption-log.md`](dependency-adoption-log.md) | historical | Dependency log. |
 | [`upstream-merge-journal.md`](upstream-merge-journal.md) | historical | Merge journal. |
 | [`deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | PR body archive. |
 | [`multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | Bring-up narrative. |
+| [`GLOSSARY.md`](GLOSSARY.md) | shipped / ref-pinned | Named subsystems. |
+| [`crate-maps.md`](crate-maps.md) | shipped / ref-pinned | Crate-map convention. |
+| [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md) | historical | Dated gfx1100 prefill validation record. |
+| [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md) | historical | Dated gfx1201 validation record. |
+| [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md) | historical | Dated logit-stability record. |
+| [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md) | historical | Qwen3.5-VL design spec. |
+| [`lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) | historical | LFM2.5-VL design spec. |
+| [`SCS-SUITE.md`](SCS-SUITE.md) | unknown | Not classified. |
+| [`jit-g0-inventory.md`](jit-g0-inventory.md) | unknown | Not classified. |
 
 ## Collection classification
 
@@ -172,10 +189,15 @@ Every current top-level collection, exactly once. Directory policy applies to me
 | [`rental/`](rental/) | historical | Rental runbooks. |
 | [`governance/`](governance/) | historical | Legal/governance records; bodies stay untouched. |
 | [`superpowers/`](superpowers/) | planned | Nested plans/specs only; not an executable skill root. |
+| [`configs/`](configs/README.md) | shipped / ref-pinned | Copyable TOML profiles; `configs/README.md` owns usage. |
+| [`npu/`](npu/README.md) | unknown | Not classified; not an owner of the product NPU trunk route. |
+| [`pm-union/`](pm-union/OWNERS.md) | unknown | Not classified. |
+| [`assets/`](assets/readme/) | shipped / ref-pinned | Static README figures; embedded measurements carry no admission. |
 
 ## Audit scope
 
-- **Audited ref** (`20ba9ee3e33bddfa443ef1e5ba0c989de629fedb`): beta behavior pin used for this inventory refresh.
+- **Audited ref** (`20ba9ee3e33bddfa443ef1e5ba0c989de629fedb`): beta behavior pin for the inventory rows not named in the entry re-audit.
+- **Entry re-audit ref** (`c7a732ad5b921706519cdba30fdb43a7e62aa2d4`, 2026-10-13): covers `GETTING_STARTED.md` claims and file presence of every top-level `docs/` page and collection. It is not a re-audit of every row state in this index.
 - **Comparison base** (`origin/beta` @ `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb`): use when separating branch-only work from current beta facts.
 - Branch-implemented surfaces must not be phrased as beta product facts.
 - Historical, legal, and measured checkpoint bodies are not rewritten by this index.

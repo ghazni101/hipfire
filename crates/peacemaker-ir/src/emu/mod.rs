@@ -9,6 +9,9 @@ mod memory;
 pub mod convert;
 pub mod trans;
 pub mod mma;
+#[cfg(test)] mod swmmac_fixtures;
+mod dot;
+mod wide;
 mod wmma;
 use crate::{inst::{Abi, Wave}, operand::{Half, ImmField, InlineConst, Operand, Special}, reg::Kind, Arch, Inst, Kernel, Program};
 
@@ -42,6 +45,9 @@ impl Memory {
     pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<()> { let (i,o)=self.locate(addr,bytes.len())?; let r=&mut self.regions[i]; r.bytes[o..o+bytes.len()].copy_from_slice(bytes); r.written.mark(o,bytes.len()); Ok(()) }
 }
 
+/// How a 32-bit literal extends into a 64-bit source.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+enum Wide { Unsigned, Signed, Float }
 pub struct Launch { pub kernarg_ptr: u64, pub workgroup: [u32;3], pub block: [u32;3], pub dynamic_lds: u32 }
 struct State { s: [u32;106], t: [u32;16], v: Box<[[u32;32];256]>, exec: u32, vcc: u32, scc: bool, m0: u32, pc: usize, ended: bool, barrier: Option<u64>, signals: u64 }
 impl State {
@@ -97,6 +103,27 @@ impl State {
         })
     }
     fn read64(&self,op:&Operand,lane:usize)->Result<u64> {Ok(u64::from(self.read(op,lane,0)?)|u64::from(self.read(op,lane,1)?)<<32)}
+    /// 64-bit source of a 64-bit vector/scalar operation. `Reg` is a register pair, a wave32 `vcc`/`exec` pair has a
+    /// zero upper half, inline integers sign-extend, and a 32-bit literal is zero-extended (`Unsigned`), sign-extended
+    /// (`Signed`) or the most-significant half of a double (`Float`), as the RDNA ISA literal rules state.
+    fn read_wide(&self,op:&Operand,lane:usize,kind:Wide)->Result<u64> {
+        Ok(match op {
+            Operand::Reg(r) if r.len>=2 => self.read64(op,lane)?,
+            Operand::Reg(_)=>return Err(format!("64-bit operand needs a register pair, got {op}")),
+            Operand::Special(Special::Vcc|Special::Exec|Special::Null)=>u64::from(self.read(op,lane,0)?),
+            Operand::Inline(InlineConst::Integer(n))=>i64::from(*n) as u64,
+            Operand::Inline(InlineConst::FloatBits(b)) if kind==Wide::Float=>f64::from(f32::from_bits(*b)).to_bits(),
+            Operand::Inline(InlineConst::InvTwoPi) if kind==Wide::Float=>0x3fc4_5f30_6dc9_c882,
+            Operand::Literal(n)=>match kind {Wide::Unsigned=>u64::from(*n),Wide::Signed=>i64::from(*n as i32) as u64,Wide::Float=>u64::from(*n)<<32},
+            _=>return Err(format!("unsupported 64-bit {kind:?} operand {op}")),
+        })
+    }
+    fn put_wide(&mut self,op:&Operand,lane:usize,value:u64)->Result<()> {
+        match op {
+            Operand::Reg(r) if r.len>=2=>{self.put(op,lane,0,value as u32)?;self.put(op,lane,1,(value>>32) as u32)},
+            _=>Err(format!("64-bit destination needs a register pair, got {op}")),
+        }
+    }
     fn put(&mut self,op:&Operand,lane:usize,word:usize,value:u32)->Result<()> {
         match op {Operand::Reg(r)=>{let n=usize::from(r.base)+word;match r.kind {Kind::S=>self.s[n]=value,Kind::V=>self.v[n][lane]=value,Kind::Ttmp=>self.t[n]=value}},
             Operand::Half(r,h)=>{let old=self.read(&Operand::Reg(*r),lane,0)?;let shift=if *h==Half::Hi {16}else{0};self.put(&Operand::Reg(*r),lane,0,(old&!(0xffff<<shift))|((value&0xffff)<<shift))?;},

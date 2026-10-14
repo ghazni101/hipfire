@@ -3,7 +3,7 @@
   "symbol": "gemv_mq4g256v2_xbatch_pm",
   "module": "gemv_hfq4g256_xbatch_mq4v2",
   "abi": "gemv_mq4g256v2_xbatch: A,x,y ptr @0/8/16, M,K,B i32 @24/28/32 (36 B); grid M, block 32; B 1..8; workgroup w owns rows 4w..4w+3",
-  "source": "crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_xbatch_mq4v2.rs",
+  "source": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_xbatch_mq4v2.rs",
   "source_commit": "2b9fe2e0b8",
   "registration_commit": "91cd556e73",
   "objects": {

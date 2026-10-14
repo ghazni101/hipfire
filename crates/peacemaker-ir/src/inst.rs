@@ -19,7 +19,9 @@ pub enum Wave { Wave32, Wave64 }
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SymbolId(pub String);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum Family { Sop1, Sop2, Sopc, Sopk, Sopp, Smem, Vop1, Vop2, Vopc, Vop3, Vop3p, Vopd, Vinterp, Ds, Vmem, Export }
+/// One family per VMEM segment: BUFFER/GLOBAL/SCRATCH/FLAT reuse opcode ids with different mnemonics,
+/// so the segment is part of an opcode's identity (`Opcode::name` is form-blind).
+pub enum Family { Sop1, Sop2, Sopc, Sopk, Sopp, Smem, Vop1, Vop2, Vopc, Vop3, Vop3p, Vopd, Vinterp, Ds, VmemGlobal, VmemScratch, VmemFlat, VmemBuffer, VmemImage, Export }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Opcode { pub family: Family, pub id: u16 }
 impl Opcode {

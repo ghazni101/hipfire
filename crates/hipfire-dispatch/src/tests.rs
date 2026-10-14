@@ -2642,36 +2642,7 @@ fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
 /// (or double-rotate them) — the silent-garbage failure mode, not an error.
 #[test]
 fn cpu_quant_rotation_agrees_with_plan() {
-    for dtype in [
-        DType::MQ4G256,
-        DType::MQ4G256V2,
-        DType::MQ4CG256,
-        DType::MQ6G256,
-        DType::MQ6G256V2,
-        DType::MQ5G256,
-        DType::MQ5G256V2,
-        DType::MQ3G256,
-        DType::MQ3G256V2,
-        DType::MQ3G256Lloyd,
-        DType::MQ2G256,
-        DType::MQ2G256V2,
-        DType::MQ2G256Lloyd,
-        DType::MQ2G256LloydU,
-        DType::MQ4G256Lloyd,
-        DType::HFQ6G256,
-        DType::HFQ4G256,
-        DType::HFQ4G128,
-        DType::HFQ3G256,
-        DType::HFQ3G128,
-        DType::HFQ2G256,
-        DType::HFQ2G128,
-        DType::TQ2G128,
-        DType::BQ1G128,
-        DType::Q8_0,
-        DType::F16,
-        DType::F32,
-        DType::BF16,
-    ] {
+    for &dtype in crate::CPU_EXECUTED_DTYPES {
         let q = crate::cpu_quant_for(dtype)
             .unwrap_or_else(|| panic!("{dtype:?} has a CPU decoder and must be in cpu_quant_for"));
         assert_eq!(
@@ -2688,6 +2659,14 @@ fn cpu_quant_rotation_agrees_with_plan() {
 /// stays on the GPU over PCIe.
 #[test]
 fn cpu_quant_refuses_unimplemented_formats() {
+    // The constant declares exactly what `cpu_quant_for` executes: every entry
+    // must map to `Some`, so the declaration cannot drift from the table.
+    for &dtype in crate::CPU_EXECUTED_DTYPES {
+        assert!(
+            crate::cpu_quant_for(dtype).is_some(),
+            "{dtype:?} is declared CPU-executed but has no decoder in cpu_quant_for"
+        );
+    }
     for dtype in [
         DType::MQ8G256, // RotationPlan::Mq8Internal: int8 activation, not FWHT-f32
         DType::MQ4G128, // RotationPlan::FwhtG128: a different transform
@@ -2695,13 +2674,16 @@ fn cpu_quant_refuses_unimplemented_formats() {
         DType::MFP4G32,
         DType::MFP4G32Lloyd,
         DType::MFP4G32P,
-        DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
         DType::ParoQ4G128, // Givens rotation on the activation
         DType::Q4K,        // no dense HFQ artifact uses it
         DType::Q8HFQ,      // padded rows (row_stride), not expressible in the group model
         DType::Raw,
     ] {
+        assert!(
+            !crate::CPU_EXECUTED_DTYPES.contains(&dtype),
+            "{dtype:?} is refused and must not be declared CPU-executed"
+        );
         assert!(
             crate::cpu_quant_for(dtype).is_none(),
             "{dtype:?} must not be CPU-executed until its decode is transcribed"

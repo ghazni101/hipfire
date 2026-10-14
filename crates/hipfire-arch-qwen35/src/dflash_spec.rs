@@ -14,7 +14,8 @@ use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
-    scatter_hidden_block_to_interleaved, seed_target_hidden_dense_tp2_abortable,
+    scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
+    seed_target_hidden_dense_tp2_abortable,
     seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
     seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
     softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash, spec_step_dflash_dense_tp2,
@@ -22,7 +23,8 @@ use crate::speculative::{
     GdnTape, HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
-    DflashConfig, DflashScratch, DflashWeights, DraftCtxMode, TargetHiddenLogMark,
+    draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
+    TargetHiddenLogMark,
 };
 use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
 use hipfire_runtime::hfq::HfqFile;
@@ -62,7 +64,6 @@ pub struct DflashState {
     pub verify_scratch: VerifyScratch,
     pub target_snap: DeltaNetSnapshot,
     pub gdn_tape: GdnTape,
-    pub target_hidden_host: Vec<f32>,
     pub ctx_capacity: usize,
     pub block_size: usize,
     pub ddtree: Option<DdtreeState>,
@@ -83,7 +84,6 @@ impl DflashState {
             verify_scratch,
             target_snap,
             gdn_tape,
-            target_hidden_host: _,
             ctx_capacity: _,
             block_size: _,
             ddtree,
@@ -166,7 +166,6 @@ struct DflashOwners {
     verify_scratch: VerifyScratch,
     target_snap: DeltaNetSnapshot,
     gdn_tape: GdnTape,
-    target_hidden_host: Vec<f32>,
 }
 
 impl DflashOwners {
@@ -177,7 +176,6 @@ impl DflashOwners {
             verify_scratch,
             target_snap,
             gdn_tape,
-            target_hidden_host: _,
         } = self;
         gdn_tape.free_gpu(gpu);
         target_snap.free_gpu(gpu);
@@ -305,14 +303,12 @@ fn alloc_dflash_owners(
             return Err(format!("GdnTape::new_for_dflash: {e}"));
         }
     };
-    let target_hidden_host = vec![0.0f32; ring_positions * target_config.dim];
     Ok(DflashOwners {
         draft_scratch,
         hidden_rb,
         verify_scratch,
         target_snap,
         gdn_tape,
-        target_hidden_host,
     })
 }
 
@@ -366,6 +362,9 @@ pub fn load_dflash_state(
     // Retained-PM4 admission facts owned by the loader/target, not the draft.
     target_weights: &Qwen35Weights,
     kv_is_q8: bool,
+    // Target KV is a VMM owner; the gfx1100 split verifier admits VMM KV only.
+    kv_is_vmm: bool,
+    target_flash_partials_numel: usize,
     single_gpu: bool,
     // True when adaptive KV is engaged for this load (tier-switching cache).
     // Must be false for retained-PM4 admission.
@@ -616,7 +615,6 @@ pub fn load_dflash_state(
         verify_scratch,
         target_snap,
         gdn_tape,
-        target_hidden_host,
     } = owners;
     // Retained-PM4 admission (default-off). Pure gates + env opt-in; Disabled
     // holds no controller so HIP behavior stays byte-identical when not armed.
@@ -642,12 +640,26 @@ pub fn load_dflash_state(
         .as_ref()
         .map(|p| p.max_batch)
         .unwrap_or(0);
+    let gfx1100_split_verify_min_ctx =
+        qwen35::prefill::gfx1100_split_verify_min_ctx(gpu, target_config).filter(|&threshold| {
+            qwen35::prefill::gfx1100_split_verify_admitted(
+                gpu,
+                target_config,
+                kv_is_q8,
+                kv_is_vmm,
+                DFLASH_VERIFY_PM4_BLOCK,
+                threshold.saturating_add(1),
+                target_flash_partials_numel,
+            )
+        });
+    let gfx1100_split_verify = gfx1100_split_verify_min_ctx.is_some();
     // The draft's selector/dynamic-conv shape is deliberately NOT a gate: the
     // draft forward is outside the tape, so DFlash2 and legacy DFlash yield an
     // identical target verify body.
     let verify_pm4 = match admit_dflash_verify_pm4(
         env_opt_in,
         &gpu.arch,
+        gfx1100_split_verify,
         single_gpu,
         target_config.num_experts,
         kv_is_q8,
@@ -679,7 +691,14 @@ pub fn load_dflash_state(
                 "  DFlash verify PM4: armed (B={}, exact {})",
                 DFLASH_VERIFY_PM4_BLOCK, gpu.arch
             );
-            DflashVerifyPm4::armed()
+            if let Some(min_ctx) = gfx1100_split_verify_min_ctx {
+                // Keep the faster incumbent below the resolved crossover, and
+                // do not capture a short-context tape that would silently omit
+                // the new partial + merge launches.
+                DflashVerifyPm4::armed_after_context(min_ctx)
+            } else {
+                DflashVerifyPm4::armed()
+            }
         }
         Err(reason) => {
             eprintln!("  DFlash verify PM4: disabled ({reason})");
@@ -696,7 +715,6 @@ pub fn load_dflash_state(
         verify_scratch,
         target_snap,
         gdn_tape,
-        target_hidden_host,
         // Windowed mode reports the TARGET's physical capacity: the draft
         // degrades τ past its window instead of refusing, so the spec
         // loop's overflow guard and the daemon's capacity fallback track
@@ -712,6 +730,20 @@ pub fn load_dflash_state(
     })
 }
 
+/// Whether a cold prefill of `prompt_len` rows downloads its hidden rows into
+/// a temporary CPU shadow. After the prompt, production singleton/lane decode
+/// reads only the GPU-resident draft context (`ctx_slice=None`); the only host
+/// reader left is the windowed long-reach backfill, so by default the shadow
+/// is captured exactly when [`draft_seed_backfill_reads_host`] holds. The
+/// paired all-sliding draft therefore keeps every piece on device.
+/// `HIPFIRE_DFLASH_PREFILL_DEVICE=0` restores the per-piece capture.
+pub fn dflash_prefill_host_required(ctx_mode: DraftCtxMode, prompt_len: usize) -> bool {
+    static DEVICE_PREFILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_DFLASH_PREFILL_DEVICE", true)
+    });
+    !*DEVICE_PREFILL || draft_seed_backfill_reads_host(ctx_mode, prompt_len)
+}
+
 /// Cold/suffix DFlash prefill finishing steps shared by the singleton and the
 /// VMM lane prefill: scatter the seeded hidden rows into the draft's
 /// interleaved context (on a hit, only the suffix rows at `prefill_start`;
@@ -722,6 +754,7 @@ pub fn load_dflash_state(
 fn dflash_prefill_finish(
     gpu: &mut Gpu,
     df: &mut DflashState,
+    host_hidden: &[f32],
     logits: &GpuTensor,
     prompt_tokens: &[u32],
     prefill_len: usize,
@@ -734,7 +767,7 @@ fn dflash_prefill_finish(
     } else {
         (0, prompt_tokens.len())
     };
-    if let Err(e) = scatter_hidden_block_to_interleaved(
+    if let Err(e) = scatter_hidden_prefill_to_interleaved(
         gpu,
         &df.hidden_rb,
         &df.draft_scratch.target_hidden,
@@ -755,7 +788,7 @@ fn dflash_prefill_finish(
             &df.draft_weights,
             &df.draft_config,
             &mut df.draft_scratch,
-            &df.target_hidden_host,
+            host_hidden,
             prompt_tokens.len(),
         )
         .map_err(|e| {
@@ -984,12 +1017,16 @@ impl Speculator for DflashSpeculator {
             .df
             .as_mut()
             .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        if let Some(t) = df.draft_scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
 
-        // Mirror the daemon's pre-seed drafter setup (generate_dflash 4064-4072):
-        // always clear the host hidden buffer; on a full prefill drop the draft's
-        // upload/projection tracking. On a cache HIT it is PRESERVED so the draft
-        // reuses the cached [0..start_pos] projections and only projects the suffix.
-        df.target_hidden_host.clear();
+        // A CPU shadow exists only while the cold backfill reads it (see
+        // `dflash_prefill_host_required`). Cold prompts drop draft
+        // upload/projection tracking; cache hits preserve the prior turn's GPU
+        // projections and extend its suffix.
+        let mut host_hidden = Vec::new();
+        let capture_host = dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt_tokens.len());
         if !cache_hit {
             df.draft_scratch.reset_upload_tracking();
         }
@@ -1021,7 +1058,7 @@ impl Speculator for DflashSpeculator {
                 gpu,
                 slot,
                 &mut df.hidden_rb,
-                &mut df.target_hidden_host,
+                capture_host.then_some(&mut host_hidden),
                 prefill_tokens,
                 abort,
                 ckpt_sink,
@@ -1052,6 +1089,7 @@ impl Speculator for DflashSpeculator {
         let first_logits = dflash_prefill_finish(
             gpu,
             df,
+            &host_hidden,
             &slot.scratch.logits,
             prompt_tokens,
             prefill_tokens.len(),
@@ -1223,6 +1261,9 @@ impl Speculator for DflashSpeculator {
         // chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
+        // The production chain/tree calls below use ctx_slice=None, so no
+        // persistent host shadow exists or is read after prompt backfill.
+        let mut host_hidden = Vec::new();
         let result = if let Some(dd) = df.ddtree.as_mut() {
             // Tree node budget is structural; max_accept is the commit bound.
             // Keep at least 1 node so the tree builder stays well-formed; the
@@ -1235,7 +1276,7 @@ impl Speculator for DflashSpeculator {
                 &df.draft_config,
                 &mut df.draft_scratch,
                 &mut df.hidden_rb,
-                &mut df.target_hidden_host,
+                &mut host_hidden,
                 &mut df.target_snap,
                 &mut dd.post_seed_snap,
                 &mut df.gdn_tape,
@@ -1271,7 +1312,7 @@ impl Speculator for DflashSpeculator {
                 &df.draft_config,
                 &mut df.draft_scratch,
                 &mut df.hidden_rb,
-                &mut df.target_hidden_host,
+                &mut host_hidden,
                 &mut df.target_snap,
                 &df.verify_scratch,
                 position,
@@ -1300,6 +1341,11 @@ impl Speculator for DflashSpeculator {
                 Some(&mut df.verify_pm4),
             )
         };
+        if df.ddtree.is_none() {
+            if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
+                t.observe(position, &r.committed[1..], r.accepted);
+            }
+        }
 
         let lowered = result
             .map(lower_qwen35)
@@ -1505,6 +1551,13 @@ impl Speculator for DflashSpeculator {
         // the full block; the controller re-shrinks only after a fresh
         // 8-cycle window (no cross-request stale-history shrink).
         self.adaptive.reset();
+        if let Some(t) = self
+            .df
+            .as_mut()
+            .and_then(|df| df.draft_scratch.online.as_mut())
+        {
+            t.reset();
+        }
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1723,7 +1776,6 @@ pub fn new_dflash_lane_state(
         verify_scratch,
         target_snap,
         gdn_tape,
-        target_hidden_host,
     } = owners;
     Ok(DflashState {
         draft_config: assets.draft_config.clone(),
@@ -1733,7 +1785,6 @@ pub fn new_dflash_lane_state(
         verify_scratch,
         target_snap,
         gdn_tape,
-        target_hidden_host,
         ctx_capacity: assets.ctx_capacity,
         block_size: assets.block_size,
         ddtree: None,
@@ -2001,7 +2052,8 @@ pub fn dflash_prefill_lane_parts(
     if !assets.matches_state(df) {
         return Err("DFlash lane state does not match the shared assets".into());
     }
-    df.target_hidden_host.clear();
+    let mut host_hidden = Vec::new();
+    let capture_host = dflash_prefill_host_required(df.draft_scratch.ctx_mode, prompt.len());
     df.draft_scratch.reset_upload_tracking();
     let ckpt_sink = if policy.resume_enabled {
         Some(checkpoints)
@@ -2012,7 +2064,7 @@ pub fn dflash_prefill_lane_parts(
         gpu,
         target,
         &mut df.hidden_rb,
-        &mut df.target_hidden_host,
+        capture_host.then_some(&mut host_hidden),
         prompt,
         abort,
         ckpt_sink,
@@ -2029,6 +2081,7 @@ pub fn dflash_prefill_lane_parts(
     let first_logits = dflash_prefill_finish(
         gpu,
         df,
+        &host_hidden,
         &target.scratch.logits,
         prompt,
         prompt.len(),
@@ -2118,6 +2171,7 @@ pub fn dflash_repair_terminal_prefix_parts(
 pub fn admit_dflash_verify_pm4(
     env_opt_in: bool,
     arch: &str,
+    gfx1100_split_verify: bool,
     single_gpu: bool,
     num_experts: usize,
     kv_is_q8: bool,
@@ -2137,8 +2191,10 @@ pub fn admit_dflash_verify_pm4(
     if !env_opt_in {
         return Err("HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1".into());
     }
-    if arch != "gfx1201" {
-        return Err(format!("arch is {arch}, not exact gfx1201"));
+    if arch != "gfx1201" && !(arch == "gfx1100" && gfx1100_split_verify) {
+        return Err(format!(
+            "arch is {arch}, not exact gfx1201 or admitted gfx1100 split verifier"
+        ));
     }
     if !single_gpu {
         return Err("multi-GPU load is not admitted".into());
@@ -2441,7 +2497,6 @@ pub fn load_dflash_speculator_dense_tp2(
             gpu.alloc_tensor(&[block_size * dim], rdna_compute::DType::F32),
             "tp_partial alloc"
         );
-        let target_hidden_host = vec![0.0f32; ctx_capacity * dim];
         ranks.push(DenseTpDflashRankState {
             dflash: DflashState {
                 draft_config: draft_config.clone(),
@@ -2451,7 +2506,6 @@ pub fn load_dflash_speculator_dense_tp2(
                 verify_scratch,
                 target_snap,
                 gdn_tape,
-                target_hidden_host,
                 ctx_capacity: if window.is_some() {
                     requested_ctx
                 } else {
@@ -2531,7 +2585,6 @@ impl DenseTpDflashSpeculator {
             let _ = gpus.devices[rank].bind_thread();
             s.dflash.hidden_rb.reset();
             s.dflash.draft_scratch.reset_upload_tracking();
-            s.dflash.target_hidden_host.clear();
             s.logical_pos = 0;
             s.receipt_generation = u64::MAX;
         }
@@ -2590,6 +2643,7 @@ mod admit_dflash_verify_pm4_tests {
     struct Args {
         env_opt_in: bool,
         arch: &'static str,
+        gfx1100_split_verify: bool,
         single_gpu: bool,
         num_experts: usize,
         kv_is_q8: bool,
@@ -2612,6 +2666,7 @@ mod admit_dflash_verify_pm4_tests {
             Self {
                 env_opt_in: true,
                 arch: "gfx1201",
+                gfx1100_split_verify: false,
                 single_gpu: true,
                 num_experts: 0,
                 kv_is_q8: true,
@@ -2635,6 +2690,7 @@ mod admit_dflash_verify_pm4_tests {
         admit_dflash_verify_pm4(
             a.env_opt_in,
             a.arch,
+            a.gfx1100_split_verify,
             a.single_gpu,
             a.num_experts,
             a.kv_is_q8,
@@ -2675,7 +2731,20 @@ mod admit_dflash_verify_pm4_tests {
             ..Args::default()
         })
         .unwrap_err();
-        assert_eq!(err, "arch is gfx1100, not exact gfx1201");
+        assert_eq!(
+            err,
+            "arch is gfx1100, not exact gfx1201 or admitted gfx1100 split verifier"
+        );
+    }
+
+    #[test]
+    fn admits_gfx1100_only_with_split_verifier() {
+        assert!(admit(Args {
+            arch: "gfx1100",
+            gfx1100_split_verify: true,
+            ..Args::default()
+        })
+        .is_ok());
     }
 
     #[test]

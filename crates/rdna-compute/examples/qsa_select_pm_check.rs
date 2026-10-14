@@ -97,6 +97,7 @@ fn sha256(b: &[u8]) -> String { format!("{:x}", Sha256::digest(b)) }
 
 const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
 const HIPCC_SCORE: &str = "indexed_attention_select_scores_rows16_f32";

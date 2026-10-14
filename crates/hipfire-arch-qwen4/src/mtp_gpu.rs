@@ -11,8 +11,8 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode,
-    Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
+    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::program::{
@@ -20,9 +20,10 @@ use crate::program::{
     QWEN4_QSA_KERNEL_ROPE_THETA,
 };
 use crate::state::{meta_bytes, meta_words, whole_part};
-use crate::weights::{Qwen4FfnWeights, Qwen4Weights, WeightError};
+use crate::weights::{Qwen4EpPlacement, Qwen4FfnWeights, Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::MoeRowGather;
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DenseFfnOp, DenseFfnRecipe,
     DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
@@ -36,8 +37,8 @@ use hipfire_runtime::kv_backend::{
 use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
-    indexed_attention_pool_rope_incremental, HyperNorm, HyperReadProjected,
+    hc_activation_fused_f32, hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
+    indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
     IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -49,11 +50,84 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
-/// Metadata words of an MTP head session snapshot: model id and the state mark.
+/// Metadata words of an MTP head session snapshot: a reserved zero word and
+/// the state mark.
 const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;
+
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET`: the DET route of the batched prompt-fill
+/// Append ([`MtpFillContext::PromptFill`] only), on by default on exact
+/// gfx1151; `0` is the kill switch.
+pub(crate) const MTP_APPEND_DET_ENV: &str = "HIPFIRE_QWEN4_MTP_APPEND_DET";
+/// Default of [`MTP_APPEND_DET_ENV`] when it is unset (or neither `0` nor
+/// `1`): requested, so exact gfx1151 takes DET and every other arch keeps the
+/// incumbent kernels ([`append_det_active`]).
+const MTP_APPEND_DET_DEFAULT: bool = true;
+
+/// Which caller a batched Append pass (`Qwen4MtpGpu::append_rows`) serves. It
+/// is stated by every caller and never inferred from the hidden row, the
+/// scratch or any option: only [`Self::PromptFill`] can take the DET route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpFillContext {
+    /// `mtp_prefill` / lane prompt tiles: the head consumes prompt rows after
+    /// the trunk's chunked forward.
+    PromptFill,
+    /// The decode takeover step's head fill of the accepted window rows. Always
+    /// the incumbent kernels, whatever `HIPFIRE_QWEN4_MTP_APPEND_DET` says.
+    DecodeFill,
+}
+
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET` as requested: on unless `0`
+/// ([`MTP_APPEND_DET_DEFAULT`]); read at every prompt fill. See
+/// [`mtp_append_det_enabled`] for the effective gate.
+pub(crate) fn mtp_append_det_requested() -> bool {
+    hipfire_config::developer_bool(MTP_APPEND_DET_ENV, MTP_APPEND_DET_DEFAULT)
+}
+
+/// The DET gate from its two inputs: requested and exact gfx1151 (gfx1150,
+/// gfx1152, gfx1201 and every other arch never take it).
+fn append_det_active(requested: bool, exact_gfx1151: bool) -> bool {
+    requested && exact_gfx1151
+}
+
+/// Whether DET (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on) is in force on this GPU: exact
+/// gfx1151 only. This is the machine-level gate; whether one Append pass takes
+/// the DET route also depends on its [`MtpFillContext`] ([`append_rows_det`]).
+pub(crate) fn mtp_append_det_enabled(gpu: &Gpu) -> bool {
+    append_det_active(mtp_append_det_requested(), gpu.arch_caps.is_gfx1151())
+}
+
+/// Whether an Append pass of `context` takes the DET route when the machine
+/// gate `det_enabled` is on: prompt fill only.
+fn append_rows_det(context: MtpFillContext, det_enabled: bool) -> bool {
+    det_enabled && context == MtpFillContext::PromptFill
+}
+
+/// Fewest rows one `append_rows` pass takes: the incumbent multirow
+/// projections need two rows or more, the DET kernels take any `n >= 1`.
+fn append_rows_min(det: bool) -> usize {
+    if det {
+        1
+    } else {
+        2
+    }
+}
+
+/// Whether a prompt-fill sub-chunk of `rows` rows runs through
+/// `append_rows` (and so its scratch): always under DET, where a lone row
+/// takes the same kernels as every other row; otherwise only from two rows,
+/// a lone row staying the per-row `append_token`.
+pub(crate) fn prompt_fill_uses_rows(det: bool, rows: usize) -> bool {
+    rows >= append_rows_min(det)
+}
+
+/// The DET dense kernel's shape limits (`gemm_bf16_xf32_mtp_dense_det_pm`):
+/// `M % 16 == 0`, `K % 64 == 0`, `N >= 1`.
+fn det_dense_shape_ok(m: usize, k: usize, n: usize) -> bool {
+    m != 0 && m % 16 == 0 && k != 0 && k % 64 == 0 && n >= 1
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -449,9 +523,7 @@ impl AppendWidths {
                 .checked_mul(config.indexer_head_dim)?
                 .checked_add(index_kv_width)?,
             index_kv_width,
-            kv_width: config
-                .num_key_value_heads
-                .checked_mul(config.head_dim)?,
+            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
         })
     }
 }
@@ -618,11 +690,16 @@ impl MtpAppendScratch {
     /// Non-owning view of `rows` prompt-chunk ids from row `first` of the
     /// last [`Self::upload_prompt_ids`] upload, for `append_rows`'s
     /// `device_ids`. The view must not be freed.
-    pub(crate) fn prompt_ids_view(&self, first: usize, rows: usize) -> Result<GpuTensor, MtpGpuError> {
+    pub(crate) fn prompt_ids_view(
+        &self,
+        first: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, MtpGpuError> {
         match first.checked_add(rows) {
-            Some(end) if end <= self.id_rows => Ok(self
-                .prompt_ids
-                .sub_offset(first * std::mem::size_of::<i32>(), rows * std::mem::size_of::<i32>())),
+            Some(end) if end <= self.id_rows => Ok(self.prompt_ids.sub_offset(
+                first * std::mem::size_of::<i32>(),
+                rows * std::mem::size_of::<i32>(),
+            )),
             _ => Err(invalid("MTP prompt id view is outside the id capacity")),
         }
     }
@@ -744,9 +821,17 @@ impl<'a> AppendWeights<'a> {
         let qsa = qsa_desc(weights, &mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
-            return Err(invalid("MTP batched append Q8_0 projections need hidden 2560"));
+            return Err(invalid(
+                "MTP batched append Q8_0 projections need hidden 2560",
+            ));
         }
-        check("indexer_qk", &qsa.indexer_qk, DType::Q8_0, w.index_width, w.hidden)?;
+        check(
+            "indexer_qk",
+            &qsa.indexer_qk,
+            DType::Q8_0,
+            w.index_width,
+            w.hidden,
+        )?;
         check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
         check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
         Ok(Self {
@@ -759,6 +844,26 @@ impl<'a> AppendWeights<'a> {
             qsa,
         })
     }
+}
+
+/// One BF16 dense projection of `append_rows` over `rows` rows (`weight` is
+/// `[m, k]`, `x` F32 `[rows, k]`, `y` F32 `[rows, m]`): the incumbent
+/// `gemm_bf16_xf32_multirow` (G1), or with `det` the fixed-row F16 WMMA
+/// `gemm_bf16_xf32_mtp_dense_det_pm`.
+fn append_dense_projection(
+    gpu: &mut Gpu,
+    det: bool,
+    weight: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> Result<(), MtpGpuError> {
+    if det {
+        gpu.gemm_bf16_xf32_mtp_dense_det_pm(weight.buf, x, y, weight.m, weight.k, rows)?;
+    } else {
+        gpu.gemm_bf16_xf32_multirow(weight.buf, x, y, weight.m, weight.k, rows)?;
+    }
+    Ok(())
 }
 
 /// F32 elements of every subview the shared HC read takes from its `up`
@@ -1076,7 +1181,10 @@ impl MtpGpuState {
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
     /// snapshot backups.
-    pub(crate) fn device_bytes(config: &Qwen4Config, context: &Qwen4ContextCommit) -> Option<usize> {
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
@@ -1567,13 +1675,13 @@ impl MtpGpuState {
         ]
         .map(|value| value as u64);
         Ok((
-            [self.model_id].into_iter().chain(words).collect(),
+            [0].into_iter().chain(words).collect(),
             self.session_layout(&mark),
         ))
     }
 
     fn parse_session_mark(&self, words: &[u64]) -> Result<MtpStateMark, MtpGpuError> {
-        if words.len() != MTP_SESSION_WORDS || words[0] != self.model_id {
+        if words.len() != MTP_SESSION_WORDS {
             return Err(invalid("MTP session snapshot shape mismatch"));
         }
         let mark = MtpStateMark {
@@ -1598,15 +1706,11 @@ impl MtpGpuState {
         words: &[u64],
     ) -> Result<StateLayout<'_>, MtpGpuError> {
         let mark = self.parse_session_mark(words)?;
-        let required = mark
-            .position
-            .max(mark.full_len)
-            .max(mark.raw_len)
-            .max(
-                mark.pooled_len
-                    .saturating_mul(self.compress)
-                    .min(self.full_capacity),
-            );
+        let required = mark.position.max(mark.full_len).max(mark.raw_len).max(
+            mark.pooled_len
+                .saturating_mul(self.compress)
+                .min(self.full_capacity),
+        );
         self.ensure_mapped_capacity(gpu, required)?;
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
@@ -1770,6 +1874,15 @@ pub struct Qwen4MtpGpu {
     /// MQ2 copy with exact re-scoring of its top 8 drafts the Q8_0 head's own
     /// argmax at a quarter of its read; plain MQ3 loses acceptance.
     pub(crate) draft: DraftHead,
+    /// The head's MoE runtime is an EP decode table (the rank-compact
+    /// experts + the zero dummy expert): each MoE head step then exchanges
+    /// its expanded rows through the forward's row gather.
+    pub(crate) ep_bound: bool,
+    /// MoE head steps sealed under EP so far: a monotonic invocation counter
+    /// (never reset, never part of a state snapshot) whose parity picks the
+    /// head's gather buffer `2 + j % 2`, so a probe-and-restore never reuses
+    /// a buffer on two consecutive invocations.
+    pub(crate) moe_steps: u64,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -1903,16 +2016,26 @@ impl Qwen4MtpGpu {
     }
 
     /// MTP head whose QSA context arenas are `backend` storage (admission
-    /// resolves it); see [`MtpGpuState::new_with_backend`].
+    /// resolves it); see [`MtpGpuState::new_with_backend`]. Under expert
+    /// parallelism `ep` is the rank's binding from its attached forward (the
+    /// placement the weights were loaded with and the rank's zero dummy
+    /// expert): the head's MoE runtime is then the rank's EP decode table.
     pub(crate) fn new_with_backend(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
         max_seq: usize,
         backend: Qwen4KvBackend,
+        ep: Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)>,
     ) -> Result<Self, MtpGpuError> {
         admit_mtp(weights, config)?;
-        if max_seq == 0 || max_seq > config.max_position_embeddings {
+        if weights.ep_placement() != ep.map(|(placement, _)| placement) {
+            return Err(invalid(
+                "the MTP head's EP binding must be the forward's placement the weights were loaded with (EP weights are rank-compact)",
+            ));
+        }
+        let ep_bound = ep.is_some();
+        if max_seq == 0 || max_seq > config.context_limit() {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
         let head = bound_mtp(weights)?;
@@ -1926,7 +2049,19 @@ impl Qwen4MtpGpu {
         };
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
-                match Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config) {
+                let built = match ep {
+                    Some((placement, dummy)) => Qwen4MoeLayerRuntime::from_moe_ep(
+                        gpu,
+                        weights,
+                        moe_weights,
+                        0,
+                        config,
+                        placement,
+                        dummy,
+                    ),
+                    None => Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config),
+                };
+                match built {
                     Ok(moe) => Some(moe),
                     Err(error) => {
                         let _ = state.free_gpu(gpu);
@@ -1957,6 +2092,8 @@ impl Qwen4MtpGpu {
             moe,
             max_seq,
             draft,
+            ep_bound,
+            moe_steps: 0,
         })
     }
 
@@ -2127,6 +2264,7 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         logits: &GpuTensor,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<u32, MtpGpuError> {
         if logits.dtype != DType::F32 || logits.numel() != self.draft.logits().numel() {
             return Err(invalid("MTP logits destination shape mismatch"));
@@ -2141,6 +2279,7 @@ impl Qwen4MtpGpu {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Predict,
+                ep,
             )?
             .ok_or_else(|| invalid("MTP prediction requested but no token produced"))?;
         gpu.copy_d2d(self.draft.logits(), logits, logits.byte_size())?;
@@ -2157,6 +2296,7 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<Option<u32>, MtpGpuError> {
         let lengths = self.head_block(
             gpu,
@@ -2167,6 +2307,7 @@ impl Qwen4MtpGpu {
             position,
             fresh_qsa_selection,
             step,
+            ep,
         )?;
         let next_token = if step == MtpStep::Predict {
             let head = weights.resident(&weights.root.lm_head)?;
@@ -2194,6 +2335,7 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         top1_out: &GpuTensor,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<(), MtpGpuError> {
         if top1_out.dtype != DType::Raw || top1_out.byte_size() < Gpu::TOPK8_OUT_BYTES {
             return Err(invalid(format!(
@@ -2210,6 +2352,7 @@ impl Qwen4MtpGpu {
             position,
             fresh_qsa_selection,
             MtpStep::Predict,
+            ep,
         )?;
         let head = weights.resident(&weights.root.lm_head)?;
         self.draft
@@ -2262,6 +2405,7 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
         let wide = config
             .hc_count
@@ -2339,6 +2483,7 @@ impl Qwen4MtpGpu {
                     raw_index_keys: &state.raw_index_keys,
                     pooled_keys: &state.pooled_keys,
                     selected_indices: &state.selected_indices,
+                    f16_arena: None,
                     full_capacity: state.full_capacity,
                     raw_capacity: state.raw_capacity,
                     pooled_capacity: state.pooled_capacity,
@@ -2369,6 +2514,7 @@ impl Qwen4MtpGpu {
                 kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
                 rotary_dim: config.rotary_dim(),
+                rope: config.rope(),
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
@@ -2376,6 +2522,26 @@ impl Qwen4MtpGpu {
                 phase: MixerPhase::Whole,
             };
             let lengths = attention.next_lengths()?;
+            // Under EP a MoE head step exchanges its expanded rows through the
+            // forward's row gather: gather buffer `2 + j % 2` and layer index
+            // `trunk_layers + j % 2` for the head's monotonic MoE invocation
+            // counter `j` (one increment per MoE head step, never rewound).
+            let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if self.ep_bound
+                && step != MtpStep::Append
+                && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
+            {
+                let ep = ep
+                    .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
+                let parity = (self.moe_steps % 2) as usize;
+                self.moe_steps = self.moe_steps.wrapping_add(1);
+                Some((
+                    config.num_hidden_layers + parity,
+                    ep.buffers[2 + parity],
+                    ep.hook as &dyn MoeRowGather,
+                ))
+            } else {
+                None
+            };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
@@ -2386,7 +2552,7 @@ impl Qwen4MtpGpu {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,
                             config,
-                            0,
+                            moe_ep.map_or(0, |(layer, _, _)| layer),
                             runtime,
                             &scratch.hc_mixed,
                             &scratch.ffn_output,
@@ -2406,8 +2572,12 @@ impl Qwen4MtpGpu {
                                 rot_batch: &scratch.moe_rot_batch,
                                 topk_indices: &scratch.moe_topk_indices,
                                 topk_weights: &scratch.moe_topk_weights,
-                                down_expanded: &scratch.moe_down_expanded,
+                                down_expanded: match moe_ep {
+                                    Some((_, buffer, _)) => buffer,
+                                    None => &scratch.moe_down_expanded,
+                                },
                             },
+                            moe_ep.map(|(_, _, hook)| hook),
                         )?)
                     }
                     (Qwen4FfnWeights::Dense(dense), None) => {
@@ -2517,15 +2687,16 @@ impl Qwen4MtpGpu {
     }
 
     /// Whether [`Self::append_rows`] can run for this model on this GPU:
-    /// gfx1151 only (the tiled Q8_0 projection is the K = 2560 staged GEMV
-    /// the per-row path takes there; other arches run `gemv_q8_0` and have no
-    /// batched twin) and the shipped weight formats and shapes.
+    /// exact gfx1151 or gfx1201 (the tiled Q8_0 projection repeats the dot
+    /// of the per-row Q8_0 GEMV there: the K = 2560 staged GEMV on gfx1151,
+    /// `gemv_q8_0` on gfx1201; other arches have no proven batched twin)
+    /// and the shipped weight formats and shapes.
     pub(crate) fn append_rows_supported(
         gpu: &Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
     ) -> bool {
-        gpu.arch_caps.is_gfx1151()
+        (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
             && AppendWidths::new(config)
                 .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
     }
@@ -2545,6 +2716,12 @@ impl Qwen4MtpGpu {
     /// `wide_hidden`, the selection and its length are not touched (the
     /// per-row Append leaves them alone too).
     ///
+    /// `context` names the caller. [`MtpFillContext::PromptFill`] takes the
+    /// DET route (all seven projections through the fixed-row native kernels)
+    /// on exact gfx1151 (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on), which also takes
+    /// a lone row; [`MtpFillContext::DecodeFill`] always runs the incumbent
+    /// kernels (at least two rows).
+    ///
     /// `device_ids`, when given, holds `tokens` as `tokens.len()` device i32
     /// ids (at least that many bytes) that the embedding gather reads in place
     /// of the scratch upload: the trunk forward's uploaded rows, or the
@@ -2559,6 +2736,7 @@ impl Qwen4MtpGpu {
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
+        context: MtpFillContext,
         scratch: &mut MtpAppendScratch,
         tokens: &[u32],
         hidden: &GpuTensor,
@@ -2567,10 +2745,17 @@ impl Qwen4MtpGpu {
     ) -> Result<(), MtpGpuError> {
         let rows = tokens.len();
         let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
-        if rows == 0 || rows > scratch.rows {
+        let det = append_rows_det(context, mtp_append_det_enabled(gpu));
+        let min_rows = append_rows_min(det);
+        if rows < min_rows || rows > scratch.rows {
             return Err(invalid(format!(
-                "MTP batched append of {rows} rows needs 1..={} (scratch capacity)",
-                scratch.rows
+                "MTP batched append of {rows} rows needs {min_rows}..={} (scratch capacity{})",
+                scratch.rows,
+                if det {
+                    ""
+                } else {
+                    "; the incumbent multirow projections take two rows or more"
+                }
             )));
         }
         let hidden_elements = rows
@@ -2581,8 +2766,8 @@ impl Qwen4MtpGpu {
                 "MTP batched append hidden must be F32 with at least {hidden_elements} elements"
             )));
         }
-        if !gpu.arch_caps.is_gfx1151() {
-            return Err(invalid("MTP batched append is gfx1151 only"));
+        if !(gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) {
+            return Err(invalid("MTP batched append needs exact gfx1151 or gfx1201"));
         }
         if position != self.state.position {
             return Err(invalid(format!(
@@ -2620,6 +2805,26 @@ impl Qwen4MtpGpu {
             return Err(invalid("MTP indexer compress ratio is zero"));
         }
         let mw = AppendWeights::resolve(weights, config, &w)?;
+        if det {
+            // Refused before the draft state observes anything: the DET dense
+            // kernel's M / K limits against the seven projection weights.
+            for (label, weight) in [
+                ("fc_embedding", &mw.fc_embedding),
+                ("fc_hidden", &mw.fc_hidden),
+                ("HC down", &mw.hc.input_mix_down),
+                ("HC up", &mw.hc.input_mix_up),
+                ("indexer_qk", &mw.qsa.indexer_qk),
+                ("k_proj", &mw.qsa.k),
+                ("v_proj", &mw.qsa.v),
+            ] {
+                if !det_dense_shape_ok(weight.m, weight.k, rows) {
+                    return Err(invalid(format!(
+                        "MTP DET append {label} [{}x{}] is outside the DET kernel's limits (M % 16 == 0, K % 64 == 0)",
+                        weight.m, weight.k
+                    )));
+                }
+            }
+        }
         for &token in tokens {
             self.draft.observe(token);
         }
@@ -2659,13 +2864,7 @@ impl Qwen4MtpGpu {
         let qsa_v = view(&scratch.qsa_v, w.kv_width);
 
         // Embed (`Step::Embed`): the Q8_0 table, one grid row per token.
-        gpu.embedding_lookup_q8_batched(
-            mw.embedding,
-            &token_embedding,
-            token_ids,
-            rows,
-            w.hidden,
-        )?;
+        gpu.embedding_lookup_q8_batched(mw.embedding, &token_embedding, token_ids, rows, w.hidden)?;
         hyper_norm(
             gpu,
             &HyperNorm {
@@ -2677,24 +2876,47 @@ impl Qwen4MtpGpu {
                 state_bf16: false,
             },
         )?;
-        // G1 (byte identity vs the per-row `gemv_bf16_xf32`) governs every
-        // `gemm_bf16_xf32_multirow` below. On gfx1151 `gemm.rs` selects by
-        // (m, k, batch): (2560, 2560) is on the r16 allowlist for batch >= 64
-        // (`r16w4t` / `r16w4` / `r16`, documented bitwise to the four-row
-        // kernel) and the base four-row kernel below that; (10240, 320) is
-        // not on the allowlist and K = 320 takes the `pto2` tile
-        // (257..=512, LDS weights, also documented bitwise to the four-row
-        // kernel). If G1 shows any difference for a pair, replace that call
+        // Incumbent (the default, and every `DecodeFill`): G1 (byte identity vs
+        // the per-row reference) governs every `gemm_bf16_xf32_multirow` and
+        // tiled projection below; the reference
+        // is the per-row kernel of each operator on the running arch:
+        //   - fc_embedding and HC up: singleton `gemv_bf16_xf32` (gfx1201
+        //     runs the shipped `gemv_bf16_xf32` kernel);
+        //   - fc_hidden (four branch rows per token): on gfx1201
+        //     `gemv_bf16_xf32_x4_rows_r4`, not four singleton GEMVs;
+        //   - HC down: the K4 singleton (`gemv_bf16_xf32_k4`, scale 1/4);
+        //   - QSA indexer_qk / K / V (Q8_0): on gfx1151 the K = 2560 staged
+        //     `gemv_q8_0`, on gfx1201 the unstaged `gemv_q8_0` (the staged
+        //     tiled kernel repeats the same dot arithmetic).
+        // On gfx1151 `gemm.rs` selects by (m, k, batch): (2560, 2560) is on
+        // the r16 allowlist for batch >= 64 (`r16w4t` / `r16w4` / `r16`,
+        // documented bitwise to the four-row kernel) and the base four-row
+        // kernel below that; (10240, 320) is not on the allowlist and
+        // K = 320 takes the `pto2` tile (257..=512, LDS weights, also
+        // documented bitwise to the four-row kernel). The same selector
+        // runs on gfx1201 (the `r16*_gfx1151` names are not gfx1151-only).
+        // If G1 shows any difference for a pair, replace that call
         // with a rows-grid twin of the single-row kernel (`blockIdx.y`
         // token tile over `gemv_bf16_xf32_rows_body`) before tuning
         // anything. Never route these through `project_weight` /
         // `gemm_bf16_xf32_f16_wmma_qwen4` (F16 WMMA from 512 rows).
-        gpu.gemm_bf16_xf32_multirow(
-            mw.fc_embedding.buf,
+        //
+        // DET (`PromptFill` on exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET`
+        // on unless `0`, `det` below): all seven projections run the fixed-row
+        // native kernels instead (F16 WMMA, F32 accumulate, one ascending-K
+        // chain per output, no split-K, no epilogue). That arithmetic is
+        // deterministic and row-invariant (a row's bytes do not depend on its
+        // batch or sub-chunk) but it is NOT G1: the operands are F16-narrowed
+        // (BF16 weights through a model-lifetime F16 shadow, X rounded to F16
+        // per call; a narrower exponent range than BF16/F32) and the
+        // gfx11 WMMA's internal dot order is its own, so the outputs are not
+        // byte-equal to the incumbent kernels or to the per-row reference.
+        append_dense_projection(
+            gpu,
+            det,
+            &mw.fc_embedding,
             &embedding_norm,
             &projected_embedding,
-            mw.fc_embedding.m,
-            mw.fc_embedding.k,
             rows,
         )?;
         hyper_norm(
@@ -2710,12 +2932,12 @@ impl Qwen4MtpGpu {
         )?;
         // The four branch rows of a token are four projection rows
         // (per-row: `gemv_bf16_xf32_x4_rows` over rows = hc_count).
-        gpu.gemm_bf16_xf32_multirow(
-            mw.fc_hidden.buf,
+        append_dense_projection(
+            gpu,
+            det,
+            &mw.fc_hidden,
             &hidden_norm,
             &projected_hidden,
-            mw.fc_hidden.m,
-            mw.fc_hidden.k,
             rows * config.hc_count,
         )?;
         gpu.broadcast_add_rows_f32(
@@ -2739,25 +2961,41 @@ impl Qwen4MtpGpu {
                 state_bf16: false,
             },
         )?;
-        // The long-K down projection keeps the K4 quarter fold and applies the
-        // 1/branches activation in its epilogue, as the per-row route does.
-        gpu.gemv_bf16_xf32_k4_rows_tiled(
-            mw.hc.input_mix_down.buf,
-            &hc_normalized,
-            &hc_low,
-            mw.hc.input_mix_down.m,
-            mw.hc.input_mix_down.k,
-            Some(1.0 / config.hc_count as f32),
-            rows,
-        )?;
-        gpu.gemm_bf16_xf32_multirow(
-            mw.hc.input_mix_up.buf,
-            &hc_low,
-            &hc_up,
-            mw.hc.input_mix_up.m,
-            mw.hc.input_mix_up.k,
-            rows,
-        )?;
+        if det {
+            // DET: the raw fixed-ascending-K F16 WMMA down projection, then the
+            // HC read activation (`hc_activation_fused_f32`, scale 1/branches,
+            // in place over the F32 `hc_low` rows) the incumbent fuses into the
+            // K4 GEMV epilogue; the same SiLU expression, not a second one.
+            gpu.gemm_bf16_xf32_mtp_dense_det_pm(
+                mw.hc.input_mix_down.buf,
+                &hc_normalized,
+                &hc_low,
+                mw.hc.input_mix_down.m,
+                mw.hc.input_mix_down.k,
+                rows,
+            )?;
+            hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &hc_low,
+                    scale: 1.0 / config.hc_count as f32,
+                    bf16_out: None,
+                },
+            )?;
+        } else {
+            // The long-K down projection keeps the K4 quarter fold and applies
+            // the 1/branches activation in its epilogue, as the per-row route does.
+            gpu.gemv_bf16_xf32_k4_rows_tiled(
+                mw.hc.input_mix_down.buf,
+                &hc_normalized,
+                &hc_low,
+                mw.hc.input_mix_down.m,
+                mw.hc.input_mix_down.k,
+                Some(1.0 / config.hc_count as f32),
+                rows,
+            )?;
+        }
+        append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
         hyper_read_projected(
             gpu,
             &HyperReadProjected {
@@ -2772,15 +3010,42 @@ impl Qwen4MtpGpu {
         )?;
 
         // QSA append-only: index, K and V projections of the mixed row.
-        gpu.gemv_q8_0_k2560_staged_rows_tiled(
-            mw.qsa.indexer_qk.buf,
-            &hc_mixed,
-            &index,
-            mw.qsa.indexer_qk.m,
-            rows,
-        )?;
-        gpu.gemv_q8_0_k2560_staged_rows_tiled(mw.qsa.k.buf, &hc_mixed, &qsa_k, mw.qsa.k.m, rows)?;
-        gpu.gemv_q8_0_k2560_staged_rows_tiled(mw.qsa.v.buf, &hc_mixed, &qsa_v, mw.qsa.v.m, rows)?;
+        if det {
+            // DET: the fixed-row Q8_0 projection (`mtp_q8_det_pm_launch`), not
+            // the staged GEMV's arithmetic. The mixed row converts F32 -> F16
+            // RNE once (the shared X scratch, same stream) for all three
+            // projections; each launch reads it in place.
+            let mixed16 = gpu.qwen4_convert_f16_x(&hc_mixed, rows * w.hidden)?;
+            for (weight, output) in [
+                (&mw.qsa.indexer_qk, &index),
+                (&mw.qsa.k, &qsa_k),
+                (&mw.qsa.v, &qsa_v),
+            ] {
+                gpu.mtp_q8_det_pm_launch(weight.buf, &mixed16, output, weight.m, weight.k, rows)?;
+            }
+        } else {
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.indexer_qk.buf,
+                &hc_mixed,
+                &index,
+                mw.qsa.indexer_qk.m,
+                rows,
+            )?;
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.k.buf,
+                &hc_mixed,
+                &qsa_k,
+                mw.qsa.k.m,
+                rows,
+            )?;
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.v.buf,
+                &hc_mixed,
+                &qsa_v,
+                mw.qsa.v.m,
+                rows,
+            )?;
+        }
         {
             let state = &self.state;
             indexed_attention_append_prologue(
@@ -2803,6 +3068,7 @@ impl Qwen4MtpGpu {
                     rows,
                     // The one MTP layer keeps the exact F32 QSA state.
                     format: QsaKvFormat::F32,
+                    yarn: config.rope().yarn(config.head_dim.min(64)),
                 },
             )?;
             // Pool exactly the blocks these rows complete, from raw keys the
@@ -2824,6 +3090,7 @@ impl Qwen4MtpGpu {
                             rows,
                         }),
                         grid_bound: state.pooled_capacity,
+                        yarn: config.rope().yarn(w.index_kv_width.min(64)),
                     },
                 )?;
             }
@@ -2909,6 +3176,8 @@ impl crate::bundle::Qwen4Bundle {
             position,
             true,
             MtpStep::Predict,
+            // Developer profiles never run under EP.
+            None,
         );
         let freed = gpu.free_tensor(input);
         let draft_token = step
@@ -2939,6 +3208,78 @@ mod tests {
     use super::*;
     use crate::config::compact_test_config;
     use crate::state::Qwen4State;
+
+    #[test]
+    fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {
+        // `0` (not requested): never on, on any arch.
+        assert!(!append_det_active(false, true));
+        assert!(!append_det_active(false, false));
+        // Requested: only exact gfx1151 (`is_gfx1151` is `arch == "gfx1151"`,
+        // so gfx1150 / gfx1152 / gfx1201 all arrive as `false`).
+        assert!(append_det_active(true, true));
+        assert!(!append_det_active(true, false));
+        assert_eq!(MTP_APPEND_DET_ENV, "HIPFIRE_QWEN4_MTP_APPEND_DET");
+    }
+
+    #[test]
+    fn append_det_default_resolves_on_for_gfx1151_only() {
+        // Unset resolves to the default: on for exact gfx1151, off on every
+        // other arch through the same `ArchCaps::is_gfx1151` predicate
+        // `mtp_append_det_enabled` reads.
+        use rdna_compute::arch_caps::ArchCaps;
+        use rdna_compute::feature_flags::FeatureFlags;
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942",
+        ] {
+            let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
+            assert_eq!(
+                append_det_active(MTP_APPEND_DET_DEFAULT, caps.is_gfx1151()),
+                arch == "gfx1151",
+                "{arch}",
+            );
+        }
+    }
+
+    #[test]
+    fn only_prompt_fill_takes_the_det_route() {
+        for enabled in [false, true] {
+            // The decode takeover never takes DET, whatever the machine gate.
+            assert!(!append_rows_det(MtpFillContext::DecodeFill, enabled));
+        }
+        assert!(append_rows_det(MtpFillContext::PromptFill, true));
+        // Without the gate prompt fill keeps the incumbent route.
+        assert!(!append_rows_det(MtpFillContext::PromptFill, false));
+    }
+
+    #[test]
+    fn lone_prompt_row_takes_rows_only_under_det() {
+        // Default: a lone row stays the per-row `append_token`.
+        assert!(!prompt_fill_uses_rows(false, 1));
+        assert!(!prompt_fill_uses_rows(false, 0));
+        assert!(prompt_fill_uses_rows(false, 2));
+        assert!(prompt_fill_uses_rows(false, 1024));
+        // DET: one row is the same kernels; an empty pass is still no pass.
+        assert!(prompt_fill_uses_rows(true, 1));
+        assert!(prompt_fill_uses_rows(true, 2));
+        assert!(!prompt_fill_uses_rows(true, 0));
+        assert_eq!(append_rows_min(false), 2);
+        assert_eq!(append_rows_min(true), 1);
+    }
+
+    #[test]
+    fn det_dense_shape_limits_cover_the_append_projections() {
+        // fc_embedding / fc_hidden, HC down (320 x 10240), HC up (10240 x 320)
+        // and the Q8_0 projections' K = 2560, at one row and at a full pass.
+        for (m, k) in [(2560, 2560), (320, 10240), (10240, 320)] {
+            for n in [1, 2, 4096] {
+                assert!(det_dense_shape_ok(m, k, n), "{m}x{k} n={n}");
+            }
+        }
+        assert!(!det_dense_shape_ok(2560, 2560, 0));
+        assert!(!det_dense_shape_ok(2568, 2560, 1));
+        assert!(!det_dense_shape_ok(2560, 2592, 1));
+        assert!(!det_dense_shape_ok(0, 2560, 1));
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {

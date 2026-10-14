@@ -401,9 +401,7 @@ impl Qwen35VmmStore {
             if cfg.temp > 1e-6 {
                 let b = lane.df.block_size;
                 lane.sampled_draft = Some(DflashSampledDraft::new(b, config.vocab_size));
-                lane.sampled_target.probs.reserve(b * config.vocab_size);
-                lane.sampled_target.tau.reserve(b);
-                lane.sampled_target.z.reserve(b);
+                lane.sampled_target.reserve_rows(b, config.vocab_size, &cfg);
                 lane.sample_scratch.reserve(config.vocab_size);
             }
             // The lane owns no FWHT rotation buffers: the engine lends its
@@ -860,7 +858,7 @@ impl Qwen35VmmStore {
     }
 
     /// Commit one verified DFlash window: singleton greedy prefix/clamp or
-    /// sampled host rejection over the genuine selector q and target rows,
+    /// sampled verify-time decision or host rejection over selector q/target rows,
     /// followed by shared hidden scatter/thlog append and snapshot/tape repair.
     /// Publish its window — position
     /// `+= accepted + 1`, pending seed = bonus, history `+= committed[1..]` —
@@ -907,11 +905,14 @@ impl Qwen35VmmStore {
                 let cfg = lane.sample_cfg();
                 let proposal = lane.sampled_draft.as_ref()
                     .ok_or("commit_step: sampled DFlash verify without its proposal")?;
-                let decision = dflash_sampled_accept_rows(
-                    &draft.verify_tokens, proposal, Some(&lane.sampled_target), &[],
-                    config.vocab_size, cfg, draft.max_accept, &mut lane.rng_state,
-                    &mut lane.sample_scratch,
-                );
+                let decision = match lane.device_decision.take() {
+                    Some(decision) => decision,
+                    None => dflash_sampled_accept_rows(
+                        &draft.verify_tokens, proposal, Some(&lane.sampled_target), &[],
+                        config.vocab_size, cfg, draft.max_accept, &mut lane.rng_state,
+                        &mut lane.sample_scratch,
+                    ),
+                };
                 let receipt = dflash_eager_hip_verify_receipt(
                     gpu, &target, &lane.df, draft.verify_tokens.len(),
                 );

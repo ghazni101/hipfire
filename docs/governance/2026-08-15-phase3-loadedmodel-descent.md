@@ -69,18 +69,18 @@ Not scope reduction — sequencing, on one specific ground: **the paths it touch
 ones that session could not runtime-verify.**
 
 The verification harness in use covered lfm2moe, gemma4, muse-glimmer and qwen35, all
-text-only, on hiptrx. The refactor touches the VL side-load, dots-ocr, PP scratch, EP state
-and unload. hiptrx carries **zero** VL/OCR fixtures; the six that exist are on the
+text-only, on the 4×gfx1201 multi-GPU host. The refactor touches the VL side-load, dots-ocr, PP scratch, EP state
+and unload. That host carries **zero** VL/OCR fixtures; the six that exist are on the
 single-GPU local box. A change to the VL side-load proven only to compile is exactly the
 kind that ships silent breakage, and this repo's own rule is that decoded output — not a
 green build — is the evidence.
 
 ## Verification this phase owes before it can land
 
-1. **Text regression** — the existing four-architecture sweep on hiptrx, decoded output read.
+1. **Text regression** — the existing four-architecture sweep on the 4×gfx1201 host, decoded output read.
 2. **VL** — `dots-ocr` and an `ovisocr2` variant with a real image, locally, output read.
-   No VL fixture exists on hiptrx; either copy one or accept the local single-GPU run.
-3. **PP / EP** — the multi-GPU paths that own `pp_scratch_set` and `EpState`, on hiptrx's
+   No VL fixture exists on the 4×gfx1201 host; either copy one or accept the local single-GPU run.
+3. **PP / EP** — the multi-GPU paths that own `pp_scratch_set` and `EpState`, on that host's
    four R9700s. These have no coverage in the current harness and need one built.
 4. **Unload** — a load/unload/reload loop per architecture. `free_gpu` moved once already in
    Phase 1; the Glimmer arm leaks ~1.3 GB over five cycles if only one side is freed
@@ -149,7 +149,7 @@ built first.** That is the prerequisite, not the refactor.
 `scripts/vram_leak_harness.py` was the named prerequisite for the `pp_scratch_set` step. It
 now exists, and it discriminates.
 
-Measured on hiptrx (gfx1201, single GPU), five/four load-unload cycles:
+Measured on the 4×gfx1201 host (single GPU), five/four load-unload cycles:
 
 | model | per-cycle delta | slope | verdict |
 |---|---|---:|---|
@@ -180,7 +180,7 @@ That is a small change to a tool that now exists, rather than the missing capabi
 Building the harness to de-risk moving `pp_scratch_set` found the bug that field's own
 comment warns about — before any code moved.
 
-`qwen3.6-27b` on hiptrx, four load/unload cycles each:
+`qwen3.6-27b` on the 4×gfx1201 host, four load/unload cycles each:
 
 | | per-cycle delta | slope | |
 |---|---|---:|---|
@@ -272,7 +272,7 @@ wants `ArchModel::kv_compact_offset()`.
 ### Verification at this step
 
 - dots-ocr VL output **byte-identical**, 8,286 bytes, against the pre-descent baseline
-- three architectures generating coherent text on hiptrx at `029f2facd`
+- three architectures generating coherent text on the 4×gfx1201 host at `029f2facd`
 - pp=2 VRAM **+0.0 MiB/cycle** over three cycles
 - workspace builds, 1,997 lib tests pass
 

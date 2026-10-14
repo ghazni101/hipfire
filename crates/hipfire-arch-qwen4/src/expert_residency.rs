@@ -12,6 +12,7 @@
 //! read over PCIe (zero-copy) with no kernel or dispatch change: a decode
 //! token reads only its routed experts' bytes from host RAM.
 
+use crate::gpu_forward::Qwen4ForwardScratchMode;
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::uma_memory::{
@@ -138,6 +139,16 @@ pub fn routed_expert_bytes(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
 ) -> Result<u64, String> {
+    routed_expert_bytes_ranks(weights, bytes_of, 1)
+}
+
+/// [`routed_expert_bytes`] for one rank of a `ranks`-way expert-parallel load
+/// (`1/ranks` of every routed expert stack).
+pub fn routed_expert_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<u64, String> {
     weights
         .iter()
         .filter(|entry| {
@@ -146,9 +157,9 @@ pub fn routed_expert_bytes(
                 && !matches!(entry.policy, ShardPolicy::Tied { .. })
         })
         .try_fold(0u64, |total, entry| {
-            bytes_of(entry)
-                .map(|bytes| total + bytes)
-                .ok_or_else(|| format!("no payload size for '{}'", entry.name))
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            Ok(total + rank_share(entry, bytes, ranks)?)
         })
 }
 
@@ -174,6 +185,17 @@ pub fn resident_split(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
 ) -> Result<(u64, u64), String> {
+    resident_split_ranks(weights, bytes_of, 1)
+}
+
+/// [`resident_split`] for one rank of a `ranks`-way expert-parallel load: the
+/// non-expert bytes are replicated on every rank, the layer-0 routed-expert
+/// bytes are `1/ranks` of the single-device figure.
+pub fn resident_split_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<(u64, u64), String> {
     let mut non_expert = 0u64;
     let mut layer_experts = 0u64;
     for entry in weights {
@@ -184,7 +206,7 @@ pub fn resident_split(
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
-            layer_experts += bytes;
+            layer_experts += rank_share(entry, bytes, ranks)?;
         }
     }
     Ok((non_expert, layer_experts))
@@ -213,14 +235,24 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// admitted context does not size a VMM reserve; legacy arenas commit all
 /// of `max_seq`. Callers on a discrete card pass legacy storage whatever the
 /// backend ([`crate::Qwen4ContextCommit::for_expert_reserve`]).
+///
+/// `mode` is the scratch plan the forward will actually allocate
+/// ([`crate::gpu_forward::qwen4_forward_scratch_mode`]); only the current
+/// forward is charged in it. The measured baseline is a historical
+/// subtraction of the original layout and stays `Full` with its all-row
+/// speculative logits, so a compact plan's saving reaches the placement
+/// instead of being rebased away.
 pub fn auto_vram_reserve(
     config: &Qwen4Config,
     context: &crate::Qwen4ContextCommit,
     chunk_rows: usize,
-    qsa_format: rdna_compute::tensor_ops::QsaKvFormat,
+    mode: Qwen4ForwardScratchMode,
+    qsa_layout: impl Into<rdna_compute::tensor_ops::QsaStateLayout>,
     mtp_bytes: Option<u64>,
     gather_bytes: Option<u64>,
 ) -> Result<u64, String> {
+    let qsa_layout = qsa_layout.into();
+    let qsa_format = qsa_layout.kv;
     let overflow = |seq| format!("QSA context state for max_seq {seq} overflows");
     let trunk = |bytes: Option<usize>| {
         bytes
@@ -231,19 +263,36 @@ pub fn auto_vram_reserve(
         .ok_or_else(|| overflow(context.max_seq))?;
     let measured_context = trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
         .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
-    let context = committed.saturating_sub(measured_context);
+    // BF-1's extra storage must fit through the admitted context, including
+    // on UMA VMM loads that otherwise charge only the first mapped chunk.
+    // Do not subtract it with the historical (arena-off) measured layout.
+    let arena = if qsa_layout.f16_arena {
+        let capacity = crate::Qwen4ContextCommit { tokens: context.max_seq, ..*context };
+        let plain = capacity.committed_layer_bytes(config, qsa_format)
+            .ok_or_else(|| overflow(context.max_seq))?;
+        let with = capacity.committed_layer_bytes(config, qsa_layout)
+            .ok_or_else(|| overflow(context.max_seq))?;
+        trunk(Some(with.checked_sub(plain).ok_or_else(|| overflow(context.max_seq))?))
+            .ok_or_else(|| overflow(context.max_seq))?
+    } else {
+        0
+    };
+    let context = committed.saturating_sub(measured_context)
+        .checked_add(arena).ok_or_else(|| overflow(context.max_seq))?;
     let overflow = || format!("forward resources for a {chunk_rows}-row chunk overflow");
-    let measured =
-        crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(config, AUTO_VRAM_RESERVE_CHUNK)
-            .ok()
-            .and_then(|scratch| {
-                let spec =
-                    AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
-                scratch.checked_add(spec as u64)
-            })
-            .ok_or_else(overflow)?;
+    let measured = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+        config,
+        AUTO_VRAM_RESERVE_CHUNK,
+        Qwen4ForwardScratchMode::Full,
+    )
+    .ok()
+    .and_then(|scratch| {
+        let spec = AUTO_VRAM_RESERVE_CHUNK.checked_mul(config.vocab_size.checked_mul(4)? + 4)?;
+        scratch.checked_add(spec as u64)
+    })
+    .ok_or_else(overflow)?;
     let forward =
-        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows).ok_or_else(overflow)?;
+        crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode).ok_or_else(overflow)?;
     AUTO_VRAM_RESERVE_BYTES
         .checked_add(context)
         .and_then(|bytes| bytes.checked_add(forward))
@@ -304,6 +353,208 @@ pub fn host_mapped_bytes(
         }
     }
     Ok(total)
+}
+
+/// Pinned host bytes one rank of a `ranks`-way expert-parallel load takes for
+/// its [`WeightResidency::HostMapped`] entries (`bytes_of` is the full source
+/// payload; a routed expert stack is `1/ranks` of it per rank), and the total
+/// across all ranks: every rank pins its own copy in the same host RAM, so
+/// [`check_host_ram`] and [`check_gtt_cap`] take the total. `ranks == 1` is
+/// [`host_mapped_bytes`].
+pub fn host_mapped_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+) -> Result<(u64, u64), String> {
+    let mut per_rank = 0u64;
+    for entry in weights {
+        if entry.residency == WeightResidency::HostMapped {
+            let bytes =
+                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+            per_rank += rank_share(entry, bytes, ranks)? + HOST_MAPPED_PAD_BYTES;
+        }
+    }
+    Ok((per_rank, per_rank.saturating_mul(ranks as u64)))
+}
+
+/// Two donor mirrors per rank share one host RAM/GTT budget. Each donor has
+/// separate gate/up and down pinned allocations, including their padding.
+pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Result<u64, String> {
+    (layer_bytes as u64)
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(4 * HOST_MAPPED_PAD_BYTES))
+        .and_then(|bytes| bytes.checked_mul(ranks as u64))
+        .filter(|_| ranks > 0)
+        .ok_or_else(|| "expert stage mirror host charge overflow or zero ranks".to_string())
+}
+
+/// One rank's share of an entry's payload: routed expert stacks split evenly
+/// across `ranks`, everything else is replicated.
+fn rank_share(entry: &WeightEntry, bytes: u64, ranks: usize) -> Result<u64, String> {
+    if ranks == 0 {
+        return Err("expert-parallel rank count must be at least 1".to_string());
+    }
+    if ranks == 1 || !is_routed_expert(&entry.name) {
+        return Ok(bytes);
+    }
+    let ranks = ranks as u64;
+    if bytes % ranks != 0 {
+        return Err(format!(
+            "'{}' has {bytes} bytes, which do not split across {ranks} ranks",
+            entry.name
+        ));
+    }
+    Ok(bytes / ranks)
+}
+
+/// MoE layers of the model: the trunk's plus the MTP head's.
+pub fn moe_layer_count(config: &Qwen4Config) -> usize {
+    config.num_hidden_layers + usize::from(config.mtp.is_some())
+}
+
+/// How many of the model's MoE layers (trunk first, the MTP layer last) one
+/// rank with `free_vram` keeps resident: all of them when the trunk, every
+/// layer's experts and the reserve fit, otherwise the trunk layers `auto`
+/// fits (the MTP layer is then always host-mapped, as in
+/// [`place_routed_experts`]). `layer_expert_bytes_per_rank` is one MoE
+/// layer's routed experts on one rank.
+pub fn ep_rank_layers(
+    config: &Qwen4Config,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+) -> usize {
+    let moe_layers = moe_layer_count(config);
+    let all_experts = layer_expert_bytes_per_rank.saturating_mul(moe_layers as u64);
+    if fits_fully_resident(free_vram, non_expert_bytes, all_experts, reserve_bytes) {
+        return moe_layers;
+    }
+    auto_vram_layers(
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        config.num_hidden_layers,
+        reserve_bytes,
+    )
+}
+
+/// The expert VRAM split every rank of an expert-parallel load applies: the
+/// minimum over ranks of [`ep_rank_layers`], so each layer is resident on all
+/// ranks or on none (the full prefill table relies on equal residency per
+/// layer across ranks). A count of [`moe_layer_count`] means fully resident.
+/// `free_per_rank` is every rank's free VRAM before the load; the result is
+/// the `expert_vram_layers` override passed to every rank's load.
+pub fn ep_vram_layers(
+    config: &Qwen4Config,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+) -> usize {
+    free_per_rank
+        .iter()
+        .map(|&free| {
+            ep_rank_layers(
+                config,
+                free,
+                non_expert_bytes,
+                layer_expert_bytes_per_rank,
+                reserve_bytes,
+            )
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// One rank's line of the expert-parallel fit table: free VRAM, the
+/// replicated trunk, the rank's routed-expert bytes (`MoE layers` of
+/// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
+/// of the MoE layers resident, the rest pinned host RAM; the MTP layer is the
+/// last), what this rank alone could keep, the reserve and the predicted
+/// headroom.
+pub fn ep_fit_rank_line(
+    config: &Qwen4Config,
+    rank: usize,
+    ranks: usize,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    applied_layers: usize,
+) -> String {
+    let moe_layers = moe_layer_count(config);
+    let applied = applied_layers.min(moe_layers);
+    let own = ep_rank_layers(
+        config,
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+    );
+    let resident_bytes = layer_expert_bytes_per_rank.saturating_mul(applied as u64);
+    let headroom = i128::from(free_vram)
+        - i128::from(non_expert_bytes)
+        - i128::from(resident_bytes)
+        - i128::from(reserve_bytes);
+    let gib = |bytes: u64| bytes as f64 / GIB;
+    format!(
+        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB | experts {:.2} GiB/rank \
+         ({moe_layers} MoE layers x {:.1} MiB) | resident expert layers {applied} of {moe_layers} \
+         ({} host-mapped; this rank alone fits {own}) | reserve {:.2} GiB | headroom {:+.2} GiB",
+        gib(free_vram),
+        gib(non_expert_bytes),
+        gib(layer_expert_bytes_per_rank.saturating_mul(moe_layers as u64)),
+        layer_expert_bytes_per_rank as f64 / (1u64 << 20) as f64,
+        moe_layers - applied,
+        gib(reserve_bytes),
+        headroom as f64 / GIB,
+    )
+}
+
+/// The expert-parallel fit table for `ranks` cards (`free_per_rank[r]` is rank
+/// `r`'s free VRAM): a header naming the context and chunk the reserve was
+/// sized for and the split every rank applies ([`ep_vram_layers`], the minimum
+/// over ranks), then one [`ep_fit_rank_line`] per rank at that split.
+/// `non_expert_bytes` is the replicated trunk, `layer_expert_bytes_per_rank`
+/// one MoE layer's routed experts on one rank (`resident_split_ranks`),
+/// `reserve_bytes` ([`auto_vram_reserve`]) what `auto` keeps free.
+pub fn ep_fit_report(
+    config: &Qwen4Config,
+    ranks: usize,
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    max_seq: usize,
+    chunk_rows: usize,
+) -> String {
+    let split = ep_vram_layers(
+        config,
+        free_per_rank,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+    );
+    let mut report = format!(
+        "qwen4 EP fit: {ranks} ranks, max_seq {max_seq}, prefill chunk {chunk_rows} rows, \
+         VRAM split {split} of {} MoE layers on every rank (minimum over ranks)",
+        moe_layer_count(config)
+    );
+    for (rank, free) in free_per_rank.iter().enumerate() {
+        report.push('\n');
+        report.push_str(&ep_fit_rank_line(
+            config,
+            rank,
+            ranks,
+            *free,
+            non_expert_bytes,
+            layer_expert_bytes_per_rank,
+            reserve_bytes,
+            split,
+        ));
+    }
+    report
 }
 
 /// Refuse before any allocation when the pinned experts would not leave
@@ -411,6 +662,7 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_forward::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use rdna_compute::tensor_ops::QsaKvFormat::{self, F32};
     use rdna_compute::DType;
@@ -448,6 +700,25 @@ mod tests {
     }
 
     #[test]
+    fn f16_arena_reserve_covers_full_capacity_even_with_vmm() {
+        let config = crate::config::compact_test_config();
+        let layout = rdna_compute::tensor_ops::QsaStateLayout {
+            f16_arena: true, ..rdna_compute::tensor_ops::QsaStateLayout::F32
+        };
+        for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
+            let context = crate::Qwen4ContextCommit::new(backend, 262145, 8192, 2 << 20);
+            let plain = auto_vram_reserve(&config, &context, 8192, Full, F32, None, None).unwrap();
+            let with = auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
+            let extra = if backend == crate::Qwen4KvBackend::Vmm {
+                2 * (262148usize * 1024).div_ceil(2 << 20) * (2 << 20) * config.n_full_layers()
+            } else {
+                262148 * layout.f16_arena_bytes_per_token(2, 256) * config.n_full_layers()
+            };
+            assert_eq!(with - plain, extra as u64);
+        }
+    }
+
+    #[test]
     fn auto_fits_the_measured_gfx1201_card() {
         // R9700 before load: 32548 MiB free; Flash-Next non-expert weights
         // 5.364 GB; one trunk layer's routed experts 1.3369 GB.
@@ -455,7 +726,7 @@ mod tests {
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
         let reserve =
-            |chunk| auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
+            |chunk| auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
@@ -484,11 +755,44 @@ mod tests {
     }
 
     #[test]
+    fn compact_scratch_lowers_the_reserve_by_exactly_its_saving() {
+        let config = crate::config::compact_test_config();
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let reserve = |rows, mode| {
+            auto_vram_reserve(&config, &measured, rows, mode, F32, None, None).unwrap()
+        };
+        let forward = |rows, mode| {
+            crate::gpu_forward::qwen4_forward_device_bytes(&config, rows, mode).unwrap()
+        };
+        // The 8192-row chunk's compact plan is 4240.125 MiB smaller, and the
+        // whole of it reaches the reserve: the historical baseline stays on
+        // the Full layout, so the saving is not subtracted from both sides.
+        let saving = forward(8192, Full) - forward(8192, FnSymGfx1201);
+        assert_eq!(saving, 4240 * (1 << 20) + (1 << 20) / 8);
+        assert_eq!(reserve(8192, Full) - reserve(8192, FnSymGfx1201), saving);
+        // The same holds at every chunk, including the measured layout's own
+        // 1536 rows.
+        for rows in [AUTO_VRAM_RESERVE_CHUNK, 2048, 4096] {
+            let delta = forward(rows, Full) - forward(rows, FnSymGfx1201);
+            assert!(delta > 0, "{rows} rows");
+            assert_eq!(reserve(rows, Full) - reserve(rows, FnSymGfx1201), delta, "{rows} rows");
+        }
+        // A compact 8192-row chunk costs no more than today's 4096-row chunk,
+        // so `auto` keeps at least the layers it keeps today.
+        assert!(reserve(8192, FnSymGfx1201) <= reserve(4096, Full));
+        let (free, weights, layer) = (32548u64 << 20, 5_364_000_000u64, 1_336_900_000u64);
+        let layers = |reserve| auto_vram_layers(free, weights, layer, 48, reserve);
+        assert!(layers(reserve(8192, FnSymGfx1201)) >= layers(reserve(4096, Full)));
+        assert!(layers(reserve(8192, FnSymGfx1201)) > layers(reserve(8192, Full)));
+    }
+
+    #[test]
     fn native_mtp_and_longer_context_grow_the_reserve() {
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
         let base =
-            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, F32, None, None).unwrap();
+            auto_vram_reserve(&config, &measured, AUTO_VRAM_RESERVE_CHUNK, Full, F32, None, None)
+                .unwrap();
         let native = |context: &crate::Qwen4ContextCommit, max_k, row_capture| {
             crate::mtp_spec::native_mtp_device_bytes(
                 &config,
@@ -506,6 +810,7 @@ mod tests {
             &config,
             &measured,
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             F32,
             Some(mtp),
             None,
@@ -522,6 +827,7 @@ mod tests {
             &config,
             &measured,
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             F32,
             None,
             Some(gather),
@@ -595,6 +901,7 @@ mod tests {
                 &config,
                 &crate::Qwen4ContextCommit::legacy(long_seq),
                 AUTO_VRAM_RESERVE_CHUNK,
+                Full,
                 format,
                 None,
                 None,
@@ -614,6 +921,7 @@ mod tests {
             &config,
             &crate::Qwen4ContextCommit::legacy(2048),
             AUTO_VRAM_RESERVE_CHUNK,
+            Full,
             QsaKvFormat::Fp8,
             None,
             None,
@@ -626,19 +934,21 @@ mod tests {
         let config = crate::config::compact_test_config();
         let chunk = AUTO_VRAM_RESERVE_CHUNK;
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        let base = auto_vram_reserve(&config, &measured, chunk, F32, None, None).unwrap();
+        let base = auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
         let vmm = |max_seq| {
             crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20)
         };
         // The native logical context, virtual under VMM, does not size the
         // reserve; legacy storage at that context commits every arena.
         let native = crate::QWEN4_MAX_CONTEXT;
-        let vmm_native = auto_vram_reserve(&config, &vmm(native), chunk, F32, None, None).unwrap();
+        let vmm_native =
+            auto_vram_reserve(&config, &vmm(native), chunk, Full, F32, None, None).unwrap();
         assert_eq!(vmm_native, base);
         let legacy_native = auto_vram_reserve(
             &config,
             &crate::Qwen4ContextCommit::legacy(native),
             chunk,
+            Full,
             F32,
             None,
             None,
@@ -685,6 +995,7 @@ mod tests {
                 &config,
                 context,
                 chunk,
+                Full,
                 format,
                 Some(mtp(context) as u64),
                 Some(gather),
@@ -735,6 +1046,33 @@ mod tests {
         // The pool counts toward the room, byte for byte.
         assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES).is_ok());
         assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES - 1).is_err());
+    }
+
+    #[test]
+    fn stage_mirrors_charge_every_rank_on_the_shared_host() {
+        let full = 512 * (1_740_800 + 870_400);
+        assert_eq!(expert_stage_mirror_bytes(full, 1).unwrap(), 2 * full as u64 + 4 * HOST_MAPPED_PAD_BYTES);
+        assert_eq!(expert_stage_mirror_bytes(full / 2, 2).unwrap(), 2 * full as u64 + 8 * HOST_MAPPED_PAD_BYTES);
+        assert!(expert_stage_mirror_bytes(full, 0).is_err());
+        assert!(expert_stage_mirror_bytes(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn ep4_stage_mirrors_charge_all_four_ranks_against_host_and_gtt() {
+        let full = 512 * (1_740_800 + 870_400);
+        let charge = expert_stage_mirror_bytes(full / 4, 4).unwrap();
+        assert_eq!(charge, 2 * full as u64 + 16 * HOST_MAPPED_PAD_BYTES);
+        // Same payload as EP2 (the ranks split it); every extra rank adds its own pads.
+        let ep2 = expert_stage_mirror_bytes(full / 2, 2).unwrap();
+        assert_eq!(charge - ep2, 8 * HOST_MAPPED_PAD_BYTES);
+        // Host RAM admission takes the total over all four ranks, byte for byte.
+        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
+        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES - 1), 0).is_err());
+        // So does the GTT cap: one rank's quarter fits where the four-rank total does not.
+        let budget = |limit_bytes| Some(GttBudget { limit_bytes, used_bytes: 0 });
+        assert!(check_gtt_cap(charge, budget(charge)).is_ok());
+        assert!(check_gtt_cap(charge, budget(charge - 1)).is_err());
+        assert!(check_gtt_cap(charge / 4, budget(charge - 1)).is_ok());
     }
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
@@ -951,5 +1289,138 @@ mod tests {
             ),
             config.num_hidden_layers
         );
+    }
+
+    #[test]
+    fn ep_ranks_split_only_the_routed_expert_bytes() {
+        let config = crate::config::compact_test_config();
+        let mut manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let (non_expert, layer_experts) =
+            resident_split(&manifest.weights, element_bytes).expect("split");
+        let experts = routed_expert_bytes(&manifest.weights, element_bytes).unwrap();
+        // ranks == 1 is the single-device arithmetic.
+        assert_eq!(
+            resident_split_ranks(&manifest.weights, element_bytes, 1),
+            Ok((non_expert, layer_experts))
+        );
+        assert_eq!(
+            routed_expert_bytes_ranks(&manifest.weights, element_bytes, 1),
+            Ok(experts)
+        );
+        for ranks in [2u64, 4] {
+            let r = ranks as usize;
+            // The trunk is replicated; experts are 1/ranks per rank.
+            assert_eq!(
+                resident_split_ranks(&manifest.weights, element_bytes, r),
+                Ok((non_expert, layer_experts / ranks))
+            );
+            assert_eq!(
+                routed_expert_bytes_ranks(&manifest.weights, element_bytes, r),
+                Ok(experts / ranks)
+            );
+            assert_eq!(layer_experts % ranks, 0);
+        }
+        // Every rank host-maps its own 1/N share: the total across ranks is
+        // N x the per-rank bytes, and ranks == 1 equals host_mapped_bytes.
+        let routed = manifest
+            .weights
+            .iter()
+            .filter(|entry| is_routed_expert(&entry.name))
+            .count();
+        assert_eq!(place_routed_experts(&mut manifest.weights, 0), routed);
+        let single = host_mapped_bytes(&manifest.weights, element_bytes).unwrap();
+        assert_eq!(
+            host_mapped_bytes_ranks(&manifest.weights, element_bytes, 1),
+            Ok((single, single))
+        );
+        for ranks in [2usize, 4] {
+            let (per_rank, total) =
+                host_mapped_bytes_ranks(&manifest.weights, element_bytes, ranks).unwrap();
+            // Payload bytes shrink by N; each tensor keeps its pad.
+            let pad = routed as u64 * HOST_MAPPED_PAD_BYTES;
+            assert_eq!(per_rank, (single - pad) / ranks as u64 + pad);
+            assert_eq!(total, per_rank * ranks as u64);
+        }
+        // An indivisible stack and a zero rank count are refused.
+        assert!(resident_split_ranks(&manifest.weights, element_bytes, 3).is_err());
+        assert!(routed_expert_bytes_ranks(&manifest.weights, element_bytes, 0).is_err());
+    }
+
+    #[test]
+    fn ep_auto_layers_use_the_per_rank_expert_bytes() {
+        let free = 30u64 << 30;
+        let non_expert = 5_990_000_000u64;
+        let layer = 1_336_900_000u64;
+        let reserve = 6_656u64 << 20;
+        let single = auto_vram_layers(free, non_expert, layer, 48, reserve);
+        let ep4 = auto_vram_layers(free, non_expert, layer / 4, 48, reserve);
+        let ep2 = auto_vram_layers(free, non_expert, layer / 2, 48, reserve);
+        assert!(single < ep2 && ep2 < ep4);
+        // EP4 at 30 GiB keeps every trunk layer resident; EP2 does not.
+        assert_eq!(ep4, 48);
+        assert!(ep2 < 48);
+    }
+
+    #[test]
+    fn ep_fit_report_prints_one_line_per_rank() {
+        let config = crate::config::compact_test_config();
+        let free = [30u64 << 30, 29 << 30, 30 << 30, 28 << 30];
+        let report = ep_fit_report(
+            &config,
+            4,
+            &free,
+            5_990_000_000,
+            334_225_000,
+            6_656u64 << 20,
+            32768,
+            1536,
+        );
+        let lines: Vec<_> = report.lines().collect();
+        assert_eq!(lines.len(), 5, "{report}");
+        assert!(lines[0].contains("4 ranks") && lines[0].contains("32768") && lines[0].contains("1536"));
+        for (rank, line) in lines[1..].iter().enumerate() {
+            assert!(line.starts_with(&format!("qwen4 EP rank {rank}/4:")), "{line}");
+            for part in ["free", "trunk", "experts", "resident expert layers", "reserve", "headroom"] {
+                assert!(line.contains(part), "{part} missing from {line}");
+            }
+            // 49 MoE layers incl. the MTP head.
+            assert!(line.contains("of 49"), "{line}");
+        }
+        // EP4 at 28..30 GiB free keeps all 49 MoE layers (the MTP layer too) resident.
+        assert!(lines[0].contains("VRAM split 49 of 49"), "{}", lines[0]);
+        assert!(lines[1].contains("resident expert layers 49 of 49 (0 host-mapped"), "{}", lines[1]);
+        // Headroom: 30 GiB - 5.99 GB trunk - 49 x 0.334 GB - 6.5 GiB reserve > 0 on rank 0.
+        assert!(lines[1].contains("headroom +"), "{}", lines[1]);
+        // A rank with too little VRAM for the reserve reports negative headroom.
+        let tight =
+            ep_fit_rank_line(&config, 1, 2, 8 << 30, 5_990_000_000, 668_450_000, 6_656u64 << 20, 0);
+        assert!(tight.contains("headroom -"), "{tight}");
+        assert!(tight.contains("resident expert layers 0 of 49"), "{tight}");
+    }
+
+    #[test]
+    fn ep_split_is_the_minimum_over_ranks_and_identical_everywhere() {
+        let config = crate::config::compact_test_config();
+        let (non_expert, layer, reserve) = (5_990_000_000u64, 668_450_000u64, 6_656u64 << 20);
+        let rank = |free| ep_rank_layers(&config, free, non_expert, layer, reserve);
+        // EP2-sized layers: 49 x 0.668 GB does not fit 30 GiB with the reserve.
+        let roomy = rank(30 << 30);
+        let tight = rank(24 << 30);
+        assert!(tight < roomy && roomy < 49 && tight > 0, "{tight} {roomy}");
+        assert_eq!(rank(64 << 30), 49, "everything fits");
+        assert_eq!(rank(1 << 30), 0, "reserve alone does not fit");
+        let free = [30u64 << 30, 24 << 30, 30 << 30, 29 << 30];
+        assert_eq!(ep_vram_layers(&config, &free, non_expert, layer, reserve), tight);
+        assert_eq!(ep_vram_layers(&config, &free[..1], non_expert, layer, reserve), roomy);
+        assert_eq!(ep_vram_layers(&config, &[], non_expert, layer, reserve), 0);
+        // The report applies the minimum to every rank.
+        let report = ep_fit_report(&config, 4, &free, non_expert, layer, reserve, 32768, 1536);
+        let lines: Vec<_> = report.lines().collect();
+        assert!(lines[0].contains(&format!("VRAM split {tight} of 49")), "{}", lines[0]);
+        for line in &lines[1..] {
+            assert!(line.contains(&format!("resident expert layers {tight} of 49")), "{line}");
+        }
+        assert!(lines[2].contains(&format!("this rank alone fits {tight}")), "{}", lines[2]);
+        assert!(lines[1].contains(&format!("this rank alone fits {roomy}")), "{}", lines[1]);
     }
 }

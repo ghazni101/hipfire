@@ -1,9 +1,11 @@
 # Dense 27B co-op prototype: down and gate_up, GPU + NPU (IEF15) on Halo
 
-Coop27Down, 2026-10-03, branch `npu/coop-down27`. Model `qwen3.8-27b.mq4-xts` sha256 `3e38ccba…f6f8ae` (re-verified on hipx).
-Code: `coop27/` (out-of-tree prototype; hipfire read-only, incumbent kernel bytes vendored from wt-land-041m 798d63b3a,
+> **Historical research note: superseded by the 0.4.2 serving route.** This file records a killed dense 27B co-op prototype (verdict in section 8) from the 2026-10 NPU research cycle. It is not current guidance, and any figure in it is a dated fixture-bound measurement or an explicitly labelled historical estimate, not a product claim. The shipped 0.4.2 NPU route is the Flash-Next gfx1151 trunk input projection described in [npu-trunk.md](npu-trunk.md): `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` (default `auto`, effectively `off` on every architecture except gfx1151), calibration schema 4, BF16-direct only. There is **no I32 serving contract** (no int32 partial, combine or fold exists in the product route). The out-projection program exists but is **not wired** into serving; `qsa.o` and the GDN o-projection are **not shipped**. Environment-variable names and flag syntax below are historical proposals or experiment switches, not supported configuration.
+
+2026-10-03, research branch `npu/coop-down27`. Model `qwen3.8-27b.mq4-xts` sha256 `3e38ccba…f6f8ae` (re-verified on the measurement host).
+Code: `coop27/` (out-of-tree prototype; hipfire read-only, incumbent kernel bytes vendored from the 0.4.1 hipfire beta checkout at 798d63b3a,
 `native/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco` sha256 `2395edab…778d2b`; PM-native glue kernels assembled
-by peacemaker, `native/build.sh`). Windows: `tools/npu/npu-coop27-*.sh`, logs hipx `~/pm-wave/coop27/logs/`.
+by peacemaker, `native/build.sh`). Windows: `tools/npu/npu-coop27-*.sh`; run logs are not included here.
 Labels: **M** measured, **E** estimate.
 
 ## 1. What was built

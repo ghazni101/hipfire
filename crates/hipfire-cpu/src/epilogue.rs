@@ -3,12 +3,37 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Host-side epilogues for CPU-executed steps.
 //!
-//! Only the residual accumulate lives here today, because it is the only
-//! epilogue the CPU seam needs: the SiLU that feeds a fused down-projection is
-//! still computed by the GPU (`silu_mul_f32`) and only the weight-reading matmul
-//! moves to the CPU, so a `silu_mul` here would be a second implementation with
-//! no caller. The gated/sigmoid-scaled epilogues are the MoE shared-expert and
-//! DeltaNet-output forms, which this path does not cover.
+//! [`residual_add`] is the epilogue a CPU-executed `Step::GemvResidual` needs.
+//! [`silu_mul`] is the epilogue a CPU-executed **routed-expert** FFN needs: the
+//! pair of GEMVs that a `Step::Moe` fuses runs on the CPU for a spilled expert
+//! blob, so the SwiGLU between them cannot stay on the GPU the way it does for a
+//! dense layer (whose weight-reading matmul is the only half that moves). Both
+//! mirror the device kernels (`silu_mul_f32`) element-for-element. The
+//! gated/sigmoid-scaled epilogues are the MoE *shared*-expert and DeltaNet-output
+//! forms, which this path does not cover.
+
+/// `out[i] = silu(gate_up[i]) * gate_up[mi + i]` — the SwiGLU an MoE expert's
+/// fused gate/up projection feeds its down projection with.
+///
+/// `gate_up` holds the concatenated `[gate(0..mi) | up(mi..2*mi)]` rows a fused
+/// `gate_up` GEMV produces; `out` receives the `mi`-long hidden. Panics on a
+/// length mismatch: a silently short hidden is a partial FFN, which reads as a
+/// coherent model until it does not.
+pub fn silu_mul(gate_up: &[f32], out: &mut [f32]) {
+    let mi = out.len();
+    assert!(
+        gate_up.len() >= 2 * mi,
+        "silu_mul: gate_up has {} elements, needs {}",
+        gate_up.len(),
+        2 * mi
+    );
+    for (o, (g, u)) in out
+        .iter_mut()
+        .zip(gate_up[..mi].iter().zip(gate_up[mi..2 * mi].iter()))
+    {
+        *o = (*g / (1.0 + (-*g).exp())) * *u;
+    }
+}
 
 /// `acc[j] += delta[j]`.
 ///
@@ -56,5 +81,24 @@ mod test {
     fn residual_add_rejects_a_longer_delta() {
         let mut acc = [0.0f32; 2];
         residual_add(&mut acc, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn silu_mul_matches_the_device_kernel_form() {
+        // Same expression as `silu_mul_f32`: (v / (1 + exp(-v))) * up[i].
+        let gate_up = [-1.0f32, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let mut out = [0.0f32; 3];
+        silu_mul(&gate_up, &mut out);
+        let expect = |v: f32, u: f32| (v / (1.0 + (-v).exp())) * u;
+        assert_eq!(out[0], expect(-1.0, 2.0));
+        assert_eq!(out[1], expect(0.0, 3.0));
+        assert_eq!(out[2], expect(1.0, 4.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "needs 8")]
+    fn silu_mul_rejects_a_short_gate_up() {
+        let mut out = [0.0f32; 4];
+        silu_mul(&[1.0, 2.0, 3.0], &mut out);
     }
 }

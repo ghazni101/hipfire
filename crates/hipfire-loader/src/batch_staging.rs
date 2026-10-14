@@ -535,6 +535,12 @@ fn stage_qwen4_lanes(
     if req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact {
         return refuse("qwen4 has only the exact lane route");
     }
+    let ep = crate::admission::effective_ep(m.arch_id);
+    if ep > 1 {
+        return refuse(&format!(
+            "expert parallelism (topology.ep = {ep}) serves one request at a time; lanes/continuous batching need topology.ep = 1"
+        ));
+    }
     let max_seq = m.max_seq;
     let spec_off_reason = if !req.spec {
         Some("serve.batch_spec off")

@@ -336,13 +336,19 @@ Codec MSE is **not** a KLD proxy. Product quality is §8 / the ladder checkpoint
 
 ---
 
-## 8 · Product admission boundary (measured, not claimed shipping)
+## 8 · Product admission boundary (historical August sweep; not current quality pins)
 
-Evidence host: hiptrx, 4×gfx1201, ROCm/HIP 7.14. Fixture: Qwen3.8-27B,
+The data in this section is a **historical, fixture-bound** August 2026 sweep,
+kept separate from current quality pins (see
+[`ladder.md`](ladder.md#current-quality-methodology) and
+[`../../AGENTS.md`](../../AGENTS.md) § 5). It records evidence, not shipping
+status. Full record:
+[`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md).
+
+Evidence host: 4×gfx1201, ROCm/HIP 7.14. Fixture: Qwen3.8-27B,
 26,895,998,464 params. Scoring: WT2 + v6sel, 24 chunks, prompt md5
 `253c7ac50857fe6d0e10fb0d2c5e35c0`. Ladder summary generated
-`2026-08-20T14:13:16Z`, commit `bfe3cfead5856c5ee85e972b609712b0badbd1b1`,
-source `ssh://hiptrx/home/kaden/qcal/ladder-v2/summary.json`.
+`2026-08-20T14:13:16Z`, commit `bfe3cfead5856c5ee85e972b609712b0badbd1b1`.
 
 Acceptance rate from native generate is **null**
 (`acceptance_reason: unavailable_in_native_generate_v1`).
@@ -398,8 +404,8 @@ Fixed-tier overlays (product recipe, not wire):
 MQ2V2 **codec math is valid** (encoder round-trips, kernels decode, parity
 gate covers qt=50). Product quality is not:
 
-- WT2/v6sel KLD ≈ 12–14 on every mq2 rung (three orders of magnitude above
-  mq3+).
+- WT2/v6sel KLD ≈ 12–14 on every mq2 rung, substantially higher than mq3–mq6
+  on this fixture.
 - Serve battery (`serve-mq2.json`): no attractor/empty flags, but outputs are
   coherent-yet-degraded / repetitive (`runaway` on the 5-prompt battery).
 - Do **not** advertise MQ2V2 as a shipping body format. Wire support remains
@@ -479,8 +485,8 @@ byte consumption explicit per dtype.
 - [`qt-register.txt`](qt-register.txt) — qt 47–50 passthrough rows
 - [`mq4-v2.md`](mq4-v2.md) — qt=44/45 detailed sibling
 - [`ladder.md`](ladder.md) — product names / rungs / honesty invariant
-- `docs/perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md` — immutable
-  ladder checkpoint (peer-owned; historical fixture scope)
+- [`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md) — immutable
+  ladder checkpoint (historical fixture scope; measured ladder summary)
 - `docs/perf-checkpoints/2026-08-23-mq-v2-crossarch-prefill-reuse.md` — multi-arch
   prefill weight-reuse (gfx1151 all ops bits2–6; gfx1201 QKV BT8 bits2/5/6, MQ3 base)
 - `crates/rdna-compute/src/dispatch.rs` — group-byte constants, AWQ allow-list
@@ -490,4 +496,4 @@ byte consumption explicit per dtype.
 - `crates/hipfire-runtime/examples/mqv2_family_parity.rs` — parity gate
 - `crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs`,
   `test_mqv2_qkv_bt_gfx1201.rs` — ladder BT screens
-- `ssh://hiptrx/home/kaden/qcal/ladder-v2/summary.{json,md,csv}` — measured ladder
+- [`kld/VERIFY.md`](https://huggingface.co/hipfire-models/qwen3.8-27b/blob/main/kld/VERIFY.md) — public current quality-pin reproduction

@@ -71,6 +71,23 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::{Path, PathBuf};
 
+/// Kill switch for the kv_only MTP fill concat acceleration
+/// (`HIPFIRE_MTP_FILL_FAST=0` restores the per-row D2D concat loop).
+pub(crate) fn mtp_fill_fast_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_MTP_FILL_FAST", true)
+    });
+    *ON
+}
+
+/// Restore the incumbent v1 GEMM with `HIPFIRE_MTP_FILL_PM_GEMM=0`.
+fn mtp_fill_pm_gemm_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_MTP_FILL_PM_GEMM", true)
+    });
+    *ON
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,7 +732,31 @@ impl Qwen35MtpHeadKvCache {
     /// Reset positions to all-zeros. Q8 K/V slots are 34 B per 32-element
     /// block stored inside an F32-typed buffer; zeroing the underlying
     /// buffer is equivalent to "no positions written" at the kernel level.
+    /// With `HIPFIRE_MTP_FILL_FAST` enabled, allocation-free device zeroing
+    /// is ordered on the active stream and writes the exact same positive-zero
+    /// bytes across the full K/V buffers. Setting the flag to `0` preserves
+    /// the original host-zero allocation and H2D-copy path.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if mtp_fill_fast_enabled() {
+            gpu.bind_thread()?;
+            for layer in 0..self.inner.k_gpu.len() {
+                let k_n = self.inner.k_gpu[layer].numel();
+                let v_n = self.inner.v_gpu[layer].numel();
+                gpu.hip.memset_d32_async(
+                    &self.inner.k_gpu[layer].buf,
+                    0,
+                    k_n,
+                    gpu.active_stream.as_ref(),
+                )?;
+                gpu.hip.memset_d32_async(
+                    &self.inner.v_gpu[layer].buf,
+                    0,
+                    v_n,
+                    gpu.active_stream.as_ref(),
+                )?;
+            }
+            return Ok(());
+        }
         for layer in 0..self.inner.k_gpu.len() {
             let k_n = self.inner.k_gpu[layer].numel();
             let v_n = self.inner.v_gpu[layer].numel();
@@ -2254,6 +2295,9 @@ pub struct Qwen35MtpHeadBatchedScratch {
     pub t_mtp_outs: GpuTensor,
     /// Per-slot positions device buffer. [max_n] i32, uploaded fresh each call.
     pub positions: GpuTensor,
+    /// True only for scratch from [`Self::new_for_prompt_fill`]: the eleven
+    /// inactive fields are borrowed views and `free_gpu` releases nine owners.
+    prompt_fill_only: bool,
 }
 
 impl Qwen35MtpHeadBatchedScratch {
@@ -2291,29 +2335,209 @@ impl Qwen35MtpHeadBatchedScratch {
             ffn_out: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
             t_mtp_outs: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
             positions: gpu.alloc_tensor(&[max_n], DType::F32)?, // F32 alias for i32 storage
+            prompt_fill_only: false,
         })
     }
 
+    /// Lean scratch for the fast kv_only prompt fill: allocates only
+    /// `tok_embd, e_norm, h_norm, concat, cur, tmp, k, v, positions`. The
+    /// other eleven fields are one-element borrowed views of `positions`
+    /// (no extra HIP allocations). It is valid only for
+    /// [`mtp_head_forward_block_batched`] with `kv_only && HIPFIRE_MTP_FILL_FAST`;
+    /// any other use is refused by an assertion. A failed allocation releases
+    /// every buffer allocated so far before the error is returned.
+    pub(crate) fn new_for_prompt_fill(
+        gpu: &mut Gpu,
+        config: &Qwen35MtpHeadConfig,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            max_n >= 1,
+            "Qwen35MtpHeadBatchedScratch: max_n must be >= 1"
+        );
+        let dim = config.n_embd;
+        let q_dim = config.head_dim * config.n_head;
+        let kv_dim = config.head_dim * config.n_head_kv;
+
+        // Transactional construction: `owned` holds every successful
+        // allocation until the struct is built; on error, reverse-release.
+        let numels = [
+            max_n * dim,     // tok_embd
+            max_n * dim,     // e_norm
+            max_n * dim,     // h_norm
+            max_n * 2 * dim, // concat
+            max_n * dim,     // cur
+            max_n * dim,     // tmp
+            max_n * kv_dim,  // k
+            max_n * kv_dim,  // v
+            max_n,           // positions
+        ];
+        let mut owned: [Option<GpuTensor>; 9] = Default::default();
+        for (i, numel) in numels.into_iter().enumerate() {
+            match gpu.alloc_tensor(&[numel], DType::F32) {
+                Ok(t) => owned[i] = Some(t),
+                Err(e) => {
+                    for slot in owned.iter_mut().rev() {
+                        if let Some(t) = slot.take() {
+                            let _ = gpu.free_tensor(t);
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut take = |i: usize| owned[i].take().expect("lean MTP scratch slot taken twice");
+        let tok_embd = take(0);
+        let e_norm = take(1);
+        let h_norm = take(2);
+        let concat = take(3);
+        let cur = take(4);
+        let tmp = take(5);
+        let k = take(6);
+        let v = take(7);
+        let positions = take(8);
+        // One-element non-owning views of the owned positions buffer; never
+        // freed, never dereferenced beyond one element.
+        let sentinel = || positions.sub_offset(0, 1);
+        Ok(Self {
+            max_n,
+            n_embd: dim,
+            n_ff: config.n_ff,
+            q_dim,
+            kv_dim,
+            tok_embd,
+            e_norm,
+            h_norm,
+            concat,
+            cur,
+            residual: sentinel(),
+            tmp,
+            q_full: sentinel(),
+            q: sentinel(),
+            gate: sentinel(),
+            k,
+            v,
+            attn_out: sentinel(),
+            o: sentinel(),
+            gate_ffn: sentinel(),
+            up: sentinel(),
+            ffn_hidden: sentinel(),
+            ffn_out: sentinel(),
+            t_mtp_outs: sentinel(),
+            positions,
+            prompt_fill_only: true,
+        })
+    }
+
+    /// Allocation-size model for [`Self::new`] / [`Self::new_for_prompt_fill`]:
+    /// one pool allocation of `numel` F32 elements, with the pool's 256 B floor.
+    fn requested_bytes(numel: usize) -> usize {
+        (numel * 4).max(256)
+    }
+
+    /// Requested device bytes of the full [`Self::new`] layout (20 buffers).
+    fn full_requested_bytes(config: &Qwen35MtpHeadConfig, rows: usize) -> usize {
+        let dim = config.n_embd;
+        let q_dim = config.head_dim * config.n_head;
+        let kv_dim = config.head_dim * config.n_head_kv;
+        let r = Self::requested_bytes;
+        // tok_embd, e_norm, h_norm, cur, residual, tmp, o, ffn_out, t_mtp_outs
+        r(rows * dim) * 9
+            + r(rows * 2 * dim)
+            + r(rows * 2 * q_dim)
+            + r(rows * q_dim) * 3 // q, gate, attn_out
+            + r(rows * kv_dim) * 2
+            + r(rows * config.n_ff) * 3
+            + r(rows)
+    }
+
+    /// Requested device bytes of the lean [`Self::new_for_prompt_fill`] layout
+    /// (9 owners; the 11 inactive fields are borrowed views of `positions`).
+    fn lean_requested_bytes(config: &Qwen35MtpHeadConfig, rows: usize) -> usize {
+        let dim = config.n_embd;
+        let kv_dim = config.head_dim * config.n_head_kv;
+        let r = Self::requested_bytes;
+        // tok_embd, e_norm, h_norm, cur, tmp
+        r(rows * dim) * 5 + r(rows * 2 * dim) + r(rows * kv_dim) * 2 + r(rows)
+    }
+
+    /// Requested bytes of one rotated-input scratch of `k` columns by `rows`.
+    fn rotation_requested_bytes(rows: usize, k: usize) -> usize {
+        Self::requested_bytes(rows * k)
+    }
+
+    /// Largest prompt-fill head capacity whose lean scratch + fill rotation
+    /// requested bytes do not exceed the legacy full scratch + legacy rotation
+    /// requested bytes at `legacy_rows`. The budget capacity is aligned down to
+    /// a multiple of 8 when it is at least 8, and only then clamped by
+    /// `prompt_len` and `trunk_chunk_max`, so a short prompt keeps a single
+    /// call of exactly its own length. Pure metadata: no GPU query or
+    /// allocation. Returns 0 for an empty prompt; otherwise at least 1.
+    pub(crate) fn prompt_fill_rows_for_budget(
+        cfg: &Qwen35MtpHeadConfig,
+        legacy_rows: usize,
+        trunk_chunk_max: usize,
+        prompt_len: usize,
+        legacy_rotation_k: usize,
+        fill_rotation_k: usize,
+    ) -> usize {
+        if prompt_len == 0 || legacy_rows == 0 || trunk_chunk_max == 0 {
+            return 0;
+        }
+        let budget = Self::full_requested_bytes(cfg, legacy_rows)
+            .saturating_add(Self::rotation_requested_bytes(legacy_rows, legacy_rotation_k));
+        let fits = |rows: usize| {
+            Self::lean_requested_bytes(cfg, rows)
+                .saturating_add(Self::rotation_requested_bytes(rows, fill_rotation_k))
+                <= budget
+        };
+        // Requested bytes are monotonically non-decreasing in rows. Double
+        // from the legacy row count to the first non-fitting bound (lean +
+        // fill rotation is never wider than legacy per row, so this ends within
+        // a few doublings), then binary-search the largest fitting row count.
+        let mut lo = 0usize; // largest known-fitting rows (0 = none known)
+        let mut bad = legacy_rows;
+        while fits(bad) {
+            lo = bad;
+            bad *= 2;
+        }
+        while bad - lo > 1 {
+            let mid = lo + (bad - lo) / 2;
+            if fits(mid) {
+                lo = mid;
+            } else {
+                bad = mid;
+            }
+        }
+        let aligned = if lo >= 8 { lo & !7 } else { lo };
+        aligned.min(prompt_len).min(trunk_chunk_max).max(1)
+    }
+
+    /// Frees owned allocations. Lean scratch owns only the nine active
+    /// buffers; its eleven inactive fields are borrowed views of `positions`
+    /// and must never reach `free_tensor`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.tok_embd);
         let _ = gpu.free_tensor(self.e_norm);
         let _ = gpu.free_tensor(self.h_norm);
         let _ = gpu.free_tensor(self.concat);
         let _ = gpu.free_tensor(self.cur);
-        let _ = gpu.free_tensor(self.residual);
         let _ = gpu.free_tensor(self.tmp);
-        let _ = gpu.free_tensor(self.q_full);
-        let _ = gpu.free_tensor(self.q);
-        let _ = gpu.free_tensor(self.gate);
         let _ = gpu.free_tensor(self.k);
         let _ = gpu.free_tensor(self.v);
-        let _ = gpu.free_tensor(self.attn_out);
-        let _ = gpu.free_tensor(self.o);
-        let _ = gpu.free_tensor(self.gate_ffn);
-        let _ = gpu.free_tensor(self.up);
-        let _ = gpu.free_tensor(self.ffn_hidden);
-        let _ = gpu.free_tensor(self.ffn_out);
-        let _ = gpu.free_tensor(self.t_mtp_outs);
+        if !self.prompt_fill_only {
+            let _ = gpu.free_tensor(self.residual);
+            let _ = gpu.free_tensor(self.q_full);
+            let _ = gpu.free_tensor(self.q);
+            let _ = gpu.free_tensor(self.gate);
+            let _ = gpu.free_tensor(self.attn_out);
+            let _ = gpu.free_tensor(self.o);
+            let _ = gpu.free_tensor(self.gate_ffn);
+            let _ = gpu.free_tensor(self.up);
+            let _ = gpu.free_tensor(self.ffn_hidden);
+            let _ = gpu.free_tensor(self.ffn_out);
+            let _ = gpu.free_tensor(self.t_mtp_outs);
+        }
         let _ = gpu.free_tensor(self.positions);
     }
 }
@@ -2322,8 +2546,8 @@ impl Qwen35MtpHeadBatchedScratch {
 /// projections. M is the OUTPUT row count, K is the input dim. Each batch
 /// row `i` reads `x[i * k..(i+1) * k]` and writes `y[i * m..(i+1) * m]`.
 ///
-/// Reuses the same kernels the trunk's prefill batch + lm_head batched paths
-/// use (no new kernels).
+/// Incumbent routes are unchanged unless this is an eh/wk/wv fast-fill
+/// projection: eligible MQ4-v1 on gfx1201 then uses the exact PM GEMM.
 fn weight_gemm_batched(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -2331,6 +2555,7 @@ fn weight_gemm_batched(
     y_batched: &GpuTensor,
     n: usize,
     rotated_x_scratch: Option<&GpuTensor>,
+    fast_fill: bool,
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(&w.buf, x_batched, y_batched, w.m, w.k, n),
@@ -2339,7 +2564,10 @@ fn weight_gemm_batched(
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
             let rot = rotated_x_scratch.expect("MQ4 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
-            gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
+            hipfire_dispatch::families::gemm::run_mtp_fill_mq4(
+                gpu, &w.buf, rot, y_batched, w.m, w.k, n,
+                fast_fill && mtp_fill_pm_gemm_enabled(),
+            )
         }
         DType::MQ4G256V2 => {
             let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
@@ -2510,6 +2738,14 @@ pub fn mtp_head_forward_block_batched(
         );
     }
 
+    // Lean prompt-fill scratch owns only the buffers the fast kv_only path
+    // touches; refuse any other use before a sentinel view can be dereferenced.
+    let fast_fill = kv_only && mtp_fill_fast_enabled();
+    assert!(
+        !scratch.prompt_fill_only || fast_fill,
+        "lean prompt-fill scratch requires kv_only && HIPFIRE_MTP_FILL_FAST"
+    );
+
     // Reuse the raw i32 positions buffer for token ids during embedding, then
     // overwrite it with absolute positions before RoPE/KV writes.
     let token_bytes =
@@ -2553,21 +2789,46 @@ pub fn mtp_head_forward_block_batched(
 
     // ── 3. Build concat = [e_norm | h_norm] per slot ─────────────────────
     // Layout: concat[i] = [e_norm[i, 0..dim], h_norm[i, 0..dim]] (length 2*dim).
-    for i in 0..n {
-        gpu.hip.memcpy_dtod_at(
+    if fast_fill {
+        // Two pitched D2D copies replace the 2n per-row copies: e_norm rows go
+        // to concat[:, 0..dim], h_norm rows to concat[:, dim..2*dim].
+        gpu.memcpy_dtod_2d_at_ordered_async(
             &scratch.concat.buf,
-            i * 2 * dim_bytes,
+            0,
+            2 * dim_bytes,
             &scratch.e_norm.buf,
-            i * dim_bytes,
+            0,
             dim_bytes,
+            dim_bytes,
+            n,
         )?;
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_2d_at_ordered_async(
             &scratch.concat.buf,
-            i * 2 * dim_bytes + dim_bytes,
-            &scratch.h_norm.buf,
-            i * dim_bytes,
             dim_bytes,
+            2 * dim_bytes,
+            &scratch.h_norm.buf,
+            0,
+            dim_bytes,
+            dim_bytes,
+            n,
         )?;
+    } else {
+        for i in 0..n {
+            gpu.hip.memcpy_dtod_at(
+                &scratch.concat.buf,
+                i * 2 * dim_bytes,
+                &scratch.e_norm.buf,
+                i * dim_bytes,
+                dim_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &scratch.concat.buf,
+                i * 2 * dim_bytes + dim_bytes,
+                &scratch.h_norm.buf,
+                i * dim_bytes,
+                dim_bytes,
+            )?;
+        }
     }
 
     // cur = eh_proj @ concat (per-slot). w.eh_proj has m=n_embd, k=2*n_embd.
@@ -2580,52 +2841,97 @@ pub fn mtp_head_forward_block_batched(
         &cur_view,
         n,
         rotated_x_scratch,
+        fast_fill,
     )?;
 
-    // Save residual (inpSA) for the post-attn add.
-    gpu.hip
-        .memcpy_dtod_at(&scratch.residual.buf, 0, &scratch.cur.buf, 0, n * dim_bytes)?;
+    // Save residual (inpSA) for the post-attn add. kv_only returns before the
+    // post-attn add, so fast_fill skips it.
+    if !fast_fill {
+        gpu.hip
+            .memcpy_dtod_at(&scratch.residual.buf, 0, &scratch.cur.buf, 0, n * dim_bytes)?;
+    }
 
     // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
     let tmp_view = scratch.tmp.sub_offset(0, n * dim);
     gpu.rmsnorm_batched(&cur_view, &w.attn_norm, &tmp_view, n, dim, cfg.rms_norm_eps)?;
 
-    // wq emits 2 * q_dim per slot.
-    let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
-    weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch)?;
+    // wq emits 2 * q_dim per slot. fast_fill (kv_only) never consumes Q/gate,
+    // so the wq GEMM, deinterleave and per-head Q norm are skipped. Lean
+    // prompt-fill scratch borrows one-element sentinels for q, so no full
+    // n*q_dim view may be formed from it: fast_fill uses a one-element valid
+    // pointer, and the full q_full/q/gate views exist only inside !fast_fill.
+    let q_view = if fast_fill {
+        scratch.q.sub_offset(0, 1)
+    } else {
+        scratch.q.sub_offset(0, n * q_dim)
+    };
+    if !fast_fill {
+        let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
+        let gate_view = scratch.gate.sub_offset(0, n * q_dim);
+        weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch, false)?;
 
-    // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
-    let q_view = scratch.q.sub_offset(0, n * q_dim);
-    let gate_view = scratch.gate.sub_offset(0, n * q_dim);
-    gpu.deinterleave_f32_batched(
-        &q_full_view,
-        &q_view,
-        &gate_view,
-        cfg.n_head,
-        cfg.head_dim,
-        n,
-    )?;
+        // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
+        gpu.deinterleave_f32_batched(
+            &q_full_view,
+            &q_view,
+            &gate_view,
+            cfg.n_head,
+            cfg.head_dim,
+            n,
+        )?;
 
-    // attn_q_norm: per-head normalization of Q.
-    // rmsnorm_batched treats `batch` as "rows of length n", and gates the
-    // single norm-weight broadcast across all rows. For per-head norm here,
-    // each Q row is `n_head` heads of length `head_dim`, so we want
-    // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
-    // per-head q_norm at qwen35.rs.
-    gpu.rmsnorm_batched(
-        &q_view,
-        &w.attn_q_norm,
-        &q_view,
-        n * cfg.n_head,
-        cfg.head_dim,
-        cfg.rms_norm_eps,
-    )?;
+        // attn_q_norm: per-head normalization of Q.
+        // rmsnorm_batched treats `batch` as "rows of length n", and gates the
+        // single norm-weight broadcast across all rows. For per-head norm here,
+        // each Q row is `n_head` heads of length `head_dim`, so we want
+        // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
+        // per-head q_norm at qwen35.rs.
+        gpu.rmsnorm_batched(
+            &q_view,
+            &w.attn_q_norm,
+            &q_view,
+            n * cfg.n_head,
+            cfg.head_dim,
+            cfg.rms_norm_eps,
+        )?;
+    }
 
     // K, V projections.
     let k_view = scratch.k.sub_offset(0, n * kv_dim);
     let v_view = scratch.v.sub_offset(0, n * kv_dim);
-    weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch)?;
-    weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?;
+    weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch, fast_fill)?;
+    // fast_fill: wk and wv share input tmp_view; when both are plain MQ4G256
+    // (no AWQ sidecar, same k) the rotation wk just wrote into rotated_x_scratch
+    // is bit-identical to what wv would recompute, so reuse it.
+    match rotated_x_scratch {
+        Some(rot)
+            if fast_fill
+                && w.wk.gpu_dtype == DType::MQ4G256
+                && w.wv.gpu_dtype == DType::MQ4G256
+                && w.wk.awq_scale.is_none()
+                && w.wv.awq_scale.is_none()
+                && w.wk.k == w.wv.k =>
+        {
+            if mtp_fill_pm_gemm_enabled() && gpu.arch == "gfx1201" {
+                hipfire_dispatch::families::gemm::run_mtp_fill_mq4(
+                    gpu, &w.wv.buf, rot, &v_view, w.wv.m, w.wv.k, n, true,
+                )?;
+            } else {
+                crate::qwen35::prefill::run_plain_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+                    &w.wv.buf,
+                    w.wv.gpu_dtype,
+                    rot,
+                    &v_view,
+                    w.wv.m,
+                    w.wv.k,
+                    n,
+                )?;
+            }
+        }
+        _ => weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch, fast_fill)?,
+    }
     gpu.rmsnorm_batched(
         &k_view,
         &w.attn_k_norm,
@@ -2636,11 +2942,13 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
+    // fast_fill (kv_only): Q is never consumed (return follows the K/V cache
+    // writes), so rope runs with zero Q heads over the same valid q_view.
     gpu.rope_partial_interleaved_f32_batched(
         &q_view,
         &k_view,
         &scratch.positions,
-        cfg.n_head,
+        if fast_fill { 0 } else { cfg.n_head },
         cfg.n_head_kv,
         cfg.head_dim,
         cfg.n_rot,
@@ -2676,6 +2984,10 @@ pub fn mtp_head_forward_block_batched(
     if kv_only {
         return Ok(());
     }
+
+    // Only the !fast_fill path reaches here (fast_fill implies kv_only).
+    // Lean scratch never gets here: it is guarded to fast kv_only above.
+    let gate_view = scratch.gate.sub_offset(0, n * q_dim);
 
     // attn_out = V (self-only attention with 1 key collapses softmax to 1).
     // V layout = [n × n_head_kv × head_dim]; attn_out layout = [n × n_head × head_dim].
@@ -2717,7 +3029,7 @@ pub fn mtp_head_forward_block_batched(
 
     // ── 8. Output projection + residual ──────────────────────────────────
     let o_view = scratch.o.sub_offset(0, n * dim);
-    weight_gemm_batched(gpu, &w.wo, &attn_out_view, &o_view, n, rotated_x_scratch)?;
+    weight_gemm_batched(gpu, &w.wo, &attn_out_view, &o_view, n, rotated_x_scratch, false)?;
     let res_view = scratch.residual.sub_offset(0, n * dim);
     gpu.add_inplace_f32(&o_view, &res_view)?;
 
@@ -2744,8 +3056,9 @@ pub fn mtp_head_forward_block_batched(
                 &gate_ffn_view,
                 n,
                 rotated_x_scratch,
+                false,
             )?;
-            weight_gemm_batched(gpu, &ffn.up, &tmp_view, &up_view, n, rotated_x_scratch)?;
+            weight_gemm_batched(gpu, &ffn.up, &tmp_view, &up_view, n, rotated_x_scratch, false)?;
             gpu.silu_mul_f32(&gate_ffn_view, &up_view, &ffn_hidden_view)?;
             weight_gemm_batched(
                 gpu,
@@ -2754,6 +3067,7 @@ pub fn mtp_head_forward_block_batched(
                 &ffn_out_view,
                 n,
                 rotated_x_scratch,
+                false,
             )?;
             gpu.add_inplace_f32(&ffn_out_view, &o_view)?;
         }
@@ -2811,5 +3125,104 @@ mod sidecar_probe_tests {
             "absent sidecars must miss"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod prompt_fill_budget_tests {
+    use super::*;
+
+    /// Fixture-backed 27B MTP head dimensions (D=5120, Q=6144, KV=1024, F=17408).
+    fn cfg_27b() -> Qwen35MtpHeadConfig {
+        Qwen35MtpHeadConfig {
+            n_embd: 5120,
+            n_head: 24,
+            n_head_kv: 4,
+            head_dim: 256,
+            n_ff: 17408,
+            ffn_kind: Qwen35MtpFfnKind::Dense,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            norm_topk_prob: false,
+            vocab_size: 248320,
+            rope_theta: 10_000_000.0,
+            n_rot: 64,
+            rms_norm_eps: 1e-6,
+            max_seq: 16384,
+            tie_word_embeddings: false,
+        }
+    }
+
+    const LEGACY_K: usize = 17408; // max(2*dim, n_ff, dim, q_dim)
+    const FILL_K: usize = 10240; // 2 * dim
+
+    fn rows(legacy: usize, trunk_max: usize, prompt: usize) -> usize {
+        Qwen35MtpHeadBatchedScratch::prompt_fill_rows_for_budget(
+            &cfg_27b(),
+            legacy,
+            trunk_max,
+            prompt,
+            LEGACY_K,
+            FILL_K,
+        )
+    }
+
+    #[test]
+    fn byte_models_match_per_row_widths() {
+        let c = cfg_27b();
+        assert_eq!(
+            Qwen35MtpHeadBatchedScratch::full_requested_bytes(&c, 512),
+            512 * 565_252
+        );
+        assert_eq!(
+            Qwen35MtpHeadBatchedScratch::lean_requested_bytes(&c, 512)
+                + Qwen35MtpHeadBatchedScratch::rotation_requested_bytes(512, FILL_K),
+            512 * 192_516
+        );
+    }
+
+    #[test]
+    fn default_caps_are_1688_and_1264() {
+        assert_eq!(rows(512, 8192, 16_059), 1688);
+        assert_eq!(rows(384, 8192, 16_059), 1264);
+    }
+
+    #[test]
+    fn cap_is_clamped_by_trunk_chunk_and_prompt() {
+        assert_eq!(rows(512, 1000, 16_059), 1000);
+        assert_eq!(rows(512, 8192, 1500), 1500);
+        assert_eq!(rows(384, 8192, 1264), 1264);
+        assert_eq!(rows(384, 8192, 1265), 1264);
+    }
+
+    #[test]
+    fn short_prompts_keep_their_own_length() {
+        // Alignment applies to the budget capacity before the prompt clamp.
+        assert_eq!(rows(512, 8192, 0), 0);
+        assert_eq!(rows(512, 8192, 1), 1);
+        assert_eq!(rows(512, 8192, 2), 2);
+        assert_eq!(rows(512, 8192, 9), 9);
+        assert_eq!(rows(384, 8192, 9), 9);
+    }
+
+    #[test]
+    fn requested_bytes_never_exceed_legacy_budget() {
+        let c = cfg_27b();
+        for legacy in [1usize, 7, 8, 64, 384, 512, 1024] {
+            let budget = Qwen35MtpHeadBatchedScratch::full_requested_bytes(&c, legacy)
+                + Qwen35MtpHeadBatchedScratch::rotation_requested_bytes(legacy, LEGACY_K);
+            for prompt in [1usize, 2, 9, 383, 1264, 1688, 4096, 16_059] {
+                let r = rows(legacy, 8192, prompt);
+                assert!(r >= 1 && r <= prompt.min(8192), "legacy={legacy} prompt={prompt} r={r}");
+                let used = Qwen35MtpHeadBatchedScratch::lean_requested_bytes(&c, r)
+                    + Qwen35MtpHeadBatchedScratch::rotation_requested_bytes(r, FILL_K);
+                assert!(
+                    used <= budget,
+                    "legacy={legacy} prompt={prompt} rows={r}: {used} > {budget}"
+                );
+            }
+        }
     }
 }

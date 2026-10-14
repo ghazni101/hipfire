@@ -281,7 +281,11 @@ pub fn build_speculator(
         if eviction_is_none && matches!(arch_id, 5 | 6) {
             let max_n = spec
                 .mtp_k
-                .unwrap_or(hipfire_runtime::config::get().mtp_k)
+                .unwrap_or(
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT),
+                )
                 .clamp(1, 10);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(

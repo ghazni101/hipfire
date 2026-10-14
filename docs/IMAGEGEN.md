@@ -22,7 +22,7 @@ crate-level details (modules, A/B env flags, gate bars) are in
 ## Quick start
 
 Five commands from a clean checkout to a first image (Klein 4B, the smaller
-model; about 20 minutes, most of it the download):
+model; the download dominates the time):
 
 ```bash
 cargo build --release
@@ -47,9 +47,10 @@ tests and what to do when something fails.
 - An RDNA3 or RDNA3.5 GPU with the ROCm HIP runtime installed. hipfire
   `dlopen`s HIP at run time, so the build needs no ROCm. RDNA4 (gfx12) is
   refused at load: the FLUX kernels use the gfx11 wave32 WMMA intrinsics.
-  Measured: gfx1151 (Radeon 8060S, unified memory; FLUX.1 schnell and
-  Klein), gfx1150 (Radeon 890M, Klein only), gfx1100 (RX 7900 XT: kernels
-  pass, FLUX.1 schnell does not fit in 24 GB — see § 10).
+  Hardware seen to run it (historical characterization, measurement dates
+  not recorded; not an admission): gfx1151 (Radeon 8060S, unified memory;
+  FLUX.1 schnell and Klein), gfx1150 (Radeon 890M, Klein only), gfx1100
+  (RX 7900 XT: kernels pass, FLUX.1 schnell does not fit in 24 GB — see § 10).
 - Rust stable and disk for the pipe plus its packs: about 90 GB for FLUX.1
   schnell (54 GB pipe + 34 GB packs), 30 GB for Klein 4B.
 - `huggingface-cli` (or any HF download tool) for the weights.
@@ -87,8 +88,9 @@ FLUX.1 dev is gated and non-commercial; the same commands work on its pipe.
 The packer is CPU-only. It converts the weights to F16 (bias, scale and
 norm statistics stay F32) and embeds each component's config, the scheduler
 config and the tokenizers in the pack headers, so the pipe directory is not
-needed after this step. Measured on a 32-core box: about 25 minutes for
-FLUX.1 schnell, 12 minutes for Klein 4B.
+needed after this step. Historical characterization (one 32-core CPU host,
+measurement date not recorded, no current claim): about 25 minutes for
+FLUX.1 schnell and 12 minutes for Klein 4B.
 
 ```bash
 ./target/release/hipfire-quantize --flux-pipe ~/models/flux-schnell-pipe --output ~/models/flux-schnell.hfq
@@ -115,6 +117,17 @@ expect it to take longer than the numbers below.
 The JSON result names the file, size, seed, steps and wall time. The same
 seed gives a byte-identical PNG on the same GPU.
 
+Flag defaults, from the CLI and daemon: `--width` / `--height` default to
+1024 for plain txt2img (with `--image`, the reference image's own size) and
+must be at most 8192; `--steps` defaults to the architecture default (4 for
+schnell, 28 for dev, 4 for Klein) and must be 1 to 128; `--seed` defaults to
+0; `--out` defaults to `hipfire-<seed>.png` in the working directory;
+`--image` is repeatable up to 4 times and needs a Klein (arch 45) pack. A
+model argument that is a registry tag (`flux.schnell:1`) is pulled first
+when it is not already local. `--backend gpu|cpu` picks the transformer
+forward; the default is `gpu` when a GPU is available. `cpu` is the f32
+reference oracle and takes minutes per step at real geometry.
+
 Klein txt2img and reference edit (`--image` must come before the prompt):
 
 ```bash
@@ -124,7 +137,9 @@ Klein txt2img and reference edit (`--image` must come before the prompt):
   "make the bicycle blue" --out bike-blue.png
 ```
 
-Measured on gfx1151 at 512x512, 4 steps, after warm-up:
+Historical characterization, not a current performance claim: one gfx1151
+unified-memory host, f16 packs, 512x512, 4 steps, `hipfire img`, after
+warm-up; measurement date not recorded, not a default or a floor.
 
 | Model | Wall time |
 |---|---:|
@@ -141,15 +156,20 @@ curl -s -X POST http://127.0.0.1:11580/v1/images/generations \
   | jq -r '.data[0].b64_json' | base64 -d > lighthouse.png
 ```
 
-`n` must be 1 and `response_format` must be `b64_json`. Malformed bodies
-return 400 with a message; a text model on this endpoint, or a diffusion model
-on `/v1/chat/completions`, is refused.
+`n` must be 1 and `response_format` must be `b64_json`. Besides `size`, the
+body accepts `width` / `height`, `steps`, `seed` and `backend`; `model` is
+only echoed, because the model must already be loaded (`--model` above). An
+`images` field is refused (use `/v1/images/edits`), as is `negative_prompt`
+and any `sampler` other than `euler`. Malformed bodies return 400 with a
+message; a text model on this endpoint, or a diffusion model on
+`/v1/chat/completions`, is refused.
 
-Reference edit over HTTP is the OpenAI multipart route (Klein pack loaded):
+Reference edit over HTTP is the OpenAI multipart route (Klein pack loaded;
+one to four `image` parts):
 
 ```bash
 curl -s -X POST http://127.0.0.1:11580/v1/images/edits \
-  -F image=.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
+  -F image=@bike.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
   | jq -r .data[0].b64_json | base64 -d > bike-blue.png
 ```
 
@@ -208,7 +228,8 @@ the table in the crate README lists them.
 
 ## 9. Known limits
 
-- One image per request; `euler` (flow-match) is the only sampler.
+- One image per request; `euler` (flow-match) is the only sampler, and
+  `negative_prompt` is refused (no CFG pass).
 - FLUX.1 runs f16 activations by default (`HIPFIRE_FLUX_F16_ACT=0` for f32).
 - Width and height must be multiples of 16: the VAE factor is 8 and the
   latent is packed in 2x2 patches. Klein never upscales a reference image;
@@ -218,6 +239,9 @@ the table in the crate README lists them.
   gates start from the fixture's captured init latent for that reason.
 - The `flux.schnell:1` registry entry points at the public `elphil/flux` Hub
   repo (Apache-2.0); `hipfire pull flux.schnell:1` fetches the packs directly.
+  `flux.dev:1` is a local-only placeholder (the dev weights cannot be
+  redistributed), and there is no Klein registry entry: pack Klein locally
+  with `hipfire-quantize --flux-pipe` (section 4).
 
 ## 10. Troubleshooting
 
@@ -232,6 +256,7 @@ the table in the crate README lists them.
   before you read any timing.
 - Out of device memory on FLUX.1 — the T5 and CLIP encoders fall back to
   the host (slow, correct), but the transformer itself needs about 24.3 GB
-  resident (23.8 GB f16 weights + row padding + activations), so a 24 GB
-  card (RX 7900 XT/XTX) fails at the first activation alloc. FLUX.1 needs a
-  unified-memory APU (Strix Halo) or a 32 GB+ RDNA3 card; Klein 4B fits.
+  resident (23.8 GB f16 weights + row padding + activations), so a card with
+  24 GB or less (RX 7900 XT/XTX) fails at the first activation alloc. FLUX.1
+  needs a unified-memory APU (Strix Halo) or a 32 GB+ RDNA3 card; Klein 4B
+  fits.

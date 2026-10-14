@@ -1022,7 +1022,7 @@
     {
      "module": "kv_cache_write_fp8_e4m3_batched",
      "kind": "hip",
-     "sha256": "2bc1f18954c5a0cf43e4cf3b915822319ab06004cf6e3782d550b76e116a7221",
+     "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1307,9 +1307,45 @@
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
      ]
+    },
+    {
+     "module": "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+     "kind": "hip",
+     "sha256": "9e2a7f3f2fb9d3c43a18115baa1f957bfd05aff8357e1dc566e5740e3e375183",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"
+     ]
+    },
+    {
+     "module": "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab",
+     "kind": "hip",
+     "sha256": "0c80aaabd4e595f17203376e8e67d12a4890fdef82c73ebdf10121ff0d9431f6",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"
+     ]
     }
    ],
-   "symbol_count": 115
+   "symbol_count": 117
   },
   "native_mtp": {
    "entries": [
@@ -2585,7 +2621,7 @@
     {
      "module": "kv_cache_write_fp8_e4m3_batched",
      "kind": "hip",
-     "sha256": "2bc1f18954c5a0cf43e4cf3b915822319ab06004cf6e3782d550b76e116a7221",
+     "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2639,7 +2675,7 @@
     {
      "module": "kv_cache_write_q8_0_batched",
      "kind": "hip",
-     "sha256": "0ff7afcc1d83c0d2378d8332278c530e9a0dd66d48f415d52703aea6ee5dae82",
+     "sha256": "b282e1815bd1a0b7c88d4f474fbf2c88536cc6608eed68dd6d01573f59dd0317",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -3014,9 +3050,55 @@
       "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
       "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"
      ]
+    },
+    {
+     "module": "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+     "kind": "hip",
+     "sha256": "9e2a7f3f2fb9d3c43a18115baa1f957bfd05aff8357e1dc566e5740e3e375183",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201"
+     ]
+    },
+    {
+     "module": "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab",
+     "kind": "hip",
+     "sha256": "0c80aaabd4e595f17203376e8e67d12a4890fdef82c73ebdf10121ff0d9431f6",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab"
+     ]
+    },
+    {
+     "module": "gemm_hfq4g256_rows_pm",
+     "kind": "embedded",
+     "sha256": "797358d9320e112003efdfa3ebc7ba684323f7d2b754bc569bfa9207e8b084c7",
+     "flags": null,
+     "scheduler_profile": null,
+     "symbols": [
+      "gemm_hfq4g256_rows_pm"
+     ]
     }
    ],
-   "symbol_count": 138,
+   "symbol_count": 141,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
@@ -3030,6 +3112,7 @@
     "fused_qk_l2_norm_scale_interleave_f32_batched",
     "gated_delta_net_q8_fast_ml",
     "gemm_hfq4g256",
+    "gemm_hfq4g256_rows_pm",
     "gemv_hfq4g256",
     "gemv_hfq4g256_multirow_default",
     "greedy_accept",
@@ -3762,7 +3845,7 @@
     "module": "kv_cache_write_fp8_e4m3_batched",
     "symbol": "kv_cache_write_fp8_e4m3_batched",
     "kind": "hip",
-    "sha256": "2bc1f18954c5a0cf43e4cf3b915822319ab06004cf6e3782d550b76e116a7221",
+    "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -5004,7 +5087,7 @@
     "module": "kv_cache_write_fp8_e4m3_batched",
     "symbol": "kv_cache_write_fp8_e4m3_batched",
     "kind": "hip",
-    "sha256": "2bc1f18954c5a0cf43e4cf3b915822319ab06004cf6e3782d550b76e116a7221",
+    "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -5036,7 +5119,7 @@
     "module": "kv_cache_write_q8_0_batched",
     "symbol": "kv_cache_write_q8_0_batched",
     "kind": "hip",
-    "sha256": "0ff7afcc1d83c0d2378d8332278c530e9a0dd66d48f415d52703aea6ee5dae82",
+    "sha256": "b282e1815bd1a0b7c88d4f474fbf2c88536cc6608eed68dd6d01573f59dd0317",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",

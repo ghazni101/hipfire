@@ -6,8 +6,8 @@
 // tile 128, full causal). One 256-thread workgroup per (kv head, tile)
 // serves all six q heads of its kv head, so each K/V tile is read from
 // memory once instead of once per q head. At entry every thread issues its
-// whole share of the tile's Q, V rows and K codes/scales, so the tile is in
-// flight before the first dot product.
+// whole share of Q, the first 64-key V slab and K codes/scales. The second V
+// slab reuses LDS after the first slab's readers finish.
 //
 // Output is byte-identical to `attention_flash_q8_0_tile` (same
 // `[n_heads, max_tiles, 2 + head_dim]` f32 partials, consumed unchanged by
@@ -46,8 +46,9 @@
 #define GQA_SEG (GQA_HD / 32 * GQA_BLK)
 // Each wave scores 16 keys, two per pass (one per 16-lane row).
 #define GQA_PASSES (GQA_TILE / GQA_WAVES / 2)
-// V bytes staged per thread: 128 segments x 272 B / 256 threads = 17 x 8 B.
-#define GQA_V_CHUNKS (GQA_TILE * GQA_SEG / 8 / GQA_THREADS)
+// Stage 64 V segments at a time; the final per-thread chunk is guarded.
+#define GQA_V_TILE 64
+#define GQA_V_CHUNKS ((GQA_V_TILE * GQA_SEG / 8 + GQA_THREADS - 1) / GQA_THREADS)
 // Q floats staged per thread: 6 heads x 256 / 256 threads = 3 x float2.
 #define GQA_Q_CHUNKS (GQA_GROUP * GQA_HD / 2 / GQA_THREADS)
 
@@ -166,6 +167,7 @@ __device__ __forceinline__ void gqa_tile(
 #pragma unroll
     for (int i = 0; i < GQA_V_CHUNKS; ++i) {
         const int c = tid + GQA_THREADS * i;
+        if (c >= GQA_V_TILE * GQA_SEG / 8) continue;
         const int seg = c / (GQA_SEG / 8);
         const int col = c - seg * (GQA_SEG / 8);
         const unsigned voff = (unsigned)min(seg, tile_len - 1) * row_stride + head_off + 8u * (unsigned)col;
@@ -194,7 +196,10 @@ __device__ __forceinline__ void gqa_tile(
 #pragma unroll
     for (int i = 0; i < GQA_Q_CHUNKS; ++i) ((float2*)q_lds)[tid + GQA_THREADS * i] = qv[i];
 #pragma unroll
-    for (int i = 0; i < GQA_V_CHUNKS; ++i) *(uint2*)(v_lds + 2 * (tid + GQA_THREADS * i)) = vr[i];
+    for (int i = 0; i < GQA_V_CHUNKS; ++i) {
+        const int c = tid + GQA_THREADS * i;
+        if (c < GQA_V_TILE * GQA_SEG / 8) *(uint2*)(v_lds + 2 * c) = vr[i];
+    }
     __syncthreads();
 
     // ── Scores: two keys per pass (one per 16-lane row); heads in two
@@ -240,20 +245,43 @@ __device__ __forceinline__ void gqa_tile(
     const unsigned char* vb = (const unsigned char*)v_lds;
     const float* ws = sc + 3 * g * GQA_TILE;
     float acc[3][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
-    int t = 0;
-    for (; t + 3 < tile_len; t += 4) {
-        float4 w4[3];
+    for (int vstart = 0; vstart < tile_len; vstart += GQA_V_TILE) {
+        const int vend = min(tile_len, vstart + GQA_V_TILE);
+        if (vstart != 0) {
+            __syncthreads(); // all prior-slab readers finish before refill
 #pragma unroll
-        for (int j = 0; j < 3; ++j) w4[j] = *(const float4*)(ws + j * GQA_TILE + t);
+            for (int i = 0; i < GQA_V_CHUNKS; ++i) {
+                const int c = tid + GQA_THREADS * i;
+                if (c >= GQA_V_TILE * GQA_SEG / 8) continue;
+                const int seg = c / (GQA_SEG / 8);
+                const int col = c - seg * (GQA_SEG / 8);
+                const unsigned voff = (unsigned)(vstart + min(seg, tile_len - vstart - 1)) * row_stride + head_off + 8u * (unsigned)col;
+                const auto w = __builtin_amdgcn_raw_buffer_load_b64(v_rsrc, voff, 0, 0);
+                vr[i] = make_uint2(w[0], w[1]);
+            }
+
 #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const float w[3] = {w4[0][k], w4[1][k], w4[2][k]};
-            gqa_accum_key(vb + (t + k) * GQA_SEG, soff, coff, w, acc);
+            for (int i = 0; i < GQA_V_CHUNKS; ++i) {
+                const int c = tid + GQA_THREADS * i;
+                if (c < GQA_V_TILE * GQA_SEG / 8) *(uint2*)(v_lds + 2 * c) = vr[i];
+            }
+            __syncthreads(); // all refill stores visible before accumulation
         }
-    }
-    for (; t < tile_len; ++t) {
-        const float w[3] = {ws[t], ws[GQA_TILE + t], ws[2 * GQA_TILE + t]};
-        gqa_accum_key(vb + t * GQA_SEG, soff, coff, w, acc);
+        int t = vstart;
+        for (; t + 3 < vend; t += 4) {
+            float4 w4[3];
+#pragma unroll
+            for (int j = 0; j < 3; ++j) w4[j] = *(const float4*)(ws + j * GQA_TILE + t);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float w[3] = {w4[0][k], w4[1][k], w4[2][k]};
+                gqa_accum_key(vb + (t - vstart + k) * GQA_SEG, soff, coff, w, acc);
+            }
+        }
+        for (; t < vend; ++t) {
+            const float w[3] = {ws[t], ws[GQA_TILE + t], ws[2 * GQA_TILE + t]};
+            gqa_accum_key(vb + (t - vstart) * GQA_SEG, soff, coff, w, acc);
+        }
     }
     const int d = 2 * pc;
 #pragma unroll
@@ -292,7 +320,7 @@ __global__ void attention_flash_q8_0_tile_gqa_gfx1100(
     const int max_tiles = (max_seq + GQA_TILE - 1) / GQA_TILE;
     const int n_tiles = min((seq_len + GQA_TILE - 1) / GQA_TILE, max_tiles);
 
-    __shared__ __attribute__((aligned(16))) unsigned int v_lds[GQA_TILE * GQA_SEG / 4];
+    __shared__ __attribute__((aligned(16))) unsigned int v_lds[GQA_V_TILE * GQA_SEG / 4];
     __shared__ __attribute__((aligned(16))) float sc[GQA_GROUP * GQA_TILE];
     __shared__ __attribute__((aligned(16))) float q_lds[GQA_GROUP * GQA_HD];
 

@@ -4,7 +4,8 @@
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const PATH: &str = "/sys/bus/pci/devices/0000:bf:00.0/gpu_metrics";
+/// `gpu_metrics` of the Halo iGPU (`railgun::npu::fclk::igpu_pci`, env `NPU_IGPU_PCI`).
+pub fn path() -> String { format!("/sys/bus/pci/devices/{}/gpu_metrics", railgun::npu::fclk::igpu_pci()) }
 pub const COLS: &str = "real_ns sysclk dram_rd dram_wr ipu_rd ipu_wr ipu_busy0 ipu_busy1 ipu_busy2 ipu_busy3 ipu_busy4 ipu_busy5 ipu_busy6 ipu_busy7 gfx_busy ipu_mW socket_mW gfxclk fclk ipuclk mpipuclk uclk";
 /// Decode format 3.0, naturally aligned 264-byte SMU table. The caller supplies
 /// realtime so offline fixtures and live sampling use exactly the same schema.
@@ -39,7 +40,8 @@ pub fn format(values: &[u64; 22]) -> String {
     line
 }
 fn sample() -> Result<[u64; 22], String> {
-    let data = std::fs::read(PATH).map_err(|e| format!("{PATH}: {e}"))?;
+    let path = path();
+    let data = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
     let real_ns = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
     let real_ns = u64::try_from(real_ns).map_err(|_| "realtime timestamp exceeds u64")?;
     decode(&data, real_ns)

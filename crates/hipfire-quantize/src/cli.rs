@@ -15,7 +15,9 @@ use clap::Parser;
     after_help = "SUBCOMMANDS:\n  ple-hot-rank  Rank Qwen4 PLE rows over a corpus and write the <model>.plehot \
                   hot-row sidecar (run `hipfire-quantize ple-hot-rank --help`)\n  \
                   ple-hot-pack  Cut the <model>.plehotrows hot-row pack from a model and its \
-                  .plehot sidecar (run `hipfire-quantize ple-hot-pack --help`)"
+                  .plehot sidecar (run `hipfire-quantize ple-hot-pack --help`)\n  \
+                  trunk-overlay  Build the <model>.trunk-overlay QT44 overlay sidecar for a base \
+                  model (run `hipfire-quantize trunk-overlay --help`)"
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is

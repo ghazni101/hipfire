@@ -5,7 +5,7 @@
 //!
 //! The kernels are precompiled into `native/gpu_bw_gfx1151.co` and loaded through the shared lazy
 //! HIP runtime (`railgun::npu::hip_runtime`, `dlopen` only); nothing here needs the ROCm compiler. The
-//! runtime selects PCI `0000:bf:00.0` before the module is loaded and the arch is gated to
+//! runtime selects the Halo iGPU (`railgun::npu::fclk::igpu_pci`, env `NPU_IGPU_PCI`, default `0000:bf:00.0`) before the module is loaded and the arch is gated to
 //! `gfx1151` before the (gfx1151-only) code object is touched. `HIP_VISIBLE_DEVICES` is not needed.
 //!
 //! Module symbols `read_bw` / `write_bw` take the same 32-byte kernarg blob: `ptr@0`, `count@8`
@@ -19,10 +19,11 @@
 //! sink is compared with CPU-computed per-thread four-lane XOR checksums of every loaded element
 //! (a checksum verification, not a byte-exact image of the source).
 
-use railgun::npu::hip_runtime::{HipBuffer, HipEvent, HipFunction, HipMemoryKind, HipRuntime};
+use railgun::npu::hip_runtime::{HipBuffer, HipEvent, HipFunction, HipMemoryKind, HipRuntime, HostRegistration};
+use railgun::npu::{Bo, Device};
+use std::ffi::c_void;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const PCI_BUS_ID: &str = "0000:bf:00.0";
 const ARCH: &str = "gfx1151";
 const CODE_OBJECT: &[u8] = include_bytes!("../native/gpu_bw_gfx1151.co");
 const THREADS: u32 = 256;
@@ -32,31 +33,36 @@ const ELEMENT: usize = 16;
 const DEFAULT_BYTES: usize = 1 << 30;
 const DEFAULT_ITERS: u32 = 10;
 
-const BACKINGS: [&str; 3] = ["vram", "vmm-host", "vmm-host-uncached"];
-const OPS: [&str; 2] = ["read", "write"];
+const BACKINGS: [&str; 7] = ["vram", "vmm-host", "vmm-host-uncached", "host-registered",
+    "host-registered-mapped", "host-registered-portable", "host-registered-userptr"];
+const OPS: [&str; 3] = ["read", "write", "copy"];
 
 const USAGE: &str = "\
 Usage: gpu-bw [--buf LIST] [--op LIST] [--bytes N] [--iters N]
-       gpu-bw --duration SECONDS --buf vram --op read [--bytes N]
+       gpu-bw --duration SECONDS --buf host-registered,vram --op read,write [--bytes N]
   --buf LIST  Comma-separated backings (default: all):
-              vram,vmm-host,vmm-host-uncached
-              vram: ordinary hipMalloc device memory (the reference; not NPU zero-copy).
-              vmm-host: hipMemCreate Pinned, host location; vmm-host-uncached:
-              hipMemAllocationTypeUncached, host location (ext-fine-grain pool).
-  --op LIST   read,write (default: both)
+              vram,vmm-host,vmm-host-uncached,host-registered,
+              host-registered-mapped,host-registered-portable,host-registered-userptr
+              vram: ordinary hipMalloc; vmm-host: pinned host VMM;
+              vmm-host-uncached: uncached host VMM.
+              host-registered: MAP_POPULATE anonymous pages, 2 MiB aligned, flags=0;
+              -mapped: flags=2; -portable: flags=3 (Portable | Mapped);
+              -userptr: flags=0, also pinned by an amdxdna userptr BO.
+  --op LIST   read,write,copy (default: all); copy traffic counts read + write bytes
   --bytes N   Bytes per buffer, positive multiple of 16 (default: 1073741824)
   --iters N   Timed launches after two warm-ups (default: 10)
-  --duration SECONDS  Background run; requires one backing and one op.
+  --duration SECONDS  Run each selected backing/op for this duration.
   --help      Show usage without making any HIP call.
-Verification (outside timing, on the CPU): write buffers are poisoned by a full CPU upload,
-launched, and compared byte-exact against a deterministic pattern before and after timing and
-after a final poisoned launch. Read sources get the full pattern uploaded and proven present;
-the per-thread sink is set to 0xA5 and compared with CPU-computed per-thread four-lane XOR
-checksums of all loaded elements (checksum verification, not full-byte-exact). Failure =>
+Verification (outside timing, on the CPU): write/copy destinations are poisoned by a full
+CPU upload, launched, and compared byte-exact against a deterministic pattern before and
+after timing and after a final poisoned launch. Copy sources are uploaded and proven present.
+Read sources get the full pattern uploaded and proven present; the per-thread sink is set to
+0xA5 and compared with CPU-computed per-thread four-lane XOR checksums of all loaded elements
+(checksum verification, not full-byte-exact). Failure =>
 verify_fail line and an error exit. Result rows carry verification=checksum (read) or
-verification=byte-exact (write). An unsupported allocation prints alloc_fail and continues;
+verification=byte-exact (write/copy). An unsupported allocation prints alloc_fail and continues;
 a run that completes nothing is an error.
-Device is selected by PCI bus ID 0000:bf:00.0 (gfx1151 only); HIP_VISIBLE_DEVICES is not needed.
+Device is selected by PCI bus ID $NPU_IGPU_PCI, default 0000:bf:00.0 (gfx1151 only); HIP_VISIBLE_DEVICES is not needed.
 GB/s = 1e9 bytes/s. Background timestamps are CLOCK_REALTIME nanoseconds.";
 
 // ---------------------------------------------------------------------------------------------
@@ -238,9 +244,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         iters: iters.unwrap_or(DEFAULT_ITERS),
         duration,
     };
-    if options.duration.is_some() && (options.backings.len() != 1 || options.ops.len() != 1) {
-        return Err("--duration requires exactly one --buf and one --op".to_string());
-    }
+    // Duration applies independently to each selected backing/op.
     Ok(options)
 }
 
@@ -276,6 +280,87 @@ fn verification_label(op: &str) -> &'static str {
     }
 }
 
+// Linux anonymous mmap, deliberately local to the probe: no new allocator/runtime API.
+unsafe extern "C" {
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+}
+struct Pages { ptr: *mut u8, len: usize }
+impl Pages {
+    fn new(bytes: usize) -> Result<Self, String> {
+        const ALIGN: usize = 2 << 20;
+        let len = bytes.checked_add(ALIGN - 1).ok_or("mmap size overflow")? & !(ALIGN - 1);
+        let reserve = len.checked_add(ALIGN).ok_or("mmap size overflow")?;
+        // PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS|POPULATE.
+        let raw = unsafe { mmap(std::ptr::null_mut(), reserve, 3, 0x8022, -1, 0) };
+        if raw as usize == usize::MAX { return Err(format!("mmap: {}", std::io::Error::last_os_error())); }
+        let aligned = (raw as usize + ALIGN - 1) & !(ALIGN - 1);
+        let prefix = aligned - raw as usize;
+        let suffix = reserve - prefix - len;
+        unsafe {
+            if prefix != 0 { munmap(raw, prefix); }
+            if suffix != 0 { munmap((aligned + len) as *mut c_void, suffix); }
+        }
+        Ok(Self { ptr: aligned as *mut u8, len })
+    }
+}
+impl Drop for Pages {
+    fn drop(&mut self) { unsafe { munmap(self.ptr.cast(), self.len); } }
+}
+enum Buffer {
+    Hip(HipBuffer),
+    // Field drop order: unpin both devices before unmapping; BO before its device fd.
+    Registered { reg: HostRegistration, _bo: Option<Bo>, _device: Option<Device>, pages: Pages },
+}
+impl Buffer {
+    fn allocate(rt: &HipRuntime, bytes: usize, backing: &str) -> Result<Self, String> {
+        if !backing.starts_with("host-registered") {
+            return rt.allocate(bytes, kind_for(backing)).map(Self::Hip);
+        }
+        let pages = Pages::new(bytes)?;
+        let device = if backing == "host-registered-userptr" { Some(Device::open()?) } else { None };
+        let bo = device.as_ref().map(|d| d.userptr_bo(pages.ptr, pages.len)).transpose()?;
+        let flags = match backing {
+            "host-registered-mapped" => 2,
+            "host-registered-portable" => 3,
+            _ => 0,
+        };
+        let reg = rt.register_host_flags(pages.ptr, pages.len, flags)?;
+        Ok(Self::Registered { reg, _bo: bo, _device: device, pages })
+    }
+    fn ptr(&self) -> u64 {
+        match self { Self::Hip(b) => b.ptr(), Self::Registered { reg, .. } => reg.ptr() }
+    }
+    fn upload(&self, rt: &HipRuntime, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Hip(b) => rt.upload(b, bytes),
+            Self::Registered { pages, .. } => {
+                rt.synchronize()?;
+                assert!(bytes.len() <= pages.len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), pages.ptr, bytes.len());
+                    railgun::npu::clflush(pages.ptr, bytes.len());
+                }
+                Ok(())
+            }
+        }
+    }
+    fn download(&self, rt: &HipRuntime, bytes: &mut [u8]) -> Result<(), String> {
+        match self {
+            Self::Hip(b) => rt.download(b, bytes),
+            Self::Registered { pages, .. } => {
+                rt.synchronize()?;
+                assert!(bytes.len() <= pages.len);
+                unsafe {
+                    railgun::npu::clflush(pages.ptr, bytes.len());
+                    std::ptr::copy_nonoverlapping(pages.ptr, bytes.as_mut_ptr(), bytes.len());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 struct Bench {
     rt: HipRuntime,
     read_fn: HipFunction,
@@ -291,6 +376,7 @@ struct Bench {
     host: Vec<u8>,
     sink_host: Vec<u8>,
     expected: Option<Vec<[u32; 4]>>,
+    copy_source: Option<Buffer>,
 }
 
 /// Why a verified step stopped: a verify mismatch is reported and the op skipped, a HIP error aborts.
@@ -306,29 +392,41 @@ impl From<String> for Stop {
 }
 
 impl Bench {
-    fn launch(&self, op: &str, buffer: &HipBuffer) -> Result<(), String> {
+    fn launch(&self, op: &str, buffer: &Buffer) -> Result<(), String> {
+        if op == "copy" {
+            return self.rt.copy_dtod(buffer.ptr(), self.copy_source.as_ref().ok_or("missing copy source")?.ptr(), self.bytes);
+        }
         let function = if op == "read" { &self.read_fn } else { &self.write_fn };
         let mut args = kernarg(buffer.ptr(), self.count as u64, self.sink.ptr(), self.total_threads as u64);
         self.rt.launch(function, self.blocks, THREADS, &mut args)
     }
 
-    fn launch_sync(&self, op: &str, buffer: &HipBuffer) -> Result<(), String> {
+    fn launch_sync(&self, op: &str, buffer: &Buffer) -> Result<(), String> {
         self.launch(op, buffer)?;
         self.rt.synchronize()
     }
 
-    fn download_host(&mut self, buffer: &HipBuffer) -> Result<(), String> {
-        self.rt.download(buffer, &mut self.host)
+    fn download_host(&mut self, buffer: &Buffer) -> Result<(), String> {
+        buffer.download(&self.rt, &mut self.host)
     }
 
     /// Op-specific initial state; the target is proven to hold it by readback.
-    fn init(&mut self, op: &str, buffer: &HipBuffer) -> Result<(), Stop> {
+    fn init(&mut self, op: &str, buffer: &Buffer) -> Result<(), Stop> {
+        if op == "copy" {
+            fill_pattern(&mut self.host);
+            let source = self.copy_source.as_ref().ok_or("missing copy source".to_string())?;
+            source.upload(&self.rt, &self.host)?;
+            self.host.fill(0);
+            source.download(&self.rt, &mut self.host)?;
+            let bad = pattern_mismatches(&self.host);
+            if bad != 0 { return Err(Stop::Verify { phase: "copy-source", mismatches: bad }); }
+        }
         if op == "read" {
             fill_pattern(&mut self.host);
         } else {
             fill_poison(&mut self.host);
         }
-        self.rt.upload(buffer, &self.host)?;
+        buffer.upload(&self.rt, &self.host)?;
         self.rt.synchronize()?;
         self.host.fill(0);
         self.download_host(buffer)?;
@@ -340,14 +438,14 @@ impl Bench {
     }
 
     /// Prepares the op's output so a no-op launch cannot pass: sink 0xA5 for read, poison for write.
-    fn poison_output(&mut self, op: &str, buffer: &HipBuffer, phase: &'static str) -> Result<(), Stop> {
+    fn poison_output(&mut self, op: &str, buffer: &Buffer, phase: &'static str) -> Result<(), Stop> {
         if op == "read" {
             self.rt.memset(&self.sink, SINK_FILL)?;
             self.rt.synchronize()?;
             return Ok(());
         }
         fill_poison(&mut self.host);
-        self.rt.upload(buffer, &self.host)?;
+        buffer.upload(&self.rt, &self.host)?;
         self.rt.synchronize()?;
         self.host.fill(0);
         self.download_host(buffer)?;
@@ -358,7 +456,7 @@ impl Bench {
         Ok(())
     }
 
-    fn verify(&mut self, op: &str, buffer: &HipBuffer, phase: &'static str) -> Result<(), Stop> {
+    fn verify(&mut self, op: &str, buffer: &Buffer, phase: &'static str) -> Result<(), Stop> {
         let bad = if op == "read" {
             if self.expected.is_none() {
                 self.expected = Some(expected_read(self.count, self.total_threads));
@@ -375,7 +473,7 @@ impl Bench {
         Ok(())
     }
 
-    fn timed_iteration(&self, op: &str, buffer: &HipBuffer) -> Result<f32, String> {
+    fn timed_iteration(&self, op: &str, buffer: &Buffer) -> Result<f32, String> {
         self.rt.record(&self.start)?;
         self.launch(op, buffer)?;
         self.rt.record(&self.stop)?;
@@ -388,14 +486,14 @@ impl Bench {
     }
 
     /// Runs one verified op on `buffer`; prints the result row on success.
-    fn run_op(&mut self, options: &Options, backing: &str, op: &str, buffer: &HipBuffer) -> Result<(), Stop> {
+    fn run_op(&mut self, options: &Options, backing: &str, op: &str, buffer: &Buffer) -> Result<(), Stop> {
         self.init(op, buffer)?;
         // Warm-up 1 is verified, warm-up 2 is unverified, as in the original tool.
         self.poison_output(op, buffer, "pre-poison")?;
         self.launch_sync(op, buffer)?;
         self.verify(op, buffer, "pre")?;
         self.launch_sync(op, buffer)?;
-        let traffic = self.bytes;
+        let traffic = self.bytes * if op == "copy" { 2 } else { 1 };
         if let Some(seconds) = options.duration {
             let wall_start = realtime_ns()?;
             println!("gpubw-bg start {wall_start}");
@@ -470,18 +568,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let options = parse_args(args)?;
 
-    let rt = HipRuntime::load_for_pci(PCI_BUS_ID)?;
+    let pci = railgun::npu::fclk::igpu_pci();
+    let rt = HipRuntime::load_for_pci(&pci)?;
     let arch = rt.device_arch()?;
     if arch != ARCH {
         return Err(format!(
-            "device {PCI_BUS_ID} reports arch {arch:?}; this gpu-bw code object is {ARCH}-only"
+            "device {pci} reports arch {arch:?}; this gpu-bw code object is {ARCH}-only"
         ));
     }
     let cus = rt.compute_units()?;
     if cus == 0 {
         return Err("device reports no compute units".to_string());
     }
-    println!("device gcnArchName={arch} pci={PCI_BUS_ID} CUs={cus}");
+    println!("device gcnArchName={arch} pci={pci} CUs={cus}");
 
     let blocks = cus.checked_mul(BLOCKS_PER_CU).ok_or("grid size overflows u32")?;
     let total_threads = usize::try_from(u64::from(blocks) * u64::from(THREADS)).map_err(|_| "thread count overflows usize")?;
@@ -512,12 +611,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
         host,
         sink_host: vec![0u8; sink_bytes],
         expected: None,
+        copy_source: None,
     };
 
     let mut completed = 0u32;
     let mut verify_failed = false;
     for backing in &options.backings {
-        let buffer = match bench.rt.allocate(options.bytes, kind_for(backing)) {
+        let allocation = (|| {
+            let buffer = Buffer::allocate(&bench.rt, options.bytes, backing)?;
+            bench.copy_source = if options.ops.iter().any(|op| op == "copy") {
+                Some(Buffer::allocate(&bench.rt, options.bytes, backing)?)
+            } else { None };
+            Ok::<_, String>(buffer)
+        })();
+        let buffer = match allocation {
             Ok(buffer) => buffer,
             Err(error) => {
                 println!("alloc_fail buf={backing} call=allocate err={}", one_line(&error));
@@ -536,6 +643,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 Err(Stop::Fatal(error)) => return Err(format!("buf={backing} op={op}: {error}")),
             }
         }
+        bench.copy_source = None;
     }
     // Unsupported backings are expected; a completely empty run or any verification failure is not.
     if verify_failed {
@@ -604,15 +712,30 @@ mod tests {
             &["--iters", "4294967296"],
             &["--buf", "vram,vram"],
             &["--buf", "host"],
-            &["--op", "copy"],
             &["--bytes"],
             &["--bytes", "16", "--bytes", "32"],
             &["--duration", "inf"],
             &["--duration", "0"],
-            &["--duration", "1"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
         assert!(parse_args(&args(&["--duration", "0.5", "--buf", "vram", "--op", "read"])).is_ok());
+        assert!(parse_args(&args(&["--duration", "6", "--buf", "host-registered,vram", "--op", "read,write,copy"])).is_ok());
+    }
+
+    #[test]
+    fn anonymous_pages_are_populated_and_two_mib_aligned() {
+        for bytes in [16usize,4096,(2<<20)+16] {
+            let pages=Pages::new(bytes).unwrap();
+            assert_eq!(pages.ptr as usize% (2<<20),0);
+            assert!(pages.len>=bytes);
+            assert_eq!(pages.len% (2<<20),0);
+            unsafe {
+                assert_eq!(*pages.ptr,0);
+                assert_eq!(*pages.ptr.add(pages.len-1),0);
+                *pages.ptr.add(bytes-1)=0x5a;
+                assert_eq!(*pages.ptr.add(bytes-1),0x5a);
+            }
+        }
     }
 }

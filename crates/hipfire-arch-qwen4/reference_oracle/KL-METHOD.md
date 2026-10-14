@@ -16,7 +16,7 @@ Publish, separately for text and assistant positions and for their equal-weight 
 
 Also publish mean, document-bootstrap 95% CI, p50/p95/p99, teacher and candidate NLL/PPL, top-1 agreement, routing agreement and context-length strata. Report paired ordinary-minus-forced differences, not an additive attribution of all damage to routing. Do **not** subtract the bf16 floor from KL: KL is not additive.
 
-Paiton's supplied claims (0.060 ordinary, 0.041 routing-forced, 0.0077 bf16/bf16) are accepted verbatim. This is comparable **in kind**, not a reproduction of their undisclosed corpus, arithmetic, KL support or forcing semantics. Label our direction, support and forcing semantics explicitly; a different corpus cannot establish a like-for-like numerical win.
+External published KL claims are treated as comparable **in kind** only. This is not a reproduction of an undisclosed corpus, arithmetic, KL support or forcing semantics. Label our direction, support and forcing semantics explicitly; a different corpus cannot establish a like-for-like numerical win.
 
 All repository citations below are relative to `/home/kaden/ClaudeCode/warpfront/hipfire-beta`. This document is a design, not a measured quality result. No GPU runs or competitor software were used. Numerical estimates marked `[INFERENCE]` are planning envelopes, not benchmark observations.
 
@@ -110,7 +110,7 @@ Internal dispatch has `MoeRouterInput::PrecomputedSoftmaxTopK` (`crates/hipfire-
 
 Primary **ID-forced KL**: at every layer, compute the candidate's own router logits on its own hidden state, replace its selected IDs with the teacher's ordered top-10 IDs, and gather/normalize the candidate probabilities **on those IDs**, with the source's normalization and dtype-rounding rules. Do not retain candidate weights belonging to the candidate's discarded IDs. Do not transplant teacher hidden states or expert outputs. Shared expert and shared gate remain candidate computations.
 
-Also support a separately named **IDs-and-weights-forced diagnostic** that replays the teacher's normalized scores as well as IDs. This removes additional router-score differences and must not be conflated with ID-only forcing. Paiton's exact forcing semantics were not supplied; show the distinction rather than guessing.
+Also support a separately named **IDs-and-weights-forced diagnostic** that replays the teacher's normalized scores as well as IDs. This removes additional router-score differences and must not be conflated with ID-only forcing. External forcing semantics are not always disclosed; show the distinction rather than guessing.
 
 `[INFERENCE / proposed implementation]` Add an opt-in, evaluator-only route-tape input at Qwen4 bundle/forward lowering and a typed **quality-replay route authority** in the MoE dispatch. At the router-to-expert-dispatch boundary, inject tape IDs and either candidate gathered/renormalized scores or teacher scores, before expert grouping or indexed GEMV/GEMM. Existing EP precomputed machinery may share mechanics, but do not forge an EP receipt, overwrite buffers behind the seal's assumptions, or weaken production proof gates. Disable router/shared fused variants that cannot honor the replay contract. Thread replay through chunk, decode and future EP root routing; non-root ranks must consume the root-authoritative forced route.
 

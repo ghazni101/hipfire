@@ -331,6 +331,7 @@ fn decode_step_body(
                     norm_topk_prob: cfg.norm_topk_prob,
                     x_rot_prerotated: false,
                     defer_routed_combine: false,
+                    cpu_deferred_experts: false,
                     ep_mode: MoeEpMode::None,
                     layer_idx: l as u16,
                     x_norm: &state.normed,
@@ -361,6 +362,7 @@ fn decode_step_body(
                     topk_indices: &state.topk_indices,
                     topk_weights: &state.topk_weights,
                     down_expanded: &state.down_expanded,
+                    ep_row_gather: None,
                 };
                 let ctx = DispatchCtx::new(gpu);
                 let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
@@ -796,6 +798,7 @@ pub fn forward_batch(
                     n_exp,
                     m_total_max,
                     force_mq4_grouped_fp16: false,
+                    cpu_deferred_experts: false,
                     topk_indices: &topk_idx,
                     topk_weights: &topk_w,
                     x_batch: &x,
@@ -822,6 +825,10 @@ pub fn forward_batch(
                     paro_down: params_down_paro,
                     down_awq_scale: None,
                     routed_out: None,
+                    ep_row_gather: None,
+                    shared_down_out: None,
+                    ep_layer_idx: 0,
+                    ep_tile_exchange: None,
                 };
                 let call = seal_prefill(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;

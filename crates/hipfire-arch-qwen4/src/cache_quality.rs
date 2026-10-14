@@ -1240,6 +1240,11 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
     let placements = receipt.placements.clone();
     let content_digest = hfq.content_digest();
     let domain = CacheDomain::for_model(&hfq, &tokenizer, None, "qwen4", gpu.device_id);
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode =
+        crate::artifact::source_forward_scratch_mode(&*gpu, &hfq, &config, &manifest)
+            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1278,7 +1283,7 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let attach = (|| -> Result<usize, String> {
         bundle
-            .attach_forward(gpu, max_seq)
+            .attach_forward(gpu, max_seq, scratch_mode)
             .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
         if mode == CqMode::NativeMtp {
             bundle

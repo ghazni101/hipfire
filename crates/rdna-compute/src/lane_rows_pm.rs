@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder (PeaceMaker) multi-column row kernels of the Flash-Next lane step,
-//! exact gfx1151 (`hipfire-isa` module `qwen4_lane_rows_pm`).
+//! exact gfx1151 (`peacemaker-isa` module `qwen4_lane_rows_pm`).
 //!
 //! Each export computes up to [`LANE_ROWS_PM_MAX`] activation columns per
 //! launch. Every column keeps the arithmetic DAG of its 1-row HIP incumbent,

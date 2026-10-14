@@ -64,7 +64,11 @@ extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
     const float* __restrict__ gate, const float* __restrict__ beta, void* __restrict__ state,
     const float* __restrict__ z, const hip_bfloat16* __restrict__ norm, void* __restrict__ output,
     int rows, int qkv_width, int key_heads, int value_heads, float query_scale, int output_bf16,
-    int state_q8, unsigned int frame) {
+    int state_q8, unsigned int frame
+#ifdef NPU_TRUNK_ARENA
+    , int z_pitch, int z_col0
+#endif
+    ) {
     const int vh = blockIdx.x;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
     const int kh = vh / (value_heads / key_heads);
@@ -164,7 +168,11 @@ extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const int e = tid + 256 * i, r = e >> 7;
+#ifdef NPU_TRUNK_ARENA
+                zc[i] = r < nn ? __uint_as_float((unsigned int)((const unsigned short*)z)[(size_t)(t0 + r) * z_pitch + z_col0 + vh * 128 + (e & 127)] << 16) : 0.0f;
+#else
                 zc[i] = r < nn ? z[(size_t)(t0 + r) * value_width + vh * 128 + (e & 127)] : 0.0f;
+#endif
             }
         }
         const unsigned int kw[4] = {pk.x, pk.y, pk.z, pk.w}, qw[4] = {pq.x, pq.y, pq.z, pq.w};

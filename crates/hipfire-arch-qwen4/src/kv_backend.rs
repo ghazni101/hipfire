@@ -10,7 +10,7 @@ use crate::config::Qwen4Config;
 use hipfire_runtime::kv_backend::{
     KvBackend, KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
-use rdna_compute::tensor_ops::QsaKvFormat;
+use rdna_compute::tensor_ops::{qsa_f16_arena_rows, QsaStateLayout};
 use rdna_compute::Gpu;
 
 /// Storage of Qwen4 QSA context arenas.
@@ -152,7 +152,7 @@ impl Qwen4ContextCommit {
     }
 
     /// Virtual bytes of one layer's context arenas in `format`.
-    pub fn virtual_layer_bytes(&self, config: &Qwen4Config, format: QsaKvFormat) -> Option<usize> {
+    pub fn virtual_layer_bytes(&self, config: &Qwen4Config, format: impl Into<QsaStateLayout>) -> Option<usize> {
         config.qsa_context_arena_bytes(self.max_seq, format)
     }
 
@@ -163,10 +163,12 @@ impl Qwen4ContextCommit {
     pub fn committed_layer_bytes(
         &self,
         config: &Qwen4Config,
-        format: QsaKvFormat,
+        layout: impl Into<QsaStateLayout>,
     ) -> Option<usize> {
+        let layout = layout.into();
+        let format = layout.kv;
         if self.backend == Qwen4KvBackend::Legacy {
-            return self.virtual_layer_bytes(config, format);
+            return self.virtual_layer_bytes(config, layout);
         }
         let kv_row = format.kv_row_bytes(config.num_key_value_heads, config.head_dim);
         let index_row = config
@@ -190,13 +192,21 @@ impl Qwen4ContextCommit {
         mapped(kv_row, self.max_seq, self.tokens)?
             .checked_mul(2)?
             .checked_add(mapped(index_row, self.max_seq, self.tokens)?)?
-            .checked_add(mapped(index_row, pooled_capacity, pooled_tokens)?)
+            .checked_add(mapped(index_row, pooled_capacity, pooled_tokens)?)?
+            .checked_add(if layout.f16_arena {
+                let row = config.num_key_value_heads.checked_mul(config.head_dim)?.checked_mul(2)?;
+                mapped(row, qsa_f16_arena_rows(self.max_seq), qsa_f16_arena_rows(self.tokens))?
+                    .checked_mul(2)?
+            } else {
+                0
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdna_compute::tensor_ops::QsaKvFormat;
 
     #[test]
     fn vmm_is_refused_off_gfx1151_gfx1201_and_without_the_runtime() {

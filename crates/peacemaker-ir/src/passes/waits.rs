@@ -4,7 +4,7 @@
 
 //! C5: per-counter weighted wait replay across the CFG.
 //!
-//! CFG-aware port of `hipfire-isa/src/ledger_replay.rs` onto typed streams,
+//! CFG-aware port of `peacemaker-isa/src/ledger_replay.rs` onto typed streams,
 //! implementing the rule table of core.md §2.6:
 //!
 //! * Issue: one [`PendingEvent`] per memory instruction. Counter membership

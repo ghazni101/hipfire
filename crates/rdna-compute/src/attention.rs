@@ -154,7 +154,11 @@ pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 #[derive(Clone, Copy)]
 enum QresidentOut<'a> {
     F32(&'a GpuTensor),
-    A4Slab { qgate: &'a GpuTensor, awq: &'a GpuTensor, x_i4: &'a GpuTensor },
+    A4Slab {
+        qgate: &'a GpuTensor,
+        awq: &'a GpuTensor,
+        x_i4: &'a GpuTensor,
+    },
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -397,6 +401,38 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
         && hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA", true)
 }
 
+/// gfx1151 Q8_0 decode attention for the Gemma 4 26B-A4B shapes through a
+/// GQA-shared, 8-wave tile (`attention_flash_q8_0_tile_gqa_gemma.gfx1151.hip`):
+/// head_dim 256 with GQA group 2 (sliding layers) and head_dim 512 with group
+/// 8 (full layers), tile 128, any window. Same partials as the reference tile,
+/// paired with `attention_flash_q8_0_reduce_skip`; not bit-identical
+/// (different summation order). Reached only through the Gemma 4 decode entry
+/// point ([`Gpu::attention_flash_q8_0_windowed_gemma`]).
+/// `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the swa tile.
+fn q8_decode_attn_gqa_gemma_gfx1151(
+    gpu: &Gpu,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> Option<&'static str> {
+    if !gpu.arch_caps.is_gfx1151()
+        || tile_size != 128
+        || n_kv_heads == 0
+        || !hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA", true)
+    {
+        return None;
+    }
+    match (head_dim, n_heads / n_kv_heads, n_heads % n_kv_heads) {
+        (256, 2, 0) => Some("attention_flash_q8_0_tile_gqa_d256g2_gfx1151"),
+        (512, 8, 0) => Some("attention_flash_q8_0_tile_gqa_d512g8_gfx1151"),
+        _ => None,
+    }
+}
+
+/// Grid-y cap of the Gemma GQA tile; its workgroups loop over the tiles.
+const Q8_DECODE_GQA_GEMMA_GRID_Y_CAP: usize = 64;
+
 /// Kernel pair of a GQA-shared decode attention route: a 13-arg tile with one
 /// 256-thread workgroup per (kv head, tile) and a 7-arg head-dim-split reduce.
 struct DecodeGqaPair {
@@ -597,7 +633,10 @@ const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
     qk: "attention_verify_wmma_qk_gfx1151",
-    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
+    pv: [
+        "attention_verify_wmma_pv1s_d4_gfx1151",
+        "attention_verify_wmma_pv2_d2_gfx1151",
+    ],
 };
 
 fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
@@ -658,7 +697,11 @@ pub struct VerifyWmmaGeometry {
 
 impl Default for VerifyWmmaGeometry {
     fn default() -> Self {
-        Self { packed: true, qk_waves: 160, pv: None }
+        Self {
+            packed: true,
+            qk_waves: 160,
+            pv: None,
+        }
     }
 }
 
@@ -690,6 +733,71 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
 #[inline]
 fn q8_multirow_arch_supported(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+}
+
+#[inline]
+fn gfx1100_q8_fa2_split_admitted(
+    enabled: bool,
+    arch: &str,
+    logical_ctx_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+) -> bool {
+    enabled
+        && arch == "gfx1100"
+        && logical_ctx_len > 4096
+        && n_heads == 24
+        && n_kv_heads == 4
+        && head_dim == 256
+        && (4..=32).contains(&batch_size)
+}
+
+/// F32 elements required by the production gfx1100 S=8 split-KV verifier.
+///
+/// Kept shared with the product admission so a reduced
+/// `HIPFIRE_FLASH_PARTIALS_BATCH` cannot arm split-only capture fusions while
+/// the attention launcher itself must fall back for lack of workspace.
+#[doc(hidden)]
+pub fn gfx1100_q8_fa2_split_partials_len(
+    batch_size: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Option<usize> {
+    batch_size
+        .checked_mul(n_heads)?
+        .checked_mul(8)?
+        .checked_mul(head_dim.checked_add(1)?)
+}
+
+#[inline]
+fn q8_multirow_fail_closed_after_split_miss(
+    arch: &str,
+    split_admitted: bool,
+    capture_mode: bool,
+    replay_recording: bool,
+) -> bool {
+    replay_recording || (arch == "gfx1100" && split_admitted && capture_mode)
+}
+
+#[inline]
+fn gfx1100_split_capture_assets_ready(
+    partial_loaded: bool,
+    merge_loaded: bool,
+    preconvert_loaded: bool,
+    q16_scratch_bytes: usize,
+    q16_scratch_present: bool,
+    need_q16_bytes: usize,
+) -> bool {
+    partial_loaded
+        && merge_loaded
+        && preconvert_loaded
+        && !crate::scratch::scratch_will_grow(
+            q16_scratch_bytes,
+            q16_scratch_present,
+            need_q16_bytes,
+        )
 }
 
 /// `head_dim` envelope of a batched flash-tile kernel, inclusive.
@@ -2322,6 +2430,9 @@ impl Gpu {
     ///
     /// untested-hw: gfx1201-only path, implemented from the q8 slots template;
     /// no gfx1201 host was available.
+    /// Descriptor write evidence: `test_bf16_slots_parity` check 4d on
+    /// gfx1201 compares slot-base bytes and preserves slot-0 poison.
+    /// This is a kernel-level check, not full-serve parity.
     #[allow(clippy::too_many_arguments)]
     pub fn kv_cache_write_fp8_e4m3_batched_slots(
         &mut self,
@@ -5287,7 +5398,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
 
@@ -5483,8 +5598,11 @@ impl Gpu {
     /// would synchronize, free and malloc mid-capture). A cold capture keeps
     /// the incumbent route instead of failing the capture.
     fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
-        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
-            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
+        self.functions
+            .contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self
+                .functions
+                .contains_key("attention_fa2_q_preconvert_gfx1201")
             && !crate::scratch::scratch_will_grow(
                 self.scratch.fa2_q16_scratch_bytes,
                 self.scratch.fa2_q16_scratch.is_some(),
@@ -5768,7 +5886,11 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernel_src, false)
                 }
             );
-            let module = if multi_slot { format!("{module}_paged") } else { module };
+            let module = if multi_slot {
+                format!("{module}_paged")
+            } else {
+                module
+            };
             self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
@@ -6780,6 +6902,7 @@ impl Gpu {
             head_dim,
             max_ctx_len,
             batch_size,
+            None,
         )
     }
 
@@ -6816,6 +6939,7 @@ impl Gpu {
             head_dim,
             max_ctx_len,
             batch_size,
+            None,
         )
     }
 
@@ -6844,7 +6968,49 @@ impl Gpu {
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
             QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size, None,
+        )
+    }
+
+    /// Segment of [`Self::attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201`]
+    /// over rows `[q_row_offset, q_row_offset + batch_size)` of a full
+    /// two-plane Raw Q allocation of `q_total_rows` rows:
+    /// `[q_total_rows*H*D fp8 code bytes][q_total_rows*H*4 F32 scale bytes]`.
+    /// `out` and `positions` are already segment views. Same kernel, grid and
+    /// LDS as the full-batch method; only the code/scale base pointers move.
+    /// Segment `batch_size` must be 64..=32768 and either <= 512 or a
+    /// multiple of 512.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        q_total_rows: usize,
+        q_row_offset: usize,
+    ) -> HipResult<()> {
+        if !(64..=32768).contains(&batch_size) || (batch_size > 512 && batch_size % 512 != 0) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "Q8 range attention requires segment batch 64..=32768 and \
+                     <=512 or %512==0, got {batch_size}"
+                ),
+            ));
+        }
+        self.qresident_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
+            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, QresidentOut::F32(out), positions,
             n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            Some((q_total_rows, q_row_offset)),
         )
     }
 
@@ -6873,10 +7039,11 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw
-            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
-        {
-            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Q8 resident attention requires Raw codes and scales",
+            ));
         }
         self.ensure_mq_signs()?;
         self.qresident_launch(
@@ -6884,7 +7051,7 @@ impl Gpu {
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC,
             QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache,
             QresidentOut::A4Slab { qgate, awq, x_i4 }, positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size, None,
         )
     }
 
@@ -6907,6 +7074,7 @@ impl Gpu {
         head_dim: usize,
         max_ctx_len: usize,
         batch_size: usize,
+        q_planes: Option<(usize, usize)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
@@ -6936,7 +7104,29 @@ impl Gpu {
                 &format!("{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"),
             ));
         }
+        if let Some((total_rows, row_offset)) = q_planes {
+            let end = row_offset.checked_add(batch_size);
+            let cap = total_rows.checked_mul(n_heads * (head_dim + 4));
+            if !q8_input
+                || q.dtype != crate::DType::Raw
+                || end.map_or(true, |e| e > total_rows)
+                || cap.map_or(true, |c| q.buf.size() < c)
+            {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{symbol} Q8 range invalid: total_rows={total_rows} \
+                         row_offset={row_offset} batch={batch_size} q_bytes={}",
+                        q.buf.size()
+                    ),
+                ));
+            }
+        }
         let need_qo = batch_size * n_heads * head_dim;
+        let need_q = match q_planes {
+            Some((total_rows, _)) => total_rows * n_heads * head_dim,
+            None => need_qo,
+        };
         let out_ok = match out {
             QresidentOut::F32(o) => o.numel() >= need_qo,
             QresidentOut::A4Slab { qgate, awq, x_i4 } => {
@@ -6945,7 +7135,7 @@ impl Gpu {
                     && x_i4.buf.size() >= (n_heads * head_dim / 128) * batch_size * 72
             }
         };
-        if q.numel() < need_qo || !out_ok || positions.numel() < batch_size {
+        if q.numel() < need_q || !out_ok || positions.numel() < batch_size {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -6964,10 +7154,20 @@ impl Gpu {
         let grid_z = batch_size.div_ceil(512) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_arg = q.buf.as_ptr();
-        let mut q_scales = if q8_input {
-            unsafe { (q_arg as *mut u8).add(need_qo) as *mut c_void }
-        } else {
+        let mut q_scales = if !q8_input {
             std::ptr::null_mut()
+        } else if let Some((total_rows, row_offset)) = q_planes {
+            // Two planes: [total*H*D code bytes][total*H*4 scale bytes]; the
+            // segment starts `row_offset` rows into each plane.
+            let codes_bytes = total_rows * n_heads * head_dim;
+            let code_off = row_offset * n_heads * head_dim;
+            let scale_off = codes_bytes + row_offset * n_heads * 4;
+            unsafe {
+                q_arg = (q_arg as *mut u8).add(code_off) as *mut c_void;
+                (q.buf.as_ptr() as *mut u8).add(scale_off) as *mut c_void
+            }
+        } else {
+            unsafe { (q_arg as *mut u8).add(need_qo) as *mut c_void }
         };
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
@@ -7750,11 +7950,20 @@ impl Gpu {
             && self.arch == "gfx1151"
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
         let (module, preconvert) = if r3 {
-            ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
+            (
+                "attention_q8_0_fa2_gqa_gfx1100",
+                "attention_fa2_q_preconvert_gfx1100",
+            )
         } else if twin {
-            ("attention_q8_0_fa2_gqa_gfx1151", "attention_fa2_q_preconvert_gfx1151")
+            (
+                "attention_q8_0_fa2_gqa_gfx1151",
+                "attention_fa2_q_preconvert_gfx1151",
+            )
         } else {
-            ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
+            (
+                "attention_q8_0_fa2_gqa_gfx11",
+                "attention_fa2_q_preconvert_gfx11",
+            )
         };
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
@@ -7876,6 +8085,330 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Experimental exact-gfx1100 split-KV twin of the tuned Q16/R3 FA2
+    /// kernel. The partial grid partitions the live KT32 range across Z and
+    /// the merge performs a stable LSE-weighted reduction. Product dispatch
+    /// reaches this only through the fail-closed exact-shape admission in
+    /// [`Self::attention_flash_q8_0_rows_masked`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_split_gfx1100_bench(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench requires 1 <= batch <= 32, got {batch_size}"
+                ),
+            ));
+        }
+        if !matches!(n_splits, 1 | 2 | 4 | 8) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench requires 1/2/4/8 splits, got {n_splits}"
+                ),
+            ));
+        }
+        let need_qo = batch_size
+            .checked_mul(n_heads)
+            .and_then(|v| v.checked_mul(head_dim))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench query size overflow",
+                )
+            })?;
+        let records = batch_size
+            .checked_mul(n_heads)
+            .and_then(|v| v.checked_mul(n_splits))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench record count overflow",
+                )
+            })?;
+        let need_partials = records
+            .checked_mul(head_dim.checked_add(1).unwrap())
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench scratch size overflow",
+                )
+            })?;
+        if q.numel() < need_qo
+            || out.numel() < need_qo
+            || positions.numel() < batch_size
+            || partials.numel() < need_partials
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_split_gfx1100_bench capacity mismatch: \
+                     q={} out={} positions={} partials={} (need qo>={need_qo}, \
+                     pos>={batch_size}, partials>={need_partials})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel(),
+                    partials.numel()
+                ),
+            ));
+        }
+
+        const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1100";
+        const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1100";
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100";
+        const MODULE: &str = "attention_q8_0_fa2_gqa_gfx1100";
+        let src = format!(
+            "// HIPFIRE_COMPILER_FLAGS: -mcumode\n\
+             #define HIPFIRE_FA2_KT 32\n\
+             #define HIPFIRE_FA2_Q16 1\n\
+             #define HIPFIRE_FA2_FILL 1\n\
+             #define HIPFIRE_FA2_GFX1100 1\n{}",
+            kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
+        );
+        if !self.functions.contains_key(PARTIAL) {
+            self.ensure_kernel(MODULE, &src, PARTIAL)?;
+        }
+        if !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(MODULE, &src, PRECONVERT)?;
+        }
+        if !self.functions.contains_key(MERGE) {
+            self.ensure_kernel(MODULE, &src, MERGE)?;
+        }
+
+        let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_split_gfx1100_bench Q16 size overflow",
+            )
+        })?;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            std::ptr::null(),
+            std::ptr::null(),
+            batch_size,
+            0,
+        )?;
+
+        let grid_x = batch_size.div_ceil(16) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut p_ptr = partials.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut ns = n_splits as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            PARTIAL,
+            [grid_x, 4, n_splits as u32],
+            [256, 1, 1],
+            32768,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q16_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b.push_i32(ns);
+                b
+            },
+        )?;
+
+        let mut pp_ptr = partials.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut mbs = batch_size as i32;
+        let mut mnh = n_heads as i32;
+        let mut mhd = head_dim as i32;
+        let mut mns = n_splits as i32;
+        let mut mparams: Vec<*mut c_void> = vec![
+            &mut pp_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut mbs as *mut _ as *mut c_void,
+            &mut mnh as *mut _ as *mut c_void,
+            &mut mhd as *mut _ as *mut c_void,
+            &mut mns as *mut _ as *mut c_void,
+        ];
+        let merge_grid_x = (batch_size * n_heads).div_ceil(8) as u32;
+        self.launch_maybe_blob(
+            MERGE,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
+    }
+
+    /// Whether the gfx1100 split-KV verifier can be entered while HipGraph or
+    /// retained-PM4 capture is active. Capture must never trigger JIT or move
+    /// the persistent Q16 scratch pointer; the direct warmup/prime window
+    /// materializes both before either recorder reaches this predicate.
+    #[doc(hidden)]
+    pub fn gfx1100_q8_fa2_split_capture_assets_ready(&self, batch_size: usize) -> bool {
+        const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1100";
+        const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1100";
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100";
+        let need_q16_bytes = batch_size * 24 * 256 * 2;
+        gfx1100_split_capture_assets_ready(
+            self.functions.contains_key(PARTIAL),
+            self.functions.contains_key(MERGE),
+            self.functions.contains_key(PRECONVERT),
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        )
+    }
+
+    /// Full capture readiness, including the caller-owned partial/merge
+    /// workspace. The auxiliary F16/LDS producers use the asset-only twin
+    /// after `ChainVerifySplit` has already proved this capacity at the model
+    /// boundary.
+    #[doc(hidden)]
+    pub fn gfx1100_q8_fa2_split_capture_ready(
+        &self,
+        batch_size: usize,
+        partials_numel: usize,
+    ) -> bool {
+        self.gfx1100_q8_fa2_split_capture_assets_ready(batch_size)
+            && gfx1100_q8_fa2_split_partials_len(batch_size, 24, 256)
+                .is_some_and(|need| partials_numel >= need)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_attention_q8_0_fa2_gqa_split_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        logical_ctx_len: usize,
+        batch_size: usize,
+        route_admitted: bool,
+    ) -> HipResult<bool> {
+        const SPLITS: usize = 8;
+        let capturing = self.graphs.capture_mode || self.replay.is_recording();
+        let capture_ready =
+            !capturing || self.gfx1100_q8_fa2_split_capture_ready(batch_size, partials.numel());
+        if !capture_ready
+            || !gfx1100_q8_fa2_split_admitted(
+                route_admitted && self.flags.verify_attn && self.flags.gfx1100_fa2_split_verify,
+                &self.arch,
+                logical_ctx_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+            )
+        {
+            return Ok(false);
+        }
+        let Some(need_qo) = batch_size
+            .checked_mul(n_heads)
+            .and_then(|v| v.checked_mul(head_dim))
+        else {
+            return Ok(false);
+        };
+        let Some(need_partials) = gfx1100_q8_fa2_split_partials_len(batch_size, n_heads, head_dim)
+        else {
+            return Ok(false);
+        };
+        if q.numel() < need_qo
+            || out.numel() < need_qo
+            || positions.numel() < batch_size
+            || partials.numel() < need_partials
+        {
+            return Ok(false);
+        }
+        self.attention_q8_0_fa2_gqa_split_gfx1100_bench(
+            q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, SPLITS,
+        )?;
+        Ok(true)
     }
 
     /// gfx11 (RDNA3) GQA-fused FA2 prefill for fwht3 K (research opt-in).
@@ -9121,8 +9654,15 @@ impl Gpu {
         let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
         // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
         let qk_block = (32 * nf.max(4)) as u32;
-        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
-        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
+        let qk_splits = geom
+            .qk_waves
+            .div_ceil(row_groups * n_kv_heads * nf)
+            .clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 {
+            VerifyWmmaPv::Chunk2Whole2
+        } else {
+            VerifyWmmaPv::Chunk1Split4
+        });
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
@@ -9436,6 +9976,13 @@ impl Gpu {
     /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
     /// On arches with a VerifyAttn `rows_q8` twin (gfx1100) an admitted shape
     /// runs the byte-identical twin instead ([`Self::try_attention_verify_gqa_rows`]).
+    /// Compatibility entry for eager callers whose KV stride equals the live
+    /// causal extent. Capture/retained callers must use
+    /// [`Self::attention_flash_q8_0_rows_masked_logical`] so an oversized
+    /// fixed KV allocation cannot satisfy a live-context crossover gate.
+    /// This entry cannot prove the model/VMM contract, so it retains incumbent
+    /// routes only. Product split callers must pass explicit admission to the
+    /// logical entry.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_q8_0_rows_masked(
         &mut self,
@@ -9451,9 +9998,46 @@ impl Gpu {
         batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<bool> {
-        if self.replay.is_recording() {
-            return Ok(false);
-        }
+        self.attention_flash_q8_0_rows_masked_logical(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            max_ctx_len,
+            batch_size,
+            partials,
+            false,
+        )
+    }
+
+    /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope,
+    /// caller must fall back. `max_ctx_len` is the KV allocation stride while
+    /// `logical_ctx_len` is the live causal extent used for crossover
+    /// admission; they intentionally differ during graph/retained capture.
+    /// On arches with a VerifyAttn `rows_q8` twin (gfx1100) an admitted shape
+    /// runs the byte-identical twin instead ([`Self::try_attention_verify_gqa_rows`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_rows_masked_logical(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        logical_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        allow_gfx1100_split: bool,
+    ) -> HipResult<bool> {
         if !q8_multirow_arch_supported(self.arch_caps.arch()) {
             return Ok(false);
         }
@@ -9466,6 +10050,33 @@ impl Gpu {
             return Ok(false);
         }
         self.bind_thread()?;
+        if self.try_attention_q8_0_fa2_gqa_split_gfx1100(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            partials,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            logical_ctx_len,
+            batch_size,
+            allow_gfx1100_split,
+        )? {
+            return Ok(true);
+        }
+        // The incumbent multi-row/VerifyGQA routes are outside this captured
+        // split contract. If split admission or readiness misses during either
+        // recorder, fail closed to the caller's established batched route.
+        if q8_multirow_fail_closed_after_split_miss(
+            self.arch_caps.arch(),
+            allow_gfx1100_split,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        ) {
+            return Ok(false);
+        }
         if self.try_attention_verify_gqa_rows(
             q,
             k_cache,
@@ -9685,6 +10296,100 @@ impl Gpu {
     /// method). Used by cohere2moe's `sliding_attention` layers so context beyond
     /// `sliding_window` clips correctly instead of running full-causal (degraded).
     #[allow(clippy::too_many_arguments)]
+    /// Whether [`Self::attention_q8_0_prefill_gqa_wmma`] admits this shape.
+    pub fn attention_q8_0_prefill_gqa_wmma_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> bool {
+        // Measured on gfx1151 only; the kernel is gfx11 wave32 WMMA.
+        self.arch_caps.is_gfx1151()
+            && matches!(head_dim, 256 | 512)
+            && n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+            && matches!(n_heads / n_kv_heads, 1 | 2 | 4 | 8 | 16)
+            && hipfire_config::developer_bool("HIPFIRE_Q8_PREFILL_GQA_WMMA", true)
+    }
+
+    /// Causal attention of `batch` consecutive query rows (`positions`, i32,
+    /// increasing) over a position-indexed Q8_0 KV cache, GQA-shared, on
+    /// gfx11 WMMA (see `attention_q8_0_prefill_gqa_wmma.gfx11.hip`).
+    /// `window > 0` limits each row to its last `window` keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_prefill_gqa_wmma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch: usize,
+        window: i32,
+    ) -> HipResult<()> {
+        if !self.attention_q8_0_prefill_gqa_wmma_admitted(n_heads, n_kv_heads, head_dim) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_prefill_gqa_wmma: unsupported shape heads={n_heads} kv={n_kv_heads} hd={head_dim} on {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        let func = if head_dim == 256 {
+            "attention_q8_0_prefill_gqa_wmma_d256"
+        } else {
+            "attention_q8_0_prefill_gqa_wmma_d512"
+        };
+        self.ensure_kernel(
+            "attention_q8_0_prefill_gqa_wmma",
+            kernels::ATTENTION_Q8_0_PREFILL_GQA_WMMA_GFX11_SRC,
+            func,
+        )?;
+        let g = n_heads / n_kv_heads;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let b = batch as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let wn = window;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &b as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &wn as *const _ as *mut c_void,
+        ];
+        let grid = [(batch * g).div_ceil(16) as u32, n_kv_heads as u32, 1];
+        self.launch_maybe_blob(func, grid, [128, 1, 1], 0, &mut params, || {
+            let mut kb = hip_bridge::KernargBlob::new();
+            kb.push_ptr(qp);
+            kb.push_ptr(kp);
+            kb.push_ptr(vp);
+            kb.push_ptr(op);
+            kb.push_ptr(pp);
+            kb.push_i32(nh);
+            kb.push_i32(nkv);
+            kb.push_i32(b);
+            kb.push_f32(sc);
+            kb.push_i32(wn);
+            kb
+        })
+    }
+
     pub fn attention_flash_q8_0_batched_masked_windowed(
         &mut self,
         q: &GpuTensor,
@@ -9804,6 +10509,48 @@ impl Gpu {
             window,
             None,
             None,
+            false,
+        )
+    }
+
+    /// Gemma 4 decode twin of [`Self::attention_flash_q8_0_windowed`]: the
+    /// tile pass runs `attention_flash_q8_0_tile_swa` (a tile wholly below the
+    /// window publishes an empty partial without reading V) or, on gfx1151 at
+    /// the Gemma 4 GQA shapes, the GQA-shared Gemma tile, and the reduce runs
+    /// `attention_flash_q8_0_reduce_skip`. Every other caller keeps the
+    /// shared `attention_flash_q8_0_tile` / `_reduce` modules.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_windowed_gemma(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window: i32,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            window,
+            None,
+            None,
+            true,
         )
     }
 
@@ -9841,6 +10588,7 @@ impl Gpu {
             0,
             Some(gate),
             None,
+            false,
         )
     }
 
@@ -9880,6 +10628,7 @@ impl Gpu {
             0,
             Some(gate),
             Some(awq_scale),
+            false,
         )
     }
 
@@ -9900,6 +10649,8 @@ impl Gpu {
         window: i32,
         output_gate: Option<&GpuTensor>,
         output_awq_scale: Option<&GpuTensor>,
+        // Gemma 4 decode only: swa tile / Gemma GQA tile + skip reduce.
+        gemma_tiles: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
@@ -9981,21 +10732,40 @@ impl Gpu {
         }
 
         // ── Tile kernel ──
+        let gemma_gqa = if gemma_tiles && output_gate.is_none() {
+            q8_decode_attn_gqa_gemma_gfx1151(self, n_heads, n_kv_heads, head_dim, tile_size)
+        } else {
+            None
+        };
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
                 == Ok("1");
-        let (tile_module, tile_src) = if gfx1151_tile_dpp {
+        let (tile_module, tile_src, tile_fn) = if let Some(func) = gemma_gqa {
+            (
+                "attention_flash_q8_0_tile_gqa_gemma_gfx1151",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GEMMA_GFX1151_SRC,
+                func,
+            )
+        } else if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC,
+                "attention_flash_q8_0_tile",
+            )
+        } else if gemma_tiles {
+            (
+                "attention_flash_q8_0_tile_swa",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_SWA_SRC,
+                "attention_flash_q8_0_tile_swa",
             )
         } else {
             (
                 "attention_flash_q8_0_tile",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                "attention_flash_q8_0_tile",
             )
         };
-        self.ensure_kernel(tile_module, tile_src, "attention_flash_q8_0_tile")?;
+        self.ensure_kernel(tile_module, tile_src, tile_fn)?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let q_ptr = q.buf.as_ptr();
@@ -10011,8 +10781,18 @@ impl Gpu {
             let ts = tile_size as i32;
             let wn = window;
             let es = effective_seq_arg;
-            let grid = [n_heads as u32, launch_tiles as u32, 1];
-            let shared = ((tile_size + head_dim) * 4) as u32;
+            // The GQA route runs one 256-thread workgroup per (kv head,
+            // tile) and loops over tiles, so its grid is capped.
+            let (grid, block, shared) = if gemma_gqa.is_some() {
+                let y = launch_tiles.min(Q8_DECODE_GQA_GEMMA_GRID_Y_CAP) as u32;
+                ([n_kv_heads as u32, y, 1], [256, 1, 1], 0)
+            } else {
+                (
+                    [n_heads as u32, launch_tiles as u32, 1],
+                    [32, 1, 1],
+                    ((tile_size + head_dim) * 4) as u32,
+                )
+            };
             let mut params: Vec<*mut c_void> = vec![
                 &q_ptr as *const _ as *mut c_void,
                 &k_ptr as *const _ as *mut c_void,
@@ -10029,9 +10809,9 @@ impl Gpu {
                 &es as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob_position_grid(
-                "attention_flash_q8_0_tile",
+                tile_fn,
                 grid,
-                [32, 1, 1],
+                block,
                 shared,
                 &mut params,
                 1,
@@ -10079,8 +10859,20 @@ impl Gpu {
                     max_tiles,
                 )?;
             } else {
-                const KERNEL: &str = "attention_flash_q8_0_reduce";
-                self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
+                // The swa and Gemma GQA tiles leave the V partials of an
+                // empty tile unwritten; only the skip reduce never reads them.
+                let (kernel, src) = if gemma_tiles {
+                    (
+                        "attention_flash_q8_0_reduce_skip",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC,
+                    )
+                } else {
+                    (
+                        "attention_flash_q8_0_reduce",
+                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                    )
+                };
+                self.ensure_kernel(kernel, src, kernel)?;
                 let mut params: Vec<*mut c_void> = vec![
                     &p_ptr as *const _ as *mut c_void,
                     &o_ptr as *const _ as *mut c_void,
@@ -10091,7 +10883,7 @@ impl Gpu {
                     &mt as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
-                    KERNEL,
+                    kernel,
                     [n_heads as u32, 1, 1],
                     [256, 1, 1],
                     (max_tiles * 4) as u32,
@@ -10463,7 +11255,11 @@ impl Gpu {
                 ),
             ));
         }
-        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, TILE)?;
+        self.ensure_kernel(
+            TILE,
+            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            TILE,
+        )?;
         self.ensure_kernel(
             REDUCE,
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -10794,7 +11590,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens4",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens4"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -10812,16 +11607,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens4",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         // V: standard Q8_0
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
@@ -10978,7 +11781,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens3",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens3"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -10996,16 +11798,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens3",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
@@ -11194,7 +12004,6 @@ impl Gpu {
             kernels::KV_CACHE_WRITE_FWHT256_2BIT_SRC,
             "kv_cache_write_fwht256_2bit",
         )?;
-        let func = &self.functions["kv_cache_write_fwht256_2bit"];
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
@@ -11212,16 +12021,24 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_kv_heads as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
+        self.launch_maybe_blob(
+            "kv_cache_write_fwht256_2bit",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )?;
         Ok(())
     }
 
@@ -11301,7 +12118,6 @@ impl Gpu {
             kernels::KV_CACHE_WRITE_FWHT256_4BIT_SRC,
             "kv_cache_write_fwht256_4bit",
         )?;
-        let func = &self.functions["kv_cache_write_fwht256_4bit"];
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
@@ -11319,16 +12135,24 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_kv_heads as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
+        self.launch_maybe_blob(
+            "kv_cache_write_fwht256_4bit",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )?;
         Ok(())
     }
 
@@ -14205,7 +15029,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens2",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens2"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -14223,16 +15046,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens2",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
@@ -16203,7 +17034,6 @@ impl Gpu {
             row_slot,
         )
     }
-
 
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
@@ -19624,6 +20454,146 @@ impl Gpu {
                 b.push_ptr(t3);
                 b.push_ptr(xo);
                 b.push_i32(h);
+                b
+            },
+        )
+    }
+
+    /// Resolve the gfx1100 TP2 graph-signal module before graph capture. JIT
+    /// compilation is not capture-safe, so model load calls this once per rank.
+    pub fn ensure_tp_graph_signal_gfx1100_kernels(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_barrier_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_barrier_gfx1100",
+        )?;
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_reduce_gfx1100",
+        )
+    }
+
+    /// Advance this rank's gfx1100 TP2 graph generation and wait until the
+    /// peer reaches the same barrier. The generation is device-resident, so a
+    /// captured graph can replay without host-side signal resets.
+    pub fn tp_graph_signal_barrier_gfx1100(
+        &mut self,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_barrier_gfx1100 requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_barrier_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_barrier_gfx1100",
+        )?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let mut params: [*mut c_void; 2] = [
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp_graph_signal_barrier_gfx1100",
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b
+            },
+        )
+    }
+
+    /// Fused reusable TP2 graph barrier and rank-ordered residual reduction.
+    /// Each rank publishes its local partial into the peer-owned coherent
+    /// shadow. `local_is_first` then preserves `x + (p0 + p1)` bit order on
+    /// both devices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_graph_signal_reduce_gfx1100(
+        &mut self,
+        local_signal: &DeviceBuffer,
+        peer_signal: &DeviceBuffer,
+        x: &DeviceBuffer,
+        local_partial: &DeviceBuffer,
+        peer_shadow: *mut c_void,
+        local_shadow: *const c_void,
+        local_is_first: bool,
+        count: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "tp_graph_signal_reduce_gfx1100 requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "tp_graph_signal_reduce_gfx1100",
+            kernels::TP_GRAPH_SIGNAL_GFX1100_SRC,
+            "tp_graph_signal_reduce_gfx1100",
+        )?;
+
+        let local_ptr = local_signal.as_ptr();
+        let peer_ptr = peer_signal.as_ptr();
+        let x_ptr = x.as_ptr();
+        let local_partial_ptr = local_partial.as_ptr();
+        let local_is_first_arg = i32::from(local_is_first);
+        let count_arg = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
+        let mut params: [*mut c_void; 8] = [
+            &local_ptr as *const _ as *mut c_void,
+            &peer_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &local_partial_ptr as *const _ as *mut c_void,
+            &peer_shadow as *const _ as *mut c_void,
+            &local_shadow as *const _ as *mut c_void,
+            &local_is_first_arg as *const _ as *mut c_void,
+            &count_arg as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "tp_graph_signal_reduce_gfx1100",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(local_ptr);
+                b.push_ptr(peer_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(local_partial_ptr);
+                b.push_ptr(peer_shadow);
+                b.push_ptr(local_shadow);
+                b.push_i32(local_is_first_arg);
+                b.push_i32(count_arg);
                 b
             },
         )
@@ -23570,7 +24540,6 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b
 }
 
-
 /// `*_paged` symbol of a descriptor-aware kernel launched through the
 /// givens4/turbo assembler, or `None` when the kernel has no paged variant.
 fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
@@ -23626,9 +24595,11 @@ mod tests {
 
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, kv_slot_paged_symbol, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
-        q8_flash_default_tile_size, q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
-        replay_stable_tile_count,
+        flux_attn_route_name, gfx1100_q8_fa2_split_admitted, gfx1100_q8_fa2_split_partials_len,
+        gfx1100_split_capture_assets_ready, kv_slot_paged_symbol,
+        pack_attention_q8_0_fa2_gqa_gfx11_kernarg, q8_flash_default_tile_size,
+        q8_flash_reduce_safe_tile_size, q8_multirow_arch_supported,
+        q8_multirow_fail_closed_after_split_miss, replay_stable_tile_count,
     };
     use crate::DType;
     use std::ffi::c_void;
@@ -23693,6 +24664,78 @@ mod tests {
         for arch in ["gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942"] {
             assert!(!q8_multirow_arch_supported(arch), "arch={arch}");
         }
+    }
+
+    #[test]
+    fn gfx1100_fa2_split_admission_uses_live_context_not_kv_capacity() {
+        let admitted = |logical_ctx_len, batch_size| {
+            gfx1100_q8_fa2_split_admitted(true, "gfx1100", logical_ctx_len, 24, 4, 256, batch_size)
+        };
+        assert!(!admitted(4096, 16));
+        assert!(admitted(4097, 16));
+        assert!(!admitted(262_144, 3));
+        assert!(!gfx1100_q8_fa2_split_admitted(
+            true, "gfx1201", 262_144, 24, 4, 256, 16,
+        ));
+        assert!(!gfx1100_q8_fa2_split_admitted(
+            false, "gfx1100", 262_144, 24, 4, 256, 16,
+        ));
+    }
+
+    #[test]
+    fn split_miss_capture_fallback_is_gfx1100_only() {
+        assert!(q8_multirow_fail_closed_after_split_miss(
+            "gfx1100", true, true, false,
+        ));
+        for arch in ["gfx1151", "gfx1201"] {
+            assert!(
+                !q8_multirow_fail_closed_after_split_miss(arch, true, true, false),
+                "arch={arch} must retain its incumbent HipGraph VerifyAttn path"
+            );
+        }
+        assert!(!q8_multirow_fail_closed_after_split_miss(
+            "gfx1100", false, true, false,
+        ));
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(q8_multirow_fail_closed_after_split_miss(
+                arch, false, false, true,
+            ));
+        }
+    }
+
+    #[test]
+    fn split_capture_assets_require_all_symbols_and_fixed_q16_scratch() {
+        assert!(gfx1100_split_capture_assets_ready(
+            true, true, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            false, true, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, false, true, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, false, 196_608, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, true, 196_607, true, 196_608,
+        ));
+        assert!(!gfx1100_split_capture_assets_ready(
+            true, true, true, 196_608, false, 196_608,
+        ));
+    }
+
+    #[test]
+    fn gfx1100_split_partials_len_is_checked_and_matches_s8_layout() {
+        assert_eq!(
+            gfx1100_q8_fa2_split_partials_len(16, 24, 256),
+            Some(16 * 24 * 8 * 257)
+        );
+        assert_eq!(
+            gfx1100_q8_fa2_split_partials_len(32, 24, 256),
+            Some(32 * 24 * 8 * 257)
+        );
+        assert_eq!(gfx1100_q8_fa2_split_partials_len(usize::MAX, 24, 256), None);
     }
 
     /// The suffix table is the mapping from tensor dtypes to a kernel symbol.
@@ -24108,5 +25151,50 @@ mod kv_slot_desc_port_tests {
                 && bf16_body.contains("kv_offset_for_v(desc, t, per_pos_bytes)"),
             "bf16 scalar kernel must translate K and V rows through the descriptor"
         );
+    }
+}
+
+/// Decode KV writers reachable from a retained Redline / HipGraph forward must
+/// launch through `launch_maybe_blob`: a raw `hip.launch_kernel` is invisible
+/// to the recorder, so the replayed tape silently drops the cache write (the
+/// 2026-10-13 gfx1100 MQ4R `--kv-v lloyd2` page fault: 623 vs 633 launches).
+#[cfg(test)]
+mod recorded_kv_writer_tests {
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("pub fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .into_iter()
+            .chain(rest[1..].find("\n    fn "))
+            .chain(rest[1..].find("\n    #["))
+            .min()
+            .map_or(rest.len(), |e| e + 1);
+        &rest[..end]
+    }
+
+    #[test]
+    fn decode_kv_writers_route_through_the_recorder() {
+        let attention = include_str!("attention.rs");
+        let gemma4 = include_str!("gemma4_ext.rs");
+        let cases: &[(&str, &str)] = &[
+            (attention, "kv_cache_write_v256_2bit_vec"),
+            (attention, "kv_cache_write_v256_4bit_vec"),
+            (attention, "kv_cache_write_fwht3_vec"),
+            (attention, "kv_cache_write_asym2_fused"),
+            (attention, "kv_cache_write_asym3_fused"),
+            (attention, "kv_cache_write_asym4_fused"),
+            (gemma4, "kv_cache_write_fwht3_hd512"),
+        ];
+        for &(src, name) in cases {
+            let body = fn_body(src, name);
+            assert!(
+                !body.contains(".launch_kernel("),
+                "{name} launches raw; the Redline recorder cannot see it"
+            );
+            assert!(body.contains("launch_maybe_blob("), "{name} lost its recorded launch");
+        }
     }
 }

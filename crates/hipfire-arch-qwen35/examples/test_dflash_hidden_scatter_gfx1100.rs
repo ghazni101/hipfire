@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! S2 parity gate: exact gfx1100 hidden-ring scatters.
+//! S2 parity gate: exact gfx1100/gfx1151/gfx1201 hidden-ring scatters.
 //!
 //! Compares every byte against the row-copy loop oracle for
 //! heads {0, max_pos-3}, commit-n {1, 16}, block_size {n, max_pos+3}, and
@@ -13,7 +13,7 @@
 //! with the switch clear. A direct-launcher arm additionally proves the
 //! kernels themselves (not just the routing) produce the loop bytes.
 //!
-//! Exact gfx1100 only; other archs SKIP cleanly (exit 0, no GPU work).
+//! Exact gfx1100, gfx1151 and gfx1201 only; other archs SKIP cleanly (exit 0, no GPU work).
 //! Any mismatch fails loudly (nonzero exit). If the process environment
 //! sets `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1` the fused arm would be vacuous,
 //! so the harness refuses to run fused in that case — unset it first.
@@ -133,7 +133,7 @@ fn run() -> i32 {
     };
     let arch = gpu.arch.clone();
     if !gpu.arch_caps.supports_dflash_hidden_scatter_fusion() {
-        eprintln!("SKIP: arch {arch} is not exact gfx1100 or gfx1201");
+        eprintln!("SKIP: arch {arch} is not exact gfx1100, gfx1151 or gfx1201");
         return 0;
     }
     if gpu.active_capture.is_some() {
@@ -416,6 +416,32 @@ fn direct_launcher_arm(
         .download_f32(&dst_l)
         .map_err(|e| format!("direct: dl dst_l: {e}"))?;
     assert_bits_eq(&a, &b, "direct: scatter dst");
+
+    // gfx1151 only: a finite window with rows > dst_modulus aliases dst rows
+    // (loop = last writer wins). The try-launcher must refuse so the loop
+    // owns the result; other arches keep the pre-existing routing.
+    if gpu.arch_caps.is_gfx1151() {
+        let alias_mod = N - r_skip - 1; // rows = N - r_skip > alias_mod
+        let alias_n_rows = N;
+        let launched = gpu
+            .dflash_hidden_scatter5_try(
+                &rb_k.layer_bufs,
+                &dst_k,
+                start_slot,
+                alias_n_rows,
+                r_skip,
+                H,
+                MP,
+                OFF,
+                alias_mod,
+                N_EXTRACT,
+            )
+            .map_err(|e| format!("direct: alias scatter5 try: {e}"))?;
+        assert!(
+            !launched,
+            "direct: gfx1151 scatter5_try launched an aliasing window (rows > dst_modulus)"
+        );
+    }
 
     rb_k.free_gpu(gpu);
     rb_l.free_gpu(gpu);

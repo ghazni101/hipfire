@@ -296,7 +296,7 @@ loaded.bind_to(&record)?; // digest, target, upload and entry linkage
 - The injected buffer descriptor configuration is correctness-checked across
   gfx1010, gfx1030, gfx1100, gfx1151, and gfx1201. Only gfx1201 has performance
   promotion; every other target remains candidate-only until it wins its own
-  benchmark. The [hipx portability artifact](tests/artifacts/hipx-portability-2026-07-14.json)
+  benchmark. The [multi-architecture portability artifact](tests/artifacts/hipx-portability-2026-07-14.json)
   records the live outputs and inspected code-object hashes.
 - Buffer byte offsets are 32-bit. Allocations larger than 4 GiB must rebase the
   descriptor instead of allowing an offset to wrap.

@@ -328,6 +328,114 @@ fn segment_digests(
 
 // ─── derive ──────────────────────────────────────────────────────────────────
 
+/// Rebind an existing Q4 table after proving the embedded Q8 PLE shards are
+/// unchanged. The old base must bind the source table. Publication replaces
+/// the destination directory entry, never its inode (including hard links).
+pub fn rebind_q4(
+    old_base: &Path,
+    new_base: &Path,
+    source: &Path,
+    progress: Progress<'_>,
+) -> Result<PathBuf, String> {
+    let mut old = HfqFile::open(old_base).map_err(|e| e.to_string())?;
+    let mut new = HfqFile::open(new_base).map_err(|e| e.to_string())?;
+    old.drop_mmap();
+    new.drop_mmap();
+    let rows = crate::ple_sidecar::PleRowsFile::open(source)?;
+    if rows.encoding() != RowEncoding::Q4Lm {
+        return Err("ple rebind: source is not Q4".into());
+    }
+    let mut header = rows.header().clone();
+    old.attach_ple_rows(rows)?;
+    if ple_fingerprint_from_metadata(&old.metadata_json)?
+        != ple_fingerprint_from_metadata(&new.metadata_json)?
+    {
+        return Err("ple rebind: PLE metadata changed".into());
+    }
+    let old_shards: Vec<_> = old.tensor_infos().iter()
+        .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
+        .collect();
+    let new_shards: Vec<_> = new.tensor_infos().iter()
+        .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
+        .collect();
+    if old_shards.is_empty() || old_shards.len() != new_shards.len() {
+        return Err("ple rebind: requires matching embedded PLE shards".into());
+    }
+    let old_file = File::open(old_base).map_err(|e| e.to_string())?;
+    let new_file = File::open(new_base).map_err(|e| e.to_string())?;
+    let mut left = vec![0u8; DEFAULT_CHUNK_BYTES];
+    let mut right = vec![0u8; DEFAULT_CHUNK_BYTES];
+    for (a, b) in old_shards.iter().zip(&new_shards) {
+        if a.name != b.name || a.shape != b.shape || a.quant_type != b.quant_type
+            || a.group_size != b.group_size || a.data_size != b.data_size
+        {
+            return Err("ple rebind: PLE descriptor changed".into());
+        }
+        let mut offset = 0;
+        while offset < a.data_size {
+            let n = left.len().min(a.data_size - offset);
+            old_file.read_exact_at(&mut left[..n], (a.data_offset + offset) as u64)
+                .map_err(|e| e.to_string())?;
+            new_file.read_exact_at(&mut right[..n], (b.data_offset + offset) as u64)
+                .map_err(|e| e.to_string())?;
+            if left[..n] != right[..n] {
+                return Err(format!("ple rebind: source rows changed in {}", a.name));
+            }
+            offset += n;
+        }
+    }
+    let input = File::open(source).map_err(|e| e.to_string())?;
+    let tuning = Tuning { threads: 1, segment_bytes: header.table.as_ref()
+        .ok_or("ple rebind: missing table")?.segment_bytes, ..Tuning::default() };
+    let segments = segment_digests(&input, source, header.data_offset,
+        header.data_bytes, &tuning, progress)?;
+    if segments.iter().map(|s| hex(s)).collect::<Vec<_>>()
+        != header.table.as_ref().ok_or("ple rebind: missing table")?.segment_sha256 {
+        return Err("ple rebind: source payload digest mismatch".into());
+    }
+    let original = header.clone();
+    let table = header.table.as_mut().ok_or("ple rebind: missing table")?;
+    table.base_file_bytes = new.file_len();
+    table.base_index_sha256 = hex(&new.index_sha256().map_err(|e| e.to_string())?);
+    let bytes = encode_ple_table_header(&mut header)?;
+    if header.rank_offset != original.rank_offset || header.data_offset != original.data_offset {
+        return Err("ple rebind: binding changes container layout".into());
+    }
+    let out = ple_sidecar_path(new_base, PleFormat::Q4);
+    if out == source {
+        return Err("ple rebind: source and destination must differ".into());
+    }
+    let tmp = append_suffix(&out, ".tmp");
+    let mut cleanup = TmpCleanup::default();
+    let output = open_locked_tmp(&tmp, "ple rebind")?;
+    cleanup.add(&tmp);
+    let size = input.metadata().map_err(|e| e.to_string())?.len();
+    check_space(parent_dir(&out), size, "ple rebind")?;
+    output.set_len(size).map_err(|e| e.to_string())?;
+    let mut offset = 0;
+    while offset < size {
+        let n = left.len().min((size - offset) as usize);
+        input.read_exact_at(&mut left[..n], offset).map_err(|e| e.to_string())?;
+        output.write_all_at(&left[..n], offset).map_err(|e| e.to_string())?;
+        output.read_exact_at(&mut right[..n], offset).map_err(|e| e.to_string())?;
+        if left[..n] != right[..n] {
+            return Err("ple rebind: copied bytes differ".into());
+        }
+        offset += n as u64;
+    }
+    output.write_all_at(&bytes, 0).map_err(|e| e.to_string())?;
+    output.sync_all().map_err(|e| e.to_string())?;
+    if read_ple_hot_pack_header(&tmp)? != header {
+        return Err("ple rebind: written header differs".into());
+    }
+    let mut check = HfqFile::open(new_base).map_err(|e| e.to_string())?;
+    check.attach_ple_rows(crate::ple_sidecar::PleRowsFile::open(&tmp)?)?;
+    fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+    cleanup.disarm();
+    sync_dir(parent_dir(&out), "ple rebind")?;
+    Ok(out)
+}
+
 /// Derive `<model>.ple-q4` (a v3 `ple-table`) from the model's Q8F16 PLE rows
 /// (its `.ple-q8` table when present, else the embedded shards).
 ///
@@ -2139,6 +2247,52 @@ mod tests {
 
     fn derive(model: &Path, rank: Option<&Path>, tuning: &Tuning) -> Result<DeriveReport, String> {
         derive_q4_with(model, rank, tuning, &mut no_progress())
+    }
+
+    #[test]
+    fn rebind_breaks_hardlink_and_preserves_payload() {
+        use std::os::unix::fs::MetadataExt;
+        let fx = fixture(true);
+        derive(&fx.model, None, &tuning()).unwrap();
+        let source = q4_path(&fx.model);
+        let stock = read_all(&source);
+        let base = fx.dir.path().join("changed.mq4");
+        fs::copy(&fx.model, &base).unwrap();
+        crate::hfq::append_hfq_metadata_overlay(&base, METADATA).unwrap();
+        let out = q4_path(&base);
+        fs::hard_link(&source, &out).unwrap();
+        rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap();
+        assert_ne!(fs::metadata(&source).unwrap().ino(), fs::metadata(&out).unwrap().ino());
+        assert_eq!(read_all(&source), stock);
+        let a = read_ple_hot_pack_header(&source).unwrap();
+        let mut b = read_ple_hot_pack_header(&out).unwrap();
+        assert_eq!(&stock[a.data_offset as usize..], &read_all(&out)[b.data_offset as usize..]);
+        assert_eq!(b.table.as_ref().unwrap().base_file_bytes, fs::metadata(&base).unwrap().len());
+        b.table.as_mut().unwrap().base_file_bytes = a.table.as_ref().unwrap().base_file_bytes;
+        b.table.as_mut().unwrap().base_index_sha256 = a.table.as_ref().unwrap().base_index_sha256.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rebind_refuses_changed_source_rows_and_corrupt_q4() {
+        let fx = fixture(true);
+        derive(&fx.model, None, &tuning()).unwrap();
+        let source = q4_path(&fx.model);
+        let base = fx.dir.path().join("changed.mq4");
+        fs::copy(&fx.model, &base).unwrap();
+        let hfq = HfqFile::open(&base).unwrap();
+        let shard = hfq.tensor_infos().iter().find(|t| t.name == ple_shard_name(0)).unwrap();
+        let file = OpenOptions::new().write(true).open(&base).unwrap();
+        file.write_all_at(&[255], shard.data_offset as u64).unwrap();
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+            .contains("source rows changed"));
+        fs::copy(&fx.model, &base).unwrap();
+        let header = read_ple_hot_pack_header(&source).unwrap();
+        OpenOptions::new().write(true).open(&source).unwrap()
+            .write_all_at(&[255], header.data_offset).unwrap();
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+            .contains("payload digest mismatch"));
+        assert!(!q4_path(&base).exists());
     }
 
     fn do_split(model: &Path, out: Option<&Path>, tuning: &Tuning) -> Result<SplitReport, String> {

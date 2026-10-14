@@ -378,51 +378,13 @@ fn quantize_mq4g256v2_impl(
             let offset = half * 128;
             let values = &group[offset..offset + 128];
             if symmetric {
-                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
-                if amax == 0.0 {
-                    scales[half] = 0;
-                    zeros[half] = f32_to_f16(-0.0);
-                    codes[offset..offset + 128].fill(8);
-                    continue;
-                }
-
-                let candidate_base = (amax / 7.5) * 0.5;
-                let multipliers = [
-                    1.0f32,
-                    f32::from_bits(0x3fa4_9249),
-                    f32::from_bits(0x3fdb_6db7),
-                    2.0f32,
-                ];
-                let mut best_mse = f64::INFINITY;
-                for multiplier in multipliers {
-                    let scale_bits = f32_to_f16(candidate_base * multiplier);
-                    let scale = f16_to_f32(scale_bits);
-                    if scale == 0.0 {
-                        continue;
-                    }
-                    let zero_bits = f32_to_f16(-8.0 * scale);
-                    let zero = f16_to_f32(zero_bits);
-                    let inverse = 1.0 / scale;
-                    let mut mse = 0.0f64;
-                    for &value in values {
-                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
-                        let error = value - code.mul_add(scale, zero);
-                        mse += (error as f64) * (error as f64);
-                    }
-                    if mse < best_mse {
-                        best_mse = mse;
-                        scales[half] = scale_bits;
-                        zeros[half] = zero_bits;
-                    }
-                }
-                let scale = f16_to_f32(scales[half]);
-                let zero = f16_to_f32(zeros[half]);
-                let inverse = 1.0 / scale;
-                for i in 0..128 {
-                    codes[offset + i] =
-                        ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
-                            as u8;
-                }
+                let (scale_bits, zero_bits) = hipfire_quantize::mq_symmetric::quantize_symmetric_half(
+                    values,
+                    15,
+                    &mut codes[offset..offset + 128],
+                );
+                scales[half] = scale_bits;
+                zeros[half] = zero_bits;
             } else {
                 let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
                 let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);

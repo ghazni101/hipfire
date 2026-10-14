@@ -21,6 +21,79 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
+/// Refuse the author-disclosed native-MTP verify corruption, not AR or graded MQ4/MQ6.
+/// Call only after a native head resolves and higher-priority drafters decline.
+pub fn native_mtp_refusal(
+    layers: &[LayerWeights],
+    arch: &str,
+    fp16_disabled: bool,
+) -> Option<&'static str> {
+    let dtypes = layers.iter().filter_map(|layer| match layer {
+        LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
+        LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
+        _ => None,
+    }).flat_map(|ffn| {
+        // Prefer the loaded tensors. Paged/EP layers retain full-model dtype
+        // metadata in their immutable execution plan even without local tensors.
+        ffn.experts.iter()
+            .filter(move |_| ffn.global_expert_dtypes.is_none())
+            .map(|expert| (expert.gate_up.gpu_dtype, expert.down.gpu_dtype))
+            .chain(ffn.expert_execution_plan.experts().iter()
+                .filter(move |_| ffn.experts.is_empty() || ffn.global_expert_dtypes.is_some())
+                .map(|expert| (expert.gate.dtype, expert.down.dtype)))
+    });
+    native_mtp_uniform_mq6_refused(arch, fp16_disabled, dtypes).then_some(
+        "native MTP refused: uniform MQ6/qt15 routed experts with gfx12 FP16 WMMA \
+         corrupt verify windows; use --spec off / speculation.mtp=off or HIPFIRE_FP16=0",
+    )
+}
+
+fn native_mtp_uniform_mq6_refused(
+    arch: &str,
+    fp16_disabled: bool,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+) -> bool {
+    if fp16_disabled || !matches!(arch, "gfx1200" | "gfx1201") {
+        return false;
+    }
+    let mut nonempty = false;
+    for (gate_up, down) in experts {
+        nonempty = true;
+        if gate_up != DType::MQ6G256 || down != DType::MQ6G256 {
+            return false;
+        }
+    }
+    nonempty
+}
+
+#[cfg(test)]
+mod native_mtp_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_uniform_mq6_truth_table() {
+        let mq6 = (DType::MQ6G256, DType::MQ6G256);
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(native_mtp_uniform_mq6_refused(arch, false, [mq6; 2]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, true, [mq6]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, []));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [mq6, (DType::MQ4G256, DType::MQ6G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256, DType::MQ4G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256V2, DType::MQ6G256V2)],
+            ));
+            assert!(native_mtp_refusal(&[], arch, false).is_none());
+        }
+        for arch in ["gfx1151", "gfx1100", "gfx942"] {
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, [mq6]));
+        }
+    }
+}
+
 // ─── Weight structs ─────────────────────────────────────────────────────
 
 /// Weights for a DeltaNet (linear attention) layer.
@@ -126,15 +199,35 @@ pub(crate) fn bind_live_expert_cache(
         .map_err(HipError::from)
 }
 
-/// Owning storage for a layer's packed uniform-MQ4 routed experts.
+/// Owning storage for a layer's packed routed experts.
 ///
-/// `experts` still carries one [`WeightTensor`] view per routed expert so the
-/// CPU fallback and every existing indexed dispatch keep their exact metadata
-/// and pointer-table ABI. Those views are non-owning subranges of these two
-/// buffers; only this owner pair may be returned to the GPU pool.
+/// Uniform raw layers pack into exactly one bucket per projection
+/// (`gate_up.len() == down.len() == 1`); graded (mixed-dtype) host layers
+/// pack one blob per distinct `(gate_up, down)` tag bucket. `experts` still
+/// carries one [`WeightTensor`] view per routed expert so the CPU fallback
+/// and every existing indexed dispatch keep their exact metadata and
+/// pointer-table ABI. Those views are non-owning subranges of these buffers;
+/// only these owner vecs may be returned to the GPU pool.
 pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: GpuTensor,
-    pub(crate) down: GpuTensor,
+    pub(crate) gate_up: Vec<GpuTensor>,
+    pub(crate) down: Vec<GpuTensor>,
+}
+
+impl PackedExpertOwners {
+    /// Uniform packing has one owner per projection; graded packing creates
+    /// only host-mapped buckets. Residency is therefore uniform within each
+    /// projection, and its first owner is authoritative even when every expert
+    /// tensor is a non-owning subrange.
+    pub(crate) fn host_mapped_projections(&self) -> (bool, bool) {
+        (
+            self.gate_up
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+            self.down
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+        )
+    }
 }
 
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that
@@ -239,6 +332,7 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         19 => Ok(DType::MQ2G256Lloyd),
         20 => Ok(DType::MQ3G256Lloyd),
         30 => Ok(DType::MQ4G256Lloyd),
+        31 => Ok(DType::MQ5G256),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
         38 => Ok(DType::MQ2G256GL),
@@ -305,6 +399,58 @@ pub(crate) struct MoeExpertSourceRecord {
     pub(crate) gate: Option<MoeProjectionSource>,
     pub(crate) up: Option<MoeProjectionSource>,
     pub(crate) down: MoeProjectionSource,
+}
+
+/// One-shot trace of the routed-expert arm's inputs, under `HIPFIRE_LOAD_TRACE=1`.
+///
+/// The arm the shared dispatch chooses depends on these values, and the
+/// selection code is not in this crate, so logging them is the only way to see
+/// which arm a given model takes. Fires once per stage per process.
+pub(crate) fn trace_moe_arm(
+    stage: &str,
+    routed_gate_up: DType,
+    routed_down: DType,
+    all_gate_up_mq4: bool,
+    host_mapped_experts: bool,
+    has_tier_tags: bool,
+) {
+    use std::sync::Once;
+    static PREFILL: Once = Once::new();
+    static DECODE: Once = Once::new();
+    // Gated on the developer env var directly: this used to call the load-trace
+    // helper that shipped with PR #814, which this branch no longer carries. The
+    // diagnostic itself is unchanged.
+    if hipfire_config::developer_var("HIPFIRE_LOAD_TRACE").is_err() {
+        return;
+    }
+    let once = if stage == "prefill" {
+        &PREFILL
+    } else {
+        &DECODE
+    };
+    once.call_once(|| {
+        eprintln!(
+            "[moe-arm] {stage}: routed_gate_up={routed_gate_up:?} routed_down={routed_down:?} \
+             all_gate_up_mq4={all_gate_up_mq4} expert_tier_tags={has_tier_tags} \
+             experts_host_mapped={host_mapped_experts}"
+        );
+    });
+}
+
+/// True when `name` is one of a layer's *routed-expert* weight tensors — the
+/// tensors `memory.moe_expert_budget` may move to host RAM.
+///
+/// Name knowledge stays in the arch: the shared `hipfire_runtime::offload`
+/// module never parses tensor names, it only consumes the byte census this
+/// classifier feeds.
+///
+/// Deliberately excludes the router (`mlp.gate.weight`), the shared expert
+/// (`mlp.shared_expert.*`), `mlp.shared_expert_gate` and the AWQ sidecars
+/// (`*.awq_scale.weight`): those stay with the layer, whose own residency
+/// decides their placement.
+pub(crate) fn is_routed_expert_weight(name: &str) -> bool {
+    name.contains(".mlp.experts.")
+        && (name.ends_with(".gate_up_proj.weight") || name.ends_with(".down_proj.weight"))
 }
 
 fn source_metadata(
@@ -1208,6 +1354,19 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
+    /// `memory.offload_exec=cpu` armed the host-side routed-expert splice on this
+    /// host-placed packed layer (`HIPFIRE_MOE_CPU_EXPERTS=0` is the kill-switch).
+    /// Single-token decode and the narrow (`<= 4`-row) batched forwards that
+    /// share its target arithmetic (the speculative verify and its accepted-
+    /// prefix rollback replay) defer the routed FFN to
+    /// [`hipfire_dispatch::cpu_exec::moe_cpu_experts`], which recomputes it from
+    /// the intact host blobs and accumulates it into the residual; the sealed
+    /// program then skips the routed GPU stages. Ordinary prompt prefill keeps
+    /// the real expert tables and the GPU grouped PCIe read — the CPU expert FFN
+    /// is compute-bound and loses to it by >10x at chunk sizes (measured 15x on
+    /// ornith/gfx1201), so `memory.offload_exec=cpu` applies to decode and narrow
+    /// verify only, matching llama.cpp's per-op batch routing.
+    pub(crate) cpu_deferred_experts: bool,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -2082,6 +2241,20 @@ pub struct Qwen35Weights {
 }
 
 impl Qwen35Weights {
+    /// True when the loaded placement defers at least one layer's routed MoE FFN
+    /// to the CPU splice (`memory.offload_exec=cpu` on a host-placed packed
+    /// layer). Resolved placement state read from the loaded weights — the
+    /// per-layer `cpu_deferred_experts` flag armed at load — not a configuration
+    /// intent. Fully resident, PCIe grouped-read, and dense CPU loads report
+    /// false. Native MTP admission uses this as a cross-crate capability query.
+    pub fn has_cpu_deferred_experts(&self) -> bool {
+        self.layers.iter().any(|layer| match layer {
+            LayerWeights::DeltaNetMoe(l) => l.ffn.cpu_deferred_experts,
+            LayerWeights::FullAttnMoe(l) => l.ffn.cpu_deferred_experts,
+            _ => false,
+        })
+    }
+
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
@@ -2877,8 +3050,9 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
             free_weight_metadata_with(e.gate_up, free);
             free_weight_metadata_with(e.down, free);
         }
-        free(owners.gate_up);
-        free(owners.down);
+        for owner in owners.gate_up.into_iter().chain(owners.down) {
+            free(owner);
+        }
     } else {
         for e in ffn.experts {
             free_weight_with(e.gate_up, free);
@@ -3327,6 +3501,180 @@ impl DeltaNetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_weight(buf: GpuTensor) -> WeightTensor {
+        WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn metadata_owner(storage: &mut [u8], host_mapped: bool) -> GpuTensor {
+        // Metadata-only ownership descriptors, following hip-bridge's owner-tag
+        // tests. The live backing storage permits sub_offset pointer arithmetic.
+        // Neither descriptor nor its views is dereferenced by HIP or freed.
+        let ptr = storage.as_mut_ptr().cast();
+        let buf = unsafe {
+            if host_mapped {
+                hip_bridge::DeviceBuffer::from_host_mapped(ptr, storage.len())
+            } else {
+                hip_bridge::DeviceBuffer::from_vmm_owner(ptr, storage.len())
+            }
+        };
+        GpuTensor {
+            buf,
+            shape: vec![storage.len()],
+            dtype: DType::Raw,
+        }
+    }
+
+    fn metadata_moe(
+        experts: Vec<ExpertWeights>,
+        packed_expert_owners: Option<PackedExpertOwners>,
+    ) -> MoeFfnWeights {
+        let (expert_execution_plan, expert_table, expert_binding) =
+            test_expert_binding().expect("test expert metadata");
+        MoeFfnWeights {
+            router: metadata_weight(GpuTensor::null_for_test()),
+            experts,
+            packed_expert_owners,
+            shared_expert: SharedExpertWeights {
+                gate: metadata_weight(GpuTensor::null_for_test()),
+                up: metadata_weight(GpuTensor::null_for_test()),
+                down: metadata_weight(GpuTensor::null_for_test()),
+            },
+            shared_expert_gate: metadata_weight(GpuTensor::null_for_test()),
+            expert_gate_up_ptrs: GpuTensor::null_for_test(),
+            expert_down_ptrs: GpuTensor::null_for_test(),
+            expert_down_awq_ptrs: None,
+            cpu_deferred_experts: false,
+            expert_dtype_tags: None,
+            layer_idx: 0,
+            expert_shape: None,
+            paro_shared: None,
+            global_expert_dtypes: None,
+            ep_dummy_buffers: Vec::new(),
+            ep_dummy_experts: Vec::new(),
+            retired_expert_weights: Vec::new(),
+            mixed_expert_gate_up_tiers: None,
+            mixed_expert_down_tiers: None,
+            expert_execution_plan,
+            expert_table,
+            expert_binding,
+        }
+    }
+
+    #[test]
+    fn packed_projection_residency_comes_from_owners_not_borrowed_views() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let gate_owner = metadata_owner(&mut gate_storage, gate_host);
+                let down_owner = metadata_owner(&mut down_storage, down_host);
+                let expert = ExpertWeights {
+                    gate_up: metadata_weight(gate_owner.sub_offset(4, 4)),
+                    down: metadata_weight(down_owner.sub_offset(8, 4)),
+                };
+                let ffn = metadata_moe(
+                    vec![expert],
+                    Some(PackedExpertOwners {
+                        gate_up: vec![gate_owner],
+                        down: vec![down_owner],
+                    }),
+                );
+                let (gate, down) = ffn.get(0).expect("packed expert views");
+                assert!(gate.buf.buf.is_borrowed());
+                assert!(down.buf.buf.is_borrowed());
+                assert!(!gate.buf.buf.is_host_mapped());
+                assert!(!down.buf.buf.is_host_mapped());
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+
+                // Without owner metadata, the generic adapter must not infer
+                // host residency merely because these same views are borrowed.
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (false, false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unpacked_projection_residency_uses_direct_owners_and_empty_fails_closed() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let ffn = metadata_moe(
+                    vec![ExpertWeights {
+                        gate_up: metadata_weight(metadata_owner(&mut gate_storage, gate_host)),
+                        down: metadata_weight(metadata_owner(&mut down_storage, down_host)),
+                    }],
+                    None,
+                );
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (gate_host, down_host)
+                );
+            }
+        }
+        assert_eq!(
+            metadata_moe(Vec::new(), None).host_mapped_projections(),
+            (false, false)
+        );
+        assert_eq!(
+            metadata_moe(
+                Vec::new(),
+                Some(PackedExpertOwners {
+                    gate_up: Vec::new(),
+                    down: Vec::new(),
+                }),
+            )
+            .host_mapped_projections(),
+            (false, false)
+        );
+    }
+
+    /// The classifier decides which tensors `memory.moe_expert_budget` may move,
+    /// so its accept/reject sets are the contract. Every spelling below is one
+    /// `qwen35_tensor_name_candidates` actually emits for the trunk.
+    #[test]
+    fn routed_expert_classifier_accepts_only_the_expert_projections() {
+        for accepted in [
+            "layers.0.mlp.experts.255.gate_up_proj.weight",
+            "model.language_model.layers.7.mlp.experts.0.down_proj.weight",
+            "model.layers.12.mlp.experts.3.gate_up_proj.weight",
+        ] {
+            assert!(is_routed_expert_weight(accepted), "{accepted}");
+        }
+        for rejected in [
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.shared_expert.gate_proj.weight",
+            "layers.0.mlp.shared_expert.up_proj.weight",
+            "layers.0.mlp.shared_expert.down_proj.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.mlp.experts.0.down_proj.awq_scale.weight",
+            "layers.0.mlp.experts.0.gate_up_proj.awq_scale.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.linear_attn.in_proj_qkv.weight",
+        ] {
+            assert!(!is_routed_expert_weight(rejected), "{rejected}");
+        }
+    }
     use rdna_compute::DType;
 
     #[test]

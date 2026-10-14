@@ -113,7 +113,7 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
-      "sha256": "1d2662aa9d16c3dba66603f83bd84a5234cd5c7d1b4d57141e2a0f6e88c952cf",
+      "sha256": "36f07dd7cc1e80dbfa28b8d5710972ab335f231f082c0176a8ccd9afb7a19b1f",
       "symbols": [
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w8"
@@ -638,7 +638,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "40a4bf6bb9000870141564bec776fda2c993c4a6267a4c5a08a2b344f65a0d74",
+      "sha256": "75492642300fefdcf12b4c72ecaa750a4611988ccd09689deac261418a7ac24c",
       "symbols": [
         "qwen4_wmma_lds_128_128_32_64_k64",
         "qwen4_wmma_lds_128_256_32_64_k64",
@@ -1881,7 +1881,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "e903c9cdda8d03e55aec629e3f66f48542d3532733b787653ab9ec2b43656432",
+      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
       "symbols": [
         "topk8_partial_f32"
       ],
@@ -2250,7 +2250,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
+      "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -3161,7 +3161,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "40a4bf6bb9000870141564bec776fda2c993c4a6267a4c5a08a2b344f65a0d74",
+          "sha256": "75492642300fefdcf12b4c72ecaa750a4611988ccd09689deac261418a7ac24c",
           "symbols": [
             "qwen4_wmma_lds_128_128_32_64_k64",
             "qwen4_wmma_lds_128_256_32_64_k64",
@@ -4480,7 +4480,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
+          "sha256": "17035a8f1cb9893734e1ba2fd11de1d4e3c2416b366d2a4b1ed91675ace211e9",
           "symbols": [
             "argmax_f32",
             "bf16_scaled_add_batched_f32",

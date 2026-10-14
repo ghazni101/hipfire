@@ -219,7 +219,10 @@ pub struct SpecLoadCfg {
     /// mechanism selected (skip load + build), `None` = `auto` (load if a
     /// bundled trailer or `.mtp` sidecar exists).
     pub mtp: Option<bool>,
-    /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
+    /// MTP draft window K. `Some` = explicit (load param, `HIPFIRE_MTP_K`, or
+    /// `speculation.mtp_k`); `None` = `auto`: each producer applies its own
+    /// default (`hipfire_config::mtp_k_default_for_arch` for native Qwen4 MTP,
+    /// else `hipfire_config::MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
     /// Qwen DFlash draft enable, lowered from `dflash_mode`: `Some(true)` =
     /// `on` (fail the load when the draft is missing or unloadable),

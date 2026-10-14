@@ -119,18 +119,26 @@ OpenAI HTTP surface after serve is up: [SERVE.md](SERVE.md).
 Helper builds `gate-runner` and runs a command inside it with GPU
 passthrough and the host models directory bind-mounted.
 
-`Containerfile` gate-runner `CMD` and the wrapper’s no-arg default both name
-the legacy base coherence-gate entry (scripts/coherence-gate.sh) — historical/pre-modular/generated and intentionally absent from the checkout (only `scripts/coherence-gate-*.sh` variants remain). Pass an **explicit**
-existing command:
+The `gate-runner` image has no default gate. Its `CMD` and the wrapper's
+no-argument path both print guidance and exit `2`: there is no universal
+correctness battery, so select a route from [VALIDATION.md](VALIDATION.md)
+and pass it explicitly. The image ENTRYPOINT is `/bin/bash`, so invoke Python
+scripts through `python3`; a bare `.py` path would be run by bash.
 
 ```bash
-# Preferred current serve smoke (gate ENTRYPOINT is bash — invoke Python explicitly):
-scripts/container-gate.sh -lc 'exec python3 scripts/serve_harness.py --model /root/.hipfire/models/<file> --tag qwen3.5:9b'
+# Serve semantics smoke (finish reasons, empty/runaway output, prompt-cache
+# reuse across a chain of turns). The harness starts its own serve inside the
+# container; the host models dir is mounted at /root/.hipfire/models:
+scripts/container-gate.sh -lc 'exec python3 scripts/serve_harness.py --mode chain --model /root/.hipfire/models/<file> --tag qwen3.5:9b'
 
-# Historical reproduction only (retired acceptance — see VALIDATION.md):
-scripts/container-gate.sh scripts/coherence-gate-dflash.sh
-scripts/container-gate.sh scripts/serve-multiturn-gate.sh
+# Kernel / dispatch / Redline changes:
+scripts/container-gate.sh -lc 'exec python3 scripts/redline_daemon_harness.py'
 ```
+
+Prefix-cache behavior: `--mode chain` reports `cached_tokens` on related
+turns, and `--mode prefix-fanout` drives the opt-in shared-header workload.
+The cross-session prefix cache itself is opt-in multi-slot config
+(`serve.multi_slot`, `serve.prefix_cache`; see [SERVE.md](SERVE.md)).
 
 Environment:
 
@@ -144,19 +152,17 @@ Environment:
 
 **Scope limits (fail closed):**
 
-- `scripts/coherence-gate-*.sh` batteries are **retired as acceptance
-  evidence** ([VALIDATION.md](VALIDATION.md)). Historical reproduction only —
-  never merge/promotion criteria.
+- The retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance
+  evidence and are not recommended here ([VALIDATION.md](VALIDATION.md)).
 - A successful **image build** proves the multi-stage compile path only. It
   does **not** certify GPU runtime correctness, serve semantics, or perf.
-- Bare `scripts/container-gate.sh` with no args will try the missing default
-  legacy base coherence-gate entry (scripts/coherence-gate.sh; historical/pre-modular/generated and intentionally absent from the checkout) and fail closed until you pass a real command.
+- Bare `scripts/container-gate.sh` with no arguments fails closed with exit
+  `2` and a usage message until you pass a real command.
 - No-GPU CI (`.github/workflows/no-gpu-ci.yml`) does **not** build this
   Containerfile and does **not** replace a manual GPU route.
 
-For current user-facing serve smoke, prefer `scripts/serve_harness.py` (host
-or via `container-gate.sh`) per [VALIDATION.md](VALIDATION.md) and
-[SERVE.md](SERVE.md).
+Current user-facing serve smoke is `scripts/serve_harness.py` per
+[VALIDATION.md](VALIDATION.md) and [SERVE.md](SERVE.md).
 
 ## Publishing
 

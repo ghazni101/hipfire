@@ -1,0 +1,85 @@
+{
+  "_comment": "Inputs for scripts/readme_charts.py. Every measured value names its CHANGELOG 0.4.2 entry, fixture, GPU and the date of the changelog commit that recorded it. Regenerate with: python3 scripts/readme_charts.py",
+  "gains": [
+    {
+      "panel": "Strix Halo 27B DFlash decode",
+      "unit": "tok/s",
+      "higher_is_better": true,
+      "source": "CHANGELOG Unreleased (0.4.2): Strix Halo (gfx1151) 27B DFlash exact 16-row verify GEMMs (HIPFIRE_GFX1151_XLDS)",
+      "fixture": "Qwen3.8-27B XTS sha256 3e38ccba..., paired DFlash draft d0a74a23..., hipfire bench --backend noslots --workload stateless --max-tokens 256, 3 fresh processes x 5 runs, median of per-process medians",
+      "gpu": "Strix Halo (gfx1151), PerfOpt kernel",
+      "date": "2026-10-13",
+      "commit": "00d4b7464",
+      "rows": [
+        {"label": "code (merge_sort_thinking_off)", "before": 97.9, "after": 135.3},
+        {"label": "prose (prose_river_short)", "before": 19.0, "after": 26.3}
+      ]
+    },
+    {
+      "panel": "Qwen3.8-27B DFlash-default prefill",
+      "unit": "tok/s",
+      "higher_is_better": true,
+      "source": "CHANGELOG Unreleased (0.4.2): Qwen35 DFlash cold prefill keeps the target hidden rows on device (HIPFIRE_DFLASH_PREFILL_DEVICE)",
+      "fixture": "Qwen3.8-27B XTS with paired draft, committed 8.2K prompt, 3 fresh interleaved serve processes per arm, thinking off, one output token; both switches 0 vs default",
+      "gpu": "one R9700 (gfx1201)",
+      "date": "2026-10-12",
+      "commit": "5514ae905",
+      "rows": [
+        {"label": "8.2K-token prompt", "before": 3809, "after": 4921}
+      ]
+    },
+    {
+      "panel": "Flash-Next NPU prefill route, TTFT",
+      "unit": "ms",
+      "higher_is_better": false,
+      "source": "CHANGELOG Unreleased (0.4.2): Flash-Next on Strix Halo, pipelined trunk input projections on the XDNA2 NPU (fusions.npu_trunk), rebalanced-pairs Measured bullet (default auto vs off, no trace env)",
+      "fixture": "pinned Flash-Next XTS, default serve config, session cache on, zab overlay both arms, p16k (16,355 tokens), 3 fresh processes x 2 cold nonce-prefixed requests, median of per-process medians; off vs default auto",
+      "gpu": "Strix Halo (gfx1151) + XDNA2 NPU",
+      "date": "2026-10-13",
+      "commit": "475f3bb80",
+      "rows": [
+        {"label": "16K-token prompt", "before": 7878, "after": 7085}
+      ]
+    },
+    {
+      "panel": "Flash-Next EP2 prefill vs one card",
+      "unit": "tok/s",
+      "higher_is_better": true,
+      "source": "CHANGELOG Unreleased (0.4.2): Flash-Next (Qwen4) EP2/EP4 owner-routed prefill chunk MoE, final gate on the combined build",
+      "fixture": "pinned Flash-Next XTS sha256 8b15b6fe..., committed prompts, warm, 3 fresh processes per arm; single card vs EP2 combined (balanced owners + owner-routed prefill + expert staging)",
+      "gpu": "2x R9700 (gfx1201)",
+      "date": "2026-10-13",
+      "commit": "a5993c7f8",
+      "rows": [
+        {"label": "8K prompt (1.30x)", "before": 3033, "after": 3943},
+        {"label": "16K prompt (1.15x)", "before": 3754, "after": 4308}
+      ]
+    }
+  ],
+  "matrix": {
+    "_comment": "Levels: tuned = arch-specific kernels or default-on route; generic = runs on the portable/typed-dispatch path; none = not available. Capability, not admission or certification (docs/ARCHITECTURE.md).",
+    "features": ["Decode", "Prefill WMMA", "DFlash", "MTP", "NPU prefill", "Redline"],
+    "archs": [
+      {"label": "Vega / CDNA", "detail": "gfx906, gfx908, gfx940-942",
+       "cells": ["generic", "none", "generic", "generic", "none", "none"]},
+      {"label": "RDNA1", "detail": "gfx1010-1013",
+       "cells": ["generic", "none", "generic", "generic", "none", "generic"]},
+      {"label": "RDNA2", "detail": "gfx1030-1032",
+       "cells": ["generic", "none", "generic", "generic", "none", "generic"]},
+      {"label": "RDNA3", "detail": "gfx1100-1103",
+       "cells": ["tuned", "tuned", "tuned", "generic", "none", "tuned"]},
+      {"label": "RDNA3.5", "detail": "gfx1150-1152 (Strix Halo gfx1151)",
+       "cells": ["tuned", "tuned", "tuned", "tuned", "tuned", "tuned"]},
+      {"label": "RDNA4", "detail": "gfx1200, gfx1201",
+       "cells": ["tuned", "tuned", "tuned", "tuned", "none", "tuned"]}
+    ],
+    "sources": {
+      "Decode": "docs/ARCHITECTURE.md kernel-select layer (hipfire-dispatch / rdna-compute family tables pick WMMA -> specialized -> baseline); README GPU table",
+      "Prefill WMMA": "docs/ARCHITECTURE.md (WMMA family tables); docs/BENCHMARKS.md supporting notes (gfx12 WMMA paths; gfx906 uses dp4a MMQ, CDNA is MFMA not WMMA)",
+      "DFlash": "docs/speculation-support-inventory.md (DFlash is per model arch, GPU-generic); tuned: CHANGELOG 0.4.2 gfx1100 shared rotations, gfx1151 XLDS verify GEMMs, gfx1201 continuous-batching / device accept",
+      "MTP": "docs/speculation-support-inventory.md (MTP per model arch); tuned: CHANGELOG 0.4.2 gfx1151 MTP cap 4 + DET prompt fill, gfx1201 batched MTP fill",
+      "NPU prefill": "CHANGELOG 0.4.2 Flash-Next NPU trunk route: exact gfx1151 with XDNA2 only",
+      "Redline": "README / docs/ARCHITECTURE.md Redline roles: RDNA1-RDNA4 dispatch; mq4r_redline_default on exact gfx1100/gfx1151/gfx1201"
+    }
+  }
+}

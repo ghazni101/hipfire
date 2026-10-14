@@ -1,11 +1,29 @@
 # Spec: Qwen3.5-VL — `mq4v2` quantization + vision serving on arch 5 (family spec)
 
-Status: DRAFT (branch `feat/qwen35-vl`; sibling arch-11 carrier on
-`feat/lfm2-vl`. Supersedes the fatter `feat/vl` working copy, archived as
+> **Lifecycle: historical (family design and bring-up record).** Retained
+> for provenance of the 2026-08 arch-5 VL carrier work. It is **not**
+> current procedure, product authority, or acceptance: the §5 validation
+> plan and §7 file list are the original plan, "as-built" notes are dated
+> snapshots, and PR/issue references (#312, #610) describe state at the
+> time. Current behavior is defined by the code
+> (`crates/hipfire-arch-qwen35-vl/`, `crates/hipfire-quantize/src/pipeline.rs`,
+> `crates/hipfire-quantize/src/model_filter.rs`,
+> `crates/hipfire-quantize/src/vision_sidecar.rs`, `crates/hipfire-loader/`
+> admission), by [`architecture-ids.md`](architecture-ids.md), by
+> [`specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md),
+> and by [`VALIDATION.md`](VALIDATION.md) for VL claim routes (route
+> existence is not per-checkpoint evidence). The §4 "shared contract" is
+> retained as the plan the carriers were built against; the `.vl` sidecar
+> packaging question it leaves open has since gained a sidecar
+> implementation in the quantizer (`vision_sidecar.rs`), so do not read §4
+> as the current packaging decision.
+
+Status at the time: DRAFT (branch `feat/qwen35-vl`; sibling arch-11 carrier
+on `feat/lfm2-vl`. Supersedes the fatter `feat/vl` working copy, archived as
 tag `archive/feat-vl`)
-Author: engineering (hipfire agent)
-Sibling spec: [`lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) — the arch 11 carrier
-(LFM2.5-VL). §4 of this document is the shared artifact contract for both.
+Author: engineering
+Sibling record: [`lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) — the arch 11 carrier
+(LFM2.5-VL). §4 of this document was the shared artifact contract for both.
 
 ## 0. Goal and scope
 
@@ -41,19 +59,19 @@ HTTP; bf16 vision; per-fine-tune SKU work.
   fine-tunes, audited per the table below.
 - **Family vision-sourcing convention: the tower ships separately.**
   Qwen3.5-family VL sources distribute the vision encoder as a **separate
-  module** (llama.cpp `mmproj`-style — e.g. `mmproj-Ornith-1.5-9B-F16.gguf`),
+  module** (`mmproj`-style GGUF — e.g. `mmproj-Ornith-1.5-9B-F16.gguf`),
   not inside the text trunk. The hipfire build step therefore takes *two*
   inputs — text checkpoint + separate vision module — and **embeds the vision
   tensors F16 into the single `.hfq`/`.mq4` artifact**. Both as-built local
   artifacts follow this (censuses below); the separate-module source and
   embedded artifact are complementary, not competing layouts.
 - **Primary instance (as-built, verified 2026-08-26):**
-  `~/AI/models/ornith-1.5-9b.mq4` — arch_id 5, 760 tensors, census **486 F16
+  the local `ornith-1.5-9b.mq4` build — arch_id 5, 760 tensors, census **486 F16
   / 249 MQ4G256V2 / 25 Q8F16**, vision embedded; sha256
-  `dde2d142…99cb` **matches the appliance pin** in
-  `container/registry.cache.json`. Container images exist: `hipfire-ornith:mq4v2`
+  `dde2d142…99cb` **matched the appliance pin** in the local registry
+  cache at the time. Local container images existed: `hipfire-ornith:mq4v2`
   (model baked, 28.3 GB) and `local/hipfire-ornith:dynamic-pool` (model
-  bind-mounted). Validation runs through this appliance — no new pull, no new
+  bind-mounted). Validation ran through this appliance — no new pull, no new
   quant. The engine's vision path was previously validated on a 9B-VL family
   build — `benchmarks/vision/comparison-2026-05-23.md` remains the
   prompt/fixture baseline for §5.
@@ -171,7 +189,7 @@ this section.
 4. **Image coherence battery:** the 6 committed fixtures in
    `benchmarks/vision/images/`, the two fixed prompts (desc / ocr) from the
    2026-05-23 comparison, greedy, temp 0, `/no_think`. Compare against that
-   comparison's F16-spliced baseline and its llama.cpp arms. **Read the
+   comparison's F16-spliced baseline and its external-engine arms. **Read the
    outputs** — the eyeball rule; tight variance on image batteries is a
    warning sign, not a pass.
 5. **Fixture discipline:** record image SHA-256 + prompt md5 + artifact

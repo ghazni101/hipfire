@@ -75,7 +75,7 @@ anything above.
 > (`is_x86_feature_detected!("avx512f") == true`, measured 2026-09-27); the base
 > record's "AVX-512 is not available on this host (Zen 3)" is wrong, and
 > `/proc/cpuinfo` alone has been misread here before. The CPU kernels are gated on
-> AVX2+FMA+F16C **for portability, not because of this box**: the fleet's `k9lin`
+> AVX2+FMA+F16C **for portability, not because of this box**: the fleet's RDNA3 workstation
 > is a Zen 2 AM4 with no AVX-512, so an AVX-512 kernel without its own
 > `is_x86_feature_detected!` gate would be a win here and a `SIGILL` there.
 
@@ -150,6 +150,7 @@ setting it only breaks comparability with the anchors in § 6. `--spec off
 | every point after the first fails in ~1 s with no JSON, `FATAL: hipfire daemon already running` | a daemon survived; the pid file and the process disagree | `pgrep -f target/release/daemon`; kill **by path** and wait for exit before the next point |
 | the driver dies mid-run with no error at all | `kill -9 $(cat ~/.hipfire/daemon.pid)` signalled whatever now owns that *reused* pid | never signal from the pid file alone; first `ps -p <pid> -o comm= \| grep -q daemon` |
 | no `cpu exec: step` lines / `steps: 0` | `HIPFIRE_CPU_EXEC_TRACE` was not set — this is **not** a coverage failure | re-run with the env set; read the coverage line independently of the trace |
+| no `cpu exec: moe expert splice` lines on a MoE spill (`offload_exec=cpu`, `moe_expert_budget` spill) | same cause — trace off — or the forward took the wide (>4-row) GPU grouped path, which never enters the splice | re-run with the env set on an AR / `n <= 4` forward; the splice line is keyed by `(quant, dim, mi, k)` with `d2h_first` (carries the GPU wait) / `d2h_rest` / `gu` / `dn` / `h2d` plus coarse `setup` (expert resolve), `middle` (whole SiLU+FWHT loop), `combine` (weighted combine), `total` (splice wall excl. trace print) means — per-phase sums reconcile within a splice, but per-quant attribution does not (`quant` is the first selected expert's gate_up label, `graded=true` collapses all mixes, down quant and worker count never printed) |
 | coverage line reads `uncovered quants: Q8HFQ` (or MQ8G256 / MFP4* / PARO*) | the model carries a format outside `CpuQuant`; those stay on PCIe by design | expected; the arm measures a partial spill — say so in the report |
 | `prefill_tok_s` moves a lot between arms | prefill is GPU-side, so the seam cannot cause it — something else changed | compare binary / model / prompt digests between the arms |
 | `vram_free_mb` differs between arms at the same budget | the host-mapped allocation path changed | re-measure; this is a pass-condition failure, not noise |
@@ -197,6 +198,17 @@ env HIPFIRE_GPU_LAYER_BUDGET=24 HIPFIRE_OFFLOAD_EXEC=cpu HIPFIRE_CPU_EXEC_TRACE=
 Each line gives the D2H / GEMV / H2D split for a step shape, and the second
 counter *must* be `0 host-mapped steps still on GPU`. A non-zero value means a
 step shape never reached the CPU — report it, do not average it away.
+
+The same flag prints `cpu exec: idle N% — window ending at step S covers K
+steps: …ms wall, …ms on CPU (…us CPU/step)`, one line per window on the global
+step count's doubling schedule. That percentage is the share of the window's
+decode wall spent inside CPU-executed steps, and since a CPU step is a host sync
+point (a blocking D2H, the multiplication, an H2D) and prefill never enters the
+seam, it is a **lower bound on the GPU's idle fraction**. Quote the last lines of
+a run (the windows that cover most of it); the first windows are cold. This is
+the headroom reading for pass-back — scheduled co-inference of the spilled layers —
+not a rate and not a correctness signal. Also: `--runs N` decodes N times in one
+process, so use the per-window lines rather than any cumulative ratio.
 
 **Read the call count on the line before you quote a number.** A shape is printed
 at its first call and then at every doubling of that shape's call count, and each

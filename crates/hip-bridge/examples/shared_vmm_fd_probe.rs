@@ -859,7 +859,7 @@ impl GraphState {
             // SAFETY: `host` is pinned host memory of `slots` bytes that outlives the graph.
             let dst = unsafe { std::slice::from_raw_parts_mut(host.cast::<u8>(), slots) };
             gpu.hip
-                .memcpy_dtoh_async(dst, &res, &stream)
+                .memcpy_dtoh_async(dst, &res, Some(&stream))
                 .map_err(hip_err("memcpy_dtoh_async"))?;
             Ok(())
         })();

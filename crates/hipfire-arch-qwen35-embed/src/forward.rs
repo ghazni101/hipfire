@@ -22,16 +22,17 @@
 //!   Dense head.
 //!
 //! Kernel-call shapes are lifted from the production qwen35 prefill path
-//! (`hipfire-arch-qwen35/src/qwen35/prefill.rs`); the GEMM dispatch
-//! (WMMA `mb8` with naive fallback) mirrors `hipfire-arch-qwen35-vl`'s
-//! `linear_f16`. Weights are f16 GEMM operands, activations and all norms
-//! f32.
+//! (`hipfire-arch-qwen35/src/qwen35/prefill.rs`). Eligible projections and
+//! eager attention use optimized per-architecture LDS WMMA (gfx11 incumbent,
+//! gfx1201 ascending-K split1). Small projections retain WMMA `mb8` with
+//! naive fallback. Projection inputs and all norms are F32; LDS operands
+//! narrow to F16 and GEMM outputs remain F32.
 
 use crate::config::EmbedConfig;
 use crate::state::GdnEncodeState;
 use crate::weights::{EmbedWeights, ImageSpan};
-use rdna_compute::gemm::LdsTile;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::gemm::{LdsTile, LdsTileSplitK};
+use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
 
 /// Input assembled by the caller (bundle / generate body): token ids, the
 /// host hidden-state rows for image positions, and per-token (t, h, w)
@@ -46,10 +47,9 @@ pub struct EncodeInput<'a> {
     pub pos3: &'a [[i32; 3]],
 }
 
-/// LDS-tile selection for the eager attention GEMMs, shared with
-/// `Enc::gemm_ld` — `cands` is the caller's preference order, `m`/`batch` the
-/// GEMM's M/N. Public so `examples/attn_eager_parity` can run the same
-/// dispatch production uses instead of a different kernel.
+/// gfx11 LDS-tile selection for eager attention — `cands` is the caller's
+/// preference order, `m`/`batch` the GEMM's M/N. Retained for tile-sweep labs;
+/// production and parity use [`attention_gemm_ld`] for architecture dispatch.
 pub fn attention_lds_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTile> {
     cands
         .iter()
@@ -75,6 +75,75 @@ pub fn attention_pv_tiles() -> [LdsTile; 3] {
         LdsTile::new(128, 128, 32, 64, 64, false),
         LdsTile::new(64, 64, 32, 64, 64, false),
     ]
+}
+
+fn projection_gfx1201_tile(m: usize) -> LdsTileSplitK {
+    match m {
+        0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+        512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+        _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionRoute {
+    Gfx1201(LdsTileSplitK),
+    Gfx11(Option<LdsTile>),
+}
+
+fn attention_route(arch: &str, m: usize, batch: usize, qk: bool) -> AttentionRoute {
+    if arch == "gfx1201" {
+        let tile = if qk && m >= 128 && batch >= 128 {
+            LdsTileSplitK::new(128, 128, 32, 64, false, 1)
+        } else if !qk && m >= 64 && batch >= 128 {
+            LdsTileSplitK::new(64, 128, 32, 64, true, 1)
+        } else {
+            LdsTileSplitK::new(64, 64, 32, 64, true, 1)
+        };
+        AttentionRoute::Gfx1201(tile)
+    } else {
+        let cands = if qk {
+            attention_qk_tiles()
+        } else {
+            attention_pv_tiles()
+        };
+        AttentionRoute::Gfx11(attention_lds_tile(&cands, m, batch))
+    }
+}
+
+/// Production eager-attention GEMM: F16 A/X (possibly pitched), F32 `[batch, m]`
+/// output. gfx1201 uses optimized split1 LDS with ascending K; gfx11 preserves
+/// its measured QK/PV candidate order and automatic fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_gemm_ld(
+    gpu: &mut Gpu,
+    a: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+    lda: usize,
+    ldx: usize,
+    qk: bool,
+) -> HipResult<()> {
+    if !gpu.arch_caps.has_wmma_w32() && gpu.arch != "gfx1201" {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "qwen35-embed: attention LDS requires gfx11 WMMA or exact gfx1201",
+        ));
+    }
+    match attention_route(&gpu.arch, m, batch, qk) {
+        AttentionRoute::Gfx1201(tile) => {
+            gpu.gemm_f16_x_f16_wmma_lds_splitk_ld(a, x, y, m, k, batch, tile, lda, ldx)
+        }
+        AttentionRoute::Gfx11(Some(tile)) => {
+            gpu.gemm_f16_x_f16_wmma_lds_tiled_ld(a, x, y, None, m, k, batch, tile, lda, ldx)
+        }
+        AttentionRoute::Gfx11(None) => {
+            gpu.gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
+        }
+    }
 }
 
 /// Small scratch wrapper: alloc/upload/free + the f16 GEMM dispatch. A
@@ -110,12 +179,9 @@ impl<'a> Enc<'a> {
     /// `y[n, out] = x[n, k] · w_f16[out, k]ᵀ` (no bias — every text
     /// projection here is bias-free).
     ///
-    /// **`x` is F32.** Both underlying kernels (`gemm_f16_wmma_mb8` and the
-    /// naive `gemm_f16`) read their X operand as f32 and cast to f16
-    /// internally — passing an f16 activation buffer makes the kernel read
-    /// four bytes per element and run off the end of the allocation (which
-    /// showed up as per-row NaNs on the first 2 of N rows). Only the weight
-    /// operand is f16.
+    /// **`x` is F32.** `gemm_f16_wmma_mb8` and naive `gemm_f16` read X as
+    /// F32; eligible LDS projections explicitly cast it to F16 scratch.
+    /// Weights are F16 and the `[n, out]` output is always F32.
     fn gemm(
         &mut self,
         w: &GpuTensor,
@@ -154,12 +220,26 @@ impl<'a> Enc<'a> {
         // (6e-2, see scripts/check_embed_quant.py) and validated by the same
         // oracle. `HIPFIRE_EMBED_GEMM=f32` forces mb8 to A/B it or to keep
         // activations full precision.
-        let use_tiled = k % 64 == 0 && out >= 256 && !embed_gemm_f32();
+        let use_tiled = k % 64 == 0
+            && out >= 256
+            && !embed_gemm_f32()
+            && (self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch == "gfx1201");
         if use_tiled {
             let x16 = self.cast_f16(x, n * k)?;
-            let r = self
-                .gpu
-                .gemm_f16_x_f16_wmma_lds_auto(w, &x16, &y, None, out, k, n);
+            let r = if self.gpu.arch == "gfx1201" {
+                self.gpu.gemm_f16_x_f16_wmma_lds_splitk(
+                    w,
+                    &x16,
+                    &y,
+                    out,
+                    k,
+                    n,
+                    projection_gfx1201_tile(out),
+                )
+            } else {
+                self.gpu
+                    .gemm_f16_x_f16_wmma_lds_auto(w, &x16, &y, None, out, k, n)
+            };
             self.free(x16)?;
             r.map_err(|e| format!("qwen35-embed: gemm (lds-tiled): {e:?}"))?;
         } else {
@@ -169,19 +249,6 @@ impl<'a> Enc<'a> {
         }
         Ok(y)
     }
-
-    /// A measured `LdsTile` for one of the attention GEMM shapes, or `None` to
-    /// let `_auto_ld` choose.
-    ///
-    /// `lds_tile_for` is tuned at *projection* shapes (large K, m >= 1024). Both
-    /// attention GEMMs sit outside that: QK^T has K = head_dim (256, only four
-    /// k64 stages) and PV has M = head_dim (256, so a 256-wide `bm` leaves two
-    /// M-tiles). `examples/bench_gemm_tiles` measured both — auto is 1.7x off
-    /// the best tile on the PV shape (0.535 -> 0.315 ms) and 8% off on QK^T.
-    fn attn_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTile> {
-        attention_lds_tile(cands, m, batch)
-    }
-
 
     /// One attention GEMM with a measured tile where the shape allows one.
     /// `qk` selects the candidate list: QK^T contracts over head_dim (small K),
@@ -199,19 +266,7 @@ impl<'a> Enc<'a> {
         ldx: usize,
         qk: bool,
     ) -> Result<(), rdna_compute::HipError> {
-        let cands = if qk {
-            attention_qk_tiles()
-        } else {
-            attention_pv_tiles()
-        };
-        if let Some(tile) = Self::attn_tile(&cands, m, batch) {
-            // `attn_tile` only returns tiles present in LDS_TILE_VARIANTS.
-            return self
-                .gpu
-                .gemm_f16_x_f16_wmma_lds_tiled_ld(a, x, y, None, m, k, batch, tile, lda, ldx);
-        }
-        self.gpu
-            .gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
+        attention_gemm_ld(self.gpu, a, x, y, m, k, batch, lda, ldx, qk)
     }
 
     fn alloc_shaped(&mut self, shape: &[usize], dtype: DType) -> Result<GpuTensor, String> {
@@ -475,12 +530,12 @@ impl<'a> Enc<'a> {
         }
         // The eager-attention decomposition needs n % 64 == 0 (the PV GEMM
         // contracts over n) and head_dim % 64 == 0 (the LDS-tiled WMMA GEMM's
-        // K), plus a wave32-WMMA-capable arch. Short inputs, shapes the GEMM
-        // cannot take, and arches without wave32 WMMA take the tiled SIMT
-        // kernel — which handles any n and is cheap at small n precisely
-        // because its cost is O(n^2).
+        // K), plus gfx11 WMMA or exact gfx1201. Short inputs, unsupported
+        // shapes and other architectures (including other gfx12) retain the
+        // tiled SIMT kernel, which handles any n and is cheap at small n
+        // precisely because its cost is O(n^2).
         let wmma =
-            self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12();
+            self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch == "gfx1201";
         if !embed_attn_no_gemm()
             && n % 64 == 0
             && n >= 256
@@ -711,7 +766,7 @@ fn embed_attn_naive() -> bool {
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
 }
 
 /// Run the full encoder and the Dense head; returns `[n, dense_out]`
@@ -1161,7 +1216,117 @@ mod tests {
     // testable without a device is the segment layout every slice in the
     // batched forward is derived from — an off-by-one there is a silent
     // cross-sequence read, not a crash.
-    use super::{padded_rows, segment_layout, EncodeInput};
+    use super::{
+        attention_route, padded_rows, projection_gfx1201_tile, segment_layout, AttentionRoute,
+        EncodeInput, LdsTile, LdsTileSplitK,
+    };
+
+    #[test]
+    fn gfx1201_projection_tiles_are_supported_unsplit_entries() {
+        for (m, entry) in [
+            (256, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (511, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (512, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1023, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1024, "qwen4_wmma_lds_128_256_32_64_k64"),
+            (4096, "qwen4_wmma_lds_128_256_32_64_k64"),
+        ] {
+            let tile = projection_gfx1201_tile(m);
+            assert_eq!(tile.split, 1);
+            assert_eq!(tile.ks, 64);
+            assert_eq!(tile.entry(), entry);
+        }
+    }
+
+    #[test]
+    fn gfx1201_attention_tiles_are_supported_unsplit_entries() {
+        for (m, batch, qk, tile, entry) in [
+            (
+                128,
+                128,
+                true,
+                LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+                "qwen4_wmma_lds_128_128_32_64_k64",
+            ),
+            (
+                127,
+                128,
+                true,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                128,
+                127,
+                true,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                64,
+                128,
+                false,
+                LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_128_32_64_k64_p",
+            ),
+            (
+                63,
+                128,
+                false,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                64,
+                127,
+                false,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+        ] {
+            assert_eq!(
+                attention_route("gfx1201", m, batch, qk),
+                AttentionRoute::Gfx1201(tile)
+            );
+            assert_eq!(tile.split, 1);
+            assert_eq!(tile.ks, 64);
+            assert_eq!(tile.entry(), entry);
+        }
+    }
+
+    #[test]
+    fn gfx11_attention_preserves_candidate_order_and_auto_fallback() {
+        for arch in ["gfx1100", "gfx1151"] {
+            for qk in [true, false] {
+                let large = if qk {
+                    LdsTile::new(128, 128, 32, 64, 64, false).pipelined()
+                } else {
+                    LdsTile::new(128, 128, 64, 64, 64, false)
+                };
+                assert_eq!(
+                    attention_route(arch, 256, 256, qk),
+                    AttentionRoute::Gfx11(Some(large))
+                );
+                let small = LdsTile::new(64, 64, 32, 64, 64, false);
+                assert_eq!(
+                    attention_route(arch, 64, 128, qk),
+                    AttentionRoute::Gfx11(Some(small))
+                );
+                assert_eq!(
+                    attention_route(arch, 128, 64, qk),
+                    AttentionRoute::Gfx11(Some(small))
+                );
+                assert_eq!(
+                    attention_route(arch, 63, 128, qk),
+                    AttentionRoute::Gfx11(None)
+                );
+                assert_eq!(
+                    attention_route(arch, 128, 63, qk),
+                    AttentionRoute::Gfx11(None)
+                );
+            }
+        }
+    }
 
     fn input(len: usize) -> (Vec<u32>, Vec<[i32; 3]>) {
         (vec![0; len], (0..len as i32).map(|i| [i, i, i]).collect())

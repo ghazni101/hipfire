@@ -433,6 +433,7 @@ mod tests {
                 expert_gate_up_ptrs: buffers.pop().expect("MoE test pointer buffer"),
                 expert_down_ptrs: buffers.pop().expect("MoE test pointer buffer"),
                 expert_down_awq_ptrs: None,
+                cpu_deferred_experts: false,
                 expert_dtype_tags: None,
                 layer_idx: 0,
                 expert_shape: None,
@@ -489,7 +490,6 @@ mod tests {
         Qwen35Config {
             dim: 1,
             n_layers: 1,
-            i_gpu_start: 0,
             vocab_size: 1,
             norm_eps: 1e-5,
             eos_token: 0,

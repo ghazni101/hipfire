@@ -104,6 +104,13 @@ pub struct PerBGraphCache {
 pub struct GraphState {
     // AR forward (single-slot)
     pub capture_mode: bool,
+    /// The model owns host-mapped weights the CPU multiplies
+    /// (`memory.offload_exec=cpu` over a spilled prefix). A CPU step is a host
+    /// sync point — a D2H/H2D around the multiplication — so it can neither be
+    /// recorded into a hipGraph nor replayed out of one; capture is refused
+    /// centrally here. Set once per load from the resolved placement, cleared on
+    /// unload; false for every non-offload model (the zero-diff default).
+    pub host_cpu_weights: bool,
     pub capture_blobs: Vec<Vec<u8>>,
     pub graph_exec: Option<GraphExec>,
     pub captured_graph: Option<Graph>,
@@ -155,6 +162,12 @@ impl GraphState {
         device_id: i32,
         stream: &Stream,
     ) -> HipResult<()> {
+        if self.host_cpu_weights {
+            return Err(HipError::new(
+                0,
+                "hipGraph capture refused: the model owns CPU-executed (host) weights",
+            ));
+        }
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
@@ -171,6 +184,12 @@ impl GraphState {
         device_id: i32,
         stream: &Stream,
     ) -> HipResult<()> {
+        if self.host_cpu_weights {
+            return Err(HipError::new(
+                0,
+                "hipGraph capture refused: the model owns CPU-executed (host) weights",
+            ));
+        }
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
@@ -617,6 +636,7 @@ impl GraphState {
         };
         Self {
             capture_mode: false,
+            host_cpu_weights: false,
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,

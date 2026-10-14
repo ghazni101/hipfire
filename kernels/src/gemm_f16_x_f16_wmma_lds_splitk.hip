@@ -493,6 +493,216 @@ __device__ __forceinline__ void sk_lds_tile_bsr(
                                                       a_lds, x_lds);           \
     }
 
+// Scoped gfx1201 pitched entries: no split partials or reducer, ascending K.
+// lda/ldx are element pitches >= K and divisible by 16 for aligned half16 loads.
+// Existing packed global signatures and staging remain unchanged.
+#if defined(__gfx1201__)
+// Independent pitched staging keeps incumbent packed shader instantiations unchanged.
+template <int BM, int BN, int WP, int WQ, int KT>
+__device__ __forceinline__ void sk_ld_wmma_stage(
+    const _Float16* a_lds, const _Float16* x_lds,
+    int wave_m, int wave_n, int ml, int kh, sk_float8_t* acc
+) {
+    constexpr int WROWS = 16 * WP;
+    constexpr int WCOLS = 16 * WQ;
+    #pragma unroll
+    for (int kt = 0; kt < KT; kt++) {
+        sk_frag_t a[WP];
+        #pragma unroll
+        for (int i = 0; i < WP; i++) {
+            a[i] = *(const sk_frag_t*)(
+                &a_lds[(kt * BM + wave_m * WROWS + i * 16 + ml) * 16 + SK_FRAG_OFFSET(kh)]);
+        }
+        #pragma unroll
+        for (int j = 0; j < WQ; j++) {
+            const sk_frag_t b = *(const sk_frag_t*)(
+                &x_lds[(kt * BN + wave_n * WCOLS + j * 16 + ml) * 16 + SK_FRAG_OFFSET(kh)]);
+            #pragma unroll
+            for (int i = 0; i < WP; i++) {
+                acc[i * WQ + j] = SK_WMMA(a[i], b, acc[i * WQ + j]);
+            }
+        }
+    }
+}
+
+template <int BM, int BN, int WP, int WQ, int KS, bool PIPE, int SPLIT>
+__device__ __forceinline__ void sk_lds_tile_ld(
+    const _Float16* __restrict__ A,
+    const _Float16* __restrict__ X,
+    float*          __restrict__ Y,
+    int M, int K, int B,
+    _Float16* a_lds, _Float16* x_lds, int lda, int ldx
+) {
+    constexpr int KT     = KS / 16;
+    constexpr int WROWS  = 16 * WP;
+    constexpr int WCOLS  = 16 * WQ;
+    constexpr int WAVE_M = BM / WROWS;
+    constexpr int WAVE_N = BN / WCOLS;
+    constexpr int NT     = WAVE_M * WAVE_N * 32;
+    constexpr int A_VEC  = BM * KT;
+    constexpr int X_VEC  = BN * KT;
+    constexpr int A_PASS = (A_VEC + NT - 1) / NT;
+    constexpr int X_PASS = (X_VEC + NT - 1) / NT;
+
+    static_assert(KS == 32 || KS == 64, "KS must be 32 or 64");
+    static_assert(BM % WROWS == 0 && BN % WCOLS == 0, "tile must divide into waves");
+    static_assert(NT <= 1024, "block exceeds the 1024-thread limit");
+    static_assert((BM + BN) * KS * 2 <= 65536, "LDS exceeds 64 KB per workgroup");
+
+    const int m_block = blockIdx.x * BM;
+    const int n_block = blockIdx.y * BN;
+    if (m_block >= M || n_block >= B) return;
+
+    const int k_len   = K / SPLIT;
+    const int k_begin = (int)blockIdx.z * k_len;
+    const int k_end   = k_begin + k_len;
+
+    const int tid     = threadIdx.x;
+    const int lane    = tid & 31;
+    const int wave_id = tid >> 5;
+    const int ml      = lane & 15;
+    const int kh      = lane >> 4;
+
+    const int wave_m = wave_id % WAVE_M;
+    const int wave_n = wave_id / WAVE_M;
+    const int m_wave = m_block + wave_m * WROWS;
+    const int n_wave = n_block + wave_n * WCOLS;
+
+    sk_float8_t acc[WP * WQ];
+    #pragma unroll
+    for (int i = 0; i < WP * WQ; i++) {
+        acc[i] = sk_float8_t{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    sk_half16_t a_reg[PIPE ? A_PASS : 1];
+    sk_half16_t x_reg[PIPE ? X_PASS : 1];
+
+    if constexpr (PIPE) {
+        #pragma unroll
+        for (int p = 0; p < A_PASS; p++) {
+            const int v = tid + p * NT;
+            if (A_VEC % NT != 0 && v >= A_VEC) continue;
+            a_reg[p] = *sk_src<KT>(A, M, lda, m_block, k_begin, v);
+        }
+        #pragma unroll
+        for (int p = 0; p < X_PASS; p++) {
+            const int v = tid + p * NT;
+            if (X_VEC % NT != 0 && v >= X_VEC) continue;
+            x_reg[p] = *sk_src<KT>(X, B, ldx, n_block, k_begin, v);
+        }
+        for (int k0 = k_begin; k0 < k_end; k0 += KS) {
+            #pragma unroll
+            for (int p = 0; p < A_PASS; p++) {
+                const int v = tid + p * NT;
+                if (A_VEC % NT != 0 && v >= A_VEC) continue;
+                *sk_dst<BM, KT>(a_lds, v) = a_reg[p];
+            }
+            #pragma unroll
+            for (int p = 0; p < X_PASS; p++) {
+                const int v = tid + p * NT;
+                if (X_VEC % NT != 0 && v >= X_VEC) continue;
+                *sk_dst<BN, KT>(x_lds, v) = x_reg[p];
+            }
+            SK_BARRIER();
+            const int k1 = k0 + KS;
+            if (k1 < k_end) {
+                #pragma unroll
+                for (int p = 0; p < A_PASS; p++) {
+                    const int v = tid + p * NT;
+                    if (A_VEC % NT != 0 && v >= A_VEC) continue;
+                    a_reg[p] = *sk_src<KT>(A, M, lda, m_block, k1, v);
+                }
+                #pragma unroll
+                for (int p = 0; p < X_PASS; p++) {
+                    const int v = tid + p * NT;
+                    if (X_VEC % NT != 0 && v >= X_VEC) continue;
+                    x_reg[p] = *sk_src<KT>(X, B, ldx, n_block, k1, v);
+                }
+            }
+            sk_ld_wmma_stage<BM, BN, WP, WQ, KT>(a_lds, x_lds, wave_m, wave_n, ml, kh, acc);
+            SK_BARRIER();
+        }
+    } else {
+        for (int k0 = k_begin; k0 < k_end; k0 += KS) {
+            #pragma unroll
+            for (int p = 0; p < A_PASS; p++) {
+                const int v = tid + p * NT;
+                if (A_VEC % NT != 0 && v >= A_VEC) continue;
+                *sk_dst<BM, KT>(a_lds, v) = *sk_src<KT>(A, M, lda, m_block, k0, v);
+            }
+            #pragma unroll
+            for (int p = 0; p < X_PASS; p++) {
+                const int v = tid + p * NT;
+                if (X_VEC % NT != 0 && v >= X_VEC) continue;
+                *sk_dst<BN, KT>(x_lds, v) = *sk_src<KT>(X, B, ldx, n_block, k0, v);
+            }
+            SK_BARRIER();
+            sk_ld_wmma_stage<BM, BN, WP, WQ, KT>(a_lds, x_lds, wave_m, wave_n, ml, kh, acc);
+            SK_BARRIER();
+        }
+    }
+
+    float* Yz = Y + (long long)blockIdx.z * B * M;
+#if defined(__gfx1201__)
+    // Epilogue: lane (ml, kh) holds Y[n_wave + j*16 + ml][m_wave + i*16 + 8*kh + e].
+    #pragma unroll
+    for (int j = 0; j < WQ; j++) {
+        const int out_b = n_wave + j * 16 + ml;
+        if (out_b >= B) continue;
+        float* yrow = Yz + (long long)out_b * M;
+        #pragma unroll
+        for (int i = 0; i < WP; i++) {
+            const int m0 = m_wave + i * 16 + 8 * kh;
+            const sk_float8_t v = acc[i * WQ + j];
+            if (m0 + 8 <= M && (M & 3) == 0) {
+                *(float4*)(yrow + m0)     = float4{v[0], v[1], v[2], v[3]};
+                *(float4*)(yrow + m0 + 4) = float4{v[4], v[5], v[6], v[7]};
+            } else {
+                #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    if (m0 + e < M) yrow[m0 + e] = v[e];
+                }
+            }
+        }
+    }
+#else
+    // Epilogue: lane (ml, kh) holds Y[n_wave + j*16 + ml][m_wave + i*16 + 2*e + kh].
+    #pragma unroll
+    for (int j = 0; j < WQ; j++) {
+        const int out_b = n_wave + j * 16 + ml;
+        if (out_b >= B) continue;
+        float* yrow = Yz + (long long)out_b * M;
+        #pragma unroll
+        for (int i = 0; i < WP; i++) {
+            const sk_float8_t v = acc[i * WQ + j];
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int out_m = m_wave + i * 16 + 2 * e + kh;
+                if (out_m < M) yrow[out_m] = v[e];
+            }
+        }
+    }
+#endif
+}
+
+#define SK_KERNEL_LD(NAME, BM, BN, WP, WQ, PIPE)                              \
+    __launch_bounds__((BM / (16 * WP)) * (BN / (16 * WQ)) * 32, 1)             \
+    extern "C" __global__ void NAME(                                         \
+        const _Float16* __restrict__ A, const _Float16* __restrict__ X,       \
+        float* __restrict__ Y, int M, int K, int B, int lda, int ldx           \
+    ) {                                                                      \
+        __shared__ __align__(32) _Float16 a_lds[64 * (BM)];                   \
+        __shared__ __align__(32) _Float16 x_lds[64 * (BN)];                   \
+        sk_lds_tile_ld<BM, BN, WP, WQ, 64, PIPE, 1>(                          \
+            A, X, Y, M, K, B, a_lds, x_lds, lda, ldx);                       \
+    }
+SK_KERNEL_LD(qwen4_wmma_lds_64_64_32_64_k64_p_ld, 64, 64, 2, 4, true)
+SK_KERNEL_LD(qwen4_wmma_lds_64_128_32_64_k64_p_ld, 64, 128, 2, 4, true)
+SK_KERNEL_LD(qwen4_wmma_lds_128_128_32_64_k64_ld, 128, 128, 2, 4, false)
+SK_KERNEL_LD(qwen4_wmma_lds_128_256_32_64_k64_ld, 128, 256, 2, 4, false)
+#undef SK_KERNEL_LD
+#endif
+
 // gfx1201: the tiles Gpu::qwen4_lds_tile_gfx1201 selects.  Chosen from a 25-tile
 // sweep on the R9700 (qcal/release-0.4.0/qwen4-hc-wmma/logs/sweep{1,2}.txt,
 // event-timed, 10-20 reps per tile; ms, gemm_bf16_xf32_multirow in brackets):

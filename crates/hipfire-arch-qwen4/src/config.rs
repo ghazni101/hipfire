@@ -19,6 +19,7 @@
 //! the marker.
 
 use crate::ple::{PleHashMetadata, PLE_VALID_ROWS};
+use rdna_compute::{TrunkIu4Default, TRUNK_IU4_DEFAULT_KEY};
 use serde_json::Value;
 use std::fmt;
 
@@ -610,6 +611,9 @@ pub struct Qwen4Config {
     pub head_dim: usize,
     pub partial_rotary_factor: f64,
     pub rope_theta: f64,
+    /// Long-context RoPE scaling, resolved by the engine
+    /// ([`hipfire_runtime::rope::rope_scaling`]); shared by the MTP head.
+    pub rope_scaling: rdna_compute::rope::RopeScaling,
     pub attention_bias: bool,
     pub layer_types: Vec<LayerType>,
     pub full_attention_interval: usize,
@@ -663,6 +667,12 @@ pub struct Qwen4Config {
     pub mtp_use_dedicated_embeddings: bool,
     /// Authoritative optional native MTP head.
     pub mtp: Option<Qwen4MtpConfig>,
+    /// The dense IU4 trunk default the artifact's bake tooling embedded
+    /// (top-level metadata key [`TRUNK_IU4_DEFAULT_KEY`]); `None` for every
+    /// unmarked artifact. Only the loader's route resolution reads it (see
+    /// [`rdna_compute::qwen4_trunk_iu4_route`]): the shape contract above does
+    /// not depend on it.
+    pub trunk_iu4_default: Option<TrunkIu4Default>,
 }
 
 impl Qwen4Config {
@@ -926,6 +936,7 @@ impl Qwen4Config {
 
         let (num_experts, num_experts_per_tok, moe_intermediate_size, shared, norm_topk_prob) =
             ffn.scalar_mirror();
+        let trunk_iu4_default = parse_trunk_iu4_default(value, &profile)?;
         let cfg = Self {
             architecture_id: ARCH_ID,
             model_type,
@@ -941,6 +952,8 @@ impl Qwen4Config {
             head_dim: required_usize(text, "head_dim")?,
             partial_rotary_factor,
             rope_theta,
+            rope_scaling: hipfire_runtime::rope::rope_scaling(text)
+                .map_err(|error| format!("qwen4: {error}"))?,
             attention_bias: optional_bool(text, "attention_bias").unwrap_or(false),
             layer_types,
             full_attention_interval: required_usize(text, "full_attention_interval")?,
@@ -986,6 +999,7 @@ impl Qwen4Config {
             mtp_use_dedicated_embeddings: optional_bool(text, "mtp_use_dedicated_embeddings")
                 .unwrap_or(false),
             mtp,
+            trunk_iu4_default,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1577,6 +1591,17 @@ impl Qwen4Config {
         (self.head_dim as f64 * self.partial_rotary_factor).round() as usize
     }
 
+    /// The full-attention rotary embedding (the MTP head shares it).
+    pub fn rope(&self) -> rdna_compute::rope::Rope {
+        rdna_compute::rope::Rope { theta: self.rope_theta, scaling: self.rope_scaling }
+    }
+
+    /// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
+    /// `factor x original` context.
+    pub fn context_limit(&self) -> usize {
+        self.rope_scaling.context_limit(self.max_position_embeddings)
+    }
+
     /// Number of values in each sharded n-gram row (0 without PLE).
     pub fn ple_row_width(&self) -> usize {
         self.ple.as_ref().map_or(0, |ple| ple.row_width)
@@ -1601,22 +1626,31 @@ impl Qwen4Config {
         self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
     }
 
-    /// Bytes of one QSA layer's context-sized arenas at `max_seq` in
-    /// `format`: full K and V rows, raw index keys, and pooled index keys.
-    /// The trunk has `n_full_layers()` of these and an attached MTP head one
-    /// more (always F32).
+    /// Bytes of one QSA layer's context-sized storage, including its
+    /// optional derived F16 arena (four-token-rounded capacity). The MTP
+    /// head passes its plain F32 format and never owns the derived arena.
     pub fn qsa_context_arena_bytes(
         &self,
         max_seq: usize,
-        format: rdna_compute::tensor_ops::QsaKvFormat,
+        layout: impl Into<rdna_compute::tensor_ops::QsaStateLayout>,
     ) -> Option<usize> {
+        let layout = layout.into();
+        let format = layout.kv;
         let kv_row = format.kv_row_bytes(self.num_key_value_heads, self.head_dim);
         let raw = self.indexer_kv_heads.checked_mul(self.indexer_head_dim)?;
         let index_row = raw.checked_mul(format.index_dtype().size())?;
         let pooled_rows = max_seq.div_ceil(self.indexer_compress_ratio);
         max_seq
             .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
-            .checked_add(pooled_rows.checked_mul(index_row)?)
+            .checked_add(pooled_rows.checked_mul(index_row)?)?
+            .checked_add(if layout.f16_arena {
+                max_seq.div_ceil(4).checked_mul(4)?
+                    .checked_mul(self.num_key_value_heads)?
+                    .checked_mul(self.head_dim)?
+                    .checked_mul(4)?
+            } else {
+                0
+            })
     }
 }
 
@@ -1788,12 +1822,13 @@ fn ple_metadata_object(ple: &Qwen4PleConfig) -> Value {
     })
 }
 
-/// Largest context a Qwen4 load admits: the model's native
-/// `max_position_embeddings`. Past 15,360 pooled blocks (61,440 tokens) the
-/// QSA selector keeps its score rows in global memory instead of LDS; whether
-/// a context fits is decided by the state allocation, which names the MiB it
-/// needed when it does not.
-pub const QWEN4_MAX_CONTEXT: usize = 262_144;
+/// Largest context any Qwen4 load admits (the `memory.max_seq` ceiling, the
+/// Flash-Next native 262,144 under YaRN factor 4); a model admits only up to
+/// its own [`Qwen4Config::context_limit`]. Past 15,360 pooled blocks (61,440
+/// tokens) the QSA selector keeps its score rows in global memory instead of
+/// LDS; whether a context fits is decided by the state allocation, which names
+/// the MiB it needed when it does not.
+pub const QWEN4_MAX_CONTEXT: usize = 1_048_576;
 
 /// Context a Qwen4 load gets when `max_seq` is omitted.
 pub const QWEN4_DEFAULT_CONTEXT: usize = 32768;
@@ -2484,6 +2519,31 @@ fn optional_string(object: &Value, key: &str) -> Option<String> {
     object.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// The artifact's trunk default marker: absent is `None`; a present marker
+/// must be a string this build knows and the pinned Flash-Next profile (the
+/// only profile the trunk route runs) must carry it. Anything else is
+/// refused rather than guessed.
+fn parse_trunk_iu4_default(
+    envelope: &Value,
+    profile: &Qwen4Profile,
+) -> Result<Option<TrunkIu4Default>, String> {
+    let Some(marker) = envelope.get(TRUNK_IU4_DEFAULT_KEY) else {
+        return Ok(None);
+    };
+    let marker = marker
+        .as_str()
+        .ok_or_else(|| format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` must be a string"))?;
+    let default = TrunkIu4Default::from_marker(marker).ok_or_else(|| {
+        format!("qwen4: `{TRUNK_IU4_DEFAULT_KEY}` {marker:?} is not a trunk default this build knows")
+    })?;
+    if !matches!(profile, Qwen4Profile::FlashNext) {
+        return Err(format!(
+            "qwen4: `{TRUNK_IU4_DEFAULT_KEY}` is only meaningful on the Flash-Next profile"
+        ));
+    }
+    Ok(Some(default))
+}
+
 fn parse_layers(
     value: &Value,
     key: &str,
@@ -2789,6 +2849,104 @@ mod tests {
         assert_eq!(cfg.num_experts, 512);
         assert_eq!(cfg.shared_expert_intermediate_size, 640);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_is_read_from_the_envelope_root_only_when_known() {
+        let key = TRUNK_IU4_DEFAULT_KEY;
+        assert_eq!(key, "qwen4_trunk_iu4_default");
+        // Unmarked artifacts (wrapped or raw) carry no default.
+        assert_eq!(Qwen4Config::from_nested_value(&fixture()).unwrap().trunk_iu4_default, None);
+        let wrapped = json!({"config": fixture()});
+        assert_eq!(Qwen4Config::from_nested_value(&wrapped).unwrap().trunk_iu4_default, None);
+
+        // The marker rides at the root of the envelope, wrapped or raw.
+        let mut marked_wrapped = json!({"config": fixture()});
+        marked_wrapped[key] = json!("gfx1151-zab-v1");
+        let mut marked_raw = fixture();
+        marked_raw[key] = json!("gfx1151-zab-v1");
+        for value in [&marked_wrapped, &marked_raw] {
+            let cfg = Qwen4Config::from_nested_value(value).unwrap();
+            assert_eq!(cfg.trunk_iu4_default, Some(TrunkIu4Default::Gfx1151ZabV1));
+            assert_eq!(cfg.profile, Qwen4Profile::FlashNext);
+        }
+
+        // The marker is identity metadata, not shape: every other field of the
+        // config is the unmarked one's.
+        let mut stripped = Qwen4Config::from_nested_value(&marked_wrapped).unwrap();
+        stripped.trunk_iu4_default = None;
+        assert_eq!(stripped, Qwen4Config::from_nested_value(&wrapped).unwrap());
+
+        // A marker inside the inner config is not the envelope marker.
+        let mut inner = json!({"config": fixture()});
+        inner["config"][key] = json!("gfx1151-zab-v1");
+        assert_eq!(Qwen4Config::from_nested_value(&inner).unwrap().trunk_iu4_default, None);
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_refuses_unknown_and_malformed_values() {
+        let key = TRUNK_IU4_DEFAULT_KEY;
+        for bad in [
+            json!("gfx1151-zab-v2"),
+            json!("GFX1151-ZAB-V1"),
+            json!("gfx1201-zab-v1"),
+            json!(""),
+            json!(true),
+            json!(1),
+            json!(null),
+            json!({"id": "gfx1151-zab-v1"}),
+        ] {
+            let mut value = json!({"config": fixture()});
+            value[key] = bad.clone();
+            let error = Qwen4Config::from_nested_value(&value).unwrap_err();
+            assert!(error.contains(key), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn trunk_iu4_default_marker_is_refused_on_a_synthetic_profile() {
+        let mut value = synthetic();
+        value[TRUNK_IU4_DEFAULT_KEY] = json!("gfx1151-zab-v1");
+        let error = dev(&value).unwrap_err();
+        assert!(error.contains(TRUNK_IU4_DEFAULT_KEY), "{error}");
+        assert!(error.contains("Flash-Next"), "{error}");
+        // Unmarked synthetic profiles are unchanged.
+        assert_eq!(dev(&synthetic()).unwrap().trunk_iu4_default, None);
+    }
+
+    #[test]
+    fn trunk_iu4_route_follows_the_marker_arch_and_env_precedence() {
+        use rdna_compute::{Qwen4TrunkMask, TrunkFamily, TrunkIu4MaskSource};
+        let mut marked = json!({"config": fixture()});
+        marked[TRUNK_IU4_DEFAULT_KEY] = json!("gfx1151-zab-v1");
+        let marked = Qwen4Config::from_nested_value(&marked).unwrap();
+        let stock = Qwen4Config::from_nested_value(&json!({"config": fixture()})).unwrap();
+        let zab = TrunkFamily::GdnZ.bit() | TrunkFamily::GdnA.bit() | TrunkFamily::GdnB.bit();
+        let resolve = |env: Option<&str>, arch: &str, cfg: &Qwen4Config| {
+            Qwen4TrunkMask::resolve_iu4(env, arch, cfg.trunk_iu4_default).unwrap()
+        };
+
+        // Marked + exact gfx1151 + no env: the zab default, on every layer.
+        let on = resolve(None, "gfx1151", &marked);
+        assert!(matches!(on.source, TrunkIu4MaskSource::ArtifactDefault(_)));
+        assert!((0..48).all(|layer| on.mask.bits(layer) == zab));
+        // Marked on any other arch, and every unmarked artifact: unchanged (off).
+        for arch in ["gfx1201", "gfx1100", "gfx1150", "gfx942"] {
+            assert!(resolve(None, arch, &marked).mask.is_empty(), "{arch}");
+        }
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            let off = resolve(None, arch, &stock);
+            assert_eq!(off.source, TrunkIu4MaskSource::Off, "{arch}");
+            assert!(off.mask.is_empty(), "{arch}");
+        }
+        // Explicit env wins: `0` restores the stock route on the marked
+        // artifact, any other value keeps the existing grammar.
+        assert!(resolve(Some("0"), "gfx1151", &marked).mask.is_empty());
+        assert!(resolve(Some(""), "gfx1151", &marked).mask.is_empty());
+        assert_eq!(resolve(Some("gdn.qkv"), "gfx1151", &marked).mask.bits(5), TrunkFamily::GdnQkv.bit());
+        assert_eq!(resolve(Some("1"), "gfx1151", &stock).mask.bits(5), rdna_compute::TRUNK_ALL_BITS);
+        // A marked mask names layers the 48-layer trunk has.
+        assert!(on.mask.check_layers(marked.num_hidden_layers).is_ok());
     }
 
     #[test]

@@ -55,10 +55,18 @@ fn f16x4(bits: [u16; 4]) -> [u8; 8] {
 /// values of the unquantized formats) so distinct rows/groups of a synthetic
 /// tensor are distinct byte-wise.
 pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
-    let mut bytes: Vec<u8> = (0..q.group_bytes())
+    let mut bytes: Vec<u8> = (0..q.row_header_bytes() + q.group_bytes())
         .map(|i| (((i + salt) * 37 + 11) & 0xFF) as u8)
         .collect();
     match q {
+        CpuQuant::Mfp4G32E8 => {
+            bytes[..16].fill(0);
+            bytes[..2].copy_from_slice(&(0x3401u16 + (salt % 3) as u16).to_le_bytes());
+            const SCALES: [u8; 8] = [0, 1, 7, 8, 0x39, 0x41, 0x7e, 0x7f];
+            for block in 0..8 {
+                bytes[16 + block * 17] = SCALES[(block + salt) % SCALES.len()];
+            }
+        }
         CpuQuant::Mq4G256 | CpuQuant::Hfq4G256 => bytes[..8].copy_from_slice(&f32x2(0.03125, -0.5)),
         CpuQuant::Mq6G256 | CpuQuant::Hfq6G256 => {
             bytes[..8].copy_from_slice(&f32x2(0.0078125, -0.125))
@@ -131,10 +139,14 @@ pub fn group_bytes(q: CpuQuant, salt: usize) -> Vec<u8> {
 /// A `[m, k]` weight tensor's bytes, group by group.
 pub fn weight_bytes(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
     let groups = k / q.group_elems();
-    let mut out = Vec::with_capacity(m * (k / q.group_elems()) * q.group_bytes());
+    let mut out = Vec::with_capacity(m * crate::gemv::row_bytes(q, k));
     for row in 0..m {
         for g in 0..groups {
-            out.extend_from_slice(&group_bytes(q, row * groups + g));
+            let bytes = group_bytes(q, row * groups + g);
+            if g == 0 {
+                out.extend_from_slice(&bytes[..q.row_header_bytes()]);
+            }
+            out.extend_from_slice(&bytes[q.row_header_bytes()..]);
         }
     }
     out

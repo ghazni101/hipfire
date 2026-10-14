@@ -26,7 +26,8 @@ file_edition() {
 # turning untouched legacy formatting into a permanent red check.
 
 if [[ -z "${GITHUB_ACTIONS:-}" ]]; then
-  mapfile -t files < <(git diff --name-only --diff-filter=ACMRT -- '*.rs' | sort)
+  # Local run: staged + unstaged changes vs HEAD, so a pre-commit check sees them.
+  mapfile -t files < <(git diff --name-only --diff-filter=ACMRT HEAD -- '*.rs' | sort)
 elif [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
   base_ref="${GITHUB_BASE_REF:?GITHUB_BASE_REF is required for pull_request events}"
   git fetch --no-tags origin "${base_ref}:refs/remotes/origin/${base_ref}"

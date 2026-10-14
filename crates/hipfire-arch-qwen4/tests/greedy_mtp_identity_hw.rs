@@ -9,6 +9,11 @@
 //! `HIPFIRE_MTP_IDENTITY_MODEL` (explicitly running it without one fails
 //! rather than passing as model proof).
 //!
+//! Loading uses shared production expert residency:
+//! `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=auto` or `N` places discrete-GPU experts
+//! in pinned host RAM; auto reserves native MTP and QSA gather workspace.
+//! Prompts, identity/coverage assertions and production-source checks are unchanged.
+//!
 //! The rendered `tests/fixtures/qwen4_mtp_identity_p1.txt` prompt (Q8 GDN
 //! recurrent state, `max_seq` 16384, K=3, temperature 0) is prefilled once per
 //! arm and 1200 greedy token IDs are generated in process through the public
@@ -55,8 +60,22 @@
 //! `greedy_mtp_ngram_batched_is_deterministic_on_flash_next_copy` runs
 //! `ngram-batched` on `copy` in two fresh children and requires identical IDs.
 //! The tests spawn GPU children: run with `--test-threads=1`.
+//!
+//! Every arm's child starts from a reset environment (the route, floor,
+//! trace, timing, draft-head and n-gram variables a benchmark shell may have
+//! left are removed, then the arm's own are set) and is checked against it.
+//! Each arm writes `<arm>.identity.json`: the effective `HIPFIRE_*`
+//! environment (levers, floor, route and graph knobs), the executable's
+//! SHA-256, a hash of the production sources compiled in, the model's and its
+//! `.ple-q4` / `.ple-q8` sidecars' SHA-256, and a receipt (GPU arch / UUID /
+//! PCI BDF, resolved graph flags, git state). The parent requires it to equal
+//! the identity it expects, and removes any earlier result of the arm first.
+//! MTP arms also write `<arm>.windows.json`: per window the position, drafts,
+//! accepted, committed, the drafter's own window / retirement counters and the
+//! HIP call-count deltas around the step; the decoded text is `<arm>.txt`.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{
     native_mtp_row_capture, qwen4_ngram_mod_config, Qwen4MtpDrafter,
 };
@@ -64,7 +83,7 @@ use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend};
 use hipfire_dispatch::pipeline::DraftHeadPolicy;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::spec::{MtpDrafter, SpecRequestConfig};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -75,11 +94,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "common/hw_identity.rs"]
+mod hw_identity;
+use hw_identity::Counters;
+
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
 const OUT_ENV: &str = "HIPFIRE_MTP_IDENTITY_OUT";
 const ARM_ENV: &str = "HIPFIRE_MTP_IDENTITY_ARM";
 const CASE_ENV: &str = "HIPFIRE_MTP_IDENTITY_CASE";
 const ARM_TEST: &str = "greedy_mtp_identity_arm";
+/// Harness-control variables: they differ between a parent and each child
+/// without changing what the arm computes, so identities exclude them.
+const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, CASE_ENV];
+/// Column names of a `<arm>.windows.json` row (the HIP call counts follow).
+const WINDOW_COLUMNS: [&str; 11] = [
+    "index",
+    "position_before",
+    "position_after",
+    "k_budget",
+    "drafts",
+    "accepted",
+    "committed",
+    "mtp_windows_after",
+    "ar_windows_after",
+    "ngram_windows_after",
+    "retired_after",
+];
 
 const PROMPT: &[u8] = include_bytes!("fixtures/qwen4_mtp_identity_p1.txt");
 /// `hipx:~/pm-wave/fns3/in/p1.txt` (md5 `c91f8380a035dc842416b1be5efa8197`).
@@ -401,10 +441,54 @@ struct ArmRun {
     stderr: String,
 }
 
+/// What a parent changes in an arm's child environment: everything that can
+/// force a route or alter the drafter is cleared, then the arm's own settings
+/// are applied. The AR floor is left at its default (on) for every arm.
+fn arm_overrides(arm: Arm) -> Vec<(&'static str, Option<&'static str>)> {
+    let (n_match, n_min, n_max) = match arm.ngram_triple {
+        Some((n_match, n_min, n_max)) => (Some(n_match), Some(n_min), Some(n_max)),
+        None => (None, None, None),
+    };
+    vec![
+        ("HIPFIRE_MTP_AR_FLOOR", None),
+        ("HIPFIRE_MTP_PHASE_TIMING", None),
+        ("HIPFIRE_MTP_NGRAM", None),
+        ("HIPFIRE_MTP_TRACE", (arm.route != Route::Ar).then_some("1")),
+        ("HIPFIRE_MTP_INCREMENTAL", arm.incremental),
+        ("HIPFIRE_MTP_DRAFT_HEAD", arm.draft_head),
+        ("HIPFIRE_NGRAM_MOD_N_MATCH", n_match),
+        ("HIPFIRE_NGRAM_MOD_N_MIN", n_min),
+        ("HIPFIRE_NGRAM_MOD_N_MAX", n_max),
+    ]
+}
+
+/// The child must already run under its arm's environment.
+fn require_arm_env(arm: Arm) -> Result<(), String> {
+    for (name, want) in arm_overrides(arm) {
+        let have = std::env::var(name).ok();
+        if have.as_deref() != want {
+            return Err(format!(
+                "{name} is {have:?} but arm {} requires {want:?}",
+                arm.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run one arm in a fresh child of this test binary and collect its IDs and
 /// trace.
 fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
     let exe = std::env::current_exe().expect("test binary path");
+    let model_id = hw_identity::model_identity(model, dir).unwrap_or_else(|e| panic!("{e}"));
+    let expected = hw_identity::config_identity(
+        &hw_identity::env_snapshot(&arm_overrides(arm), &CONTROL_ENV),
+        &model_id,
+    );
+    // An earlier result of this arm must never stand in for this run.
+    for stale in ["ids.json", "txt", "identity.json", "windows.json"] {
+        let _ = fs::remove_file(dir.join(format!("{}.{stale}", arm.name)));
+    }
     let mut child = Command::new(&exe);
     child
         .args([
@@ -418,28 +502,16 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
         .env(CASE_ENV, case.name())
         .env(MODEL_ENV, model)
         .env(OUT_ENV, dir)
-        .env_remove("HIPFIRE_MTP_INCREMENTAL")
-        .env_remove("HIPFIRE_MTP_DRAFT_HEAD")
-        .env_remove("HIPFIRE_MTP_TRACE")
-        .env_remove("HIPFIRE_MTP_NGRAM")
-        .env_remove("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .env_remove("HIPFIRE_NGRAM_MOD_N_MIN")
-        .env_remove("HIPFIRE_NGRAM_MOD_N_MAX")
         .stdin(Stdio::null());
-    if arm.route != Route::Ar {
-        child.env("HIPFIRE_MTP_TRACE", "1");
-    }
-    if let Some(value) = arm.incremental {
-        child.env("HIPFIRE_MTP_INCREMENTAL", value);
-    }
-    if let Some(value) = arm.draft_head {
-        child.env("HIPFIRE_MTP_DRAFT_HEAD", value);
-    }
-    if let Some((n_match, n_min, n_max)) = arm.ngram_triple {
-        child
-            .env("HIPFIRE_NGRAM_MOD_N_MATCH", n_match)
-            .env("HIPFIRE_NGRAM_MOD_N_MIN", n_min)
-            .env("HIPFIRE_NGRAM_MOD_N_MAX", n_max);
+    for (name, value) in arm_overrides(arm) {
+        match value {
+            Some(value) => {
+                child.env(name, value);
+            }
+            None => {
+                child.env_remove(name);
+            }
+        }
     }
     let output = child
         .output()
@@ -459,6 +531,16 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
     )
     .expect("arm ids json");
     assert_eq!(ids.len(), case.generated(), "{} arm id count", arm.name);
+    let recorded: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.join(format!("{}.identity.json", arm.name))).expect("arm identity"),
+    )
+    .expect("arm identity json");
+    assert_eq!(
+        recorded["config"], expected,
+        "{} arm ran under a different identity than the parent expects (logs in {})",
+        arm.name,
+        dir.display()
+    );
     ArmRun { ids, stderr }
 }
 
@@ -546,6 +628,7 @@ fn greedy_mtp_identity_arm() {
 }
 
 fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String> {
+    require_arm_env(arm)?;
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
@@ -614,26 +697,23 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         }
     };
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
-    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
-    if gpu.is_uma() {
-        hfq.drop_mmap();
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        let archs = devices
+            .iter()
+            .map(|device| device.arch.as_str())
+            .collect::<Vec<_>>();
+        if residency::keeps_host_memory_out_of_reclaim(hipfire_arch_qwen4::ARCH_ID, &archs) {
+            hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
+        }
     }
-    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
-    let expected = WeightOrigin::for_single(&mesh, &gpu);
-    let source = HfqModelSource::from_hfq(hfq);
-    let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        &mut gpu,
-        expected,
-        |entry| {
-            source
-                .tensor_range(&entry.name)
-                .map_err(|e| e.to_string())?
-                .map(SourcePayload::Range)
-                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
-        },
+    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
     )
     .map_err(|e| e.to_string())?;
     let state_format = hipfire_arch_qwen4::resolve_state_format(
@@ -648,8 +728,138 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             state_format.gdn
         ));
     }
-    let vocab = receipt.config.vocab_size;
     let backend = Qwen4KvBackend::automatic(&gpu);
+    let use_ranges = gpu.is_uma();
+    let mut weights = receipt.manifest.weights.clone();
+    let explicit = residency::expert_vram_layers_from_env()?;
+    let placement = if use_ranges {
+        explicit
+    } else {
+        let (non_expert, per_layer) = residency::resident_split(&weights, |entry| {
+            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+        })?;
+        let experts = residency::routed_expert_bytes(&weights, |entry| {
+            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+        })?;
+        let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+        let free = free as u64;
+        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, MAX_SEQ);
+        let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
+            backend,
+            gpu.is_uma(),
+            MAX_SEQ,
+            chunk,
+            gpu.vmm_recommended_granularity().unwrap_or(1),
+        );
+        // Keep every oracle arm's placement identical, including the AR arm.
+        let head = residency::language_head_dtype(&weights)
+            .ok_or("qwen4: manifest has no language head")?;
+        let row_capture = native_mtp_row_capture(&gpu, &receipt.config).then_some(state_format.gdn);
+        let mtp = hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+            &receipt.config,
+            &context,
+            chunk,
+            MTP_K,
+            head,
+            row_capture,
+            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(&gpu),
+        )
+        .ok_or("qwen4: native MTP device bytes overflow")?;
+        let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            &gpu,
+            state_format.qsa,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                receipt.config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
+            .ok_or("qwen4: QSA gather scratch size overflows")
+        })
+        .transpose()?;
+        let reserve = residency::auto_vram_reserve(
+            &receipt.config,
+            &context,
+            chunk,
+            scratch_mode,
+            state_format.layout(),
+            Some(mtp),
+            gather,
+        )?;
+        match residency::resolve_expert_vram_layers(explicit, || {
+            Ok(residency::fits_fully_resident(free, non_expert, experts, reserve))
+        })? {
+            Some(residency::ExpertVramLayers::Auto) => {
+                let required = non_expert.checked_add(reserve)
+                    .ok_or("qwen4: non-expert weights plus reserve overflow")?;
+                if free < required {
+                    return Err("qwen4: not enough free VRAM for non-expert weights plus auto reserve".into());
+                }
+                Some(residency::ExpertVramLayers::Layers(residency::auto_vram_layers(
+                    free,
+                    non_expert,
+                    per_layer,
+                    receipt.config.num_hidden_layers,
+                    reserve,
+                )))
+            }
+            placement => placement,
+        }
+    };
+    let mut vram_layers = residency::moe_layer_count(&receipt.config);
+    if let Some(policy) = placement {
+        if use_ranges {
+            return Err(format!(
+                "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            ));
+        }
+        let residency::ExpertVramLayers::Layers(layers) = policy else {
+            return Err("qwen4: unresolved auto expert placement".into());
+        };
+        residency::place_routed_experts(&mut weights, layers);
+        vram_layers = layers.min(receipt.config.num_hidden_layers);
+    }
+    let host_bytes = residency::host_mapped_bytes(&weights, |entry| {
+        hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+    })?;
+    residency::check_host_ram(
+        host_bytes,
+        rdna_compute::kv_slots::mem_available_bytes(),
+        residency::ttm_pool_estimate(),
+    )?;
+    residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
+    eprintln!("qwen4 expert placement: {vram_layers} resident layers, {host_bytes} host-mapped bytes");
+    if use_ranges {
+        hfq.drop_mmap();
+    }
+    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
+    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let source = HfqModelSource::from_hfq(hfq);
+    let transaction = fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if use_ranges || entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|e| e.to_string())?
+                    .map(SourcePayload::Range)
+                    .ok_or_else(|| format!("missing tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))?;
+            Ok(SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let vocab = receipt.config.vocab_size;
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
         &receipt.manifest.identity.recipe,
@@ -663,7 +873,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     )
     .map_err(|e| e.to_string())?;
     bundle
-        .attach_forward(&mut gpu, MAX_SEQ)
+        .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .map_err(|e| e.to_string())?;
     let capture = native_mtp_row_capture(&gpu, &bundle.config);
     let head = hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
@@ -725,8 +935,10 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             drafter.mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?;
         ids.push(seed);
         let eos = bundle.config.eos_token_id;
+        let mut windows: Vec<serde_json::Value> = Vec::new();
         while ids.len() < case.generated() {
             let position = bundle.state.position;
+            let started = Counters::now();
             let window = drafter.mtp_step(
                 &mut gpu,
                 &mut bundle,
@@ -737,6 +949,23 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
                 eos,
                 None,
             )?;
+            let counters = Counters::now().since(started);
+            let after = drafter.request_stats();
+            let mut row = vec![
+                serde_json::json!(ids.len()),
+                serde_json::json!(position),
+                serde_json::json!(bundle.state.position),
+                serde_json::json!(MTP_K),
+                serde_json::json!(window.drafts_generated),
+                serde_json::json!(window.accepted),
+                serde_json::json!(window.committed.len()),
+                serde_json::json!(after.mtp_windows),
+                serde_json::json!(after.ar_windows),
+                serde_json::json!(after.ngram_mod_windows),
+                serde_json::json!(after.mtp_retired),
+            ];
+            row.extend(counters.to_array().map(|count| serde_json::json!(count)));
+            windows.push(serde_json::Value::Array(row));
             seed = *window.committed.last().ok_or("empty MTP window")?;
             ids.extend_from_slice(&window.committed);
         }
@@ -746,6 +975,18 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         if arm.ngram && !stats.mtp_ngram {
             return Err("n-gram pool was not armed for the request".into());
         }
+        let mut columns: Vec<&str> = WINDOW_COLUMNS.to_vec();
+        columns.extend(hw_identity::COUNTER_COLUMNS);
+        fs::write(
+            dir.join(format!("{}.windows.json", arm.name)),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "columns": columns,
+                "windows": windows,
+                "request_stats": format!("{stats:?}"),
+            }))
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         Box::new(drafter).mtp_free(&mut gpu);
     }
     fs::write(
@@ -756,6 +997,21 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     fs::write(
         dir.join(format!("{}.txt", arm.name)),
         tokenizer.decode(&ids),
+    )
+    .map_err(|e| e.to_string())?;
+    let identity = hw_identity::config_identity(
+        &hw_identity::env_snapshot(&[], &CONTROL_ENV),
+        &hw_identity::model_identity(model, dir)?,
+    );
+    fs::write(
+        dir.join(format!("{}.identity.json", arm.name)),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "arm": arm.name,
+            "case": case.name(),
+            "config": identity,
+            "receipt": hw_identity::receipt(&gpu, model),
+        }))
+        .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     bundle.free_gpu(&mut gpu).map_err(|e| e.to_string())

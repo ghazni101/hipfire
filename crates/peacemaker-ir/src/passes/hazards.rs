@@ -5,7 +5,7 @@
 //! C5: per-arch SGPR, VALU, and WMMA hazards.
 //!
 //! Whole-program hazard replay over typed streams. The gfx12 SGPR tracker
-//! ports `hipfire-isa/src/hazard.rs`; gfx11 rules are grounded in ROCm LLVM
+//! ports `peacemaker-isa/src/hazard.rs`; gfx11 rules are grounded in ROCm LLVM
 //! `GCNHazardRecognizer.cpp` / `AMDGPU.td` at compiler commit
 //! `8f497e0992fb7513f7f78a6f6b6f1056c375e961`:
 //! * `gfx12_sgpr`: SALU-def/VALU-use SGPR tracking. The state machine is
@@ -78,7 +78,7 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
     }
 }
 
-/// Port of `hipfire-isa` `Gfx12Sgpr`: tracks SGPR pairs read by VALU and
+/// Port of `peacemaker-isa` `Gfx12Sgpr`: tracks SGPR pairs read by VALU and
 /// written by SALU/VALU, demanding `depctr_*_sdst(0)` / `depctr_va_vcc(0)`
 /// before a cross-pipe reread. Clears on vector/scalar memory.
 #[derive(Clone, Debug, PartialEq, Eq)]

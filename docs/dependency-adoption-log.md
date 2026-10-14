@@ -1,5 +1,24 @@
 # Dependency adoption log
 
+> **Lifecycle: historical (dated change log).** Entries record what was
+> adopted on the stated date and why; they are provenance, not a current
+> dependency inventory, support policy, or to-do list. Current dependency
+> truth is `Cargo.toml` / `Cargo.lock` / `deny.toml`. Drift checked against
+> the beta source (entries themselves are left as written):
+> - The 2026-07-16 Bun / `@types/bun` / TypeScript pins in `cli/`
+>   describe the former TypeScript CLI. That directory is no longer in the
+>   tree; the user-facing CLI is the native Rust `crates/hipfire-cli`.
+> - `tracing` / `tracing-subscriber` are now regular dependencies of
+>   `crates/hipfire-daemon` (the daemon is no longer an example of
+>   `hipfire-runtime`); `hipfire-runtime` keeps `tracing` and lists
+>   `tracing-subscriber` as a dev-dependency.
+> - `libloading` is now also used by crates added after the 2026-07-16
+>   refresh (for example `hipfire-arch-deepseek4`, `va-bridge`); all use the
+>   workspace version.
+> - "Future beta follow-ups" and "Validation recorded" are the
+>   2026-07-16 plan and results (including the Bun and test counts). They
+>   are not re-run and not a current tracker.
+
 This log records dependency and developer-tool changes that materially affect
 Hipfire's build, runtime, or maintenance surface. Add entries when a dependency
 is introduced, removed, centralized, or given a new production use.

@@ -22,7 +22,6 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
-        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedGateUpHfq6G256,
         DType::MQ3G256 => KernelKey::FusedGateUpHfq3G256,
         DType::MQ3G256Lloyd => KernelKey::FusedGateUpMq3G256Lloyd,
         // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.

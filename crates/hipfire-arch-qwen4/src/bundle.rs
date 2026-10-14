@@ -11,12 +11,14 @@
 
 use crate::artifact::{Qwen4PleRows, SidecarRows};
 use crate::config::{Qwen4Config, Qwen4PleConfig};
+use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
-    qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+    qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4OutputRows,
+    QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
-use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
+use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
@@ -31,7 +33,8 @@ use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
 use hipfire_runtime::session_cache::{
-    SessionCache, SessionRoute, SessionState, SnapshotParts, StateLayout,
+    stride_boundaries, SessionCache, SessionDriver, SessionRoute, SessionState, SnapshotParts,
+    StateLayout,
 };
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
@@ -41,6 +44,10 @@ use rdna_compute::{Gpu, GpuTensor};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[path = "session_pair.rs"]
+mod session_pair;
+pub(crate) use session_pair::PairSessionStage;
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -85,112 +92,24 @@ impl AttachedWeightStore {
     }
 }
 
-/// Host record of the committed live state: the consumed history it holds and
-/// the route that produced it. A live continuation is *session-exact* (its
-/// state descends from decode, as in a continuous conversation), not
-/// cold-exact, so it is only resumed in place and never captured into the
-/// cross-session snapshot cache, except by message-end snapshots
-/// (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`), which live in their own `/turns` scope.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Qwen4LiveRecord {
-    tokens: Vec<u32>,
-    route: SessionRoute,
-}
-
-/// `Some(L)` when the live state recorded in `record` can serve `prompt` on
-/// `route`: it holds exactly `L = record.tokens.len()` tokens (`0 < L <
-/// prompt.len()`, so at least the last prompt token is computed), those tokens
-/// are `prompt[..L]`, no verify row capture is armed, the target is exactly at
-/// `L` and, for native MTP, so is the head (a retired head lags and cannot
-/// continue). Plain data, so the decision runs without a GPU.
-fn live_start(
-    record: Option<&Qwen4LiveRecord>,
-    prompt: &[u32],
+/// Where every owner of `route` sits when the live state can continue in
+/// place: the target position, for native MTP only when the head sits there
+/// too (a retired head lags, a missing one cannot continue), and never while
+/// a verify row capture is armed. Plain data, so it runs without a GPU.
+fn live_position(
     route: SessionRoute,
     target_position: usize,
     head_position: Option<usize>,
     row_capture_armed: bool,
 ) -> Option<usize> {
-    let record = record?;
-    let end = record.tokens.len();
-    (record.route == route
-        && end > 0
-        && end < prompt.len()
-        && prompt[..end] == record.tokens[..]
-        && !row_capture_armed
-        && target_position == end
-        && (route == SessionRoute::Ar || head_position == Some(end)))
-    .then_some(end)
-}
-
-/// Whether the state left by the turn that began with `turn_prompt` on `route`
-/// is the live state after `consumed`, the full host history the client
-/// committed: `consumed` extends the turn's prompt, the target is exactly at
-/// its end (and for native MTP so is the head) and no row capture is armed.
-/// An empty `consumed` (unrepaired terminal) is never live.
-fn live_after_commit(
-    turn_prompt: &[u32],
-    route: SessionRoute,
-    consumed: &[u32],
-    target_position: usize,
-    head_position: Option<usize>,
-    row_capture_armed: bool,
-) -> bool {
-    let prompt_len = turn_prompt.len();
-    prompt_len > 0
-        && consumed.len() >= prompt_len
-        && consumed[..prompt_len] == *turn_prompt
-        && !row_capture_armed
-        && target_position == consumed.len()
-        && (route == SessionRoute::Ar || head_position == Some(consumed.len()))
-}
-
-/// Prompt tokens the next prefill skips: the live state when it reaches at
-/// least as far as the longest cached snapshot (a tie prefers live: no copy),
-/// else that snapshot.
-fn plan_start(snapshot: usize, live: Option<usize>) -> usize {
-    match live {
-        Some(live) if live >= snapshot => live,
-        _ => snapshot,
-    }
+    (!row_capture_armed
+        && (route == SessionRoute::Ar || head_position == Some(target_position)))
+    .then_some(target_position)
 }
 
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
 /// when the bundle is assembled. Off by default.
 const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
-
-/// Positions just after every `im_end` token of `prompt` (a message end:
-/// user, tool, system or assistant) in `(after, up_to]`, ascending.
-fn message_end_boundaries(prompt: &[u32], im_end: u32, after: usize, up_to: usize) -> Vec<usize> {
-    let end = up_to.min(prompt.len());
-    if after >= end {
-        return Vec::new();
-    }
-    (after..end)
-        .filter(|&i| prompt[i] == im_end)
-        .map(|i| i + 1)
-        .collect()
-}
-
-/// Ascending, deduplicated snapshot boundaries in `(after, up_to]`: multiples
-/// of `chunk`, plus message ends when `im_end` is `Some`.
-fn session_boundaries(
-    chunk: usize,
-    prompt: &[u32],
-    im_end: Option<u32>,
-    after: usize,
-    up_to: usize,
-) -> Vec<usize> {
-    let mut boundaries: Vec<usize> = (after / chunk + 1..=up_to / chunk)
-        .map(|k| k * chunk)
-        .collect();
-    if let Some(im_end) = im_end {
-        boundaries.extend(message_end_boundaries(prompt, im_end, after, up_to));
-        boundaries.sort_unstable();
-        boundaries.dedup();
-    }
-    boundaries
-}
 
 /// The PLE rows owner of a bundle: present exactly when the profile declares
 /// PLE (`config.ple`), so a profile without it holds no row store, hash
@@ -242,16 +161,12 @@ pub struct Qwen4Bundle {
     /// Staging of the GPU penalty prepass (`apply_penalty_table`), allocated
     /// by the first penalized row and kept until unload.
     penalty_stage: Option<PenaltyTableStage>,
-    /// Prefill snapshot cache shared by every session (`attach_session_cache`);
-    /// `None` = off.
-    session: Option<SessionCache>,
-    /// Committed live state kept for a continuation of the same conversation
-    /// (`session_commit_live`); `None` = none. Cleared by `reset`,
-    /// `session_clear`, `session_commit` and `session_begin` (it is consumed
-    /// while a request is in flight).
-    live: Option<Qwen4LiveRecord>,
-    /// Prompt and route of the request in flight (set by `session_begin`).
-    turn: Option<(Vec<u32>, SessionRoute)>,
+    /// Prefill snapshot cache shared by every session plus this
+    /// conversation's committed live state (`attach_session_cache`); `None` =
+    /// off. Message-end snapshots of a live continuation live in their own
+    /// `/turns` scope (`HIPFIRE_QWEN4_TURN_SNAPSHOTS`).
+    session: Option<SessionDriver>,
+    pub(crate) pair_session_stage: Option<PairSessionStage>,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
@@ -262,6 +177,14 @@ pub struct Qwen4Bundle {
     /// Exact AR lane store of the Flash-Next batch route (`stage_lanes`);
     /// `None` = not staged. Lane steps never touch `state` or `mtp`.
     pub(crate) lanes: Option<crate::lane::Qwen4LaneStore>,
+    /// Expert-parallel mesh (`attach_ep_mesh`): this bundle is rank 0 and every
+    /// daemon-facing call is replicated on the peer ranks. `None` = single
+    /// device (the default; no behaviour change).
+    pub(crate) ep: Option<Box<Qwen4EpMesh>>,
+    /// Accepted trunk overlay sidecar (`attach_trunk_overlay`), consumed by
+    /// `attach_forward`; `None` = none pending.
+    pub(crate) trunk_overlay: Option<crate::trunk_overlay::Qwen4TrunkOverlay>,
+    pub(crate) npu_model_index: Option<Result<String, String>>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -364,7 +287,7 @@ impl SessionState for Qwen4Bundle {
         let Some(chunk) = self.spec_chunk_rows() else {
             return Vec::new();
         };
-        session_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
+        stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
     }
 
     fn snapshot_parts(
@@ -381,10 +304,27 @@ impl SessionState for Qwen4Bundle {
                     .ok_or("Qwen4 MTP resources are not attached")?,
             ),
         };
-        if self.state.position != position || mtp.is_some_and(|mtp| mtp.position() != position) {
+        let staged = self
+            .pair_session_stage
+            .as_ref()
+            .filter(|stage| stage.position == Some(position));
+        if (staged.is_none() && self.state.position != position)
+            || mtp.is_some_and(|mtp| mtp.position() != position)
+        {
             return Err(format!("qwen4 session capture: owners not at {position}"));
         }
-        let (mut meta, mut layout) = self.state.session_parts().map_err(|e| e.to_string())?;
+        let SnapshotParts {
+            mut meta,
+            mut layout,
+        } = match staged {
+            Some(stage) => stage
+                .snapshot_parts(&self.state)
+                .map_err(|e| e.to_string())?,
+            None => {
+                let (meta, layout) = self.state.session_parts().map_err(|e| e.to_string())?;
+                SnapshotParts { meta, layout }
+            }
+        };
         if let Some(mtp) = mtp {
             let (mtp_meta, mtp_layout) = mtp.session_parts().map_err(|e| e.to_string())?;
             meta.extend(mtp_meta);
@@ -443,11 +383,16 @@ impl SessionState for Qwen4Bundle {
         .map_err(|e| e.to_string())
     }
 
-    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64 {
-        let through = self
-            .turn
-            .as_ref()
-            .map_or(self.state.position, |(prompt, _)| prompt.len());
+    fn live_position(&self, route: SessionRoute) -> Option<usize> {
+        live_position(
+            route,
+            self.state.position,
+            self.mtp.as_ref().map(Qwen4MtpGpu::position),
+            self.state.row_capture_armed,
+        )
+    }
+
+    fn growth_reserve_bytes(&self, gpu: &Gpu, through: usize) -> u64 {
         let (context, gather) = self.context_growth_bytes(gpu, through);
         context.saturating_add(gather)
     }
@@ -636,12 +581,14 @@ impl Qwen4Bundle {
             spec_host_top1: Vec::new(),
             penalty_stage: None,
             session: None,
-            live: None,
-            turn: None,
+            pair_session_stage: None,
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
             turn_end_token: None,
             state_format,
             lanes: None,
+            ep: None,
+            trunk_overlay: None,
+            npu_model_index: None,
         })
     }
 
@@ -720,9 +667,86 @@ impl Qwen4Bundle {
         self.weight_store.external_rows_len()
     }
 
+    /// Attach cheap base-HFQ identity captured before the source was moved.
+    pub fn attach_npu_trunk_identity(&mut self, identity: Option<Result<String, String>>) {
+        self.npu_model_index = identity;
+    }
+
+    /// Hand the bundle an accepted trunk overlay
+    /// ([`crate::trunk_overlay::resolve_trunk_overlay`]).  [`Self::attach_forward`]
+    /// applies it before `HIPFIRE_QWEN4_REQUANT`: a payload that fails its
+    /// sha256 or the weights' pre-check logs `REFUSED` and the base weights
+    /// run.  One overlay, before the forward attaches.
+    pub fn attach_trunk_overlay(
+        &mut self,
+        overlay: crate::trunk_overlay::Qwen4TrunkOverlay,
+    ) -> Result<(), BundleError> {
+        if self.execution.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 trunk overlay must attach before the forward resources".to_string(),
+            ));
+        }
+        if self.trunk_overlay.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 trunk overlay is already attached".to_string(),
+            ));
+        }
+        self.trunk_overlay = Some(overlay);
+        Ok(())
+    }
+
+    /// Apply the pending trunk overlay, if any.  A refusal (payload digest,
+    /// weight pre-check) is logged and leaves the base weights; a failure
+    /// after replacement started is an error.
+    fn apply_pending_trunk_overlay(
+        &mut self,
+        gpu: &mut Gpu,
+    ) -> Result<Option<rdna_compute::TrunkIu4Default>, BundleError> {
+        let Some(overlay) = self.trunk_overlay.take() else {
+            return Ok(None);
+        };
+        let payloads = match overlay.bound.read_verified() {
+            Ok(payloads) => payloads,
+            Err(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::trunk_overlay::overlay_refusal_line(overlay.path(), &reason)
+                );
+                return Ok(None);
+            }
+        };
+        match self
+            .weights
+            .apply_trunk_overlay(gpu, &payloads)
+            .map_err(BundleError::Forward)?
+        {
+            crate::weights::TrunkOverlayOutcome::Refused(reason) => {
+                eprintln!(
+                    "{}",
+                    crate::trunk_overlay::overlay_refusal_line(overlay.path(), &reason)
+                );
+            }
+            crate::weights::TrunkOverlayOutcome::Applied(applied) => {
+                self.config.trunk_iu4_default = Some(overlay.default);
+                eprintln!("{}", crate::trunk_overlay::applied_line(&overlay, &applied));
+                return Ok(Some(overlay.default));
+            }
+        }
+        Ok(None)
+    }
+
     /// Attach reusable ordinary-HIP execution resources after the manifest
     /// transaction and model state have assembled successfully.
-    pub fn attach_forward(&mut self, gpu: &mut Gpu, max_chunk: usize) -> Result<(), BundleError> {
+    ///
+    /// `mode` is the forward scratch plan the caller admitted and, for the
+    /// loader, already charged to the automatic expert placement; the chunk
+    /// rung search and the forward allocate exactly that plan.
+    pub fn attach_forward(
+        &mut self,
+        gpu: &mut Gpu,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<(), BundleError> {
         if self.execution.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 forward resources are already attached".to_string(),
@@ -755,7 +779,7 @@ impl Qwen4Bundle {
         // prefix it reads (`Qwen4GpuForward`); legacy state commits all of
         // it here, as before. A no-op when the route is off for this arch
         // and state format.
-        if let Some(qsa) = self.state.qsa.first() {
+        if let Some(qsa) = self.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
             let heads = self.config.num_key_value_heads;
             let reserved = match self.state.qsa_backend() {
                 Qwen4KvBackend::Legacy => {
@@ -785,6 +809,24 @@ impl Qwen4Bundle {
                 );
             }
         }
+        // Admitted NPU numerics read stock MQ6, including z/a/b, before the
+        // overlay swap. Effective off does no downloads, allocation or logging.
+        #[cfg(target_os = "linux")]
+        let mut npu_prepared = Qwen4GpuForward::prepare_npu_trunk(
+            gpu,
+            self,
+            self.trunk_overlay.is_some(),
+            requested,
+            mode,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let overlay_route = self.apply_pending_trunk_overlay(gpu)?;
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = &mut npu_prepared {
+            prepared.set_overlay_route(overlay_route);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = overlay_route;
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
@@ -794,14 +836,21 @@ impl Qwen4Bundle {
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
         let max_chunk = qwen4_prefill_chunk_rungs(requested)
             .find(|&rows| {
-                qwen4_forward_device_bytes(&self.config, rows)
+                qwen4_forward_device_bytes(&self.config, rows, mode)
                     .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
                     .is_some_and(|bytes| bytes <= free as u64)
             })
             .unwrap_or_else(|| requested.min(1536));
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
-        let forward = Qwen4GpuForward::new(gpu, self, max_chunk)
-            .map_err(|error| BundleError::Forward(error.to_string()))?;
+        let forward = Qwen4GpuForward::new_inner(
+            gpu,
+            self,
+            max_chunk,
+            mode,
+            #[cfg(target_os = "linux")]
+            Some(npu_prepared),
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
         let spec_rows = qwen4_spec_logit_rows(max_chunk);
         let logits_len = spec_rows
             .checked_mul(self.config.vocab_size)
@@ -839,6 +888,7 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
             return Err(BundleError::Forward(
@@ -851,6 +901,11 @@ impl Qwen4Bundle {
             &self.config,
             max_seq,
             self.state.qsa_backend(),
+            // The forward is attached before the head: its EP binding (placement
+            // and the rank's dummy expert) builds the head's EP decode table.
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::ep_binding),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
@@ -875,11 +930,18 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (spec hidden rows)")?;
         if rows == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 spec hidden capacity is zero".to_string(),
             ));
         }
+        let rows = spec_hidden_capacity_rows(
+            rows,
+            self.spec_chunk_rows().unwrap_or(rows),
+            self.npu_trunk_pipelined(),
+        )
+        .ok_or_else(|| BundleError::Forward("spec hidden capacity overflow".into()))?;
         let width = self
             .config
             .hc_count
@@ -945,6 +1007,68 @@ impl Qwen4Bundle {
             .map(|forward| forward.scratch.max_chunk)
     }
 
+    pub(crate) fn npu_trunk_pipelined(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_pipelined())
+    }
+
+    pub(crate) fn npu_trunk_planned(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_planned())
+    }
+
+    pub(crate) fn begin_npu_trunk_request(&mut self) {
+        if let Some(forward) = &mut self.execution {
+            forward.begin_npu_trunk_request();
+        }
+    }
+
+    /// The first still-pending snapshot boundary strictly after `position`.
+    pub(crate) fn session_boundary_after(&self, position: usize) -> Option<usize> {
+        self.session.as_ref()?.next_boundary_after(position)
+    }
+
+    /// Banks and snapshot cut of the planned pair starting at `position`, the
+    /// geometry both the pair executor and the MTP head appends follow.
+    pub(crate) fn npu_trunk_pair_shape(
+        &self,
+        position: usize,
+        remaining: usize,
+        chunk: usize,
+    ) -> Option<crate::gpu_forward::PairShape> {
+        let banks = self
+            .execution
+            .as_ref()?
+            .npu_trunk_pair(position, remaining, chunk)?;
+        Some(crate::gpu_forward::PairShape::new(
+            banks,
+            position,
+            self.session_next_boundary(),
+        ))
+    }
+
+    pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
+        let next = self.session_next_boundary();
+        let boundaries = crate::gpu_forward::SessionBoundaries {
+            next,
+            after: next.and_then(|next| self.session_boundary_after(next)),
+        };
+        let planned = self
+            .execution
+            .as_ref()
+            .is_some_and(|f| f.npu_trunk_pair(position, end - position, chunk).is_some());
+        crate::gpu_forward::qwen4_prefill_segment_rows(position, end, chunk, boundaries, planned)
+    }
+
+    fn spec_prefill_capacity(&self, chunk: usize) -> usize {
+        if self.npu_trunk_pipelined() {
+            chunk * 2
+        } else {
+            chunk
+        }
+    }
     /// The `<|im_end|>` token message-end snapshots split after, when active.
     fn turn_end_token_active(&self) -> Option<u32> {
         self.turn_end_token.filter(|_| self.turn_snapshots)
@@ -961,7 +1085,17 @@ impl Qwen4Bundle {
     /// live prefills), in the session-cache scope `.../turns`. `None` keeps
     /// chunk multiples only.
     pub fn set_turn_end_token(&mut self, token: Option<u32>) {
-        self.turn_end_token = token;
+        // Host-only; every rank must plan session boundaries identically.
+        let set = |bundle: &mut Self| {
+            bundle.turn_end_token = token;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_turn_end_token", set, &|bundle, _, _| {
+            bundle.turn_end_token = token;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_turn_end_token: {error}");
+        }
     }
 
     /// Force message-end snapshots on or off regardless of the environment
@@ -969,16 +1103,53 @@ impl Qwen4Bundle {
     /// at assembly). Changing it changes the snapshot scope, so call it before
     /// the first prefill that fills the cache.
     pub fn set_turn_snapshots(&mut self, on: bool) {
-        self.turn_snapshots = on;
+        let set = |bundle: &mut Self| {
+            bundle.turn_snapshots = on;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_turn_snapshots", set, &|bundle, _, _| {
+            bundle.turn_snapshots = on;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_turn_snapshots: {error}");
+        }
     }
 
+    /// Forward over `tokens`, returning every row's argmax pick (downloaded).
     pub(crate) fn spec_forward_rows(
         &mut self,
         gpu: &mut Gpu,
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<Vec<u32>, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All, false)
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::All,
+            false,
+            true,
+        )
+    }
+
+    /// [`Self::spec_forward_rows`] for callers that consume the verify's
+    /// resident logits on the device and read no argmax pick: identical
+    /// forward, logits, hidden capture and state, minus the pick readback.
+    pub(crate) fn spec_forward_rows_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+    ) -> Result<(), BundleError> {
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::All,
+            false,
+            false,
+        )
+        .map(|_| ())
     }
 
     /// Final-row argmax of one forward over `tokens`: prompt fills and
@@ -989,10 +1160,17 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final, true)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
+        self.spec_forward_rows_with_output(
+            gpu,
+            tokens,
+            capture_hidden,
+            Qwen4OutputRows::Final,
+            true,
+            true,
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
     }
 
     /// [`Self::spec_prefill_rows`] for a prompt chunk whose pick nothing
@@ -1005,6 +1183,16 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        self.spec_prefill_rows_without_pick(gpu, tokens, true)
+    }
+
+    pub(crate) fn spec_prefill_rows_without_pick(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        capture_hidden: bool,
+    ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (spec prefill)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
@@ -1018,38 +1206,49 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        if tokens.len() > max_chunk {
+        let capacity = self.spec_prefill_capacity(max_chunk);
+        if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                "Qwen4 spec block length {} exceeds capacity {capacity}",
                 tokens.len()
             )));
         }
-        let width = self
-            .config
-            .hc_count
-            .checked_mul(self.config.hidden_size)
-            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
-        let hidden_len = tokens
-            .len()
-            .checked_mul(width)
-            .ok_or_else(|| BundleError::Forward("spec hidden row overflow".to_string()))?;
-        let hidden = self
-            .spec_hidden
-            .as_ref()
-            .ok_or_else(|| BundleError::Forward("Qwen4 spec hidden is not allocated".to_string()))?
-            .sub_offset(0, hidden_len);
+        let hidden = if capture_hidden {
+            let width = self
+                .config
+                .hc_count
+                .checked_mul(self.config.hidden_size)
+                .ok_or_else(|| BundleError::Forward("spec hidden width overflow".into()))?;
+            let len = tokens
+                .len()
+                .checked_mul(width)
+                .ok_or_else(|| BundleError::Forward("spec hidden row overflow".into()))?;
+            Some(
+                self.spec_hidden
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BundleError::Forward("Qwen4 spec hidden is not allocated".into())
+                    })?
+                    .sub_offset(0, len),
+            )
+        } else {
+            None
+        };
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
-            .forward_chunk_silent(self, gpu, tokens, Some(&hidden))
+            .forward_chunk_silent(self, gpu, tokens, hidden.as_ref())
             .map_err(|error| BundleError::Forward(error.to_string()));
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
 
+    /// One spec forward. `download_picks` reads the per-row argmax back; when
+    /// `false` the argmax is still computed on the device (head and logits are
+    /// unchanged) and the returned `Vec` is empty.
     fn spec_forward_rows_with_output(
         &mut self,
         gpu: &mut Gpu,
@@ -1057,7 +1256,9 @@ impl Qwen4Bundle {
         capture_hidden: bool,
         output_rows: Qwen4OutputRows,
         prefill: bool,
+        download_picks: bool,
     ) -> Result<Vec<u32>, BundleError> {
+        self.ep_refuse("speculative decoding (spec verify forward)")?;
         if tokens.is_empty() {
             return Err(BundleError::Forward(
                 "Qwen4 spec forward cannot process an empty block".to_string(),
@@ -1071,9 +1272,14 @@ impl Qwen4Bundle {
             })?
             .scratch
             .max_chunk;
-        if tokens.len() > max_chunk {
+        let capacity = if prefill {
+            self.spec_prefill_capacity(max_chunk)
+        } else {
+            max_chunk
+        };
+        if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
-                "Qwen4 spec block length {} exceeds capacity {max_chunk}",
+                "Qwen4 spec block length {} exceeds capacity {capacity}",
                 tokens.len()
             )));
         }
@@ -1140,6 +1346,9 @@ impl Qwen4Bundle {
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
+        if !download_picks {
+            return Ok(Vec::new());
+        }
         let bytes_len = output_count * std::mem::size_of::<i32>();
         if self.spec_host_top1.len() < bytes_len {
             return Err(BundleError::Forward(
@@ -1248,6 +1457,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         ple_normed: &GpuTensor,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("speculative decoding (verify rollback)")?;
         self.state
             .rollback_rows_retain(
                 gpu,
@@ -1323,12 +1533,22 @@ impl Qwen4Bundle {
             })
     }
 
+    /// [`Self::spec_capture_token`] without the argmax pick readback.
+    pub(crate) fn spec_capture_token_resident(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.spec_forward_rows_resident(gpu, std::slice::from_ref(&token), true)
+    }
+
     /// One ordinary target-only forward of `token`: a single final row, no
     /// wide-hidden capture, so the replay graph route stays eligible. Returns
     /// the greedy argmax (read into the first 4 bytes of `spec_host_top1`, no
     /// allocation); the row's logits stay in row 0 of `spec_logits` for a
     /// sampled follow-up. Clears any stale PLE lookahead first.
     pub(crate) fn spec_ar_token(&mut self, gpu: &mut Gpu, token: u32) -> Result<u32, BundleError> {
+        self.ep_refuse("speculative decoding (spec AR token)")?;
         let vocab = self.config.vocab_size;
         let logits = self
             .spec_logits
@@ -1398,6 +1618,9 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             MtpStep::Predict,
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?
         .ok_or_else(|| {
@@ -1427,6 +1650,9 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 top1_out,
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -1504,6 +1730,9 @@ impl Qwen4Bundle {
         if table.is_noop() {
             return Ok(());
         }
+        if self.ep.is_some() {
+            return self.ep_apply_penalty_table(gpu, logits, table);
+        }
         gpu.apply_penalty_table(
             &mut self.penalty_stage,
             logits,
@@ -1562,6 +1791,32 @@ impl Qwen4Bundle {
             })?;
         gpu.download_f32_into(&logits.sub_offset(offset, vocab), host)
             .map_err(BundleError::Hip)
+    }
+
+    /// Resident (no download) contiguous view of rows
+    /// `first_row..first_row + rows` of the last speculative forward's logits,
+    /// `rows * vocab` f32 words with row stride `vocab`. A non-owning view:
+    /// valid only until the next speculative forward, never freed.
+    pub(crate) fn spec_logits_rows(
+        &self,
+        first_row: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, BundleError> {
+        let vocab = self.config.vocab_size;
+        let logits = self.spec_logits.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec logits are not attached".to_string())
+        })?;
+        first_row
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(vocab))
+            .filter(|&end| rows > 0 && end <= logits.numel())
+            .map(|_| logits.sub_offset(first_row * vocab, rows * vocab))
+            .ok_or_else(|| {
+                BundleError::Forward(format!(
+                    "Qwen4 spec logit rows {first_row}..{} are outside capacity",
+                    first_row.saturating_add(rows)
+                ))
+            })
     }
 
     /// Row `row` of the last speculative forward's logits as `spec`'s
@@ -1661,6 +1916,9 @@ impl Qwen4Bundle {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Advance,
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1686,6 +1944,9 @@ impl Qwen4Bundle {
                 position,
                 true,
                 MtpStep::Append,
+                self.execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::mtp_ep_gather),
             )
             .map(|_| ())
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1721,9 +1982,13 @@ impl Qwen4Bundle {
     /// exactly `tokens` as i32 (the caller's once-per-chunk upload, see
     /// `MtpAppendScratch::upload_prompt_ids`), and uploads its own copy when
     /// that is `None` too.
+    ///
+    /// `context` names the caller and is passed through unchanged: only
+    /// [`MtpFillContext::PromptFill`] can take the DET projections.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
+        context: MtpFillContext,
         scratch: &mut MtpAppendScratch,
         tokens: &[u32],
         hidden_row0: usize,
@@ -1776,6 +2041,7 @@ impl Qwen4Bundle {
                 gpu,
                 &self.weights,
                 &self.config,
+                context,
                 scratch,
                 tokens,
                 &hidden,
@@ -1804,6 +2070,9 @@ impl Qwen4Bundle {
             position,
             fresh_qsa_selection,
             logits,
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -1898,6 +2167,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_token(gpu, token, logits, top1);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1917,6 +2189,9 @@ impl Qwen4Bundle {
         token: Option<u32>,
         logits: &GpuTensor,
     ) -> Result<u32, BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_token_or_argmax(gpu, token, logits);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1937,6 +2212,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_chunk(gpu, tokens, logits, top1, false);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1961,6 +2239,9 @@ impl Qwen4Bundle {
         logits: &GpuTensor,
         top1: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_forward_chunk(gpu, tokens, logits, top1, true);
+        }
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -1990,6 +2271,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
+        self.ep_refuse("silent chunk forward outside a replicated call")?;
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
@@ -2040,8 +2322,17 @@ impl Qwen4Bundle {
 
     /// Reset every owner for a cold prefill.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
-        self.live = None;
-        self.turn = None;
+        if self.ep.is_some() {
+            return self.ep_reset(gpu);
+        }
+        self.begin_npu_trunk_request();
+        if let Some(stage) = &mut self.pair_session_stage {
+            stage.position = None;
+        }
+        // `None` while the cache itself resets (it drives `self` then).
+        if let Some(session) = self.session.as_mut() {
+            session.forget_live();
+        }
         self.invalidate_ple_epoch()?;
         self.state.reset(gpu).map_err(BundleError::State)?;
         if let Some(mtp) = self.mtp.as_mut() {
@@ -2084,7 +2375,13 @@ impl Qwen4Bundle {
             .state
             .qsa
             .first()
-            .filter(|qsa| rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa.format))
+            .filter(|qsa| {
+                rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+                    gpu,
+                    qsa.format,
+                    qsa.f16_arena.is_some(),
+                )
+            })
             .and_then(|_| {
                 rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
                     self.config.num_key_value_heads,
@@ -2173,55 +2470,68 @@ impl Qwen4Bundle {
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
     pub fn attach_session_cache(&mut self, cache: SessionCache) {
-        self.session = Some(cache);
+        self.session = Some(SessionDriver::new(cache));
     }
 
     /// The attached session cache, if any.
     pub fn session_cache(&self) -> Option<&SessionCache> {
-        self.session.as_ref()
+        self.session.as_ref().map(SessionDriver::cache)
     }
 
     /// Drop every session snapshot, pending ones included, releasing their
-    /// device buffers. No-op without a cache.
+    /// device buffers, and the live state; with a disk tier attached,
+    /// published snapshots are demoted to disk instead of dropped. No-op
+    /// without a cache.
     pub fn session_clear(&mut self, gpu: &mut Gpu) {
-        self.live = None;
-        self.turn = None;
-        if let Some(cache) = self.session.as_mut() {
-            cache.clear(gpu);
+        if self.ep.is_some() {
+            return self.ep_session_clear(gpu);
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.clear(gpu);
         }
     }
 
-    /// Run `f` with the cache taken out, so it can drive `self` as its
+    /// Run `f` with the driver taken out, so it can drive `self` as its
     /// [`SessionState`]. `None` without a cache.
-    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionCache, &mut Self) -> R) -> Option<R> {
-        let mut cache = self.session.take()?;
-        let result = f(&mut cache, self);
-        self.session = Some(cache);
+    fn with_session<R>(&mut self, f: impl FnOnce(&mut SessionDriver, &mut Self) -> R) -> Option<R> {
+        let mut session = self.session.take()?;
+        let result = f(&mut session, self);
+        self.session = Some(session);
         Some(result)
     }
 
-    /// The live state's end when it can serve `prompt` on `route` now.
-    fn live_hit(&self, prompt: &[u32], route: SessionRoute) -> Option<usize> {
-        live_start(
-            self.live.as_ref(),
-            prompt,
-            route,
-            self.state.position,
-            self.mtp.as_ref().map(Qwen4MtpGpu::position),
-            self.state.row_capture_armed,
-        )
+    /// [`ArchModel::session_plan`](hipfire_runtime::arch_model::ArchModel::session_plan)
+    /// restricted to reuse points `<= cap` ([`SessionDriver::plan_capped`]).
+    /// With `cap = prompt.len()` it is the plain plan; the EP mesh lowers `cap`
+    /// until every rank agrees on one reuse point.
+    pub(crate) fn session_plan_capped(
+        &self,
+        prompt: &[u32],
+        route: SessionRoute,
+        cap: usize,
+    ) -> usize {
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
     }
 
-    /// Start a prefill of `prompt` on `route` that skips `reused` tokens:
-    /// - live: `reused` is the end of the committed live state (this
-    ///   conversation's previous turn); every owner and position is kept, no
-    ///   snapshot is restored, and nothing is captured unless message-end
-    ///   snapshots are active (then the boundaries above `reused` are, in the
-    ///   `/turns` scope);
-    /// - snapshot: restore the `reused`-token snapshot the cache planned;
-    /// - `reused == 0`: cold start.
-    ///
-    /// The live record is consumed while the request is in flight.
+    /// The host-visible request configuration every EP rank must share.
+    pub(crate) fn ep_replication_fingerprint(&self) -> ReplicaFingerprint {
+        ReplicaFingerprint {
+            session_cache: self.session.is_some(),
+            chunk_rows: self.spec_chunk_rows(),
+            state_format: self.state_format,
+            turn_end_token: self.turn_end_token,
+            turn_snapshots: self.turn_snapshots,
+            has_mtp: self.mtp.is_some(),
+            has_lanes: self.lanes.is_some(),
+        }
+    }
+
+    /// Start a prefill of `prompt` on `route` that skips `reused` tokens
+    /// ([`SessionDriver::begin`]): a live continuation of this conversation's
+    /// previous turn, a snapshot restore, or a cold start. Message-end
+    /// boundaries of a live continuation are captured when active.
     pub(crate) fn session_begin(
         &mut self,
         gpu: &mut Gpu,
@@ -2229,35 +2539,28 @@ impl Qwen4Bundle {
         reused: usize,
         route: SessionRoute,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("session_begin outside a replicated call")?;
+        self.begin_npu_trunk_request();
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        let live =
-            reused > 0 && self.session.is_some() && self.live_hit(prompt, route) == Some(reused);
-        self.live = None;
-        self.turn = None;
         let capture = self.turn_snapshots_active();
-        let result = if live {
+        let result = match self.with_session(|session, bundle| {
+            session.begin(gpu, bundle, prompt, route, reused, capture)
+        }) {
             // The kept state continues, so request-local PLE work from the
             // previous request must not publish into it.
-            self.invalidate_ple_epoch().map(|()| {
-                self.with_session(|cache, bundle| {
-                    cache.begin_live(gpu, bundle, prompt, route, reused, capture)
-                });
-            })
-        } else {
-            match self.with_session(|cache, bundle| cache.begin(gpu, bundle, prompt, route, reused))
-            {
-                Some(result) => result.map_err(BundleError::Forward),
-                None if reused == 0 => self.reset(gpu),
-                None => Err(BundleError::Forward(format!(
-                    "Qwen4 session cache is not attached; cannot reuse {reused} tokens"
-                ))),
-            }
+            Some(Ok(true)) => self.invalidate_ple_epoch(),
+            Some(Ok(false)) => Ok(()),
+            Some(Err(error)) => Err(BundleError::Forward(error)),
+            None if reused == 0 => self.reset(gpu),
+            None => Err(BundleError::Forward(format!(
+                "Qwen4 session cache is not attached; cannot reuse {reused} tokens"
+            ))),
         };
         if result.is_ok() {
-            self.turn = Some((prompt.to_vec(), route));
-        } else {
-            self.live = None;
+            if let Some(forward) = &mut self.execution {
+                forward.plan_npu_trunk_request(prompt.len() - reused, reused);
+            }
         }
         result
     }
@@ -2267,13 +2570,25 @@ impl Qwen4Bundle {
         self.session.as_ref()?.next_boundary()
     }
 
+    pub(crate) fn spec_advance_session_boundary(
+        &mut self,
+        gpu: &mut Gpu,
+        prefix: &[u32],
+    ) -> Result<(), BundleError> {
+        if self.session.as_ref().and_then(SessionDriver::turn_route) == Some(SessionRoute::Ar) {
+            self.session_at_boundary(gpu, prefix)?;
+        }
+        Ok(())
+    }
+
     /// Report that every owner consumed exactly `prefix` (the boundary).
     pub(crate) fn session_at_boundary(
         &mut self,
         gpu: &mut Gpu,
         prefix: &[u32],
     ) -> Result<(), BundleError> {
-        self.with_session(|cache, bundle| cache.at_boundary(gpu, bundle, prefix))
+        self.ep_refuse("session_at_boundary outside a replicated call")?;
+        self.with_session(|session, bundle| session.at_boundary(gpu, bundle, prefix))
             .unwrap_or(Ok(()))
             .map_err(BundleError::Forward)
     }
@@ -2290,20 +2605,31 @@ impl Qwen4Bundle {
         reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
+        if self.ep.is_some() {
+            return self.ep_prefill_final(gpu, prompt, reused, logits);
+        }
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         let mut pos = reused;
-        while let Some(boundary) = self.session_next_boundary() {
-            self.set_ple_lookahead(&prompt[boundary..]);
-            if boundary < prompt.len() {
-                self.forward_chunk_silent(gpu, &prompt[pos..boundary])?;
+        while pos < prompt.len() {
+            let end = if self.npu_trunk_planned() {
+                pos + self.prefill_schedule_rows(
+                    pos,
+                    prompt.len(),
+                    self.spec_chunk_rows().unwrap_or(1),
+                )
             } else {
-                self.forward_chunk_final(gpu, &prompt[pos..boundary], logits, None)?;
+                self.session_next_boundary().unwrap_or(prompt.len())
+            };
+            self.set_ple_lookahead(&prompt[end..]);
+            if end < prompt.len() {
+                self.forward_chunk_silent(gpu, &prompt[pos..end])?;
+            } else {
+                self.forward_chunk_final(gpu, &prompt[pos..end], logits, None)?;
             }
-            self.session_at_boundary(gpu, &prompt[..boundary])?;
-            pos = boundary;
-        }
-        if pos < prompt.len() {
-            self.forward_chunk_final(gpu, &prompt[pos..], logits, None)?;
+            if self.session_next_boundary() == Some(end) {
+                self.session_at_boundary(gpu, &prompt[..end])?;
+            }
+            pos = end;
         }
         Ok(())
     }
@@ -2325,6 +2651,7 @@ impl Qwen4Bundle {
         row_budget: usize,
         spec: Option<crate::lane::LaneSpecConfig>,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch lanes")?;
         if self.lanes.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 lanes are already staged".to_string(),
@@ -2444,7 +2771,9 @@ impl Qwen4Bundle {
             .as_ref()
             .is_some_and(|mtp| mtp.state.snapshot_active())
         {
-            return Err("promotion: the resident MTP head has an active snapshot ticket".to_string());
+            return Err(
+                "promotion: the resident MTP head has an active snapshot ticket".to_string(),
+            );
         }
         Ok(())
     }
@@ -2483,7 +2812,8 @@ impl Qwen4Bundle {
                 self.state.position
             )));
         }
-        self.promotion_resident_ready().map_err(BundleError::Forward)?;
+        self.promotion_resident_ready()
+            .map_err(BundleError::Forward)?;
         match (spec, parts.as_ref()) {
             (Some(_), None) => {
                 return Err(BundleError::Forward(
@@ -2566,6 +2896,8 @@ impl Qwen4Bundle {
                     ));
                 }
             }
+            bundle.state.clamp_f16_valid();
+            lane.state.clamp_f16_valid();
             std::mem::swap(&mut bundle.state, &mut lane.state);
             if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
                 std::mem::swap(&mut mtp.state, &mut spec.head);
@@ -2580,6 +2912,7 @@ impl Qwen4Bundle {
     /// A fresh lane trunk state: the resident state's formats, QSA backend
     /// and context bound, allocated through the same constructor.
     pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        self.ep_refuse("continuous-batch lane/wave states")?;
         Qwen4State::new_with_backend(
             gpu,
             &self.config,
@@ -2660,6 +2993,8 @@ impl Qwen4Bundle {
         }
         let mut head = head;
         let session = self.session.take();
+        self.state.clamp_f16_valid();
+        state.clamp_f16_valid();
         std::mem::swap(&mut self.state, state);
         let resident_draft = match (head.as_mut(), self.mtp.as_mut()) {
             (Some((head_state, draft)), Some(mtp)) => {
@@ -2694,6 +3029,8 @@ impl Qwen4Bundle {
             mtp.draft.set_request_state(resident);
             std::mem::swap(&mut mtp.state, &mut **head_state);
         }
+        self.state.clamp_f16_valid();
+        state.clamp_f16_valid();
         std::mem::swap(&mut self.state, state);
         self.session = session;
         Ok(result)
@@ -2711,6 +3048,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         final_logits: Option<&GpuTensor>,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch lane prefill")?;
         self.with_lane(state, None, |bundle| {
             let mut forward = bundle.execution.take().ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
@@ -2762,29 +3100,35 @@ impl Qwen4Bundle {
         top1: Option<&GpuTensor>,
         policy: &crate::gpu_forward_lanes::LaneStagePolicy,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("continuous-batch wave prefill")?;
         for lane in lanes.iter_mut() {
             let end = lane
                 .state
                 .position
                 .checked_add(lane.tokens.len())
-                .ok_or_else(|| BundleError::Forward("Qwen4 wave lane position overflows".to_string()))?;
+                .ok_or_else(|| {
+                    BundleError::Forward("Qwen4 wave lane position overflows".to_string())
+                })?;
             if end > lane.state.max_seq_len {
                 return Err(BundleError::Forward(format!(
                     "Qwen4 wave lane end position {end} exceeds its context capacity {}",
                     lane.state.max_seq_len
                 )));
             }
-            lane.state.ensure_mapped_capacity(gpu, end).map_err(|error| {
-                BundleError::Forward(format!(
-                    "map Qwen4 wave lane QSA context through {end} tokens: {error}"
-                ))
-            })?;
+            lane.state
+                .ensure_mapped_capacity(gpu, end)
+                .map_err(|error| {
+                    BundleError::Forward(format!(
+                        "map Qwen4 wave lane QSA context through {end} tokens: {error}"
+                    ))
+                })?;
         }
         crate::gpu_forward_lanes::forward_wave(gpu, self, lanes, head, logits, top1, policy)
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
+        self.ep_refuse("state snapshots")?;
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
     }
@@ -2794,6 +3138,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state restore")?;
         self.invalidate_ple_epoch()?;
         self.state
             .restore(gpu, snapshot)
@@ -2804,6 +3149,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state restore")?;
         self.quiesce_ple()?;
         self.state
             .restore_retain(gpu, snapshot)
@@ -2825,6 +3171,7 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         snapshot: Qwen4StateSnapshot,
     ) -> Result<(), BundleError> {
+        self.ep_refuse("state commit")?;
         self.quiesce_ple()?;
         self.state.commit(snapshot, gpu).map_err(BundleError::State)
     }
@@ -2832,7 +3179,10 @@ impl Qwen4Bundle {
     /// Teardown is deliberately ordered: stop/quiesce PLE reads and release
     /// leases/page-cache resources, free mutable GPU state, free finalized
     /// resident weights, then drain the attached transaction/census.
-    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), BundleError> {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        // Peers drain and free first: their gather events and P2P reads end
+        // before rank 0's buffers go.
+        let ep_result = self.ep_close(gpu);
         let Qwen4Bundle {
             weights,
             state,
@@ -2844,6 +3194,7 @@ impl Qwen4Bundle {
             spec_top1,
             spec_hidden,
             session,
+            pair_session_stage,
             penalty_stage,
             lanes,
             ..
@@ -2862,6 +3213,14 @@ impl Qwen4Bundle {
         if let Some(mut session) = session {
             session.clear(gpu);
         }
+        let mut pair_stage_error = None;
+        if let Some(stage) = pair_session_stage {
+            for tensor in stage.fixed {
+                if let Err(error) = gpu.free_tensor(tensor) {
+                    pair_stage_error.get_or_insert(error);
+                }
+            }
+        }
         let ple_result = ple_rows
             .map(|rows| rows.unload().map(|_| ()).map_err(BundleError::PleRows))
             .unwrap_or(Ok(()));
@@ -2874,7 +3233,7 @@ impl Qwen4Bundle {
                     .map_err(|error| BundleError::Forward(error.to_string()))
             })
             .unwrap_or(Ok(()));
-        let mut spec_error = None;
+        let mut spec_error = pair_stage_error;
         for tensor in [spec_logits, spec_top1, spec_hidden].into_iter().flatten() {
             if let Err(error) = gpu.free_tensor(tensor) {
                 spec_error.get_or_insert(error);
@@ -2897,7 +3256,7 @@ impl Qwen4Bundle {
         let state_result = lanes_result.and(state.free_gpu(gpu).map_err(BundleError::State));
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
-        first_bundle_error([
+        let freed = first_bundle_error([
             ple_result,
             execution_result,
             mtp_result,
@@ -2905,7 +3264,8 @@ impl Qwen4Bundle {
             state_result,
             weight_result,
             store_result,
-        ])
+        ]);
+        ep_result.and(freed)
     }
 }
 
@@ -2939,20 +3299,21 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
-        self.session.as_ref().map_or(0, |cache| {
-            plan_start(
-                cache.plan(self, prompt, route),
-                self.live_hit(prompt, route),
-            )
-        })
+        if self.ep.is_some() {
+            return self.ep_session_plan(prompt, route);
+        }
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.plan(self, prompt, route))
     }
 
     fn session_commit(&mut self) {
-        if let Some(cache) = self.session.as_mut() {
-            cache.commit();
+        if self.ep.is_some() {
+            return self.ep_session_commit(None);
         }
-        self.live = None;
-        self.turn = None;
+        if let Some(session) = self.session.as_mut() {
+            session.commit();
+        }
     }
 
     /// Publish as [`Self::session_commit`] and keep the live state when
@@ -2962,23 +3323,13 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     /// decode lineage); the snapshots just published stay cold-exact because a
     /// live turn captures none unless message-end snapshots are active.
     fn session_commit_live(&mut self, consumed: &[u32]) {
-        let Some(cache) = self.session.as_mut() else {
-            self.live = None;
-            self.turn = None;
-            return;
-        };
-        cache.commit();
-        let position = self.state.position;
-        let head = self.mtp.as_ref().map(Qwen4MtpGpu::position);
-        let armed = self.state.row_capture_armed;
-        self.live = self.turn.take().and_then(|(prompt, route)| {
-            live_after_commit(&prompt, route, consumed, position, head, armed).then(|| {
-                Qwen4LiveRecord {
-                    tokens: consumed.to_vec(),
-                    route,
-                }
-            })
-        });
+        if self.ep.is_some() {
+            return self.ep_session_commit(Some(consumed));
+        }
+        if let Some(mut session) = self.session.take() {
+            session.commit_live(self, consumed);
+            self.session = Some(session);
+        }
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
@@ -3784,219 +4135,20 @@ mod tests {
     const AR: SessionRoute = SessionRoute::Ar;
     const MTP: SessionRoute = SessionRoute::Mtp;
 
-    fn record(tokens: &[u32], route: SessionRoute) -> Qwen4LiveRecord {
-        Qwen4LiveRecord {
-            tokens: tokens.to_vec(),
-            route,
-        }
-    }
-
-    const END: u32 = 7;
-
     #[test]
-    fn message_end_boundaries_follow_every_im_end() {
-        // None.
-        assert!(message_end_boundaries(&[1, 2, 3], END, 0, 3).is_empty());
-        assert!(message_end_boundaries(&[], END, 0, 0).is_empty());
-        // Several: the position just after each im_end.
-        let prompt = [1, END, 2, 3, END, 4, END];
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 7), [2, 5, 7]);
-        // `after` is exclusive, `up_to` inclusive.
-        assert_eq!(message_end_boundaries(&prompt, END, 2, 7), [5, 7]);
-        assert_eq!(message_end_boundaries(&prompt, END, 1, 7), [2, 5, 7]);
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 5), [2, 5]);
-        assert_eq!(message_end_boundaries(&prompt, END, 0, 4), [2]);
-        assert_eq!(message_end_boundaries(&prompt, END, 5, 7), [7]);
-        assert!(message_end_boundaries(&prompt, END, 7, 7).is_empty());
-        assert!(message_end_boundaries(&prompt, END, 3, 4).is_empty());
-        // Consecutive im_end tokens each end a message.
-        assert_eq!(
-            message_end_boundaries(&[END, END, 1, END], END, 0, 4),
-            [1, 2, 4]
-        );
-        // im_end at the last position ends at the prompt length.
-        assert_eq!(message_end_boundaries(&[1, 2, END], END, 0, 3), [3]);
-        // `up_to` beyond the prompt never reads past it.
-        assert_eq!(message_end_boundaries(&[1, END], END, 0, 9), [2]);
-    }
-
-    #[test]
-    fn session_boundaries_union_chunks_and_message_ends() {
-        let mut prompt = vec![1u32; 20];
-        prompt[2] = END; // ends at 3
-        prompt[7] = END; // ends at 8: a chunk multiple
-        prompt[13] = END; // ends at 14
-                          // Chunk multiples only without a token (flag off or token unknown).
-        assert_eq!(
-            session_boundaries(4, &prompt, None, 0, 20),
-            [4, 8, 12, 16, 20]
-        );
-        // Union, sorted and deduplicated (8 is both).
-        assert_eq!(
-            session_boundaries(4, &prompt, Some(END), 0, 20),
-            [3, 4, 8, 12, 14, 16, 20]
-        );
-        // The `(after, up_to]` window applies to both sources.
-        assert_eq!(
-            session_boundaries(4, &prompt, Some(END), 3, 14),
-            [4, 8, 12, 14]
-        );
-        assert_eq!(session_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
-        // Message ends below one chunk are boundaries on their own.
-        assert_eq!(
-            session_boundaries(64, &prompt, Some(END), 0, 20),
-            [3, 8, 14]
-        );
-        assert!(session_boundaries(64, &prompt, None, 0, 20).is_empty());
-        // A prompt without the token matches the chunk-only schedule.
-        assert_eq!(
-            session_boundaries(4, &[1; 20], Some(END), 0, 20),
-            session_boundaries(4, &[1; 20], None, 0, 20)
-        );
-    }
-
-    #[test]
-    fn live_start_requires_a_strict_extension_of_the_record() {
-        let rec = record(&[1, 2, 3], AR);
-        let at = |prompt: &[u32]| live_start(Some(&rec), prompt, AR, 3, None, false);
-        assert_eq!(at(&[1, 2, 3, 4]), Some(3));
-        assert_eq!(at(&[1, 2, 3, 4, 5, 6]), Some(3));
-        // Diverges inside the record.
-        assert_eq!(at(&[1, 9, 3, 4]), None);
-        assert_eq!(at(&[9, 2, 3, 4]), None);
-        // L == prompt.len() leaves no suffix; a shorter prompt is no extension.
-        assert_eq!(at(&[1, 2, 3]), None);
-        assert_eq!(at(&[1, 2]), None);
-        assert_eq!(at(&[]), None);
-        // No record, or an empty one (L == 0).
-        assert_eq!(live_start(None, &[1, 2, 3, 4], AR, 3, None, false), None);
-        let empty = record(&[], AR);
-        assert_eq!(live_start(Some(&empty), &[1, 2], AR, 0, None, false), None);
-    }
-
-    #[test]
-    fn live_start_checks_route_positions_and_row_capture() {
-        let prompt = [1, 2, 3, 4];
-        let ar = record(&[1, 2, 3], AR);
-        let mtp = record(&[1, 2, 3], MTP);
-        // Route mismatch, both ways.
-        assert_eq!(live_start(Some(&ar), &prompt, MTP, 3, Some(3), false), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, AR, 3, Some(3), false), None);
-        // Target moved off the record's end.
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 2, None, false), None);
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 4, None, false), None);
-        // A verify row capture in flight.
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 3, None, true), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(3), true), None);
-        // AR ignores the head; MTP needs it exactly at L (floor retirement
-        // leaves it behind, a missing head cannot continue).
-        assert_eq!(
-            live_start(Some(&ar), &prompt, AR, 3, Some(1), false),
-            Some(3)
-        );
-        assert_eq!(
-            live_start(Some(&mtp), &prompt, MTP, 3, Some(3), false),
-            Some(3)
-        );
-        assert_eq!(
-            live_start(Some(&mtp), &prompt, MTP, 3, Some(2), false),
-            None
-        );
-        assert_eq!(
-            live_start(Some(&mtp), &prompt, MTP, 3, Some(4), false),
-            None
-        );
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, None, false), None);
-    }
-
-    #[test]
-    fn live_after_commit_needs_consumed_to_extend_the_turn_prompt() {
-        let prompt = [1, 2, 3];
-        let commit = |consumed: &[u32], pos: usize| {
-            live_after_commit(&prompt, AR, consumed, pos, None, false)
-        };
-        assert!(commit(&[1, 2, 3, 7, 8], 5));
-        // Nothing generated: consumed == prompt.
-        assert!(commit(&[1, 2, 3], 3));
-        // Unrepaired terminal: the host history is empty.
-        assert!(!commit(&[], 0));
-        assert!(!commit(&[], 3));
-        // Shorter than the prompt, or not extending it.
-        assert!(!commit(&[1, 2], 2));
-        assert!(!commit(&[1, 9, 3, 7], 4));
-        // Device position not at the end of the consumed history.
-        assert!(!commit(&[1, 2, 3, 7, 8], 4));
-        assert!(!commit(&[1, 2, 3, 7, 8], 6));
-        // A turn without a prompt is never live.
-        assert!(!live_after_commit(&[], AR, &[1], 1, None, false));
-    }
-
-    #[test]
-    fn live_after_commit_checks_head_and_row_capture() {
-        let prompt = [1, 2, 3];
-        let consumed = [1, 2, 3, 7, 8];
-        assert!(live_after_commit(
-            &prompt,
-            MTP,
-            &consumed,
-            5,
-            Some(5),
-            false
-        ));
-        // Floor retirement left the head behind (or absent).
-        assert!(!live_after_commit(
-            &prompt,
-            MTP,
-            &consumed,
-            5,
-            Some(3),
-            false
-        ));
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, None, false));
-        // AR does not care about the head.
-        assert!(live_after_commit(&prompt, AR, &consumed, 5, Some(3), false));
-        assert!(live_after_commit(&prompt, AR, &consumed, 5, None, false));
-        // Row capture armed.
-        assert!(!live_after_commit(&prompt, AR, &consumed, 5, None, true));
-        assert!(!live_after_commit(
-            &prompt,
-            MTP,
-            &consumed,
-            5,
-            Some(5),
-            true
-        ));
-    }
-
-    #[test]
-    fn plan_prefers_live_on_a_tie_and_the_longer_source_otherwise() {
-        // No live state: the snapshot (or a miss).
-        assert_eq!(plan_start(4096, None), 4096);
-        assert_eq!(plan_start(0, None), 0);
-        // Live alone.
-        assert_eq!(plan_start(0, Some(300)), 300);
-        // Tie prefers live (no restore copy).
-        assert_eq!(plan_start(4096, Some(4096)), 4096);
-        // The longer source wins either way.
-        assert_eq!(plan_start(4096, Some(9000)), 9000);
-        assert_eq!(plan_start(8192, Some(300)), 8192);
-    }
-
-    #[test]
-    fn live_hit_then_commit_round_trips_through_the_pure_helpers() {
-        // Turn 1: cold prompt of 3, decode two tokens, commit.
-        let turn1 = [1u32, 2, 3];
-        let consumed1 = [1u32, 2, 3, 7, 8];
-        assert!(live_after_commit(&turn1, AR, &consumed1, 5, None, false));
-        let rec = record(&consumed1, AR);
-        // Turn 2 re-renders the history and appends the next user turn.
-        let turn2 = [1u32, 2, 3, 7, 8, 11, 12];
-        let start = live_start(Some(&rec), &turn2, AR, 5, None, false);
-        assert_eq!(start, Some(5));
-        assert_eq!(plan_start(0, start), 5);
-        // A re-rendered history that rewrote the assistant turn diverges.
-        let rewritten = [1u32, 2, 3, 70, 8, 11, 12];
-        assert_eq!(live_start(Some(&rec), &rewritten, AR, 5, None, false), None);
+    fn live_position_checks_the_head_and_row_capture() {
+        // AR continues at the target and ignores the head.
+        assert_eq!(live_position(AR, 3, None, false), Some(3));
+        assert_eq!(live_position(AR, 3, Some(1), false), Some(3));
+        // MTP needs the head exactly at the target (floor retirement leaves
+        // it behind, a missing head cannot continue).
+        assert_eq!(live_position(MTP, 3, Some(3), false), Some(3));
+        assert_eq!(live_position(MTP, 3, Some(2), false), None);
+        assert_eq!(live_position(MTP, 3, Some(4), false), None);
+        assert_eq!(live_position(MTP, 3, None, false), None);
+        // A verify row capture in flight never continues.
+        assert_eq!(live_position(AR, 3, None, true), None);
+        assert_eq!(live_position(MTP, 3, Some(3), true), None);
     }
 
     use crate::config::Qwen4FfnConfig;
@@ -4207,5 +4359,19 @@ mod tests {
         let error = admit_executable_profile(&moe).unwrap_err();
         assert!(matches!(error, BundleError::Weights(_)), "{error}");
         assert!(error.to_string().contains("no sealed MoE route"), "{error}");
+    }
+}
+
+/// The correctness twin retains one-chunk capture; only actual NPU pipelining
+/// needs simultaneous A/B hidden rows.
+pub(crate) fn spec_hidden_capacity_rows(
+    rows: usize,
+    chunk: usize,
+    pipelined: bool,
+) -> Option<usize> {
+    if pipelined {
+        Some(rows.max(chunk.checked_mul(2)?))
+    } else {
+        Some(rows)
     }
 }

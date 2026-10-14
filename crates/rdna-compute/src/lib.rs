@@ -34,7 +34,7 @@ pub mod grouped_ops;
 pub mod hc_row_fold;
 pub mod kernel_pack;
 pub mod kernel_registry;
-mod kernels;
+pub mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
@@ -44,7 +44,9 @@ pub mod fn_gdn_dense;
 pub mod norm;
 pub mod pm_decode_twins;
 pub mod pm_xbatch;
+pub mod pm_mtp_gemm;
 pub mod lane_rows_pm;
+pub mod npu_trunk;
 pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;
@@ -56,11 +58,17 @@ pub mod qwen35_fa_batch;
 pub mod rdna;
 pub mod railgun_check;
 pub mod replay;
+pub mod rope;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
 pub mod lane_gdn;
 pub mod lane_fa;
+pub mod draft_lane_conv;
+pub mod draft_lane_rows;
+pub mod sampled_rows_compact;
+pub mod dflash_sampled_accept;
+pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
@@ -78,7 +86,8 @@ pub mod uma_memory;
 pub mod vae;
 pub mod trunk_mask;
 pub use trunk_mask::{
-    qwen4_trunk_iu4_mask, Qwen4TrunkMask, TrunkFamily, TRUNK_ALL_BITS, TRUNK_GDN_BITS,
+    qwen4_trunk_iu4_route, Qwen4TrunkIu4Route, Qwen4TrunkMask, TrunkFamily, TrunkIu4Default,
+    TrunkIu4MaskSource, TRUNK_ALL_BITS, TRUNK_GDN_BITS, TRUNK_IU4_DEFAULT_KEY, TRUNK_IU4_ENV,
     TRUNK_QSA_BITS,
 };
 

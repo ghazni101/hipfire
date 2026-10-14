@@ -113,6 +113,9 @@ pub enum CpuQuant {
     Bf16,
     /// qt 3 — `Q8F16` (`DType::Q8_0`): f16 scale + 32 i8, 34 B / 32.
     Q8F16,
+    /// qt 34 — FWHT-256 E8 lattice weights: one 16 B row header,
+    /// then eight 17 B blocks per 256 values.
+    Mfp4G32E8,
 }
 
 impl CpuQuant {
@@ -136,6 +139,7 @@ impl CpuQuant {
             19 => Some(Self::Mq2G256Lloyd),
             30 => Some(Self::Mq4G256Lloyd),
             31 => Some(Self::Mq5G256),
+            34 => Some(Self::Mfp4G32E8),
             40 => Some(Self::Tq2G128),
             41 => Some(Self::Bq1G128),
             45 => Some(Self::Mq4CG256),
@@ -153,7 +157,7 @@ impl CpuQuant {
         }
     }
 
-    /// Elements per group. Rows are `(k / group_elems()) * group_bytes()` long.
+    /// Elements per group. Rows also include [`Self::row_header_bytes`].
     pub fn group_elems(self) -> usize {
         match self {
             Self::Q8F16 => 32,
@@ -186,6 +190,15 @@ impl CpuQuant {
             Self::Q8F16 => 34,
             Self::F16 | Self::Bf16 => 512,
             Self::F32 => 1024,
+            Self::Mfp4G32E8 => 136,
+        }
+    }
+
+    /// Bytes preceding the groups once per row, not once per FWHT group.
+    pub fn row_header_bytes(self) -> usize {
+        match self {
+            Self::Mfp4G32E8 => 16,
+            _ => 0,
         }
     }
 
@@ -212,6 +225,7 @@ impl CpuQuant {
                 | Self::Mq2G256V2
                 | Self::Mq2G256Lloyd
                 | Self::Mq4G256Lloyd
+                | Self::Mfp4G32E8
         )
         // NOT here, deliberately: `Mq2G256LloydU` (unrotated sibling — rotating
         // it would destroy the native-ternary structure it exists to preserve),
@@ -460,7 +474,7 @@ fn f32_at(bytes: &[u8], off: usize) -> f32 {
 /// dependency list empty of the GPU stack *and* of formatting crates.
 /// `f16_widening_is_ieee` holds it against `half` for every encoding class.
 #[inline]
-fn half_f16_to_f32(bits: u16) -> f32 {
+pub(crate) fn half_f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let man = (bits & 0x3FF) as u32;
@@ -480,9 +494,49 @@ fn half_f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(out)
 }
 
+/// E8's unsigned E4M3 block scale, including its saturated 0x7f code.
+/// Powers of two and eighths are exact, matching the device decoder's bits.
+#[inline]
+pub(crate) fn mfp4_e8_scale(code: u8) -> f32 {
+    let exp = (code >> 3) & 15;
+    let mant = code & 7;
+    if exp == 0 {
+        mant as f32 / 512.0
+    } else if exp == 15 && mant == 7 {
+        448.0
+    } else {
+        f32::from_bits((exp as u32 + 120) << 23) * (1.0 + mant as f32 / 8.0)
+    }
+}
+
+/// Decode eight AoS blocks without copying the shared row header.
+pub(crate) fn decode_mfp4_e8_group(blocks: &[u8], row_scale: f32, out: &mut [f32]) {
+    for block in 0..8 {
+        let at = block * 17;
+        // Keep the format's scale multiplication order; do not fold QUANT_STEP
+        // into row_scale or defer scaling until after the dot product.
+        let scale = row_scale * mfp4_e8_scale(blocks[at]) * 0.88;
+        for word in 0..4 {
+            let offset = at + 1 + word * 4;
+            let index = u32::from_le_bytes(blocks[offset..offset + 4].try_into().unwrap());
+            let coset = (index >> 31) as f32 * 0.5;
+            let base = block * 32 + word * 8;
+            let mut parity = 0;
+            for coord in 0..7 {
+                let nibble = (index >> (coord * 4)) & 15;
+                parity ^= nibble;
+                out[base + coord] = scale * ((nibble as i32 - 7) as f32 + coset);
+            }
+            let last = ((index >> 27) & 14) | (parity & 1);
+            out[base + 7] = scale * ((last as i32 - 7) as f32 + coset);
+        }
+    }
+}
+
 /// Decode one group's *code values* into `out[0..q.group_elems()]`: the affine
 /// or codebook decode, with no rotation. These are the values the MQ kernels dot
 /// against a forward-rotated activation (see the module docs).
+/// For E8, `packed` includes the row header followed by this group's blocks.
 pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
     let ge = q.group_elems();
     assert!(
@@ -491,12 +545,15 @@ pub fn decode_group_codes(q: CpuQuant, packed: &[u8], out: &mut [f32]) {
         out.len()
     );
     assert!(
-        packed.len() >= q.group_bytes(),
+        packed.len() >= q.row_header_bytes() + q.group_bytes(),
         "decode_group_codes({q:?}): packed has {} bytes, need {}",
         packed.len(),
-        q.group_bytes()
+        q.row_header_bytes() + q.group_bytes()
     );
     match q {
+        CpuQuant::Mfp4G32E8 => {
+            decode_mfp4_e8_group(&packed[16..], f16_at(packed, 0), out);
+        }
         CpuQuant::F16 => {
             for (i, o) in out[..ge].iter_mut().enumerate() {
                 *o = f16_at(packed, 2 * i);
@@ -1491,9 +1548,58 @@ mod test {
         assert_eq!(a, b);
     }
 
-    /// Every layout the crate decodes, pinned literally: `gemv`'s row stride is
-    /// `(k / group_elems) * group_bytes`, so a wrong row here is a wrong pointer,
-    /// not a rounding difference. `(qt, quant, group_elems, group_bytes, rotated)`.
+    #[test]
+    fn mfp4_e8_preserves_coordinate_and_scale_bits() {
+        // Literal lattice points cover both cosets, both coordinate-7 parities,
+        // and extrema. They are independent of either decoder's bit unpacking.
+        const POINTS: [(u32, [f32; 8]); 6] = [
+            (0x00000000, [-7.0; 8]),
+            (0x80000000, [-6.5; 8]),
+            (0x11111111, [-6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -4.0]),
+            (0x91111111, [-5.5, -5.5, -5.5, -5.5, -5.5, -5.5, -5.5, -3.5]),
+            (0x77777777, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8.0]),
+            (0xffffffff, [8.5; 8]),
+        ];
+        let mut packed = [0u8; 152];
+        let mut got = [0.0f32; 256];
+        for bits in [0u16, 0x2802, 0x3800, 0x3c01] {
+            packed[..2].copy_from_slice(&bits.to_le_bytes());
+            let row_scale = half::f16::from_bits(bits).to_f32();
+            for code in 0..=255u8 {
+                let exp = (code >> 3) & 15;
+                let mant = code & 7;
+                let block_scale = if exp == 0 {
+                    2.0f32.powi(-6) * mant as f32 / 8.0
+                } else if exp == 15 && mant == 7 {
+                    448.0
+                } else {
+                    2.0f32.powi(exp as i32 - 7) * (1.0 + mant as f32 / 8.0)
+                };
+                for block in 0..8 {
+                    let at = 16 + block * 17;
+                    packed[at] = code;
+                    for word in 0..4 {
+                        let point = POINTS[(block * 4 + word) % POINTS.len()].0;
+                        packed[at + 1 + word * 4..at + 5 + word * 4]
+                            .copy_from_slice(&point.to_le_bytes());
+                    }
+                }
+                decode_group_codes(CpuQuant::Mfp4G32E8, &packed, &mut got);
+                for (i, &value) in got.iter().enumerate() {
+                    let coord = POINTS[(i / 8) % POINTS.len()].1[i % 8];
+                    let want = (row_scale * block_scale * 0.88) * coord;
+                    assert_eq!(value.to_bits(), want.to_bits(), "header={bits:04x} scale={code:02x} coordinate={i}");
+                }
+            }
+        }
+        for k in [256, 512, 4096] {
+            assert_eq!(crate::gemv::row_bytes(CpuQuant::Mfp4G32E8, k), 16 + (k / 32) * 17);
+        }
+    }
+
+    /// Every group layout the crate decodes, pinned literally. Row headers are
+    /// accounted separately by `gemv::row_bytes`.
+    /// `(qt, quant, group_elems, group_bytes, rotated)`.
     const FORMATS: &[(u8, CpuQuant, usize, usize, bool)] = &[
         (1, CpuQuant::F16, 256, 512, false),
         (2, CpuQuant::F32, 256, 1024, false),
@@ -1514,6 +1620,7 @@ mod test {
         (20, CpuQuant::Mq3G256Lloyd, 256, 112, true),
         (30, CpuQuant::Mq4G256Lloyd, 256, 160, true),
         (31, CpuQuant::Mq5G256, 256, 168, true),
+        (34, CpuQuant::Mfp4G32E8, 256, 136, true),
         (40, CpuQuant::Tq2G128, 128, 34, false),
         (41, CpuQuant::Bq1G128, 128, 18, false),
         (44, CpuQuant::Mq4G256V2, 256, 136, true),
@@ -1543,13 +1650,13 @@ mod test {
         //         cannot express; needs the stride to be threaded through
         //   14    MQ8G256 — `RotationPlan::Mq8Internal`, i.e. an int8-quantized
         //         activation, not a plain FWHT of f32
-        //   21/24/32-37  HFP4/MFP4/... — per-ROW 16 B header + per-32 block
-        //         scales/codewords; also arch-loaded layouts
+        //   21/24/32/33/35-37 HFP4/MFP4/... — decoders not implemented;
+        //         qt 34's AoS E8 row header is handled explicitly
         //   28/29 PARO4G128(-T) — a Givens rotation on the *activation*
         //   38/39 MQ{2,3}G256GL — MoE-indexed only, no dense GEMV kernel exists
         //   22    TidI32 — a routing table, not a weight
         for qt in [
-            0u8, 4, 5, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 34, 35, 36, 37, 38, 39, 43,
+            0u8, 4, 5, 14, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33, 35, 36, 37, 38, 39, 43,
             46, 255,
         ] {
             assert_eq!(CpuQuant::from_quant_type(qt), None, "qt {qt}");

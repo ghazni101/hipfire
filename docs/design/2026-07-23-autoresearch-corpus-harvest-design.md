@@ -15,7 +15,7 @@ outcome rows to the static ISA rows that already exist alongside them.
 | Date | 2026-07-23 |
 | Status | **Implemented** — `scripts/harvest_ledgers.py`. See "As built" below. |
 | Scope | `autoresearch/` ledgers only. Redline is explicitly excluded. |
-| Boxes surveyed | k9lin (local), hipx, hiptrx |
+| Boxes surveyed | local gfx1100 workstation ("local"), mixed-arch multi-GPU host ("mixed-arch"), 4×gfx1201 host ("gfx1201") |
 
 ---
 
@@ -29,7 +29,7 @@ in aggregate.
 
 Measured 2026-07-23:
 
-| | k9lin | hipx | hiptrx | total |
+| | local | mixed-arch | gfx1201 | total |
 |---|---:|---:|---:|---:|
 | ledger rows | 1,593 | 765 | 3,905 | **6,263** |
 | unique ledger files (name+size) | 23 | 63 | 42 | 128 |
@@ -47,7 +47,7 @@ VOID     25   DEAD_FILE 4   CROSS_ARCH 2   NO_OP 2   COHERENCE_FAIL 1
 ```
 
 Archs covered: `gfx1010`, `gfx1030`, `gfx1100`, `gfx1151`, `gfx1201` — the
-full tracked line. Distinct kernels: 26 (hipx), 17 (k9lin / hiptrx).
+full tracked line. Distinct kernels: 26 (mixed-arch), 17 (local / gfx1201).
 
 Three findings drive the design:
 
@@ -63,14 +63,14 @@ Three findings drive the design:
    fixture path. Joining it to outcomes on `(arch, kernel)` is what turns the
    corpus into a pre-flight filter instead of a historical record.
 
-3. **`measurement_hash` is present on only ~204 of 6,263 rows (~3%).** k9lin
+3. **`measurement_hash` is present on only ~204 of 6,263 rows (~3%).** the local box
    has zero. The `INSERT OR IGNORE` idempotency contract in
    `autoresearch/db/schema.sql` therefore does not work on historical rows,
    and dedup needs a composite fallback. This was the single most consequential
    discovery of the survey.
 
 Two supporting facts: `ar.db` has **never** been populated with real data (the
-51 `ar.db` files on k9lin are all pytest fixtures under `/tmp/pytest-of-kaden/`,
+51 `ar.db` files on the local box are all pytest fixtures under `/tmp/pytest-of-<user>/`,
 totalling 8 unique hashes across 3 kernels), and the `sqlite3` CLI is absent on
 all three boxes — Python's built-in `sqlite3` module is unaffected, so this
 blocks inspection but not ingest.
@@ -78,8 +78,8 @@ blocks inspection but not ingest.
 ## Scope
 
 **In scope.** `autoresearch/ledger/*.jsonl`, `tests/kernel-ledger/*.jsonl`,
-`atlas*.jsonl`, and `autoresearch/state/bod_*.json`, harvested from k9lin,
-hipx, and hiptrx.
+`atlas*.jsonl`, and `autoresearch/state/bod_*.json`, harvested from the local,
+mixed-arch, and gfx1201 boxes.
 
 **Explicitly out of scope.** Redline artifacts — `.redline-work/`,
 `redline-results/`, `redline-cert-*/`, `redline-runs/`. Redline measurement has
@@ -100,7 +100,7 @@ Two fact types, deliberately not merged into one table.
 **`attempts` — outcome facts.** "This lever was tried on this kernel and here
 is what happened." Sourced from `autoresearch/ledger/*.jsonl`.
 
-Observed row shape (real example, hiptrx):
+Observed row shape (real example, gfx1201 box):
 
 ```json
 {"arch":"gfx1100","kernel":"gemm_hfq4g256_moe_grouped_wmma_gfx12",
@@ -154,7 +154,7 @@ back-filled rows agree bit-for-bit with rows the loop emits going forward.
 
 They frequently are not present. The survey found `model` and `var_sha` absent
 from most historical swarm rows, while `kernel`, `label`, and `variant` are
-near-universal (`kernel` 3,220/3,374 on hiptrx). So harvest defines a **second,
+near-universal (`kernel` 3,220/3,374 on the gfx1201 box). So harvest defines a **second,
 explicitly distinct** fallback key:
 
 ```
@@ -195,11 +195,11 @@ recipes-that-worked KB.
 
 ## Harvest mechanism
 
-`scripts/harvest_ledgers.py`, run from k9lin. Pull-based over ssh, read-only at
+`scripts/harvest_ledgers.py`, run from the local box. Pull-based over ssh, read-only at
 the source, idempotent, re-runnable as boxes accumulate rows.
 
 ```
-for box in (k9lin, hipx, hiptrx):
+for box in (local, mixed_arch, gfx1201):
     stream ledger / kernel-ledger / atlas / bod files   # read-only
     → normalize to attempts / kernel_static / bod rows
     → attach provenance; back-fill measurement_hash where canonical
@@ -228,7 +228,7 @@ nullable column would make ordering non-deterministic and defeat the point.
   transient ssh failure cannot silently shrink the corpus.
 - **Malformed JSONL line.** Counted, logged with `source_path:line`, skipped.
   A nonzero malformed count is reported in the summary. The survey found 0 bad
-  lines across 3,374 hiptrx rows, so this should stay at zero.
+  lines across 3,374 gfx1201-box rows, so this should stay at zero.
 - **Schema drift.** Unknown fields are preserved in an `extra` object rather
   than dropped, matching how `AtlasRow` already handles this.
 - **Never writes to the source boxes.** Harvest is strictly read-only remotely.
@@ -264,9 +264,9 @@ living only on two disposable boxes.
 Implemented in `scripts/harvest_ledgers.py`. Five things diverged from the
 design above; all five were forced by the real data.
 
-**1. `/tmp` is harvested, not just `$HOME`.** hiptrx keeps 23 ledger files /
+**1. `/tmp` is harvested, not just `$HOME`.** The gfx1201 box keeps 23 ledger files /
 531 rows under `/tmp`. Excluding it lost exactly those rows (3,374 + 531 =
-3,905, the independently-measured hiptrx total). Tmp data is the most
+3,905, the independently-measured gfx1201-box total). Tmp data is the most
 loss-prone on the fleet, which makes it the most important to capture, not the
 least.
 
@@ -293,7 +293,7 @@ defeats git-tracking. Provenance also picks the lexicographically smallest
 `os.walk` order, which is not stable across runs. Both were caught by the
 idempotency test, which now passes byte-identically.
 
-**5. Timestamps come in two formats.** k9lin/hipx emit epoch ints; hiptrx emits
+**5. Timestamps come in two formats.** local/mixed-arch boxes emit epoch ints; the gfx1201 box emits
 ISO-8601 (`2026-07-09T23:47:48Z`). Both are normalized.
 
 ### Result

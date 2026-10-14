@@ -39,9 +39,12 @@ pub mod dflash;
 /// analogue is `dspark_block_controller`. Pure math, no GPU types.
 pub mod dflash_adaptive_block;
 pub mod dflash_generic;
+pub mod dflash_online;
 pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
+pub mod ep_row_gather;
+pub mod ep_tile_exchange;
 pub mod eval_common;
 pub mod external_rows;
 pub mod gguf;
@@ -59,6 +62,7 @@ pub mod loop_guard;
 pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
+pub mod offload_calibrate;
 pub mod paro;
 pub mod ple_convert;
 pub mod ple_hot_pack;
@@ -69,6 +73,7 @@ pub mod ple_sidecar;
 pub mod prefix;
 pub mod prefix_index;
 pub mod reset_core;
+pub mod rope;
 pub mod safetensors_source;
 pub mod sampler;
 /// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
@@ -90,10 +95,12 @@ pub mod slot_batch;
 pub mod spec;
 
 pub mod ngram_mod;
+pub mod offload;
 pub mod spec_ngram;
 pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
+pub mod trunk_overlay;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 pub mod weight_manifest;

@@ -112,8 +112,10 @@ impl ConfigState {
             Some("dflash_mode"),
             Some("prefill_compression"), // Prefill (pflash)
             Some("kv_cache"),
-            Some("gpu_layer_budget"), // Offload
-            Some("offload_exec"),     // Offload exec
+            Some("gpu_layer_budget"),  // Offload
+            Some("moe_expert_budget"), // Offload (MoE experts)
+            Some("offload_exec"),      // Offload exec
+            Some("offload_passback_share"), // Pass-back GPU share
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
@@ -160,7 +162,9 @@ impl ConfigState {
             self.is_override("prefill_compression"),              // Prefill
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("gpu_layer_budget"),                 // Offload
+            self.is_override("moe_expert_budget"),                // Offload (MoE experts)
             self.is_override("offload_exec"),                     // Offload exec
+            self.is_override("offload_passback_share"),           // Pass-back GPU share
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -180,7 +184,9 @@ impl ConfigState {
             "prefill_compression", // Prefill
             "kv_cache",            // KV cache
             "gpu_layer_budget",    // Offload
+            "moe_expert_budget",   // Offload (MoE experts)
             "offload_exec",        // Offload exec
+            "offload_passback_share", // Pass-back GPU share
             "thinking",            // Thinking
             "reasoning_effort",    // Reasoning effort
             "thinking_budget",     // Reasoning budget
@@ -209,7 +215,7 @@ impl ConfigState {
                     .get("dflash_mode")
                     .cloned()
                     .unwrap_or_else(|| "off".into()),
-                "DFlash mode. Keep off unless intentionally testing drafts.",
+                "Spec decode: the model's attached drafter — its DFlash draft, else its MTP head.",
             ),
             (
                 "Prefill",
@@ -241,9 +247,10 @@ impl ConfigState {
                 // GPU, and an "Offload" label invites reading it as the inverse.
                 "GPU layers",
                 {
-                    // Unset = every layer on the GPU. The bare empty string would
-                    // read as "broken" in a value column, so name the state; the
+                    // Unset keeps every layer resident on every model. Name
+                    // the state rather than leaving a blank value column; the
                     // editor seeds its buffer from `values`, not from this label.
+                    // Short: the easy table's value column is 24 wide (ui.rs).
                     match self
                         .values
                         .get("gpu_layer_budget")
@@ -251,15 +258,34 @@ impl ConfigState {
                         .unwrap_or("")
                     {
                         "" => "all on GPU".into(),
-                        // `-1` is the schema's reserved auto spelling, not a count:
-                        // rendering it as "N on GPU" would claim -1 layers are
-                        // resident. The engine currently keeps every layer on the
-                        // GPU for auto, which is what the explainer says.
-                        "-1" => "auto (engine decides)".into(),
+                        // `-1` is the schema's reserved auto spelling, and the
+                        // rule also accepts a literal `auto`; both mean fit-to-card
+                        // and neither is a layer count.
+                        "-1" | "auto" => "auto (fits to card)".into(),
                         v => format!("{v} on GPU"),
                     }
                 },
                 "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
+            ),
+            (
+                // The routed-expert tier: a MoE model's experts usually dwarf its
+                // attention weights, so this is the row that makes an over-VRAM
+                // MoE model loadable.
+                "Expert layers",
+                {
+                    match self
+                        .values
+                        .get("moe_expert_budget")
+                        .map(String::as_str)
+                        .unwrap_or("")
+                    {
+                        // Unset never spills routed experts.
+                        "" => "all on GPU".into(),
+                        "-1" | "auto" => "auto (fits to card)".into(),
+                        v => format!("{v} on GPU"),
+                    }
+                },
+                "MoE only: how many layers keep their routed experts on the GPU. Only experts move; attention, router, shared expert and KV stay.",
             ),
             (
                 // The other half of the offload decision: placement is the row
@@ -273,11 +299,27 @@ impl ConfigState {
                 {
                     "" | "pcie" => "over PCIe".into(),
                     "cpu" => "on CPU".into(),
+                    "passback" => "passback (CPU + GPU)".into(),
                     // Only reachable if the schema's list grows: show it rather
                     // than mislabel it.
                     other => other.to_string(),
                 },
                 "Who multiplies a spilled layer's weights: the GPU over the link, or the CPU.",
+            ),
+            (
+                // The pass-back's modifier: read only by the mode above, which is
+                // why the row says so rather than pretending it is standalone.
+                "Pass-back GPU share",
+                match self
+                    .values
+                    .get("offload_passback_share")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                {
+                    "" | "auto" => "auto (scheduled)".into(),
+                    other => other.to_string(),
+                },
+                "Share of each spilled step's rows the GPU takes back, for the passback mode.",
             ),
             (
                 "Thinking",
@@ -477,16 +519,41 @@ mod tests {
                 .expect("GPU layers row present")
         };
 
+        // Unset never spills, including on a MoE model.
         assert_eq!(row(&[]), "all on GPU");
         assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
         assert_eq!(
             row(&[("gpu_layer_budget", "-1")]),
-            "auto (engine decides)",
+            "auto (fits to card)",
             "-1 means auto, not -1 layers on the GPU"
+        );
+        assert_eq!(
+            row(&[("gpu_layer_budget", "auto")]),
+            "auto (fits to card)",
+            "the literal auto spelling (accepted by the value rule) is not a count"
         );
         // A cleared key is unset, not the literal string the JSON layer produces
         // for null — the bug this replaced rendered "null on GPU".
         assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
+    }
+
+    /// The routed-expert row: same cell grammar as its `GPU layers` sibling, and
+    /// distinct labels so the two offload tiers cannot be confused in the UI.
+    #[test]
+    fn offload_expert_row_renders_unset_count_and_auto() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Expert layers")
+                .map(|(_, value, _)| value)
+                .expect("Expert layers row present")
+        };
+        assert_eq!(row(&[]), "all on GPU");
+        assert_eq!(row(&[("moe_expert_budget", "26")]), "26 on GPU");
+        assert_eq!(row(&[("moe_expert_budget", "-1")]), "auto (fits to card)");
+        assert_eq!(row(&[("moe_expert_budget", "auto")]), "auto (fits to card)");
+        assert_eq!(row(&[("moe_expert_budget", "")]), "all on GPU");
     }
 
     /// The exec row's two arms, in the same cell grammar as its sibling.
@@ -504,6 +571,29 @@ mod tests {
         assert_eq!(row(&[]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "pcie")]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "cpu")]), "on CPU");
+        assert_eq!(
+            row(&[("offload_exec", "passback")]),
+            "passback (CPU + GPU)"
+        );
+    }
+
+    /// The pass-back share row: unset and `auto` both mean "the engine schedules
+    /// it", and a pinned number renders as itself.
+    #[test]
+    fn offload_passback_share_row_renders_scheduled_and_pinned() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Pass-back GPU share")
+                .map(|(_, value, _)| value)
+                .expect("Pass-back GPU share row present")
+        };
+
+        assert_eq!(row(&[]), "auto (scheduled)");
+        assert_eq!(row(&[("offload_passback_share", "auto")]), "auto (scheduled)");
+        assert_eq!(row(&[("offload_passback_share", "0")]), "0");
+        assert_eq!(row(&[("offload_passback_share", "0.375")]), "0.375");
     }
 
     #[test]

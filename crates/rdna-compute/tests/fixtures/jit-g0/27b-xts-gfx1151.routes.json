@@ -44,7 +44,7 @@
       "kind": "embedded",
       "module": "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151.hxaco",
-      "sha256": "948e84aec58728d76ecb1390ce54b2049700d3a44e4b726c26d448a38feb5a42",
+      "sha256": "09dbc6403013c7eab1b13e659faf6662f9c47477b64e2b5200be62e0f358b556",
       "symbols": [
         "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151"
       ],
@@ -1095,7 +1095,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "0ff7afcc1d83c0d2378d8332278c530e9a0dd66d48f415d52703aea6ee5dae82",
+      "sha256": "b282e1815bd1a0b7c88d4f474fbf2c88536cc6608eed68dd6d01573f59dd0317",
       "symbols": [
         "kv_cache_write_q8_0_batched"
       ],

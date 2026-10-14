@@ -112,8 +112,38 @@ __device__ __forceinline__ void mfp2_decode_index(unsigned int idx, float p[8]) 
     for (int i = 0; i < 8; i++) { float c = (float)((int)e[i] - 2); p[i] = coset ? c + 0.5f : c; }
 }
 
+#ifdef HIPFIRE_MOE_COALESCED_WEIGHTS
+// Narrow offloaded verify: fetch each packed row-group contiguously instead
+// of issuing small PCIe reads from 16 widely separated output rows. The
+// grouped layout, dequantization and WMMA K order below remain unchanged.
+template<int GROUP_BYTES>
+__device__ __forceinline__ const char* coalesced_group(
+    const char* weights, unsigned long long* storage, int row_start, int rows,
+    int groups_per_row, int group, int tid
+) {
+    constexpr int WORDS = GROUP_BYTES / 8;
+    // All consumers are in this wave. Retire the preceding group's LDS
+    // reads before reusing its storage; publish the new bytes before decode.
+    __syncthreads();
+    for (int i = tid; i < 16 * WORDS; i += 32) {
+        const int row = min(row_start + i / WORDS, rows - 1);
+        const char* src = weights + (long long)row * groups_per_row * GROUP_BYTES
+            + group * GROUP_BYTES + (i % WORDS) * 8;
+        storage[i] = *reinterpret_cast<const unsigned long long*>(src);
+    }
+    __syncthreads();
+    return reinterpret_cast<const char*>(storage) + (tid & 15) * GROUP_BYTES;
+}
+#define HIPFIRE_GROUPED_SYMBOL gemm_mixed_moe_grouped_wmma_coalesced_gfx1201
+#define HIPFIRE_GROUP_PTR(BYTES) \
+    coalesced_group<BYTES>(A, packed_group, row_start, M, groups_per_row, g, tid)
+#else
+#define HIPFIRE_GROUPED_SYMBOL gemm_mixed_moe_grouped_wmma_gfx12
+#define HIPFIRE_GROUP_PTR(BYTES) (row_base + g * (BYTES))
+#endif
+
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
+extern "C" __global__ void HIPFIRE_GROUPED_SYMBOL(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E] u64
     const unsigned char*      __restrict__ dtype_tags,         // [E] u8 tag per expert
     const int*                __restrict__ expert_tile_ids,    // [m_total / 16]
@@ -176,6 +206,9 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
     const int safe_row = (row_start + m_lane < M) ? (row_start + m_lane) : (M - 1);
     const int groups_per_row = K / 256;
     const char* row_base = A + (long long)safe_row * groups_per_row * group_bytes;
+#ifdef HIPFIRE_MOE_COALESCED_WEIGHTS
+    __shared__ unsigned long long packed_group[16 * 200 / 8];
+#endif
 
     float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
     const half8_t zero_b = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -198,7 +231,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
             DQ6(4, (d1), 0);  DQ6(5, (d1), 6);  DQ6(6, (d1), 12); DQ6(7, (d1), 18)
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 200;
+            const char* gp = HIPFIRE_GROUP_PTR(200);
             _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
             _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
             const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
@@ -267,7 +300,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
         // Per-lane REGISTER bilinear decomposition (NOT LDS broadcast).
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 72;
+            const char* gp = HIPFIRE_GROUP_PTR(72);
             const __half* cb_h = reinterpret_cast<const __half*>(gp);
             _Float16 cb0 = (_Float16)__half2float(cb_h[0]);
             _Float16 cb1 = (_Float16)__half2float(cb_h[1]);
@@ -339,7 +372,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 136;
+            const char* gp = HIPFIRE_GROUP_PTR(136);
             _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
             _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
             const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
@@ -387,7 +420,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
         // Per-lane REGISTER 3D bilinear decomposition (NOT LDS broadcast).
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 112;
+            const char* gp = HIPFIRE_GROUP_PTR(112);
             const __half* cb_h = reinterpret_cast<const __half*>(gp);
             _Float16 cb0 = (_Float16)__half2float(cb_h[0]);
             _Float16 cb1 = (_Float16)__half2float(cb_h[1]);
@@ -582,7 +615,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 136;
+            const char* gp = HIPFIRE_GROUP_PTR(136);
 
             // Dual affine grid. Stored as raw f16 bits, unlike V1's f32 pair.
             const unsigned int hdr_lo = *(const unsigned int*)(gp);
@@ -645,7 +678,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
             DQ6_V2(4, (d1), 0);  DQ6_V2(5, (d1), 6);  DQ6_V2(6, (d1), 12); DQ6_V2(7, (d1), 18)
 
         for (int g = 0; g < groups_per_row; g++) {
-            const char* gp = row_base + g * 200;
+            const char* gp = HIPFIRE_GROUP_PTR(200);
 
             const unsigned int hdr_lo = *(const unsigned int*)(gp);
             const unsigned int hdr_hi = *(const unsigned int*)(gp + 4);
@@ -720,3 +753,6 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_gfx12(
         }
     }
 }
+
+#undef HIPFIRE_GROUP_PTR
+#undef HIPFIRE_GROUPED_SYMBOL

@@ -160,11 +160,21 @@ works, what to measure, what counts as pass/fail.
   prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
   path).
 - **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
+  `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` is the default.** Any test exercising DFlash
-  still needs `hipfire config set dflash_mode auto` or
-  `HIPFIRE_DFLASH_DRAFT=<path>` first.
+- **`dflash_mode=off` is the schema default.** Any test exercising DFlash
+  on a model without a registry DFlash policy still needs
+  `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first. The one exception is the
+  Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b`, `-mq3*`,
+  `-mq4*`, including the canonical `qwen3.8:27b-mq4-xts` fixture): the
+  registry layer sets `speculation.dflash=auto`, so a present paired file
+  activates DFlash with no config, an absent file keeps MTP `auto`, and an
+  explicit `dflash_mode off` (canonical `speculation.dflash=off`) is the
+  kill switch. `dflash_block` stays `auto` (L16 singleton, L8 on a
+  `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
+  DFlash greedy may differ from AR near argmax ties; judge it against the
+  MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
 - **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
   It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
   loads, warns when used (`prefill_compression` != `off`), and is not
@@ -229,6 +239,14 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+   It runs the GPU-free CI checks that finish quickly: ratchets, crate
+   maps, scratch growth, changelog, ratchet-diff, cargo-deny
+   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   lifecycle. It skips the tests and the release build. Pass the branch
+   your PR targets (for example `origin/beta`) so ratchet-diff compares
+   against it. Fix every failure before you commit. Install cargo-deny first
+   with `cargo install --locked cargo-deny`; missing tools fail the check.
 
 ---
 
@@ -244,7 +262,8 @@ DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
 # lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
 # measured draft identity (acceptance/perf pin):
-#   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+#   a local copy of the registry draft (same bytes as the
+#   qwen38-27b-dflash-mq4.hfq sidecar)
 #   (see §5 "Pinned Hugging Face bench fixture")
 
 # Smaller / faster smoke only (not the acceptance fixture):
@@ -258,8 +277,9 @@ Legacy `qwen3.{5,6}:{9b,27b}-draft` tags remain pullable.
 
 Files land at `~/.hipfire/models/<canonical-name>`.
 **Do not rename.** Load resolves the draft by its registry-declared
-filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
-(one warning line), `on` fails the load.
+filename; renaming breaks the pairing — an explicit `dflash_mode auto` then
+runs AR (one warning line) and `on` fails the load; a Qwen3.8-27B tier
+(registry `auto`) keeps MTP `auto` when the draft file is absent.
 
 ### Verify hashes after pull (paranoid mode)
 
@@ -359,7 +379,8 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 - Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
   (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
 - Measured draft identity (acceptance/perf pin):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
+  a local copy of the registry draft (same bytes as the
+  `qwen38-27b-dflash-mq4.hfq` sidecar; see §5)
 
 Still pullable (smaller smoke / historical):
 
@@ -472,9 +493,10 @@ If you're testing an actual user UX flow:
 
 ```bash
 hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
-hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
+# Qwen3.8-27B paired tiers need no config: the registry resolves dflash=auto.
+# Other models: hipfire config set dflash_mode auto    # opt in (schema default: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
-# export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+# export HIPFIRE_DFLASH_DRAFT=/path/to/local-copy-of-registry-draft.hfq   # same bytes as the qwen38-27b-dflash-mq4.hfq sidecar
 hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
 # on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
@@ -579,8 +601,8 @@ The canonical dense trunk is whichever local artifact byte-matches
   three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
   2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
   comparable.
-- Paired draft (the registry sidecar `qwen38-27b-dflash-mq4.hfq`, same bytes):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
+- Paired draft: the registry sidecar `qwen38-27b-dflash-mq4.hfq`, or a local
+  copy of the registry draft (the same bytes)
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
 Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
@@ -596,11 +618,16 @@ code24 `heldout-code24.gptqsym.kldref.bin` (sha256
 `43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
 A change that claims to be bit-exact must reproduce its arch's `.kldseq`
 byte for byte. A change that moves a pin on purpose re-pins it here.
+A re-pin must record, in the same commit: the evaluator build commit,
+the evaluator binary md5, and the receipt path. The public references and
+one-command reproduction live in `kld/VERIFY.md` on the model's Hugging Face
+repo (`hipfire-models/qwen3.8-27b`, `hipfire-models/qwen3.8-flash-next`);
+update it with the pin.
 
 Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
 code object v6). Each pin is reproduced in two fresh processes with separate
 HOME directories. gfx1201/gfx1100 use empty kernel caches; gfx1201 repeats
-use different R9700 cards. gfx1100/gfx1151 run serialized under the hipx timing
+use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
 lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
 reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
 can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
@@ -861,7 +888,7 @@ Caveats that are part of the fixture, not trivia:
   `294c4ad9d`). `--matrix` now sizes the load to the run (largest `--pp`, or
   `--ctx` + `--tg`, plus 32), and `--max-seq N` overrides it
   ([CLI.md](docs/CLI.md#bench-context-max_seq)). Measured on 2026-10-04 on
-  hipx (Strix Halo, card `bf:00.0`, `qwen3.8-flash-next-gptq3.mq4`
+  a Strix Halo (gfx1151) host (one card, `qwen3.8-flash-next-gptq3.mq4`
   `8b15b6fe…00972`): `--matrix --pp 8192 --tg 32 --runs 3 --warmups 1` loads
   `max_seq` 20064 (the default `--ctx` tops out at 20000). pp8192 was
   1927.3 / 1921.8 / 1918.3 tok/s, fast-PPT-limited for 48–55 % of each run.
@@ -887,6 +914,8 @@ Caveats that are part of the fixture, not trivia:
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+| `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
+| Offloaded MoE with `speculation.mtp=auto` runs AR (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native Qwen35 MTP `auto` declines after placement resolves host-mapped routed experts on either `pcie` or `cpu`, logging the count, seam and `opt in with --spec mtp`. Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach (including resident `auto`). `--spec off` / `speculation.mtp=off` and auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
 
 
 ---
@@ -909,8 +938,9 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
-| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. Unset/`auto`/`-1`/unparseable = fully resident (never forces offload). Sibling of `HIPFIRE_OFFLOAD_EXEC`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md). | unset (fully resident) |
-| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default) or `cpu`. Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1. | `pcie` |
+| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU — `3` on a 64-layer model spills 61. Unset/null/empty/unparseable leaves weights device-resident on every model. Explicit `auto`/`-1` opts into fit-capacity placement, routed experts before whole layers. Manual `N` remains a hard pin. Sibling of `HIPFIRE_OFFLOAD_EXEC` (unchanged default `pcie`). See [docs/CONFIG.md](docs/CONFIG.md#memory). | unset (fully resident) |
+| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default), `cpu`, or `passback` (scheduled co-inference — both engines run the same spilled step concurrently, divided by output rows). Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe, and `passback` runs the `pcie` path on the step's first output rows and the `cpu` path on the rest, concurrently. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1 and § 6.2.2. | `pcie` |
+| `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | Schedule of a spilled step's output rows between the two engines under co-inference (`memory.offload_exec=passback` only): the GPU takes the first rows (the `pcie` arm), the CPU the rest (the `cpu` arm). `auto` (default) schedules it from this host's measured engine rates and refines it online; a number in `(0, 0.5]` pins it; `0` collapses it onto the CPU engine alone, so the mode is byte-identical to `cpu`. Inert (one notice at load) in any other mode. Measure or override with `hipfire offload-bench`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.2. | `auto` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 | `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
 

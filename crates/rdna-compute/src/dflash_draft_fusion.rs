@@ -157,6 +157,33 @@ impl Gpu {
         self.draft_rows64_scope = prev;
     }
 
+    /// Device-free admission predicate of
+    /// [`Self::gemm_mq4g256v2_overwrite_gfx12_dflash`]: `true` iff that call
+    /// with these `k` / `batch_size` would launch (never returns `Ok(false)`),
+    /// given the current flags, verify scopes, draft 64-row scope and
+    /// capture/replay/G0 state. The lane-batched draft context fill decides
+    /// its routing with this BEFORE it writes any state.
+    pub fn draft_overwrite_gfx12_admitted(&self, k: usize, batch_size: usize) -> bool {
+        !(self.arch != "gfx1201"
+            || self.flags.draft_collapse_off
+            || self.fp8_verify_scope
+            || self.iu4_verify_scope
+            || (!(2..=63).contains(&batch_size)
+                && !(batch_size == 64 && self.draft_rows64_scope))
+            || k % 256 != 0
+            || !self.arch_caps.has_wmma_w32_gfx12()
+            || self.flags.fp16_disabled
+            || self.flags.lm_head_wmma_disabled
+            || self.a8_prefill_active(batch_size, k)
+            || (self.flags.hfq4g256_ldsstage_wmma
+                && k % 512 == 0
+                && batch_size <= crate::gemm::LDSSTAGE_MAX_BATCH)
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+            || self.replay.is_g0_observing()
+            || (batch_size == 64 && !self.flags.wmma_batch_tiles))
+    }
+
     /// gfx1201 DFlash-draft MQ4G256V2 overwrite GEMM: the pre-zero-free twin of
     /// `gemm_mq4g256v2_batched_lmhead` for the shapes whose legacy route ends
     /// in the one-tile (`gemm_mq4g256v2_residual_wmma_gfx12`) or 128-K verify-tile
@@ -188,24 +215,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if self.arch != "gfx1201"
-            || self.flags.draft_collapse_off
-            || self.fp8_verify_scope
-            || self.iu4_verify_scope
-            || (!(2..=63).contains(&batch_size)
-                && !(batch_size == 64 && self.draft_rows64_scope))
-            || k % 256 != 0
-            || !self.arch_caps.has_wmma_w32_gfx12()
-            || self.flags.fp16_disabled
-            || self.flags.lm_head_wmma_disabled
-            || self.a8_prefill_active(batch_size, k)
-            || (self.flags.hfq4g256_ldsstage_wmma
-                && k % 512 == 0
-                && batch_size <= crate::gemm::LDSSTAGE_MAX_BATCH)
-            || self.replay.is_recording()
-            || self.graphs.capture_mode
-            || self.replay.is_g0_observing()
-        {
+        if !self.draft_overwrite_gfx12_admitted(k, batch_size) {
             return Ok(false);
         }
         if batch_size == 64 {
@@ -213,9 +223,7 @@ impl Gpu {
             // (`bt = 4`, one grid-y block). The vt core keeps the one-tile
             // kernel's per-output arithmetic, so every row matches the same row
             // of a 48/16-row chunk. Needs the batch-tiles family.
-            if !self.flags.wmma_batch_tiles {
-                return Ok(false);
-            }
+            // (`wmma_batch_tiles` is part of `draft_overwrite_gfx12_admitted`.)
             self.bind_thread()?;
             self.iu4_verify_note_f16();
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();

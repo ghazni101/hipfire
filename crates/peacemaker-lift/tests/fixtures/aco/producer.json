@@ -34,7 +34,7 @@
       "subgroup": { "required": 32, "require_full": true },
       "incumbent": {
         "hip_source": "kernels/src/gemv_mq4g256v2_residual.hip",
-        "builder_twin": "crates/hipfire-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+        "builder_twin": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
         "kernarg_abi": "A@0 x@8 y@16 (8-byte global pointers), M i32 @24, K i32 @28; grid = M workgroups of 32; row0 = blockIdx.x*2"
       },
       "push": {

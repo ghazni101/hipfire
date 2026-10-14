@@ -1999,6 +1999,22 @@ impl<'a> SealedMoeCall<'a> {
             }
         }
 
+        // The specialized QT44/QT53 route's scratch requirement depends on the
+        // arm this device and row count select; check it, with the bytes the
+        // tensors physically hold, before this invocation's first launch.
+        if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
+            (&self.params, &self.selection)
+        {
+            if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+                super::qt44_qt53_prefill::validate_scratch(
+                    gpu,
+                    params,
+                    selection.resolution.use_path2,
+                    selection.path2_m_total,
+                )?;
+            }
+        }
+
         if self.protocol == MoeProtocol::GroupedPrefill
             && self.router == MoeRouterInput::PrecomputedSoftmaxTopK
         {
@@ -3305,19 +3321,26 @@ fn validate_prefill(
         batch_hidden,
         "prefill rotated activation",
     )?;
-    let gate_capacity = total_slots
-        .checked_mul(params.mi)
-        .ok_or_else(|| invalid("prefill gate scratch capacity overflows"))?;
-    require_elements(params.gate_batch, gate_capacity, "prefill gate scratch")?;
-    require_elements(params.up_batch, gate_capacity, "prefill up scratch")?;
-    require_elements(params.rot_batch, gate_capacity, "prefill rotation scratch")?;
-    require_elements(
-        params.down_expanded,
-        total_slots
-            .checked_mul(params.down_m)
-            .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
-        "prefill expanded down",
-    )?;
+    // The specialized QT44/QT53 route sizes these six buffers by the kernel
+    // arm it takes (BF16 grouped rows, shared-down fallback, fallback caps),
+    // which needs the executing GPU: `validate_for_gpu` checks them through
+    // `qt44_qt53_prefill::validate_scratch` before the first launch. Generic
+    // routes keep the full-width F32 requirement.
+    if params.route_policy.is_none() {
+        let gate_capacity = total_slots
+            .checked_mul(params.mi)
+            .ok_or_else(|| invalid("prefill gate scratch capacity overflows"))?;
+        require_elements(params.gate_batch, gate_capacity, "prefill gate scratch")?;
+        require_elements(params.up_batch, gate_capacity, "prefill up scratch")?;
+        require_elements(params.rot_batch, gate_capacity, "prefill rotation scratch")?;
+        require_elements(
+            params.down_expanded,
+            total_slots
+                .checked_mul(params.down_m)
+                .ok_or_else(|| invalid("prefill expanded down capacity overflows"))?,
+            "prefill expanded down",
+        )?;
+    }
     require_bytes(
         params.expert_token_counts,
         params
@@ -3358,26 +3381,28 @@ fn validate_prefill(
             .ok_or_else(|| invalid("prefill inverse permutation capacity overflows"))?,
         "prefill inverse permutation",
     )?;
-    require_elements(
-        params.y_gate_up_grouped,
-        params
-            .m_total_max
-            .checked_mul(
-                2usize
-                    .checked_mul(params.mi)
-                    .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
-            )
-            .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
-        "prefill grouped gate/up",
-    )?;
-    require_elements(
-        params.y_down_grouped,
-        params
-            .m_total_max
-            .checked_mul(params.down_m)
-            .ok_or_else(|| invalid("prefill grouped down capacity overflows"))?,
-        "prefill grouped down",
-    )?;
+    if params.route_policy.is_none() {
+        require_elements(
+            params.y_gate_up_grouped,
+            params
+                .m_total_max
+                .checked_mul(
+                    2usize
+                        .checked_mul(params.mi)
+                        .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
+                )
+                .ok_or_else(|| invalid("prefill grouped gate/up capacity overflows"))?,
+            "prefill grouped gate/up",
+        )?;
+        require_elements(
+            params.y_down_grouped,
+            params
+                .m_total_max
+                .checked_mul(params.down_m)
+                .ok_or_else(|| invalid("prefill grouped down capacity overflows"))?,
+            "prefill grouped down",
+        )?;
+    }
     if let Some(partial) = params.routed_out {
         require_elements(
             partial,
@@ -4139,8 +4164,7 @@ fn validate_live_binding(
             expected_down.matches(&down, "live down")?;
         }
     }
-    live.gate_up_ptrs
-        .matches(gate_up_ptrs, "gate/up pointer table")?;
+    live.gate_up_ptrs.matches(gate_up_ptrs, "gate/up pointer table")?;
     live.down_ptrs.matches(down_ptrs, "down pointer table")?;
     // Table *contents*, not just the table tensor: a replay dereferences these
     // entries without re-uploading them, so each entry must point at the live
@@ -4778,6 +4802,50 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn live_validation_accepts_the_bound_table_and_rejects_a_third_table() {
+        let table = table(2, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x88_0000);
+        let n = table.n_experts();
+        cache
+            .bind_live(
+                &table,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        // The real tables still validate...
+        validate_live_binding(
+            &bound,
+            Some(&fixture.routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // ...and any other table of identical shape/dtype but a different
+        // buffer is still rejected: the binding names exactly one table per
+        // projection.
+        let third = live_tensor(0xA8_0000, n * DEVICE_POINTER_BYTES, &[2 * n], DType::F32);
+        assert!(validate_live_binding(
+            &bound,
+            Some(&fixture.routed),
+            &third,
+            &fixture.down_ptrs,
+            None,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     fn table(n: usize, dtype: DType) -> ExpertTable {
@@ -5762,6 +5830,7 @@ mod tests {
             norm_topk_prob: false,
             x_rot_prerotated: true,
             defer_routed_combine: false,
+            cpu_deferred_experts: false,
             ep_mode,
             layer_idx,
             x_norm: dummy,
@@ -5803,6 +5872,7 @@ mod tests {
             topk_indices: dummy,
             topk_weights: dummy,
             down_expanded: dummy,
+            ep_row_gather: None,
         }
     }
 
@@ -5977,6 +6047,7 @@ mod tests {
             norm_topk_prob: false,
             x_rot_prerotated: true,
             defer_routed_combine: false,
+            cpu_deferred_experts: false,
             ep_mode,
             layer_idx,
             x_norm: &s.x_norm,
@@ -6006,6 +6077,7 @@ mod tests {
             topk_indices: &s.topk_indices,
             topk_weights: &s.topk_weights,
             down_expanded: &s.down_expanded,
+            ep_row_gather: None,
         }
     }
 
@@ -6507,6 +6579,7 @@ mod tests {
             n_exp: 4,
             m_total_max: s.m_total_max,
             force_mq4_grouped_fp16: false,
+            cpu_deferred_experts: false,
             topk_indices: &s.topk_indices,
             topk_weights: &s.topk_weights,
             x_batch: &s.x_batch,
@@ -6533,6 +6606,10 @@ mod tests {
             paro_down: None,
             down_awq_scale: None,
             routed_out: partial,
+            ep_row_gather: None,
+            shared_down_out: None,
+            ep_layer_idx: 0,
+            ep_tile_exchange: None,
         }
     }
 
@@ -6733,5 +6810,415 @@ mod tests {
             adopted_from: None,
         };
         assert!(validate_route_receipt_pair(&expected, &swapped_buffers).is_err());
+    }
+
+    // ---- EP row gather lowering (decode and few-row grouped prefill) ----
+
+    use crate::families::moe::{MoeRouteCapability, MoeRowGather};
+    use moe_program::{MoeStage, MoePrefillSelection, MoeDecodeSelection};
+
+    struct NoopGather;
+
+    impl MoeRowGather for NoopGather {
+        fn gather_rows(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _slots: usize,
+            _down_expanded: &GpuTensor,
+            _topk_indices: &GpuTensor,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A call assembled by hand around `selection`/`params` (nothing is
+    /// validated or launched; only the lowering reads it).
+    fn lowering_call<'a>(
+        ctx: &'a DispatchCtx,
+        experts: BoundMoeExperts<'a>,
+        selection: MoeKernelSelection,
+        params: SealedParams<'a>,
+    ) -> SealedMoeCall<'a> {
+        let protocol = match &params {
+            SealedParams::Decode(_) => MoeProtocol::IndexedDecode,
+            SealedParams::Prefill(_) => MoeProtocol::GroupedPrefill,
+        };
+        let basis = expected_basis(&experts, DType::MQ4G256).unwrap();
+        SealedMoeCall {
+            invocation: 0,
+            dispatch_ctx: ctx,
+            experts,
+            protocol,
+            router: MoeRouterInput::SoftmaxTopK,
+            contribution: MoeContribution::Residual,
+            shared: MoeSharedContribution::PerRankResidual,
+            activation: ActivationIdentity::new(ActivationInput::PreRotated, basis),
+            selection,
+            params,
+            route_receipt: None,
+        }
+    }
+
+    fn decode_selection(
+        ctx: &DispatchCtx,
+        params: &MoeParams<'_>,
+        route: Option<MoeRouteCapability>,
+    ) -> MoeKernelSelection {
+        let mut resolution =
+            crate::families::moe::MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
+        if route.is_some() {
+            resolution.use_gpu_topk = true;
+            resolution.needs_x_rot_local = true;
+        }
+        MoeKernelSelection::Decode(MoeDecodeSelection {
+            resolution,
+            router_shared_fuse: false,
+            exact_wave64_router: false,
+            wave64_router: false,
+            down_last_combine: false,
+            route,
+            ninepath_d3: false,
+            ninepath_d4: false,
+            ninepath_mq3l: false,
+            ninepath_mq4v2: false,
+            ninepath_mq6v2: false,
+            cpu_deferred_experts: false,
+        })
+    }
+
+    fn prefill_selection(
+        ctx: &DispatchCtx,
+        params: &MoePrefillParams<'_>,
+        route: Option<MoeRouteCapability>,
+    ) -> MoeKernelSelection {
+        MoeKernelSelection::Prefill(MoePrefillSelection {
+            resolution: crate::families::moe::MoePrefillResolution::resolve(
+                &params.dtypes,
+                &ctx.arch,
+                &ctx.flags,
+            ),
+            path2_m_total: 0,
+            force_mq4_grouped_fp16: false,
+            coalesced_verify: false,
+            route,
+            cpu_deferred_experts: false,
+        })
+    }
+
+    /// Stages the decode call lowers to with `gather` installed (or not) over
+    /// the QT44/QT53 grouped selection, or `route` otherwise.
+    fn decode_stages(
+        gather: Option<&dyn MoeRowGather>,
+        route: Option<MoeRouteCapability>,
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE4_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = decode_scratch(0xE5_0000);
+        let params = MoeParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ep_row_gather: gather,
+            ..ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                8,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        let selection = decode_selection(&ctx, &params, route);
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Decode(params));
+        moe_program::lowered_stages(&call)
+    }
+
+    /// Same for the grouped prefill (`routed_out` Some ⇒ a compact EP partial).
+    fn prefill_stages(
+        gather: Option<&dyn MoeRowGather>,
+        route: Option<MoeRouteCapability>,
+        partial: bool,
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE6_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0xE7_0000);
+        let params = MoePrefillParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ep_row_gather: gather,
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                partial.then_some(&scratch.partial),
+            )
+        };
+        let selection = prefill_selection(&ctx, &params, route);
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+        moe_program::lowered_stages(&call)
+    }
+
+    /// `with` is `without` plus exactly one `RowGather`, right after the
+    /// mutation fence and right before the combine.
+    fn assert_gather_between_fence_and_combine(with: &[MoeStage], without: &[MoeStage]) {
+        assert!(
+            !without.contains(&MoeStage::RowGather),
+            "no gather installed, no RowGather stage: {without:?}"
+        );
+        let fence = with
+            .iter()
+            .position(|stage| *stage == MoeStage::MutationFence)
+            .expect("fence");
+        assert_eq!(with[fence + 1], MoeStage::RowGather, "{with:?}");
+        assert_eq!(with[fence + 2], MoeStage::Combine, "{with:?}");
+        let mut stripped = with.to_vec();
+        stripped.remove(fence + 1);
+        assert_eq!(stripped, without, "only the gather stage differs");
+    }
+
+    #[test]
+    fn decode_lowering_emits_row_gather_exactly_when_installed() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let without = decode_stages(None, grouped).unwrap();
+        let with = decode_stages(Some(&NoopGather), grouped).unwrap();
+        assert_gather_between_fence_and_combine(&with, &without);
+    }
+
+    #[test]
+    fn decode_lowering_refuses_a_gather_off_the_grouped_route() {
+        let error = decode_stages(Some(&NoopGather), None).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    #[test]
+    fn prefill_lowering_emits_row_gather_exactly_when_installed() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let without = prefill_stages(None, grouped, false).unwrap();
+        let with = prefill_stages(Some(&NoopGather), grouped, false).unwrap();
+        assert_gather_between_fence_and_combine(&with, &without);
+        // The symmetric declaration lowers through the same stages.
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let with_symmetric = prefill_stages(Some(&NoopGather), symmetric, false).unwrap();
+        assert_eq!(with_symmetric, with);
+    }
+
+    #[test]
+    fn prefill_lowering_refuses_a_gather_off_the_grouped_route_or_into_a_partial() {
+        // Generic grouped prefill without a gather still lowers (unchanged).
+        let generic = prefill_stages(None, None, false).unwrap();
+        assert!(!generic.contains(&MoeStage::RowGather));
+        let error = prefill_stages(Some(&NoopGather), None, false).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+        // A compact EP partial is a different EP contract.
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let error = prefill_stages(Some(&NoopGather), grouped, true).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    /// A gather that opts the layer into device-assigned ownership.
+    struct OwnerGather;
+
+    impl MoeRowGather for OwnerGather {
+        fn gather_rows(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _slots: usize,
+            _down_expanded: &GpuTensor,
+            _topk_indices: &GpuTensor,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn assigns_owners(&self, _layer_idx: u16) -> bool {
+            true
+        }
+    }
+
+    /// `with` is `without` plus exactly one `OwnerAssign`, placed right after
+    /// the route stage and before every routed-table reader.
+    fn assert_owner_assign_after_route(with: &[MoeStage], without: &[MoeStage]) {
+        assert!(
+            !without.contains(&MoeStage::OwnerAssign),
+            "static ownership lowers no OwnerAssign stage: {without:?}"
+        );
+        assert_eq!(
+            with.iter().filter(|stage| **stage == MoeStage::OwnerAssign).count(),
+            1,
+            "{with:?}"
+        );
+        let route = with
+            .iter()
+            .position(|stage| *stage == MoeStage::Route)
+            .expect("route");
+        assert_eq!(with[route + 1], MoeStage::OwnerAssign, "{with:?}");
+        let assign = route + 1;
+        for reader in [MoeStage::Scatter, MoeStage::GateUp, MoeStage::Down] {
+            if let Some(position) = with.iter().position(|stage| *stage == reader) {
+                assert!(assign < position, "{reader:?} reads the live tables: {with:?}");
+            }
+        }
+        let mut stripped = with.to_vec();
+        stripped.remove(assign);
+        assert_eq!(stripped, without, "only the owner stage differs");
+    }
+
+    #[test]
+    fn decode_lowering_emits_owner_assign_exactly_when_the_gather_asks() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let historical = decode_stages(Some(&NoopGather), grouped).unwrap();
+        let without_gather = decode_stages(None, grouped).unwrap();
+        assert!(!historical.contains(&MoeStage::OwnerAssign));
+        assert!(!without_gather.contains(&MoeStage::OwnerAssign));
+        let balanced = decode_stages(Some(&OwnerGather), grouped).unwrap();
+        assert_owner_assign_after_route(&balanced, &historical);
+    }
+
+    #[test]
+    fn prefill_lowering_emits_owner_assign_exactly_when_the_gather_asks() {
+        let grouped = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let historical = prefill_stages(Some(&NoopGather), grouped, false).unwrap();
+        let without_gather = prefill_stages(None, grouped, false).unwrap();
+        assert!(!historical.contains(&MoeStage::OwnerAssign));
+        assert!(!without_gather.contains(&MoeStage::OwnerAssign));
+        let balanced = prefill_stages(Some(&OwnerGather), grouped, false).unwrap();
+        assert_owner_assign_after_route(&balanced, &historical);
+        // The symmetric declaration lowers through the same stages.
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let balanced_symmetric = prefill_stages(Some(&OwnerGather), symmetric, false).unwrap();
+        assert_eq!(balanced_symmetric, balanced);
+    }
+
+    #[test]
+    fn owner_gather_off_the_grouped_route_still_refuses() {
+        let error = decode_stages(Some(&OwnerGather), None).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+        let error = prefill_stages(Some(&OwnerGather), None, false).unwrap_err();
+        assert!(format!("{error:?}").contains("row gather"), "{error:?}");
+    }
+
+    /// A tile exchange that never runs (lowering tests only).
+    struct NoopTileExchange;
+
+    impl crate::families::moe::MoeTileExchange for NoopTileExchange {
+        fn owners(&self) -> (usize, &GpuTensor, usize) {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn host_barrier(&self) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
+        fn exchange(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _tile_ids: &GpuTensor,
+            _y_down_grouped: &GpuTensor,
+            _tiles: usize,
+        ) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+    }
+
+    /// The grouped prefill lowering with an owner-routed tile exchange installed (or not).
+    fn tile_prefill_stages(
+        exchange: Option<&dyn crate::families::moe::MoeTileExchange>,
+        gather: Option<&dyn MoeRowGather>,
+        route: Option<MoeRouteCapability>,
+        partial: bool,
+    ) -> Result<Vec<MoeStage>, DispatchError> {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+        let scratch = prefill_scratch(0xE9_0000);
+        let params = MoePrefillParams {
+            recipe: MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true,
+            },
+            ep_row_gather: gather,
+            // Lowering never reads the masked ids; any tensor stands in for them.
+            ep_tile_exchange: exchange.map(|exchange| crate::families::moe::MoeTileExchangeParams {
+                exchange,
+                tile_ids_owned: &scratch.partial,
+            }),
+            ..ep_prefill_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                partial.then_some(&scratch.partial),
+            )
+        };
+        let selection = prefill_selection(&ctx, &params, route);
+        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+        moe_program::lowered_stages(&call)
+    }
+
+    /// `with` is `without` plus exactly one `TileMask` right after the scatter and one
+    /// `TileExchange` between the mutation fence and the combine.
+    fn assert_tile_stages(with: &[MoeStage], without: &[MoeStage]) {
+        for stage in [MoeStage::TileMask, MoeStage::TileExchange] {
+            assert!(!without.contains(&stage), "no exchange installed, no {stage:?}: {without:?}");
+            assert_eq!(with.iter().filter(|s| **s == stage).count(), 1, "{with:?}");
+        }
+        let scatter = with.iter().position(|s| *s == MoeStage::Scatter).expect("scatter");
+        assert_eq!(with[scatter + 1], MoeStage::TileMask, "{with:?}");
+        assert_eq!(with[scatter + 2], MoeStage::GateUp, "{with:?}");
+        let fence = with.iter().position(|s| *s == MoeStage::MutationFence).expect("fence");
+        assert_eq!(with[fence + 1], MoeStage::TileExchange, "{with:?}");
+        assert_eq!(with[fence + 2], MoeStage::Combine, "{with:?}");
+        let mut stripped = with.to_vec();
+        stripped.retain(|s| !matches!(s, MoeStage::TileMask | MoeStage::TileExchange));
+        assert_eq!(stripped, without, "only the two tile stages differ");
+    }
+
+    #[test]
+    fn prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_symmetric_route() {
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let without = tile_prefill_stages(None, None, symmetric, false).unwrap();
+        let with = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, false).unwrap();
+        assert_tile_stages(&with, &without);
+        // The unmasked symmetric lowering is the historical one.
+        assert_eq!(without, prefill_stages(None, symmetric, false).unwrap());
+    }
+
+    #[test]
+    fn prefill_lowering_refuses_a_tile_exchange_off_the_symmetric_route() {
+        for route in [None, Some(MoeRouteCapability::Qt44Qt53Grouped)] {
+            let error = tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
+            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+        }
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        // A compact EP partial and the few-row row gather are other EP contracts.
+        let error = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, true).unwrap_err();
+        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+        let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
+        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
     }
 }

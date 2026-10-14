@@ -5,8 +5,8 @@
 # Regenerate the portable ELF embedded by npu-tools; no vendor assembler/compiler.
 # Build peacemaker from the approved PM tree, with its lockfile and a separate target:
 # CARGO_TARGET_DIR=/path/out cargo build --locked --manifest-path /path/PM/Cargo.toml \
-#   -p hipfire-isa --features toolchain --bin peacemaker
-# PM reference used for this artifact: beta5b4664e3b, hipfire_isa::native::assemble.
+#   -p peacemaker-isa --features toolchain --bin peacemaker
+# PM reference used for this artifact: beta5b4664e3b, peacemaker_isa::native::assemble.
 # PEACEMAKER=/path/out/debug/peacemaker bash crates/npu-tools/native/build-gpu-bw.sh
 set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

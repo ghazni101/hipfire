@@ -14,6 +14,7 @@
 
 use crate::config::LayerType;
 use crate::ops::{hc_read, hc_write, ple_gate, rope_prefix_halfsplit, sigmoid, silu};
+use rdna_compute::rope::Rope;
 use std::fmt;
 
 const EPS: f32 = 1.0e-6;
@@ -47,7 +48,7 @@ impl std::error::Error for ForwardError {}
 /// Geometry for a compact typed forward probe.  The production pinned values
 /// are accepted, while small values make deterministic CPU/GPU fixture probes
 /// cheap and keep the operation ordering visible.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompactForwardConfig {
     pub hidden: usize,
     pub hc_count: usize,
@@ -71,6 +72,8 @@ pub struct CompactForwardConfig {
     pub shared_intermediate: usize,
     pub ple_layer: Option<usize>,
     pub ple_kernel: usize,
+    /// QSA rotary embedding (Flash-Next: theta 1e7, plus any YaRN scaling).
+    pub rope: Rope,
 }
 
 impl CompactForwardConfig {
@@ -691,7 +694,7 @@ impl ReferenceQwen4Forward {
                 &mut index_query[start..start + self.config.index_dim],
                 state.position,
                 self.config.index_dim.min(64),
-                10_000_000.0,
+                self.config.rope,
             )
             .map_err(|_| ForwardError::Shape("QSA index query RoPE"))?;
         }
@@ -732,7 +735,7 @@ impl ReferenceQwen4Forward {
                 &mut query[start..start + self.config.head_dim],
                 state.position,
                 64,
-                10_000_000.0,
+                self.config.rope,
             )
             .map_err(|_| ForwardError::Shape("QSA query RoPE"))?;
         }
@@ -744,7 +747,7 @@ impl ReferenceQwen4Forward {
                 &mut key[start..start + self.config.head_dim],
                 state.position,
                 64,
-                10_000_000.0,
+                self.config.rope,
             )
             .map_err(|_| ForwardError::Shape("QSA key RoPE"))?;
         }
@@ -762,6 +765,7 @@ impl ReferenceQwen4Forward {
                 self.config.qsa_compress,
                 block * self.config.qsa_compress,
                 self.config.index_dim,
+                self.config.rope,
             ));
             positions.push(block * self.config.qsa_compress);
         }
@@ -939,7 +943,7 @@ fn softplus(value: f32) -> f32 {
     }
 }
 
-fn pool_index_block(keys: &[f32], block: usize, start: usize, dim: usize) -> Vec<f32> {
+fn pool_index_block(keys: &[f32], block: usize, start: usize, dim: usize, rope: Rope) -> Vec<f32> {
     let mut pooled = vec![0.0f32; dim];
     for row in keys.chunks_exact(dim) {
         for (dst, &value) in pooled.iter_mut().zip(row) {
@@ -952,7 +956,7 @@ fn pool_index_block(keys: &[f32], block: usize, start: usize, dim: usize) -> Vec
     for value in &mut pooled {
         *value *= inv;
     }
-    let _ = rope_prefix_halfsplit(&mut pooled, start, dim.min(64), 10_000_000.0);
+    let _ = rope_prefix_halfsplit(&mut pooled, start, dim.min(64), rope);
     pooled
 }
 
@@ -1018,6 +1022,10 @@ mod tests {
             shared_intermediate: 3,
             ple_layer: None,
             ple_kernel: 4,
+            rope: Rope {
+                theta: 10_000_000.0,
+                scaling: rdna_compute::rope::RopeScaling::None,
+            },
         }
     }
 

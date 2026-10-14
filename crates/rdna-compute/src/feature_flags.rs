@@ -283,9 +283,17 @@ pub struct FeatureFlags {
     /// exact-gfx1100-only. Capture/replay keep the historical base. Set
     /// `HIPFIRE_GATEUP_LDSSTAGE=0` to restore the historical base symbol/block32.
     pub gate_up_ldsstage: bool,
+    /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 WMMA
+    /// GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per block, X slab staged in
+    /// LDS) for gate_up/qkvza/qkv/residual. Default on for exact gfx1151, false
+    /// elsewhere; outputs are byte-identical to the base kernels.
+    /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
+    pub gfx1151_xlds: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
     /// to the generic kernel; `HIPFIRE_MQ4V2_GATEUP_K5120=0` opts out).
     pub mq4v2_gateup_k5120: bool,
+    /// Default-off exact gfx1201 K5120 MQ4V2 gate/up decode twin.
+    pub gfx12_mq4v2_gateup_k5120: bool,
     /// `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP=0` opts out of the gfx1201 FP8-WMMA MQ4v2
     /// gate_up prefill candidate (N=384, eager HIP only). Default ON on exact
     /// gfx1201; `=1` forces it on other arches (launchers stay gfx1201-only).
@@ -436,6 +444,12 @@ pub struct FeatureFlags {
     /// and `attention_q8_0_flash_prefill_wmma`. Byte-identical output; any
     /// byte difference kills it.
     pub verify_attn: bool,
+    /// Exact-gfx1100 FA2 split-KV implementation of VerifyAttn
+    /// (`HIPFIRE_GFX1100_FA2_SPLIT_VERIFY`,
+    /// `kernel.gfx1100_fa2_split_verify`). Default OFF on every arch; an
+    /// explicit opt-in takes effect only on exact gfx1100 with VMM KV, and
+    /// the stable [`Self::verify_attn`] switch remains the parent opt-out.
+    pub gfx1100_fa2_split_verify: bool,
     /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
     /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
     pub gfx12_fa_prep_fused: bool,
@@ -590,6 +604,19 @@ pub struct FeatureFlags {
     /// vetoes the gfx1201 DFlash draft overwrite-GEMM route
     /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`), restoring memset + residual.
     pub draft_collapse_off: bool,
+    /// DFlash draft shared MQ4V2 input rotation (#838), one switch per
+    /// projection group: noise Q/K/V (`HIPFIRE_DRAFT_SHARED_QKV_ROTATION`,
+    /// `kernel.draft_shared_qkv_rotation`), FFN gate/up
+    /// (`HIPFIRE_DRAFT_SHARED_FFN_ROTATION`, `kernel.draft_shared_ffn_rotation`)
+    /// and incremental context K/V (`HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION`,
+    /// `kernel.draft_shared_ctx_kv_rotation`). Default ON on exact gfx1100,
+    /// off elsewhere; `=0` restores one rotation per projection. The runtime
+    /// admission (hipfire-runtime `dflash.rs` `gemm_dispatch_shared`) also
+    /// requires exact gfx1100, so the switch is ignored on every other arch.
+    /// Same rotation bytes, same GEMMs; bit-identical outputs.
+    pub draft_shared_qkv_rotation: bool,
+    pub draft_shared_ffn_rotation: bool,
+    pub draft_shared_ctx_kv_rotation: bool,
     /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
     pub ddtree_topk_direct_off: bool,
     /// S9: `HIPFIRE_MQ_PROLOGUE_FUSE_OFF=1` restores producer+GEMM pairs.
@@ -913,7 +940,9 @@ impl FeatureFlags {
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
             mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(true),
+            gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120").unwrap_or(false),
             gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")
@@ -955,6 +984,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
+            gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
+                .unwrap_or(false),
             gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
@@ -1057,6 +1088,12 @@ impl FeatureFlags {
             gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
             fa_batch_fuse_off: value("HIPFIRE_FA_BATCH_FUSE_OFF").ok().as_deref() == Some("1"),
             draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
+            draft_shared_qkv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_QKV_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
+            draft_shared_ffn_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_FFN_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
+            draft_shared_ctx_kv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION")
+                .unwrap_or(arch == "gfx1100"),
             ddtree_topk_direct_off: value("HIPFIRE_DDTREE_TOPK_DIRECT_OFF").ok().as_deref()
                 == Some("1"),
             mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
@@ -1227,8 +1264,8 @@ impl FeatureFlags {
         self.g12_dec_norm_enabled() || self.gfx1100_dec_norm_enabled()
     }
     pub fn mq4v2_gateup_k5120_enabled(&self, gate_m: usize, up_m: usize, k: usize) -> bool {
-        self.mq4v2_gateup_k5120
-            && self.arch == "gfx1100"
+        ((self.arch == "gfx1100" && self.mq4v2_gateup_k5120)
+            || (self.arch == "gfx1201" && self.gfx12_mq4v2_gateup_k5120))
             && (gate_m, up_m, k) == (17408, 17408, 5120)
     }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
@@ -1412,7 +1449,9 @@ impl FeatureFlags {
             gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
+            gfx1151_xlds: false,
             mq4v2_gateup_k5120: false,
+            gfx12_mq4v2_gateup_k5120: false,
             gfx12_mq4v2_fp8_gateup: false,
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
@@ -1428,6 +1467,7 @@ impl FeatureFlags {
             attn_qresident: false,
             attn_qresident_v2: false,
             verify_attn: false,
+            gfx1100_fa2_split_verify: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
             gfx11_q8_fa2_wide: false,
@@ -1474,6 +1514,9 @@ impl FeatureFlags {
             gdn_pre_fuse_off: false,
             fa_batch_fuse_off: false,
             draft_collapse_off: false,
+            draft_shared_qkv_rotation: false,
+            draft_shared_ffn_rotation: false,
+            draft_shared_ctx_kv_rotation: false,
             ddtree_topk_direct_off: false,
             mq_prologue_fuse_off: false,
             gdn_replay_ml_off: false,
@@ -1489,6 +1532,33 @@ impl FeatureFlags {
 mod tests {
     use super::*;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn gfx12_mq4v2_gateup_k5120_opt_in_roundtrip_and_shape() {
+        let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1201", &defaults)
+            .mq4v2_gateup_k5120_enabled(17408, 17408, 5120));
+        for key in ["kernel.gfx12_mq4v2_gateup_k5120", "gfx12_mq4v2_gateup_k5120"] {
+            for (value, enabled) in [("true", true), ("false", false)] {
+                let mut layer = ConfigLayer::default();
+                layer.set_cli(key, value).unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    layer,
+                }]).unwrap();
+                let config = ProcessConfig::from_resolved(&resolved).unwrap();
+                let config: ProcessConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+                assert_eq!(config.legacy_value("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120"), Some(if enabled { "1" } else { "0" }.to_string()));
+                for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx906"] {
+                    let flags = FeatureFlags::from_process_config(arch, &config);
+                    assert_eq!(flags.mq4v2_gateup_k5120_enabled(17408, 17408, 5120), arch == "gfx1100" || (arch == "gfx1201" && enabled));
+                    for shape in [(17408, 17408, 2816), (17407, 17408, 5120), (17408, 17407, 5120)] {
+                        assert!(!flags.mq4v2_gateup_k5120_enabled(shape.0, shape.1, shape.2));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn dn_snapshot_flip_defaults_on_and_zero_opts_out() {
@@ -1958,6 +2028,61 @@ mod tests {
             assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
         }
     }
+
+    #[test]
+    fn gfx1100_split_verify_is_default_off_and_opt_in() {
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(gfx1100.verify_attn);
+        assert!(!gfx1100.gfx1100_fa2_split_verify);
+        for arch in ["gfx1101", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            assert!(
+                !FeatureFlags::from_process_config(arch, &process).gfx1100_fa2_split_verify,
+                "arch={arch}"
+            );
+        }
+
+        let mut split_on = ConfigLayer::default();
+        split_on
+            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: split_on,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(flags.verify_attn);
+        assert!(flags.gfx1100_fa2_split_verify);
+
+        // The parent switch stays independent: the dispatch predicate
+        // requires both, so `kernel.verify_attn=false` still opts out.
+        let mut parent_off = ConfigLayer::default();
+        parent_off.set_cli("kernel.verify_attn", "false").unwrap();
+        parent_off
+            .set_cli("kernel.gfx1100_fa2_split_verify", "true")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer: parent_off,
+        }])
+        .unwrap();
+        let flags = FeatureFlags::from_process_config(
+            "gfx1100",
+            &ProcessConfig::from_resolved(&resolved).unwrap(),
+        );
+        assert!(!flags.verify_attn);
+        assert!(flags.gfx1100_fa2_split_verify);
+    }
+
     #[test]
     fn gfx12_silu_quant_fused_default_on_gfx1201_with_opt_out() {
         // Default process policy: the exact-gfx1201 silu+quant fusion admits
@@ -2201,6 +2326,107 @@ mod tests {
         assert!(!f.gemma4_ple_branch_batched_prefill);
         assert!(!f.gemma4_ple_activation_fused_prefill);
         assert!(f.flash_attn_ck_lib.is_none());
+    }
+
+    #[test]
+    fn draft_shared_rotations_default_on_exact_gfx1100_with_independent_opt_out() {
+        let keys = [
+            ("kernel.draft_shared_qkv_rotation", "HIPFIRE_DRAFT_SHARED_QKV_ROTATION"),
+            ("kernel.draft_shared_ffn_rotation", "HIPFIRE_DRAFT_SHARED_FFN_ROTATION"),
+            ("kernel.draft_shared_ctx_kv_rotation", "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION"),
+        ];
+        let arches = ["gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"];
+        let triple = |f: &FeatureFlags| {
+            [f.draft_shared_qkv_rotation, f.draft_shared_ffn_rotation, f.draft_shared_ctx_kv_rotation]
+        };
+
+        // Built-in true values must stay absent across the CLI-to-daemon
+        // handoff, so each architecture still selects its own fallback.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let wire = serde_json::to_string(&process).unwrap();
+        let decoded: ProcessConfig = serde_json::from_str(&wire).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, process);
+        for (key, env) in keys {
+            assert_eq!(resolved.get(key).unwrap().value, hipfire_config::ConfigValue::Bool(true));
+            assert!(process.values.get(key).is_none(), "{key}");
+            assert!(decoded.values.get(key).is_none(), "{key}");
+            assert_eq!(decoded.legacy_value(env), None, "{env}");
+            assert!(!wire.contains(key), "{key} must not be serialized");
+        }
+        for arch in arches {
+            let expected = [arch == "gfx1100"; 3];
+            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &process)), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::from_process_config(arch, &decoded)), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::from_lookup(arch, |_| Err(()))), expected, "{arch}");
+            assert_eq!(triple(&FeatureFlags::for_test(arch)), [false; 3], "{arch}: test baseline");
+        }
+
+        // Each switch independently carries both explicit true and false,
+        // including true equal to the schema default (which must not vanish).
+        for (i, (key, env)) in keys.iter().enumerate() {
+            let schema = hipfire_config::field(key).unwrap();
+            assert_eq!(schema.env_compat, Some(*env));
+            for (enabled, spellings) in [
+                (false, ["0", "false", "off", "no", "FALSE", "Off", "NO"]),
+                (true, ["1", "true", "on", "yes", "TRUE", "On", "YES"]),
+            ] {
+                // TOML booleans lower to typed ConfigValue::Bool before set;
+                // use that pure API rather than a file or ambient environment.
+                let mut toml = ConfigLayer::default();
+                toml.set(key, hipfire_config::ConfigValue::Bool(enabled)).unwrap();
+                let toml_process = ProcessConfig::from_resolved(&resolve([NamedLayer {
+                    source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                    layer: toml,
+                }]).unwrap()).unwrap();
+
+                for raw in spellings {
+                    let mut cli = ConfigLayer::default();
+                    cli.set_cli(key, raw).unwrap();
+                    let mut legacy_cli = ConfigLayer::default();
+                    legacy_cli.set_cli(schema.legacy_key, raw).unwrap();
+                    let mut environment = ConfigLayer::default();
+                    // load_env_layer uses this same schema parser for these
+                    // stable aliases; no process-global env mutation needed.
+                    environment.set(key, schema.parse_cli(raw).unwrap()).unwrap();
+                    for (source, layer) in [
+                        (ConfigSource::OneShot { argument: format!("{key}={raw}") }, cli),
+                        (ConfigSource::OneShot { argument: format!("{}={raw}", schema.legacy_key) }, legacy_cli),
+                        (ConfigSource::LegacyEnv { name: (*env).into() }, environment),
+                    ] {
+                        let resolved = resolve([NamedLayer { source, layer }]).unwrap();
+                        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                        assert_eq!(process, toml_process, "{key}={raw}");
+                        let wire = serde_json::to_string(&process).unwrap();
+                        let decoded: ProcessConfig = serde_json::from_str(&wire).unwrap();
+                        decoded.validate().unwrap();
+                        assert_eq!(decoded, process, "{key}={raw}");
+                        let normalized = if enabled { "1" } else { "0" };
+                        assert_eq!(decoded.legacy_value(env).as_deref(), Some(normalized), "{key}={raw}");
+                        for (j, (other_key, other_env)) in keys.iter().enumerate() {
+                            if j != i {
+                                assert!(decoded.values.get(other_key).is_none(), "{key} changed {other_key}");
+                                assert_eq!(decoded.legacy_value(other_env), None, "{key} changed {other_env}");
+                            }
+                        }
+                        for arch in arches {
+                            let mut expected = [arch == "gfx1100"; 3];
+                            expected[i] = enabled;
+                            assert_eq!(
+                                triple(&FeatureFlags::from_process_config(arch, &decoded)),
+                                expected,
+                                "{arch}: {key}={raw}"
+                            );
+                            let from_env = FeatureFlags::from_lookup(arch, |name| {
+                                if name == *env { Ok(normalized.into()) } else { Err(()) }
+                            });
+                            assert_eq!(triple(&from_env), expected, "{arch}: {env}={normalized}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

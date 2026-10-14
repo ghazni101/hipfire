@@ -253,6 +253,238 @@ pub fn tied_lm_head_alias(
     }
 }
 
+/// Requantize a Q8_0 `[m, k]` weight tensor to HFQ4G256 on the host, streaming
+/// one row at a time to bound host memory (a 248320x2560 lm_head never holds
+/// more than one row of f32).
+///
+/// Dev lever (`HIPFIRE_LM_HEAD_HFQ4=1`) for tied-embedding models whose q8
+/// output GEMV dominates decode bandwidth: the HFQ4G256 buffer is ~53% of the
+/// q8 bytes, so `gemv_hfq4g256` replaces `gemv_q8_0` for the logits matmul.
+/// The embedding table keeps the original buffer — only the output projection
+/// switches. Group math matches hipfire-quantize's `quantize_hfq4g256`
+/// (f32 scale = range/15, f32 min, 128 packed nibble bytes per 256-group) and
+/// gguf_input's `dequant_q8_0` (34 B blocks: f16 scale + 32 i8).
+pub fn requantize_weight_q8_0_to_hfq4g256(
+    gpu: &Gpu,
+    src: &WeightTensor,
+) -> HipResult<WeightTensor> {
+    let m = src.m;
+    let k = src.k;
+    assert!(src.gpu_dtype == DType::Q8_0, "source must be Q8_0");
+    assert!(k % 256 == 0, "k must be a multiple of 256");
+    let q8_row_bytes = (k / 32) * 34;
+    let mut raw = vec![0u8; m * q8_row_bytes];
+    gpu.hip.memcpy_dtoh(&mut raw, &src.buf.buf)?;
+
+    let groups_per_row = k / 256;
+    let out_row_bytes = groups_per_row * 136;
+    let mut out = vec![0u8; m * out_row_bytes];
+
+    let inv15 = 1.0f32 / 15.0;
+    let mut row_f32 = vec![0.0f32; k];
+    for row in 0..m {
+        let row_in = &raw[row * q8_row_bytes..(row + 1) * q8_row_bytes];
+        for b in 0..(k / 32) {
+            let off = b * 34;
+            let scale =
+                crate::llama::f16_to_f32(u16::from_le_bytes([row_in[off], row_in[off + 1]]));
+            for j in 0..32 {
+                row_f32[b * 32 + j] = row_in[off + 2 + j] as i8 as f32 * scale;
+            }
+        }
+        for g in 0..groups_per_row {
+            let group = &row_f32[g * 256..(g + 1) * 256];
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            for &v in group {
+                min_val = min_val.min(v);
+                max_val = max_val.max(v);
+            }
+            let range = max_val - min_val;
+            let scale = if range > 0.0 { range * inv15 } else { 1.0 };
+            let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let o = row * out_row_bytes + g * 136;
+            out[o..o + 4].copy_from_slice(&scale.to_le_bytes());
+            out[o + 4..o + 8].copy_from_slice(&min_val.to_le_bytes());
+            for i in 0..128 {
+                let lo = ((group[2 * i] - min_val) * inv_scale + 0.5) as u8;
+                let hi = ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8;
+                out[o + 8 + i] = lo.min(15) | (hi.min(15) << 4);
+            }
+        }
+    }
+
+    let buf = gpu.upload_raw(&out, &[out.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::HFQ4G256,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
+}
+
+/// Requantize a Q8_0 `[m, k]` weight tensor to HFQ3G256 on the host, streaming
+/// one row at a time (`HIPFIRE_LM_HEAD_HFQ3=1`). Same contract as
+/// [`requantize_weight_q8_0_to_hfq4g256`] with the 3-bit codec from
+/// hipfire-quantize's `quantize_hfq3g256` (f32 scale = range/7, f32 min,
+/// 96 packed bytes per 256-group, little-endian bitstream).
+pub fn requantize_weight_q8_0_to_hfq3g256(
+    gpu: &Gpu,
+    src: &WeightTensor,
+) -> HipResult<WeightTensor> {
+    let m = src.m;
+    let k = src.k;
+    assert!(src.gpu_dtype == DType::Q8_0, "source must be Q8_0");
+    assert!(k % 256 == 0, "k must be a multiple of 256");
+    let q8_row_bytes = (k / 32) * 34;
+    let mut raw = vec![0u8; m * q8_row_bytes];
+    gpu.hip.memcpy_dtoh(&mut raw, &src.buf.buf)?;
+
+    let groups_per_row = k / 256;
+    let out_row_bytes = groups_per_row * 104;
+    let mut out = vec![0u8; m * out_row_bytes];
+
+    let inv7 = 1.0f32 / 7.0;
+    let mut row_f32 = vec![0.0f32; k];
+    for row in 0..m {
+        let row_in = &raw[row * q8_row_bytes..(row + 1) * q8_row_bytes];
+        for b in 0..(k / 32) {
+            let off = b * 34;
+            let scale =
+                crate::llama::f16_to_f32(u16::from_le_bytes([row_in[off], row_in[off + 1]]));
+            for j in 0..32 {
+                row_f32[b * 32 + j] = row_in[off + 2 + j] as i8 as f32 * scale;
+            }
+        }
+        for g in 0..groups_per_row {
+            let group = &row_f32[g * 256..(g + 1) * 256];
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            for &v in group {
+                min_val = min_val.min(v);
+                max_val = max_val.max(v);
+            }
+            let range = max_val - min_val;
+            let scale = if range > 0.0 { range * inv7 } else { 1.0 };
+            let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let o = row * out_row_bytes + g * 104;
+            out[o..o + 4].copy_from_slice(&scale.to_le_bytes());
+            out[o + 4..o + 8].copy_from_slice(&min_val.to_le_bytes());
+            for chunk in 0..32 {
+                let ci = chunk * 8;
+                let mut q = [0u8; 8];
+                for j in 0..8 {
+                    let val = group[ci + j];
+                    q[j] = (((val - min_val) * inv_scale + 0.5) as u8).clamp(0, 7);
+                }
+                let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+                let b1 =
+                    ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+                let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+                let bo = o + 8 + chunk * 3;
+                out[bo] = b0;
+                out[bo + 1] = b1;
+                out[bo + 2] = b2;
+            }
+        }
+    }
+
+    let buf = gpu.upload_raw(&out, &[out.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::HFQ3G256,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
+}
+
+/// Requantize a Q8_0 `[m, k]` weight tensor to HFQ2G256 on the host
+/// (`HIPFIRE_LM_HEAD_HFQ2=1`). Same contract as the HFQ4/HFQ3 variants;
+/// 2-bit codec matches hipfire-quantize's `quantize_hfq2g256` (f32 scale =
+/// range/3, f32 min, 64 packed bytes per 256-group). QUALITY WARNING: 4
+/// levels per 256-group on a 248k vocab head - ship only if quality checks
+/// pass.
+pub fn requantize_weight_q8_0_to_hfq2g256(
+    gpu: &Gpu,
+    src: &WeightTensor,
+) -> HipResult<WeightTensor> {
+    let m = src.m;
+    let k = src.k;
+    assert!(src.gpu_dtype == DType::Q8_0, "source must be Q8_0");
+    assert!(k % 256 == 0, "k must be a multiple of 256");
+    let q8_row_bytes = (k / 32) * 34;
+    let mut raw = vec![0u8; m * q8_row_bytes];
+    gpu.hip.memcpy_dtoh(&mut raw, &src.buf.buf)?;
+
+    let groups_per_row = k / 256;
+    let out_row_bytes = groups_per_row * 72;
+    let mut out = vec![0u8; m * out_row_bytes];
+
+    let inv3 = 1.0f32 / 3.0;
+    let mut row_f32 = vec![0.0f32; k];
+    for row in 0..m {
+        let row_in = &raw[row * q8_row_bytes..(row + 1) * q8_row_bytes];
+        for b in 0..(k / 32) {
+            let off = b * 34;
+            let scale =
+                crate::llama::f16_to_f32(u16::from_le_bytes([row_in[off], row_in[off + 1]]));
+            for j in 0..32 {
+                row_f32[b * 32 + j] = row_in[off + 2 + j] as i8 as f32 * scale;
+            }
+        }
+        for g in 0..groups_per_row {
+            let group = &row_f32[g * 256..(g + 1) * 256];
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            for &v in group {
+                min_val = min_val.min(v);
+                max_val = max_val.max(v);
+            }
+            let range = max_val - min_val;
+            let scale = if range > 0.0 { range * inv3 } else { 1.0 };
+            let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let o = row * out_row_bytes + g * 72;
+            out[o..o + 4].copy_from_slice(&scale.to_le_bytes());
+            out[o + 4..o + 8].copy_from_slice(&min_val.to_le_bytes());
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 {
+                    let val = group[4 * i + j];
+                    let q = (((val - min_val) * inv_scale + 0.5) as u8).clamp(0, 3);
+                    byte_val |= q << (j * 2);
+                }
+                out[o + 8 + i] = byte_val;
+            }
+        }
+    }
+
+    let buf = gpu.upload_raw(&out, &[out.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::HFQ2G256,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
+}
+
 /// Resolve the output / lm_head weight, returning `(output, aliases_embd)`.
 /// `aliases_embd == true` iff `output.buf` is a view of the embedding buffer
 /// and must NOT be freed by the owning struct.
@@ -502,16 +734,17 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
 }
 
 /// Decode a passthrough quant format: enforce the K%256 guard (via DType),
-/// upload bytes verbatim, build the `WeightTensor` with the dtype + its
-/// DType-derived row_stride. `name` is the caller context for the guard panic.
-/// AWQ sidecars are attached by the caller (hfq), never here.
+/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
+/// its DType-derived row_stride. `name` is the caller context for the guard
+/// error. AWQ sidecars are attached by the caller (hfq), never here.
 pub(crate) fn decode_raw_codec(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     codec: &RawCodec,
     data: &[u8],
     m: usize,
     k: usize,
     name: &str,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     // Low-bit layout validation — centralized before any upload/host-dequant.
     // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
@@ -650,7 +883,12 @@ pub(crate) fn decode_raw_codec(
             ));
         }
     }
-    let buf = gpu.upload_raw(data, &[data.len()])?;
+    let buf = match target {
+        MemoryTarget::Device => gpu.upload_raw(data, &[data.len()])?,
+        // Zero-copy CPU copy into the registered host pointer; the pad past the
+        // logical bytes is zeroed so a tail overread reads deterministic zeros.
+        MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(data, &[data.len()])?,
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: codec.dtype,
@@ -739,21 +977,43 @@ fn validate_lowbit_layout(
     Ok(())
 }
 
-/// Quant `data` → device `WeightTensor [m, k]`. Moved from
+/// Upload bytes a host-decode arm produced (f16→f32, bf16→f32, or a raw F32
+/// payload) under `target`. No host-mapped upload exists for the widened form,
+/// so `HostMapped` fails closed ([`HOST_DECODE_REFUSAL`]) rather than silently
+/// consuming the VRAM an offloaded layer frees.
+pub(crate) fn upload_decoded_bytes(
+    gpu: &mut Gpu,
+    target: MemoryTarget,
+    bytes: &[u8],
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
+    match target {
+        MemoryTarget::Device => gpu.upload_raw(bytes, shape),
+        MemoryTarget::HostMapped => Err(HipError::new(0, HOST_DECODE_REFUSAL)),
+    }
+}
+
+/// Quant `data` → `WeightTensor [m, k]` at `target`. Moved from
 /// `hipfire-arch-qwen35::qwen35::load_weight_tensor_raw` (Task 2).
+///
+/// The host-decode arms (qt 1/2/16) widen bytes in host memory and upload the
+/// widened form; there is no host-mapped upload for that, so they fail closed
+/// under [`MemoryTarget::HostMapped`] rather than silently consuming VRAM inside
+/// an offloaded layer.
 pub fn dequant_weight_raw(
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     // Host-decode formats stay explicit (NOT passthrough table rows):
     match quant_type {
         1 => {
             // F16 — keep as F16 bytes (the HFQ path host-decodes qt 1 to F32 instead;
             // this divergence is why qt 1 is not a RAW_CODECS row).
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = upload_decoded_bytes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F16,
@@ -769,7 +1029,7 @@ pub fn dequant_weight_raw(
         }
         2 => {
             // F32 — upload as [m, k].
-            let buf = gpu.upload_raw(data, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -789,7 +1049,7 @@ pub fn dequant_weight_raw(
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            let buf = upload_decoded_bytes(gpu, target, bytes, &[m, k])?;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,
@@ -804,7 +1064,7 @@ pub fn dequant_weight_raw(
             })
         }
         other => match raw_codec(other) {
-            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw"),
+            Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw", target),
             None => Err(hip_bridge::HipError::new(
                 0,
                 &format!("unsupported quant_type {other} for dequant_weight_raw"),
@@ -895,54 +1155,13 @@ fn fwht256_inplace(group: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-/// TQ2G128 ternary block → F32, GPU-free pure fn (unit-testable in isolation
-/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (34
-/// bytes / 128-elem group): `[FP16 d (2B)][qs[32]]`, codes packed 4/byte
-/// LSB-first; `value = (code - 1) * d`. Mirrors the proven Task-5/Task-8v
-/// CPU oracle for `dequant_tq2g128_to_f16`.
-fn dequant_tq2_to_f32(data: &[u8], n: usize) -> Vec<f32> {
-    const BLK: usize = 34;
-    let nblocks = n / 128;
-    let mut out = Vec::with_capacity(n);
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        for j in 0..128 {
-            let code = (data[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x3;
-            out.push((code as i32 - 1) as f32 * d);
-        }
-    }
-    out
-}
-
-/// BQ1G128 binary block → F32, GPU-free pure fn (unit-testable in isolation
-/// from `dequant_f32`, which needs a `Gpu` to upload). Block layout (18
-/// bytes / 128-elem group): `[FP16 d (2B)][16 packed sign-bit bytes,
-/// LSB-first]`; element `e` reads byte `2 + e/8`, bit `e % 8`; `value =
-/// bit ? +d : -d`. Mirrors the proven Task-9 GPU/CPU oracle in
-/// `crates/rdna-compute/examples/test_dequant_bq1g128.rs` and the
-/// `dequant_bq1g128_to_f16.hip` kernel body.
-fn dequant_bq1_to_f32(data: &[u8], n: usize) -> Vec<f32> {
-    const BLK: usize = 18;
-    let nblocks = n / 128;
-    let mut out = Vec::with_capacity(n);
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        for j in 0..128 {
-            let byte = data[base + 2 + (j >> 3)];
-            let bit = (byte >> (j & 7)) & 1;
-            out.push(if bit == 1 { d } else { -d });
-        }
-    }
-    out
-}
-
-/// CPU-side dequant of HTQ weight bytes to F32 for every supported quant_type
-/// (F16/F32/BF16, Q8_0, MQ4/6/MQ3, MFP4, codebook 19/20/30, ...). Factored out of
-/// [`dequant_f32`] so this device path and its host-located counterpart decode
-/// byte-for-byte identically — a sign/normalization drift here is the "token soup"
-/// attractor failure mode, so there is exactly one copy.
+/// CPU-side dequant of HTQ weight bytes to F32 for the quant_types this path
+/// still decodes locally (F16/F32/BF16, Q8_0, the legacy qt14 group). Every
+/// block-quantized format delegates to the canonical decoder in `hipfire-cpu`
+/// (`quant::dequant_group`), whose expectation tables pin those bit-for-bit — so
+/// this device path and its host-located counterpart stay identical while there
+/// is one decoder, not two. A sign/normalization drift here is the "token soup"
+/// attractor failure mode.
 fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
     match quant_type {
         1 => data
@@ -970,49 +1189,6 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
                 for i in 0..256 {
                     let q = data[off + 2 + i] as i8;
                     out.push(scale * q as f32);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        44 => {
-            // MQ4G256V2 (qt44, mq4v2): per 256-group 136B — [s0 z0 s1 z1] as
-            // fp16 (per-128 half scales/zeros) + 128B pair-packed nibbles.
-            // Decode mirrors the kernel (level*scale[h]+zero[h]) then applies
-            // the FWHT inverse, exactly like the qt13 MQ4G256 arm below.
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 136;
-            let n_groups = data.len() / bytes_per_group;
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let st = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([
-                        data[off + 4 * h],
-                        data[off + 4 * h + 1],
-                    ]))
-                };
-                let zz = |h: usize| {
-                    f16_to_f32(u16::from_le_bytes([
-                        data[off + 4 * h + 2],
-                        data[off + 4 * h + 3],
-                    ]))
-                };
-                let start = out.len();
-                for i in 0..group_size {
-                    let h = i / 128;
-                    let byte_val = data[off + 8 + i / 2];
-                    let nibble = if i % 2 == 0 {
-                        byte_val & 0xF
-                    } else {
-                        byte_val >> 4
-                    };
-                    let s = if h == 0 { st(0) } else { st(1) };
-                    let z = if h == 0 { zz(0) } else { zz(1) };
-                    out.push(s * nibble as f32 + z);
                 }
                 let group = &mut out[start..start + 256];
                 fwht256_inplace(group, &signs1, &signs2);
@@ -1112,332 +1288,27 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             }
             out
         }
-        6 | 7 | 13 | 15 => {
-            let is_6bit = quant_type == 15;
-            let group_size: usize = if quant_type == 6 || quant_type == 13 || quant_type == 15 {
-                256
-            } else {
-                128
-            };
-            let bytes_per_group = if is_6bit { 200 } else { 8 + group_size / 2 };
-            let n_groups = data.len() / bytes_per_group;
-            let is_mq = quant_type == 13 || quant_type == 15;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let (signs1, signs2) = if is_mq {
-                (
-                    Some(KvCache::gen_fwht_signs(42, 256)),
-                    Some(KvCache::gen_fwht_signs(1042, 256)),
-                )
-            } else {
-                (None, None)
-            };
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_6bit {
-                    for i in (0..group_size).step_by(4) {
-                        let bo = off + 8 + (i / 4) * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        out.push(scale * ((b0 & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b0 >> 6) | (b1 << 2)) & 0x3F) as f32) + zero);
-                        out.push(scale * ((((b1 >> 4) | (b2 << 4)) & 0x3F) as f32) + zero);
-                        out.push(scale * (((b2 >> 2) & 0x3F) as f32) + zero);
-                    }
-                } else {
-                    for i in 0..group_size {
-                        let byte_idx = i / 2;
-                        let byte_val = data[off + 8 + byte_idx];
-                        let nibble = if i % 2 == 0 {
-                            byte_val & 0xF
-                        } else {
-                            byte_val >> 4
-                        };
-                        out.push(scale * nibble as f32 + zero);
-                    }
-                }
-                if is_mq && group_size == 256 {
-                    let s1 = signs1.as_ref().unwrap();
-                    let s2 = signs2.as_ref().unwrap();
-                    let group = &mut out[start..start + 256];
-                    fwht256_inplace(group, s1, s2);
-                }
+        6 | 7 | 8 | 11 | 12 | 13 | 15 | 17 | 18 | 19 | 20 | 30 | 40 | 41 | 44 => {
+            // Block-quantized formats decode through the canonical CPU decoder in
+            // `hipfire-cpu` (`dequant_group`). Its expectation tables pin each of
+            // these bit-for-bit to the arithmetic this arm used to hold, so the
+            // delegation is behaviour-preserving — and there is now one decoder
+            // instead of two. Element formats stay local above: their "group" is a
+            // single element, so the block decoder's fixed chunking does not apply
+            // to sub-block norms/biases.
+            let q = hipfire_cpu::quant::CpuQuant::from_quant_type(quant_type)
+                .expect("routed quant_type has a CpuQuant");
+            let (group_bytes, group_elems) = (q.group_bytes(), q.group_elems());
+            let mut out = vec![0.0f32; (data.len() / group_bytes) * group_elems];
+            for (g, chunk) in data.chunks_exact(group_bytes).enumerate() {
+                hipfire_cpu::quant::dequant_group(
+                    q,
+                    chunk,
+                    &mut out[g * group_elems..(g + 1) * group_elems],
+                );
             }
             out
         }
-        8 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 200;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for i in (0..group_size).step_by(4) {
-                    let byte_off = 8 + (i / 4) * 3;
-                    let b0 = data[off + byte_off] as u32;
-                    let b1 = data[off + byte_off + 1] as u32;
-                    let b2 = data[off + byte_off + 2] as u32;
-                    let q0 = (b0 & 0x3F) as f32;
-                    let q1 = (((b0 >> 6) | (b1 << 2)) & 0x3F) as f32;
-                    let q2 = (((b1 >> 4) | (b2 << 4)) & 0x3F) as f32;
-                    let q3 = ((b2 >> 2) & 0x3F) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                }
-            }
-            out
-        }
-        11 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 104;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for chunk in 0..32 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        12 => {
-            let group_size: usize = 128;
-            let bytes_per_group: usize = 56;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                for chunk in 0..16 {
-                    let bo = off + 8 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as f32;
-                    let q1 = ((b0 >> 3) & 7) as f32;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                    let q3 = ((b1 >> 1) & 7) as f32;
-                    let q4 = ((b1 >> 4) & 7) as f32;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                    let q6 = ((b2 >> 2) & 7) as f32;
-                    let q7 = ((b2 >> 5) & 7) as f32;
-                    out.push(scale * q0 + zero);
-                    out.push(scale * q1 + zero);
-                    out.push(scale * q2 + zero);
-                    out.push(scale * q3 + zero);
-                    out.push(scale * q4 + zero);
-                    out.push(scale * q5 + zero);
-                    out.push(scale * q6 + zero);
-                    out.push(scale * q7 + zero);
-                }
-            }
-            out
-        }
-        20 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 112;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 8];
-                for k in 0..8 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for chunk in 0..32 {
-                    let bo = off + 16 + chunk * 3;
-                    let b0 = data[bo] as u32;
-                    let b1 = data[bo + 1] as u32;
-                    let b2 = data[bo + 2] as u32;
-                    let q0 = (b0 & 7) as usize;
-                    let q1 = ((b0 >> 3) & 7) as usize;
-                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as usize;
-                    let q3 = ((b1 >> 1) & 7) as usize;
-                    let q4 = ((b1 >> 4) & 7) as usize;
-                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as usize;
-                    let q6 = ((b2 >> 2) & 7) as usize;
-                    let q7 = ((b2 >> 5) & 7) as usize;
-                    out.push(cb[q0]);
-                    out.push(cb[q1]);
-                    out.push(cb[q2]);
-                    out.push(cb[q3]);
-                    out.push(cb[q4]);
-                    out.push(cb[q5]);
-                    out.push(cb[q6]);
-                    out.push(cb[q7]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        19 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 72;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 4];
-                for k in 0..4 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..64 {
-                    let byte_val = data[off + 8 + i] as usize;
-                    out.push(cb[byte_val & 3]);
-                    out.push(cb[(byte_val >> 2) & 3]);
-                    out.push(cb[(byte_val >> 4) & 3]);
-                    out.push(cb[(byte_val >> 6) & 3]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        30 => {
-            let group_size: usize = 256;
-            let bytes_per_group: usize = 160;
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let mut cb = [0.0f32; 16];
-                for k in 0..16 {
-                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
-                    cb[k] = f16_to_f32(bits);
-                }
-                let start = out.len();
-                for i in 0..128 {
-                    let byte_val = data[off + 32 + i] as usize;
-                    out.push(cb[byte_val & 0xF]);
-                    out.push(cb[(byte_val >> 4) & 0xF]);
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        17 | 18 => {
-            let is_mq3 = quant_type == 17;
-            let group_size: usize = 256;
-            let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
-            let n_groups = data.len() / bytes_per_group;
-            let mut out = Vec::with_capacity(n_groups * group_size);
-            let signs1 = KvCache::gen_fwht_signs(42, 256);
-            let signs2 = KvCache::gen_fwht_signs(1042, 256);
-            for g in 0..n_groups {
-                let off = g * bytes_per_group;
-                let scale =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                let zero = f32::from_le_bytes([
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                let start = out.len();
-                if is_mq3 {
-                    for chunk in 0..32 {
-                        let bo = off + 8 + chunk * 3;
-                        let b0 = data[bo] as u32;
-                        let b1 = data[bo + 1] as u32;
-                        let b2 = data[bo + 2] as u32;
-                        let q0 = (b0 & 7) as f32;
-                        let q1 = ((b0 >> 3) & 7) as f32;
-                        let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
-                        let q3 = ((b1 >> 1) & 7) as f32;
-                        let q4 = ((b1 >> 4) & 7) as f32;
-                        let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
-                        let q6 = ((b2 >> 2) & 7) as f32;
-                        let q7 = ((b2 >> 5) & 7) as f32;
-                        out.push(scale * q0 + zero);
-                        out.push(scale * q1 + zero);
-                        out.push(scale * q2 + zero);
-                        out.push(scale * q3 + zero);
-                        out.push(scale * q4 + zero);
-                        out.push(scale * q5 + zero);
-                        out.push(scale * q6 + zero);
-                        out.push(scale * q7 + zero);
-                    }
-                } else {
-                    for i in 0..64 {
-                        let byte_val = data[off + 8 + i] as u32;
-                        out.push(scale * ((byte_val & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 2) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 4) & 3) as f32) + zero);
-                        out.push(scale * (((byte_val >> 6) & 3) as f32) + zero);
-                    }
-                }
-                let group = &mut out[start..start + 256];
-                fwht256_inplace(group, &signs1, &signs2);
-            }
-            out
-        }
-        40 => dequant_tq2_to_f32(data, n),
-        41 => dequant_bq1_to_f32(data, n),
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     }
@@ -1472,9 +1343,39 @@ pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f3
 
 // ── WeightBackend trait ─────────────────────────────────────────────────────
 
+/// Where a weight's bytes physically land at load. One parameter, one upload
+/// path: `Device` puts them in VRAM, `HostMapped` in pinned system RAM that the
+/// *same* kernels dereference over PCIe through the device-visible alias
+/// (`hipHostGetDevicePointer`). Contents are byte-identical either way, so
+/// placement changes only where the bytes live, never the arithmetic.
+///
+/// This is the load-side placement of a weight's storage. It is deliberately not
+/// the execution question ("who multiplies these bytes") — that is the caller's
+/// `memory.offload_exec` policy and, from the loader's point of view, is recorded
+/// on the loaded weight (stage 2), not decided here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryTarget {
+    /// VRAM (`hip.malloc` / pool).
+    Device,
+    /// Pinned system RAM (`hipHostMalloc(hipHostMallocMapped)`), padded by
+    /// `rdna_compute::HOST_TAIL_PAD_BYTES`. Costs no device heap; a `Gpu` kernel
+    /// read traverses PCIe.
+    HostMapped,
+}
+
+/// Refusal for the host-decode arms (qt 1/2/16, and every f32 fallback) under
+/// [`MemoryTarget::HostMapped`]. Those arms widen to f32 in host memory and then
+/// upload the widened bytes; no host-mapped upload exists, so silently placing
+/// them on the device would consume exactly the VRAM an offloaded layer frees.
+pub const HOST_DECODE_REFUSAL: &str =
+    "quantized weight falls back to the f32 dequant path, which has no \
+     host-localized upload; refusing to silently place it in device memory \
+     inside an offloaded layer";
+
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use crate::model_source::ModelSource;
 use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
+pub use crate::weight_manifest::WeightResidency;
 
 /// Pluggable weight-loading backend. `rel` is a layer-relative path: for `proj`
 /// it carries NO file extension (the backend appends `.weight` / tries `.qweight`);
@@ -1502,39 +1403,28 @@ pub struct HfqBackend<'a> {
     pub gpu: &'a mut Gpu,
     pub norm_bias: f32,
     pub candidates: fn(&str) -> Vec<String>,
-    pub read_proj:
-        fn(&HfqFile, &Gpu, &str, usize, usize, fn(&str) -> Vec<String>) -> HipResult<WeightTensor>,
+    pub read_proj: fn(
+        &HfqFile,
+        &mut Gpu,
+        &str,
+        usize,
+        usize,
+        fn(&str) -> Vec<String>,
+        MemoryTarget,
+    ) -> HipResult<WeightTensor>,
     pub layer: usize,
-    /// When true, this layer's weight tensors allocate on host-mapped system RAM (
-    /// read over PCIe) instead of device memory — leaving VRAM free for a larger KV cache
-    /// while keeping numerics byte-identical to resident mode. Set per-layer by the loader
-    /// from the placement policy; `false` is the fully-resident, zero-diff default. See
-    /// [`Gpu::upload_f32_host`] for the host upload path these weights use.
+    /// Where this layer's own weight tensors live. `HostMapped` allocates them in
+    /// pinned system RAM the kernels read over PCIe instead of device memory,
+    /// leaving VRAM free for a larger KV cache while keeping numerics
+    /// byte-identical to resident mode. Set per layer by the loader from the
+    /// resolved placement; `Resident` is the fully-resident, zero-diff default.
     ///
-    /// `proj` needs its own seam: quantized weights upload raw codes through an
-    /// arch-supplied fn pointer, and host-locating them requires `&mut Gpu`
-    /// (`Gpu::alloc_host_mapped_tensor` records the host pointer in the `Gpu`, so it is
-    /// not reachable through `read_proj`'s shared `&Gpu`). Hence the twin
-    /// `read_proj_host` field below rather than branching here. This flag governs
-    /// `norm`/`raw_f32`/`bias`, which run inline and do have `&mut Gpu`.
-    pub host_local: bool,
-    /// Host-localizing projection reader, used only when `host_local` is set.
-    ///
-    /// Takes `&mut Gpu` (unlike [`Self::read_proj`]) because host-locating a
-    /// tensor registers a VMM arena on the `Gpu`. `None` means the arch has no
-    /// offload support: an offloaded layer is then a hard error rather than a
-    /// silent device allocation, so a half-configured offload can never masquerade
-    /// as working. qwen35 dense is the only arch that sets this.
-    pub read_proj_host: Option<
-        fn(
-            &HfqFile,
-            &mut Gpu,
-            &str,
-            usize,
-            usize,
-            fn(&str) -> Vec<String>,
-        ) -> HipResult<WeightTensor>,
-    >,
+    /// It selects the [`MemoryTarget`] passed to [`Self::read_proj`] for projections
+    /// and the host uploader for `norm`/`raw_f32`/`bias`. One upload path: an arch
+    /// whose reader cannot honour `HostMapped` refuses inside its own decode (e.g.
+    /// the f32-dequant fallback, [`HOST_DECODE_REFUSAL`]) rather than landing the
+    /// weights in the VRAM the offload exists to free.
+    pub residency: WeightResidency,
 }
 
 impl<'a> WeightBackend for HfqBackend<'a> {
@@ -1544,31 +1434,15 @@ impl<'a> WeightBackend for HfqBackend<'a> {
 
     fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
         let name = hfq_proj_name(self.layer, rel);
-        if self.host_local {
-            // An offloaded layer whose arch ships no host reader is a configuration
-            // error, not something to paper over with a device allocation: the
-            // weights would silently land in the VRAM the offload was meant to free.
-            let read_host = self.read_proj_host.ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
-                        "layer {} is marked host_local but this backend has no host \
-                         projection reader; refusing to allocate the weights on the device",
-                        self.layer
-                    ),
-                )
-            })?;
-            read_host(self.hfq, self.gpu, &name, m, k, self.candidates)
-        } else {
-            (self.read_proj)(self.hfq, self.gpu, &name, m, k, self.candidates)
-        }
+        let target = crate::offload::memory_target(self.residency);
+        (self.read_proj)(self.hfq, self.gpu, &name, m, k, self.candidates, target)
     }
     fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
         let name = hfq_plain_name(self.layer, rel);
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_norm(info.quant_type, &data, shape, self.norm_bias);
-        if self.host_local {
+        if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data, shape)
         } else {
             self.gpu.upload_f32(&f32_data, shape)
@@ -1579,7 +1453,7 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_to_f32(info.quant_type, &data, n);
-        if self.host_local {
+        if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data[..n], &[n])
         } else {
             self.gpu.upload_f32(&f32_data[..n], &[n])
@@ -1590,7 +1464,7 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         let (info, data) = read_first(self.hfq, &name, self.candidates)
             .unwrap_or_else(|| panic!("tensor not found: {name}"));
         let f32_data = dequantize_to_f32(info.quant_type, &data, n);
-        let t = if self.host_local {
+        let t = if self.residency == WeightResidency::HostMapped {
             self.gpu.upload_f32_host(&f32_data[..n], &[n])?
         } else {
             self.gpu.upload_f32(&f32_data[..n], &[n])?
@@ -1849,7 +1723,7 @@ mod tests {
         data[1] = 0x40; // FP16 2.0
         data[2] = 0xE4; // codes [0,1,2,3] LSB-first (0b11_10_01_00)
                         // data[3..34] already zero => codes 0 for elements 4..127
-        let out = dequant_tq2_to_f32(&data, 128);
+        let out = dequantize_to_f32(40, &data, 128);
         assert_eq!(out.len(), 128);
         assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]);
         for (i, &v) in out.iter().enumerate().skip(4) {
@@ -1871,14 +1745,14 @@ mod tests {
         for b in data[2..18].iter_mut() {
             *b = 0xFF; // all 128 sign bits set => all +d
         }
-        let out = dequant_bq1_to_f32(&data, 128);
+        let out = dequantize_to_f32(41, &data, 128);
         assert_eq!(out.len(), 128);
         for (i, &v) in out.iter().enumerate() {
             assert!((v - 0.5).abs() < 1e-3, "expected +d at index {i}, got {v}");
         }
 
         data[2] &= !1; // clear bit 0 of qs[0] => element 0 flips to -d
-        let out = dequant_bq1_to_f32(&data, 128);
+        let out = dequantize_to_f32(41, &data, 128);
         assert!(
             (out[0] - (-0.5)).abs() < 1e-3,
             "expected -d at index 0, got {}",

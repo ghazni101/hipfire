@@ -288,7 +288,7 @@ fn redline_append_mapped(
 
 fn redline_gemma4_snapshot(
     gpu: &rdna_compute::Gpu,
-    bundle: &hipfire_loader::Gemma4LoweredBundle,
+    bundle: &hipfire_loader::Gemma4Bundle,
     _position: usize,
 ) -> Result<RedlineGemma4Snapshot, String> {
     fn append_kv(
@@ -317,8 +317,9 @@ fn redline_gemma4_snapshot(
         Ok(())
     }
 
+    let state = &bundle.state;
     let mut logits = Vec::new();
-    redline_append_buffer(gpu, &mut logits, &bundle.scratch.logits.buf)?;
+    redline_append_buffer(gpu, &mut logits, &state.logits.buf)?;
     let mut sliding_kv = Vec::new();
     let mut sliding_kv_regions = Vec::new();
     append_kv(
@@ -326,7 +327,7 @@ fn redline_gemma4_snapshot(
         &mut sliding_kv,
         &mut sliding_kv_regions,
         "sliding",
-        &bundle.kv_sliding,
+        &state.kv_sliding,
     )?;
     let mut full_kv = Vec::new();
     let mut full_kv_regions = Vec::new();
@@ -335,84 +336,59 @@ fn redline_gemma4_snapshot(
         &mut full_kv,
         &mut full_kv_regions,
         "full",
-        &bundle.kv_full,
+        &state.kv_full,
     )?;
-    macro_rules! snapshot_buffer {
-        ($buffer:expr) => {{
-            let mut bytes = Vec::new();
-            redline_append_buffer(gpu, &mut bytes, $buffer)?;
-            bytes
-        }};
-    }
+    let snapshot = |tensor: Option<&rdna_compute::GpuTensor>| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        if let Some(tensor) = tensor {
+            redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
+        }
+        Ok(bytes)
+    };
+    let moe = state.moe.as_ref();
     Ok(RedlineGemma4Snapshot {
         logits,
         sliding_kv,
         full_kv,
         sliding_kv_regions,
         full_kv_regions,
-        scratch_x: snapshot_buffer!(&bundle.scratch.x.buf),
-        scratch_tmp: snapshot_buffer!(&bundle.scratch.tmp.buf),
-        scratch_q: snapshot_buffer!(&bundle.scratch.q.buf),
-        scratch_k: snapshot_buffer!(&bundle.scratch.k.buf),
-        scratch_v: snapshot_buffer!(&bundle.scratch.v.buf),
-        scratch_attn_out: snapshot_buffer!(&bundle.scratch.attn_out.buf),
-        scratch_residual: snapshot_buffer!(&bundle.scratch.residual.buf),
-        scratch_moe_cur_mlp: snapshot_buffer!(&bundle.scratch.moe_cur_mlp.buf),
-        scratch_moe_cur_moe: snapshot_buffer!(&bundle.scratch.moe_cur_moe.buf),
-        scratch_gate_ffn: snapshot_buffer!(&bundle.scratch.gate_ffn.buf),
-        scratch_up_ffn: snapshot_buffer!(&bundle.scratch.up_ffn.buf),
-        scratch_ffn_hidden: snapshot_buffer!(&bundle.scratch.ffn_hidden.buf),
-        scratch_ffn_out: snapshot_buffer!(&bundle.scratch.ffn_out.buf),
+        scratch_x: snapshot(Some(&state.x))?,
+        scratch_tmp: snapshot(Some(&state.tmp))?,
+        scratch_q: snapshot(Some(&state.q))?,
+        scratch_k: snapshot(Some(&state.k))?,
+        scratch_v: snapshot(Some(&state.v))?,
+        scratch_attn_out: snapshot(Some(&state.attn_out))?,
+        scratch_residual: snapshot(Some(&state.residual))?,
+        scratch_moe_cur_mlp: snapshot(moe.map(|m| &m.cur_mlp))?,
+        scratch_moe_cur_moe: snapshot(moe.map(|m| &m.cur_moe))?,
+        scratch_gate_ffn: snapshot(Some(&state.gate_ffn))?,
+        scratch_up_ffn: snapshot(Some(&state.up_ffn))?,
+        scratch_ffn_hidden: snapshot(Some(&state.ffn_hidden))?,
+        scratch_ffn_out: snapshot(Some(&state.ffn_out))?,
     })
 }
 
 fn redline_reset_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &mut hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
 ) -> Result<(), String> {
-    bundle
+    let state = &mut bundle.state;
+    state
         .kv_sliding
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
-    bundle
+    state
         .kv_full
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
-    bundle.kv_sliding.compact_offset = 0;
-    bundle.kv_full.compact_offset = 0;
+    state.kv_sliding.compact_offset = 0;
+    state.kv_full.compact_offset = 0;
     // The three oracle arms must begin with identical scratch as well as KV.
-    // Reset the complete lowered scratch surface so inactive and tail lanes
-    // are deterministic across the HIP, kernarg-blob, and retained arms.
-    for buffer in [
-        &bundle.scratch.x.buf,
-        &bundle.scratch.residual.buf,
-        &bundle.scratch.tmp.buf,
-        &bundle.scratch.q.buf,
-        &bundle.scratch.k.buf,
-        &bundle.scratch.v.buf,
-        &bundle.scratch.attn_out.buf,
-        &bundle.scratch.gate_ffn.buf,
-        &bundle.scratch.up_ffn.buf,
-        &bundle.scratch.ffn_hidden.buf,
-        &bundle.scratch.ffn_out.buf,
-        &bundle.scratch.logits.buf,
-        &bundle.scratch.flash_partials.buf,
-        &bundle.scratch.moe_cur_mlp.buf,
-        &bundle.scratch.moe_pre2.buf,
-        &bundle.scratch.moe_router_in.buf,
-        &bundle.scratch.moe_router_logits.buf,
-        &bundle.scratch.moe_topk_indices.buf,
-        &bundle.scratch.moe_topk_weights.buf,
-        &bundle.scratch.moe_cur_moe.buf,
-        &bundle.scratch.moe_expert_gate_up.buf,
-        &bundle.scratch.moe_expert_hidden.buf,
-        &bundle.scratch.moe_expert_out.buf,
-        &bundle.scratch.moe_pre2_rot.buf,
-        &bundle.scratch.moe_expert_gate_batch.buf,
-        &bundle.scratch.moe_expert_up_batch.buf,
-    ] {
+    // Reset the complete scratch surface so inactive and tail lanes are
+    // deterministic across the HIP, kernarg-blob, and retained arms.
+    for tensor in state.scratch_tensors() {
         gpu.hip
-            .memset(buffer, 0, buffer.size())
+            .memset(&tensor.buf, 0, tensor.buf.size())
             .map_err(|error| error.to_string())?;
     }
     gpu.invalidate_graph_state();
@@ -423,67 +399,41 @@ fn redline_reset_gemma4(
 
 fn redline_prime_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &mut hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
     context: usize,
 ) -> Result<(), String> {
     for i in 0..context {
-        hipfire_arch_gemma4::lowered::forward_scratch(
-            gpu,
-            &bundle.weights,
+        hipfire_arch_gemma4::forward::decode_step(
             &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
             10 + (i as u32 % 1000),
-            i,
-            &mut bundle.kv_sliding,
-            &mut bundle.kv_full,
-            &bundle.scratch,
-        )
-        .map_err(|error| error.to_string())?;
+            i as u32,
+        )?;
     }
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
 }
 
+/// Stage `token`'s embedding and `position` exactly as a decode step does,
+/// outside the recorded body.
 fn redline_prepare_gemma4(
     gpu: &mut rdna_compute::Gpu,
-    bundle: &hipfire_loader::Gemma4LoweredBundle,
+    bundle: &mut hipfire_loader::Gemma4Bundle,
     token: u32,
     position: usize,
 ) -> Result<(), String> {
-    use hipfire_runtime::llama::EmbeddingFormat;
-
-    match bundle.weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        EmbeddingFormat::F32 => gpu.embedding_lookup(
-            &bundle.weights.embed_tokens,
-            &bundle.scratch.x,
-            token,
-            bundle.config.dim,
-        ),
-        _ => return Err("unsupported Gemma4 Redline embedding format".into()),
-    }
-    .map_err(|error| error.to_string())?;
-    gpu.scale_f32(&bundle.scratch.x, bundle.config.embed_scale)
-        .map_err(|error| error.to_string())?;
+    hipfire_arch_gemma4::forward::prepare_token(
+        &bundle.config,
+        &bundle.weights,
+        &mut bundle.state,
+        gpu,
+        token,
+    )?;
     gpu.hip
-        .memcpy_htod(&bundle.scratch.pos_buf, &(position as i32).to_ne_bytes())
+        .memcpy_htod(&bundle.state.pos_buf.buf, &(position as i32).to_ne_bytes())
         .map_err(|error| error.to_string())
 }
 
@@ -1212,7 +1162,8 @@ pub fn redline_bench_decode_deepseek4(
     let g0 = G0Arm::from_request(msg)?;
     if g0.is_some() && (capture || product_route || iterations != 1) {
         return Err(
-            "g0 requires iterations == 1 and excludes redline_capture/redline_product_route".to_string(),
+            "g0 requires iterations == 1 and excludes redline_capture/redline_product_route"
+                .to_string(),
         );
     }
     if context == 0 || iterations == 0 {
@@ -1237,7 +1188,8 @@ pub fn redline_bench_decode_deepseek4(
         .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
     loaded.seq_pos = context;
 
-    if capture || g0.is_some() || (product_route && gpu.replay.prepared_route_identity().is_some()) {
+    if capture || g0.is_some() || (product_route && gpu.replay.prepared_route_identity().is_some())
+    {
         // Manual capture and prepared product routes are already warm paths.
         // The first product warmup must still materialize lazy allocations and
         // record the route; later requests replay from their first timed token.
@@ -1255,14 +1207,21 @@ pub fn redline_bench_decode_deepseek4(
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    let settled = gpu.hip.device_synchronize().map_err(|error| error.to_string());
+    let settled = gpu
+        .hip
+        .device_synchronize()
+        .map_err(|error| error.to_string());
     let started = Instant::now();
     let run = settled
         .and_then(|()| {
             redline_run_deepseek4_decode(gpu, bundle, context, iterations)
                 .map_err(|error| format!("bench_decode forward failed: {error}"))
         })
-        .and_then(|()| gpu.hip.device_synchronize().map_err(|error| error.to_string()));
+        .and_then(|()| {
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())
+        });
     let elapsed = started.elapsed().as_secs_f64();
     // A G0 arm is always closed, so a failed forward cannot leave the
     // controller observing (or recording) every later launch.
@@ -2702,10 +2661,7 @@ fn redline_dflash_kv_regions(
             continue;
         }
         if validate {
-            let expect = slot
-                .kv_cache
-                .physical_cap
-                .saturating_mul(bytes_per_pos);
+            let expect = slot.kv_cache.physical_cap.saturating_mul(bytes_per_pos);
             if bytes.len() < expect || bytes.len() > expect + 3 {
                 return Err(format!(
                     "DFlash KV guard: plane bytes {} != physical_cap {} * native stride {bytes_per_pos}",
@@ -2892,25 +2848,16 @@ fn redline_dflash_recorded_hip(
         .hidden_rb
         .commit_staging_to_ring(gpu, b)
         .map_err(|e| e.to_string())?;
-    let mut argmax = Vec::with_capacity(b);
-    for i in 0..b {
-        let hidden_row = fixtures
-            .verify_scratch
-            .final_hidden
-            .sub_offset(i * dim, dim);
-        let logits_row = fixtures.verify_scratch.logits.sub_offset(i * vocab, vocab);
-        hipfire_runtime::llama::weight_gemv(gpu, &slot.weights.output, &hidden_row, &logits_row)
-            .map_err(|e| e.to_string())?;
-        let row = gpu.download_f32(&logits_row).map_err(|e| e.to_string())?;
-        argmax.push(
-            row.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(idx, _)| idx as u32)
-                .unwrap_or(0),
-        );
-    }
-    Ok(argmax)
+    let final_hidden = fixtures.verify_scratch.final_hidden.sub_offset(0, b * dim);
+    hipfire_arch_qwen35::speculative::dflash_finish_retained_lm_head_argmax(
+        gpu,
+        &slot.weights.output,
+        &final_hidden,
+        &fixtures.verify_scratch,
+        b,
+        vocab,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn redline_dflash_run_window(
@@ -3088,7 +3035,29 @@ pub fn redline_shadow_dflash_verify_pm4(
         return Err("DFlash shadow iterations must be non-zero".into());
     }
     let count = iterations.max(12);
-    let base: usize = 112;
+    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let slot = guard.model_slot()?;
+    // The gfx1100 split-KV verifier is admitted only beyond its resolved
+    // crossover. Start the shadow at no less than the 8K boundary so
+    // capture/record/PM4 evidence names the new partial + merge route rather
+    // than a short-context fallback tape.
+    let split_min_ctx =
+        qwen35::prefill::gfx1100_split_verify_min_ctx(gpu, &slot.config).filter(|&threshold| {
+            qwen35::prefill::gfx1100_split_verify_admitted(
+                gpu,
+                &slot.config,
+                slot.kv_cache.quant_q8
+                    && matches!(slot.kv_cache.v_mode, hipfire_runtime::llama::VMode::Q8),
+                slot.kv_cache.uses_vmm_backend(),
+                batch,
+                threshold.saturating_add(1),
+                slot.scratch.flash_partials.numel(),
+            )
+        });
+    let base: usize = split_min_ctx
+        .map(|threshold| threshold.saturating_add(1).max(8192).saturating_sub(batch))
+        .unwrap_or(112);
     let mut positions: Vec<usize> = Vec::with_capacity(count);
     for i in 0..count {
         positions.push(base + i * batch);
@@ -3103,10 +3072,6 @@ pub fn redline_shadow_dflash_verify_pm4(
             last + batch
         ));
     }
-
-    let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
-    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
-    let slot = guard.model_slot()?;
     let hidden_k = slot.config.dim.next_power_of_two();
     let max_n = batch + 1;
     let mut fixtures = RedlineDflashFixtures {
@@ -3709,8 +3674,18 @@ fn redline_qwen4_snapshot(
     let mut lengths = Vec::with_capacity(state.qsa.len());
     for (layer, qsa) in state.qsa.iter().enumerate() {
         let active = [
-            ("full_keys", &qsa.full_keys, qsa.full_len, qsa.full_row_units),
-            ("full_values", &qsa.full_values, qsa.full_len, qsa.full_row_units),
+            (
+                "full_keys",
+                &qsa.full_keys,
+                qsa.full_len,
+                qsa.full_row_units,
+            ),
+            (
+                "full_values",
+                &qsa.full_values,
+                qsa.full_len,
+                qsa.full_row_units,
+            ),
             ("raw_keys", &qsa.raw_index_keys, qsa.raw_len, raw_width),
             ("pooled_keys", &qsa.pooled_keys, qsa.pooled_len, raw_width),
         ];
@@ -4096,7 +4071,9 @@ pub fn railgun_g0_dflash_cycle(
     context: usize,
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1 || loaded.ep.is_some() || (loaded.arch_id != 5 && loaded.arch_id != 6) {
-        return Err("railgun_g0_dflash_cycle requires a single-GPU Qwen3.5/3.8-family target".into());
+        return Err(
+            "railgun_g0_dflash_cycle requires a single-GPU Qwen3.5/3.8-family target".into(),
+        );
     }
     if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4").as_deref() == Ok("1") {
         return Err("railgun_g0_dflash_cycle refuses HIPFIRE_DFLASH_VERIFY_PM4=1 (retained verify swaps controllers)".into());
@@ -4212,8 +4189,8 @@ fn redline_shadow_gemma4(
 
     let replay_arm = (|| -> Result<(RedlineGemma4Snapshot, f64, f64), String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline shadow requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline shadow requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         let started = Instant::now();
@@ -4259,8 +4236,8 @@ fn redline_shadow_gemma4(
 
     let blob_snapshot = (|| -> Result<RedlineGemma4Snapshot, String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline blob oracle requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline blob oracle requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         for i in 0..iterations {
@@ -4276,24 +4253,21 @@ fn redline_shadow_gemma4(
 
     let hip_arm = (|| -> Result<(RedlineGemma4Snapshot, f64), String> {
         let bundle = loaded
-            .gemma4_lowered_mut()
-            .ok_or("Gemma4 Redline HIP oracle requires lowered state")?;
+            .gemma4_mut()
+            .ok_or("Gemma4 Redline HIP oracle requires Gemma 4 state")?;
         redline_reset_gemma4(gpu, bundle)?;
         redline_prime_gemma4(gpu, bundle, context)?;
         let started = Instant::now();
         for i in 0..iterations {
             redline_prepare_gemma4(gpu, bundle, 101 + (i as u32 % 1000), position(i))?;
-            hipfire_arch_gemma4::lowered::forward_scratch(
-                gpu,
-                &bundle.weights,
+            hipfire_arch_gemma4::forward::decode_step(
                 &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
                 101 + (i as u32 % 1000),
-                position(i),
-                &mut bundle.kv_sliding,
-                &mut bundle.kv_full,
-                &bundle.scratch,
-            )
-            .map_err(|error| error.to_string())?;
+                position(i) as u32,
+            )?;
         }
         gpu.hip
             .device_synchronize()
@@ -4392,7 +4366,7 @@ pub fn handle_redline_shadow(
         loaded.pp == 1
             && loaded.ep.is_none()
             && loaded.state.as_ref().is_some_and(|state| {
-                (state.as_ref() as &dyn Any).is::<hipfire_loader::Gemma4LoweredBundle>()
+                (state.as_ref() as &dyn Any).is::<hipfire_loader::Gemma4Bundle>()
             })
     }) {
         let loaded = model.as_mut().expect("Gemma4 retained route checked");
@@ -5602,7 +5576,10 @@ fn redline_trace_dn_bytes(
     Ok(())
 }
 
-fn redline_trace_kv_bytes(gpu: &rdna_compute::Gpu, bundle: &Qwen35Bundle) -> Result<Vec<u8>, String> {
+fn redline_trace_kv_bytes(
+    gpu: &rdna_compute::Gpu,
+    bundle: &Qwen35Bundle,
+) -> Result<Vec<u8>, String> {
     let mut kv = Vec::new();
     for tensor in redline_trace_kv_planes(bundle) {
         redline_append_mapped(gpu, &mut kv, tensor)?;
@@ -5621,7 +5598,11 @@ fn redline_trace_upload(
 ) -> Result<(), String> {
     let mut offset = 0;
     for tensor in planes {
-        let size = if mapped { redline_mapped_len(gpu, tensor) } else { tensor.buf.size() };
+        let size = if mapped {
+            redline_mapped_len(gpu, tensor)
+        } else {
+            tensor.buf.size()
+        };
         let chunk = bytes
             .get(offset..offset + size)
             .ok_or_else(|| format!("state dump short: plane needs {size} B at {offset}"))?;
@@ -5631,7 +5612,10 @@ fn redline_trace_upload(
         offset += size;
     }
     if offset != bytes.len() {
-        return Err(format!("state dump has {} B, planes took {offset} B", bytes.len()));
+        return Err(format!(
+            "state dump has {} B, planes took {offset} B",
+            bytes.len()
+        ));
     }
     Ok(())
 }
@@ -5725,7 +5709,10 @@ fn redline_greedy_trace(
     // `prompt_tokens_file`: raw little-endian u32 token ids. The prime uses
     // the first `context_tokens`, and the first decoded input defaults to the
     // file's next token; otherwise the shadow's synthetic prime and 101.
-    let prompt = match msg.get("prompt_tokens_file").and_then(|value| value.as_str()) {
+    let prompt = match msg
+        .get("prompt_tokens_file")
+        .and_then(|value| value.as_str())
+    {
         None => None,
         Some(path) => {
             let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
@@ -5734,14 +5721,21 @@ fn redline_greedy_trace(
                 .map(|word| u32::from_le_bytes(word.try_into().expect("4-byte chunk")))
                 .collect::<Vec<u32>>();
             if tokens.len() < context {
-                return Err(format!("{path}: {} tokens < context {context}", tokens.len()));
+                return Err(format!(
+                    "{path}: {} tokens < context {context}",
+                    tokens.len()
+                ));
             }
             Some(tokens)
         }
     };
     let first_token = number("first_token")
         .map(|token| token as u32)
-        .or_else(|| prompt.as_ref().and_then(|tokens| tokens.get(context).copied()))
+        .or_else(|| {
+            prompt
+                .as_ref()
+                .and_then(|tokens| tokens.get(context).copied())
+        })
         .unwrap_or(101);
     let fixed = match msg.get("mode").and_then(|value| value.as_str()) {
         None | Some("greedy") => false,
@@ -5839,14 +5833,15 @@ fn redline_greedy_trace(
             }
             Some(source) => {
                 let source = source.join(format!("seq{sequence}"));
-                let meta: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(source.join("primed.json")).map_err(io)?,
-                )
-                .map_err(|error| error.to_string())?;
+                let meta: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(source.join("primed.json")).map_err(io)?)
+                        .map_err(|error| error.to_string())?;
                 if meta["context_tokens"].as_u64() != Some(context as u64)
                     || meta["poison"].as_u64() != Some(u64::from(poison))
                 {
-                    return Err(format!("primed state {meta} does not match ctx {context} poison {poison}"));
+                    return Err(format!(
+                        "primed state {meta} does not match ctx {context} poison {poison}"
+                    ));
                 }
                 bundle
                     .kv_cache
@@ -5937,7 +5932,10 @@ fn redline_greedy_trace(
             let x_bytes = hidden.len();
             redline_append_buffer(gpu, &mut hidden, &bundle.scratch.tmp.buf)?;
             if logits.len() < vocab * 4 {
-                return Err(format!("logits buffer {} < vocab {vocab} f32", logits.len()));
+                return Err(format!(
+                    "logits buffer {} < vocab {vocab} f32",
+                    logits.len()
+                ));
             }
             let mut best: Option<(usize, f32)> = None;
             let mut nonfinite = 0usize;

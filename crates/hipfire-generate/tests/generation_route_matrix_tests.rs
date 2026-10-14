@@ -350,6 +350,37 @@ fn route_capability_table_covers_all_variants() {
     }
 }
 
+/// `generate` falls through to its generic AR body on `QwenAr` and, when
+/// `generate_dflash` declines a request over the drafter's ctx capacity, on
+/// `QwenDflash`; both need that body's `Qwen35Bundle` branch. No other route
+/// may take it, only the Qwen3.5 carrier (arch 5|6) selects the two, and
+/// arch 17 (the embedding encoder, GatedDeltaNet state but no Qwen DFlash
+/// caps) must not.
+#[test]
+fn qwen35_ar_body_is_taken_by_qwen_ar_and_a_declined_qwen_dflash() {
+    for &route in GenerationRoute::ALL {
+        let expected = matches!(route, GenerationRoute::QwenAr | GenerationRoute::QwenDflash);
+        assert_eq!(route.runs_qwen35_ar_body(), expected, "{route:?}");
+    }
+    for (route, inputs) in capability_rows() {
+        if route.runs_qwen35_ar_body() {
+            assert!(
+                matches!(inputs.arch_id, 5 | 6),
+                "{route:?} selected for arch {}",
+                inputs.arch_id
+            );
+        }
+    }
+    for has_speculator in [false, true] {
+        let embed = GenerationRouteInputs {
+            arch_id: 17,
+            has_speculator,
+            ..base()
+        };
+        assert!(!select_generation_route(&embed).runs_qwen35_ar_body());
+    }
+}
+
 #[test]
 fn route_matrix_tools_absent_and_present() {
     for (route, inputs) in capability_rows() {
@@ -591,7 +622,10 @@ fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
         ..base()
     };
     assert_eq!(
-        select_generation_route(&GenerationRouteInputs { temp: 0.0, ..dflash }),
+        select_generation_route(&GenerationRouteInputs {
+            temp: 0.0,
+            ..dflash
+        }),
         GenerationRoute::QwenDflash,
         "greedy DFlash without penalties"
     );

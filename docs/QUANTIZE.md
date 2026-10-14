@@ -4,7 +4,7 @@
 `hipfire-quantize` binary. It converts HuggingFace safetensors or a local
 model directory into hipfire’s HFQM container (extensions `.mq4`, `.hf4`,
 `.mq6`, …). The daemon mmaps the result directly. GGUF **weight** input is
-deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. A llama.cpp
+deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; quantize from the original safetensors instead. A GGUF-format
 `imatrix.gguf` (`--imatrix`) stays supported.
 
 Design / math / wire IDs: [QUANTIZATION.md](QUANTIZATION.md).
@@ -111,7 +111,7 @@ exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
 
 ## From GGUF (deprecated, removal in 0.5.0)
 
-**Deprecated since 0.4.0, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.**
+**Deprecated since 0.4.0, removal in 0.5.0: GGUF→mqN is lossy double quantization; quantize from the original safetensors instead.**
 A GGUF weight input prints
 `warning: GGUF weight input is deprecated and will be removed in 0.5.0; … (imatrix.gguf input stays supported)`.
 Quantize from the original safetensors instead. `--imatrix <file.gguf>` is not affected.
@@ -183,7 +183,7 @@ Full alias set and product-ladder controls. Common extras:
 | `--format` | Full set: `mq4`/`mq4v2` → qt44; `mq4v1`/`mq4g256`/`magnum` → qt13; `mq4c`; `mq{6,5,3,2}v2`; `mq3`; `hf4`/`hf6`; `hfp4`/`mfp4`/`mfp4e8`; Lloyd; `tq2`/`bq1`; … |
 | `--tier <xt\|base\|pro>` | Product rung (Qwen3.8 ladder): `xt` keeps lm_head at base codec; `base` lifts embed+lm_head; `pro` also lifts `ssm_out`. embed/conv1d stay Q8; structural tensors stay F16. See [ladder.md](quant-formats/ladder.md). |
 | `--fixed-tier <spec>` | Per-class codec overrides, e.g. `lm_head:mq6v2,ssm_out:mq6v2`. Classes: `lm_head,embed,router,attn,ssm_out` (plus `attn_full` where applicable). Dtypes: `q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2` (+ limited legacy). Env: `HIPFIRE_FIXED_TIER`. |
-| `--imatrix <gguf>` | llama.cpp imatrix for activation-aware recipes |
+| `--imatrix <gguf>` | GGUF-format imatrix for activation-aware recipes |
 | `--hessian-dir <dir>` | GPTQ-E8 Hessians |
 | `--awq` / `--awq-alpha` / `--awq-a4-aware` | AWQ pre-scale (default alpha 0.55). `--awq-a4-aware` is MQ4V2-only and selects an alpha per shared activation group from 0.35/0.45/0.55/0.65/0.75 by sampled W4A4 block-output error, using the imatrix RMS profile and the runtime-exact four-candidate `block_i4_128` fake quantizer. Fused qkvza/gate-up siblings share the anchor projection's alpha so their single runtime inverse scale remains valid. |
 | `--kmap-dense` / `--kmap-mode` / `--no-kmap` / `--uniform` | K-map promotion policy |
@@ -193,6 +193,9 @@ Full alias set and product-ladder controls. Common extras:
 | `--threads` / `HIPFIRE_QUANT_THREADS` | CPU thread cap (default ~80% cores) |
 | `--include-vision` / `--vision-quant` | Vision tensors |
 | `--allow-mq2` / `--allow-mq*-lloyd` | Research gates (v1 mq2 / Lloyd) |
+| `--qwen4-flash-next` | Native Qwen4 / Qwen3.8-Flash-Next streaming producer; see [Qwen4 Flash-Next streaming producer](#qwen4-flash-next-streaming-producer). Reads no legacy recipe flag. |
+| `--qwen4-component-mode production\|compact-fixture` | Only with `--qwen4-flash-next`; default `production`. `compact-fixture` is a non-production bounded fixture mode. |
+| `ple-hot-rank` / `ple-hot-pack` / `trunk-overlay` | Standalone subcommands (first argument), not flags: PLE hot-row sidecars and the trunk overlay sidecar; see the sections below. |
 
 **Dense-only gate:** `mq{2,3,5,6}v2` refuse MoE `arch_id`s. Use legacy
 `mq{2,3,5,6}` or `mq4`/`mq4v2`/`mq4c` for MoE, or a dense checkpoint.
@@ -235,22 +238,28 @@ members are uniform-group-only — no plain per-projection key). lm_head adds
 `HFQ3G256` and `F16`. Every `--tier` and `--fixed-tier` recipe on this page
 that stays inside those containers loads on slots — including the mixed
 `--tier pro` body (MQ4G256V2 projections + Q8_0 wo/embed/lm_head/conv1d).
-Refused with named errors: Lloyd-V2 (qt52), PARO, E8/MFP4, G128-rotated
-containers, non-Q8 embeddings, fp32 DeltaNet state. AWQ sidecars are
-refused inside a mixed-dtype group (each scale needs its own rotated
-input). KV tiers: q8 (default), fwht{2,3,4}, bf16, f16 (slots-only), fp8 on
-gfx1201 — `--kv-k`/`--kv-v` splits are not slots-resolved.
+Embedding lookup admits only the loaded formats `Q8_0`, `F32`, `HFQ4G256`
+and `HFQ4G128`. Supported host-decoded embeddings arrive as `F32`: F16,
+BF16, TQ2G128, BQ1G128 and MQ*G256V2 (quant types 44/45/47–50); other
+embedding formats still refuse with a named error.
+Refused projection containers: Lloyd-V2 (qt52), PARO, E8/MFP4 and
+G128-rotated containers. fp32 DeltaNet state also refuses with a named
+error. AWQ sidecars are refused inside a mixed-dtype group (each scale
+needs its own rotated input). KV tiers: q8 (auto/unset default on every
+GPU), fwht{2,3,4} (`asymN`/`turboN` aliases; bare `turbo` = fwht3),
+legacy-asym{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
+on exact gfx1201 only — `--kv-k`/`--kv-v` splits are not supported by slots.
 
 ### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)
 
-The Qwen3.8-27B vision tower ships as a shared sidecar (llama.cpp
-mmproj-style) beside the trunk so every text quant tier serves images
+The Qwen3.8-27B vision tower ships as a shared sidecar beside the trunk so
+every text quant tier serves images
 without requantizing the trunk. Build it from the tower HF dir (needs
 `config.json` + the `model.visual.*` shard, e.g.
 `model-00001-of-00018.safetensors`):
 
 ```bash
-hipfire-quantize --input /home/kaden/.hipfire/hf/Qwen3.8-27B-tower \
+hipfire-quantize --input ./qwen3.8-27b-tower \
     --include-vision --include-prefix model.visual. \
     --output ~/.hipfire/models/qwen3.8-27b-vision.hfq
 # shorthand for the same two flags:
@@ -327,19 +336,178 @@ metadata as `qwen4_recipe.id`; the runtime selects the packed manifest by that i
 and by nothing else. Synthetic artifacts are developer evidence only: they do not
 establish Qwen4-27B compatibility or GPU execution support.
 
+## Qwen4 Flash-Next streaming producer
+
+`hipfire-quantize --qwen4-flash-next --input <source> --output <file>` writes the
+native Qwen4 (`arch_id` 16) HFQM artifact. It is `hipfire-quantize` direct only: the
+thin `hipfire quantize` wrapper does not expose it. Source: `crates/hipfire-quantize/src/cli.rs`
+(flags, `--help`) and `crates/hipfire-quantize/src/qwen4.rs` (producer).
+
+- **Input** (`--input`): a local directory of `.safetensors` shards, a single local
+  `.safetensors` file, or the **immutable** remote form
+  `hf://OWNER/REPO@<40-hex-commit>`. The revision must be exactly 40 hexadecimal
+  characters: `hf://OWNER/REPO` without a revision, a branch such as `main`, a tag,
+  or a short SHA is rejected, so an artifact can never depend on mutable
+  repository state. A remote source is read with bounded HTTP range requests; each
+  response's reported revision must equal the pinned one and the source identity
+  is re-checked before publication. The endpoint is `HIPFIRE_HF_BASE`, else
+  `HF_ENDPOINT`, else `https://huggingface.co`; a bearer token is taken from
+  `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN`.
+- **Production admission** is the pinned checkpoint: exactly 131 safetensors
+  shards and 1,658 source tensors (1,655 BF16 + 3 I64); the 333 vision-tower tensors
+  are not written, so the output has 1,325 entries.
+- **`--qwen4-component-mode`**: `production` (default) keeps those pinned counts.
+  `compact-fixture` is explicitly non-production: a bounded local fixture mode for
+  exercising the full transactional writer, with the production admission counts
+  (shards, source tensors, output entries) not applied.
+- **No legacy recipe flags.** The recipe is fixed by the Qwen4 manifest. The route
+  accepts only `--input`, `--output`, `--threads` and `--qwen4-component-mode`; any
+  other flag given explicitly on the command line (`--format`, `--imatrix`, AWQ,
+  symmetric-requant, `--tier`, `--fixed-tier`, `--hessian-dir`, …) is refused, not
+  ignored, with `--<flag> has no effect with --qwen4-flash-next; remove it`. It also
+  conflicts with `--flux-pipe`.
+- **Always** includes typed PLE metadata, all 128 PLE shards, and the native MTP
+  experts.
+- **Per-role formats** (`Qwen4Manifest::build`, `crates/hipfire-arch-qwen4/src/weights.rs`,
+  shared by producer and loader): routed experts gate/up MQ4G256V2 (qt 44, hidden
+  `K % 256 == 0`) and down MQ4G128V2 (qt 53, row-local per-128 groups; K = 640
+  cannot tile 256); `lm_head` MQ6G256V2 (qt 47); `embed_tokens` and the rank-2 trunk
+  attention/GDN projections Q8F16 (qt 3; developer env `HIPFIRE_QWEN4_TRUNK_TIER=mq6`
+  declares the trunk at MQ6G256V2 instead, see [env-vars.md](env-vars.md)); the 128
+  PLE n-gram shards Q8F16 rows; hyper-connection mixers and the MTP connector
+  matrices stay BF16; the three PLE hash arrays are raw I64 records (qt 54, not a
+  quantized weight). Exact stored bpw per format is in
+  [QUANTIZATION.md](QUANTIZATION.md#shipped-xts-artifacts); it counts group headers
+  only, not whole-model bpw.
+- **Transaction.** The index is planned from the safetensors headers, a temporary
+  file is written with bounded chunks, fsynced, source-identity checked, reopened
+  and validated against the plan, then published without replacing an existing
+  file (an existing `--output` is refused). A destination-capacity preflight
+  runs first; `HIPFIRE_QWEN4_CAPACITY_BYTES` overrides the available-bytes figure it
+  compares against. On success one `qwen4: wrote …` summary line (entries, experts,
+  PLE shards, resident / external PLE bytes, predicted size, scratch high-water) goes
+  to stderr.
+
+The direct producer does not claim to reproduce the shipped XTS file: the pinned
+Flash-Next XTS artifact is defined by size and SHA-256 in
+[AGENTS.md](../AGENTS.md) §5 (its experts are GPTQ-solved, a calibrated recipe this
+route does not read). Check any candidate against that pin before comparing results.
+
+### PLE row sidecars (`.ple-q4`, `.ple-q8`)
+
+The Flash-Next per-layer-embedding (PLE) n-gram table is 128 shard tensors of
+2,500,012 rows × 160 weights. The loader can read those rows from the artifact
+or from a sidecar next to the model file:
+
+| File | Rows | Stored bpw (group bytes × 8 ÷ weights) |
+|---|---|---:|
+| `<model>.ple-q8` | the exact Q8F16 rows (34 B per 32 weights) | 8.5 |
+| `<model>.ple-q4` | 4-bit Lloyd-Max rows derived from them; per 32-weight block an f16 scale + 16 B of labels (18 B) | 4.5 |
+
+A sidecar is bound to its base file (sha256 of the header and tensor index, and file
+size); the loader refuses a mismatched sidecar. Command surface (`crates/hipfire-cli/src/ple.rs`;
+full behavior in [CLI.md](CLI.md#flash-next-split-ple-layout)):
+
+```bash
+hipfire ple derive [--format q4] [--rank PATH] <model>   # write <model>.ple-q4 from the Q8 rows (q8 is not derivable)
+hipfire ple split  [--out PATH] [--keep-original] <model> # monolithic model -> <base> without PLE shards + <base>.ple-q8
+hipfire ple rebind --old-base PATH --new-base PATH --source PATH  # carry a q4 sidecar to a repacked base with identical embedded PLE rows
+hipfire pull <tag> --ple auto|q4|q8|all|none              # which sidecar(s) to download for a split registry entry
+```
+
+**Format selection** is `memory.ple_format` (`auto` \| `q4` \| `q8`, compat env
+`HIPFIRE_PLE_FORMAT`):
+
+- `auto` (default) resolves to **q4 only when the GPU architecture is exactly
+  `gfx1151`**, and to **q8 on every other architecture** (an unknown architecture
+  resolves to q8). `auto` never derives and never downloads: if the preferred file
+  is absent it uses the other format when present and prints a note.
+- `q4` always uses the 4-bit rows, deriving `<model>.ple-q4` from the local Q8 rows on
+  first load when it is missing (`hipfire ple derive` does it ahead of time).
+- `q8` always uses the exact rows. This is the opt-out from the q4 default on
+  gfx1151: set `HIPFIRE_PLE_FORMAT=q8` or `memory.ple_format = "q8"`. A split base
+  then needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`); a missing file is
+  refused with that hint, never substituted.
+
+`hipfire pull --ple none` only skips the download; it does not change which format
+the loader selects. Env and config reference:
+[CONFIG.md](CONFIG.md#qwen4-ple-row-tables), [env-vars.md](env-vars.md)
+(`HIPFIRE_PLE_FORMAT`).
+
+### Trunk overlay sidecar (`.trunk-overlay`)
+
+The zab trunk tier of the stock Flash-Next XTS artifact ships as
+`qwen3.8-flash-next.mq4-xts.trunk-overlay` (305,543,168 B) in
+`hipfire-models/qwen3.8-flash-next`, pinned in the client (not a registry schema
+change) to the stock base by exact size and SHA-256. `hipfire pull` fetches and verifies it next to the base
+for the four stock tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`); `hipfire rm`
+removes it, and listings never show it as a model. It is an HFQM container of
+pre-encoded symmetric QT44 (MQ4G256V2, qt 44) tensors that replace the base's MQ6
+`linear_attn.in_proj_{z,a,b}` matrices at load (108 tensors) and arm the trunk A4 default
+its manifest names, `gfx1151-zab-v1`.
+
+`HIPFIRE_QWEN4_TRUNK_OVERLAY` selects the policy: `auto` (default, also unset) applies a
+present sidecar **only on exact gfx1151**; `0` never applies it (kill switch: the
+stock base weights run); `1` applies it on any architecture (the A4 route itself
+still arms by default only on gfx1151); any other value fails the load. A sidecar
+that fails binding is refused with one log line and the base weights run.
+`HIPFIRE_QWEN4_TRUNK_IU4=0` disables the A4 route but keeps the overlaid weights.
+No speed or quality figure is claimed here; see [CONFIG.md](CONFIG.md#qwen4-trunk-overlay-sidecar),
+[CLI.md](CLI.md#flash-next-trunk-overlay) and [env-vars.md](env-vars.md).
+
+Build one from a base model and a directory of pre-encoded QT44 payloads
+(`<tensor name>.bin`, exactly the QT44 size `rows × (K/256) × 136` B; this command does
+not encode them):
+
+```bash
+hipfire-quantize trunk-overlay --base <base.hfq> --qt44-payload-dir <dir> \
+    --suffix <tensor-name-suffix> [--suffix ...] \
+    --trunk-iu4-default gfx1151-zab-v1 --output <base>.trunk-overlay
+```
+
+Base tensors whose names end with any `--suffix` are replaced. The sidecar binds to the
+base's file length and header/index digest, records the base's full sha256, is
+re-bound and re-read as a self-check, and refuses to overwrite an existing output; the
+report is printed as JSON on stdout. Source: `crates/hipfire-quantize/src/trunk_overlay.rs`,
+`crates/hipfire-runtime/src/trunk_overlay.rs`.
+
+### PLE hot-row tools
+
+Two offline, no-GPU subcommands build the optional hot-row store inputs
+(runtime budget: `memory.ple_hot_store_bytes`, off by default; see
+[CONFIG.md](CONFIG.md#memory)):
+
+```bash
+hipfire-quantize ple-hot-rank --model <MODEL.mq4> --out <MODEL.mq4>.plehot \
+    [--window 8192] [--threads N] [--counts-in FILE.u32 ...] <corpus.jsonl>...
+hipfire-quantize ple-hot-pack --model <MODEL.mq4> [--rank <MODEL.mq4>.plehot] \
+    [--out <rows>.plehotrows] [--ple-format q4|q8] [--gib 40] [--tier-group 5]
+```
+
+- `ple-hot-rank` tokenizes a JSONL corpus (`{"text": …}` encoded raw, or
+  `{"messages": […], "tools": […]?}` rendered with the model's chat template with thinking
+  off; unparseable lines are counted and skipped), scores each PLE row by how many
+  `--window`-token windows touch it, and writes the 256-bucket `<model>.plehot` rank
+  sidecar (bucket 0 = hottest). It needs at least one corpus file or `--counts-in`
+  (precomputed u32 little-endian per-row counts, summed into the score), and works on a
+  split base because it reads only metadata.
+- `ple-hot-pack` copies the hottest rows verbatim into `<rows source>.plehotrows`, in
+  tiers of `--tier-group` buckets (2–256, default 5). `--gib` (default 40) sets the
+  data budget; the number of kept buckets is the largest K ≤ 256 whose rows fit.
+  `--ple-format q4|q8` cuts from the `.ple-q4` / `.ple-q8` sidecar instead of the
+  model's embedded rows (it never derives; run `hipfire ple derive` first, and a
+  rank-order q4 table is its own pack and is refused).
+
+`hipfire rm` removes `.plehot` / `.plehotrows` with the model; they are never listed or
+served as models. Sources: `crates/hipfire-quantize/src/ple_hot_rank.rs`,
+`crates/hipfire-quantize/src/ple_hot_pack.rs`.
+
 ## Runtime cost
 
-CPU- and memory-bandwidth bound. Rough desktop wall times (order-of-magnitude,
-not a guarantee):
-
-| Model size | Wall time |
-|---|---|
-| ~1B | tens of seconds |
-| ~4B | ~1 min |
-| ~9B | a few minutes |
-| ~27B | several–tens of minutes |
-
-Peak RAM is roughly `max(tensor elements) × 4` (one tensor dequantized to f32).
+Quantization is CPU- and memory-bandwidth bound. Wall time and peak memory depend on
+tensor size, target format, calibration, and the thread cap, so no fixed numbers
+are given; run on a small model first to gauge cost, and lower the thread cap if
+the machine becomes memory-bandwidth constrained.
 
 ## Deprecated: CASK sidecar (removal in 0.5.0)
 
@@ -358,5 +526,7 @@ attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
   [quant-formats/ladder.md](quant-formats/ladder.md),
   [quant-formats/qt-register.txt](quant-formats/qt-register.txt)
 - Models / aliases: [MODELS.md](MODELS.md)
-- CLI surface: [CLI.md](CLI.md)
+- CLI surface: [CLI.md](CLI.md) (`hipfire ple`, `hipfire pull --ple`, trunk overlay pull)
+- Runtime controls for PLE sidecars and the trunk overlay: [CONFIG.md](CONFIG.md#qwen4-ple-row-tables),
+  [CONFIG.md](CONFIG.md#qwen4-trunk-overlay-sidecar), [env-vars.md](env-vars.md)
 - Sources: `crates/hipfire-cli/src/main.rs`, `crates/hipfire-quantize`

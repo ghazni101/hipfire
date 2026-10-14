@@ -1,8 +1,12 @@
 # What else the XDNA2 NPU could do for hipfire models — lever brainstorm
 
-NpuUsesBrainstorm, 2026-10-03. Research only; nothing here was run. Every number is tagged **M** (measured, with
+> **Historical research note: superseded by the 0.4.2 serving route.** This file records a lever brainstorm (research only, nothing run) for what else the NPU could do for hipfire models from the 2026-10 NPU research cycle. It is not current guidance, and any figure in it is a dated fixture-bound measurement or an explicitly labelled historical estimate, not a product claim. The shipped 0.4.2 NPU route is the Flash-Next gfx1151 trunk input projection described in [npu-trunk.md](npu-trunk.md): `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` (default `auto`, effectively `off` on every architecture except gfx1151), calibration schema 4, BF16-direct only. There is **no I32 serving contract** (no int32 partial, combine or fold exists in the product route). The out-projection program exists but is **not wired** into serving; `qsa.o` and the GDN o-projection are **not shipped**. Environment-variable names and flag syntax below are historical proposals or experiment switches, not supported configuration.
+>
+> Candidate levers here are unbuilt proposals. Env names written as "proposed" (`HIPFIRE_IU4_NPU_EC`, `HIPFIRE_QWEN4_SHARED_NPU`) were never implemented. `HIPFIRE_QWEN4_TRUNK_IU4` is a real, separate GPU IU4-trunk developer switch and is unrelated to the NPU route.
+
+2026-10-03. Research only; nothing here was run. Every number is tagged **M** (measured, with
 its source) or **E** (estimate / arithmetic on measured inputs). Paths: `npu/` = this repo; `W:` =
-`/home/kaden/ClaudeCode/warpfront/wt-land-041m` (hipfire beta f7960b4e8, read only); `R:` = `/home/kaden/qcal/release-0.4.1`.
+the 0.4.1 hipfire beta checkout (hipfire beta f7960b4e8, read only); `R:` = the 0.4.1 release-workspace measurement reports (not included in this repository).
 
 ## 0. The three walls every candidate hits (measured)
 
@@ -34,7 +38,7 @@ F16-expert route 0.066 → IU4 experts 0.1027: **the expert A4 costs +0.037**, t
 
 ## 1. Candidates
 
-### C1. Block-selective A8 "low half" for IU4 — residual GEMM on the NPU (the user's error-correction idea, sized)
+### C1. Block-selective A8 "low half" for IU4 — residual GEMM on the NPU (the proposed error-correction idea, sized)
 
 **Mechanism.** The A4 producer already forms `x' = FWHT256(x/awq)`, per-128 `amax`, the MSE-clip grid
 `d_j = (amax/7)·½·(1+j/7)` and `q = clamp(rint(x'/d), -8, 7)` (`W:kernels/src/block_i4_128_quant.hip:20-33,53-55,
@@ -44,14 +48,14 @@ outlier channels/heads — and those are static per tensor. The correction is `Y
 `C_lo,e = Σ_j W'[n][128e+j]·q_lo[t][128e+j]` over a **static block set S** (|S| ≈ 20 % of K), with `q_lo` the int4
 re-quant of `r'` (second plane, `d_lo = max|r'|/7`, emitted by the GPU producer: +1 nibble plane for S only). This is
 exactly hipfire's two-plane A8 integer identity restricted to S (`R:fn-wmo/w4a8-moe.md:60-71,95-102` **M design**),
-and the NPU core holds it exactly (`npu/pm-npu/src/kernels/iu4.rs:1-25,121` — silicon-exact partials,
+and the NPU core holds it exactly (`npu/peacemaker-npu/src/kernels/iu4.rs:1-25,121` — silicon-exact partials,
 `dense27b.md:69-77` **M**).
 
 **Numerics.** The correction is a *new* term: it needs **determinism, not parity with the GPU fold**. Fold it on the
 NPU with the all-integer epoch fold (`S·D` ≤ 32 bit, `C·(S·D)` into int64, one final RNE, `dense27b.md:189-207`
 **E**: 1.15–1.33× the GEMM) or bf16/fp32-acc (deterministic on a fixed program; exact-RNE-ness irrelevant). The GPU
 adds `Y_corr` (bf16 or f32) with one add in the IU4 epilogue → new PM-builder epilogue variant → **non-bit-exact,
-default-OFF, named kill switch** (proposed name only: `HIPFIRE_IU4_NPU_EC`), like `HIPFIRE_QWEN4_TRUNK_IU4`.
+default-OFF, named kill switch** (proposed name only, never implemented and not a supported variable: `HIPFIRE_IU4_NPU_EC`), like `HIPFIRE_QWEN4_TRUNK_IU4`.
 
 **Why the NPU and not the GPU.** The GPU can run the same S-blocks itself as extra K epochs at **+|S|/K ≈ +20 % of the
 corrected GEMM's time** (`A8Split128` machinery exists, `w4a8-moe.md:75-85`). The NPU version instead costs the GPU
@@ -100,11 +104,13 @@ does it for less than the NPU's contention cost**; the NPU has no role.
 S-captured energy** (output form, `W'_S` has rank ≤ 512). Unmeasured; §3 produces both curves from the GPTQ MQ4 trunk
 payloads (`R:fn-trunk-iu4/payloads/`, 240 tensors) and the dense `~/.hipfire/models/qwen3.8-27b.mq4*` weights.
 
-**Verdict.** Not an NPU lever. Hand "output-side low-rank selective-A8 correction" to a GPU seat as the cheapest
+**Verdict.** Not an NPU lever. Hand "output-side low-rank selective-A8 correction" to GPU-side work as the cheapest
 quality lever if §3 shows `f(S)` high and `W'_S` low-rank: ≈ +5 % GPU time on the corrected GEMMs for most of C1's
 quality gain, no NPU, no port traffic.
 
 ### C3. Deferred-add EC for residual writers (Flash-Next gdn.out, qsa.o) — full A8 low half, hidden behind the MoE block
+
+*Historical candidate: no NPU path for `qsa.o` or the GDN o-projection shipped in 0.4.2; the shipped trunk covers input projections only ([npu-trunk.md](npu-trunk.md)).*
 
 **Mechanism.** `gdn.out`/`qsa.o` outputs enter the residual (HC write); their next *unavoidable* consumer after the
 MoE block is the next layer's norm — ≈22 ms/layer of slack (`fn-halo-2500.md:41-43` **M**, 1048 ms/48). The NPU
@@ -159,7 +165,7 @@ layer = 192 ring ops ≈ 1 ms. GPU-alone alternative: shared expert as IU4 on th
 NPU's advantage is ≈ 30–50 ms **plus A8 instead of A4 quality**; against the exact BF16 baseline it is the full 180–200.
 
 **Numerics.** W8A8 is BF16-class error (int8 per-128 ≈ 2⁻⁸ relative, bf16 2⁻⁹); KLD cost **E ≤ +0.001–0.002**,
-unmeasured. Not bit-exact → opt-in kill switch (proposed `HIPFIRE_QWEN4_SHARED_NPU`). A bf16-VMAC fallback (exact
+unmeasured. Not bit-exact → opt-in kill switch (proposed name only, never implemented and not a supported variable: `HIPFIRE_QWEN4_SHARED_NPU`). A bf16-VMAC fallback (exact
 precision class, accumulation order only) exists in the ISA (`dense27b.md:114`) but its rate on our emitter is
 unmeasured; use it only if the A8 gate fails.
 
@@ -185,7 +191,7 @@ expert shapes was measured intercept-bound (`report.md:587-590`) — this lever 
 Already modelled: NPU owns ≈23 % of output features with its own fold at 26.9 TOPS → **+9.5…10.9 % step (E,
 `dense27b.md:160-165`)**; with IEF 19–22 TOPS → +4.9…7.9 % (`dense27b.md:208`). It was killed only under the
 bit-exact contract (`dense27b.md:173`). It is a *speed* lever; C1 is a *quality* lever; both saturate the 55 GB/s
-port, so they cannot run together at full rate. If the user admits a non-exact opt-in NPU route at all, this is the
+port, so they cannot run together at full rate. If a non-exact opt-in NPU route is admitted at all, this is the
 cheaper one to build (no producer change, no new numerics class beyond the fold) and it should be the control arm
 any EC claim is measured against.
 
@@ -217,7 +223,7 @@ The vision tower (27 layers, hidden 1152, intermediate 4304, 16 heads; `release-
 `vision_config` **M**) ≈ 411 M params (E); per 1024-patch image ≈ 1 TOP → NPU int8 ≈ 40 ms + attention/LN/GELU on
 the vector unit (unmeasured) vs GPU ≈ 20–25 ms (E at 40–57 F16 TOPS). It frees ≈ 1 decode token of GPU time per
 image and couples to nothing on the token chain; same shape of argument for a 100–300 M-param embedder (10–20 ms
-per query, E). Cost: a second inference stack on pm-npu (bf16 attention, norms, GELU, int8 GEMMs with deterministic
+per query, E). Cost: a second inference stack on peacemaker-npu (bf16 attention, norms, GELU, int8 GEMMs with deterministic
 folds) — the largest build in this list. Quality: int8 ViT/embedder is standard deployment practice, but OCR fidelity
 needs its own gate. **Unsized**: measure the tower's GPU ms/image on gfx1151 first; if < 25 ms it is not worth a stack.
 
@@ -258,15 +264,15 @@ Decode MoE share (≈1.2 GB expert bytes/token, E) on the NPU: ≤ 0.4 ms saved 
 |---|---|---|---|
 | 1 | **C5 shared expert W8A8 on NPU (Flash-Next)** | 180–200 ms/step (4–5 %), ≈0 contention, BF16-class quality | measured rates transfer; needs A8 quality gate + fold epilogue |
 | 2 | **C1 block-selective EC on NPU, dense 27B** | quality purchase: −`f`·0.028 KLD for ≈ +7 % step, ≈480–640 ms cheaper than GPU-alone selective A8 | lives or dies on `f(S)` from §3 |
-| 3 | **C6 dense-27B deterministic column split** | +9.5–10.9 % step (modelled) | control arm for any NPU route; needs user admission of non-exact opt-in |
+| 3 | **C6 dense-27B deterministic column split** | +9.5–10.9 % step (modelled) | control arm for any NPU route; needs admission of a non-exact opt-in |
 | 4 | C1/C3 EC on Flash-Next trunk | +70–170 ms/step (1.6–4 %) if `f ≥ 0.5` and family Δs add; C3 needs η ≥ 0.8 | marginal; GPU-only C2/C4 forms are better quality-per-ms |
 | 5 | C13 gfx1152 | unsized; ratio flips in the NPU's favour | needs a Krackan window, nothing else first |
 
 Drop now, with the numbers above: C7, C8, C9, C11, C12, C14 (bandwidth- or launch-floor-killed), C10 (right shape,
 wrong cost until a tower timing says otherwise). **Not NPU levers but the best EC findings:** C2 output-side low-rank
-selective-A8 and C4 expert partial-A8 — hand both to GPU seats.
+selective-A8 and C4 expert partial-A8 — hand both to GPU-side work.
 
-Plain answer to the user's question: the NPU is a 25–30 TOPS int8 engine behind a 55 GB/s straw. Error correction is
+Plain answer to the question this note set out to answer: the NPU is a 25–30 TOPS int8 engine behind a 55 GB/s straw. Error correction is
 a real use only where the GPU work it hides behind is long (dense 27B GEMMs, the Flash-Next MoE phase) and only as a
 quality purchase; tiny sidecars at decode are all slower on the NPU than on the GPU and sit on the token chain. The
 single best *speed* use found is a GEMM after all — the shared expert — because it is the one dense GEMM that is
