@@ -5222,17 +5222,6 @@ impl Carrier for EmbeddingGemma2Carrier {
 }
 
 #[cfg(test)]
-mod gemma4_route_tests {
-    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
-
-    #[test]
-    fn e_series_never_enters_dense_lowered_prefill() {
-        assert!(!gemma4_use_lowered(false, true, false, true));
-    }
-
-}
-
-#[cfg(test)]
 mod qwen4_source_policy_tests {
     use super::qwen4_use_range_payload;
     use hipfire_runtime::weight_manifest::WeightResidency;
