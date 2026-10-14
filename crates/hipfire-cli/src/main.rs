@@ -8206,6 +8206,16 @@ pub(crate) fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Files the quantizer writes BESIDE its trunk output, which an install or an
+/// upload has to carry along: today the arch-18 `.vl` tower pack (the vision
+/// and audio tower groups). Located with the loader's own probe, so an install
+/// and a later load can never disagree about which file that is.
+fn derived_packs(trunk: &std::path::Path) -> Vec<std::path::PathBuf> {
+    hipfire_runtime::sidecar::find_vl_sidecar(trunk)
+        .into_iter()
+        .collect()
+}
+
 fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     let quantizer = find_workspace_binary(paths, "hipfire-quantize").ok_or_else(|| {
         anyhow!(
@@ -8299,6 +8309,10 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     if args.install {
         fs::create_dir_all(&paths.models)?;
         for (_, output) in &mut produced {
+            // Packs the quantizer wrote BESIDE the trunk (the arch-18 `.vl`
+            // tower sidecar) must be located before `output` becomes the
+            // installed path.
+            let packs = derived_packs(output);
             let file = output
                 .file_name()
                 .ok_or_else(|| anyhow!("invalid output path {}", output.display()))?;
@@ -8310,6 +8324,25 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             }
             *output = fs::canonicalize(&destination).unwrap_or(destination);
             eprintln!("installed {}", output.display());
+            // Installing the trunk alone would leave a 1 GB tower pack in the
+            // caller's working directory and hand the user a text-only install
+            // (media refused with no tower): carry each derived pack over under
+            // its own name so it lands as the trunk's sibling.
+            for pack in packs {
+                let pack_file = pack
+                    .file_name()
+                    .ok_or_else(|| anyhow!("invalid sidecar path {}", pack.display()))?;
+                let pack_dst = paths.models.join(pack_file);
+                if fs::canonicalize(&pack_dst).ok().as_ref()
+                    != fs::canonicalize(&pack).ok().as_ref()
+                {
+                    fs::copy(&pack, &pack_dst)?;
+                }
+                eprintln!(
+                    "installed {}",
+                    fs::canonicalize(&pack_dst).unwrap_or(pack_dst).display()
+                );
+            }
         }
     }
     if let Some(repo) = args.upload.as_deref() {
@@ -8320,18 +8353,23 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             )?;
         }
         for (_, output) in &produced {
-            let file = output
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| anyhow!("invalid output filename"))?;
-            run_checked(
-                Command::new("hf")
-                    .arg("upload")
-                    .arg(repo)
-                    .arg(output)
-                    .arg(file),
-                "hf upload",
-            )?;
+            // The trunk plus everything the quantizer wrote beside it (the
+            // arch-18 `.vl` tower pack), so an upload is not a trunk-only
+            // artifact that loads text-only on the far side.
+            for path in std::iter::once(output.clone()).chain(derived_packs(output)) {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| anyhow!("invalid upload filename"))?;
+                run_checked(
+                    Command::new("hf")
+                        .arg("upload")
+                        .arg(repo)
+                        .arg(&path)
+                        .arg(name),
+                    "hf upload",
+                )?;
+            }
         }
     }
     if let Some(alias) = args.register {
@@ -11568,6 +11606,30 @@ mod tests {
         assert_eq!(params["vision"], vision_path.display().to_string());
         fs::remove_dir_all(&paths.root).unwrap();
     }
+    #[test]
+    pub(crate) fn derived_packs_finds_the_tower_pack_beside_the_trunk() {
+        // `hipfire quantize --install` must carry the arch-18 `.vl` pack the
+        // quantizer wrote beside the trunk: installing the trunk alone left the
+        // 1 GB pack in the caller's CWD and produced a text-only install (media
+        // refused with no tower), which is what the BYO flow hit.
+        let paths = test_paths("derived-packs");
+        fs::create_dir_all(&paths.root).unwrap();
+        let trunk = paths.root.join("embeddinggemma-2-q8f16.hfq");
+        fs::write(&trunk, b"trunk").unwrap();
+        assert!(
+            derived_packs(&trunk).is_empty(),
+            "a trunk with no pack has nothing to carry"
+        );
+        let pack = paths.root.join("embeddinggemma-2-q8f16.vl");
+        fs::write(&pack, b"towers").unwrap();
+        assert_eq!(derived_packs(&trunk), vec![pack.clone()]);
+        // A second stem's pack must not be picked up.
+        fs::write(paths.root.join("other.q8f16"), b"t").unwrap();
+        fs::write(paths.root.join("other.vl"), b"p").unwrap();
+        assert_eq!(derived_packs(&trunk), vec![pack]);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     #[test]
     pub(crate) fn embed_load_params_projects_the_vision_ladder() {
         // Regression: `embed` used to load with `{}`, so `vision.mode` never

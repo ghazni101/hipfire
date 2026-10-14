@@ -1906,6 +1906,34 @@
       "min_vram_gb": 24,
       "arch_id": 40,
       "desc": "FLUX.1-dev MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Guidance-distilled: 28 default steps (guidance_embed_dim 128). LOCAL-ONLY PLACEHOLDER: FLUX.1-dev is NCL and cannot be redistributed; dev packs are never uploaded to the Hub, so digest fields stay TBD."
+    },
+    "embeddinggemma-2:q8f16": {
+      "repo": "",
+      "file": "embeddinggemma-2-q8f16.hfq",
+      "vision": {
+        "file": "embeddinggemma-2-q8f16.hfq.vl",
+        "sha256": "f2f33f1ab332316a25cdae181e7513ac31649f6e8620539dad0d6a3546a6e300",
+        "size_bytes": 1015714560
+      },
+      "size_gb": 0.33,
+      "min_vram_gb": 2,
+      "desc": "EmbeddingGemma 2 (`google/embeddinggemma-2`) single-vector embedding encoder (arch 18): 24 bidirectional Gemma-4-family layers (sliding/full 5:1, per-layer head_dim/KV overrides, half-split RoPE, projection-only PLE, sandwich norms, `layer_scalar`), mean pool + L2 into the 768-d `embedding_projection`, Matryoshka 768/512/256/128 via the request's `dims`. **Not a chat model** — no LM head, served only through the non-chat `embed` verb (`hipfire embed`, `POST /v1/embeddings`). Text, image, audio and video: the checkpoint's vision and audio towers ride the `<trunk-stem>.vl` pack declared in `vision`, and the video leg drives that same vision tower per frame (no extra weights). Tower VRAM is opt-in — `vision_mode` defaults to `off` (text-only, media refused per modality); set `vision_mode=auto` to serve media. LOCAL-ONLY staged artifact, NOT uploaded/pullable: produced with `hipfire-quantize --input <google/embeddinggemma-2 snapshot> --output <this file> --format q8f16`, which writes the tower pack beside it; place both in the models directory. The digests are of the bytes that command reproduced, so a re-quantized artifact carries different ones. Parity against a float32 CPU transformers 5.19.0 reference (2e-2 rel-L2 band, `scripts/check_embeddinggemma2_parity.py`): text 2.2e-4-1.0e-3, images 2.7e-4-3.1e-3, audio 2.4e-4-2.6e-3, video 3.1e-4-4.9e-3 on the raw checkpoint; on this q8f16 trunk the worst fixture is 1.98e-2 against its 3e-2 band, and `scripts/check_embeddinggemma2_multislot.py` is bit-identical to the sequential route with mixed media in one batched forward.",
+      "sha256": "1cf20e1b933786c0ea9941da21bff6965e690f95466a0fb4c6fe9b5b70610bd9",
+      "size_bytes": 325527600
+    },
+    "embeddinggemma-2:mq4v2": {
+      "repo": "",
+      "file": "embeddinggemma-2-mq4v2.hfq",
+      "vision": {
+        "file": "embeddinggemma-2-mq4v2.hfq.vl",
+        "sha256": "93ff93da538be9da6d6a1e56c5feee5dcf0a36c53ded22eda25ea2ae97f101ec",
+        "size_bytes": 1015714560
+      },
+      "size_gb": 0.25,
+      "min_vram_gb": 2,
+      "desc": "EmbeddingGemma 2 (`google/embeddinggemma-2`) single-vector embedding encoder (arch 18): 24 bidirectional Gemma-4-family layers (sliding/full 5:1, per-layer head_dim/KV overrides, half-split RoPE, projection-only PLE, sandwich norms, `layer_scalar`), mean pool + L2 into the 768-d `embedding_projection`, Matryoshka 768/512/256/128 via the request's `dims`. **Not a chat model** — no LM head, served only through the non-chat `embed` verb (`hipfire embed`, `POST /v1/embeddings`). Text, image, audio and video: the checkpoint's vision and audio towers ride the `<trunk-stem>.vl` pack declared in `vision`, and the video leg drives that same vision tower per frame (no extra weights). Tower VRAM is opt-in — `vision_mode` defaults to `off` (text-only, media refused per modality); set `vision_mode=auto` to serve media. LOCAL-ONLY staged artifact, NOT uploaded/pullable: produced with `hipfire-quantize --input <google/embeddinggemma-2 snapshot> --output <this file> --format mq4v2`, which writes the tower pack beside it; place both in the models directory. The digests are of the bytes that command reproduced, so a re-quantized artifact carries different ones. Parity against a float32 CPU transformers 5.19.0 reference (2e-2 rel-L2 band, `scripts/check_embeddinggemma2_parity.py`): text 2.2e-4-1.0e-3, images 2.7e-4-3.1e-3, audio 2.4e-4-2.6e-3, video 3.1e-4-4.9e-3 on the raw checkpoint; on this mq4v2 trunk the worst fixture is 2.75e-1 against its 5e-1 band, and `scripts/check_embeddinggemma2_multislot.py` is bit-identical to the sequential route with mixed media in one batched forward.",
+      "sha256": "793e692303905fe54d3f65db7f0fe7d79bc07390f399a76a6aa6ef416819cc07",
+      "size_bytes": 253110320
     }
   },
   "aliases": {
@@ -1990,6 +2018,8 @@
     "muse-glimmer:30b": "muse-glimmer",
     "muse-glimmer:30b-draft": "muse-glimmer:draft",
     "muse-glimmer:30b:draft": "muse-glimmer:draft",
-    "muse-glimmer-30b:draft": "muse-glimmer:draft"
+    "muse-glimmer-30b:draft": "muse-glimmer:draft",
+    "embeddinggemma-2": "embeddinggemma-2:q8f16",
+    "embeddinggemma": "embeddinggemma-2:q8f16"
   }
 }

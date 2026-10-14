@@ -117,12 +117,17 @@ with mixed media in one forward, and `pre-commit-ci.sh` is green. Docs carry the
 formula-level ground truth ([`embeddinggemma2-tower-spec.md`](embeddinggemma2-tower-spec.md))
 with HF file:line references.
 
-- **Registry entry: not landed.** It requires the artifact to exist on
-  HuggingFace first (the trunk plus its `<trunk>.vl` pack, published under the
-  registry's naming rules); a row pointing at an unpublished artifact fails the
-  registry's own tests and misleads `hipfire pull`. `hipfire pull` also needs
-  the sidecar declared in the same row — the mechanism the DFlash draft sidecar
-  uses. Publish, then add the row.
+- **Registry entry: landed as a local-only row.** Publishing was never a
+  prerequisite: `repo: ""` is the registry's local-only shape (`pull` refuses
+  with "place \<file\> in \<models dir\>" instead of 404ing), which is how the
+  staged Flash-Next ZAB row already ships. `embeddinggemma-2:q8f16` (default,
+  also the `embeddinggemma-2` alias) and `embeddinggemma-2:mq4v2` declare their
+  `<trunk>.vl` pack in the `vision` slot with the real digests, and
+  `scripts/registry_gen.py` gained the arch-18 family mapping. Verified end to
+  end from `hipfire quantize <snapshot> --format q8f16 --install --register
+  embeddinggemma-2:q8f16` → `hipfire embed embeddinggemma-2:q8f16 --image/--audio/--video`
+  (all modalities within the tier's band). Publishing on HuggingFace would only
+  change `pull` from "place the file yourself" to "download it".
 - **Perf checkpoint: deliberately deferred.** No throughput or latency claim is
   made for these legs (the changelog's entry states parity, exactness and the
   quant bands only), and an append-only checkpoint with nothing to back would
