@@ -11,6 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ple_hot_store::NowaitRead;
+
 /// Metadata about a single tensor in a model file.
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
@@ -187,6 +189,14 @@ impl std::error::Error for SourceError {
 pub(crate) trait SourceReaderImpl: Send + Sync {
     fn identity(&self) -> &SourceIdentity;
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError>;
+    /// [`SourceReaderImpl::read_exact_at`] that completes only when every byte
+    /// is already in memory (`RWF_NOWAIT`) and otherwise reports
+    /// [`NowaitRead::WouldBlock`] without waiting for the device.  The checks
+    /// are those of `read_exact_at`; real I/O errors are returned.  The default
+    /// never serves a read, so callers use the blocking path.
+    fn read_nowait_at(&self, _offset: u64, _dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+        Ok(NowaitRead::WouldBlock)
+    }
     /// The bytes at `offset..offset + len` were uploaded and will not be read
     /// again by the load: a source whose page-cache policy evicts drops them
     /// (advice only; the default keeps them).
@@ -222,6 +232,15 @@ impl SourceReader {
     /// Read exactly `dst.len()` bytes at an absolute source-file offset.
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
         self.inner.read_exact_at(offset, dst)
+    }
+
+    /// See [`SourceReaderImpl::read_nowait_at`].
+    pub(crate) fn read_nowait_at(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        self.inner.read_nowait_at(offset, dst)
     }
 
     /// Immutable source seal checked by this reader.
@@ -291,6 +310,24 @@ impl SourceRangeDescriptor {
     /// Read a sub-range at an absolute source-file offset. Reads outside this
     /// descriptor are rejected even when they are valid in the backing file.
     pub fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
+        self.check_read_range(offset, dst.len())?;
+        self.reader.read_exact_at(offset, dst)
+    }
+
+    /// [`SourceRangeDescriptor::read_exact_at`] that only completes from memory
+    /// (see [`SourceReaderImpl::read_nowait_at`]); same range checks.
+    pub(crate) fn read_nowait_at(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        self.check_read_range(offset, dst.len())?;
+        self.reader.read_nowait_at(offset, dst)
+    }
+
+    /// Reject a read of `len` bytes at absolute `offset` outside this
+    /// descriptor.
+    fn check_read_range(&self, offset: u64, len: usize) -> Result<(), SourceError> {
         let desc_end = self
             .offset
             .checked_add(self.length)
@@ -298,7 +335,7 @@ impl SourceRangeDescriptor {
                 offset: self.offset,
                 length: self.length,
             })?;
-        let read_len = u64::try_from(dst.len()).map_err(|_| SourceError::Overflow {
+        let read_len = u64::try_from(len).map_err(|_| SourceError::Overflow {
             offset,
             length: u64::MAX,
         })?;
@@ -313,7 +350,7 @@ impl SourceRangeDescriptor {
                 source_len: desc_end,
             });
         }
-        self.reader.read_exact_at(offset, dst)
+        Ok(())
     }
 
     /// Read this descriptor's complete payload into a caller-owned buffer.
@@ -380,20 +417,7 @@ pub(crate) fn read_file_exact_at(
     dst: &mut [u8],
 ) -> Result<(), SourceError> {
     verify_path_identity(expected)?;
-    let length = u64::try_from(dst.len()).map_err(|_| SourceError::Overflow {
-        offset,
-        length: u64::MAX,
-    })?;
-    let end = offset
-        .checked_add(length)
-        .ok_or(SourceError::Overflow { offset, length })?;
-    if end > expected.len {
-        return Err(SourceError::RangeOutOfBounds {
-            offset,
-            length,
-            source_len: expected.len,
-        });
-    }
+    let length = check_file_range(expected, offset, dst.len())?;
     if dst.is_empty() {
         return Ok(());
     }
@@ -432,6 +456,46 @@ pub(crate) fn read_file_exact_at(
         done += n;
     }
     Ok(())
+}
+
+/// [`read_file_exact_at`] that completes only when every byte is already in the
+/// page cache (`preadv2(RWF_NOWAIT)`): the same identity and range checks, then
+/// `Done` with `dst` filled or `WouldBlock` (cache miss, short read, no
+/// `RWF_NOWAIT` support) with `dst` unspecified.  A real I/O error is returned.
+pub(crate) fn read_file_nowait_at(
+    file: &File,
+    expected: &SourceFileIdentity,
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<NowaitRead, SourceError> {
+    verify_path_identity(expected)?;
+    check_file_range(expected, offset, dst.len())?;
+    crate::ple_hot_store::read_nowait_at(file, offset, dst)
+        .map_err(|source| SourceError::Io { offset, source })
+}
+
+/// Bounds check shared by the exact and no-wait file reads: returns the read
+/// length as `u64`.
+fn check_file_range(
+    expected: &SourceFileIdentity,
+    offset: u64,
+    len: usize,
+) -> Result<u64, SourceError> {
+    let length = u64::try_from(len).map_err(|_| SourceError::Overflow {
+        offset,
+        length: u64::MAX,
+    })?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(SourceError::Overflow { offset, length })?;
+    if end > expected.len {
+        return Err(SourceError::RangeOutOfBounds {
+            offset,
+            length,
+            source_len: expected.len,
+        });
+    }
+    Ok(length)
 }
 
 /// Capture the cheap, immutable file identity used by source readers.

@@ -493,6 +493,101 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceE
     Ok(())
 }
 
+/// Result of a non-blocking positional read ([`read_nowait_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NowaitRead {
+    /// `dst` was filled completely from data already in memory.
+    Done,
+    /// Nothing usable was read: the bytes are not in the page cache (`EAGAIN`),
+    /// the read was short (including end of file), or the kernel/filesystem has
+    /// no `RWF_NOWAIT` support.  `dst` content is unspecified; the caller redoes
+    /// the whole read through its blocking path, which also reports a genuine
+    /// short read or error.
+    WouldBlock,
+}
+
+/// Set once the kernel or filesystem reported no `RWF_NOWAIT` support, so later
+/// reads skip the doomed syscall.  Capability only: real I/O errors never set it.
+static NOWAIT_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Read `dst.len()` bytes at `offset` with `preadv2(RWF_NOWAIT)`: the read
+/// completes only when every byte is already in the page cache, and never
+/// waits for the device.  `Ok(WouldBlock)` (see [`NowaitRead`]) covers a cache
+/// miss, a short read and missing `RWF_NOWAIT` support (`ENOSYS`,
+/// `EOPNOTSUPP`, `EINVAL`); every other errno is a real I/O error and is
+/// returned.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_nowait_at(file: &File, offset: u64, dst: &mut [u8]) -> io::Result<NowaitRead> {
+    if dst.is_empty() {
+        return Ok(NowaitRead::Done);
+    }
+    if NOWAIT_UNSUPPORTED.load(Ordering::Relaxed) {
+        return Ok(NowaitRead::WouldBlock);
+    }
+    let Ok(at) = libc::off_t::try_from(offset) else {
+        return Ok(NowaitRead::WouldBlock);
+    };
+    match nowait_probe(file, at, dst)? {
+        NowaitProbe::Read(read) => Ok(read),
+        NowaitProbe::Unsupported => {
+            NOWAIT_UNSUPPORTED.store(true, Ordering::Relaxed);
+            Ok(NowaitRead::WouldBlock)
+        }
+    }
+}
+
+/// One `preadv2(RWF_NOWAIT)` of a non-empty `dst` (see [`read_nowait_at`]),
+/// without the process-wide capability flag.
+#[cfg(target_os = "linux")]
+fn nowait_probe(file: &File, at: libc::off_t, dst: &mut [u8]) -> io::Result<NowaitProbe> {
+    let iov = libc::iovec {
+        iov_base: dst.as_mut_ptr().cast(),
+        iov_len: dst.len(),
+    };
+    loop {
+        // SAFETY: `iov` describes `dst`, exclusively borrowed for the call; the
+        // descriptor is open for the duration of the borrow of `file`.
+        let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, at, libc::RWF_NOWAIT) };
+        if n >= 0 {
+            return Ok(NowaitProbe::Read(if n as usize == dst.len() {
+                NowaitRead::Done
+            } else {
+                NowaitRead::WouldBlock
+            }));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) => return Ok(NowaitProbe::Read(NowaitRead::WouldBlock)),
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => {
+                return Ok(NowaitProbe::Unsupported)
+            }
+            _ => return Err(error),
+        }
+    }
+}
+
+/// Outcome of [`nowait_probe`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum NowaitProbe {
+    Read(NowaitRead),
+    /// The kernel or filesystem has no `RWF_NOWAIT` (`ENOSYS`, `EOPNOTSUPP`,
+    /// `EINVAL`).
+    Unsupported,
+}
+
+/// `RWF_NOWAIT` is Linux-only: elsewhere every read takes the blocking path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_nowait_at(_: &File, _: u64, _: &mut [u8]) -> io::Result<NowaitRead> {
+    Ok(NowaitRead::WouldBlock)
+}
+
+/// Test hook of [`HotRowStore::read_pack_nowait`]: `policy(offset)` true =
+/// served as if cached, false = would block.
+#[cfg(test)]
+pub(crate) type NowaitPolicy = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
 fn fadvise(file: &File, advice: libc::c_int) {
     // SAFETY: a valid open descriptor; advice only.
     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) };
@@ -692,6 +787,10 @@ pub struct HotRowStore {
     retouched: AtomicU64,
     /// The row store's fetch activity (see [`HotRowStore::bind_activity`]).
     activity: OnceLock<std::sync::Arc<FetchActivity>>,
+    /// Test hook: once set, [`HotRowStore::read_pack_nowait`] answers from the
+    /// policy instead of the kernel.
+    #[cfg(test)]
+    nowait_policy: OnceLock<NowaitPolicy>,
 }
 
 impl HotRowStore {
@@ -838,6 +937,8 @@ impl HotRowStore {
             load_filled: AtomicU64::new(0),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
+            #[cfg(test)]
+            nowait_policy: OnceLock::new(),
         }))
     }
 
@@ -938,6 +1039,8 @@ impl HotRowStore {
             load_filled: AtomicU64::new(0),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
+            #[cfg(test)]
+            nowait_policy: OnceLock::new(),
         }))
     }
 
@@ -1087,20 +1190,54 @@ impl HotRowStore {
 
     /// Read `dst.len()` bytes of the pack at absolute `offset`.
     pub fn read_pack(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
-        let end = offset
-            .checked_add(dst.len() as u64)
-            .ok_or(SourceError::Overflow {
-                offset,
-                length: dst.len() as u64,
-            })?;
+        self.check_pack_range(offset, dst.len())?;
+        read_exact_at(&self.pack, offset, dst)
+    }
+
+    /// [`HotRowStore::read_pack`] that only completes from the page cache
+    /// (`RWF_NOWAIT`, see [`read_nowait_at`]): the same range check, then
+    /// `Done` with `dst` filled or `WouldBlock` with `dst` unspecified.
+    pub(crate) fn read_pack_nowait(
+        &self,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<NowaitRead, SourceError> {
+        self.check_pack_range(offset, dst.len())?;
+        #[cfg(test)]
+        if let Some(policy) = self.nowait_policy.get() {
+            return if policy(offset) {
+                read_exact_at(&self.pack, offset, dst).map(|()| NowaitRead::Done)
+            } else {
+                dst.fill(0xA5);
+                Ok(NowaitRead::WouldBlock)
+            };
+        }
+        read_nowait_at(&self.pack, offset, dst)
+            .map_err(|source| SourceError::Io { offset, source })
+    }
+
+    fn check_pack_range(&self, offset: u64, len: usize) -> Result<(), SourceError> {
+        let end = offset.checked_add(len as u64).ok_or(SourceError::Overflow {
+            offset,
+            length: len as u64,
+        })?;
         if offset < self.data_offset || end > self.data_offset + self.data_bytes {
             return Err(SourceError::RangeOutOfBounds {
                 offset,
-                length: dst.len() as u64,
+                length: len as u64,
                 source_len: self.data_offset + self.data_bytes,
             });
         }
-        read_exact_at(&self.pack, offset, dst)
+        Ok(())
+    }
+
+    /// Install the test hook of [`HotRowStore::read_pack_nowait`] (once).
+    #[cfg(test)]
+    pub(crate) fn set_nowait_policy(&self, policy: NowaitPolicy) {
+        assert!(
+            self.nowait_policy.set(policy).is_ok(),
+            "nowait policy already installed"
+        );
     }
 
     /// Index of `row` inside tier `tier` (rows of the tier in ascending global
@@ -1795,6 +1932,96 @@ mod tests {
         assert!(store
             .read_pack(end - ENCODED_ROW_BYTES as u64, &mut bytes)
             .is_ok());
+    }
+
+    /// `preadv2(RWF_NOWAIT)` completes a read with the file's bytes or reports
+    /// `WouldBlock` (a cache miss, or no kernel/filesystem support: the host
+    /// decides which); it never returns other bytes and never completes a read
+    /// that runs past the end of the file.
+    #[test]
+    fn read_nowait_at_completes_with_the_file_bytes_or_would_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let data: Vec<u8> = (0..20_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = File::open(&path).unwrap();
+        for (offset, len) in [(0usize, 1usize), (3, 4093), (4096, 8192), (19_000, 1000)] {
+            let mut dst = vec![0xA5u8; len];
+            match read_nowait_at(&file, offset as u64, &mut dst).unwrap() {
+                NowaitRead::Done => assert_eq!(dst, data[offset..offset + len], "{offset}+{len}"),
+                NowaitRead::WouldBlock => {}
+            }
+        }
+        let mut dst = vec![0u8; 100];
+        assert_eq!(
+            read_nowait_at(&file, 19_950, &mut dst).unwrap(),
+            NowaitRead::WouldBlock,
+            "50 bytes remain: a short read is not a completed one"
+        );
+        assert_eq!(
+            read_nowait_at(&file, u64::MAX, &mut dst).unwrap(),
+            NowaitRead::WouldBlock
+        );
+        assert_eq!(
+            read_nowait_at(&file, 0, &mut []).unwrap(),
+            NowaitRead::Done
+        );
+    }
+
+    /// A failure that is not "no `RWF_NOWAIT` here" is returned, not turned
+    /// into a fallback that would hide it (`EBADF`: a descriptor not open for
+    /// reading).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nowait_probe_returns_real_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, [7u8; 64]).unwrap();
+        let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut dst = [0u8; 16];
+        let error = nowait_probe(&write_only, 0, &mut dst).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        let readable = File::open(&path).unwrap();
+        assert!(nowait_probe(&readable, 0, &mut dst).is_ok());
+    }
+
+    /// `read_pack_nowait` bounds-checks like `read_pack`, and under the test
+    /// hook serves (with the pack's bytes) or would block as the policy says.
+    #[test]
+    fn read_pack_nowait_checks_the_range_and_follows_the_policy() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 64, 5, 3);
+        let store = &fixture.store;
+        let mut bytes = vec![0u8; ENCODED_ROW_BYTES];
+        assert!(store.read_pack_nowait(0, &mut bytes).is_err());
+        let end = store.data_offset + store.data_bytes();
+        assert!(store.read_pack_nowait(end - 10, &mut bytes).is_err());
+
+        let serve = std::sync::Arc::new(AtomicBool::new(true));
+        let seen = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        {
+            let (serve, seen) = (serve.clone(), seen.clone());
+            store.set_nowait_policy(std::sync::Arc::new(move |offset: u64| {
+                seen.store(offset, Ordering::Release);
+                serve.load(Ordering::Acquire)
+            }));
+        }
+        let at = end - ENCODED_ROW_BYTES as u64;
+        let mut want = vec![0u8; ENCODED_ROW_BYTES];
+        store.read_pack(at, &mut want).unwrap();
+        assert_eq!(
+            store.read_pack_nowait(at, &mut bytes).unwrap(),
+            NowaitRead::Done
+        );
+        assert_eq!(bytes, want);
+        assert_eq!(seen.load(Ordering::Acquire), at);
+        serve.store(false, Ordering::Release);
+        assert_eq!(
+            store.read_pack_nowait(at, &mut bytes).unwrap(),
+            NowaitRead::WouldBlock
+        );
     }
 
     /// A pack cut from another rank, another model size, or other shard

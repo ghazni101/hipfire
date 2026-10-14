@@ -521,9 +521,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemm_mq4g256v2_wmma_gfx1151_xlds", kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds", "gemm_mq4g256v2_residual_wmma_gfx1151_xlds", "gemm_qkv_mq4g256v2_wmma_gfx1151_xlds", "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds"]);
         add!("gemm_mqv2_wmma_gfx1151_mw_lds", kernels::GEMM_MQV2_WMMA_GFX11_MW_LDS_SRC, ["gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds", "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds", "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"]);
         add!("gemv_hfq4g256_multirow_default_mq4v2", kernels::GEMV_MQ4G256V2_MULTIROW_SRC, ["gemv_mq4g256v2_multirow_r2", "gemv_mq4g256v2_multirow_r4", "gemv_mq4g256v2_multirow_r8"]);
+        add!("gemv_mq4g256v2_multirow_r2_x3", kernels::GEMV_MQ4G256V2_MULTIROW_R2_X3_SRC, ["gemv_mq4g256v2_multirow_r2_x3"]);
         add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
         add!("gemv_mq4g256v2_residual_row_serial_gfx1151", kernels::GEMV_MQ4G256V2_RESIDUAL_ROW_SERIAL_GFX1151_SRC, ["gemv_mq4g256v2_residual_row_serial_gfx1151"]);
         add!("qwen35_fa_prep_batched_gfx1151", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1151_SRC, ["qwen35_fa_prep_batched_gfx1151"]);
+        // Exact-gfx1151 Qwen4 decode MoE head (HIPFIRE_QWEN4_DECODE_HEAD_FUSE; =0 keeps the x4 + Q8_0 pair launches).
+        add!("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, ["gemv_bf16_xf32_x2_q8_0_k2560_staged_pair"]);
         add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
         add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
     }
@@ -559,8 +562,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151", kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC, [
             "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
         ]);
+        add!("gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs", kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_XS_GFX1151_SRC, ["gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151"]);
         add!("gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4", kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC, [
             "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4",
+        ]);
+        add!("gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe", kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_PIPE_GFX1151_SRC, [
+            "gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151",
         ]);
         add!("gemm_mq6g256v2_f32_rows", kernels::GEMM_MQ6G256V2_F32_ROWS_SRC, [
             "gemm_mq6g256v2_f32_rows_r2", "gemm_mq6g256v2_f32_rows_r3", "gemm_mq6g256v2_f32_rows_r4", "gemm_mq6g256v2_f32_rows_r5",
@@ -580,6 +587,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "ple_conv_add_bf16s", "ple_conv_add_bf16s_k4d3", "ple_gate_rows_bf16s", "ple_norm_inv",
         ]);
         add!("hc_streams_init_from_embed_batched", kernels::HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC, ["hc_streams_init_from_embed_batched"]);
+        add!("hyper_read_up_fused_twin", crate::tensor_ops::HYPER_READ_UP_FUSED_TWIN_SRC, ["hyper_read_up_fused_f32_sx"]);
         add!("moe_down_combine_grouped_top10", kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, [
             "moe_combine_order_top10", "moe_down_combine_grouped_top10", "moe_down_combine_grouped_top10_bf16in",
             "moe_down_combine_grouped_top10_bf16in_zinit",
@@ -1859,10 +1867,15 @@ mod tests {
         // builder module, not a hipcc entry), and the 27B AR route's plain q8
         // Q-resident v2 attention and `_gil_` slab sigmoid producer (ragged
         // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 145 keys plus the
-        // opt-in exact-K5120 gate/up twin and the Gemma 4 decode twins
+        // opt-in exact-K5120 gate/up twin, the O8×R16 X-in-LDS QT53 grouped-down twin
+        // (gfx1151-routed, packaged for every gfx11/gfx12 inventory like its
+        // O8×R16 sibling), the HC read tail twin `hyper_read_up_fused_twin`
+        // (gfx1151-routed, likewise packaged for every gfx11/gfx12 inventory),
+        // the O4×R8 pipe gate/up twin `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`
+        // (gfx1151-routed, likewise packaged) and the Gemma 4 decode twins
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 148, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 151, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

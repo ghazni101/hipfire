@@ -40,6 +40,19 @@ pub(crate) fn require_span(tensor: &GpuTensor, dims: &[usize], what: &str) -> Hi
     Ok(())
 }
 
+/// Kernel behind the Qwen4 grouped QT53 down launcher
+/// ([`Gpu::gemm_mq4g128v2_moe_grouped_top10`]); all three are bitwise equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoeDownKernel {
+    /// Portable generic kernel, one output row per workgroup.
+    Multirow,
+    /// gfx11+ exact-shape O8×R16 (one wave owns a 16-slot tile).
+    O8R16,
+    /// gfx1151 X-in-LDS twin of [`Self::O8R16`] (four waves share each
+    /// group's X).
+    XsTwin,
+}
+
 impl Gpu {
     /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
     /// outputs per (token, m) weighted by topk_weights, accumulates into
@@ -2803,7 +2816,20 @@ impl Gpu {
                 false,
             );
         }
-        let o8_r16 = self.arch_caps.has_gfx11_plus_simt() && m == 2560 && k == 640;
+        let kernel = if crate::gemm::qwen4_moe_down_twin_applies(
+            *crate::gemm::QWEN4_MOE_DOWN_TWIN,
+            self.arch_caps.is_gfx1151(),
+            m,
+            k,
+            x_row_div,
+            x_src_rows,
+        ) {
+            MoeDownKernel::XsTwin
+        } else if self.arch_caps.has_gfx11_plus_simt() && m == 2560 && k == 640 {
+            MoeDownKernel::O8R16
+        } else {
+            MoeDownKernel::Multirow
+        };
         self.gemm_mq4g128v2_moe_grouped_top10_with(
             expert_ptrs,
             expert_tile_ids,
@@ -2816,7 +2842,7 @@ impl Gpu {
             grouped_rows,
             x_src_rows,
             n_exp,
-            o8_r16,
+            kernel,
         )
     }
 
@@ -2972,23 +2998,36 @@ impl Gpu {
         grouped_rows: usize,
         x_src_rows: usize,
         n_exp: usize,
-        o8_r16: bool,
+        kernel: MoeDownKernel,
     ) -> HipResult<()> {
         require_span(y_grouped, &[grouped_rows, m, 4], "gemm_mq4g128v2_moe_grouped_top10 grouped rows")?;
-        let (func, source, grid_x) = if o8_r16 {
-            (
+        let (func, module, source, grid_x, grid_z, block_x) = match kernel {
+            MoeDownKernel::XsTwin => (
+                "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151",
+                "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_XS_GFX1151_SRC,
+                m.div_ceil(32),
+                1u32,
+                128u32,
+            ),
+            MoeDownKernel::O8R16 => (
+                "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
                 "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC,
                 m.div_ceil(8),
-            )
-        } else {
-            (
+                1u32,
+                32u32,
+            ),
+            MoeDownKernel::Multirow => (
+                "gemm_mq4g128v2_moe_grouped_top10_multirow",
                 "gemm_mq4g128v2_moe_grouped_top10_multirow",
                 kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC,
                 m,
-            )
+                1u32,
+                32u32,
+            ),
         };
-        self.ensure_kernel(func, source, func)?;
+        self.ensure_kernel(module, source, func)?;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();
@@ -3018,8 +3057,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
         let result = self.launch_maybe_blob(
             func,
-            [grid_x as u32, grouped_rows.div_ceil(16) as u32, 1],
-            [32, 1, 1],
+            [grid_x as u32, grouped_rows.div_ceil(16) as u32, grid_z],
+            [block_x, 1, 1],
             0,
             &mut params,
             || {
@@ -3805,21 +3844,22 @@ mod tests {
             .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
             .collect();
         let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
-        let mut run = |o8_r16: bool| {
+        let on_gfx1151 = gpu.arch_caps.is_gfx1151();
+        let mut run = |kernel: MoeDownKernel| {
             let sentinel = vec![f32::from_bits(0x7fc0_1234); GROUPED * M];
             let y = gpu
                 .upload_f32(&sentinel, &[sentinel.len()])
                 .expect("y upload");
             gpu.gemm_mq4g128v2_moe_grouped_top10_with(
-                &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, o8_r16,
+                &ptrs_gpu, &tiles_gpu, &slots_gpu, &x_gpu, &y, M, K, 1, GROUPED, SLOTS, 2, kernel,
             )
             .expect("down launch");
             let out = gpu.download_f32(&y).expect("y download");
             gpu.free_tensor(y).expect("free y");
             out
         };
-        let reference = run(false);
-        let candidate = run(true);
+        let reference = run(MoeDownKernel::Multirow);
+        let candidate = run(MoeDownKernel::O8R16);
         assert!(reference.iter().any(|v| v.is_finite() && *v != 0.0));
         let differing = reference
             .iter()
@@ -3830,6 +3870,18 @@ mod tests {
             differing, 0,
             "O8xR16 down differs from multirow in {differing} cells"
         );
+        if on_gfx1151 {
+            let twin = run(MoeDownKernel::XsTwin);
+            let twin_differing = candidate
+                .iter()
+                .zip(&twin)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                twin_differing, 0,
+                "X-in-LDS twin down differs from O8xR16 in {twin_differing} cells"
+            );
+        }
     }
 
     /// The fused grouped gate/up unscatter + SwiGLU must equal the unfused

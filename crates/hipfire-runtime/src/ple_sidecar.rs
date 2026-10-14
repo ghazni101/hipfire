@@ -53,14 +53,15 @@ use sha2::{Digest, Sha256};
 use crate::external_rows::RowEncoding;
 use crate::hfq::{HfqFile, HfqTensorInfo};
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, SourceError, SourceFileIdentity, SourceFormat,
+    capture_file_identity, read_file_exact_at, read_file_nowait_at, SourceError,
+    SourceFileIdentity, SourceFormat,
     SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl,
 };
 use crate::ple_convert::{derive_q4, PleProgress};
 use crate::ple_hot_pack::{
     read_ple_hot_pack_header, PackKind, PackOrder, PleHotPackHeader, PleTableFields,
 };
-use crate::ple_hot_store::HotRowStore;
+use crate::ple_hot_store::{HotRowStore, NowaitRead};
 
 /// Name of PLE shard `s` is `PLE_SHARD_PREFIX + s + PLE_SHARD_SUFFIX`.
 pub const PLE_SHARD_PREFIX: &str =
@@ -194,6 +195,10 @@ impl SourceReaderImpl for PleRowsReader {
 
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+
+    fn read_nowait_at(&self, offset: u64, dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+        read_file_nowait_at(&self.file, &self.file_identity, offset, dst)
     }
 }
 

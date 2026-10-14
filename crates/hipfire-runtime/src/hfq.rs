@@ -9,10 +9,12 @@ use crate::llama::{
 };
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::model_source::{
-    capture_file_identity, read_file_exact_at, verify_path_identity, ModelSource, SourceError,
+    capture_file_identity, read_file_exact_at, read_file_nowait_at, verify_path_identity,
+    ModelSource, SourceError,
     SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
     SourceReader, SourceReaderImpl,
 };
+use crate::ple_hot_store::NowaitRead;
 use crate::ple_sidecar::PleRowsFile;
 use crate::offload::LayerResidency;
 use crate::weight_backend::{
@@ -509,6 +511,13 @@ impl SourceReaderImpl for HfqRangeReader {
             verify_path_identity(expected)?;
         }
         read_file_exact_at(&self.file, &self.file_identity, offset, dst)
+    }
+
+    fn read_nowait_at(&self, offset: u64, dst: &mut [u8]) -> Result<NowaitRead, SourceError> {
+        for expected in &self.identity.files {
+            verify_path_identity(expected)?;
+        }
+        read_file_nowait_at(&self.file, &self.file_identity, offset, dst)
     }
 
     fn release_uploaded(&self, offset: u64, len: u64) {

@@ -72,6 +72,22 @@ name = "test_mq4v2_xlds_gfx1151"
 required-features = ["lab"]
 
 [[example]]
+name = "test_moe_down_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_gateup_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hc_read_up_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_qsa_hg12_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_moe_sym"
 required-features = ["lab"]
 

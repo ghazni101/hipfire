@@ -90,6 +90,13 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
     pub qwen4_router_fast: bool,
+    /// Exact single-token GDN a/b/z MQ4 projection fusion
+    /// (`HIPFIRE_QWEN4_DECODE_ZBA_X3`), default on only for gfx1151.
+    pub qwen4_decode_zba_x3: bool,
+    /// Exact single-token decode MoE head fusion (BF16 router/selector rows
+    /// plus the Q8_0 shared gate/up pair, `HIPFIRE_QWEN4_DECODE_HEAD_FUSE`),
+    /// default on only for gfx1151.
+    pub qwen4_decode_head_fuse: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -789,6 +796,10 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(exact_unit_default),
+            qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
+                .unwrap_or(arch == "gfx1151"),
+            qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
+                .unwrap_or(arch == "gfx1151"),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -1214,6 +1225,17 @@ impl FeatureFlags {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
+        self.qwen4_decode_zba_x3 && self.arch == "gfx1151"
+    }
+
+    /// Exact single-token decode MoE head fusion (`HIPFIRE_QWEN4_DECODE_HEAD_FUSE`):
+    /// the BF16 router/selector rows and the Q8_0 shared gate/up pair in one
+    /// launch. Exact gfx1151 only.
+    pub fn qwen4_decode_head_fuse_enabled(&self) -> bool {
+        self.qwen4_decode_head_fuse && self.arch == "gfx1151"
+    }
+
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 / gfx1201.
     pub fn qwen4_ple_fuse_enabled(&self) -> bool {
@@ -1356,6 +1378,8 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_decode_zba_x3: false,
+            qwen4_decode_head_fuse: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
@@ -1773,6 +1797,43 @@ mod tests {
                 if n == "HIPFIRE_QWEN4_ROUTER_FAST" { Ok("1".into()) } else { Err(()) }
             });
             assert_eq!(on.qwen4_router_fast_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The decode MoE head fusion defaults on for exact gfx1151 only; `0` turns it off.
+    #[test]
+    fn qwen4_decode_head_fuse_defaults_on_exact_gfx1151() {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            let exact = arch == "gfx1151";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_decode_head_fuse_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, |n| {
+                if n == "HIPFIRE_QWEN4_DECODE_HEAD_FUSE" { Ok("0".into()) } else { Err(()) }
+            });
+            assert!(!off.qwen4_decode_head_fuse_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, |n| {
+                if n == "HIPFIRE_QWEN4_DECODE_HEAD_FUSE" { Ok("1".into()) } else { Err(()) }
+            });
+            assert_eq!(on.qwen4_decode_head_fuse_enabled(), exact, "{arch}");
+        }
+    }
+
+    #[test]
+    fn qwen4_decode_zba_x3_defaults_on_exact_gfx1151() {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            let exact = arch == "gfx1151";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_decode_zba_x3_enabled(), exact, "{arch}");
+            for (value, expected) in [("0", false), ("1", exact)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_QWEN4_DECODE_ZBA_X3" {
+                        Ok(value.into())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.qwen4_decode_zba_x3_enabled(), expected, "{arch}");
+            }
         }
     }
 

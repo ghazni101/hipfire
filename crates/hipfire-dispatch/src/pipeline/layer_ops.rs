@@ -434,6 +434,47 @@ fn project_trunk_masked(
 ) -> Result<(), DispatchError> {
     debug_assert_eq!(a4.len(), projections.len());
     debug_assert!(covered.is_empty() || covered.len() == projections.len());
+    // Decode's MQ6 qkv and MQ4 a/b/z already share one aligned-256 FWHT.
+    // Keep qkv first; only replace the three independent MQ4 launches.
+    // A stored A4 mask / ZBA fold may be present at decode, but neither
+    // per-call IU4 route applies to this one-row F32 projection group.
+    if gdn_in_proj
+        && projections.len() == 4
+        && covered.iter().all(|&done| !done)
+        && rows == 1
+        && gpu.route_rows(rows) == 1
+        && gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.gemv_rows_default() == 2
+        && gpu.flags.qwen4_decode_zba_x3_enabled()
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && !gpu.qwen4_trunk_iu4_applies(rows)
+        && gpu.qwen4_trunk_iu4_ragged(rows).is_none()
+        && input.dtype == DType::F32
+    {
+        let (qkv, y_qkv) = projections[0];
+        let (a, y_a) = projections[1];
+        let (b, y_b) = projections[2];
+        let (z, y_z) = projections[3];
+        if qkv.dtype == DType::MQ6G256V2
+            && y_qkv.dtype == DType::F32
+            && [a, b, z].iter().all(|w| {
+                w.dtype == DType::MQ4G256V2
+                    && w.k == qkv.k
+                    // This shape takes a specialized non-r2 lm-head route.
+                    && !(w.m == 248_320 && w.k == 2_048)
+            })
+            && [y_a, y_b, y_z].iter().all(|y| y.dtype == DType::F32)
+        {
+            let elements = checked_mul(rows, qkv.k, "rotation scratch")?;
+            let x = view(rotation, 0, elements);
+            hip(gpu.rotate_x_mq(input, &x, qkv.k))?;
+            project_rotated(gpu, qkv, &x, y_qkv, rows)?;
+            return hip(gpu.gemv_mq4g256v2_multirow_r2_x3(
+                a.buf, y_a, a.m, b.buf, y_b, b.m, z.buf, y_z, z.m, &x, qkv.k,
+            ));
+        }
+    }
     let mut done: SmallVec<[bool; 4]> = if covered.is_empty() {
         SmallVec::from_elem(false, projections.len())
     } else { covered.iter().copied().collect() };

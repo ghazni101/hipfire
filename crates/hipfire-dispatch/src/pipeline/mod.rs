@@ -2981,27 +2981,57 @@ fn decode_gate_side_stage(
             // would: the BF16 ones share one launch, a Q8_0 gate/up pair
             // (recipe r2) shares another.
             let bf16_shared = shared_gate_w.dtype == DType::BF16;
-            let rows = |m: usize| if bf16_shared { m } else { 0 };
-            hip!(gpu.gemv_bf16_xf32_x4(
-                [
-                    (p.router.buf, p.router_logits, p.router.m),
-                    (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
-                    (shared_gate_w.buf, shared_gate, rows(shared_gate_w.m)),
-                    (shared_up_w.buf, shared_up, rows(shared_up_w.m)),
-                ],
-                p.x_norm,
-                p.router.k,
-            ))?;
-            if !bf16_shared {
-                hip!(gpu.gemv_q8_0_pair(
-                    shared_gate_w.buf,
-                    shared_up_w.buf,
-                    p.x_norm,
-                    shared_gate,
-                    shared_up,
+            // Exact gfx1151 decode (flag `qwen4_decode_head_fuse`): with a Q8_0
+            // gate/up pair at K = 2560 the two launches become one, every
+            // output row the incumbent's bitwise. Never under a recorder or a
+            // graph capture.
+            if !bf16_shared
+                && gpu.flags.qwen4_decode_head_fuse_enabled()
+                && p.batch_size == 1
+                && p.router.k == 2560
+                && shared_gate_w.m == shared_up_w.m
+                && !gpu.replay.is_recording()
+                && !gpu.graphs.capture_mode
+                && gpu.active_capture.is_none()
+                && gpu.hessian_capture.is_none()
+                && !moe_dump::enabled()
+                && hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").is_err()
+                && p.ep_mode == crate::families::moe::MoeEpMode::None
+                && p.ep_row_gather.is_none()
+            {
+                hip!(gpu.gemv_bf16_xf32_x2_q8_0_k2560_staged_pair(
+                    [
+                        (p.router.buf, p.router_logits, p.router.m),
+                        (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
+                    ],
+                    [(shared_gate_w.buf, shared_gate), (shared_up_w.buf, shared_up)],
                     shared_gate_w.m,
-                    shared_gate_w.k,
+                    p.x_norm,
+                    p.router.k,
                 ))?;
+            } else {
+                let rows = |m: usize| if bf16_shared { m } else { 0 };
+                hip!(gpu.gemv_bf16_xf32_x4(
+                    [
+                        (p.router.buf, p.router_logits, p.router.m),
+                        (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
+                        (shared_gate_w.buf, shared_gate, rows(shared_gate_w.m)),
+                        (shared_up_w.buf, shared_up, rows(shared_up_w.m)),
+                    ],
+                    p.x_norm,
+                    p.router.k,
+                ))?;
+                if !bf16_shared {
+                    hip!(gpu.gemv_q8_0_pair(
+                        shared_gate_w.buf,
+                        shared_up_w.buf,
+                        p.x_norm,
+                        shared_gate,
+                        shared_up,
+                        shared_gate_w.m,
+                        shared_gate_w.k,
+                    ))?;
+                }
             }
         } else {
             static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();

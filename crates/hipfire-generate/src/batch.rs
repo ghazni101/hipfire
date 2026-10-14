@@ -2617,6 +2617,7 @@ fn vmm_admission_render(
         &cold,
         &history,
         None,
+        hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
         "vmm-batch",
         None,
     ) {

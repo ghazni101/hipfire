@@ -3802,6 +3802,10 @@ pub struct Qwen4GpuForward {
     pub(crate) ple_ahead: Option<RowTicket>,
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
+    /// `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY` (default on), read once at
+    /// construction: whether `TokenReadback` queues the id copy at the
+    /// argmax instead of at the PLE read.
+    token_readback_early: bool,
     pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
@@ -3849,6 +3853,101 @@ pub struct Qwen4GpuForward {
 struct TokenReadback {
     stream: hip_bridge::Stream,
     event: hip_bridge::Event,
+    /// `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY`: pinned 4-byte landing for the
+    /// id copy that `enqueue` queues on `stream` right behind the argmax
+    /// event. `None` keeps the legacy sequence (host event wait, then a D2H
+    /// into a stack array, then a stream wait) at `read_token`.
+    pinned: Option<hip_bridge::PinnedTransferBuffer>,
+}
+
+// SAFETY: `TokenReadback` exclusively owns its stream, event and pinned id
+// buffer. `Stream` and `Event` are already `Send`; the pinned buffer's raw
+// stream handle is the same kind of opaque HIP handle, its `hipHostMalloc`
+// allocation has a single owner (no aliasing across threads) and its HIP
+// function pointers/library are thread-agnostic. Every use goes through
+// `&mut self`, so there is no concurrent access, and teardown drains the
+// stream first (`Qwen4GpuForward::free_gpu`, `PinnedTransferBuffer::drop`).
+unsafe impl Send for TokenReadback {}
+
+impl TokenReadback {
+    /// Stream, event and (when `early`) the pinned id buffer. A failure
+    /// destroys whatever this call already created.
+    fn create(hip: &hip_bridge::HipRuntime, early: bool) -> Result<Self, hip_bridge::HipError> {
+        let stream = hip.stream_create_non_blocking()?;
+        let event = match hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = hip.stream_destroy(stream);
+                return Err(error);
+            }
+        };
+        let pinned = if early {
+            match hip.transfer_buffer(std::mem::size_of::<i32>()) {
+                Ok(buffer) => Some(buffer),
+                Err(error) => {
+                    let _ = hip.event_destroy(event);
+                    let _ = hip.stream_destroy(stream);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            stream,
+            event,
+            pinned,
+        })
+    }
+
+    /// Record the argmax-done event on the compute stream. Early mode then
+    /// makes the readback stream wait on that event and queues the 4-byte id
+    /// copy into the pinned buffer, so `read_token` only drains this stream.
+    /// The copy reads `token_ids` after the event, i.e. the argmax this call
+    /// follows; every later writer of `token_ids` first runs
+    /// [`Self::complete`].
+    fn enqueue(
+        &mut self,
+        hip: &hip_bridge::HipRuntime,
+        token_ids: &hip_bridge::DeviceBuffer,
+        active: Option<&hip_bridge::Stream>,
+    ) -> Result<(), hip_bridge::HipError> {
+        hip.event_record(&self.event, active)?;
+        if let Some(pinned) = self.pinned.as_mut() {
+            hip.stream_wait_event(&self.stream, &self.event)?;
+            pinned.download_async(hip, token_ids, 0, std::mem::size_of::<i32>(), Some(&self.stream))?;
+        }
+        Ok(())
+    }
+
+    /// Drain a queued id copy (no-op when none is pending), so `token_ids`
+    /// may be rewritten and the pinned bytes read.
+    fn complete(&mut self, hip: &hip_bridge::HipRuntime) -> Result<(), hip_bridge::HipError> {
+        match self.pinned.as_mut() {
+            Some(pinned) => pinned.complete(hip),
+            None => Ok(()),
+        }
+    }
+
+    /// The id of the argmax `enqueue` followed. Early mode drains the queued
+    /// copy and reads the pinned bytes; otherwise the legacy event wait, D2H
+    /// and stream wait.
+    fn read_token(
+        &mut self,
+        hip: &hip_bridge::HipRuntime,
+        token_ids: &hip_bridge::DeviceBuffer,
+    ) -> Result<u32, hip_bridge::HipError> {
+        let mut bytes = [0u8; 4];
+        if let Some(pinned) = self.pinned.as_mut() {
+            pinned.complete(hip)?;
+            bytes.copy_from_slice(&pinned.as_bytes_mut()[..4]);
+        } else {
+            hip.event_synchronize(&self.event)?;
+            hip.memcpy_dtoh_async(&mut bytes, token_ids, Some(&self.stream))?;
+            hip.stream_synchronize(&self.stream)?;
+        }
+        Ok(i32::from_ne_bytes(bytes) as u32)
+    }
 }
 
 /// Environment knob naming the routing-trace output file (appended).
@@ -4282,6 +4381,10 @@ impl Qwen4GpuForward {
             ple_lookahead: Vec::new(),
             ple_ahead: None,
             token_readback: None,
+            token_readback_early: hipfire_config::developer_bool(
+                "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
+                true,
+            ),
             moe,
             decode_q8,
             route_trace,
@@ -4748,8 +4851,14 @@ impl Qwen4GpuForward {
                 first.get_or_insert(error);
             }
         }
-        if let Some(readback) = token_readback {
+        if let Some(mut readback) = token_readback {
+            // Drain the id copy first: the pinned buffer drops with `readback`.
+            let drained = match readback.pinned.as_mut() {
+                Some(pinned) => pinned.complete(&gpu.hip),
+                None => Ok(()),
+            };
             for result in [
+                drained,
                 gpu.hip.stream_synchronize(&readback.stream),
                 gpu.hip.stream_destroy(readback.stream),
                 gpu.hip.event_destroy(readback.event),
@@ -6059,6 +6168,11 @@ impl Qwen4GpuForward {
             }
             _ => tokens,
         };
+        // A queued early id copy still reads `token_ids`: drain it before this
+        // forward (or its HIP-body fill) overwrites them.
+        if let Some(readback) = self.token_readback.as_mut() {
+            readback.complete(&gpu.hip)?;
+        }
         let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
         // No claim on the device ids until this forward's own upload lands.
         self.uploaded_id_rows = 0;
@@ -6073,16 +6187,22 @@ impl Qwen4GpuForward {
                 },
             )?;
             if self.token_readback.is_none() {
-                self.token_readback = Some(TokenReadback {
-                    stream: gpu.hip.stream_create_non_blocking()?,
-                    event: gpu
-                        .hip
-                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
-                });
+                self.token_readback = Some(TokenReadback::create(
+                    &gpu.hip,
+                    self.token_readback_early,
+                )?);
             }
-            if let Some(readback) = self.token_readback.as_ref() {
-                gpu.hip
-                    .event_record(&readback.event, gpu.active_stream.as_ref())?;
+            if let Some(readback) = self.token_readback.as_mut() {
+                if let Err(error) = readback.enqueue(
+                    &gpu.hip,
+                    &self.scratch.token_ids.buf,
+                    gpu.active_stream.as_ref(),
+                ) {
+                    // The copy may already be queued (marked pending before
+                    // submission): retire it, keeping the enqueue error.
+                    let _ = readback.complete(&gpu.hip);
+                    return Err(error.into());
+                }
             }
         } else {
             for (index, token) in tokens.iter().copied().enumerate() {
@@ -6110,21 +6230,33 @@ impl Qwen4GpuForward {
                 }
             }
         }
-        let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
         let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
         let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
-        execute_embedding(
-            gpu,
-            &EmbeddingOp {
-                table: embedding,
-                rotated: &embedding_rot,
-                token_ids: &ids,
-                output: &embeddings,
-                rows: n,
-                dim: config.hidden_size,
-            },
-        )
-        .map_err(|e| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {e:?}")))?;
+        // Every fallible step between the readback enqueue and the `attempt`
+        // closure: on failure retire the queued id copy (keeping the original
+        // error) so a caller's lane/NPU path may rewrite `token_ids`.
+        let embedded = (|| -> Result<(), Qwen4GpuForwardError> {
+            let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
+            execute_embedding(
+                gpu,
+                &EmbeddingOp {
+                    table: embedding,
+                    rotated: &embedding_rot,
+                    token_ids: &ids,
+                    output: &embeddings,
+                    rows: n,
+                    dim: config.hidden_size,
+                },
+            )
+            .map_err(|e| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {e:?}")))?;
+            Ok(())
+        })();
+        if let Err(error) = embedded {
+            if let Some(readback) = self.token_readback.as_mut() {
+                let _ = readback.complete(&gpu.hip);
+            }
+            return Err(error);
+        }
 
         let next_history = bundle.state.ple_history;
         let next_position = bundle.state.position;
@@ -6183,7 +6315,7 @@ impl Qwen4GpuForward {
                 .position(|step| matches!(step, Step::GroupedDepthwise(_)))
                 .filter(|_| n > 1 || device_token.is_some());
             let deferred = ple_split.is_some();
-            let readback = self.token_readback.as_ref();
+            let mut readback = self.token_readback.as_mut();
             let token_ids = &self.scratch.token_ids;
             let history = &bundle.state.ple_history;
             let ple_metadata = bundle.ple.as_ref().map(|owner| &owner.metadata);
@@ -6197,14 +6329,10 @@ impl Qwen4GpuForward {
                     // The argmax this forward enqueued first: wait for it alone
                     // and read its id on a stream independent of the layers
                     // enqueued since.
-                    let readback =
-                        readback.ok_or_else(|| invalid("Qwen4 token readback missing"))?;
-                    gpu.hip.event_synchronize(&readback.event)?;
-                    let mut bytes = [0u8; 4];
-                    gpu.hip
-                        .memcpy_dtoh_async(&mut bytes, &token_ids.buf, Some(&readback.stream))?;
-                    gpu.hip.stream_synchronize(&readback.stream)?;
-                    let token = i32::from_ne_bytes(bytes) as u32;
+                    let readback = readback
+                        .as_deref_mut()
+                        .ok_or_else(|| invalid("Qwen4 token readback missing"))?;
+                    let token = readback.read_token(&gpu.hip, &token_ids.buf)?;
                     if token as usize >= vocab {
                         return Err(invalid(
                             "Qwen4 token id is outside the embedding vocabulary",
@@ -6624,6 +6752,16 @@ impl Qwen4GpuForward {
             drop(steps);
             Ok(qsa_commits)
         })();
+        // Whatever way the attempt ended, no early id copy outlives the
+        // forward: lanes, MTP and the NPU trunk write `token_ids` unfenced.
+        let drained = match self.token_readback.as_mut() {
+            Some(readback) => readback.complete(&gpu.hip),
+            None => Ok(()),
+        };
+        let attempt = match (attempt, drained) {
+            (Ok(_), Err(error)) => Err(error.into()),
+            (attempt, _) => attempt,
+        };
         let read_tokens: [u32; 1];
         let tokens = match device_read {
             Some(token) => {

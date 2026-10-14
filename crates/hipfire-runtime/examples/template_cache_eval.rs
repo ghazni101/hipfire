@@ -20,11 +20,16 @@
 //!
 //! Usage (authoritative Harmony/Onyx gate):
 //!   template_cache_eval <model.mq4> --harmony [--perturb none|drop-reasoning-envelope|corrupt-tool-body-token]
+//!
+//! Usage (GPU-free Qwen XML tool-turn splice oracle; replays a 3-request agent conversation
+//! through the production Qwen4 Jinja render, plain vs `ToolTurnSplice::WholeBody`):
+//!   template_cache_eval --qwen-tool-turns <metadata.json>
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::{
-    build_cached_history_jinja, hf_tojson, CachedAssistantBody, CachedAssistantToolBody,
-    CachedAssistantTurn, JinjaChatFrame, Message, Role, ToolCall,
+    build_cached_history_jinja, build_cached_history_jinja_with, cached_producer_reasoning_text,
+    hf_tojson, CachedAssistantBody, CachedAssistantToolBody, CachedAssistantTurn, JinjaChatFrame,
+    Message, Role, ToolCall, ToolTurnSplice,
 };
 use hipfire_runtime::tokenizer::Tokenizer;
 use minijinja::{context, Environment, Error, ErrorKind, Value};
@@ -752,8 +757,319 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// Qwen tool-turn oracle (`--qwen-tool-turns`): GPU-free replay of a 3-request
+// agent conversation through the production Qwen4 Jinja render, comparing the
+// per-request prior consumed stream (prompt ++ generated body ++ <|im_end|>)
+// with the `Envelopes` (plain re-render) and `WholeBody` cached renders.
+// ---------------------------------------------------------------------------
+struct ToolTurnRow {
+    thinking: &'static str,
+    tok: &'static str,
+    request: usize,
+    prior_len: usize,
+    lcp_plain: usize,
+    lcp_wholebody: usize,
+    strict_plain: bool,
+    strict_wholebody: bool,
+}
+
+fn tt_msg(role: Role, content: &str, reasoning: Option<&str>) -> Message {
+    Message {
+        role,
+        content: content.to_string(),
+        reasoning_content: reasoning.map(|s| s.to_string()),
+        name: None,
+        rendered_name: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_plan: String::new(),
+    }
+}
+
+fn tt_call_text(name: &str, key: &str, value: &str) -> String {
+    format!(
+        "<tool_call>\n<function={name}>\n<parameter={key}>\n{value}\n</parameter>\n</function>\n</tool_call>"
+    )
+}
+
+/// Generated-body ids. Canonical = one whole-text encode. Non-canonical =
+/// each line encoded separately with newlines as their own encode, so BPE
+/// merges across line boundaries (`\n\n`, `>\n`, ...) differ from the
+/// whole-text encode — the tokenization a sampler can emit but the encoder
+/// would not reproduce. A body with no merge across a line boundary (e.g. a
+/// single tool call with no blank line) encodes identically per line, so each
+/// line is then additionally split at its midpoint; the result is asserted to
+/// differ from the canonical encode either way.
+fn tt_body_ids(tok: &Tokenizer, text: &str, canonical: bool) -> Result<Vec<u32>, String> {
+    let whole = tok.encode(text);
+    if canonical {
+        return Ok(whole);
+    }
+    let encode_lines = |split_midpoint: bool| -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                ids.extend(tok.encode("\n"));
+            }
+            if line.is_empty() {
+                continue;
+            }
+            if split_midpoint {
+                let mut mid = line.len() / 2;
+                while !line.is_char_boundary(mid) {
+                    mid += 1;
+                }
+                let (a, b) = line.split_at(mid);
+                for piece in [a, b] {
+                    if !piece.is_empty() {
+                        ids.extend(tok.encode(piece));
+                    }
+                }
+            } else {
+                ids.extend(tok.encode(line));
+            }
+        }
+        ids
+    };
+    for split_midpoint in [false, true] {
+        let ids = encode_lines(split_midpoint);
+        if ids != whole {
+            return Ok(ids);
+        }
+    }
+    Err(format!(
+        "non-canonical tokenization equals canonical for body {text:?}; the oracle would not discriminate"
+    ))
+}
+
+fn tt_filler(prefix: &str, lines: usize) -> String {
+    (0..lines)
+        .map(|i| format!("{prefix}_{i}: fn handler_{i}(input: u32) -> u32 {{ input.wrapping_mul({}) }}", i + 3))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn simulate_qwen_tool_turns(
+    tok: &Tokenizer,
+    template: &str,
+    thinking: bool,
+    canonical: bool,
+    tools: &[serde_json::Value],
+) -> Result<Vec<ToolTurnRow>, String> {
+    let frame = JinjaChatFrame {
+        tokenizer: tok,
+        template,
+        system: None,
+        user: "",
+        enable_thinking: thinking,
+        bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: None,
+    };
+    let im_end = tok
+        .special_token_id("<|im_end|>")
+        .ok_or("tokenizer has no <|im_end|>")?;
+    // (reasoning text, prose before the call, call name, arg key, arg value, tool result)
+    let turns: [(&str, &str, &str, &str, &str, String); 2] = [
+        (
+            "The user wants the failing test fixed. I should read the source file first.",
+            "",
+            "read_file",
+            "path",
+            "src/lib.rs",
+            tt_filler("file", 9),
+        ),
+        (
+            "The file looks fine at a glance. Now I should run the tests to see the failure.",
+            "I'll run the tests.",
+            "run_tests",
+            "filter",
+            "parse",
+            tt_filler("test", 9),
+        ),
+    ];
+    let mut messages = vec![
+        tt_msg(Role::System, "You are a coding agent.", None),
+        tt_msg(Role::User, "Fix the failing parse test.", None),
+    ];
+    let render_ids = |msgs: &[Message]| -> Result<(Vec<u32>, bool), String> {
+        let text = frame.render_messages(msgs, Some(tools), None)?;
+        Ok((tok.encode(&text), text.ends_with("<think>\n")))
+    };
+    let (mut prompt, started_in_think) = render_ids(&messages)?;
+    if started_in_think != thinking {
+        return Err(format!(
+            "generation prompt primer ({started_in_think}) disagrees with enable_thinking ({thinking})"
+        ));
+    }
+    // asst_turn_cache stand-in: keyed by the call's identity (name + arguments).
+    let mut entries: Vec<(String, serde_json::Value, CachedAssistantTurn)> = Vec::new();
+    let mut rows = Vec::new();
+    for (k, (reasoning, prose, name, key, value, result)) in turns.iter().enumerate() {
+        let call = tt_call_text(name, key, value);
+        let prose_part = if prose.is_empty() {
+            String::new()
+        } else {
+            format!("{prose}\n\n")
+        };
+        let body_text = if thinking {
+            format!("{reasoning}\n</think>\n\n{prose_part}{call}")
+        } else {
+            format!("{prose_part}{call}")
+        };
+        let body = tt_body_ids(tok, &body_text, canonical)?;
+        let mut consumed = prompt.clone();
+        consumed.extend_from_slice(&body);
+        consumed.push(im_end);
+        // Production cache entry shape (`qwen_cached_turn_entry`).
+        let reasoning_text = cached_producer_reasoning_text(tok, &body, started_in_think);
+        let entry = CachedAssistantTurn {
+            reasoning: reasoning_text.clone().map(|text| CachedAssistantBody {
+                token_ids: Vec::new(),
+                text,
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: body.clone(),
+                text: String::new(),
+            }),
+        };
+        let arguments = serde_json::json!({ *key: *value });
+        entries.push((name.to_string(), arguments.clone(), entry));
+        // API echo of the turn: visible content, reasoning channel, parsed call.
+        let mut assistant = tt_msg(Role::Assistant, prose, reasoning_text.as_deref());
+        assistant.tool_calls = vec![ToolCall {
+            id: Some(format!("call_{k}")),
+            name: name.to_string(),
+            arguments,
+            rendered_body: None,
+        }];
+        let mut tool_result = tt_msg(Role::Tool, result, None);
+        tool_result.tool_call_id = Some(format!("call_{k}"));
+        messages.push(assistant);
+        messages.push(tool_result);
+
+        let lookup = |m: &Message| -> Option<CachedAssistantTurn> {
+            if m.role != Role::Assistant {
+                return None;
+            }
+            let c = m.tool_calls.first()?;
+            entries
+                .iter()
+                .find(|(n, a, _)| *n == c.name && *a == c.arguments)
+                .map(|(_, _, e)| e.clone())
+        };
+        let plain = build_cached_history_jinja_with(
+            &frame,
+            &messages,
+            Some(tools),
+            ToolTurnSplice::Envelopes,
+            lookup,
+        )?;
+        let whole = build_cached_history_jinja_with(
+            &frame,
+            &messages,
+            Some(tools),
+            ToolTurnSplice::WholeBody,
+            lookup,
+        )?;
+        let lcp_plain = lcp(&consumed, &plain);
+        let lcp_wholebody = lcp(&consumed, &whole);
+        rows.push(ToolTurnRow {
+            thinking: if thinking { "on" } else { "off" },
+            tok: if canonical { "canonical" } else { "noncanonical" },
+            request: k + 2,
+            prior_len: consumed.len(),
+            lcp_plain,
+            lcp_wholebody,
+            strict_plain: lcp_plain == consumed.len() && plain.len() > consumed.len(),
+            strict_wholebody: lcp_wholebody == consumed.len() && whole.len() > consumed.len(),
+        });
+        // The engine feeds the WholeBody render as the next request's prompt.
+        prompt = whole;
+    }
+    Ok(rows)
+}
+
+fn run_qwen_tool_turns(meta_path: &Path) -> Result<Vec<ToolTurnRow>, String> {
+    let json = std::fs::read_to_string(meta_path).map_err(|e| format!("read {meta_path:?}: {e}"))?;
+    let tok = Tokenizer::from_hfq_metadata(&json).map_err(|e| format!("tokenizer: {e:?}"))?;
+    let meta: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("metadata json: {e}"))?;
+    let template = meta["tokenizer_config"]["chat_template"]
+        .as_str()
+        .ok_or("metadata has no tokenizer_config.chat_template string")?;
+    let tools = vec![
+        serde_json::json!({"type": "function", "function": {
+            "name": "read_file",
+            "description": "Read a file from the workspace.",
+            "parameters": {"type": "object",
+                "properties": {"path": {"type": "string", "description": "Workspace-relative path"}},
+                "required": ["path"]}}}),
+        serde_json::json!({"type": "function", "function": {
+            "name": "run_tests",
+            "description": "Run the test suite.",
+            "parameters": {"type": "object",
+                "properties": {"filter": {"type": "string", "description": "Test name filter"}},
+                "required": ["filter"]}}}),
+    ];
+    eprintln!(
+        "tool result sizes: {} / {} tokens",
+        tok.encode(&tt_filler("file", 9)).len(),
+        tok.encode(&tt_filler("test", 9)).len()
+    );
+    let mut rows = Vec::new();
+    for thinking in [false, true] {
+        for canonical in [true, false] {
+            rows.extend(simulate_qwen_tool_turns(&tok, template, thinking, canonical, &tools)?);
+        }
+    }
+    Ok(rows)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Qwen tool-turn mode: template_cache_eval --qwen-tool-turns <metadata.json>
+    if let Some(idx) = args.iter().position(|a| a == "--qwen-tool-turns") {
+        let Some(meta_path) = args.get(idx + 1) else {
+            eprintln!("usage: template_cache_eval --qwen-tool-turns <metadata.json>");
+            std::process::exit(2);
+        };
+        match run_qwen_tool_turns(Path::new(meta_path)) {
+            Ok(rows) => {
+                let mut failing = 0usize;
+                for r in &rows {
+                    println!(
+                        "qwen_tool_turns thinking={} tok={} request={} prior_len={} lcp_plain={} \
+                         lcp_wholebody={} strict_extension_plain={} strict_extension_wholebody={}",
+                        r.thinking,
+                        r.tok,
+                        r.request,
+                        r.prior_len,
+                        r.lcp_plain,
+                        r.lcp_wholebody,
+                        r.strict_plain,
+                        r.strict_wholebody
+                    );
+                    if !r.strict_wholebody {
+                        failing += 1;
+                    }
+                }
+                if failing == 0 {
+                    println!("oracle_result=PASS");
+                    std::process::exit(0);
+                }
+                eprintln!("{failing} WholeBody row(s) are not a strict extension of the consumed stream");
+                println!("oracle_result=FAIL");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("qwen tool-turn oracle error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Harmony mode: template_cache_eval <model.mq4> --harmony [--perturb ...]
     let harmony_idx = args.iter().position(|a| a == "--harmony");

@@ -12119,6 +12119,99 @@ impl Gpu {
         result
     }
 
+    /// Fused three-matrix MQ4G256V2 R=2 GEMV over one shared rotated F32 `x`
+    /// (`y_i = A_i · x`, `A_i` is `[m_i, k]`): ONE `gemv_mq4g256v2_multirow_r2_x3`
+    /// launch, grid `sum ceil(m_i / 2)`, block 32. Every matrix runs the exact
+    /// `gemv_mq4g256v2_multirow_r2` body, so each `y_i` is bit-identical to a
+    /// separate r2 launch. It lives in its own module `gemv_mq4g256v2_multirow_r2_x3`
+    /// (`GEMV_MQ4G256V2_MULTIROW_R2_X3_SRC`), leaving the incumbent source pinned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256v2_multirow_r2_x3(
+        &mut self,
+        a0: &GpuTensor,
+        y0: &GpuTensor,
+        m0: usize,
+        a1: &GpuTensor,
+        y1: &GpuTensor,
+        m1: usize,
+        a2: &GpuTensor,
+        y2: &GpuTensor,
+        m2: usize,
+        x: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "gemv_mq4g256v2_multirow_r2_x3";
+        self.bind_thread()?;
+        if k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHAT}: K must be a positive multiple of 256 (got {k})"),
+            ));
+        }
+        let blocks = m0.div_ceil(2) + m1.div_ceil(2) + m2.div_ceil(2);
+        if blocks == 0 || [m0, m1, m2, k].iter().any(|&v| v > i32::MAX as usize) || blocks > u32::MAX as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHAT}: invalid shape m0={m0} m1={m1} m2={m2} k={k}"),
+            ));
+        }
+        self.ensure_kernel(WHAT, kernels::GEMV_MQ4G256V2_MULTIROW_R2_X3_SRC, WHAT)?;
+        let a0_ptr = a0.buf.as_ptr();
+        let y0_ptr = y0.buf.as_ptr();
+        let a1_ptr = a1.buf.as_ptr();
+        let y1_ptr = y1.buf.as_ptr();
+        let a2_ptr = a2.buf.as_ptr();
+        let y2_ptr = y2.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let m0_val = m0 as i32;
+        let m1_val = m1 as i32;
+        let m2_val = m2 as i32;
+        let k_val = k as i32;
+        let mut params: [*mut c_void; 11] = [
+            &a0_ptr as *const _ as *mut c_void,
+            &y0_ptr as *const _ as *mut c_void,
+            &m0_val as *const _ as *mut c_void,
+            &a1_ptr as *const _ as *mut c_void,
+            &y1_ptr as *const _ as *mut c_void,
+            &m1_val as *const _ as *mut c_void,
+            &a2_ptr as *const _ as *mut c_void,
+            &y2_ptr as *const _ as *mut c_void,
+            &m2_val as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m0, k)
+            + crate::profile::gemv_hfq4g256_bytes(m1, k)
+            + crate::profile::gemv_hfq4g256_bytes(m2, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", WHAT, bytes);
+        let result = self.launch_maybe_blob(
+            WHAT,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a0_ptr);
+                b.push_ptr(y0_ptr);
+                b.push_i32(m0_val);
+                b.push_ptr(a1_ptr);
+                b.push_ptr(y1_ptr);
+                b.push_i32(m1_val);
+                b.push_ptr(a2_ptr);
+                b.push_ptr(y2_ptr);
+                b.push_i32(m2_val);
+                b.push_ptr(x_ptr);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ3 v2 multirow — dedicated multirow launcher. Mirrors the multirow
     /// branch of `gemv_hfq4g256` exactly: same rows/R selection, same
     /// arch gating for gfx1151/rdna3, same grid (`ceil(M/R)`) and block
@@ -19431,6 +19524,73 @@ impl Gpu {
             blob_builder,
         )
     }
+
+    /// [`Gpu::gemv_bf16_xf32_x4`] of two `(weight, y, m)` BF16 matrices
+    /// (Qwen4 decode router and selector) and [`Gpu::gemv_q8_0_pair`] of two
+    /// `[q8_m x 2560]` Q8_0 matrices (shared gate/up) over the same `x`, in one
+    /// launch (`HIPFIRE_QWEN4_DECODE_HEAD_FUSE`, module `qwen4_decode_head_fuse`).
+    /// Exact gfx1151, `k == 2560`; any other arch or `k` is an error. Every
+    /// output row is bitwise the one the two incumbent launches write.
+    pub fn gemv_bf16_xf32_x2_q8_0_k2560_staged_pair(
+        &mut self,
+        bf16: [(&GpuTensor, &GpuTensor, usize); 2],
+        q8: [(&GpuTensor, &GpuTensor); 2],
+        q8_m: usize,
+        x: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        if !(self.arch_caps.is_gfx1151() && k == 2560) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "decode head fusion needs exact gfx1151 and K == 2560",
+            ));
+        }
+        self.bind_thread()?;
+        const FUNC: &str = "gemv_bf16_xf32_x2_q8_0_k2560_staged_pair";
+        self.ensure_kernel("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, FUNC)?;
+        let w = bf16.map(|(w, _, _)| w.buf.as_ptr());
+        let a = q8.map(|(a, _)| a.buf.as_ptr());
+        let x_ptr = x.buf.as_ptr();
+        let y = bf16.map(|(_, y, _)| y.buf.as_ptr());
+        let q = q8.map(|(_, y)| y.buf.as_ptr());
+        let m0 = bf16[0].2 as i32;
+        let m1 = bf16[1].2 as i32;
+        let mq = q8_m as i32;
+        let k_val = k as i32;
+        let rows = bf16[0].2 + bf16[1].2 + 2 * q8_m;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
+        for p in w.iter().chain(&a) {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in y.iter().chain(&q) {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in [&m0, &m1, &mq, &k_val] {
+            params.push(v as *const _ as *mut c_void);
+        }
+        self.launch_maybe_blob(
+            FUNC,
+            [rows as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in w.into_iter().chain(a) {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y.into_iter().chain(q) {
+                    b.push_ptr(p);
+                }
+                for v in [m0, m1, mq, k_val] {
+                    b.push_i32(v);
+                }
+                b
+            },
+        )
+    }
     /// [`Gpu::gemm_mq6g256v2_f32_rows`] of up to four MQ6G256V2 matrices
     /// reading the same rotated `[rows, k]` x in one launch (blocks routed as
     /// [`Gpu::gemv_mq6g256v2_x4`]); each output bitwise the one-matrix call.
@@ -21876,5 +22036,176 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod mq4v2_multirow_r2_x3_tests {
+    use super::*;
+
+    /// Direct launch of the incumbent `gemv_mq4g256v2_multirow_r2` symbol in the
+    /// default MQ4V2 multirow module, bypassing the arch-selected launcher
+    /// (which may pick r4/r8 on other GPUs).
+    fn launch_r2(
+        gpu: &mut Gpu,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) {
+        const SYMBOL: &str = "gemv_mq4g256v2_multirow_r2";
+        gpu.ensure_kernel(
+            "gemv_hfq4g256_multirow_default_mq4v2",
+            kernels::GEMV_MQ4G256V2_MULTIROW_SRC,
+            SYMBOL,
+        )
+        .expect("compile incumbent r2");
+        let (a_ptr, x_ptr, y_ptr) = (a.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr());
+        let (m_val, k_val) = (m as i32, k as i32);
+        let mut params: [*mut c_void; 5] = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        gpu.launch_maybe_blob(
+            SYMBOL,
+            [m.div_ceil(2) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
+        .expect("launch incumbent r2");
+    }
+
+    /// Deterministic MQ4G256V2 weights: 136 B/group = four fp16 headers
+    /// (scale/offset pairs) + 128 B of random nibbles; every header finite.
+    fn synth_mq4v2(rows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let groups = k / 256;
+        let mut st = seed;
+        let mut next = move || -> u32 {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 32) as u32
+        };
+        let mut bytes = vec![0u8; rows * groups * 136];
+        for group in bytes.chunks_exact_mut(136) {
+            // (base fp16 bits, jitter) per header: scale0, zero0, scale1, zero1.
+            for (i, base) in [0x2c00u16, 0xb000, 0x2a00, 0x3000].into_iter().enumerate() {
+                let bits = base + (next() & 0x3f) as u16;
+                group[2 * i..2 * i + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+            for word in group[8..].chunks_exact_mut(4) {
+                word.copy_from_slice(&next().to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Realistic rotated activations: bell-shaped (sum of three uniforms),
+    /// rounded to BF16-representable F32 values, never exactly zero.
+    fn synth_x(k: usize, seed: u64) -> Vec<f32> {
+        let mut st = seed;
+        let mut uniform = move || -> f32 {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+        };
+        (0..k)
+            .map(|_| {
+                let v = half::bf16::from_f32((uniform() + uniform() + uniform()) * 0.6).to_f32();
+                if v == 0.0 {
+                    1.0 / 4096.0 // 2^-12, exactly BF16-representable
+                } else {
+                    v
+                }
+            })
+            .collect()
+    }
+
+    /// `gemv_mq4g256v2_multirow_r2_x3` over 48x2560, 48x2560, 6144x2560 must
+    /// equal three direct launches of the incumbent r2 symbol bit for bit.
+    ///
+    /// Run: `cargo test -p rdna-compute --release --lib mq4v2_multirow_r2_x3_tests -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a GPU and working HIP toolchain"]
+    fn x3_is_bit_identical_to_three_r2_launches() {
+        const K: usize = 2560;
+        const MS: [usize; 3] = [48, 48, 6144];
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        let weights: Vec<GpuTensor> = MS
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let bytes = synth_mq4v2(m, K, 0x5eed_0000 + i as u64);
+                gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight upload")
+            })
+            .collect();
+        let x_host = synth_x(K, 0xa11c_e5ed);
+        assert!(x_host.iter().all(|v| v.is_finite() && *v != 0.0));
+        let x = gpu.upload_f32(&x_host, &[K]).expect("x upload");
+
+        let sentinel = |gpu: &mut Gpu, m: usize| {
+            let host = vec![f32::from_bits(0x7fc0_1234); m];
+            gpu.upload_f32(&host, &[m]).expect("y upload")
+        };
+        let y_ref: Vec<GpuTensor> = MS.iter().map(|&m| sentinel(&mut gpu, m)).collect();
+        let y_x3: Vec<GpuTensor> = MS.iter().map(|&m| sentinel(&mut gpu, m)).collect();
+
+        for i in 0..3 {
+            launch_r2(&mut gpu, &weights[i], &x, &y_ref[i], MS[i], K);
+        }
+        gpu.gemv_mq4g256v2_multirow_r2_x3(
+            &weights[0], &y_x3[0], MS[0],
+            &weights[1], &y_x3[1], MS[1],
+            &weights[2], &y_x3[2], MS[2],
+            &x, K,
+        )
+        .expect("x3 launch");
+        gpu.hip.device_synchronize().expect("sync");
+
+        for i in 0..3 {
+            let reference = gpu.download_f32(&y_ref[i]).expect("ref download");
+            let fused = gpu.download_f32(&y_x3[i]).expect("x3 download");
+            assert_eq!(reference.len(), MS[i]);
+            assert!(
+                reference.iter().all(|v| v.is_finite()) && reference.iter().any(|v| *v != 0.0),
+                "matrix {i}: incumbent r2 output not finite/nonzero"
+            );
+            let differing = reference
+                .iter()
+                .zip(&fused)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "matrix {i} ({} rows): x3 differs from r2 in {differing} outputs",
+                MS[i]
+            );
+        }
+
+        for t in y_ref.into_iter().chain(y_x3).chain(weights) {
+            gpu.free_tensor(t).expect("free");
+        }
+        gpu.free_tensor(x).expect("free x");
     }
 }

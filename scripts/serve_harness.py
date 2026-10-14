@@ -21,6 +21,11 @@ Modes:
             conversation each prompt (no cache); surfaces genre-specific runaway.
   chain   — the genre prompts chained into one growing conversation; exercises the
             prefix cache (cached_tokens) + cross-turn prefill/decode.
+            With --tool-chain FILE (tool-chain-v1 JSON, e.g.
+            benchmarks/sessions/tool_chain_agent.json) the chain is an agent
+            transcript: system prompt + tools, user turns, and every tool call
+            answered from frozen tool_results; rows carry per-request
+            cached/prefill_ms/ttft for session-cache reuse A/B (diff two --out dumps).
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
   prefix-fanout — opt-in shared-header concurrency/alternating-session workload.
@@ -4170,6 +4175,212 @@ def _self_test_concurrent_clients():
     print("self-test concurrent-clients: OK", flush=True)
 
 
+def _load_tool_chain(path):
+    """Load a ``tool-chain-v1`` fixture for ``--mode chain --tool-chain``.
+
+    Returns ``{system, tools, turns:[{content, prompt_md5, step}], tool_results:{name:str},
+    max_tool_rounds, tool_chain_md5, path}``. ``content_file`` / ``system_file`` paths
+    resolve REPO-relative (or absolute) and are read as exact bytes.
+    """
+    try:
+        raw = Path(path).read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r} unreadable: {e}")
+    if not isinstance(data, dict) or data.get("schema") != "tool-chain-v1":
+        got = data.get("schema") if isinstance(data, dict) else type(data).__name__
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: schema must be 'tool-chain-v1', got {got!r}")
+
+    def read_ref(p):
+        fp = p if os.path.isabs(p) else os.path.join(REPO, p)
+        try:
+            return Path(fp).read_bytes().decode("utf-8")
+        except Exception as e:
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: failed to load content_file {p!r}: {e}")
+
+    system = data.get("system")
+    if system is None and data.get("system_file"):
+        system = read_ref(data["system_file"])
+    if system is not None and not isinstance(system, str):
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: system must be a string")
+    tools = data.get("tools")
+    if not isinstance(tools, list) or not tools:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: tools must be a non-empty list")
+    raw_turns = data.get("turns")
+    if not isinstance(raw_turns, list) or not raw_turns:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: turns must be a non-empty list")
+    turns = []
+    for i, t in enumerate(raw_turns):
+        if not isinstance(t, dict) or t.get("role", "user") != "user":
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: turn {i} must be an object with role 'user'")
+        content = t.get("content")
+        if content is None and t.get("content_file"):
+            content = read_ref(t["content_file"])
+        if not isinstance(content, str):
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: turn {i} needs content or content_file")
+        turns.append({"content": content, "step": t.get("step"),
+                      "prompt_md5": hashlib.md5(content.encode("utf-8")).hexdigest()})
+    tool_results = {}
+    for name, v in (data.get("tool_results") or {}).items():
+        if isinstance(v, str):
+            tool_results[name] = v
+        elif isinstance(v, dict) and isinstance(v.get("content_file"), str):
+            tool_results[name] = read_ref(v["content_file"])
+        else:
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: tool_results[{name!r}] must be a string or {{content_file}}")
+    mtr = data.get("max_tool_rounds", 4)
+    if isinstance(mtr, bool) or not isinstance(mtr, int) or mtr < 0:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: max_tool_rounds must be an int >= 0")
+    return {"system": system, "tools": tools, "turns": turns, "tool_results": tool_results,
+            "max_tool_rounds": mtr, "tool_chain_md5": hashlib.md5(raw).hexdigest(), "path": str(path)}
+
+
+def _run_tool_chain(cfg, args, scenario):
+    """``--mode chain --tool-chain``: agent transcript with frozen tool results.
+
+    History is always rich (content + reasoning_content + structured tool_calls
+    round-trip). Every tool call is answered from ``tool_results`` (unknown tool ->
+    ``{"error": "unknown tool"}``) for up to ``max_tool_rounds`` rounds per user turn;
+    a ``finish == "length"`` turn never feeds tool results. Rows carry step,
+    prompt_md5, tool_chain_md5 plus the exact content/reasoning/tool_calls so a
+    cache-on and cache-off run can be diffed byte-for-byte.
+    """
+    tools = scenario["tools"]
+    tool_results = scenario["tool_results"]
+    max_rounds = scenario["max_tool_rounds"]
+    messages = []
+    if scenario.get("system"):
+        messages.append({"role": "system", "content": scenario["system"]})
+    rows = []
+    tool_rounds = 0
+    for i, turn in enumerate(scenario["turns"]):
+        messages.append({"role": "user", "content": turn["content"]})
+        round_md5 = turn["prompt_md5"]
+        k = 0
+        while True:
+            r = send(cfg, messages, tools=tools)
+            r["step"] = f"u{i}" if k == 0 else f"u{i}.t{k}"
+            r["fixture_step"] = turn.get("step")
+            r["prompt_md5"] = round_md5
+            r["tool_chain_md5"] = scenario["tool_chain_md5"]
+            messages.append(_assistant_feedback(r, "rich"))
+            rows.append(r)
+            print(f"  [{r['step']}]" + turn_line(len(rows), r)[2:], flush=True)
+            calls = r.get("tool_calls") or []
+            if not calls or k >= max_rounds or r.get("finish") == "length":
+                break
+            contents = []
+            for call in calls:
+                fn_name = (call.get("function") or {}).get("name") or call.get("name") or ""
+                content = tool_results.get(fn_name)
+                if content is None:
+                    content = '{"error": "unknown tool"}'
+                contents.append(content)
+                messages.append(_tool_result_feedback(call.get("id") or "call_0", content, "rich", name=fn_name))
+            round_md5 = hashlib.md5("\n".join(contents).encode("utf-8")).hexdigest()
+            tool_rounds += 1
+            k += 1
+    for r in rows:
+        print(f"  tool-chain row step={r['step']} ctx={r['ctx']} cached={r['cached']} "
+              f"prefill_ms={r['prefill_ms']} ttft_s={r['ttft_s']} finish={r['finish']} "
+              f"tool_calls={len(r.get('tool_calls') or [])}", flush=True)
+    cached = [r["cached"] for r in rows]
+    uncached = [r["ctx"] - r["cached"] for r in rows]
+    print(f"tool-chain: requests={len(rows)} tool_rounds={tool_rounds} cached_total={sum(cached)} "
+          f"prompt_total={sum(r['ctx'] for r in rows)} cached_rows={cached} uncached_rows={uncached}", flush=True)
+    return rows
+
+
+def _self_test_tool_chain():
+    """Offline: tool-chain loader, message sequencing, labels, and round bound."""
+    global send
+    real_send = send
+    seen = []
+    mode = {"always_tool": False, "finish": "tool_calls"}
+    tc = [{"id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}]
+
+    def fake(cfg, messages, tools=None, *a, **k):
+        assert tools, "tools must be sent on every request"
+        seen.append([m["role"] for m in messages])
+        last = messages[-1]
+        first_round = last["role"] == "user" and last["content"] == "q0"
+        call = tc if (mode["always_tool"] or first_round) else []
+        fin = mode["finish"] if call else "stop"
+        return {"assistant_content": "a", "content": "ans", "reasoning_content": "think",
+                "tool_calls": call, "finish": fin, "gen": 3, "ctx": 100 + len(messages),
+                "cached": 50, "ttft_s": 0.1, "prefill_ms": 5.0, "prefill_tok_s": 1.0,
+                "decode_tok_s": 1.0, "decode_estimated": False, "tau": None,
+                "think_words": 1, "ans_words": 1, "runaway": fin == "length", "empty": False,
+                "attractor": False, "ans_preview": "ans"}
+
+    with tempfile.TemporaryDirectory() as d:
+        sysf = Path(d, "sys.txt"); sysf.write_text("SYS", encoding="utf-8")
+        resf = Path(d, "res.txt"); resf.write_text("FILE-RESULT", encoding="utf-8")
+        fx = Path(d, "fx.json")
+        fx.write_text(json.dumps({
+            "schema": "tool-chain-v1", "system_file": str(sysf),
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "turns": [{"role": "user", "content": "q0", "step": "task"}, {"role": "user", "content": "q1"}],
+            "tool_results": {"read_file": {"content_file": str(resf)}, "other": "X"},
+            "max_tool_rounds": 2}), encoding="utf-8")
+        sc = _load_tool_chain(str(fx))
+        assert sc["system"] == "SYS" and sc["tool_results"]["read_file"] == "FILE-RESULT"
+        assert sc["tool_chain_md5"] == hashlib.md5(fx.read_bytes()).hexdigest()
+        bad = Path(d, "bad.json"); bad.write_text('{"schema": "nope"}', encoding="utf-8")
+        try:
+            _load_tool_chain(str(bad))
+            raise AssertionError("bad schema accepted")
+        except SystemExit as e:
+            assert "tool-chain-v1" in str(e)
+        real_fx = os.path.join(REPO, "benchmarks", "sessions", "tool_chain_agent.json")
+        if os.path.exists(real_fx):
+            assert _load_tool_chain(real_fx)["turns"]
+        try:
+            send = fake
+            # 1) one tool call on u0, plain answers after
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert seen == [["system", "user"],
+                            ["system", "user", "assistant", "tool"],
+                            ["system", "user", "assistant", "tool", "assistant", "user"]], seen
+            assert [r["step"] for r in rows] == ["u0", "u0.t1", "u1"], [r["step"] for r in rows]
+            assert rows[0]["prompt_md5"] == hashlib.md5(b"q0").hexdigest()
+            assert rows[1]["prompt_md5"] == hashlib.md5(b"FILE-RESULT").hexdigest()
+            assert all(r["tool_chain_md5"] == sc["tool_chain_md5"] for r in rows)
+            # 2) tool message content / id / name and assistant round-trip
+            captured = []
+            def cap(cfg, messages, tools=None, *a, **k):
+                captured.append(json.loads(json.dumps(messages)))
+                return fake(cfg, messages, tools)
+            send = cap
+            seen.clear(); _run_tool_chain({"mode": "chain"}, None, sc)
+            msgs = captured[-1]
+            assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]
+            assert msgs[2]["tool_calls"] == tc and msgs[2]["reasoning_content"] == "think"
+            assert msgs[3] == {"role": "tool", "tool_call_id": "call_0", "content": "FILE-RESULT", "name": "read_file"}
+            # 3) max_tool_rounds bounds the loop (2 rounds -> 3 requests per user turn)
+            send = fake
+            mode["always_tool"] = True
+            seen.clear()
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert len(rows) == 6 and len(seen) == 6, len(rows)
+            assert [r["step"] for r in rows] == ["u0", "u0.t1", "u0.t2", "u1", "u1.t1", "u1.t2"]
+            # 4) finish=length with tool_calls never feeds tool results
+            mode["finish"] = "length"
+            seen.clear()
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert len(rows) == 2 and all(r["step"] in ("u0", "u1") for r in rows)
+            assert all("tool" not in s for s in seen), seen
+            # 5) unknown tool name -> error payload
+            mode["finish"] = "tool_calls"; mode["always_tool"] = False
+            sc2 = dict(sc, tool_results={})
+            send = cap; captured.clear()
+            _run_tool_chain({"mode": "chain"}, None, sc2)
+            assert captured[1][3]["content"] == '{"error": "unknown tool"}'
+        finally:
+            send = real_send
+    print("self-test tool-chain: OK", flush=True)
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
@@ -4179,11 +4390,14 @@ def run(cfg, args):
         return _run_images_battery(cfg, args)
     if cfg["mode"] == "prefix-fanout":
         return _run_prefix_fanout(cfg, args)
-    battery = load_prompt_battery(
+    tool_chain = getattr(args, "tool_chain", None) if cfg["mode"] == "chain" else None
+    battery = None if tool_chain else load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
     if getattr(args, "concurrent_clients", None):
         rows = _run_concurrent_clients(cfg, args, battery, feedback_shape)
+    elif tool_chain:
+        rows = _run_tool_chain(cfg, args, _load_tool_chain(tool_chain))
     elif cfg["mode"] == "battery":
         for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
@@ -4494,6 +4708,11 @@ def main():
                     help="battery/chain only: comma-separated concurrent client counts, e.g. 1,2,...,8. "
                          "One shared server; each client runs an independent conversation (chains stay "
                          "sequential per client); greedy runs assert isolation equality.")
+    ap.add_argument("--tool-chain", default=None, metavar="FILE",
+                    help="--mode chain only: run a tool-chain-v1 agent transcript (system+tools, user turns, "
+                         "frozen tool results; e.g. benchmarks/sessions/tool_chain_agent.json) instead of the "
+                         "prompt battery. Reports per-request cached/prefill_ms/ttft; --out rows are "
+                         "byte-diffable across cache-on/off runs.")
     ap.add_argument("--fanout-clients", type=_parse_fanout_clients, default=[1, 4, 8, 16],
                     help="Comma-separated concurrent client counts (default 1,4,8,16).")
     ap.add_argument("--fanout-shared-tokens", type=int, default=2048,
@@ -4599,6 +4818,10 @@ def main():
     args.fanout_sampling_explicit = any(x == "--sampling" or x.startswith("--sampling=") for x in sys.argv[1:])
     if args.concurrent_clients and args.mode not in ("battery", "chain"):
         ap.error("--concurrent-clients applies to --mode battery or chain")
+    if args.tool_chain and args.mode != "chain":
+        ap.error("--tool-chain applies to --mode chain only")
+    if args.tool_chain and args.concurrent_clients:
+        ap.error("--tool-chain cannot be combined with --concurrent-clients")
     if args.mode == "prefix-fanout":
         for name in ("shared_tokens", "unique_tokens", "output_tokens", "repeats"):
             if getattr(args, "fanout_" + name) < 1:
@@ -4622,6 +4845,7 @@ def main():
         _self_test_prefix_fanout_summary()
         _self_test_prefix_fanout_scheduling()
         _self_test_concurrent_clients()
+        _self_test_tool_chain()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")

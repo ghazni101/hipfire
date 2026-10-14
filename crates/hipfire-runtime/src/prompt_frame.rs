@@ -1637,10 +1637,42 @@ pub fn template_emits_history_primer(frame: &JinjaChatFrame, primer: &[u32]) -> 
 /// those. `CachedAssistantBody.text` must byte-equal the corresponding
 /// `Message` field when that field is non-empty; recipient must equal
 /// `Message.tool_calls[i].name`. Any violation is structural doubt → plain render.
+///
+/// Tool-call messages splice per-tool envelopes ([`ToolTurnSplice::Envelopes`]);
+/// [`build_cached_history_jinja_with`] can instead replay a whole-body content
+/// slot over them.
 pub fn build_cached_history_jinja(
     frame: &JinjaChatFrame,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
+    cache_lookup: impl FnMut(&Message) -> Option<CachedAssistantTurn>,
+) -> Result<Vec<u32>, String> {
+    build_cached_history_jinja_with(frame, messages, tools, ToolTurnSplice::Envelopes, cache_lookup)
+}
+
+/// How [`build_cached_history_jinja_with`] splices an assistant message that
+/// carries `tool_calls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolTurnSplice {
+    /// Only per-tool envelope slots (`CachedAssistantTurn::tools`, Harmony):
+    /// a content-only cached turn on a tool-call message is structural doubt.
+    Envelopes,
+    /// The template renders a message's tool calls inside its assistant
+    /// envelope, after the content (Qwen XML `<tool_call>` blocks), and the
+    /// cached content slot holds the producer's whole generated body: reasoning,
+    /// prose and every tool call. The message then renders without its tool
+    /// calls and that body replays once in the content slot, so the history
+    /// reproduces the emitted tokens instead of a template re-render of the
+    /// calls. The cache key must cover the calls' identity.
+    WholeBody,
+}
+
+/// [`build_cached_history_jinja`] with an explicit [`ToolTurnSplice`].
+pub fn build_cached_history_jinja_with(
+    frame: &JinjaChatFrame,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    tool_turns: ToolTurnSplice,
     mut cache_lookup: impl FnMut(&Message) -> Option<CachedAssistantTurn>,
 ) -> Result<Vec<u32>, String> {
     let tok = frame.tokenizer;
@@ -1682,8 +1714,10 @@ pub fn build_cached_history_jinja(
         }
         // Validate tool count and recipients, and reasoning provenance.
         if turn.tools.is_empty() {
-            // Content turn: must have no tool_calls on the Message.
-            if !m.tool_calls.is_empty() {
+            // Content turn: must have no tool_calls on the Message, unless
+            // its content slot is the whole generated body (tool calls
+            // included) of a template that renders calls inline.
+            if !m.tool_calls.is_empty() && tool_turns != ToolTurnSplice::WholeBody {
                 return Ok(plain_tokens);
             }
             if turn.content.is_none() {
@@ -1779,6 +1813,9 @@ pub fn build_cached_history_jinja(
             }
         } else if turn.content.is_some() {
             m.content = a_text.clone();
+            // WholeBody: the content slot replays the calls with the body;
+            // rendering them too would duplicate them.
+            m.tool_calls.clear();
         }
     }
     // Build the expected sentinel sequence, MOVING each slot body out of the
@@ -4449,6 +4486,227 @@ SYS:{{ build_system_message(system_message) }}:END
         .expect("cached render");
         let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
         assert_eq!(rendered, plain, "tool turn without tool bodies must miss");
+    }
+
+    // ── whole-body tool-turn splice (Qwen XML tool calls) ───────────────
+    //
+    // Fixture: `QWEN38_HISTORY_THINK` plus the Flash-Next tool-call and
+    // tool-role rendering (qwen3.8 FN `chat_template`): content is trimmed,
+    // calls follow it (`\n\n` separator only when content is non-empty), tool
+    // results share one `user` envelope, and the generation prompt closes the
+    // think block when `enable_thinking` is false. Newlines inside block-tag
+    // adjacency are emitted via string expressions because the render env
+    // uses `trim_blocks`.
+    const QWEN38_TOOL_HISTORY: &str = "{% for m in messages %}{% if m.role == 'assistant' %}{% set reasoning_content = '' %}{% if m.reasoning_content is string %}{% set reasoning_content = m.reasoning_content %}{% endif %}{% set reasoning_content = reasoning_content|trim %}<|im_start|>assistant\n<think>\n{{ reasoning_content }}\n</think>\n\n{{ m.content|trim }}{% if m.tool_calls %}{% for tc in m.tool_calls %}{% if loop.first %}{% if m.content|trim %}{{ '\\n\\n' }}{% endif %}{% else %}{{ '\\n' }}{% endif %}<tool_call>\n<function={{ tc.name }}>\n{% for k, v in tc.arguments|items %}<parameter={{ k }}>\n{{ v }}\n</parameter>\n{% endfor %}</function>\n</tool_call>{% endfor %}{% endif %}<|im_end|>\n{% elif m.role == 'tool' %}{% if messages[loop.index0 - 1].role != 'tool' %}<|im_start|>user{% endif %}{{ '\\n<tool_response>\\n' }}{{ m.content }}{{ '\\n</tool_response>' }}{% if loop.last or messages[loop.index0 + 1].role != 'tool' %}<|im_end|>\n{% endif %}{% else %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}";
+
+    const QWEN_TOOL_CALL_BLOCK: &str =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+
+    fn qwen_tool_frame(t: &Tokenizer, enable_thinking: bool) -> JinjaChatFrame<'_> {
+        JinjaChatFrame {
+            tokenizer: t,
+            template: QWEN38_TOOL_HISTORY,
+            system: None,
+            user: "",
+            enable_thinking,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn qwen_weather_call_message(content: &str, reasoning: Option<&str>) -> Message {
+        let mut a = qmsg(Role::Assistant, content, reasoning);
+        a.tool_calls = vec![ToolCall {
+            id: Some("call_0".to_string()),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({ "city": "Paris" }),
+            rendered_body: None,
+        }];
+        a
+    }
+
+    fn qwen_tool_history(assistant: Message) -> Vec<Message> {
+        let mut tool_result = qmsg(Role::Tool, "sunny", None);
+        tool_result.tool_call_id = Some("call_0".to_string());
+        vec![
+            qmsg(Role::User, "weather in Paris?", None),
+            assistant,
+            tool_result,
+        ]
+    }
+
+    /// Production cache shape (`qwen_cached_turn_entry`): whole generated body in
+    /// the content slot (empty text), producer reasoning text-only when the turn
+    /// thought.
+    fn qwen_whole_body_entry(t: &Tokenizer, body: &[u32], started_in_think: bool) -> CachedAssistantTurn {
+        CachedAssistantTurn {
+            reasoning: cached_producer_reasoning_text(t, body, started_in_think).map(|text| {
+                CachedAssistantBody {
+                    token_ids: Vec::new(),
+                    text,
+                }
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: body.to_vec(),
+                text: String::new(),
+            }),
+        }
+    }
+
+    fn assert_strict_extension(rendered: &[u32], consumed: &[u32], what: &str) {
+        assert!(
+            rendered.len() > consumed.len() && rendered[..consumed.len()] == *consumed,
+            "{what}: must strictly extend the consumed stream (rendered_len={}, consumed_len={})",
+            rendered.len(),
+            consumed.len()
+        );
+    }
+
+    fn assistant_lookup(
+        stored: &CachedAssistantTurn,
+    ) -> impl FnMut(&Message) -> Option<CachedAssistantTurn> + '_ {
+        move |m| matches!(m.role, Role::Assistant).then(|| stored.clone())
+    }
+
+    #[test]
+    fn qwen_whole_body_tool_turn_extends_prior_conversation() {
+        let t = make_tokenizer();
+        let frame = qwen_tool_frame(&t, true);
+        let history = qwen_tool_history(qwen_weather_call_message("", Some("plan A\n")));
+        let r1 = t.encode(
+            &frame
+                .render_messages(&history[..1], None, None)
+                .unwrap(),
+        );
+        let body = t.encode(&format!("plan A\n</think>\n\n{QWEN_TOOL_CALL_BLOCK}"));
+        let mut consumed = r1.clone();
+        consumed.extend_from_slice(&body);
+        consumed.push(1); // <|im_end|>
+        let stored = qwen_whole_body_entry(&t, &body, true);
+        assert_eq!(
+            stored.reasoning.as_ref().map(|r| r.text.as_str()),
+            Some("plan A\n"),
+            "production-shaped reasoning text"
+        );
+        let rendered = build_cached_history_jinja_with(
+            &frame,
+            &history,
+            None,
+            ToolTurnSplice::WholeBody,
+            assistant_lookup(&stored),
+        )
+        .expect("cached render");
+        assert_strict_extension(&rendered, &consumed, "WholeBody");
+        for sid in [9u32, 10, 11, 12, 13] {
+            assert!(!rendered.contains(&sid), "sentinel {sid} must be fully replaced");
+        }
+        let decoded = t.decode(&rendered);
+        assert_eq!(
+            decoded.matches("<tool_call>").count(),
+            1,
+            "tool call must replay once, not be re-rendered beside the body: {decoded}"
+        );
+    }
+
+    #[test]
+    fn qwen_whole_body_replays_body_bytes_the_template_would_rewrite() {
+        // The generated prose has no `\n\n` before the call and keeps a trailing
+        // space; the template trims content and inserts `\n\n`, so a plain
+        // re-render cannot extend the consumed stream. Only the whole-body
+        // replay can.
+        let t = make_tokenizer();
+        let frame = qwen_tool_frame(&t, true);
+        let history = qwen_tool_history(qwen_weather_call_message("checking", Some("plan A\n")));
+        let r1 = t.encode(&frame.render_messages(&history[..1], None, None).unwrap());
+        let body = t.encode(&format!("plan A\n</think>\n\nchecking {QWEN_TOOL_CALL_BLOCK}"));
+        let mut consumed = r1.clone();
+        consumed.extend_from_slice(&body);
+        consumed.push(1);
+        let stored = qwen_whole_body_entry(&t, &body, true);
+        let whole = build_cached_history_jinja_with(
+            &frame,
+            &history,
+            None,
+            ToolTurnSplice::WholeBody,
+            assistant_lookup(&stored),
+        )
+        .expect("cached render");
+        assert_strict_extension(&whole, &consumed, "WholeBody");
+        let plain = t.encode(&frame.render_messages(&history, None, None).unwrap());
+        assert!(
+            plain.len() < consumed.len() || plain[..consumed.len()] != *consumed,
+            "plain render must NOT extend the consumed stream for this body"
+        );
+    }
+
+    #[test]
+    fn qwen_envelopes_splice_on_tool_turn_equals_plain_render() {
+        let t = make_tokenizer();
+        let frame = qwen_tool_frame(&t, true);
+        let history = qwen_tool_history(qwen_weather_call_message("", Some("plan A\n")));
+        let body = t.encode(&format!("plan A\n</think>\n\n{QWEN_TOOL_CALL_BLOCK}"));
+        let stored = qwen_whole_body_entry(&t, &body, true);
+        let plain = t.encode(&frame.render_messages(&history, None, None).unwrap());
+        let explicit = build_cached_history_jinja_with(
+            &frame,
+            &history,
+            None,
+            ToolTurnSplice::Envelopes,
+            assistant_lookup(&stored),
+        )
+        .expect("cached render");
+        assert_eq!(explicit, plain, "Envelopes: content-only tool turn must miss");
+        let default = build_cached_history_jinja(&frame, &history, None, assistant_lookup(&stored))
+            .expect("cached render");
+        assert_eq!(default, plain, "default entry point is Envelopes");
+    }
+
+    #[test]
+    fn qwen_whole_body_without_reasoning_extends_closed_think_prompt() {
+        // Thinking off: the generation prompt already closed the think block, so
+        // the body is bare prose + calls and there is no reasoning slot.
+        let t = make_tokenizer();
+        let frame = qwen_tool_frame(&t, false);
+        let history = qwen_tool_history(qwen_weather_call_message("", None));
+        let r1 = t.encode(&frame.render_messages(&history[..1], None, None).unwrap());
+        let body = t.encode(QWEN_TOOL_CALL_BLOCK);
+        let mut consumed = r1.clone();
+        consumed.extend_from_slice(&body);
+        consumed.push(1);
+        let stored = qwen_whole_body_entry(&t, &body, false);
+        assert!(stored.reasoning.is_none(), "no reasoning slot when thinking is off");
+        let rendered = build_cached_history_jinja_with(
+            &frame,
+            &history,
+            None,
+            ToolTurnSplice::WholeBody,
+            assistant_lookup(&stored),
+        )
+        .expect("cached render");
+        assert_strict_extension(&rendered, &consumed, "WholeBody (thinking off)");
+        for sid in [9u32, 10, 11, 12, 13] {
+            assert!(!rendered.contains(&sid), "sentinel {sid} must be fully replaced");
+        }
+        assert_eq!(t.decode(&rendered).matches("<tool_call>").count(), 1);
+    }
+
+    #[test]
+    fn qwen_whole_body_lookup_miss_equals_plain_render() {
+        let t = make_tokenizer();
+        let frame = qwen_tool_frame(&t, true);
+        let history = qwen_tool_history(qwen_weather_call_message("", Some("plan A\n")));
+        let plain = t.encode(&frame.render_messages(&history, None, None).unwrap());
+        let rendered = build_cached_history_jinja_with(
+            &frame,
+            &history,
+            None,
+            ToolTurnSplice::WholeBody,
+            |_| None,
+        )
+        .expect("cached render");
+        assert_eq!(rendered, plain, "lookup miss must be the plain render");
     }
 
     #[test]

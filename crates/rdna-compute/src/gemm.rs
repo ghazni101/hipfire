@@ -227,6 +227,77 @@ pub(crate) static QWEN4_MOE_X_LDS: std::sync::LazyLock<Qwen4MoeXLds> = std::sync
 pub(crate) fn qwen4_moe_x_lds_armed(mode: Qwen4MoeXLds, exact_gfx1151: bool, sym_iu4_selected: bool) -> bool {
     mode != Qwen4MoeXLds::Off && exact_gfx1151 && !sym_iu4_selected
 }
+
+/// `HIPFIRE_QWEN4_MOE_DOWN_TWIN` (default on; `0` restores the O8×R16 down for
+/// every row count): on exact gfx1151 the Qwen4 grouped MoE down GEMM below
+/// the F16 WMMA window runs the X-in-LDS twin
+/// (`gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151`) for batches of at
+/// least [`QWEN4_MOE_DOWN_TWIN_MIN_TOKENS`] tokens. Bitwise the O8×R16 output.
+/// Read once.
+pub(crate) static QWEN4_MOE_DOWN_TWIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_TWIN", true));
+
+/// Smallest token batch (inclusive) that takes the down twin.
+pub(crate) const QWEN4_MOE_DOWN_TWIN_MIN_TOKENS: usize = 9;
+
+/// Whether the Qwen4 grouped MoE down takes the X-in-LDS twin instead of
+/// O8×R16. The twin is a bitwise twin of O8×R16 (same per-output arithmetic
+/// and reduction order) that shares each group's X chunk through LDS across
+/// four waves (32 rows per block) instead of every 8-row wave loading it. It
+/// is faster at every measured batch, so it is admitted for exact gfx1151,
+/// the production shape (`m == 2560`, `k == 640`, one X row per slot) and a
+/// slot count `x_src_rows` (raw, tokens * 10 on this route; never the routed
+/// row count) of at least [`QWEN4_MOE_DOWN_TWIN_MIN_TOKENS`] tokens. The F16
+/// WMMA arm (>= 512 tokens) is checked first by the caller.
+pub(crate) fn qwen4_moe_down_twin_applies(
+    enabled: bool,
+    exact_gfx1151: bool,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    x_src_rows: usize,
+) -> bool {
+    enabled
+        && exact_gfx1151
+        && m == 2560
+        && k == 640
+        && x_row_div == 1
+        && x_src_rows >= QWEN4_MOE_DOWN_TWIN_MIN_TOKENS * 10
+}
+
+/// `HIPFIRE_QWEN4_MOE_GATEUP_TWIN` (default on; `0` restores the O4×R8 X4
+/// gate/up for every row count): on exact gfx1151 the Qwen4 grouped MoE
+/// gate/up GEMM (M = 1280, K = 2560, ten slots per token) on batches of more
+/// than eight tokens below the F16 WMMA window runs
+/// `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151`. Bitwise the O4×R8 X4
+/// output. Read once.
+pub(crate) static QWEN4_MOE_GATEUP_TWIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GATEUP_TWIN", true));
+
+/// Waves per block of the gate/up twin (block = `32 * WAVES` threads, grid x =
+/// `m.div_ceil(4 * WAVES)`). Must match the instantiation in
+/// `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe.gfx1151.hip`.
+pub(crate) const QWEN4_MOE_GATEUP_TWIN_WAVES: usize = 4;
+
+/// Whether the Qwen4 grouped MoE gate/up takes the O4×R8 pipe twin instead of
+/// the O4×R8 X4 kernel. The twin is a bitwise twin of O4×R8 X4 (same
+/// per-output arithmetic; only scheduling differs: fully unrolled ten-group
+/// walk, waves per block, prefetch depth), admitted for exact gfx1151, the
+/// production shape (`m == 1280`, `k == 2560`, ten slots per token) and more
+/// than eight tokens (`x_src_rows` is the token count here; the few-row O4×R2
+/// arm keeps the incumbent). The F16 WMMA arm (>= 512 tokens) is checked
+/// first by the caller.
+pub(crate) fn qwen4_moe_gateup_twin_applies(
+    enabled: bool,
+    exact_gfx1151: bool,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    x_src_rows: usize,
+) -> bool {
+    enabled && exact_gfx1151 && m == 1280 && k == 2560 && x_row_div == 10 && x_src_rows > 8
+}
+
 /// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
 static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_DOWN_EPI", false)
@@ -46737,6 +46808,26 @@ impl Gpu {
             );
         }
         if self.arch_caps.has_gfx11_plus_simt() && m == 1280 && k == 2560 {
+            if qwen4_moe_gateup_twin_applies(
+                *QWEN4_MOE_GATEUP_TWIN,
+                self.arch_caps.is_gfx1151(),
+                m,
+                k,
+                x_row_div,
+                x_src_rows,
+            ) {
+                return self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151(
+                    expert_weight_ptrs,
+                    expert_tile_ids,
+                    sorted_slot_index,
+                    x_src,
+                    y_grouped,
+                    m,
+                    k,
+                    x_row_div,
+                    grouped_rows,
+                );
+            }
             return self.gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -46827,6 +46918,86 @@ impl Gpu {
                 1,
             ],
             [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151 exact-shape bitwise twin of the O4×R8 X4 gate/up kernel
+    /// (`gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151`): same nine kernel
+    /// arguments and per-output arithmetic, with the ten-group walk fully
+    /// unrolled and [`QWEN4_MOE_GATEUP_TWIN_WAVES`] waves per block, each wave
+    /// owning four output rows (grid x = `m.div_ceil(4 * WAVES)`).  Only
+    /// eight-slot subtiles exist (`grouped_rows.div_ceil(8)` on grid y).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe";
+        const FUNC: &str = "gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_PIPE_GFX1151_SRC,
+            FUNC,
+        )?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = x_row_div as i32;
+        let gr = grouped_rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+        ];
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [
+                m.div_ceil(4 * QWEN4_MOE_GATEUP_TWIN_WAVES) as u32,
+                grouped_rows.div_ceil(8) as u32,
+                1,
+            ],
+            [(32 * QWEN4_MOE_GATEUP_TWIN_WAVES) as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -49204,6 +49375,55 @@ mod lds_epi_tests {
 #[cfg(test)]
 mod route_selector_tests {
     use super::*;
+
+    #[test]
+    fn qwen4_moe_down_twin_window_and_shape_table() {
+        // (enabled, exact_gfx1151, m, k, x_row_div, tokens, expected)
+        for (enabled, gfx1151, m, k, row_div, tokens, want) in [
+            (false, true, 2560, 640, 1, 200, false),
+            (true, false, 2560, 640, 1, 200, false),
+            (true, true, 2048, 640, 1, 200, false),
+            (true, true, 2560, 512, 1, 200, false),
+            (true, true, 2560, 640, 10, 200, false),
+            (true, true, 2560, 640, 1, 8, false),
+            (true, true, 2560, 640, 1, 9, true),
+            (true, true, 2560, 640, 1, 145, true),
+            (true, true, 2560, 640, 1, 336, true),
+            (true, true, 2560, 640, 1, 337, true),
+            (true, true, 2560, 640, 1, 401, true),
+            (true, true, 2560, 640, 1, 529, true),
+        ] {
+            assert_eq!(
+                qwen4_moe_down_twin_applies(enabled, gfx1151, m, k, row_div, tokens * 10),
+                want,
+                "enabled={enabled} gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_moe_gateup_twin_token_and_shape_table() {
+        // (enabled, exact_gfx1151, m, k, x_row_div, tokens, expected)
+        for (enabled, gfx1151, m, k, row_div, tokens, want) in [
+            (false, true, 1280, 2560, 10, 200, false),
+            (true, false, 1280, 2560, 10, 200, false),
+            (true, true, 2560, 2560, 10, 200, false),
+            (true, true, 1280, 640, 10, 200, false),
+            (true, true, 1280, 2560, 1, 200, false),
+            (true, true, 1280, 2560, 10, 8, false),
+            (true, true, 1280, 2560, 10, 9, true),
+            (true, true, 1280, 2560, 10, 145, true),
+            (true, true, 1280, 2560, 10, 401, true),
+            (true, true, 1280, 2560, 10, 511, true),
+            (true, true, 1280, 2560, 10, 529, true),
+        ] {
+            assert_eq!(
+                qwen4_moe_gateup_twin_applies(enabled, gfx1151, m, k, row_div, tokens),
+                want,
+                "enabled={enabled} gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
+            );
+        }
+    }
 
     #[test]
     fn mq3_lloyd_mb4_gfx1100_bands_and_row_boundary() {

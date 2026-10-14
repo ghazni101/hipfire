@@ -2391,6 +2391,38 @@ fn commit_qwen4_session(model: &mut LoadedModel) {
     }
 }
 
+/// `HIPFIRE_QWEN_CACHE_TRACE=1`: one `[qwen4-session]` line per Qwen4 request
+/// with the reuse the session cache planned against the committed history
+/// (`prior`, the previous turn's consumed tokens) and, on a divergent render,
+/// the token ids around the first difference. Host-only; no device work.
+fn trace_qwen4_session_plan(route: SessionRoute, prior: &[u32], prompt: &[u32], reused: usize) {
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    let lcp = prior.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let source = if reused == 0 {
+        "cold"
+    } else if reused == prior.len() && lcp == prior.len() {
+        "live"
+    } else {
+        "snapshot"
+    };
+    eprintln!(
+        "[qwen4-session] route={route:?} prompt={} prior={} lcp={lcp} reused={reused} new={} source={source}",
+        prompt.len(),
+        prior.len(),
+        prompt.len() - reused,
+    );
+    if lcp < prior.len() {
+        let lo = lcp.saturating_sub(8);
+        eprintln!(
+            "[qwen4-session ids] prior[{lo}..]={:?} prompt[{lo}..]={:?}",
+            &prior[lo..(lcp + 16).min(prior.len())],
+            &prompt[lo..(lcp + 16).min(prompt.len())],
+        );
+    }
+}
+
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
 /// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
 /// so the DFlash path can use it too. Renders the canonical conversation via
@@ -2549,8 +2581,10 @@ pub fn plan_from_rendered(
 /// think opener. A primer-less full body (no reasoning) gets the generation
 /// primer prepended so the spliced stream byte-matches the end-of-turn bake on
 /// bare-history templates. Returns `None` on fingerprint miss or a content-less
-/// entry. Tool slots stay empty — Qwen history tool turns keep the existing
-/// safe miss via the count check.
+/// entry. Tool slots stay empty: a tool-call turn's stored body already holds
+/// its `<tool_call>` blocks, so it splices only as a whole body
+/// ([`ToolTurnSplice::WholeBody`](hipfire_runtime::prompt_frame::ToolTurnSplice));
+/// otherwise the count check keeps the safe miss.
 pub fn qwen_jinja_lookup_turn(
     cache: &mut AsstTurnCache,
     msg: &hipfire_runtime::prompt_frame::Message,
@@ -2710,6 +2744,29 @@ fn qwen_accept_tool_argument_replay(
     baseline
 }
 
+/// Whether a whole-body tool-turn hit may replay its stored prose. The cache
+/// key of a tool-call turn covers only the calls (name + canonical arguments),
+/// because clients often echo such turns with empty content; a client that
+/// echoes non-empty content must echo the producer's own visible prose (the
+/// stored body with its reasoning stripped, up to the first `<tool_call>`),
+/// else the turn misses rather than replaying prose the client replaced.
+fn qwen_whole_body_prose_matches(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    turn: &hipfire_runtime::prompt_frame::CachedAssistantTurn,
+    echoed: &str,
+) -> bool {
+    let echoed = normalize_asst_turn_for_fingerprint(echoed);
+    if echoed.trim().is_empty() {
+        return true;
+    }
+    let Some(body) = turn.content.as_ref() else {
+        return false;
+    };
+    let produced = normalize_asst_turn_for_fingerprint(&tokenizer.decode(&body.token_ids));
+    let prose = produced.split("<tool_call>").next().unwrap_or("");
+    prose.trim() == echoed.trim()
+}
+
 /// Render the multi-turn Jinja history with the verbatim assistant-turn token
 /// splice (item-#37 machinery), shared by the MTP/DFlash route and the Qwen4
 /// AR route so both build byte-identical turn-N prompts from one
@@ -2718,13 +2775,18 @@ fn qwen_accept_tool_argument_replay(
 /// `cold_prompt_tokens` is THIS turn's plain Jinja render; the assistant-opener
 /// primer is everything after its last `<|im_start|>assistant\n`. The replay
 /// prepends the primer only when the template does not already re-emit it on
-/// history assistant turns (Qwen3.5 does not, Qwen3.8 does).
+/// history assistant turns (Qwen3.5 does not, Qwen3.8 does). `tool_turns`
+/// selects whether tool-call turns replay their whole stored body
+/// ([`ToolTurnSplice::WholeBody`](hipfire_runtime::prompt_frame::ToolTurnSplice))
+/// or keep the template re-render.
+#[allow(clippy::too_many_arguments)]
 pub fn qwen_jinja_cached_history_tokens(
     frame: &hipfire_runtime::prompt_frame::JinjaChatFrame,
     asst_turn_cache: &mut AsstTurnCache,
     cold_prompt_tokens: &[u32],
     hist: &[hipfire_runtime::prompt_frame::Message],
     tools: Option<&[serde_json::Value]>,
+    tool_turns: hipfire_runtime::prompt_frame::ToolTurnSplice,
     trace_label: &str,
     producer_prefix: Option<&[u32]>,
 ) -> Result<Vec<u32>, String> {
@@ -2749,8 +2811,12 @@ pub fn qwen_jinja_cached_history_tokens(
         .as_deref()
         == Some("1");
     let mut render = |history: &[hipfire_runtime::prompt_frame::Message]| {
-    hipfire_runtime::prompt_frame::build_cached_history_jinja(frame, history, tools, |msg| {
-        let hit = qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer);
+    hipfire_runtime::prompt_frame::build_cached_history_jinja_with(frame, history, tools, tool_turns, |msg| {
+        let hit = qwen_jinja_lookup_turn(&mut *asst_turn_cache, msg, &primer).filter(|turn| {
+            tool_turns != hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody
+                || msg.tool_calls.is_empty()
+                || qwen_whole_body_prose_matches(tok, turn, &msg.content)
+        });
         if trace_cache {
             let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
@@ -3234,6 +3300,7 @@ pub fn generate_dflash(
                 &prompt_tokens,
                 hist,
                 tools,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
                 "dflash",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
@@ -3329,6 +3396,7 @@ pub fn generate_dflash(
             .as_deref()
             .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Mtp))
             .unwrap_or(0);
+        trace_qwen4_session_plan(SessionRoute::Mtp, &m.conversation_tokens, &prompt_tokens, start);
         prefill_start = start;
         prefill_tokens = prompt_tokens[start..].to_vec();
         cache_hit = start > 0;
@@ -8424,7 +8492,7 @@ mod qwen_history_chain_tests {
             history.push(msg(Role::User, user));
             let cold = tok.encode(&frame.render_messages(&history, None, None).unwrap());
             let prompt =
-                qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, &history, None, label, None)
+                qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, &history, None, hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes, label, None)
                     .unwrap();
             // Every earlier turn hits: its entry is still cached AND its
             // emitted byte-level IDs (absent from any canonical re-encode,
@@ -8478,6 +8546,97 @@ mod qwen_history_chain_tests {
                     "turn {turn}: MTP and AR prompts must be byte-identical"
                 );
             }
+        }
+    }
+
+    /// Qwen3.8-shaped inline tool-call template (closed-think history turns,
+    /// `<tool_call>` blocks after the content, tool results in a user turn).
+    const INLINE_TOOLS: &str = "{% for m in messages %}{% if m.role == 'assistant' %}<|im_start|>assistant\n<think>\n\n</think>\n\n{{ m.content }}{% for c in m.tool_calls %}<tool_call>\n<function={{ c.name }}>\n{% for k, v in c.arguments.items() %}<parameter={{ k }}>\n{{ v }}\n</parameter>\n{% endfor %}</function>\n</tool_call>{% endfor %}<|im_end|>\n{% elif m.role == 'tool' %}<|im_start|>user\n<tool_response>\n{{ m.content }}\n</tool_response><|im_end|>\n{% else %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}";
+
+    fn call(name: &str, path: &str) -> hipfire_runtime::prompt_frame::ToolCall {
+        hipfire_runtime::prompt_frame::ToolCall {
+            id: Some("call_0".into()),
+            name: name.into(),
+            arguments: serde_json::json!({ "path": path }),
+            rendered_body: None,
+        }
+    }
+
+    /// A tool-call turn replays its emitted IDs under `WholeBody`, so the next
+    /// turn strictly extends the committed conversation; the cache key covers
+    /// the call's name and arguments (and echoed prose), so a client that edits
+    /// any of them misses and never gets the stale emitted bytes.
+    #[test]
+    fn whole_body_tool_turn_replays_emitted_ids_and_edited_turns_miss() {
+        use hipfire_runtime::prompt_frame::ToolTurnSplice;
+        let tok = tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &tok,
+            template: INLINE_TOOLS,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let history = vec![msg(Role::System, "be helpful"), msg(Role::User, "read it")];
+        let cold = tok.encode(&frame.render_messages(&history, None, None).unwrap());
+        // The producer emits prose and the call byte by byte: `he` stays
+        // unmerged, so any template re-encode of this turn differs from it.
+        let prose = "he reads the file";
+        let body = format!(
+            "{prose}\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nhe.txt\n</parameter>\n</function>\n</tool_call>"
+        );
+        let mut streamed = emitted_body(&body);
+        streamed.push(IM_END);
+        let mut consumed = cold.clone();
+        consumed.extend_from_slice(&streamed);
+        let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let mut cache = AsstTurnCache::new_from_env();
+        cache.insert(
+            crate::common::asst_turn_fingerprint(
+                &crate::common::normalize_asst_turn_for_fingerprint(prose),
+                &[call("read_file", "he.txt")],
+            ),
+            qwen_cached_turn_entry(&tok, qwen_dflash_cache_seq(&streamed, Some(IM_END), &nl), false),
+        );
+        let next = |content: &str, c: hipfire_runtime::prompt_frame::ToolCall| {
+            let mut assistant = msg(Role::Assistant, content);
+            assistant.tool_calls.push(c);
+            let mut h = history.clone();
+            h.push(assistant);
+            h.push(msg(Role::Tool, "ok"));
+            h
+        };
+        let mut render = |h: &[Message], mode: ToolTurnSplice| {
+            let cold = tok.encode(&frame.render_messages(h, None, None).unwrap());
+            qwen_jinja_cached_history_tokens(&frame, &mut cache, &cold, h, None, mode, "qwen4", Some(&consumed))
+                .unwrap()
+        };
+        let extends = |p: &[u32]| p.len() > consumed.len() && p.starts_with(&consumed);
+        // Unedited echoes hit: with the producer's prose, and with the empty
+        // content most clients send on tool-call turns.
+        for echoed in [prose, ""] {
+            let h = next(echoed, call("read_file", "he.txt"));
+            assert!(extends(&render(&h, ToolTurnSplice::WholeBody)), "echo {echoed:?} must extend");
+            // The template re-render cannot reproduce the emitted bytes.
+            assert!(!extends(&render(&h, ToolTurnSplice::Envelopes)), "Envelopes re-renders the call");
+        }
+        // Edited arguments, edited name, edited prose: each misses, and the
+        // render carries none of the stale emitted IDs.
+        for (label, h) in [
+            ("arguments", next(prose, call("read_file", "she.txt"))),
+            ("name", next(prose, call("open_file", "he.txt"))),
+            ("prose", next("she reads the file", call("read_file", "he.txt"))),
+        ] {
+            let plain = tok.encode(&frame.render_messages(&h, None, None).unwrap());
+            let rendered = render(&h, ToolTurnSplice::WholeBody);
+            assert_eq!(rendered, plain, "edited {label}: must fall back to the template render");
+            assert!(
+                !rendered.windows(streamed.len() - 1).any(|w| w == &streamed[..streamed.len() - 1]),
+                "edited {label}: the stale emitted body must not be replayed"
+            );
         }
     }
 }
@@ -8690,6 +8849,11 @@ pub(crate) fn render_qwen4_prompt_history(
             &cold,
             hist,
             tools,
+            // The Qwen3.8 template renders tool calls inline after the content,
+            // and every stored turn is the producer's whole body, so tool-call
+            // history replays the emitted tokens and stays a strict extension
+            // of the committed conversation.
+            hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
             label,
             Some(&m.conversation_tokens),
         ) {
@@ -8896,6 +9060,7 @@ pub fn generate_qwen4_ar(
         .as_deref()
         .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Ar))
         .unwrap_or(0);
+    trace_qwen4_session_plan(SessionRoute::Ar, &m.conversation_tokens, &prompt_tokens, reused);
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
