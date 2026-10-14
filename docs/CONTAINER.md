@@ -151,17 +151,22 @@ cp <ref>.npz ~/.hipfire/models/
 # the tower pack must be a sibling of the DIRECTORY: ~/.hipfire/models/farm/$NAME.vl
 
 HIPFIRE_MODELS_DIR=~/.hipfire/models HIPFIRE_SKIP_BUILD=1 \
-  scripts/container-gate.sh -lc 'set -e; python3 -m pip install --quiet --break-system-packages pillow soundfile;
+  scripts/container-gate.sh bash -lc 'set -e; python3 -m pip install --quiet --break-system-packages pillow soundfile;
     exec python3 scripts/check_embeddinggemma2_parity.py \
       --model /root/.hipfire/models/farm/$NAME --ref /root/.hipfire/models/<ref>.npz \
       --daemon target/release/daemon'
 ```
 
 `pillow` (image/video frames) and `soundfile` (WAV) are not baked into
-`gate-runner`; install them in the same shell. `HIPFIRE_CONTAINER=docker` picks
-docker over the default podman (docker treats podman's `keep-groups` as a
-literal group name, so the wrapper only adds it for podman). Use
-`HIPFIRE_SKIP_BUILD=1` once the `gate-runner` tag is current.
+`gate-runner`; install them in the same shell. `hipfire-gate`'s `ENTRYPOINT` is
+empty (its `CMD` is the no-gate guidance, run in `/hipfire`), so name the shell
+explicitly: `bash -lc '<cmd>'`. A bare `-lc '<cmd>'` is taken as the executable
+and fails with `exec: "-lc": executable file not found in $PATH` (verified with
+docker 29.9; the two `-lc` examples above predate this one and fail the same
+way). `HIPFIRE_CONTAINER=docker` picks docker over the default podman (docker
+treats podman's `keep-groups` as a literal group name, so the wrapper only adds
+it for podman). Use `HIPFIRE_SKIP_BUILD=1` once the `gate-runner` tag is
+current.
 
 **The image declares `VOLUME ["/root/.hipfire/models", "/var/cache/hipfire"]`.** Docker
 mounts an anonymous volume at each of those paths, and an anonymous volume
