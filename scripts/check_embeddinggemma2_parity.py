@@ -5,8 +5,8 @@
 
 Drives the daemon's `embed` verb over a safetensors dir and compares the
 served 768-d embeddings (and their Matryoshka truncations) against a
-float32 CPU `transformers` reference produced by
-`make_reference.py` (google/embeddinggemma-2, `AutoModel` + mean pool +
+float32 CPU `transformers` reference produced by the committed
+`scripts/make_embeddinggemma2_reference.py` (google/embeddinggemma-2,
 L2), plus the edge-case contract: image input refused, empty text refused,
 oversized and non-integer `dims` refused, prompt-exceeds-limit refused, bad
 kind refused, and >8192-token input truncated to exactly 8192.

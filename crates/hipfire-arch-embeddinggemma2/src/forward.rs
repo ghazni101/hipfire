@@ -414,11 +414,12 @@ fn encode_hidden_segments(
     let hidden = e.upload(&host_hidden, n * h)?;
     trace(&mut e, || "embed (×√512)".into(), &hidden, n * h)?;
 
-    // Positions: one per row, restarting per segment (padding rows get 0 —
-    // their queries are dropped and their keys masked). The rope kernel
-    // reads this buffer as i32 (see gemma4's forward_batch positions
-    // upload); the tensor stays F32-typed with the i32 bits memcpy'd in,
-    // the same DeviceBuffer contract the arch-17 encoder's pos3 upload uses.
+    // Positions: one per row, restarting per segment — padding rows continue
+    // the count (their queries are dropped and their keys masked, so the
+    // value never reaches an output). The rope kernel reads this buffer as
+    // i32 (see gemma4's forward_batch positions upload); the tensor stays
+    // F32-typed with the i32 bits memcpy'd in, the same DeviceBuffer
+    // contract the arch-17 encoder's pos3 upload uses.
     let mut pos_host: Vec<i32> = Vec::with_capacity(n);
     for seg in segs {
         for p in 0..seg.rows {

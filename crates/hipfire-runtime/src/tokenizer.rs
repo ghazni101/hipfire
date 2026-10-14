@@ -1588,9 +1588,11 @@ impl Tokenizer {
     /// shared rank-ordered merge. Only the merge algorithm differs from the
     /// greedy path; the normalization is shared, so the two are coherent by
     /// construction. The HF pre-tokenizer (`Split(' ', MergedWithPrevious)`)
-    /// cannot fire after the replacement, so the merge runs across the whole
-    /// sequence — multi-word `▁of▁the` pieces are real and only the merge
-    /// ranks decide whether they form.
+    /// cannot fire after the replacement — no literal `' '` survives — so HF
+    /// itself already runs BPE on the whole normalized string, exactly what
+    /// this path does. The only merges whose right operand starts with `▁`
+    /// (the ones that could glue a following word in) are whitespace runs
+    /// (`▁ⁿ + ▁ᵐ`) and a lone `> + ▁</`; both paths apply them identically.
     fn encode_sp_bpe(&self, text: &str) -> Vec<u32> {
         let mut normalized = String::with_capacity(text.len() + 3);
         if self.sp_dummy_prefix {
