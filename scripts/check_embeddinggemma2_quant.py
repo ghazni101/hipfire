@@ -8,8 +8,12 @@ Loads every artifact the CLI can write (dir, .q8, .q8f16, .mq6, .hf6, .mq4,
 .hf4), encodes the parity fixtures through the daemon `embed` verb, and
 asserts each artifact's embeddings sit inside its bit-width band against the
 HF f32 reference (q8 3e-2, 6-bit 8e-2, 4-bit 2.5e-1 — an order under the O(1)
-a broken dequant arm produces). The band is chosen by the artifact's own
+a broken dequant arm produces. The band is chosen by the artifact's own
 dominant quant type (via the `astrea` HFQ parser), never its filename.
+
+An artifact whose format is not in the dense HFQ decode set is skipped with a
+reason, and a run where *every* artifact was skipped exits non-zero: a gate
+that encoded nothing must not report a pass.
 """
 import argparse
 import os
@@ -97,6 +101,7 @@ def main():
         return cand if os.path.exists(cand) else None
 
     failures = 0
+    measured = 0
     for path in args.artifacts:
         fmt = artifact_format(path) if not os.path.isdir(path) else "dir"
         band = BANDS.get(fmt)
@@ -107,6 +112,7 @@ def main():
         if band is None:
             print(f"SKIP {name}: unknown format {fmt}")
             continue
+        measured += 1
         vl = sibling_vl(path)
         d = Daemon(args.daemon, path,
                    params={"vision_mode": "auto"} if vl else None)
@@ -139,7 +145,16 @@ def main():
     if failures:
         print(f"\n{failures} FAILURES")
         return 1
-    print("\nALL PASS")
+    if not measured:
+        # Every artifact was skipped: a gate that ran no leg must not report a
+        # pass (a mistyped filename or a batch built only from NON_LOADABLE
+        # formats otherwise "passes" without encoding anything).
+        print(
+            f"\nNOTHING MEASURED: all {len(args.artifacts)} artifact(s) were skipped "
+            "(unknown format, or every one a non-loadable tier) — no leg ran"
+        )
+        return 1
+    print(f"\nALL PASS ({measured} artifact(s) measured, {len(args.artifacts) - measured} skipped)")
     return 0
 
 
