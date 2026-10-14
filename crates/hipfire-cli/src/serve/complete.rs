@@ -4822,10 +4822,8 @@ mod tests {
         use hipfire_config::{resolve, NamedLayer};
         use saddle_core::caps::ReasoningContract;
         let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let (off, off_res) = qwen_effort_request(
-            serde_json::json!({ "enable_thinking": false }),
-            &builtin,
-        );
+        let (off, off_res) =
+            qwen_effort_request(serde_json::json!({ "enable_thinking": false }), &builtin);
         assert!(off.get("reasoning_effort").is_none());
         assert_eq!(off["thinking_enabled"], false);
         assert_eq!(off_res.effective_mode, "disabled");
@@ -4857,10 +4855,7 @@ mod tests {
         assert_eq!(res36.effective_effort, None);
         assert!(res36.warnings.is_empty());
         // Other contracts keep their own `high` default.
-        for contract in [
-            ReasoningContract::DeepSeek4,
-            ReasoningContract::MuseGlimmer,
-        ] {
+        for contract in [ReasoningContract::DeepSeek4, ReasoningContract::MuseGlimmer] {
             let mut req = serde_json::json!({});
             let res = apply_http_reasoning_request(
                 &serde_json::json!({}),
@@ -4899,10 +4894,9 @@ mod tests {
 {%- if add_generation_prompt -%}\
 {%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
 {%- endif -%}";
-        let tokenizer = Tokenizer::from_hf_json(
-            r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#,
-        )
-        .unwrap();
+        let tokenizer =
+            Tokenizer::from_hf_json(r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#)
+                .unwrap();
         let messages = vec![Message {
             role: Role::User,
             content: "hi".to_string(),
@@ -4934,8 +4928,10 @@ mod tests {
         };
         let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
         let (default_req, _) = qwen_effort_request(serde_json::json!({}), &builtin);
-        let (explicit_req, _) =
-            qwen_effort_request(serde_json::json!({ "reasoning_effort": "medium" }), &builtin);
+        let (explicit_req, _) = qwen_effort_request(
+            serde_json::json!({ "reasoning_effort": "medium" }),
+            &builtin,
+        );
         assert_eq!(default_req["reasoning_effort"], "medium");
         let default_render = render(&default_req);
         assert_eq!(default_render, render(&explicit_req));
@@ -4945,10 +4941,8 @@ mod tests {
         assert!(raw_render.contains("[I:XHIGH]"));
         assert_ne!(default_render, raw_render);
         // Thinking off: effort omitted, closed think block, no instructions.
-        let (off_req, _) = qwen_effort_request(
-            serde_json::json!({ "enable_thinking": false }),
-            &builtin,
-        );
+        let (off_req, _) =
+            qwen_effort_request(serde_json::json!({ "enable_thinking": false }), &builtin);
         let off_render = render(&off_req);
         assert!(!off_render.contains("[I:"));
         assert!(off_render.ends_with("<think>\n\n</think>\n\n"));
