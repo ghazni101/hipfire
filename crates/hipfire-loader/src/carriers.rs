@@ -1811,7 +1811,7 @@ pub fn load_qwen4_rank(
                     host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
-                );
+            );
         }
     }
     // Expert parallelism: this rank's fit line, at the split it applied.
@@ -5142,7 +5142,92 @@ impl Carrier for Qwen35EmbedCarrier {
             .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))
     }
+}
 
+// ─── EmbeddingGemma 2 single-vector embedding encoder (arch 18) ─────────────
+//
+// Same non-chat wire-verb shape as arch 17: loads the model, embedding
+// requests flow through the daemon's `embed` verb → hipfire-generate's embed
+// body. The checkpoint's text trunk is tower-less: the vision tower arrives
+// as the shared `.vl` sidecar (admission resolves the path, the arch crate
+// opens it at load), and a load without one refuses image inputs with a
+// pointing error rather than silently embedding them.
+pub struct EmbeddingGemma2Carrier;
+impl Carrier for EmbeddingGemma2Carrier {
+    fn name(&self) -> &'static str {
+        "embeddinggemma2"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 18
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            // Architectural capability: the EmbeddingGemma-2 checkpoint ships
+            // the Gemma4 vision tower in its own arch-18 `.vl` pack (probed
+            // via `vision_tower.patch_embedder.input_proj.weight`, admission.rs
+            // `EMBED_GEMMA_VISION_PROBE_TENSOR`); this flag declares that the
+            // arch CAN accept images when that tower is present. Per-instance
+            // gating still checks `EmbedGemmaBundle.vision.is_some()` — a
+            // tower-less trunk (`vision_mode=off` / no sidecar) refuses images
+            // with the pointing error.
+            supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "embeddinggemma2: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "embeddinggemma2: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_embeddinggemma2::load_embed_gemma_bundle(src, ctx)?;
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator: None,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+
+    fn preflight_slot_model(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<Result<hipfire_runtime::serve::SlotModelPreflight, String>> {
+        match hipfire_arch_embeddinggemma2::carrier::preflight_slot(path) {
+            Ok(Some(p)) => Some(Ok(p)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// One weight copy, one GPU thread, no KV: the encoder's slot engine
+    /// batches the requests that arrive together into a single forward.
+    fn spawn_slot_engine(
+        &self,
+        cfg: hipfire_runtime::serve::SlotEngineConfig,
+    ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
+        use hipfire_arch_embeddinggemma2::slot_engine::{EmbedEngineConfig, EmbedSlotEngine};
+        let engine = EmbedSlotEngine::spawn(EmbedEngineConfig::from_slot_config(&cfg))
+            .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
+        Ok(Box::new(engine))
+    }
 }
 
 #[cfg(test)]

@@ -115,7 +115,7 @@ weights and `=1` applies the overlay on any architecture.
 |---|---|
 | `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
 | `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `hipfire-<seed>.png` in the working directory (or the `-o` path) and prints the path. |
-| `hipfire embed <model> [flags] [text...]` | Encode text and/or an image with an embedding checkpoint (arch 17, the Qwen3.5 multi-vector encoder — e.g. `pplx-embed-v2-late-0.6b`). Prints tokens×dims; `--query`/`--doc` score the pair by late-interaction MaxSim; `--json` emits the token-embedding matrix. See [`hipfire embed` flags](#hipfire-embed-flags). |
+| `hipfire embed <model> [flags] [text...]` | Encode text and/or images with an embedding checkpoint (arch 17, the Qwen3.5 multi-vector encoder — e.g. `pplx-embed-v2-late-0.6b`; or arch 18, EmbeddingGemma-2, one pooled vector). Prints tokens×dims; `--query`/`--doc` score the pair by late-interaction MaxSim; `--image`/`--audio`/`--video` add media (arch 18: `--video` takes one clip per flag, as its decoded frames); `--json` emits the token-embedding matrix. See [`hipfire embed` flags](#hipfire-embed-flags). |
 | `hipfire chat [model] [-t <f>] [--top-p <f>] [-n <n>] [--system <text>] [--no-color]` | Interactive multi-turn line client over the HTTP service (not the TUI; for the TUI use `hipfire tui`). The model defaults to `serve.default_model`. `-t` is `0..=2`, `--top-p` is `(0,1]`, `-n` is `1..=393216`. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
@@ -236,12 +236,21 @@ with `hipfire-quantize` (the quantizer keeps the norms, the 128-d Dense head
 and the vision tower raw, folds `1_Dense/model.safetensors` into the trunk,
 and auto-includes the tower).
 
+EmbeddingGemma-2 (arch 18) snapshots — e.g. a `google/embeddinggemma-2`
+directory, whose quantized form writes a `.vl` tower sidecar — are served by
+the same command. They answer with **one pooled vector** (`n_tokens: 1`)
+instead of arch 17's token matrix, and `--image` / `--audio` / `--video` reach
+their vision and audio towers (video drives the vision tower frame by frame)
+when the sidecar is resident.
+
 | Flag | Purpose |
 |---|---|
 | `--query <text>` | Query-side text (its marker is `"[Q] "`). |
 | `--doc <text>` | Document-side text (marker `"[D] "`); with `--query`, prints the MaxSim score. |
 | `--kind <query\|document>` | Side for the positional text; default `document`. Sets the marker and truncation limit. |
-| `--image <path>` | Encode an image (PNG/JPEG) with the checkpoint's vision tower; text and image may be combined. |
+| `--image <path>` | Encode an image (PNG/JPEG) with the checkpoint's vision tower. Repeatable — the images are appended after the text, in flag order; text and images may be combined. An arch-18 checkpoint without its `.vl` sidecar, or a host where `vision_mode` is off, refuses the image instead of dropping it. |
+| `--audio <path>` | Encode an audio clip with the checkpoint's audio tower (arch 18). Repeatable — clips are appended after the text and images, in flag order. Takes 16 kHz mono/stereo **WAV/RIFF** (PCM16 or float32); any other container is refused with the `ffmpeg` conversion to run. |
+| `--video <frame>[,<frame>…]` | Encode a video with the checkpoint's vision tower (arch 18), which runs once per frame. **One clip per flag**: give that clip's decoded **frames**, comma separated, in display order — the daemon applies the video processor's own sampler (`max_frames` 32: ≤32 frames are all used, more are strided uniformly) itself, so pass a clip at whatever rate you extracted it. Repeat the flag for several clips; each clip is spliced at its own `<|video|>` marker (one marker per video, never per frame). Frames are PNG/JPEG; a container (MP4/MKV/…) is refused with the `ffmpeg` extraction to run. |
 | `-j, --json` | Print the full JSON result — the `tokens×dims` matrix for a single encode, or `{score, query_tokens, doc_tokens, dim}` for a pair. |
 
 Token limits are per side (`query_length` 1024, `document_length` 4096 on the
@@ -260,7 +269,34 @@ hipfire embed <model> --image chart.png "the caption" --json
 
 The same surface is exposed over HTTP as `POST /v1/embeddings` (OpenAI-shaped;
 the `embedding` array is the flat `n_tokens × dim` matrix and each data object
-carries `n_tokens`, with an optional `"kind": "query" | "document"`).
+carries `n_tokens`, with an optional `"kind": "query" | "document"`). `input`
+takes a string, a one-element list, the object form (`{text, image_base64}`, or
+`{text, images_base64: […]}` for several — the same spelling the JSONL `embed`
+verb takes), or the typed content array
+(`[{"content": [{"type": "text", "text": …}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}]}]`)
+— one content object per request, text parts concatenated in order, image
+parts decoded at the route. A bare content-part array without the
+`{"content": …}` wrapper is refused with the wrapper it should have used.
+Interleave media by putting one `<|image|>` marker per image in the text
+(arch 18); a text with no marker gets its image runs appended before EOS, and
+a marker count that disagrees with the image count is refused. Audio takes the
+OpenAI `input_audio` part
+(`{"type": "input_audio", "input_audio": {"data": "data:audio/wav;base64,…", "format": "wav"}}`,
+WAV/RIFF only, `format` optional) and the JSONL `audios_base64` list, with one
+`<|audio|>` marker per clip under the same count rule; a text with no marker
+gets its audio runs appended after the image runs. Audio needs the
+checkpoint's audio tower (the same `.vl` sidecar as vision): a vision-only load
+refuses a clip by name rather than encoding the text alone.
+
+Video takes the llama.cpp-shaped `input_video` part
+(`{"type": "input_video", "input_video": {"data": ["data:image/png;base64,…", …]}}`,
+one entry per frame in display order, `format` optional and PNG/JPEG only) or
+the JSONL `videos_base64` field — **one frame list per video**, e.g.
+`{"text": "… <|video|> …", "videos_base64": [[frame0, frame1, …]]}`. One
+`<|video|>` marker per video under the same count rule, and the daemon samples
+the frames itself (the video processor's `max_frames` 32 budget, uniform
+stride) before running the vision tower once per frame; a frame that is not a
+PNG/JPEG image is refused with the `ffmpeg` extraction to run.
 
 ## Configuration
 

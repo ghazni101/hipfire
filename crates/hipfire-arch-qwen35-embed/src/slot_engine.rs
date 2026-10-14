@@ -103,7 +103,11 @@ impl EmbedEngineConfig {
 /// the snapshot freezes on first read, so a test cannot drive it through the
 /// environment.
 fn batch_window_from_env() -> Duration {
-    parse_batch_window(hipfire_config::developer_var("HIPFIRE_EMBED_BATCH_WINDOW_US").ok().as_deref())
+    parse_batch_window(
+        hipfire_config::developer_var("HIPFIRE_EMBED_BATCH_WINDOW_US")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Parse one `HIPFIRE_EMBED_BATCH_WINDOW_US` value: microseconds, or the
@@ -308,7 +312,61 @@ fn serve_batch(
                 EmbedKind::Query => InputKind::Query,
                 EmbedKind::Document => InputKind::Document,
             };
-            match assemble_input(bundle, gpu, kind, &req.text, req.image.as_deref()) {
+            // Mirror the sequential route's refusal: this encoder is
+            // multi-vector with a fixed 128-d head and no Matryoshka
+            // support, so a `dims` request must error rather than be
+            // silently ignored.
+            if let Some(d) = req.dims {
+                if d != 0 {
+                    errs.push(Some(format!(
+                        "{}: `dims` ({d}) is not supported on this encoder — it is                          multi-vector with a fixed {}-d head",
+                        req.request_tag, bundle.config.dense_out_features
+                    )));
+                    continue;
+                }
+            }
+            // One image per request is this encoder's contract (its
+            // `assemble_input` splices a single vision block). A longer list
+            // is asking for the arch-18 list form, so it is refused rather
+            // than silently truncated to the first image.
+            if req.images.len() > 1 {
+                errs.push(Some(format!(
+                    "{}: this encoder takes at most one image per request (got {}); \
+                     embeddinggemma2 (arch 18) accepts a list",
+                    req.request_tag,
+                    req.images.len()
+                )));
+                continue;
+            }
+            // No audio tower on this encoder at all: refuse the clips by name
+            // rather than letting the engine encode the text and drop them.
+            if !req.audios.is_empty() {
+                errs.push(Some(format!(
+                    "{}: this encoder has no audio tower — {} audio clip(s) cannot be \
+                     encoded here; audio applies to embeddinggemma2 (arch 18)",
+                    req.request_tag,
+                    req.audios.len()
+                )));
+                continue;
+            }
+            // Same for video: arch 18's video leg drives ITS vision tower per
+            // frame, and this encoder has no such leg.
+            if !req.videos.is_empty() {
+                errs.push(Some(format!(
+                    "{}: this encoder has no video leg — {} video(s) cannot be encoded \
+                     here; video applies to embeddinggemma2 (arch 18)",
+                    req.request_tag,
+                    req.videos.len()
+                )));
+                continue;
+            }
+            match assemble_input(
+                bundle,
+                gpu,
+                kind,
+                &req.text,
+                req.images.first().map(|bytes| bytes.as_slice()),
+            ) {
                 Ok(assembled) => {
                     errs.push(None);
                     prepared.push(Prepared {
@@ -357,7 +415,10 @@ fn serve_batch(
         .map(|errs| errs.into_iter().map(|e| e.map(Err)).collect())
         .collect();
 
-    let trace = hipfire_config::developer_var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_EMBED_ENGINE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     if trace {
         eprintln!(
             "[engine] batch: {} cmds -> {} requests -> {} groups {:?} (assemble {:.1} ms)",
@@ -562,8 +623,14 @@ mod tests {
         // The reader freezes with the process snapshot, so the parser — the
         // part with behavior — is tested directly.
         assert!(parse_batch_window(Some("0")).is_zero());
-        assert_eq!(parse_batch_window(Some("50000")), Duration::from_micros(50000));
-        assert_eq!(parse_batch_window(Some(" 2000 ")), Duration::from_micros(2000));
+        assert_eq!(
+            parse_batch_window(Some("50000")),
+            Duration::from_micros(50000)
+        );
+        assert_eq!(
+            parse_batch_window(Some(" 2000 ")),
+            Duration::from_micros(2000)
+        );
         assert_eq!(parse_batch_window(Some("not-a-number")), BATCH_WINDOW);
         assert_eq!(parse_batch_window(None), BATCH_WINDOW);
     }

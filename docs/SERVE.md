@@ -167,7 +167,19 @@ Config and env owners for bind, idle, queue, and body limits:
    With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
-   is deterministic for a fixed batch composition. 2 slots matched serial in
+   is deterministic for a fixed batch composition.
+
+   The **embedding** route (arch 17) uses the same switch with a different
+   engine behind it: `POST /v1/embeddings` requests arriving together are
+   served as **one batched forward** rather than one at a time, and because the
+   encoder is deterministic (no KV, GDN state reset per sequence) that batch is
+   **bit-identical** to encoding each input alone — batching is a throughput
+   choice there, never an output change. `serve.multi_slot_slots` is the number
+   of requests one forward may hold and `serve.max_batch_tokens` its row
+   budget; an isolated request pays only the collector's window
+   (`HIPFIRE_EMBED_BATCH_WINDOW_US`, default 2 ms). Measured on gfx1101: eight
+   concurrent 9-token queries go from 100 ms serial (80 req/s) to 19 ms
+   (**416 req/s, 5.2x**) in a single 72-row forward. 2 slots matched serial in
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
 
@@ -210,7 +222,7 @@ Implemented paths (anything else → `404`):
 | Method | Path | Role |
 |---|---|---|
 | `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`; `503` unless `status` is `ok` |
-| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture` |
+| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
 | `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |

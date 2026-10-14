@@ -89,7 +89,32 @@ required_features_daemon    == 0
 # Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
 # stays 0. Paid down when the message loop's per-verb refusal boilerplate is
 # factored out.
-daemon_lines                <= 5515
+# RATCHET-RAISE 5515 -> 5680 (arch 18, EmbeddingGemma 2): the embed arm's
+# arch-18 branch — dims forwarding to the wire request, the text-only
+# image-input refusal and the widened not-an-embedding-checkpoint refusal —
+# plus the merge's carrying of beta's arch-17 arms. The body still lives in
+# hipfire-generate::embed; same paydown: factor the per-verb refusal
+# boilerplate out.
+# RATCHET-RAISE 5680 -> 5813 (arch 18, the media legs): the embed arm's media
+# gate — `embed_request_media` (wire-shape only, so the daemon still carries no
+# arch_id literal), `media_refusal_message` (per-modality noun + the
+# `vision_mode` knob and the skipped `.vl` sidecar) and their two tests. The
+# image-only gate it replaces grew a modality axis because one `.vl` carries
+# both towers. Same paydown as the 5515 raise: the per-verb refusal boilerplate,
+# now per-modality too, is what wants factoring.
+# RATCHET-RAISE 5813 -> 5835: the media gate's video arm (`videos_base64`
+# routing to the vision tower, plus its wire test) and the slot route's vision
+# ladder — a carrier-delegated preflight cannot see `params.vision_mode`, so
+# `cpu_preflight` now applies `off`/`on`/explicit-path to the carrier's report
+# and the slot engine honors that decision instead of rediscovering the `.vl`
+# sibling. Same paydown: the per-verb, now per-modality, refusal boilerplate.
+# RATCHET-RAISE 5835 -> 5845: the `loaded` ack publishes two more residency
+# facts (`audio`, `video`) on both the slot and the sequential arm, so
+# `/v1/models` `input_modalities` can advertise every modality the serve
+# actually accepts instead of image-only — the facts a discovery client needs
+# are per-modality, so the ack grows per-modality too. Paydown: the ack
+# builders (three spellings of one envelope) want a single serializer.
+daemon_lines                <= 5845
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
@@ -173,6 +198,20 @@ bypass_slack                == 0
 # RATCHET-RAISE 300 -> 307: the +7 row-exact gfx1151 batched native-MTP prompt
 # fill calls (a5b0cc14f) recorded on the hipfire-arch-qwen4 ledger row; follow-up:
 # migrate row-exact kernels into a dispatch-registry row family (0.4.2).
+# RATCHET-RAISE 307 -> 363: NOT new debt — a measurement correction. The
+# dispatch-bypass regex required `gpu.` immediately before the method name, so
+# it could only see calls short enough for rustfmt to keep on one line and was
+# blind to a wrapped `gpu\n    .gemm_*` chain (which is what every match arm
+# returning one compiles to). Measured 2026-10-12: 56 call sites across seven
+# crates were uncounted, and hipfire-arch-qwen35-embed (arch 17) had no row at
+# all. The regex is now whitespace-tolerant, every row is re-measured, and the
+# ledger header records the per-crate correction. The holster objective's
+# descent starts from 363, not 307.
+# RATCHET-RAISE 363 -> 365: +2 for hipfire-arch-qwen35-embed's eager-attention
+# decomposition (its `S = Q*K^T` and `O = P*V` WMMA GEMMs). This is the first
+# genuine growth the corrected regex has caught — at the old adjacent-only
+# regex it would have been invisible, which is the whole reason it was fixed.
+bypass_total                <= 365
 # RATCHET-RAISE 306 -> 357: measurement correction, not new debt. The checker's
 # regex required `gpu.` adjacent to the method name and missed rustfmt-wrapped
 # `gpu\n    .gemm_*` chains; 51 existing call sites across six arch crates

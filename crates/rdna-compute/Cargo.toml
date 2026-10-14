@@ -26,16 +26,14 @@ sha2.workspace = true
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+half.workspace = true
 peacemaker-npu = { path = "../peacemaker-npu" }
 peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
 peacemaker-lift = { path = "../peacemaker-lift" }
-half.workspace = true
-
 [[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
-
 [[example]]
 name = "npu_trunk_consumers_check"
 required-features = ["lab"]

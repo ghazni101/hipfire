@@ -2428,6 +2428,8 @@ impl Gpu {
     /// several independent sequences into disjoint KV slabs. Both `None` =
     /// byte-identical to the plain variant.
     ///
+    /// untested-hw: gfx1201-only path, implemented from the q8 slots template;
+    /// no gfx1201 host was available.
     /// Descriptor write evidence: `test_bf16_slots_parity` check 4d on
     /// gfx1201 compares slot-base bytes and preserves slot-0 poison.
     /// This is a kernel-level check, not full-serve parity.
@@ -3255,6 +3257,50 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        result
+    }
+
+    /// Additive band mask for bidirectional sliding-window scores: sets
+    /// `S[row, col]` to a large finite negative where `|row - col| > window`
+    /// (embeddinggemma2's sliding layers; inclusive radius — see
+    /// `kernels/src/attention_band_mask.hip`). In-place on the `[rows, cols]`
+    /// f32 score matrix the eager attention materializes; composes with
+    /// `attention_rows_softmax_f16`'s padding column bound.
+    pub fn attention_scores_band_mask_f32(
+        &mut self,
+        scores: &GpuTensor,
+        rows: usize,
+        cols: usize,
+        window: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_band_mask",
+            kernels::ATTENTION_BAND_MASK_SRC,
+            "attention_scores_band_mask_f32",
+        )?;
+        let mut sp = scores.buf.as_ptr();
+        let mut r = rows as i32;
+        let mut c = cols as i32;
+        let mut w = window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = [(cols as u32 + block - 1) / block, rows as u32, 1];
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["attention_scores_band_mask_f32"],
+                grid,
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         result
     }
 
@@ -9927,6 +9973,9 @@ impl Gpu {
         )
     }
 
+    /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
+    /// On arches with a VerifyAttn `rows_q8` twin (gfx1100) an admitted shape
+    /// runs the byte-identical twin instead ([`Self::try_attention_verify_gqa_rows`]).
     /// Compatibility entry for eager callers whose KV stride equals the live
     /// causal extent. Capture/retained callers must use
     /// [`Self::attention_flash_q8_0_rows_masked_logical`] so an oversized

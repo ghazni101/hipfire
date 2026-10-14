@@ -311,6 +311,44 @@ No Gemma4 rows are registered until a quantized artifact is actually on the Hub 
 
 ---
 
+### EmbeddingGemma 2 (arch 18 — local-only rows, no Hub artifact)
+
+Two `embeddinggemma-2:` rows are registered with an **empty `repo`**, which the
+registry reads as *local-only*: `hipfire pull` refuses them with "place \<file\>
+in \<models dir\>" instead of 404ing, and `hipfire embed`/`list` resolve them
+from your models directory. Digests are of the bytes the command below
+reproduces (a re-quantized artifact carries different ones). Nothing needs to be
+published for this to work.
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `embeddinggemma-2:q8f16` | `embeddinggemma-2-q8f16.hfq` | 0.33 | 2 | Arch-18 default tier: worst fixture 2.0e-2 rel-L2 against the float32 reference (band 3e-2). Also reachable as the `embeddinggemma-2` alias |
+| `embeddinggemma-2:mq4v2` | `embeddinggemma-2-mq4v2.hfq` | 0.25 | 2 | MQ4G256V2 trunk, worst fixture 2.8e-1 (band 5e-1) |
+
+**Media needs the tower pack as a sibling.** Both rows declare their
+`<trunk>.vl` pack in the registry's `vision` slot (963 tensors: the checkpoint's
+vision + audio towers), and the loader also finds a `<trunk>.vl` sibling on its
+own. `vision_mode` still defaults to `off` — text-only, media refused per
+modality — so serve media with `hipfire config set vision_mode auto`.
+
+```bash
+# One command, from the HF snapshot: quantize, install both files, register the tag.
+hipfire quantize ~/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/<rev> \
+  --format q8f16 --install --register embeddinggemma-2:q8f16
+hipfire config set vision_mode auto
+hipfire embed embeddinggemma-2:q8f16 --kind query "what is in this picture <|image|>" \
+  --image photo.png -j
+```
+
+`--format mq4v2` produces the smaller tier (`--install --register
+embeddinggemma-2:mq4v2`). `--install` copies the trunk **and** the `.vl` pack it
+was written beside into the models directory — the originals stay in the working
+directory, so run it somewhere disposable or delete them afterwards. `--format
+q4k` is refused at load: Q4K (qt=4) is a GGUF/Maple-side container outside the
+dense HFQ decode set, which this encoder's host decoder does not implement.
+
+---
+
 ## Aliases
 
 String redirects in `registry/models.json` → `aliases` (not separate

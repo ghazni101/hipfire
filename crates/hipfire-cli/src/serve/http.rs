@@ -854,11 +854,22 @@ fn model_entry(
         // load window — resident id set, ack not yet in — cannot advertise
         // text-only for a model whose facts are simply not known yet.
         if loaded.n_embd > 0 {
-            let input_modalities = if loaded.vision {
-                vec!["text", "image"]
-            } else {
-                vec!["text"]
-            };
+            // One entry per input the serve actually accepts, in wire order:
+            // text always; image on a resident vision tower; audio on a
+            // resident audio tower; video on the embed route's video leg
+            // (arch 18 — its frames ride the vision tower). An arch that
+            // refuses a modality by name (arch 17's audio/video refusals)
+            // must not advertise it.
+            let mut input_modalities = vec!["text"];
+            if loaded.vision {
+                input_modalities.push("image");
+            }
+            if loaded.audio {
+                input_modalities.push("audio");
+            }
+            if loaded.video {
+                input_modalities.push("video");
+            }
             // Same facts /health publishes from `meta.loaded`, so a client
             // discovering models the OpenAI way doesn't also need a bespoke
             // /health probe to learn the effort rungs. `reasoning_contract`
@@ -1323,13 +1334,18 @@ async fn handle_generation(
 /// PNG as `b64_json`. The daemon (not the gateway) is the authority on
 /// sampler/geometry validation — everything it refuses surfaces as a 4xx
 /// here with its message.
-/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17).
+/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17) and
+/// EmbeddingGemma-2 (arch 18).
 ///
-/// Body: `{"input": <string | [string] | {text, image_base64}>, "model"?,
-/// "kind"?: "query"|"document"}`. Reply is OpenAI-shaped `{object:"list",
-/// data:[{object:"embedding", index, n_tokens, embedding:[f32…]}], model,
-/// usage}` where `embedding` is the flat `n_tokens × dim` token matrix
-/// (late interaction), not a pooled vector.
+/// Body: `{"input": <string | [string] | {text, image_base64} |
+/// {text, images_base64:[…]} | [{content:[{type:"text"|"image_url",…}]}]>,
+/// "model"?, "kind"?: "query"|"document", "dims"?}` — see
+/// [`crate::serve::embeddings::lower_embeddings_input`] for the accepted
+/// input spellings and the shape each refusal names. Reply is OpenAI-shaped
+/// `{object:"list", data:[{object:"embedding", index, n_tokens,
+/// embedding:[f32…]}], model, usage}` where `embedding` is the flat
+/// `n_tokens × dim` token matrix (late interaction), not a pooled vector; an
+/// arch-18 single-vector model answers with `n_tokens: 1`.
 async fn handle_embeddings(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -1348,23 +1364,14 @@ async fn handle_embeddings(
         }
     };
     // One input per HTTP request; the multi-slot engine batches concurrent
-    // requests behind this endpoint. A list of length 1 is accepted; longer
-    // lists refuse rather than silently dropping inputs.
+    // requests behind this endpoint. Every accepted spelling (bare string,
+    // one-element list, legacy object, typed content array) lowers to the
+    // daemon `embed` verb's `input`; a longer list or a bare content-part
+    // array refuses rather than silently dropping or half-reading inputs.
     let input = body
         .get("input")
         .ok_or_else(|| "input is required".to_string())?;
-    let input = match input {
-        serde_json::Value::Array(items) => match items.as_slice() {
-            [one] => one.clone(),
-            other => {
-                return Err(format!(
-                    "input has {} entries; this endpoint accepts one input per request",
-                    other.len()
-                ))
-            }
-        },
-        other => other.clone(),
-    };
+    let input = crate::serve::embeddings::lower_embeddings_input(input)?;
 
     let request_model = body
         .get("model")
@@ -1396,7 +1403,11 @@ async fn handle_embeddings(
             }
         }
     } else {
-        match shared.admission.acquire_async(CancellationToken::new()).await {
+        match shared
+            .admission
+            .acquire_async(CancellationToken::new())
+            .await
+        {
             Ok(guard) => guard,
             Err(error) => {
                 return Ok(admission_error_response(
@@ -1416,10 +1427,7 @@ async fn handle_embeddings(
     // with "no model loaded" while chat (which always names a model) kept
     // working.
     let (engine, loaded_model) = {
-        let mut runtime = shared
-            .runtime
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if runtime.current_path.is_none() {
             let name = request_model
                 .clone()
@@ -1445,6 +1453,16 @@ async fn handle_embeddings(
         }
         (runtime.engine.clone(), runtime.current_path.clone())
     };
+    // The name a client knows the resident model by: the spelling it was
+    // served under (`meta.current_model` mirrors `served_name` from the load
+    // path), never the canonicalized on-disk path — path mounts leak into
+    // the wire name otherwise (`/pplx-embed-v2-late` instead of the name the
+    // client asked for).
+    let served_name = {
+        let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.current_model.clone()
+    };
+
     // A request that names a DIFFERENT model than the resident one would be
     // silently answered by the resident checkpoint — the response looks like
     // a 200 with embeddings from a model the caller didn't ask for. Refuse
@@ -1472,26 +1490,30 @@ async fn handle_embeddings(
             return Err(format!(
                 "requested model {name:?} is not the resident model ({}); \
                  this serve encodes with the resident model only",
-                loaded_model
-                    .as_ref()
-                    .map(|p| p.display().to_string())
+                served_name
+                    .clone()
+                    .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
                     .unwrap_or_else(|| "none".to_string())
             ));
         }
     }
-    let model_echo = loaded_model
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or(request_model)
+    let model_echo = request_model
+        .or(served_name)
+        .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let id = request_id();
-    let request = serde_json::json!({
+    // Optional Matryoshka width (embeddinggemma2): forwarded verbatim; arches
+    // without MRL support refuse it in the embed body.
+    let mut request = serde_json::json!({
         "type": "embed",
         "id": id,
         "kind": kind,
         "input": input,
     });
+    if let Some(d) = body.get("dims") {
+        request["dims"] = d.clone();
+    }
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
     tokio::task::spawn_blocking(move || {
@@ -1627,10 +1649,15 @@ async fn handle_images_generations(
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         (runtime.engine.clone(), runtime.current_path.clone())
     };
-    let model_echo = loaded_model
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or(request_model)
+    // Same reporting rule as /v1/embeddings: echo the request spelling, then
+    // the served name, not the canonicalized resident path.
+    let served_name = {
+        let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.current_model.clone()
+    };
+    let model_echo = request_model
+        .or(served_name)
+        .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let id = request_id();
@@ -2596,6 +2623,22 @@ mod tests {
         assert!(next(&mut body).await.is_none());
     }
 
+    /// Every `/v1/embeddings` input-shape refusal is the caller's request, not
+    /// a server fault: bare content arrays, list arity, marker/image count and
+    /// a bad data URL all answer 400.
+    #[test]
+    fn embeddings_refusals_are_client_errors() {
+        for message in [
+            "input is required",
+            "input has 2 entries; this endpoint accepts one input per request",
+            "input looks like a bare content-part array — wrap the parts in a content object",
+            "input content[0]: image_url is not valid base64: Invalid symbol 33",
+            "embed: text carries 2 <|image|> marker(s) but the request has 1 image(s)",
+        ] {
+            assert_eq!(embeddings_error_status(message), 400, "{message}");
+        }
+    }
+
     #[tokio::test]
     async fn tracked_flush_delivers_ok_ack() {
         let (mut tracked, _client, acks) = loopback_pair().await;
@@ -2787,6 +2830,8 @@ mod tests {
     fn model_entry_publishes_runtime_facts_only_for_the_resident_model() {
         let loaded = LoadedInfo {
             vision: false,
+            audio: false,
+            video: false,
             n_embd: 2048,
             n_vocab: 248320,
             reasoning_contract: String::new(),
@@ -2819,6 +2864,8 @@ mod tests {
     fn model_entry_advertises_image_input_only_when_a_tower_loaded() {
         let vision = LoadedInfo {
             vision: true,
+            audio: false,
+            video: false,
             n_embd: 5120,
             n_vocab: 248320,
             reasoning_contract: String::new(),
@@ -2829,6 +2876,49 @@ mod tests {
         assert_eq!(
             entry["architecture"]["input_modalities"],
             serde_json::json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn model_entry_advertises_every_resident_embed_modality() {
+        // arch 18 with both towers resident: all four inputs. The wire order
+        // is text, image, audio, video — a harness keying on position or
+        // membership must see the same list the embed body admits.
+        let eg2 = LoadedInfo {
+            vision: true,
+            audio: true,
+            video: true,
+            n_embd: 512,
+            n_vocab: 262144,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
+        };
+        let entry = model_entry("embeddinggemma-2:q8f16", None, Some((&eg2, 8192)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "image", "audio", "video"])
+        );
+
+        // Audio without video cannot happen today (both ride the arch-18
+        // `.vl` pack), but the list is per-fact, not a package deal: a
+        // video-capable ack whose vision tower is absent advertises no
+        // image and no video — the tower the frames would ride is the one
+        // that refused the load.
+        let audio_only = LoadedInfo {
+            vision: false,
+            audio: true,
+            video: false,
+            n_embd: 512,
+            n_vocab: 262144,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
+        };
+        let entry = model_entry("embeddinggemma-2:q8f16", None, Some((&audio_only, 8192)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "audio"])
         );
     }
 

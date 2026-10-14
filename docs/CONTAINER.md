@@ -135,6 +135,54 @@ scripts/container-gate.sh -lc 'exec python3 scripts/serve_harness.py --mode chai
 scripts/container-gate.sh -lc 'exec python3 scripts/redline_daemon_harness.py'
 ```
 
+Embedding encoders (arch 17 / arch 18 routes in [VALIDATION.md](VALIDATION.md))
+take a checkpoint *directory*, so mount it through the same models dir. The
+helper's only mount is `<models dir>:/root/.hipfire/models`, so everything a
+harness reads must live under it — including the arch-18 `.vl` tower pack
+(`ensure_vision_sidecar` finds the pack beside the checkpoint and then needs no
+`--quantizer`) and the reference `.npz`. A farm of hard links into the harness's
+HF snapshot works and keeps the cache out of the container:
+
+```bash
+SNAP=…   # HF snapshot dir
+mkdir -p ~/.hipfire/models/farm/$NAME
+for e in "$SNAP"*; do ln "$(readlink -f "$e")" ~/.hipfire/models/farm/$NAME/; done
+cp <ref>.npz ~/.hipfire/models/
+# the tower pack must be a sibling of the DIRECTORY: ~/.hipfire/models/farm/$NAME.vl
+
+HIPFIRE_MODELS_DIR=~/.hipfire/models HIPFIRE_SKIP_BUILD=1 \
+  scripts/container-gate.sh -lc 'set -e; python3 -m pip install --quiet --break-system-packages pillow soundfile;
+    exec python3 scripts/check_embeddinggemma2_parity.py \
+      --model /root/.hipfire/models/farm/$NAME --ref /root/.hipfire/models/<ref>.npz \
+      --daemon target/release/daemon'
+```
+
+`pillow` (image/video frames) and `soundfile` (WAV) are not baked into
+`gate-runner`; install them in the same shell. `HIPFIRE_CONTAINER=docker` picks
+docker over the default podman (docker treats podman's `keep-groups` as a
+literal group name, so the wrapper only adds it for podman). Use
+`HIPFIRE_SKIP_BUILD=1` once the `gate-runner` tag is current.
+
+**The image declares `VOLUME ["/root/.hipfire/models", "/var/cache/hipfire"]`.** Docker
+mounts an anonymous volume at each of those paths, and an anonymous volume
+**shadows** the same sub-path of a bind mount above it: mounting a whole
+`HIPFIRE_HOME` (for `config.toml`, a registry cache, logs) at `/root/.hipfire`
+leaves `/root/.hipfire/models` *empty* — the config is read, the model is not
+found, and `serve`/`embed` fall through to `pull`, which for a local-only
+registry row reports "place \<file\> in /root/.hipfire/models" for a file that is
+plainly on the host. Mount the models path explicitly as well (or use the
+documented `-v <models dir>:/root/.hipfire/models`):
+
+```bash
+docker run -d --name hipfire-serve \
+  --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
+  -p 9500:9500 \
+  -v "$HOME/hipfire-home:/root/.hipfire" \
+  -v "$HOME/hipfire-home/models:/root/.hipfire/models" \
+  -v hipfire-kcache:/var/cache/hipfire \
+  hipfire:local serve --model <tag> --max-seq <N>
+```
+
 Prefix-cache behavior: `--mode chain` reports `cached_tokens` on related
 turns, and `--mode prefix-fanout` drives the opt-in shared-header workload.
 The cross-session prefix cache itself is opt-in multi-slot config

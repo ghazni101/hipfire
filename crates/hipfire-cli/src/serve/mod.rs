@@ -39,6 +39,7 @@ pub(crate) mod metrics;
 
 pub mod complete;
 pub(crate) mod decide;
+pub(crate) mod embeddings;
 pub mod http;
 pub(crate) mod responses;
 pub(crate) mod ui;
@@ -234,6 +235,12 @@ pub(crate) struct ServePidRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LoadedInfo {
     pub(crate) vision: bool,
+    /// An audio tower is resident (arch 18's `.vl` pack). `false` from a
+    /// pre-`audio` daemon ack, matching the modality the serve then refuses.
+    pub(crate) audio: bool,
+    /// The embed route's video leg is served (arch 18; frames ride the
+    /// vision tower). `false` from a pre-`video` daemon ack.
+    pub(crate) video: bool,
     /// Hidden size (`dim`) — llama.cpp's `meta.n_embd`.
     pub(crate) n_embd: u64,
     /// Vocabulary size (`vocab`) — llama.cpp's `meta.n_vocab`.
@@ -1251,12 +1258,7 @@ pub(crate) fn parse_bind(
 
 /// Builds the detached child's argv. `--open` stays a parent-only action; the
 /// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
-fn detached_serve_command(
-    executable: &Path,
-    args: &ServeArgs,
-    host: &str,
-    port: u16,
-) -> Command {
+fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port: u16) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("serve")
@@ -2098,6 +2100,14 @@ impl ServeRuntime {
             let published = LoadedInfo {
                 vision: loaded
                     .get("vl")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                audio: loaded
+                    .get("audio")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                video: loaded
+                    .get("video")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
                 n_embd: loaded
@@ -3604,6 +3614,8 @@ mod tests {
             n_ctx: 32768,
             loaded: LoadedInfo {
                 vision: true,
+                audio: true,
+                video: true,
                 n_embd: 5120,
                 n_vocab: 248320,
                 reasoning_contract: "qwen_jinja".into(),

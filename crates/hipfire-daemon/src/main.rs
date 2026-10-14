@@ -23,19 +23,6 @@
 use base64::Engine;
 use hipfire_config::developer_var;
 use hipfire_config::devices::{Claim, DeviceSelection, ObservedDevice};
-use hipfire_runtime::emit_text::{
-    currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
-    ToolOutputRouter, ToolRouteError, ToolRouteEvent,
-};
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::llama;
-use hipfire_runtime::prompt_frame::ThinkMode;
-use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::spec::accept_greedy_prefix;
-use std::io::{BufRead, Write};
-use std::path::Path;
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
@@ -64,22 +51,35 @@ use hipfire_generate::batch::{
     lfm_prefill_cancellable_or_fallback,
 };
 use hipfire_generate::redline::{
-    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace, handle_redline_pm4_prefix_profile,
-    handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
-    redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
-    redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
-    redline_dspark_verify_snapshot, redline_is_dense_lfm, redline_lfm2moe_snapshot,
-    redline_pm4_prefix_profile_deepseek4, redline_prepare_retained_fixture,
-    redline_prime_deepseek4, redline_prime_dspark_shadow_arm, redline_prime_qwen,
-    redline_prime_retained_fixture, redline_qwen_debug_hashes, redline_qwen_snapshot,
-    redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
+    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4,
+    handle_redline_dispatch_profile, handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace,
+    handle_redline_pm4_prefix_profile, handle_redline_prefix_shadow, handle_redline_probe_aql,
+    handle_redline_shadow, redline_append_tensor_slice, redline_bench_decode_deepseek4,
+    redline_bench_decode_lfm2moe, redline_deepseek4_snapshot, redline_dspark_shadow_block,
+    redline_dspark_verify_guard, redline_dspark_verify_snapshot, redline_is_dense_lfm,
+    redline_lfm2moe_snapshot, redline_pm4_prefix_profile_deepseek4,
+    redline_prepare_retained_fixture, redline_prime_deepseek4, redline_prime_dspark_shadow_arm,
+    redline_prime_qwen, redline_prime_retained_fixture, redline_qwen_debug_hashes,
+    redline_qwen_snapshot, redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
     redline_run_deepseek4_decode, redline_run_direct_fixture, redline_run_dspark_capture_arm,
     redline_run_dspark_direct_arm, redline_run_dspark_replay_arm, redline_shadow_deepseek4,
     redline_shadow_dspark_verify_pm4, redline_snapshot, RedlineDeepseek4Snapshot, RedlineDsparkArm,
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+use hipfire_runtime::emit_text::{
+    currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
+    ToolOutputRouter, ToolRouteError, ToolRouteEvent,
+};
+use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::llama;
+use hipfire_runtime::prompt_frame::ThinkMode;
+use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_runtime::spec::accept_greedy_prefix;
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
 mod request_guards;
@@ -507,7 +507,9 @@ fn apply_batch_drive_result(
         Ok(()) => {}
         Err(BatchDriveError::Gpu(e)) => eprintln!("{tag} drive failed (attested): {e}"),
         Err(BatchDriveError::Poisoned(e)) => {
-            eprintln!("{tag} drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+            eprintln!(
+                "{tag} drive poisoned (unattested): {e} — generation poisoned until unload/reload"
+            );
             *batch_scheduler = None;
             *continuous_batch_size = 1;
             *batch_poisoned = Some(e);
@@ -530,20 +532,86 @@ fn client_seed_or_refuse(
     }
 }
 
-/// Refuse an image sent to a model with no vision encoder: the client asked
-/// for a capability this load lacks (`unsupported`), not a server fault.
+/// Which tower a media-carrying request needs, for the refusal text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaTower {
+    Vision,
+    Audio,
+}
+
+impl MediaTower {
+    fn noun(self) -> &'static str {
+        match self {
+            MediaTower::Vision => "vision",
+            MediaTower::Audio => "audio",
+        }
+    }
+}
+
+/// Refuse media sent to a model with no encoder for it: the client asked for a
+/// capability this load lacks (`unsupported`), not a server fault. The tower is
+/// named because the two are separate artifacts on paper and one load can have
+/// either (arch 18 keeps both in the one `.vl` sidecar).
+fn refuse_media_without_tower(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    tower: MediaTower,
+    vision_gated_off: Option<&str>,
+) {
+    let message = media_refusal_message(tower, vision_gated_off);
+    write_typed_error(stdout, id, &message, "unsupported", false, false);
+}
+
+/// The refusal text, split out from the writer so the tower noun and the knob
+/// that dropped the sidecar are directly testable.
+fn media_refusal_message(tower: MediaTower, vision_gated_off: Option<&str>) -> String {
+    let noun = tower.noun();
+    match vision_gated_off {
+        Some(sidecar) => format!(
+            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+        ),
+        None => format!("model has no {noun} encoder"),
+    }
+}
+
+/// The vision-only spelling the generate route uses.
 fn refuse_image_without_vision(
     stdout: &mut impl std::io::Write,
     id: &str,
     vision_gated_off: Option<&str>,
 ) {
-    let message = match vision_gated_off {
-        Some(sidecar) => format!(
-            "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
-        ),
-        None => "model has no vision encoder".to_owned(),
+    refuse_media_without_tower(stdout, id, MediaTower::Vision, vision_gated_off);
+}
+
+/// Which tower an `embed` request asks for — the wire's `images_base64` /
+/// `audios_base64` / `videos_base64` lists, or the one-image `image_base64`
+/// legacy field. Vision wins when a request carries both, so a tower-less
+/// load refuses the input the caller listed first.
+///
+/// A video asks for the VISION tower: arch 18's video leg has no tower of its
+/// own, it runs the image tower once per frame.
+///
+/// Wire shape only: this arm must not name an arch type, so it answers "did
+/// the caller ask for a tower", not "is a tower resident" (the encode body in
+/// `hipfire_generate::embed` owns that, and decodes the bytes).
+fn embed_request_media(msg: &serde_json::Value) -> Option<MediaTower> {
+    let input = msg.get("input").and_then(|v| v.as_object())?;
+    let list_present = |key: &str| {
+        input
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|media| !media.is_empty())
     };
-    write_typed_error(stdout, id, &message, "unsupported", false, false);
+    if list_present("images_base64") || input.get("image_base64").is_some_and(|v| !v.is_null()) {
+        return Some(MediaTower::Vision);
+    }
+    if list_present("audios_base64") {
+        return Some(MediaTower::Audio);
+    }
+    if list_present("videos_base64") {
+        return Some(MediaTower::Vision);
+    }
+    None
 }
 
 /// Resident KV backend metadata for `loaded` ACK and `diag`.
@@ -829,7 +897,8 @@ fn receive_startup_config(
             config.validate().map_err(|error| error.to_string())?;
             return Ok(Some((config, None, true, model)));
         }
-        let model = model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
+        let model =
+            model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
         let pending = match announce_generate_terminal(&msg) {
@@ -869,10 +938,12 @@ fn main() {
             std::process::exit(1);
         });
         // Packaging needs only the arch and reserves no card.
-        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(|error| {
-            eprintln!("FATAL: failed to install process configuration: {error}");
-            std::process::exit(1);
-        });
+        install_process_config(process_config, &mut |_| Ok(Claim::Claimed)).unwrap_or_else(
+            |error| {
+                eprintln!("FATAL: failed to install process configuration: {error}");
+                std::process::exit(1);
+            },
+        );
         // A separate --module probe below exercises the real GPU launch. Normal
         // packaging needs the active architecture but no writable cold directory
         // during Gpu::init: pack_to publishes to the executable-neighbor path.
@@ -900,21 +971,31 @@ fn main() {
                 gpu.free_tensor(weight)?;
                 gpu.free_tensor(output)?;
                 Ok(values)
-            })().unwrap_or_else(|error| {
+            })()
+            .unwrap_or_else(|error| {
                 eprintln!("ERROR: rmsnorm_f32 execution failed: {error}");
                 std::process::exit(1);
             });
             let input = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let weight = [1.0f32, 0.5, 1.5, 2.0, 0.25, 0.75, 1.0, 1.25];
-            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5).sqrt().recip();
-            if result.iter().zip(input.iter().zip(weight)).any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5) {
+            let scale = (input.iter().map(|v| v * v).sum::<f32>() / 8.0 + 1e-5)
+                .sqrt()
+                .recip();
+            if result
+                .iter()
+                .zip(input.iter().zip(weight))
+                .any(|(&got, (&x, w))| (got - x * w * scale).abs() > 1e-5)
+            {
                 eprintln!("ERROR: rmsnorm_f32 numerical output differs from reference: {result:?}");
                 std::process::exit(1);
             }
             eprintln!(
                 "precompile: rmsnorm_f32 execution succeeded on {}: output_bits={:?}",
                 gpu.arch,
-                result.iter().map(|v| format!("{:08x}", v.to_bits())).collect::<Vec<_>>()
+                result
+                    .iter()
+                    .map(|v| format!("{:08x}", v.to_bits()))
+                    .collect::<Vec<_>>()
             );
             return;
         }
@@ -925,10 +1006,14 @@ fn main() {
             .join("kernels")
             .join("compiled")
             .join(&gpu.arch);
-        let extra_flags = rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
+        let extra_flags =
+            rdna_compute::FeatureFlags::from_active_config(&gpu.arch).hipcc_extra_flags;
         let entries = rdna_compute::kernel_registry::entries(&gpu.arch, &extra_flags)
             .unwrap_or_else(|error| {
-                eprintln!("ERROR: no indexed kernel registry for {}: {error:?}", gpu.arch);
+                eprintln!(
+                    "ERROR: no indexed kernel registry for {}: {error:?}",
+                    gpu.arch
+                );
                 std::process::exit(1);
             });
         let count = entries.len();
@@ -938,17 +1023,26 @@ fn main() {
                 std::process::exit(1);
             });
         for entry in entries {
-            compiler.pack_to(
-                entry.module,
-                entry.source(),
-                &entry.symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<Vec<_>>(),
-                &output,
-            ).unwrap_or_else(|error| {
-                eprintln!("ERROR: packaging {} failed: {error}", entry.module);
-                std::process::exit(1);
-            });
+            compiler
+                .pack_to(
+                    entry.module,
+                    entry.source(),
+                    &entry
+                        .symbols
+                        .iter()
+                        .map(|symbol| (*symbol).to_owned())
+                        .collect::<Vec<_>>(),
+                    &output,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("ERROR: packaging {} failed: {error}", entry.module);
+                    std::process::exit(1);
+                });
         }
-        eprintln!("precompile: packaged {count} indexed modules for {}", gpu.arch);
+        eprintln!(
+            "precompile: packaged {count} indexed modules for {}",
+            gpu.arch
+        );
         return;
     }
 
@@ -1175,10 +1269,17 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let idle = !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0);
+        let idle = !batch_scheduler
+            .as_ref()
+            .is_some_and(|s| s.active_count() > 0);
         let quiet = weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag");
         if quiet && weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
-            (resident_kv, batch_scheduler, vmm_batch, continuous_batch_size) = (None, None, None, 1);
+            (
+                resident_kv,
+                batch_scheduler,
+                vmm_batch,
+                continuous_batch_size,
+            ) = (None, None, None, 1);
         }
         let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let command_span = tracing::info_span!(
@@ -1202,8 +1303,16 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
-                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg)
+                {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &refusal,
+                        "validation",
+                        false,
+                        false,
+                    );
                     let _ = stdout.flush();
                     continue;
                 }
@@ -1221,7 +1330,8 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
-                let parsed_vmm_batch = hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
+                let parsed_vmm_batch =
+                    hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
                 let experimental_multi_slot = msg
                     .get("params")
                     .and_then(|p| p.get("experimental_multi_slot"))
@@ -1237,7 +1347,8 @@ fn main() {
                     .map(|n| n as usize);
                 if requested_seq.is_some_and(|n| n < MIN_REQUESTED_SEQ) {
                     let e = format!(
-                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}", requested_seq.unwrap()
+                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}",
+                        requested_seq.unwrap()
                     );
                     emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                     let _ = stdout.flush();
@@ -1434,6 +1545,8 @@ fn main() {
                             let layers = backend.layers();
                             let vocab = backend.vocab();
                             let vl = backend.is_vl();
+                            let audio = backend.is_audio();
+                            let video = backend.is_video();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
@@ -1449,6 +1562,8 @@ fn main() {
                                 "layers": layers,
                                 "vocab": vocab,
                                 "vl": vl,
+                                "audio": audio,
+                                "video": video,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],
@@ -1523,7 +1638,6 @@ fn main() {
                             }
                             batch_clear_all_terminals();
                             resident_kv = None;
-
                         }
                     }
                 }
@@ -1671,9 +1785,11 @@ fn main() {
                 // One warning line when the load names a deprecated KV format
                 // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
                 if let Some(warning) = [
-                    Some(kv_mode_override.as_deref().unwrap_or(
-                        hipfire_runtime::config::get().kv_mode.as_str(),
-                    )),
+                    Some(
+                        kv_mode_override
+                            .as_deref()
+                            .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
+                    ),
                     kv_k_override.as_deref(),
                 ]
                 .into_iter()
@@ -2103,27 +2219,45 @@ fn main() {
                     expert_count_override: deepseek4_experts_per_token.is_some(),
                     pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
                 };
-                let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
-                    kv_backend_override.as_deref()
-                ) {
-                    Ok(request) => request,
-                    Err(e) => {
-                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                };
+                let backend_request =
+                    match hipfire_loader::admission::KvBackendRequest::from_override(
+                        kv_backend_override.as_deref(),
+                    ) {
+                        Ok(request) => request,
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &e,
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
                 let admission = match hipfire_loader::admission::admit_source_with_options(
-                    path, tp, pp, backend_request, draft_path.as_deref(),
-                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
-                    head_path.as_deref(), max_seq,
+                    path,
+                    tp,
+                    pp,
+                    backend_request,
+                    draft_path.as_deref(),
+                    gpu.arch.as_str(),
+                    vision_path.as_deref(),
+                    &vision_mode,
+                    head_path.as_deref(),
+                    max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
                         kv_k: kv_k_override.as_deref(),
                         kv_v: kv_v_override.as_deref(),
                         kv_adaptive: kv_adaptive_override.as_deref(),
                         cask: Some(&cask),
-                        deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
+                        deepseek4_heterogeneous: !matches!(
+                            deepseek4_compute_placement,
+                            hipfire_config::Deepseek4ComputePlacement::Single
+                        ),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
                         free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
@@ -2259,7 +2393,11 @@ fn main() {
                         let max_seq = m.max_seq;
                         let resolved = m.sequence.as_ref();
                         let seq_bound = resolved.map_or(
-                            if requested_seq.is_some() { "user" } else { "legacy" },
+                            if requested_seq.is_some() {
+                                "user"
+                            } else {
+                                "legacy"
+                            },
                             |s| s.bound,
                         );
                         let model_ctx = resolved.map(|s| s.model_ctx);
@@ -2313,12 +2451,15 @@ fn main() {
                             && !hipfire_runtime::config::mq4r_redline_default(
                                 &gpu.arch, path, pp, tp,
                             );
-                        gpu.replay.set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
-                            rdna_compute::replay::gfx1201_pm4_pacing_from_config()
-                        } else {
-                            Default::default()
-                        });
+                        gpu.replay
+                            .set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {
+                                rdna_compute::replay::gfx1201_pm4_pacing_from_config()
+                            } else {
+                                Default::default()
+                            });
                         let vl = m.has_vision_encoder();
+                        let audio = m.has_audio_encoder();
+                        let video = m.has_video_route();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // MTP config from load params; `None` (auto) keeps the carrier-resolved K (Qwen4 native MTP) else the skeleton MTP_K_DEFAULT.
@@ -2505,7 +2646,10 @@ fn main() {
                         // session cache (`ArchModel::session_cache_attached`).
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            13 | 16 => m.state.as_deref().is_some_and(|state| state.session_cache_attached()),
+                            13 | 16 => m
+                                .state
+                                .as_deref()
+                                .is_some_and(|state| state.session_cache_attached()),
                             _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
@@ -2535,12 +2679,10 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        let backend_reason_json =
-                            serde_json::to_string(&pending_kv_diag.reason)
-                                .expect("backend reason is serializable");
-                        let backend_warning_json =
-                            serde_json::to_string(&pending_kv_diag.warning)
-                                .expect("backend warning is serializable");
+                        let backend_reason_json = serde_json::to_string(&pending_kv_diag.reason)
+                            .expect("backend reason is serializable");
+                        let backend_warning_json = serde_json::to_string(&pending_kv_diag.warning)
+                            .expect("backend warning is serializable");
                         // Publish resident KV metadata with the loaded ACK.
                         resident_kv = Some(ResidentKvDiag {
                             mode: Some(seq_kv.to_owned()),
@@ -2550,12 +2692,14 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                audio,
+                                video,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -2569,17 +2713,23 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
+                                max_seq,
+                                seq_bound,
+                                seq_reason_json,
+                                serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(),
+                                seq_kv,
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                audio,
+                                video,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -2591,11 +2741,20 @@ fn main() {
                                 backend_reason_json,
                                 pending_kv_diag.legacy,
                                 backend_warning_json,
-                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
-                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
+                                max_seq,
+                                seq_bound,
+                                seq_reason_json,
+                                serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(),
+                                seq_kv,
                             );
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
-                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget, &gpu,
+                                ack,
+                                &mut m,
+                                vmm_batch,
+                                staging.slots,
+                                staging.row_budget,
+                                &gpu,
                             );
                             let _ = writeln!(stdout, "{ack}");
                         }
@@ -2752,7 +2911,6 @@ fn main() {
                 }
                 let _ = stdout.flush();
             }
-
             "generate" => {
                 let gen_attempt_id = match require_wire_attempt_id(msg.get("attempt_id")) {
                     Ok(id) => id,
@@ -3686,7 +3844,13 @@ fn main() {
                                     &mut stdout,
                                     &mut inbox,
                                 );
-                                apply_batch_drive_result(drive_res, "[batch][EP]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
+                                apply_batch_drive_result(
+                                    drive_res,
+                                    "[batch][EP]",
+                                    &mut batch_scheduler,
+                                    &mut continuous_batch_size,
+                                    &mut batch_poisoned,
+                                );
                             }
                             continue;
                         }
@@ -3701,9 +3865,18 @@ fn main() {
                     let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
                         == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
                     let qwen4_lanes = qwen4_batch && vmm_route;
-                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() && (!qwen4_batch || qwen4_lanes) {
+                    let batch_eligible = if !singleton_handoff
+                        && batch_scheduler.is_some()
+                        && (!qwen4_batch || qwen4_lanes)
+                    {
                         hipfire_generate::batch::batch_request_eligible_for_route(
-                            vmm_route, &msg, m, continuous_batch_size, serve_continuous_batch, pflash_active, &mut inbox,
+                            vmm_route,
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pflash_active,
+                            &mut inbox,
                         )
                     } else {
                         false
@@ -3743,16 +3916,17 @@ fn main() {
                             Ok((Vec::new(), false))
                         } else {
                             batch_render_prompt_tokens(
-                            &prompt_owned,
-                            system,
-                            assistant_prefix,
-                            m.tokenizer.as_ref().unwrap(),
-                            m.chat_template.as_ref(),
-                            max_think_tokens,
-                            messages_history.as_deref(),
-                            enable_thinking_jinja,
-                            reasoning_effort_jinja.as_deref(),
-                        ) };
+                                &prompt_owned,
+                                system,
+                                assistant_prefix,
+                                m.tokenizer.as_ref().unwrap(),
+                                m.chat_template.as_ref(),
+                                max_think_tokens,
+                                messages_history.as_deref(),
+                                enable_thinking_jinja,
+                                reasoning_effort_jinja.as_deref(),
+                            )
+                        };
                         let (prompt_tokens, started_in_think) = match render {
                             Ok(v) => v,
                             Err(e) => {
@@ -3773,8 +3947,14 @@ fn main() {
                         // this prompt length takes the singleton route before enqueue announces it.
                         let vmm_singleton_now = vmm_route
                             && !hipfire_generate::batch::vmm_request_fits_batch(
-                                &msg, m, &sampling, vmm_batch, batch_scheduler.as_ref().map_or(0, |s| s.max_batch),
-                                &gpu.arch, prompt_tokens.len(), max_tokens,
+                                &msg,
+                                m,
+                                &sampling,
+                                vmm_batch,
+                                batch_scheduler.as_ref().map_or(0, |s| s.max_batch),
+                                &gpu.arch,
+                                prompt_tokens.len(),
+                                max_tokens,
                             );
                         if (started_in_think && !vmm_route) || vmm_singleton_now {
                             // Fixed-lane route: think-open prompts are sequential
@@ -3792,7 +3972,9 @@ fn main() {
                             }
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
-                            if !qwen4_lanes && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq) {
+                            if !qwen4_lanes
+                                && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq)
+                            {
                                 emit_batch_admission_error(
                                     &mut stdout,
                                     id,
@@ -3859,7 +4041,13 @@ fn main() {
                                         &mut stdout,
                                         &mut inbox,
                                     );
-                                    apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
+                                    apply_batch_drive_result(
+                                        drive_res,
+                                        "[batch]",
+                                        &mut batch_scheduler,
+                                        &mut continuous_batch_size,
+                                        &mut batch_poisoned,
+                                    );
                                 } else if arch == 5 || arch == 6 || qwen4_lanes {
                                     let enq_ok = sched.enqueue(pending);
                                     if !enq_ok {
@@ -3884,10 +4072,22 @@ fn main() {
                                             started_in_think,
                                         );
                                     }
-                                    let drive_res = hipfire_generate::batch::drive_staged_continuous_batch(
-                                        sched, &mut gpu, m, vmm_batch.filter(|_| vmm_route), &mut stdout, &mut inbox,
+                                    let drive_res =
+                                        hipfire_generate::batch::drive_staged_continuous_batch(
+                                            sched,
+                                            &mut gpu,
+                                            m,
+                                            vmm_batch.filter(|_| vmm_route),
+                                            &mut stdout,
+                                            &mut inbox,
+                                        );
+                                    apply_batch_drive_result(
+                                        drive_res,
+                                        "[batch]",
+                                        &mut batch_scheduler,
+                                        &mut continuous_batch_size,
+                                        &mut batch_poisoned,
                                     );
-                                    apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
                                 } else {
                                     eprintln!(
                                         "[batch] impossible arch {} reached scheduler — fail closed",
@@ -3966,8 +4166,16 @@ fn main() {
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     hipfire_generate::batch::arm_promotion(
-                        vmm_route && batch_scheduler.is_some(), &msg, m, continuous_batch_size, serve_continuous_batch,
-                        pflash_active, max_tokens, max_think_tokens, client_seed, assistant_prefix,
+                        vmm_route && batch_scheduler.is_some(),
+                        &msg,
+                        m,
+                        continuous_batch_size,
+                        serve_continuous_batch,
+                        pflash_active,
+                        max_tokens,
+                        max_think_tokens,
+                        client_seed,
+                        assistant_prefix,
                     );
                     generate(
                         m,
@@ -4004,9 +4212,20 @@ fn main() {
                         request_seed,
                     );
                     if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
-                        batch_scheduler.as_mut(), &mut gpu, m, vmm_batch, &mut stdout, &mut inbox,
+                        batch_scheduler.as_mut(),
+                        &mut gpu,
+                        m,
+                        vmm_batch,
+                        &mut stdout,
+                        &mut inbox,
                     ) {
-                        apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
+                        apply_batch_drive_result(
+                            drive_res,
+                            "[batch]",
+                            &mut batch_scheduler,
+                            &mut continuous_batch_size,
+                            &mut batch_poisoned,
+                        );
                     }
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
@@ -4387,9 +4606,9 @@ fn main() {
 
             "embed" => {
                 // Embedding encode (arch 17, the qwen3.5 multi-vector
-                // encoder). The img_generate shape: dispatch + refusals
-                // here, the body in hipfire-generate so main.rs names no
-                // arch-crate type.
+                // encoder; arch 18, EmbeddingGemma-2). The img_generate shape:
+                // dispatch + refusals here, the body in hipfire-generate so
+                // main.rs names no arch-crate type.
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4450,13 +4669,32 @@ fn main() {
                         &mut stdout,
                         Some(id.as_str()),
                         "embed refused: loaded model is not an embedding checkpoint \
-                         (qwen3.5 multi-vector encoder) — use generate",
+                         (arch 17/18) — use generate",
                         "validation",
                         false,
                         false,
                     );
                     let _ = stdout.flush();
                     continue;
+                }
+                // A media-carrying embed needs its tower. Whether a tower is
+                // resident is arch-side state (`bundle.vision` / `bundle.audio`)
+                // this arm must not name; the load-time knob it DOES own is
+                // named here — `vision_mode=off` dropped the sidecar (which
+                // carries both towers) that this request needs. Placed after
+                // the verb refusal so a generation model still answers "use
+                // generate" (the actionable fix there).
+                if let Some(tower) = embed_request_media(&msg) {
+                    if vision_gated_off.is_some() {
+                        refuse_media_without_tower(
+                            &mut stdout,
+                            id.as_str(),
+                            tower,
+                            vision_gated_off.as_deref(),
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                 }
                 hipfire_generate::embed::generate_embed(m, &mut gpu, &mut stdout, &id, &msg);
                 let _ = stdout.flush();
@@ -4877,7 +5115,14 @@ fn main() {
                 let g0 = match hipfire_engine::redline::G0Arm::from_request(&msg) {
                     Ok(g0) => g0,
                     Err(reason) => {
-                        emit_uncorrelated_error(&mut stdout, None, &reason, "validation", false, false);
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &reason,
+                            "validation",
+                            false,
+                            false,
+                        );
                         let _ = stdout.flush();
                         continue;
                     }
@@ -4989,7 +5234,14 @@ fn main() {
                 let g0_before = match g0.map(|arm| arm.begin(&mut gpu)).transpose() {
                     Ok(before) => before,
                     Err(reason) => {
-                        emit_uncorrelated_error(&mut stdout, None, &reason, "unsupported", false, false);
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &reason,
+                            "unsupported",
+                            false,
+                            false,
+                        );
                         let _ = stdout.flush();
                         continue;
                     }
@@ -5060,7 +5312,14 @@ fn main() {
                     (Some(arm), Some(before)) => match arm.finish(&mut gpu, before) {
                         Ok(value) => Some(value),
                         Err(reason) => {
-                            emit_uncorrelated_error(&mut stdout, None, &reason, "internal", false, false);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &reason,
+                                "internal",
+                                false,
+                                false,
+                            );
                             let _ = stdout.flush();
                             continue;
                         }
@@ -5228,8 +5487,8 @@ mod tests {
 
     use super::{
         announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
-        emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,
-        TERMINAL_TEST_LOCK,
+        embed_request_media, emit_batch_admission_error, media_refusal_message,
+        refuse_image_without_vision, require_wire_attempt_id, MediaTower, TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -5257,6 +5516,76 @@ mod tests {
                 Some("/models/qwen3.8-27b-vision.hfq".to_owned())
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
+        }
+    }
+
+    /// The embed arm's media predicate decides which refusal a media request
+    /// gets, so its spelling sensitivity is load-bearing: the canonical
+    /// `images_base64` / `audios_base64` lists and the one-image
+    /// `image_base64` legacy field count, and the *wrong* list spelling does
+    /// not — that request is refused by field name in
+    /// `hipfire_generate::embed`, and answering it with the tower-knob refusal
+    /// instead would point the caller at the wrong fix.
+    #[test]
+    fn an_embed_request_reports_which_tower_it_asked_for() {
+        let media = |prompt: serde_json::Value| embed_request_media(&prompt);
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images_base64": ["QUJD"]}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "image_base64": "QUJD"}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "audios_base64": ["QUJD"]}})),
+            Some(MediaTower::Audio)
+        );
+        // Video asks for the VISION tower: arch 18's video leg runs the image
+        // tower once per frame, it has no tower of its own.
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos_base64": [["QUJD"]]}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos_base64": []}})),
+            None
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos": [["QUJD"]]}})),
+            None
+        );
+        // Both media: vision first, the tower whose refusal the caller sees.
+        assert_eq!(
+            media(serde_json::json!({
+                "input": {"images_base64": ["QUJD"], "audios_base64": ["REVG"]}
+            })),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(media(serde_json::json!({"input": {"text": "t"}})), None);
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images_base64": []}})),
+            None
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images": ["QUJD"]}})),
+            None
+        );
+        assert_eq!(media(serde_json::json!({"input": "t"})), None);
+        assert_eq!(media(serde_json::json!({"input": null})), None);
+    }
+
+    /// The refusal names the tower the caller asked for, and the knob that
+    /// dropped the one sidecar both towers live in.
+    #[test]
+    fn a_media_refusal_names_the_tower_the_caller_asked_for() {
+        for (tower, noun) in [(MediaTower::Vision, "vision"), (MediaTower::Audio, "audio")] {
+            let gated = media_refusal_message(tower, Some("/models/m.vl"));
+            assert!(gated.contains(&format!("no {noun} encoder")), "{gated}");
+            assert!(gated.contains("vision_mode is off"), "{gated}");
+            assert!(gated.contains("/models/m.vl"), "{gated}");
+            let bare = media_refusal_message(tower, None);
+            assert_eq!(bare, format!("model has no {noun} encoder"), "{bare}");
         }
     }
 
@@ -5290,7 +5619,10 @@ mod tests {
             announce("req-seed");
             let _scope = BatchAttemptScope::enter_for("req-seed", 7);
             let mut output = Vec::new();
-            assert_eq!(client_seed_or_refuse(&mut output, "req-seed", Some(&seed)), None);
+            assert_eq!(
+                client_seed_or_refuse(&mut output, "req-seed", Some(&seed)),
+                None
+            );
             let events = error_events(&output);
             assert_eq!(events.len(), 1, "{seed}");
             assert_eq!(events[0]["type"], "error");
@@ -5304,7 +5636,10 @@ mod tests {
             client_seed_or_refuse(&mut output, "req-seed", Some(&serde_json::json!(42))),
             Some(Some(42))
         );
-        assert_eq!(client_seed_or_refuse(&mut output, "req-seed", None), Some(None));
+        assert_eq!(
+            client_seed_or_refuse(&mut output, "req-seed", None),
+            Some(None)
+        );
         assert!(output.is_empty(), "a valid or absent seed emits nothing");
 
         for gated in [None, Some("/models/x-vision.hfq")] {

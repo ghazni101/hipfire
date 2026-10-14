@@ -14,6 +14,14 @@
 //! (`pipeline.rs`) and dtype fallback call these; they must agree with
 //! `model_filter::should_quantize`, which keeps every vision-group tensor
 //! off the text-quantize path.
+//!
+//! EmbeddingGemma-2 (arch 18) reuses the same emit path for its own `.vl`
+//! sibling, but never through `--vision-only`: the checkpoint's tower groups
+//! are flat (`vision_tower.*` / `audio_tower.*` / `embed_vision.*` /
+//! `embed_audio.*`, see [`is_eg2_sidecar_tensor`]), so no `--include-prefix`
+//! selects them and the arch-18 pack is written unconditionally by the
+//! ordinary trunk build. [`eg2_sidecar_dtype`] is the dtype half of that
+//! reuse; it wins over [`vision_dtype`] for the names both recognise.
 
 /// Tensor prefix that selects the Qwen3.5-family vision tower, and the
 /// default `--include-prefix` implied by `--vision-only`.
@@ -66,6 +74,50 @@ pub fn vision_dtype(name: &str, ndim: usize) -> Option<VisionDtype> {
         || name.ends_with(".bias")
         || name.contains(".norm")
         || name.ends_with("pos_embed.weight");
+    Some(if is_vector {
+        VisionDtype::F32Vector
+    } else {
+        VisionDtype::F16Matrix
+    })
+}
+
+/// EmbeddingGemma-2 (arch 18) tower groups: the gemma4 vision tower, the
+/// audio conformer tower, and the two projection heads that map each tower
+/// into the shared 512-wide sentence space. Flat checkpoint names — this
+/// checkpoint has no `model.` prefix and no `visual.` alias, so the qwen35
+/// prefix set never matches it (and vice versa).
+///
+/// The trunk is tower-less by construction: arch 18 skips every one of these
+/// from the text artifact and ships them as the model's own `.vl` sidecar.
+pub fn is_eg2_sidecar_tensor(name: &str) -> bool {
+    name.starts_with("vision_tower.")
+        || name.starts_with("audio_tower.")
+        || name.starts_with("embed_vision.")
+        || name.starts_with("embed_audio.")
+}
+
+/// Container for an EmbeddingGemma-2 tower tensor, or `None` when `name` is
+/// outside the arch-18 tower groups (the trunk tensors take the normal text
+/// path, which for arch 18 means the skip gate).
+///
+/// Same convention as [`vision_dtype`] and for the same reason — tower
+/// matrices and conv kernels load through the f16 GEMM/conv path
+/// (`load_f16_gpu`), their norms, biases, `per_dim_scale`, clip scalars and
+/// lookup tables through the f32 arms — with two arch-18 specifics:
+///
+/// * the audio tower's clipped-linears ship their clip bounds as **0-d**
+///   tensors (`input_min`/`input_max`/`output_min`/`output_max`, 480 of
+///   them): scalars, not matrices, so `ndim == 0` rides F32;
+/// * the vision tower's positional lookup table is spelled
+///   `position_embedding_table` (3-D `[2, 10240, 768]`), not
+///   `pos_embed.weight`, so [`vision_dtype`]'s suffix list never matches it
+///   and a plain rank rule would narrow it to F16 — a lookup table must ride
+///   F32 exactly like the qwen35 one.
+pub fn eg2_sidecar_dtype(name: &str, ndim: usize) -> Option<VisionDtype> {
+    if !is_eg2_sidecar_tensor(name) {
+        return None;
+    }
+    let is_vector = ndim <= 1 || name == "vision_tower.patch_embedder.position_embedding_table";
     Some(if is_vector {
         VisionDtype::F32Vector
     } else {
@@ -231,6 +283,287 @@ mod tests {
         assert_eq!(
             resolve_vision_prefix(Some("model.visual."), false),
             Some("model.visual.")
+        );
+    }
+
+    /// EmbeddingGemma-2 (arch 18) tower inventory. Scope source of truth: the
+    /// `google/embeddinggemma-2` safetensors header (1376 tensors; 963 of them
+    /// tower-side) cross-checked against `docs/plans/embeddinggemma2-tower-spec.md`.
+    /// Rank is carried because the dtype policy is rank-sensitive: the audio
+    /// clip bounds are 0-d and the vision positional table is 3-D — the two
+    /// cases a name-only (qwen35-shaped) rule classifies wrong.
+    fn eg2_sidecar_names() -> Vec<(String, usize)> {
+        let mut names: Vec<(String, usize)> = Vec::with_capacity(963);
+        // Vision tower: patch embedder + 16 encoder layers of 13 tensors.
+        names.push((
+            "vision_tower.patch_embedder.input_proj.weight".to_string(),
+            2,
+        ));
+        names.push((
+            "vision_tower.patch_embedder.position_embedding_table".to_string(),
+            3,
+        ));
+        for i in 0..16 {
+            let p = format!("vision_tower.encoder.layers.{i}");
+            for suffix in [
+                "input_layernorm.weight",            // rank 1
+                "mlp.down_proj.linear.weight",       // rank 2
+                "mlp.gate_proj.linear.weight",       // rank 2
+                "mlp.up_proj.linear.weight",         // rank 2
+                "post_attention_layernorm.weight",   // rank 1
+                "post_feedforward_layernorm.weight", // rank 1
+                "pre_feedforward_layernorm.weight",  // rank 1
+                "self_attn.k_norm.weight",           // rank 1
+                "self_attn.k_proj.linear.weight",    // rank 2
+                "self_attn.o_proj.linear.weight",    // rank 2
+                "self_attn.q_norm.weight",           // rank 1
+                "self_attn.q_proj.linear.weight",    // rank 2
+                "self_attn.v_proj.linear.weight",    // rank 2
+            ] {
+                let ndim = if suffix.ends_with(".linear.weight") {
+                    2
+                } else {
+                    1
+                };
+                names.push((format!("{p}.{suffix}"), ndim));
+            }
+        }
+        // Audio tower: conv subsample + output projection, then 12 conformer
+        // layers of 62 tensors (12 matrices, 50 vectors/scalars).
+        for (suffix, ndim) in [
+            ("output_proj.weight", 2),
+            ("output_proj.bias", 1),
+            ("subsample_conv_projection.input_proj_linear.weight", 2),
+            ("subsample_conv_projection.layer0.conv.weight", 4),
+            ("subsample_conv_projection.layer0.norm.weight", 1),
+            ("subsample_conv_projection.layer1.conv.weight", 4),
+            ("subsample_conv_projection.layer1.norm.weight", 1),
+        ] {
+            names.push((format!("audio_tower.{suffix}"), ndim));
+        }
+        // Per-layer matrices: FFN pair x2, depthwise lconv, lconv linear
+        // start/end, and the four attention projections + relative-k.
+        const AUDIO_LAYER_MATRICES: [(&str, usize); 12] = [
+            ("feed_forward1.ffw_layer_1.linear.weight", 2),
+            ("feed_forward1.ffw_layer_2.linear.weight", 2),
+            ("feed_forward2.ffw_layer_1.linear.weight", 2),
+            ("feed_forward2.ffw_layer_2.linear.weight", 2),
+            ("lconv1d.depthwise_conv1d.weight", 3),
+            ("lconv1d.linear_end.linear.weight", 2),
+            ("lconv1d.linear_start.linear.weight", 2),
+            ("self_attn.k_proj.linear.weight", 2),
+            ("self_attn.post.linear.weight", 2),
+            ("self_attn.q_proj.linear.weight", 2),
+            ("self_attn.relative_k_proj.weight", 2),
+            ("self_attn.v_proj.linear.weight", 2),
+        ];
+        // Per-layer vectors: the clipped-linears' 0-d clip bounds (each of the
+        // 6 clipped linears ships input_min/max + output_min/max), the norms,
+        // and per_dim_scale.
+        const AUDIO_LAYER_VECTORS: [&str; 50] = [
+            "feed_forward1.ffw_layer_1.input_max", // 0-d
+            "feed_forward1.ffw_layer_1.input_min",
+            "feed_forward1.ffw_layer_1.output_max",
+            "feed_forward1.ffw_layer_1.output_min",
+            "feed_forward1.ffw_layer_2.input_max",
+            "feed_forward1.ffw_layer_2.input_min",
+            "feed_forward1.ffw_layer_2.output_max",
+            "feed_forward1.ffw_layer_2.output_min",
+            "feed_forward1.post_layer_norm.weight", // 1-d
+            "feed_forward1.pre_layer_norm.weight",
+            "feed_forward2.ffw_layer_1.input_max",
+            "feed_forward2.ffw_layer_1.input_min",
+            "feed_forward2.ffw_layer_1.output_max",
+            "feed_forward2.ffw_layer_1.output_min",
+            "feed_forward2.ffw_layer_2.input_max",
+            "feed_forward2.ffw_layer_2.input_min",
+            "feed_forward2.ffw_layer_2.output_max",
+            "feed_forward2.ffw_layer_2.output_min",
+            "feed_forward2.post_layer_norm.weight",
+            "feed_forward2.pre_layer_norm.weight",
+            "lconv1d.conv_norm.weight",
+            "lconv1d.linear_end.input_max",
+            "lconv1d.linear_end.input_min",
+            "lconv1d.linear_end.output_max",
+            "lconv1d.linear_end.output_min",
+            "lconv1d.linear_start.input_max",
+            "lconv1d.linear_start.input_min",
+            "lconv1d.linear_start.output_max",
+            "lconv1d.linear_start.output_min",
+            "lconv1d.pre_layer_norm.weight",
+            "norm_out.weight",
+            "norm_post_attn.weight",
+            "norm_pre_attn.weight",
+            "self_attn.k_proj.input_max",
+            "self_attn.k_proj.input_min",
+            "self_attn.k_proj.output_max",
+            "self_attn.k_proj.output_min",
+            "self_attn.per_dim_scale",
+            "self_attn.post.input_max",
+            "self_attn.post.input_min",
+            "self_attn.post.output_max",
+            "self_attn.post.output_min",
+            "self_attn.q_proj.input_max",
+            "self_attn.q_proj.input_min",
+            "self_attn.q_proj.output_max",
+            "self_attn.q_proj.output_min",
+            "self_attn.v_proj.input_max",
+            "self_attn.v_proj.input_min",
+            "self_attn.v_proj.output_max",
+            "self_attn.v_proj.output_min",
+        ];
+        for i in 0..12 {
+            let p = format!("audio_tower.layers.{i}");
+            for (suffix, ndim) in AUDIO_LAYER_MATRICES {
+                names.push((format!("{p}.{suffix}"), ndim));
+            }
+            for suffix in AUDIO_LAYER_VECTORS {
+                let ndim = if suffix.ends_with(".weight") || suffix.ends_with("per_dim_scale") {
+                    1
+                } else {
+                    0
+                };
+                names.push((format!("{p}.{suffix}"), ndim));
+            }
+        }
+        // The two tower-to-sentence projection heads.
+        names.push(("embed_vision.embedding_projection.weight".to_string(), 2));
+        names.push(("embed_audio.embedding_projection.weight".to_string(), 2));
+        names
+    }
+
+    #[test]
+    fn eg2_sidecar_name_set_is_963_with_f16_matrices_and_f32_vectors() {
+        let names = eg2_sidecar_names();
+        // 210 vision (2 + 13 x 16) + 751 audio (7 + 62 x 12) + 2 projections.
+        assert_eq!(names.len(), 210 + 751 + 2, "sidecar inventory size");
+        let group = |prefix: &str| names.iter().filter(|(n, _)| n.starts_with(prefix)).count();
+        assert_eq!(group("vision_tower."), 210, "vision tower tensors");
+        assert_eq!(group("audio_tower."), 751, "audio tower tensors");
+        assert_eq!(
+            names.len() - group("vision_tower.") - group("audio_tower."),
+            2
+        );
+        let mut f16 = 0usize;
+        let mut f32 = 0usize;
+        for (name, ndim) in &names {
+            assert!(
+                is_eg2_sidecar_tensor(name),
+                "{name} must be in the arch-18 tower group"
+            );
+            match eg2_sidecar_dtype(name, *ndim) {
+                Some(VisionDtype::F16Matrix) => f16 += 1,
+                Some(VisionDtype::F32Vector) => f32 += 1,
+                None => panic!("{name} must have an arch-18 sidecar dtype"),
+            }
+        }
+        // Matrices: 7 per vision layer + patch_embedder.input_proj; 12 per
+        // audio layer + output_proj/input_proj_linear/2 subsample convs; the
+        // two projection heads. Everything else is F32: norms, biases,
+        // per_dim_scale, the positional table and the 480 0-d clip scalars.
+        assert_eq!(f16, 1 + 7 * 16 + 12 * 12 + 4 + 2, "F16 (qt=1) matrix count");
+        assert_eq!(f32, 1 + 6 * 16 + 50 * 12 + 3, "F32 (qt=2) vector count");
+        assert_eq!(f16 + f32, 963);
+    }
+
+    #[test]
+    fn eg2_sidecar_spot_dtypes_match_the_rank_rule() {
+        // Matrices and conv kernels ride F16.
+        for (name, ndim) in [
+            ("vision_tower.patch_embedder.input_proj.weight", 2),
+            ("vision_tower.encoder.layers.0.mlp.up_proj.linear.weight", 2),
+            (
+                "vision_tower.encoder.layers.15.self_attn.o_proj.linear.weight",
+                2,
+            ),
+            ("audio_tower.output_proj.weight", 2),
+            (
+                "audio_tower.subsample_conv_projection.input_proj_linear.weight",
+                2,
+            ),
+            (
+                "audio_tower.subsample_conv_projection.layer0.conv.weight",
+                4,
+            ),
+            (
+                "audio_tower.subsample_conv_projection.layer1.conv.weight",
+                4,
+            ),
+            ("audio_tower.layers.0.lconv1d.depthwise_conv1d.weight", 3),
+            ("audio_tower.layers.11.self_attn.relative_k_proj.weight", 2),
+            ("audio_tower.layers.7.lconv1d.linear_start.linear.weight", 2),
+            ("embed_vision.embedding_projection.weight", 2),
+            ("embed_audio.embedding_projection.weight", 2),
+        ] {
+            assert_eq!(
+                eg2_sidecar_dtype(name, ndim),
+                Some(VisionDtype::F16Matrix),
+                "{name}"
+            );
+        }
+        // Vectors, the 0-d clip scalars and the positional lookup table ride F32.
+        for (name, ndim) in [
+            ("vision_tower.encoder.layers.0.input_layernorm.weight", 1),
+            ("vision_tower.encoder.layers.3.self_attn.q_norm.weight", 1),
+            // 3-D positional lookup table: rank alone would narrow it to F16.
+            ("vision_tower.patch_embedder.position_embedding_table", 3),
+            ("audio_tower.output_proj.bias", 1),
+            (
+                "audio_tower.subsample_conv_projection.layer0.norm.weight",
+                1,
+            ),
+            ("audio_tower.layers.0.self_attn.per_dim_scale", 1),
+            ("audio_tower.layers.0.norm_out.weight", 1),
+            // 0-d clip bounds: scalars, not matrices.
+            ("audio_tower.layers.0.self_attn.q_proj.input_min", 0),
+            ("audio_tower.layers.5.self_attn.post.output_max", 0),
+            ("audio_tower.layers.11.lconv1d.linear_end.input_max", 0),
+            (
+                "audio_tower.layers.2.feed_forward1.ffw_layer_2.output_min",
+                0,
+            ),
+        ] {
+            assert_eq!(
+                eg2_sidecar_dtype(name, ndim),
+                Some(VisionDtype::F32Vector),
+                "{name}"
+            );
+        }
+    }
+
+    /// The arch-18 selector is additive: it claims none of the qwen35 family's
+    /// names and changes none of their dtypes, and the trunk's own tensors stay
+    /// outside it (arch 18 skips them off the text-quantize path).
+    #[test]
+    fn eg2_sidecar_selection_leaves_qwen35_and_trunk_names_alone() {
+        for (name, ndim) in [
+            ("model.visual.patch_embed.proj.weight", 2),
+            ("model.visual.pos_embed.weight", 2),
+            ("model.visual.blocks.0.norm1.bias", 1),
+            ("model.multi_modal_projector.linear.weight", 2),
+        ] {
+            assert_eq!(eg2_sidecar_dtype(name, ndim), None, "{name}");
+        }
+        for (name, ndim) in [
+            ("language_model.model.embed_tokens.weight", 2),
+            ("language_model.model.layers.0.self_attn.q_proj.weight", 2),
+            ("vision_tower_extra.weight", 2),
+            ("embedded.weight", 2),
+        ] {
+            assert_eq!(eg2_sidecar_dtype(name, ndim), None, "{name}");
+        }
+        // The qwen35 selectors are untouched by the arch-18 additions.
+        assert_eq!(
+            vision_dtype("model.visual.patch_embed.proj.weight", 2),
+            Some(VisionDtype::F16Matrix)
+        );
+        assert_eq!(
+            vision_dtype("model.visual.pos_embed.weight", 2),
+            Some(VisionDtype::F32Vector)
+        );
+        assert_eq!(
+            vision_dtype("language_model.model.layers.0.self_attn.q_proj.weight", 2),
+            None
         );
     }
 }

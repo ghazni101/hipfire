@@ -553,15 +553,23 @@ fn stage_qwen4_lanes(
     };
     // The lane ring is `K + 1` rows and a verify block is at most
     // `LANE_MAX_ROWS` rows, so the lane draft depth is bounded by it.
-    let spec_k = m.mtp_k.min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1).max(1);
-    let end_of_turn = m.tokenizer.as_ref().and_then(|t| t.special_token_id("<|im_end|>"));
+    let spec_k = m
+        .mtp_k
+        .min(hipfire_arch_qwen4::gpu_forward_lanes::LANE_MAX_ROWS - 1)
+        .max(1);
+    let end_of_turn = m
+        .tokenizer
+        .as_ref()
+        .and_then(|t| t.special_token_id("<|im_end|>"));
     let Some(bundle) = m.qwen4_mut() else {
         return refuse("model state not Qwen4");
     };
-    let spec = spec_off_reason.is_none().then_some(hipfire_arch_qwen4::lane::LaneSpecConfig {
-        k: spec_k,
-        end_of_turn,
-    });
+    let spec = spec_off_reason
+        .is_none()
+        .then_some(hipfire_arch_qwen4::lane::LaneSpecConfig {
+            k: spec_k,
+            end_of_turn,
+        });
     let spec_on_k = spec.as_ref().map(|s| s.k);
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
         return refuse("QSA context backend is not VMM");
@@ -634,7 +642,9 @@ fn stage_qwen_vmm_batch(
     let mut out = BatchStaging::default();
     let max_seq = m.max_seq;
     let Some(b) = m.qwen35_mut() else {
-        eprintln!("[daemon] VMM continuous batch requested but model state not Qwen35 — existing route");
+        eprintln!(
+            "[daemon] VMM continuous batch requested but model state not Qwen35 — existing route"
+        );
         return out;
     };
     // The executor's own coverage predicate (embedding/lm_head dtypes,
@@ -740,10 +750,15 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_bud
         None,
     );
     let Some(head) = head else {
-        eprintln!("[daemon] VMM spec lanes unavailable: MTP head not loaded ({}) — AR lanes", errors.join("; "));
+        eprintln!(
+            "[daemon] VMM spec lanes unavailable: MTP head not loaded ({}) — AR lanes",
+            errors.join("; ")
+        );
         return;
     };
-    let route = hipfire_arch_qwen35::mtp_spec::MtpPromptRoute::from_own_prefill(hipfire_config::mtp_own_prefill());
+    let route = hipfire_arch_qwen35::mtp_spec::MtpPromptRoute::from_own_prefill(
+        hipfire_config::mtp_own_prefill(),
+    );
     // AR's penalty window bound: the resident scratch's `repeat_buf` (what
     // `spec_prefill` passes every lane).
     let ar_cap = b.scratch.repeat_buf.buf.size() / 4;

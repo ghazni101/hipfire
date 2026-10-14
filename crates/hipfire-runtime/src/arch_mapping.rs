@@ -97,6 +97,15 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // from the causal LM — only the architectures field discriminates.
     ("qwen3_5model", 17),
     ("qwen3_5_embed", 17),
+    // arch 18 — EmbeddingGemma 2 (google/embeddinggemma-2): single-vector
+    // embedding encoder on the Gemma 4 text architecture. `embeddinggemma2`
+    // (no underscore) catches the class name `EmbeddingGemma2Model` in
+    // `derive_arch_id`'s substring loop; the underscored keys are the
+    // `model_type` strings (composite `embedding_gemma2`, text sub-config
+    // `embedding_gemma2_text`).
+    ("embedding_gemma2", 18),
+    ("embedding_gemma2_text", 18),
+    ("embeddinggemma2", 18),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
@@ -133,7 +142,8 @@ pub fn lookup_model_type(model_type: &str) -> Option<u32> {
 
 /// Resolve an `arch_id` from an HF `architectures` class name
 /// (case-insensitive substring, longest key wins) — the same match
-/// `derive_arch_id`'s architectures loop performs.
+/// `derive_arch_id`'s architectures loop performs, exposed so the
+/// quantizer can stamp the same id the loader will derive from the dir.
 ///
 /// Returns `None` when no table key is a substring of `arch`; the
 /// qwen3.5-family dense-vs-MoE and `qwen3_5model` embedding decisions are
@@ -235,6 +245,17 @@ mod tests {
         assert_eq!(lookup_model_type("qwen3_5_embed"), Some(17));
         // model_type stays the causal LM's — only architectures discriminates.
         assert_eq!(lookup_model_type("qwen3_5"), Some(5));
+    }
+
+    #[test]
+    fn embedding_gemma2_resolves_to_18_by_every_route() {
+        use super::lookup_architecture;
+        assert_eq!(lookup_architecture("EmbeddingGemma2Model"), Some(18));
+        assert_eq!(lookup_model_type("embedding_gemma2"), Some(18));
+        assert_eq!(lookup_model_type("embedding_gemma2_text"), Some(18));
+        // Longest-key discipline: nothing else in the table is a substring of
+        // the class name (the gemma4 keys are not — "gemma4" != "gemma2").
+        assert_ne!(lookup_architecture("EmbeddingGemma2Model"), Some(13));
     }
 
     #[test]

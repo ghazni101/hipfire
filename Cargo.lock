@@ -1340,6 +1340,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-embeddinggemma2"
+version = "0.4.2"
+dependencies = [
+ "half",
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-runtime",
+ "image",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-gemma4"
 version = "0.4.3"
 dependencies = [
@@ -1674,6 +1687,7 @@ dependencies = [
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2-vl",
  "hipfire-arch-lfm2moe",
@@ -1707,6 +1721,7 @@ dependencies = [
  "hipfire-arch-deepseek4",
  "hipfire-arch-diffusion",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
  "hipfire-arch-lfm2-vl",
  "hipfire-arch-lfm2moe",

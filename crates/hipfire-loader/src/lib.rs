@@ -364,6 +364,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         14 => "muse_glimmer",
         16 => "qwen4",
         17 => "qwen3_5_embed",
+        18 => "embedding_gemma2",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -387,6 +388,9 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     // implementation to run (QwenVl vs DotsOcr vs Lfm2Vl have distinct generate
     // bodies in `hipfire_generate::vision`), not just whether vision is present.
     // Consulting caps here makes the gate declarative without changing behaviour.
+    // The converse is not implied: an images-capable arch with no generate-side
+    // VL body still returns `None` — the embed-only encoders (arch 17, 18) take
+    // their media through the bundle, and 18's `None` is pinned by test.
     let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
     if !caps.supports_images {
         return VisionRoute::None;
@@ -463,7 +467,7 @@ pub enum WireVerb {
 /// needs no change here; a new non-generating arch is added explicitly.
 pub fn wire_verb(arch_id: u32) -> WireVerb {
     match arch_id {
-        17 => WireVerb::Embed,
+        17 | 18 => WireVerb::Embed,
         _ => WireVerb::Generate,
     }
 }
@@ -540,6 +544,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
+    &EmbeddingGemma2Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -1185,6 +1190,25 @@ impl LoadedModel {
         })
     }
 
+    /// EmbeddingGemma-2 bundle if this model is arch_id=18, else `None`.
+    /// The daemon `embed` verb's typed handle.
+    pub fn embeddinggemma2_mut(
+        &mut self,
+    ) -> Option<&mut hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
+        })
+    }
+
+    /// Read-only twin of [`Self::embeddinggemma2_mut`] for the residency
+    /// probes (`has_vision_encoder` / `has_audio_encoder` / `has_video_route`)
+    /// and any other inspection that needs no mutation.
+    pub fn embeddinggemma2(&self) -> Option<&hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref().and_then(|s| {
+            (s as &dyn Any).downcast_ref::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
+        })
+    }
+
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
         self.state
             .as_deref_mut()
@@ -1296,9 +1320,11 @@ impl LoadedModel {
     }
 
     /// Declared vision capability across ALL carriers that can carry a
-    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
-    /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
-    /// this instead of the qwen-typed accessors above.
+    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8),
+    /// lfm2-vl (arch-11 bundle field), and embeddinggemma2 (arch 18, whose
+    /// `.vl` pack carries the Gemma4 tower). The daemon's image gate and the
+    /// `loaded` ack's `vl` fact consult this instead of the qwen-typed
+    /// accessors above.
     pub fn has_vision_encoder(&self) -> bool {
         if self.dots_ocr().is_some() {
             return true;
@@ -1308,7 +1334,27 @@ impl LoadedModel {
                 return true;
             }
         }
+        if self.embeddinggemma2().is_some_and(|b| b.vision.is_some()) {
+            return true;
+        }
         self.qwen35().is_some_and(|b| b.vision_config.is_some())
+    }
+
+    /// Declared audio capability: an audio tower is resident in this load.
+    /// Today only embeddinggemma2 (arch 18) carries one (in the same `.vl`
+    /// pack as the vision tower); every other arch answers `false`, matching
+    /// the embed body's per-modality refusals.
+    pub fn has_audio_encoder(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.audio.is_some())
+    }
+
+    /// Declared video capability: the arch serves the embed route's video
+    /// leg. Video has no tower of its own — arch 18's frames ride the vision
+    /// tower, one pass per frame — so this is the vision tower's residency on
+    /// the one arch with a video leg, and `false` everywhere else (arch 17's
+    /// encoder has no video leg; chat VL arches take no video input).
+    pub fn has_video_route(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.vision.is_some())
     }
 
     /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
@@ -1973,7 +2019,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
         trunk_path,
         sidecar,
@@ -2240,7 +2289,11 @@ fn finish_qwen35_load(
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size, s.block_size
+                    dp,
+                    s.draft_config.n_layers,
+                    s.draft_config.hidden,
+                    s.draft_config.block_size,
+                    s.block_size
                 );
                 Some(s)
             }
@@ -2341,50 +2394,51 @@ fn finish_qwen35_load(
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> = if adaptive_blocks_generic_spec
-        || eviction.is_some()
-        || !matches!(arch_id, 5 | 6)
-        || ctx.spec.mtp == Some(false)
-        || mtp_spill_degrade
-        || dflash.is_some()
-        || dspark_speculator.is_some()
-    {
-        None
-    } else {
-        // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
-        // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
-        // daemon clients keep the canonical-sibling lookup.
-        let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
-            Path::new(ctx.path),
-            ctx.mtp_path.clone(),
-            (config.dim, config.vocab_size),
-            &mut *ctx.gpu,
-            physical_cap,
-            None,
-        );
-        if resolved.is_none() {
-            if ctx.spec.mtp == Some(true) {
-                let reason = if errors.is_empty() {
-                    "no bundled trailer or .mtp sidecar found".to_string()
-                } else {
-                    errors.join("; ")
-                };
-                return Err(rollback_unfinished_qwen35(
-                    format!("MTP head required (mtp=on) but not loaded: {reason}"),
-                    bundle,
-                    vision_weights,
-                    ctx.gpu,
-                ));
+    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
+        if adaptive_blocks_generic_spec
+            || eviction.is_some()
+            || !matches!(arch_id, 5 | 6)
+            || ctx.spec.mtp == Some(false)
+            || mtp_spill_degrade
+            || dflash.is_some()
+            || dspark_speculator.is_some()
+        {
+            None
+        } else {
+            // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
+            // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
+            // daemon clients keep the canonical-sibling lookup.
+            let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+                Path::new(ctx.path),
+                ctx.mtp_path.clone(),
+                (config.dim, config.vocab_size),
+                &mut *ctx.gpu,
+                physical_cap,
+                None,
+            );
+            if resolved.is_none() {
+                if ctx.spec.mtp == Some(true) {
+                    let reason = if errors.is_empty() {
+                        "no bundled trailer or .mtp sidecar found".to_string()
+                    } else {
+                        errors.join("; ")
+                    };
+                    return Err(rollback_unfinished_qwen35(
+                        format!("MTP head required (mtp=on) but not loaded: {reason}"),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
+                if !errors.is_empty() {
+                    eprintln!(
+                        "  MTP head not loaded: {} — falling back to AR/n-gram",
+                        errors.join("; ")
+                    );
+                }
             }
-            if !errors.is_empty() {
-                eprintln!(
-                    "  MTP head not loaded: {} — falling back to AR/n-gram",
-                    errors.join("; ")
-                );
-            }
-        }
-        resolved
-    };
+            resolved
+        };
     if mtp.is_some() {
         if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
             &bundle.weights.layers,
@@ -2777,8 +2831,9 @@ fn resolve_route_plan(
     {
         return Err("vision tower".into());
     }
-    let config = <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
-        .map_err(|e| e.to_string())?;
+    let config =
+        <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
+            .map_err(|e| e.to_string())?;
     // Same K/V resolution as the qwen35 HFQ carrier (adaptive/CASK refused above).
     let mode_raw = req
         .kv_mode_override
@@ -2810,9 +2865,10 @@ fn resolve_route_plan(
             let name = kv_mode::qwen_k_display_name(k);
             (name, name)
         }
-        kv_mode::KvPair::Split(k, v) => {
-            (kv_mode::qwen_k_display_name(k), kv_mode::qwen_v_display_name(v))
-        }
+        kv_mode::KvPair::Split(k, v) => (
+            kv_mode::qwen_k_display_name(k),
+            kv_mode::qwen_v_display_name(v),
+        ),
     };
     let state_quant = match parse_state_quant(req.state_quant_override)? {
         StateQuant::Q8 => "q8",
@@ -2892,7 +2948,9 @@ fn begin_route_kernels(
     req: &RouteRequest<'_>,
     gpu: &mut Gpu,
 ) -> Result<Option<PlannedRoute>, String> {
-    use rdna_compute::compile_jobs::{compile_job_budget, host_available_memory, parse_job_override};
+    use rdna_compute::compile_jobs::{
+        compile_job_budget, host_available_memory, parse_job_override,
+    };
     gpu.abort_route_kernel_load()
         .map_err(|e| format!("kernel route reset: {e}"))?;
     let (plan, spec) = match resolve_route_plan(req, gpu) {
@@ -2907,7 +2965,9 @@ fn begin_route_kernels(
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
     let override_jobs = parse_job_override(
         "HIPFIRE_JIT_JOBS",
-        hipfire_config::developer_var("HIPFIRE_JIT_JOBS").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_JIT_JOBS")
+            .ok()
+            .as_deref(),
     )?;
     let available = host_available_memory();
     let modules = plan.entries.len();
@@ -2927,10 +2987,17 @@ fn begin_route_kernels(
             );
         }
         Err(overlap) => {
-            let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
-                .map_err(|e| {
-                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
-                })?;
+            let jobs = compile_job_budget(
+                cores,
+                available,
+                ROUTE_COMPILE_SAFETY_RESERVE,
+                override_jobs,
+            )
+            .map_err(|e| {
+                format!(
+                    "refusing load: no kernel compile worker fits ({overlap}; before weights: {e})"
+                )
+            })?;
             gpu.begin_route_kernel_load(plan, jobs)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
                 .map_err(|e| {
@@ -5113,7 +5180,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     match (first_err, weight_lease) {
         (Some(err), Some(lease)) => {
             drop(lease);
-            Err(format!("{err}; weight-host lease closed without release (teardown not proven clean)"))
+            Err(format!(
+                "{err}; weight-host lease closed without release (teardown not proven clean)"
+            ))
         }
         (Some(err), None) => Err(err),
         (None, Some(lease)) => lease.release(),
@@ -5613,6 +5682,24 @@ mod registry_tests {
                 .caps()
                 .supports_images,
             "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
+        );
+        // EmbeddingGemma-2 (arch 18) declares the capability: the checkpoint's
+        // vision tower ships in the arch-18 `.vl` pack, and the per-instance
+        // gate is the loaded bundle's tower. It has no generate-side VL route
+        // — embed inputs dispatch through the bundle — so `vision_route(18)`
+        // must stay `None` even with the capability declared.
+        let eg2 = REGISTRY
+            .iter()
+            .find(|c| c.name() == "embeddinggemma2")
+            .expect("embeddinggemma2 carrier missing");
+        assert!(
+            eg2.caps().supports_images,
+            "embeddinggemma2 (arch 18) must declare supports_images — tower-less trunks (no .vl pack) still refuse images via the bundle check"
+        );
+        assert_eq!(
+            super::vision_route(18),
+            super::VisionRoute::None,
+            "embeddinggemma2 is embed-only: no generate-side VL route"
         );
         for name in [
             "qwen2",

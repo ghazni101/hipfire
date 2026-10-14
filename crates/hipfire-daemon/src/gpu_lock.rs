@@ -28,7 +28,10 @@ mod os {
 
     pub(super) fn prepare_dir(path: &Path) -> Result<(), String> {
         if !path.is_absolute() {
-            return Err(format!("GPU lock directory must be absolute: {}", path.display()));
+            return Err(format!(
+                "GPU lock directory must be absolute: {}",
+                path.display()
+            ));
         }
         if !path.exists() {
             std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
@@ -36,18 +39,27 @@ mod os {
                 .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
         }
         if !path.is_dir() {
-            return Err(format!("GPU lock path is not a directory: {}", path.display()));
+            return Err(format!(
+                "GPU lock path is not a directory: {}",
+                path.display()
+            ));
         }
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
         if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-            return Err(format!("GPU lock directory is not writable: {}", path.display()));
+            return Err(format!(
+                "GPU lock directory is not writable: {}",
+                path.display()
+            ));
         }
         Ok(())
     }
 
     pub(super) fn default_dirs() -> Vec<PathBuf> {
-        vec![PathBuf::from("/run/lock/hipfire"), PathBuf::from("/tmp/hipfire-locks")]
+        vec![
+            PathBuf::from("/run/lock/hipfire"),
+            PathBuf::from("/tmp/hipfire-locks"),
+        ]
     }
 
     pub(super) fn open(path: &Path) -> std::io::Result<File> {
@@ -131,11 +143,17 @@ mod os {
 
     pub(super) fn prepare_dir(path: &Path) -> Result<(), String> {
         if !path.is_absolute() {
-            return Err(format!("GPU lock directory must be absolute: {}", path.display()));
+            return Err(format!(
+                "GPU lock directory must be absolute: {}",
+                path.display()
+            ));
         }
         std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
         if !path.is_dir() {
-            return Err(format!("GPU lock path is not a directory: {}", path.display()));
+            return Err(format!(
+                "GPU lock path is not a directory: {}",
+                path.display()
+            ));
         }
         Ok(())
     }
@@ -155,7 +173,11 @@ mod os {
     /// std opens with FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     /// so a contender can open the file and read the holder PID.
     pub(super) fn open(path: &Path) -> std::io::Result<File> {
-        std::fs::OpenOptions::new().read(true).write(true).create(true).open(path)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
     }
 
     /// `Ok(false)` when another handle holds the lock.
@@ -275,11 +297,19 @@ impl GpuLocks {
             admission.entry_id,
             admission.state_path.display()
         );
-        Ok(Self { dir, held: Vec::new(), kind: ClaimKind::Shared(admission) })
+        Ok(Self {
+            dir,
+            held: Vec::new(),
+            kind: ClaimKind::Shared(admission),
+        })
     }
 
     fn in_dir(dir: PathBuf) -> Self {
-        Self { dir, held: Vec::new(), kind: ClaimKind::Exclusive }
+        Self {
+            dir,
+            held: Vec::new(),
+            kind: ClaimKind::Exclusive,
+        }
     }
 
     /// Non-blocking reservation; a busy card reports its holder so arch
@@ -298,7 +328,9 @@ impl GpuLocks {
             // that binds the admission to the physical card.
             admission.require_wrapper_holds(&path)?;
             if !os::try_lock_shared(&file).map_err(|e| format!("lock {}: {e}", path.display()))? {
-                return Ok(Claim::Busy("held exclusively; shared weight-host claim refused".into()));
+                return Ok(Claim::Busy(
+                    "held exclusively; shared weight-host claim refused".into(),
+                ));
             }
             eprintln!("[gpu-lock] shared {}", path.display());
             self.held.push((identity, file));
@@ -316,7 +348,8 @@ impl GpuLocks {
         // The lock file stays on disk forever; never unlink an active inode.
         os::after_claim(&path);
         file.set_len(0).map_err(|e| e.to_string())?;
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
         writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
         file.flush().map_err(|e| e.to_string())?;
         eprintln!("[gpu-lock] reserved {}", path.display());
@@ -352,7 +385,11 @@ impl GpuLocks {
         if matches!(self.kind, ClaimKind::Shared(_)) {
             return Ok(());
         }
-        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
+        let mut identities = self
+            .held
+            .iter()
+            .map(|(identity, _)| identity.as_str())
+            .collect::<Vec<_>>();
         identities.sort_unstable();
         let hipfire_dir = Path::new(&os::home()?).join(".hipfire");
         std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
@@ -419,10 +456,16 @@ pub(crate) mod fabric {
                 .map_err(|e| format!("fabric admission: read {}: {e}", state_path.display()))?;
             let entry = running_entry(&raw, entry_id)?;
             if proc_start(entry.wrapper_pid) != Some(entry.wrapper_start) {
-                return Err(format!("fabric admission: entry {entry_id} wrapper {} is gone", entry.wrapper_pid));
+                return Err(format!(
+                    "fabric admission: entry {entry_id} wrapper {} is gone",
+                    entry.wrapper_pid
+                ));
             }
             if proc_start(entry.child) != Some(entry.child_start) {
-                return Err(format!("fabric admission: entry {entry_id} session {} is gone", entry.child));
+                return Err(format!(
+                    "fabric admission: entry {entry_id} session {} is gone",
+                    entry.child
+                ));
             }
             let session = proc_session(pid)
                 .ok_or_else(|| format!("fabric admission: process {pid} is gone"))?;
@@ -432,7 +475,12 @@ pub(crate) mod fabric {
                     entry.child
                 ));
             }
-            Ok(Self { state_path, entry_id, wrapper_pid: entry.wrapper_pid, session })
+            Ok(Self {
+                state_path,
+                entry_id,
+                wrapper_pid: entry.wrapper_pid,
+                session,
+            })
         }
 
         /// The admitting wrapper must hold a shared `flock` on `lock_path`.
@@ -455,16 +503,18 @@ pub(crate) mod fabric {
     }
 
     fn parse_token(token: &str) -> Result<(PathBuf, u64), String> {
-        let (path, id) = token
-            .rsplit_once('#')
-            .ok_or_else(|| format!("fabric admission token {token:?}: expected <state-json>#<entry-id>"))?;
+        let (path, id) = token.rsplit_once('#').ok_or_else(|| {
+            format!("fabric admission token {token:?}: expected <state-json>#<entry-id>")
+        })?;
         let path = PathBuf::from(path);
         if !path.is_absolute() || path.extension().and_then(|e| e.to_str()) != Some("json") {
-            return Err(format!("fabric admission token {token:?}: state path must be an absolute .json file"));
+            return Err(format!(
+                "fabric admission token {token:?}: state path must be an absolute .json file"
+            ));
         }
-        let id = id
-            .parse::<u64>()
-            .map_err(|_| format!("fabric admission token {token:?}: entry id is not a decimal integer"))?;
+        let id = id.parse::<u64>().map_err(|_| {
+            format!("fabric admission token {token:?}: entry id is not a decimal integer")
+        })?;
         Ok((path, id))
     }
 
@@ -474,7 +524,11 @@ pub(crate) mod fabric {
         let entry = state
             .get("entries")
             .and_then(|v| v.as_array())
-            .and_then(|entries| entries.iter().find(|e| e.get("id").and_then(|v| v.as_u64()) == Some(entry_id)))
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("id").and_then(|v| v.as_u64()) == Some(entry_id))
+            })
             .ok_or_else(|| format!("fabric admission: entry {entry_id} not found"))?;
         let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
         let number = |key: &str| {
@@ -484,10 +538,13 @@ pub(crate) mod fabric {
                 .ok_or_else(|| format!("fabric admission: entry {entry_id} lacks {key}"))
         };
         if text("kind") != Some("correct") || text("state") != Some("running") {
-            return Err(format!("fabric admission: entry {entry_id} is not a running correct job"));
+            return Err(format!(
+                "fabric admission: entry {entry_id} is not a running correct job"
+            ));
         }
         let pid = |key: &str| {
-            number(key).and_then(|v| u32::try_from(v).map_err(|_| format!("fabric admission: bad {key}")))
+            number(key)
+                .and_then(|v| u32::try_from(v).map_err(|_| format!("fabric admission: bad {key}")))
         };
         Ok(Entry {
             wrapper_pid: pid("pid")?,
@@ -501,7 +558,11 @@ pub(crate) mod fabric {
     /// index 19 = starttime (the same parse fabric.py uses).
     fn stat_field(pid: u32, index: usize) -> Option<u64> {
         let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        raw.get(raw.rfind(')')? + 2..)?.split_whitespace().nth(index)?.parse().ok()
+        raw.get(raw.rfind(')')? + 2..)?
+            .split_whitespace()
+            .nth(index)?
+            .parse()
+            .ok()
     }
 
     pub(crate) fn proc_start(pid: u32) -> Option<u64> {
@@ -528,7 +589,10 @@ pub(crate) mod fabric {
             if fields.contains(&"->") || fields.len() < 6 {
                 return false;
             }
-            if fields[1] != "FLOCK" || fields[3] != "READ" || fields[4].parse::<u32>().ok() != Some(pid) {
+            if fields[1] != "FLOCK"
+                || fields[3] != "READ"
+                || fields[4].parse::<u32>().ok() != Some(pid)
+            {
                 return false;
             }
             let mut id = fields[5].split(':');
@@ -552,7 +616,15 @@ pub(crate) mod fabric {
                 parse_token("/q/state/hiptrx-card-B.json#75").unwrap(),
                 (PathBuf::from("/q/state/hiptrx-card-B.json"), 75)
             );
-            for bad in ["", "75", "state.json#75", "/q/state.txt#75", "/q/s.json#", "/q/s.json#-1", "/q/s.json#7x"] {
+            for bad in [
+                "",
+                "75",
+                "state.json#75",
+                "/q/state.txt#75",
+                "/q/s.json#",
+                "/q/s.json#-1",
+                "/q/s.json#7x",
+            ] {
                 assert!(parse_token(bad).is_err(), "{bad:?} must be refused");
             }
         }
@@ -565,10 +637,21 @@ pub(crate) mod fabric {
                 {"id":7,"kind":"correct","state":"running","pid":30,"start":31,"child":32,"child_start":33}]}"#;
             assert_eq!(
                 running_entry(state, 7).unwrap(),
-                Entry { wrapper_pid: 30, wrapper_start: 31, child: 32, child_start: 33 }
+                Entry {
+                    wrapper_pid: 30,
+                    wrapper_start: 31,
+                    child: 32,
+                    child_start: 33
+                }
             );
-            assert!(running_entry(state, 8).is_err(), "timing entries never admit shared claims");
-            assert!(running_entry(state, 9).is_err(), "waiting entries are not admitted");
+            assert!(
+                running_entry(state, 8).is_err(),
+                "timing entries never admit shared claims"
+            );
+            assert!(
+                running_entry(state, 9).is_err(),
+                "waiting entries are not admitted"
+            );
             assert!(running_entry(state, 6).is_err(), "unknown entry");
             assert!(running_entry("{not json", 7).is_err());
         }
@@ -632,16 +715,24 @@ mod tests {
     /// and LockFileEx both conflict per open file handle.
     #[test]
     fn claims_are_exclusive_name_the_holder_and_release_on_drop() {
-        let dir = LockDir(std::env::temp_dir().join(format!("hipfire-gpu-lock-{}", std::process::id())));
+        let dir =
+            LockDir(std::env::temp_dir().join(format!("hipfire-gpu-lock-{}", std::process::id())));
         std::fs::create_dir_all(&dir.0).unwrap();
         let cards = cards();
         let mut first = GpuLocks::in_dir(dir.0.clone());
         let mut second = GpuLocks::in_dir(dir.0.clone());
 
         assert_eq!(first.try_claim(&cards[0]).unwrap(), Claim::Claimed);
-        assert_eq!(first.try_claim(&cards[0]).unwrap(), Claim::Claimed, "re-claim of a held card");
+        assert_eq!(
+            first.try_claim(&cards[0]).unwrap(),
+            Claim::Claimed,
+            "re-claim of a held card"
+        );
         let holder = format!("already reserved by holder PID {}", std::process::id());
-        assert_eq!(second.try_claim(&cards[0]).unwrap(), Claim::Busy(holder.clone()));
+        assert_eq!(
+            second.try_claim(&cards[0]).unwrap(),
+            Claim::Busy(holder.clone())
+        );
         assert_eq!(
             std::fs::read_to_string(dir.0.join("gpu-GPU-9eb7aeda51c88ffd.lock")).unwrap(),
             format!("{} 0000:03:00.0\n", std::process::id())
@@ -649,9 +740,15 @@ mod tests {
 
         // all-or-nothing: a set containing a busy card fails
         let error = second.claim_all(&cards).unwrap_err();
-        assert_eq!(error, format!("GPU GPU-9eb7aeda51c88ffd (PCI 0000:03:00.0) {holder}"));
+        assert_eq!(
+            error,
+            format!("GPU GPU-9eb7aeda51c88ffd (PCI 0000:03:00.0) {holder}")
+        );
         assert_eq!(second.try_claim(&cards[1]).unwrap(), Claim::Claimed);
-        assert!(dir.0.join("gpu-pci-0000:13:00.0.lock").exists(), "no-UUID card locks by PCI address");
+        assert!(
+            dir.0.join("gpu-pci-0000:13:00.0.lock").exists(),
+            "no-UUID card locks by PCI address"
+        );
         assert_eq!(
             first.claim_all(&cards).unwrap_err(),
             format!("GPU pci-0000:13:00.0 (PCI 0000:13:00.0) {holder}")
@@ -670,7 +767,9 @@ mod tests {
     #[test]
     fn shared_claims_coexist_exclude_exclusive_and_need_the_wrapper_hold() {
         use super::{fabric::FabricAdmission, os, ClaimKind};
-        let dir = LockDir(std::env::temp_dir().join(format!("hipfire-gpu-lock-shared-{}", std::process::id())));
+        let dir = LockDir(
+            std::env::temp_dir().join(format!("hipfire-gpu-lock-shared-{}", std::process::id())),
+        );
         std::fs::create_dir_all(&dir.0).unwrap();
         let cards = cards();
         let shared = |dir: &std::path::Path| GpuLocks {
@@ -696,16 +795,26 @@ mod tests {
         assert_eq!(host.try_claim(&cards[0]).unwrap(), Claim::Claimed);
         assert_eq!(tenant.try_claim(&cards[0]).unwrap(), Claim::Claimed);
         tenant.write_pid_file().unwrap();
-        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "", "shared claims never write the lock file");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            "",
+            "shared claims never write the lock file"
+        );
 
         let mut exclusive = GpuLocks::in_dir(dir.0.clone());
-        assert!(matches!(exclusive.try_claim(&cards[0]).unwrap(), Claim::Busy(_)));
+        assert!(matches!(
+            exclusive.try_claim(&cards[0]).unwrap(),
+            Claim::Busy(_)
+        ));
 
         drop(host);
         drop(tenant);
         drop(wrapper);
         assert_eq!(exclusive.try_claim(&cards[0]).unwrap(), Claim::Claimed);
         let wrapper = os::open(&lock_path).unwrap();
-        assert!(!os::try_lock_shared(&wrapper).unwrap(), "exclusive daemon blocks the fabric hold");
+        assert!(
+            !os::try_lock_shared(&wrapper).unwrap(),
+            "exclusive daemon blocks the fabric hold"
+        );
     }
 }
