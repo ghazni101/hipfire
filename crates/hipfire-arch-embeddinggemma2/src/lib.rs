@@ -42,12 +42,17 @@
 //!
 //! Multimodal scope: the checkpoint also ships a Gemma-4 vision tower, an
 //! audio tower and their projectors (`vision_tower.*`, `audio_tower.*`,
-//! `embed_vision.*`, `embed_audio.*`). This implementation serves the text
-//! embedding path only: the towers are neither loaded nor quantized, and an
-//! image/video/audio ATTACHMENT is refused with an explicit error at
-//! assembly. (Text that literally contains a placeholder token like
-//! `<|image|>` embeds as that token's row — the same thing the HF tokenizer
-//! does, so prompt-paste parity is preserved.)
+//! `embed_vision.*`, `embed_audio.*`). Both legs are implemented and stream
+//! from the same arch-18 `.vl` sidecar: the vision tower ([`vision`]) with
+//! its image processor ([`image`]), the audio tower ([`audio_tower`]) with
+//! its mel frontend ([`audio`]). A request's media is spliced as projected
+//! rows over the placeholder rows before the text encode
+//! ([`carrier::assemble_input`]). A bundle loaded without a sidecar is
+//! text-only and refuses images with [`carrier::NO_VISION_TOWER`] and audio
+//! with [`carrier::NO_AUDIO_TOWER`] — never silently. Text that literally
+//! contains a placeholder token like `<|image|>` with no media attached
+//! embeds as that token's row — the same thing the HF tokenizer does, so
+//! prompt-paste parity is preserved.
 //!
 //! Numerics: activations f32, GEMM weights f16 (WMMA f16×f16 f32-accumulate)
 //! — the same tradeoff the qwen35-embed encoder makes, ~1e-3 relative vs an
@@ -55,20 +60,37 @@
 //! float16" warning concerns serving the whole network in f16, not the
 //! weight-operand precision of an f32-accumulate GEMM.
 
+pub mod audio;
+pub mod audio_tower;
 pub mod bundle;
 pub mod carrier;
 pub mod config;
 pub mod forward;
+pub mod image;
 pub mod names;
 pub mod post;
 pub mod slot_engine;
+pub mod video;
+pub mod vision;
 pub mod weights;
 
+pub use audio::{decode_wav, process_audio, AudioPlan, ProcessedAudio};
+pub use audio_tower::{load_audio_tower, AudioTower};
 pub use bundle::EmbedGemmaBundle;
-pub use carrier::{assemble_input, load_embed_gemma_bundle, load_embed_gemma_from_source, preflight_slot, AssembledInput};
-pub use config::{EmbedConfig, InputKind};
-pub use forward::{encode_embeddings, encode_embeddings_batch, EncodeInput};
+pub use carrier::{
+    assemble_input, encode_assembled, encode_media, load_embed_gemma_bundle,
+    load_embed_gemma_from_source, load_embed_gemma_with_vision, media_rows, preflight_slot,
+    AssembledInput, MediaKind, MediaSpan, NO_AUDIO_TOWER, NO_VIDEO_TOWER, NO_VISION_TOWER,
+};
+pub use config::{
+    parse_audio_config, parse_vision_config, AudioConfig, AudioFrontendConfig, EmbedConfig,
+    InputKind, OverflowStrategy, VideoFrontendConfig, VisionConfig,
+};
+pub use forward::{encode_embeddings, encode_embeddings_batch, EncodeInput, MediaRows};
+pub use image::ProcessedImage;
 pub use post::{l2_normalize_rows, mean_pool_rows, mrl_truncate};
+pub use video::{process_video, sample_indices};
+pub use vision::{encode_images, VisionTower};
 
 /// `arch_id` this crate claims — see `docs/architecture-ids.md`.
 pub const ARCH_ID: u32 = 18;

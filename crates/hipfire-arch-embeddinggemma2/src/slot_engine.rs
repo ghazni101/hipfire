@@ -9,15 +9,19 @@
 //! `encode_embeddings_batch` per group, per-request failure isolation).
 
 use crate::bundle::EmbedGemmaBundle;
-use crate::carrier::{assemble_input, load_embed_gemma_from_source};
+use crate::carrier::{
+    assemble_input, encode_media, load_embed_gemma_with_vision, media_rows,
+    resolve_slot_vision_path, AssembledInput, NO_AUDIO_TOWER, NO_VIDEO_TOWER, NO_VISION_TOWER,
+};
 use crate::config::InputKind;
-use crate::forward::{encode_embeddings_batch, padded_rows, EncodeInput};
+use crate::forward::{encode_embeddings_batch, padded_rows, EncodeInput, MediaRows};
 use hipfire_runtime::loader_api::ModelSource;
 use hipfire_runtime::serve::{
     EmbedKind, EmbedRequest, EmbedResponse, EngineStats, SlotEngineConfig, SlotEngineHandle,
     SubmitRequest,
 };
 use rdna_compute::Gpu;
+use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,10 +40,25 @@ pub struct EmbedEngineConfig {
     pub max_batch_requests: usize,
     pub max_batch_rows: usize,
     pub batch_window: Duration,
+    /// Resolved `.vl` sidecar (`None` = text-only). It carries BOTH towers
+    /// (vision and audio). Resolved from the slot preflight's `vl_path`, or
+    /// by [`resolve_slot_vision_path`] when the caller passed none (an
+    /// explicit `HIPFIRE_VISION_MODE=off` resolves nothing).
+    pub vision_path: Option<PathBuf>,
 }
 
 impl EmbedEngineConfig {
     pub fn from_slot_config(cfg: &SlotEngineConfig) -> Self {
+        // The daemon's carrier preflight already applied the load's vision
+        // ladder: `off` clears both fields, `auto`/`on` fill `vl_path` when a
+        // tower resolved. Honor that decision instead of rediscovering — an
+        // unconditional probe here is what let the tower load under an
+        // explicit `off`.
+        let vision_path = if cfg.vl_path.is_some() || cfg.is_vl {
+            resolve_slot_vision_path(&cfg.model_path, cfg.vl_path.as_deref())
+        } else {
+            None
+        };
         Self {
             model_path: cfg.model_path.clone(),
             max_batch_requests: cfg.n_slots.max(1),
@@ -49,6 +68,7 @@ impl EmbedEngineConfig {
                 cfg.max_batch_tokens
             },
             batch_window: batch_window_from_env(),
+            vision_path,
         }
     }
 }
@@ -102,16 +122,23 @@ impl EmbedSlotEngine {
                         return Err(e);
                     }
                 };
-                let bundle = match load_embed_gemma_from_source(&mut gpu, src) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.clone()));
-                        return Err(e);
-                    }
-                };
+                let bundle =
+                    match load_embed_gemma_with_vision(&mut gpu, src, cfg.vision_path.as_deref()) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e.clone()));
+                            return Err(e);
+                        }
+                    };
                 let _ = ready_tx.send(Ok(()));
                 let mut bundle = bundle;
                 let res = run_loop(&mut gpu, &mut bundle, rx, stats_thread, &cfg);
+                if let Some(vision) = bundle.vision.take() {
+                    vision.free_gpu(&mut gpu);
+                }
+                if let Some(audio) = bundle.audio.take() {
+                    audio.free_gpu(&mut gpu);
+                }
                 bundle.weights.free_gpu(&mut gpu);
                 res
             })
@@ -225,7 +252,10 @@ fn serve_batch(
         kind: InputKind,
         dims: usize,
         n_input: usize,
-        assembled: crate::carrier::AssembledInput,
+        assembled: AssembledInput,
+        /// The image towers' projected rows, one `[span.len, hidden]` block
+        /// per span (empty for text-only inputs).
+        media: Vec<Vec<f32>>,
     }
     let mut prepared: Vec<Prepared> = Vec::new();
     let mut early: Vec<Vec<Option<String>>> = Vec::with_capacity(cmds.len());
@@ -236,13 +266,19 @@ fn serve_batch(
                 EmbedKind::Query => InputKind::Query,
                 EmbedKind::Document => InputKind::Document,
             };
-            if req.image.is_some() {
-                errs.push(Some(format!(
-                    "{}: embeddinggemma2 is served text-only on this route — image \
-                     inputs are refused (the checkpoint's vision/audio towers are not \
-                     part of this implementation)",
-                    req.request_tag
-                )));
+            // The towers are a separate artifact (the `.vl` sidecar), so a
+            // tower-less instance refuses each modality with its load-time
+            // pointing error instead of silently embedding the text.
+            if !req.images.is_empty() && bundle.vision.is_none() {
+                errs.push(Some(format!("{}: {NO_VISION_TOWER}", req.request_tag)));
+                continue;
+            }
+            if !req.audios.is_empty() && bundle.audio.is_none() {
+                errs.push(Some(format!("{}: {NO_AUDIO_TOWER}", req.request_tag)));
+                continue;
+            }
+            if !req.videos.is_empty() && bundle.vision.is_none() {
+                errs.push(Some(format!("{}: {NO_VIDEO_TOWER}", req.request_tag)));
                 continue;
             }
             // Truncate a nonsense dims ask here so it fails per-request,
@@ -256,17 +292,32 @@ fn serve_batch(
                 )));
                 continue;
             }
-            match assemble_input(bundle, kind, &req.text) {
+            match assemble_input(
+                bundle,
+                kind,
+                &req.text,
+                &req.images,
+                &req.audios,
+                &req.videos,
+            ) {
                 Ok(assembled) => {
-                    errs.push(None);
-                    prepared.push(Prepared {
-                        cmd: ci,
-                        slot: errs.len() - 1,
-                        kind,
-                        dims,
-                        n_input: assembled.ids.len(),
-                        assembled,
-                    });
+                    // The tower runs NOW, on the engine thread, before the
+                    // batched text encode — never cached across requests.
+                    match encode_media(gpu, bundle, &assembled) {
+                        Ok(media) => {
+                            errs.push(None);
+                            prepared.push(Prepared {
+                                cmd: ci,
+                                slot: errs.len() - 1,
+                                kind,
+                                dims,
+                                n_input: assembled.ids.len(),
+                                assembled,
+                                media,
+                            });
+                        }
+                        Err(e) => errs.push(Some(format!("{}: {e}", req.request_tag))),
+                    }
                 }
                 Err(e) => errs.push(Some(format!("{}: {e}", req.request_tag))),
             }
@@ -308,10 +359,33 @@ fn serve_batch(
         .as_deref()
         == Some("1");
     for group in &groups {
+        // The tower rows live in `prepared` (they outlive the group), so the
+        // per-span views borrow from there.
+        let mut media_views: Vec<Vec<MediaRows<'_>>> = Vec::with_capacity(group.len());
+        let mut view_err: Option<String> = None;
+        for &i in group {
+            let p = &prepared[i];
+            match media_rows(&p.assembled, &p.media) {
+                Ok(v) => media_views.push(v),
+                Err(e) => {
+                    view_err = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = view_err {
+            for &i in group {
+                let p = &prepared[i];
+                results[p.cmd][p.slot] = Some(Err(format!("embeddinggemma2: encode: {e}")));
+            }
+            continue;
+        }
         let inputs: Vec<EncodeInput<'_>> = group
             .iter()
-            .map(|&i| EncodeInput {
+            .enumerate()
+            .map(|(gi, &i)| EncodeInput {
                 ids: &prepared[i].assembled.ids,
+                media: &media_views[gi],
             })
             .collect();
         let t_g = Instant::now();

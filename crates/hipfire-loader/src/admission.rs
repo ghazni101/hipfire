@@ -834,9 +834,11 @@ pub struct SourceAdmission {
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
     /// Validated vision-tower sidecar (`params.vision` / `HIPFIRE_VISION_SIDECAR`).
-    /// `Some` only when the sidecar opened, carries arch_id 5|6, and holds the
-    /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
-    /// `None` = trunk-only (or explicit opt-out via empty string).
+    /// `Some` only when the sidecar opened, carries the trunk's VL family arch
+    /// id (Qwen3.5-VL 5|6, EmbeddingGemma-2 18), and holds that family's tower
+    /// probe tensor; the single/pp route threads it into `LoadCtx`, which the
+    /// arch crate opens at load. `None` = trunk-only (or explicit opt-out via
+    /// empty string).
     pub vision_path: Option<std::path::PathBuf>,
     /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
     /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
@@ -933,15 +935,53 @@ fn probe_vision(src: &ModelSource, arch_id: u32) -> Result<bool, String> {
     classify_vision(arch_id, has_tensor, has_config)
 }
 
-/// Tower probe tensor shared by the trunk and the vision sidecar.
+/// Tower probe tensor shared by the Qwen3.5-VL trunk and its `.vl` sidecar.
 const VISION_PROBE_TENSOR: &str = "model.visual.patch_embed.proj.weight";
 
+/// EmbeddingGemma-2 (arch 18) tower probe: the vision patch embedder. The
+/// checkpoint carries the tower under flat `vision_tower.*` names — there is
+/// no `model.visual.` alias — so the Qwen probe never resolves there, and the
+/// two families must not share one probe.
+const EMBED_GEMMA_VISION_PROBE_TENSOR: &str = "vision_tower.patch_embedder.input_proj.weight";
+
+/// The `.vl` sidecar contract of one VL family:
+/// `(sidecar arch ids the quantizer stamps on the pack, their spelling in
+/// refusals, the probe tensor proving the tower shipped, the pack remedy)`.
+/// The trunk-side gate and the sidecar-side gate share it, so a pack stamped
+/// by another family — whose tower names never resolve against this trunk —
+/// is refused instead of being opened as the wrong tower.
+fn vision_sidecar_family(
+    arch_id: u32,
+) -> Option<(&'static [u32], &'static str, &'static str, &'static str)> {
+    match arch_id {
+        // Qwen3.5-VL dense (5) / MoE (6): the `--vision-only` pack of
+        // `model.visual.*`; either trunk accepts either family stamp.
+        5 | 6 => Some((
+            &[5, 6],
+            "5|6",
+            VISION_PROBE_TENSOR,
+            "pack the tower with `hipfire-quantize <hf-dir> --include-vision \
+             --include-prefix model.visual.`",
+        )),
+        // EmbeddingGemma-2 (18): the trunk is tower-less by construction and
+        // ships its own arch-18 `.vl` pack of the `vision_tower.*` group.
+        18 => Some((
+            &[18],
+            "18",
+            EMBED_GEMMA_VISION_PROBE_TENSOR,
+            "requantize with `hipfire-quantize <hf-dir>` (the EmbeddingGemma-2 \
+             pack writes the `.vl` tower sidecar beside the trunk)",
+        )),
+        _ => None,
+    }
+}
+
 /// Validate the optional vision-tower sidecar and return its resolved path.
-/// Fail-closed: an unopenable, non-5|6, or tower-less sidecar refuses with a
-/// message naming the remedy. The sidecar opens read-only as a SEPARATE
-/// `HfqFile` (never `attach_overlay` — REAP rejects additive tensor names,
-/// hfq.rs:391-427). Empty string counts as unset (explicit opt-out, same
-/// semantics as `HIPFIRE_DFLASH_DRAFT`).
+/// Fail-closed: an unopenable, wrong-family, or tower-less sidecar refuses
+/// with a message naming the remedy. The sidecar opens read-only as a
+/// SEPARATE `HfqFile` (never `attach_overlay` — REAP rejects additive tensor
+/// names, hfq.rs:391-427). Empty string counts as unset (explicit opt-out,
+/// same semantics as `HIPFIRE_DFLASH_DRAFT`).
 fn resolve_vision_sidecar(
     vision: Option<&str>,
     arch_id: u32,
@@ -957,26 +997,23 @@ fn resolve_vision_sidecar(
              sources cannot carry a sidecar tower"
         ));
     }
-    if !matches!(arch_id, 5 | 6) {
+    let Some((sidecar_archs, expected, probe, remedy)) = vision_sidecar_family(arch_id) else {
         return Err(format!(
             "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
-             only serve Qwen3.5-VL trunks (arch_id 5|6)"
+             only serve Qwen3.5-VL (arch_id 5|6) and EmbeddingGemma-2 (arch_id 18) trunks"
         ));
-    }
+    };
     let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
         .map_err(|e| format!("vision sidecar '{path}': open failed: {e}"))?;
-    if !matches!(sidecar.arch_id, 5 | 6) {
+    if !sidecar_archs.contains(&sidecar.arch_id) {
         return Err(format!(
-            "vision sidecar '{path}' has arch_id={} (expected 5|6): pack the tower \
-             with `hipfire-quantize <hf-dir> --include-vision --include-prefix model.visual.`",
+            "vision sidecar '{path}' has arch_id={} (expected {expected}): {remedy}",
             sidecar.arch_id
         ));
     }
-    if sidecar.tensor_data(VISION_PROBE_TENSOR).is_none() {
+    if sidecar.tensor_data(probe).is_none() {
         return Err(format!(
-            "vision sidecar '{path}' carries no vision tower tensor \
-             '{VISION_PROBE_TENSOR}': pack the tower with `hipfire-quantize <hf-dir> \
-             --include-vision --include-prefix model.visual.`"
+            "vision sidecar '{path}' carries no vision tower tensor '{probe}': {remedy}"
         ));
     }
     Ok(Some(std::path::PathBuf::from(path)))
@@ -1467,8 +1504,7 @@ pub fn admit_source_with_options(
     // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
     // (arch 5) on one device; anything else would be a private load, which
     // the opt-in forbids. Refused before teardown, so the prior model stays.
-    if hipfire_arch_qwen35::carrier::weight_host_socket()?
-        .is_some()
+    if hipfire_arch_qwen35::carrier::weight_host_socket()?.is_some()
         && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
     {
         return Err(format!(
@@ -1506,10 +1542,13 @@ pub fn admit_source_with_options(
         let ep = hipfire_config::topology::qwen4_ep()?;
         let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
         let spec_mtp = options.spec.mtp;
-        let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
+        let carrier =
+            crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
         crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
         carrier.admit_options(draft_path, options)?;
-        if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
+        if let Some(refusal) =
+            qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count())
+        {
             return Err(refusal);
         }
         // The PLE rows source is chosen (and a missing q4 derived from the
@@ -1963,8 +2002,8 @@ mod tests {
     #[test]
     fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {
         for mode in [
-            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2",
-            "turbo3", "turbo4",
+            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2", "turbo3",
+            "turbo4",
         ] {
             assert!(qwen35_gfx11_vmm_supported(
                 "gfx1100", 5, 1, mode, None, None
@@ -2043,8 +2082,8 @@ mod tests {
         let refuses = qwen35_gfx1151_fwht_k_override;
         for mode in ["", "auto", "q8", " q8 "] {
             for k in [
-                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2",
-                "turbo3", "turbo4", "turbo", " fwht3 ",
+                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2", "turbo3", "turbo4",
+                "turbo", " fwht3 ",
             ] {
                 for arch_id in [5, 6] {
                     assert!(refuses("gfx1151", arch_id, mode, Some(k)));
@@ -2146,7 +2185,10 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
-        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1),
+            Ok(true)
+        );
         assert_eq!(
             qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1, 1),
             Ok(false)
@@ -2169,7 +2211,10 @@ mod tests {
         // Expert parallelism attaches the head only on an explicit `on`:
         // `auto`/off stay AR.
         for ep in [2, 4] {
-            assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep),
+                Ok(false)
+            );
             assert_eq!(
                 qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
                 Ok(false)
@@ -2192,7 +2237,12 @@ mod tests {
         }
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 3, 5, 8] {
-            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in {1, 2, 4}"), "ep {ep}");
+            assert!(
+                admit(1, 1, ep, false)
+                    .unwrap_err()
+                    .contains("ep in {1, 2, 4}"),
+                "ep {ep}"
+            );
         }
         for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
             assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
@@ -2208,9 +2258,15 @@ mod tests {
         assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4)), None);
         assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None), None);
         let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1100", Some(4)).unwrap();
-        assert!(arch.contains("gfx1201") && arch.contains("expert parallelism"), "{arch}");
+        assert!(
+            arch.contains("gfx1201") && arch.contains("expert parallelism"),
+            "{arch}"
+        );
         let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2)).unwrap();
-        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
+        assert!(
+            count.contains("4 visible devices") && count.contains("2 visible"),
+            "{count}"
+        );
         assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2)).is_some());
         assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2)).is_some());
     }
@@ -2222,12 +2278,17 @@ mod tests {
         assert_eq!(qwen4_ep_device_refusal(4, &gfx1201(4), all), Ok(()));
         assert_eq!(qwen4_ep_device_refusal(2, &gfx1201(4), all), Ok(()));
         // Too few devices.
-        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all).unwrap_err().contains("3 visible"));
+        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all)
+            .unwrap_err()
+            .contains("3 visible"));
         // A different arch on rank 2 refuses and names the rank.
         let mut mixed = gfx1201(4);
         mixed[2] = "gfx1100".to_string();
         let error = qwen4_ep_device_refusal(4, &mixed, all).unwrap_err();
-        assert!(error.contains("rank 2") && error.contains("gfx1100"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("gfx1100"),
+            "{error}"
+        );
         // An arch beyond the rank count is not part of the mesh.
         assert_eq!(qwen4_ep_device_refusal(2, &mixed, all), Ok(()));
         // Every directed pair is probed; one missing direction refuses.
@@ -2242,9 +2303,11 @@ mod tests {
             qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| Ok(!(a == 3 && b == 1))).unwrap_err();
         assert!(error.contains("device 3 cannot access device 1"), "{error}");
         // A failed query is an error, not "no peer".
-        assert!(qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
-            .unwrap_err()
-            .contains("hip"));
+        assert!(
+            qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
+                .unwrap_err()
+                .contains("hip")
+        );
     }
 
     #[test]
@@ -2683,11 +2746,20 @@ mod tests {
     }
 
     /// Vision-sidecar fixtures: minimal HFQ files via the in-memory writer.
-    /// The trunk is a tower-less arch-5 text pack; the sidecar carries just
-    /// the probe tensor. Admission is read-only — no GPU needed.
+    /// The trunk is a tower-less text pack; the sidecar carries just the
+    /// trunk family's probe tensor. Admission is read-only — no GPU needed.
     mod vision_sidecar {
         use super::*;
         use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+        /// The probe tensor admission looks for on an `arch_id` sidecar.
+        fn probe_for(arch_id: u32) -> &'static str {
+            if arch_id == 18 {
+                super::super::EMBED_GEMMA_VISION_PROBE_TENSOR
+            } else {
+                super::super::VISION_PROBE_TENSOR
+            }
+        }
 
         fn write_hfq(name: &str, arch_id: u32, with_tower: bool) -> std::path::PathBuf {
             let dir = std::env::temp_dir().join(format!(
@@ -2706,7 +2778,7 @@ mod tests {
             }];
             if with_tower {
                 tensors.push(HfqMemTensor {
-                    name: super::super::VISION_PROBE_TENSOR.into(),
+                    name: probe_for(arch_id).into(),
                     quant_type: 1,
                     shape: vec![4, 4],
                     group_size: 0,
@@ -2801,6 +2873,134 @@ mod tests {
             assert!(err.contains("arch_id=9"), "names the sidecar arch: {err}");
             cleanup(&trunk);
             cleanup(&sidecar);
+        }
+
+        /// EmbeddingGemma-2: tower-less arch-18 trunk + its arch-18 `.vl` pack
+        /// admits, and the resolved path reaches the carrier through
+        /// `LoadCtx` exactly as the Qwen3.5-VL sidecar does.
+        #[test]
+        fn embed_gemma_sidecar_promotes_tower_less_trunk() {
+            let trunk = write_hfq("eg2-trunk", 18, false);
+            let sidecar = write_hfq("eg2-sidecar", 18, true);
+            let admitted = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .expect("EmbeddingGemma-2 tower sidecar must admit");
+            assert!(
+                admitted.has_vision,
+                "sidecar tower promotes the tower-less arch-18 trunk"
+            );
+            assert_eq!(admitted.vision_path, Some(sidecar.clone()));
+            assert!(
+                admitted
+                    .carrier
+                    .is_some_and(|c| c.name() == "embeddinggemma2"),
+                "trunk still routes to embeddinggemma2"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// An arch-18 pack without the EmbeddingGemma-2 tower probe refuses
+        /// with the requantize remedy — never silently text-only.
+        #[test]
+        fn embed_gemma_sidecar_without_tower_refuses() {
+            let trunk = write_hfq("eg2-b-trunk", 18, false);
+            let sidecar = write_hfq("eg2-b-sidecar", 18, false);
+            let err = admit_source(
+                trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("tower-less arch-18 sidecar must refuse");
+            assert!(err.contains("no vision tower tensor"), "remedy: {err}");
+            assert!(
+                err.contains(super::super::EMBED_GEMMA_VISION_PROBE_TENSOR),
+                "names the EmbeddingGemma-2 probe: {err}"
+            );
+            cleanup(&trunk);
+            cleanup(&sidecar);
+        }
+
+        /// The two families do not interchange: an arch-18 trunk refuses a
+        /// Qwen3.5-VL sidecar (and vice versa) — the wrong tower's names would
+        /// never resolve against the trunk.
+        #[test]
+        fn sidecar_families_do_not_interchange() {
+            let eg2_trunk = write_hfq("eg2-x-trunk", 18, false);
+            let qwen_sidecar = write_hfq("eg2-x-qwen-sidecar", 5, true);
+            let err = admit_source(
+                eg2_trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(qwen_sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("Qwen sidecar on an arch-18 trunk must refuse");
+            assert!(err.contains("arch_id=5"), "names the sidecar arch: {err}");
+            assert!(err.contains("expected 18"), "names the family: {err}");
+            cleanup(&eg2_trunk);
+            cleanup(&qwen_sidecar);
+
+            let qwen_trunk = write_hfq("eg2-y-trunk", 5, false);
+            let eg2_sidecar = write_hfq("eg2-y-sidecar", 18, true);
+            let err = admit_source(
+                qwen_trunk.to_str().unwrap(),
+                1,
+                1,
+                None,
+                None,
+                "gfx1100",
+                Some(eg2_sidecar.to_str().unwrap()),
+                "auto",
+                None,
+                4096,
+            )
+            .map(|_| ())
+            .expect_err("EmbeddingGemma-2 sidecar on a Qwen trunk must refuse");
+            assert!(err.contains("arch_id=18"), "names the sidecar arch: {err}");
+            assert!(err.contains("expected 5|6"), "names the family: {err}");
+            cleanup(&qwen_trunk);
+            cleanup(&eg2_sidecar);
+        }
+
+        /// A sidecar requested for any arch outside the two VL families is
+        /// refused before the file is even opened.
+        #[test]
+        fn sidecar_for_a_non_vl_arch_refuses() {
+            let missing = std::env::temp_dir().join("hipfire-vision-admit-never-exists.hfq");
+            let _ = std::fs::remove_file(&missing);
+            let err =
+                super::super::resolve_vision_sidecar(Some(missing.to_str().unwrap()), 13, false)
+                    .map(|_| ())
+                    .expect_err("text-only arch must refuse a sidecar request");
+            assert!(
+                err.contains("arch_id=13") && err.contains("EmbeddingGemma-2"),
+                "names the arch and both VL families: {err}"
+            );
         }
         #[test]
         fn automatic_backend_resolves_by_capability_not_source_spelling() {

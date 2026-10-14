@@ -1781,6 +1781,28 @@ fn cpu_preflight(
     // reading and the refusals.
     if let Some(over) = hipfire_loader::slot_preflight(std::path::Path::new(model_path)) {
         let p = over?;
+        // The carrier reports the tower it FOUND (an explicit path, or the
+        // `.vl` sibling); the load's ladder owns whether it is used — the
+        // same rule the sequential arm applies (`vision_mode=off` is a hard
+        // override; `on` requires a tower). Without this gate the mode never
+        // reached a carrier-delegated preflight at all, so a multi-slot load
+        // asking for `auto` came back text-only and refused media.
+        let (vl_path, is_vl) = match vision_mode {
+            "off" => (None, false),
+            _ => {
+                let explicit = vision.filter(|v| !v.is_empty()).map(PathBuf::from);
+                match explicit.or(p.vl_path) {
+                    Some(v) => (Some(v), true),
+                    None if vision_mode == "on" && !p.is_vl => {
+                        return Err(format!(
+                            "vision_mode=on: no vision tower resolved for {model_path} \
+                             (no explicit sidecar and no <stem>.vl sibling found)"
+                        ))
+                    }
+                    None => (None, p.is_vl),
+                }
+            }
+        };
         return Ok(Preflight {
             arch_id: p.arch_id,
             arch_str: p.arch_str,
@@ -1792,9 +1814,9 @@ fn cpu_preflight(
             // chat template, no sampling recommendation, no VL splice. The
             // tower is loaded and driven by the arch crate itself.
             chat_template: None,
-            is_vl: p.is_vl,
+            is_vl,
             vision_config: None,
-            vl_path: p.vl_path,
+            vl_path,
             rec_temperature: None,
             rec_top_p: None,
         });
@@ -2973,12 +2995,22 @@ mod tests {
                 matches!(registered, hipfire_config::DefaultValue::Integer(i) if i == expected),
                 "{key}: registered default is {registered:?}, expected {expected}"
             );
-            assert_eq!(integer_or_registered_default(&empty, key), expected, "{key}");
+            assert_eq!(
+                integer_or_registered_default(&empty, key),
+                expected,
+                "{key}"
+            );
         }
         let mut set = hipfire_config::ConfigLayer::default();
-        set.set("serve.queue_timeout_ms", hipfire_config::ConfigValue::Integer(1234))
-            .unwrap();
-        assert_eq!(integer_or_registered_default(&set, "serve.queue_timeout_ms"), 1234);
+        set.set(
+            "serve.queue_timeout_ms",
+            hipfire_config::ConfigValue::Integer(1234),
+        )
+        .unwrap();
+        assert_eq!(
+            integer_or_registered_default(&set, "serve.queue_timeout_ms"),
+            1234
+        );
     }
 
     #[test]
@@ -3312,11 +3344,24 @@ mod tests {
 
     #[test]
     fn load_caps_admit_only_the_default_dflash_block() {
-        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
-            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
+        for ok in [
+            json!({"params": {}}),
+            json!({"params": {"dflash_block": 16}}),
+            json!({"params": {"dflash_block": "auto"}}),
+        ] {
+            assert!(
+                validate_load_caps(&ok, "gfx1100").is_none(),
+                "{ok} must be admitted"
+            );
         }
-        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
-            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
+        for bad in [
+            json!({"params": {"dflash_block": 8}}),
+            json!({"params": {"dflash_block": 99}}),
+        ] {
+            assert!(
+                validate_load_caps(&bad, "gfx1100").is_some(),
+                "{bad} must be refused"
+            );
         }
     }
 

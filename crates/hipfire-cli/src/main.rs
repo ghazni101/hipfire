@@ -143,7 +143,7 @@ pub(crate) enum Commands {
     Run(RunArgs),
     /// Generate an image (txt2img) through a fresh native daemon process.
     Img(ImgArgs),
-    /// Encode text (or an image) with an embedding model; optionally score a
+    /// Encode text and/or images with an embedding model; optionally score a
     /// query against a document with late-interaction MaxSim.
     Embed(EmbedArgs),
     /// Start an interactive conversation through the native HTTP service.
@@ -574,8 +574,27 @@ struct EmbedArgs {
     #[arg(long)]
     kind: Option<String>,
     /// Image input (PNG/JPEG); encoded with the checkpoint's vision tower.
+    /// Repeatable — the images are appended after the text, in flag order
+    /// (each takes the place of one `<|image|>` marker written in the text,
+    /// or, with no marker, its run lands before EOS).
     #[arg(long = "image", value_name = "PATH")]
-    image: Option<PathBuf>,
+    image: Vec<PathBuf>,
+    /// Audio input; encoded with the checkpoint's audio tower. Repeatable —
+    /// clips are appended after the text and images, in flag order. Takes
+    /// 16 kHz mono/stereo WAV/RIFF (PCM16 or float32); anything else is
+    /// refused here with the conversion to run.
+    #[arg(long = "audio", value_name = "PATH")]
+    audio: Vec<PathBuf>,
+    /// Video input (arch 18); encoded with the checkpoint's vision tower,
+    /// which runs once per frame. One clip per flag: give that clip's
+    /// FRAMES, comma separated, in display order — the daemon applies the
+    /// video processor's sampler (`max_frames` 32) itself, so pass a decoded
+    /// clip at whatever rate you extracted it. Repeat the flag for several
+    /// clips; clip order is flag order and each clip's frames are spliced at
+    /// its own `<|video|>` marker. Frames are PNG/JPEG; a container (MP4,
+    /// MKV, …) is refused here with the `ffmpeg` extraction to run.
+    #[arg(long = "video", value_name = "FRAME[,FRAME…]")]
+    video: Vec<String>,
     /// Emit the full JSON result (token-embedding matrix / score object)
     /// instead of the human summary.
     #[arg(short = 'j', long)]
@@ -2116,7 +2135,12 @@ fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
+    format!(
+        "{}/{}/resolve/main/{}",
+        base.trim_end_matches('/'),
+        repo,
+        file
+    )
 }
 
 #[cfg(test)]
@@ -2904,8 +2928,7 @@ fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
 /// last.
 fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
     let largest = reports.iter().map(|r| r.bytes).max()?;
-    let biggest: Vec<&CalibrationReport> =
-        reports.iter().filter(|r| r.bytes == largest).collect();
+    let biggest: Vec<&CalibrationReport> = reports.iter().filter(|r| r.bytes == largest).collect();
     let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
     shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let label = if biggest.len() == 1 {
@@ -3230,25 +3253,92 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
     if !matches!(kind, "query" | "document") {
         bail!("--kind must be \"query\" or \"document\", got {kind:?}");
     }
-    if args.query.is_none() && args.doc.is_none() && args.text.is_empty() && args.image.is_none() {
+    if args.query.is_none()
+        && args.doc.is_none()
+        && args.text.is_empty()
+        && args.image.is_empty()
+        && args.audio.is_empty()
+        && args.video.is_empty()
+    {
         bail!(
-            "nothing to encode: pass text (positional or --query/--doc) and/or --image \
-             (e.g. `hipfire embed <model> --query \"what is rust\" --doc \"Rust is …\"`)"
+            "nothing to encode: pass text (positional or --query/--doc) and/or \
+             --image/--audio/--video (e.g. `hipfire embed <model> --query \"what is rust\" \
+             --doc \"Rust is …\"`)"
         );
     }
     if args.doc.is_some() && args.query.is_none() {
         bail!("--doc without --query: encode the document alone with the positional text + --kind document");
     }
-    let image_b64: Option<String> = args
+    // Every `--image` in flag order. The daemon decodes them; the base64 here
+    // is the wire's one media spelling (`images_base64`, a list).
+    let images_b64: Vec<String> = args
         .image
-        .as_ref()
+        .iter()
         .map(|p| -> Result<String> {
             use base64::Engine as _;
             let bytes = std::fs::read(p)
                 .with_context(|| format!("--image {}: cannot read file", p.display()))?;
             Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
         })
-        .transpose()?;
+        .collect::<Result<_>>()?;
+    // Same for the clips. The container is checked here because the caller can
+    // fix it without a model: the tower takes 16 kHz WAV/RIFF only.
+    let audios_b64: Vec<String> = args
+        .audio
+        .iter()
+        .map(|p| -> Result<String> {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--audio {}: cannot read file", p.display()))?;
+            if !is_wav(&bytes) {
+                bail!(
+                    "--audio {}: not a WAV file (RIFF/WAVE) — convert it first: \
+                     ffmpeg -i {} -ar 16000 -ac 1 {}.wav",
+                    p.display(),
+                    p.display(),
+                    p.display()
+                );
+            }
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .collect::<Result<_>>()?;
+    // Videos: one clip per `--video`, frames comma separated. The daemon runs
+    // the sampler (`max_frames` 32) and the tower, so this layer only reads
+    // the frames and checks each one's container — a clip container (MP4 …)
+    // is refused here with the extraction to run, never decoded by guessing.
+    let videos_b64: Vec<Vec<String>> = args
+        .video
+        .iter()
+        .enumerate()
+        .map(|(v, spec)| -> Result<Vec<String>> {
+            use base64::Engine as _;
+            let frames: Vec<&str> = spec
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if frames.is_empty() {
+                bail!("--video #{v} ({spec:?}) names no frames");
+            }
+            frames
+                .iter()
+                .enumerate()
+                .map(|(f, path)| -> Result<String> {
+                    let bytes = std::fs::read(path).with_context(|| {
+                        format!("--video #{v} frame {f} ({path}): cannot read file")
+                    })?;
+                    if !is_frame_image(&bytes) {
+                        bail!(
+                            "--video #{v} frame {f} ({path}): not a PNG/JPEG image — this \
+                             flag takes a clip's decoded FRAMES, not a container; extract \
+                             them first: ffmpeg -i {path} -vf fps=1 frame_%04d.png"
+                        );
+                    }
+                    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+                })
+                .collect()
+        })
+        .collect::<Result<_>>()?;
 
     let loaded_registry = load_registry(&paths.registry);
     let registry = &loaded_registry.registry;
@@ -3279,31 +3369,42 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
 
-    let encode =
-        |id: &str, kind: &str, text: &str, image: Option<&str>| -> Result<serde_json::Value> {
-            let mut input = serde_json::Map::new();
-            if !text.is_empty() {
-                input.insert("text".into(), serde_json::json!(text));
-            }
-            if let Some(b64) = image {
-                input.insert("image_base64".into(), serde_json::json!(b64));
-            }
-            let request = serde_json::json!({
-                "type": "embed",
-                "id": id,
-                "kind": kind,
-                "input": input,
-            });
-            engine
-                .embed(&request)
-                .map_err(|e| anyhow!("embed request failed: {e}"))
-        };
+    let encode = |id: &str,
+                  kind: &str,
+                  text: &str,
+                  images: &[String],
+                  audios: &[String],
+                  videos: &[Vec<String>]|
+     -> Result<serde_json::Value> {
+        let mut input = serde_json::Map::new();
+        if !text.is_empty() {
+            input.insert("text".into(), serde_json::json!(text));
+        }
+        if !images.is_empty() {
+            input.insert("images_base64".into(), serde_json::json!(images));
+        }
+        if !audios.is_empty() {
+            input.insert("audios_base64".into(), serde_json::json!(audios));
+        }
+        if !videos.is_empty() {
+            input.insert("videos_base64".into(), serde_json::json!(videos));
+        }
+        let request = serde_json::json!({
+            "type": "embed",
+            "id": id,
+            "kind": kind,
+            "input": input,
+        });
+        engine
+            .embed(&request)
+            .map_err(|e| anyhow!("embed request failed: {e}"))
+    };
 
     let positional = args.text.join(" ");
     let mut result_json = None;
     if let (Some(q), Some(d)) = (&args.query, args.doc.as_deref()) {
-        let q_res = encode("q", "query", q, image_b64.as_deref())?;
-        let d_res = encode("d", "document", d, None)?;
+        let q_res = encode("q", "query", q, &images_b64, &audios_b64, &videos_b64)?;
+        let d_res = encode("d", "document", d, &[], &[], &[])?;
         let dim = q_res
             .get("dim")
             .and_then(serde_json::Value::as_u64)
@@ -3366,7 +3467,7 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
             positional
         };
         let kind = if args.query.is_some() { "query" } else { kind };
-        let res = encode("e", kind, &text, image_b64.as_deref())?;
+        let res = encode("e", kind, &text, &images_b64, &audios_b64, &videos_b64)?;
         if args.json {
             result_json = Some(res);
         } else {
@@ -3389,6 +3490,18 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
         println!("{}", serde_json::to_string(&j)?);
     }
     Ok(())
+}
+
+/// RIFF/WAVE magic — the only container the embeddinggemma2 audio tower takes
+/// (`--audio` needs nothing else from the bytes; the daemon decodes them).
+fn is_wav(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
+}
+
+/// PNG/JPEG magic — the only frames the embeddinggemma2 video leg takes
+/// (`--video` names decoded frames, never a container).
+fn is_frame_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.starts_with(b"\xff\xd8\xff")
 }
 
 fn process_truthy(name: &str) -> bool {
@@ -6587,7 +6700,15 @@ fn open_bench_engine(
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
-    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation))
+    Ok((
+        engine,
+        loaded,
+        pre_diag,
+        post_diag,
+        devices_spec,
+        max_seq,
+        load_speculation,
+    ))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -9182,6 +9303,53 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--video` takes ONE clip per occurrence: its frames, comma separated,
+    /// in display order. The comma is the only frame separator, so the
+    /// parsing (and the frame-container check) is pinned here rather than
+    /// only end-to-end.
+    #[test]
+    fn the_video_flag_carries_one_clip_per_occurrence() {
+        let cli = Cli::try_parse_from([
+            "hipfire",
+            "embed",
+            "model",
+            "a",
+            "clip",
+            "of",
+            "--video",
+            "f0.png,f1.png",
+            "--video",
+            "g0.png",
+        ])
+        .expect("parses");
+        let Some(Commands::Embed(args)) = cli.command else {
+            panic!("expected the embed verb");
+        };
+        assert_eq!(args.text, vec!["a", "clip", "of"]);
+        assert_eq!(
+            args.video,
+            vec!["f0.png,f1.png".to_string(), "g0.png".to_string()]
+        );
+        assert!(args.image.is_empty() && args.audio.is_empty());
+
+        // No --video: the list is empty, and the flag is not implied by text.
+        let cli = Cli::try_parse_from(["hipfire", "embed", "model", "text"]).expect("parses");
+        let Some(Commands::Embed(args)) = cli.command else {
+            panic!("expected the embed verb");
+        };
+        assert!(args.video.is_empty());
+    }
+
+    #[test]
+    fn only_png_and_jpeg_bytes_count_as_frames() {
+        assert!(is_frame_image(b"\x89PNG\r\n\x1a\n\x00"));
+        assert!(is_frame_image(b"\xff\xd8\xff\xe0\x00\x10"));
+        assert!(!is_frame_image(b"RIFF"));
+        assert!(!is_frame_image(b"\x00\x00\x00\x18ftypmp42"));
+        assert!(!is_frame_image(b"\x1aE\xdf\xa3"));
+        assert!(!is_frame_image(b""));
+    }
     use crate::serve::complete::{
         forward_think_fragments, include_reasoning_content, inject_default_system_message,
         normalize_openai_messages, Completion, ThinkFragment,
@@ -9395,13 +9563,24 @@ mod tests {
         let paths = test_paths("offload-bench-pids");
         std::fs::create_dir_all(&paths.root).unwrap();
         // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
-        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
-        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
-            .unwrap();
+        std::fs::write(
+            paths.root.join("daemon.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"),
+            "999999999\n",
+        )
+        .unwrap();
         // Not pid files, and not a pid: ignored, never an error.
         std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
         std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
-        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(
+            paths.root.join("serve.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
 
         assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
 
@@ -9437,7 +9616,10 @@ mod tests {
 
         // One pinned format: itself, named.
         let one = vec![report("mq4g256", 201_328_960, 0.375)];
-        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+        assert_eq!(
+            recommended_share(&one),
+            Some(("mq4g256".to_string(), 0.375))
+        );
 
         // A tie on size takes the median share of the tied set, and says so.
         let tied = vec![
@@ -9453,10 +9635,7 @@ mod tests {
 
         // A strictly larger entry wins outright, wherever it sits in the matrix.
         let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
-        assert_eq!(
-            recommended_share(&mixed),
-            Some(("big".to_string(), 0.30))
-        );
+        assert_eq!(recommended_share(&mixed), Some(("big".to_string(), 0.30)));
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery
@@ -12446,7 +12625,8 @@ mod tests {
                 &paths.models,
                 &model_path,
                 Some("qwen3.6:35b-a3b-mq4p"),
-            ).expect_err("DFlash on requires a DFlash draft, not an MTP head");
+            )
+            .expect_err("DFlash on requires a DFlash draft, not an MTP head");
             assert!(error.to_string().contains("--model-draft"), "{error:#}");
             assert_eq!(params["mtp_mode"], mtp_mode);
             assert!(params.get("draft").is_none());
@@ -14175,11 +14355,7 @@ mod tests {
         let log = h.read_requests_log();
         let loads = Task11HttpHarness::ops_of_type(&log, "load");
         assert_eq!(loads.len(), 2);
-        assert!(
-            loads
-                .iter()
-                .all(|load| load["params"]["max_seq"] == 65_536)
-        );
+        assert!(loads.iter().all(|load| load["params"]["max_seq"] == 65_536));
     }
 
     /// A request may not load a file outside the installed models, nor start
@@ -18535,7 +18711,10 @@ mod tests {
         handle.join().unwrap();
         assert!(paths.models.join("overlay-model.mq4").is_file());
         assert!(
-            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            !paths
+                .models
+                .join("overlay-model.mq4.trunk-overlay")
+                .exists(),
             "a failed verification must not leave the overlay installed"
         );
         fs::remove_dir_all(&paths.root).unwrap();
@@ -18546,7 +18725,11 @@ mod tests {
         let paths = test_paths("overlay-rm");
         let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
         fs::create_dir_all(&paths.models).unwrap();
-        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+        for file in [
+            "overlay-model.mq4",
+            "overlay-model.mq4.trunk-overlay",
+            "untouched.mq4",
+        ] {
             fs::write(paths.models.join(file), b"x").unwrap();
         }
         rm_with_overlay_pins(
@@ -18560,7 +18743,10 @@ mod tests {
         )
         .unwrap();
         assert!(!paths.models.join("overlay-model.mq4").exists());
-        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(!paths
+            .models
+            .join("overlay-model.mq4.trunk-overlay")
+            .exists());
         assert!(paths.models.join("untouched.mq4").exists());
 
         // An unregistered base takes its `<file>.trunk-overlay` with it too.

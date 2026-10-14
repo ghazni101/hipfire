@@ -2,7 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Weight streaming for the EmbeddingGemma-2 checkpoint.
+//! Streaming for the EmbeddingGemma-2 checkpoint.
+//!
+//! The text backbone streams from the trunk source ([`load_weights`]); the
+//! Gemma-4 vision tower streams from the `.vl` sidecar through the same
+//! decode/upload gates ([`crate::vision::VisionTower::load`]).
 //!
 //! Layout on the GPU (the qwen35-embed contract):
 //!
@@ -29,19 +33,18 @@ use crate::config::{EmbedConfig, LayerType};
 use crate::names::{self, TensorBytes};
 use half::f16;
 use hipfire_runtime::loader_api::ModelSource;
-use hipfire_runtime::model_source::ModelSource as _;
 use rdna_compute::{Gpu, GpuTensor};
 
 pub struct LayerWeights {
-    pub input_ln: GpuTensor,  // f32 [hidden]
+    pub input_ln: GpuTensor, // f32 [hidden]
     pub post_attn_ln: GpuTensor,
     pub pre_ff_ln: GpuTensor,
     pub post_ff_ln: GpuTensor,
     /// The layer's output scalar (host f32 — one value, applied via
     /// `scale_f32`; a whole GPU tensor would be pure overhead).
     pub layer_scalar: f32,
-    pub q_proj: GpuTensor,       // f16 [heads*hd, hidden]
-    pub k_proj: GpuTensor,       // f16 [kv*hd, hidden]
+    pub q_proj: GpuTensor, // f16 [heads*hd, hidden]
+    pub k_proj: GpuTensor, // f16 [kv*hd, hidden]
     pub v_proj: GpuTensor,
     pub o_proj: GpuTensor, // f16 [hidden, heads*hd]
     pub q_norm: GpuTensor, // f32 [hd]
@@ -50,9 +53,9 @@ pub struct LayerWeights {
     pub v_ones: GpuTensor,
     pub gate_proj: GpuTensor, // f16 [intermediate, hidden]
     pub up_proj: GpuTensor,
-    pub down_proj: GpuTensor, // f16 [hidden, intermediate]
-    pub ple_gate: GpuTensor,  // f16 [ple, hidden]
-    pub ple_proj: GpuTensor,  // f16 [hidden, ple]
+    pub down_proj: GpuTensor,     // f16 [hidden, intermediate]
+    pub ple_gate: GpuTensor,      // f16 [ple, hidden]
+    pub ple_proj: GpuTensor,      // f16 [hidden, ple]
     pub ple_post_norm: GpuTensor, // f32 [hidden]
 }
 
@@ -70,12 +73,16 @@ pub struct EmbedWeights {
 }
 
 // ─── dtype decode (same two-convention contract as qwen35-embed) ────────────
+//
+// `pub(crate)`: the vision tower loader (`crate::vision`) streams its
+// sidecar through these same two gates, so a tower tensor decodes by the
+// identical rules the text backbone's do.
 
-fn bf16_to_f32(bits: u16) -> f32 {
+pub(crate) fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-fn decode_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn decode_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
     let n = t.numel();
     if t.quant_type != 0xFF {
         let v =
@@ -92,7 +99,11 @@ fn decode_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
     let bytes = &t.bytes;
     let need_bytes = |w: usize| -> Result<(), String> {
         if bytes.len() < n * w {
-            return Err(format!("tensor `{name}`: {} bytes < {}", bytes.len(), n * w));
+            return Err(format!(
+                "tensor `{name}`: {} bytes < {}",
+                bytes.len(),
+                n * w
+            ));
         }
         Ok(())
     };
@@ -124,11 +135,15 @@ fn decode_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
     }
 }
 
-fn decode_f16(t: &TensorBytes<'_>, name: &str) -> Result<Vec<u16>, String> {
+pub(crate) fn decode_f16(t: &TensorBytes<'_>, name: &str) -> Result<Vec<u16>, String> {
     if t.quant_type == 0xFF && t.dtype == "F16" {
         let n = t.numel();
         if t.bytes.len() < n * 2 {
-            return Err(format!("tensor `{name}`: {} bytes < {}", t.bytes.len(), n * 2));
+            return Err(format!(
+                "tensor `{name}`: {} bytes < {}",
+                t.bytes.len(),
+                n * 2
+            ));
         }
         return Ok(t.bytes[..n * 2]
             .chunks_exact(2)
@@ -138,7 +153,11 @@ fn decode_f16(t: &TensorBytes<'_>, name: &str) -> Result<Vec<u16>, String> {
     if t.quant_type == 1 {
         let n = t.numel();
         if t.bytes.len() < n * 2 {
-            return Err(format!("tensor `{name}`: {} bytes < {}", t.bytes.len(), n * 2));
+            return Err(format!(
+                "tensor `{name}`: {} bytes < {}",
+                t.bytes.len(),
+                n * 2
+            ));
         }
         return Ok(t.bytes[..n * 2]
             .chunks_exact(2)
@@ -152,6 +171,30 @@ fn decode_f16(t: &TensorBytes<'_>, name: &str) -> Result<Vec<u16>, String> {
 }
 
 // ─── upload helpers ─────────────────────────────────────────────────────────
+
+/// Upload an already-decoded f16 matrix as `[rows, cols]`.
+pub(crate) fn upload_f16_words(
+    gpu: &mut Gpu,
+    words: &[u16],
+    rows: usize,
+    cols: usize,
+    name: &str,
+) -> Result<GpuTensor, String> {
+    if words.len() != rows * cols {
+        return Err(format!(
+            "embeddinggemma2: tensor `{name}` has {} elems, expected {rows}×{cols}",
+            words.len()
+        ));
+    }
+    gpu.upload_f16_bits(words, &[rows, cols])
+        .map_err(|e| format!("embeddinggemma2: upload `{name}`: {e:?}"))
+}
+
+/// Upload an already-decoded f32 vector.
+pub(crate) fn upload_f32_slice(gpu: &mut Gpu, v: &[f32], name: &str) -> Result<GpuTensor, String> {
+    gpu.upload_f32(v, &[v.len()])
+        .map_err(|e| format!("embeddinggemma2: upload `{name}`: {e:?}"))
+}
 
 fn upload_lin_f16(
     gpu: &mut Gpu,
@@ -169,8 +212,7 @@ fn upload_lin_f16(
             words.len()
         ));
     }
-    gpu.upload_f16_bits(&words, &[rows, cols])
-        .map_err(|e| format!("embeddinggemma2: upload `{name}`: {e:?}"))
+    upload_f16_words(gpu, &words, rows, cols, name)
 }
 
 fn upload_vec_f32(
@@ -188,8 +230,7 @@ fn upload_vec_f32(
             v.len()
         ));
     }
-    gpu.upload_f32(&v, &[n])
-        .map_err(|e| format!("embeddinggemma2: upload `{name}`: {e:?}"))
+    upload_f32_slice(gpu, &v, name)
 }
 
 fn upload_ones(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
@@ -201,7 +242,11 @@ fn upload_ones(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
 
 /// Stream the text backbone to the GPU. The vision/audio towers are not
 /// addressed (see [`crate`]).
-pub fn load_weights(gpu: &mut Gpu, src: &ModelSource, cfg: &EmbedConfig) -> Result<EmbedWeights, String> {
+pub fn load_weights(
+    gpu: &mut Gpu,
+    src: &ModelSource,
+    cfg: &EmbedConfig,
+) -> Result<EmbedWeights, String> {
     let h = cfg.hidden_size;
     let inter = cfg.intermediate_size;
 
@@ -299,9 +344,19 @@ pub fn load_weights(gpu: &mut Gpu, src: &ModelSource, cfg: &EmbedConfig) -> Resu
         cfg.num_layers * cfg.ple_dim,
         h,
     )?;
-    let ple_norm = upload_vec_f32(gpu, src, "ple.per_layer_projection_norm.weight", cfg.ple_dim)?;
-    let embedding_projection =
-        upload_lin_f16(gpu, src, "embedding_projection.weight", cfg.embedding_dim, h)?;
+    let ple_norm = upload_vec_f32(
+        gpu,
+        src,
+        "ple.per_layer_projection_norm.weight",
+        cfg.ple_dim,
+    )?;
+    let embedding_projection = upload_lin_f16(
+        gpu,
+        src,
+        "embedding_projection.weight",
+        cfg.embedding_dim,
+        h,
+    )?;
 
     Ok(EmbedWeights {
         embed_table,
@@ -355,7 +410,12 @@ impl EmbedWeights {
 
     /// Gather `ids` rows of the host embedding table into `out`
     /// (row-major `[ids.len(), hidden]`).
-    pub fn gather_hidden(&self, ids: &[u32], hidden: usize, out: &mut Vec<f32>) -> Result<(), String> {
+    pub fn gather_hidden(
+        &self,
+        ids: &[u32],
+        hidden: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), String> {
         out.clear();
         out.reserve(ids.len() * hidden);
         for &id in ids {
@@ -383,11 +443,7 @@ pub fn layer_type_summary(cfg: &EmbedConfig) -> String {
         .iter()
         .filter(|t| **t == LayerType::Sliding)
         .count();
-    format!(
-        "{} sliding / {} full",
-        sliding,
-        cfg.num_layers - sliding
-    )
+    format!("{} sliding / {} full", sliding, cfg.num_layers - sliding)
 }
 
 #[cfg(test)]

@@ -388,6 +388,9 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     // implementation to run (QwenVl vs DotsOcr vs Lfm2Vl have distinct generate
     // bodies in `hipfire_generate::vision`), not just whether vision is present.
     // Consulting caps here makes the gate declarative without changing behaviour.
+    // The converse is not implied: an images-capable arch with no generate-side
+    // VL body still returns `None` — the embed-only encoders (arch 17, 18) take
+    // their media through the bundle, and 18's `None` is pinned by test.
     let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
     if !caps.supports_images {
         return VisionRoute::None;
@@ -2360,50 +2363,51 @@ fn finish_qwen35_load(
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> = if adaptive_blocks_generic_spec
-        || eviction.is_some()
-        || !matches!(arch_id, 5 | 6)
-        || ctx.spec.mtp == Some(false)
-        || mtp_spill_degrade
-        || dflash.is_some()
-        || dspark_speculator.is_some()
-    {
-        None
-    } else {
-        // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
-        // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
-        // daemon clients keep the canonical-sibling lookup.
-        let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
-            Path::new(ctx.path),
-            ctx.mtp_path.clone(),
-            (config.dim, config.vocab_size),
-            &mut *ctx.gpu,
-            physical_cap,
-            None,
-        );
-        if resolved.is_none() {
-            if ctx.spec.mtp == Some(true) {
-                let reason = if errors.is_empty() {
-                    "no bundled trailer or .mtp sidecar found".to_string()
-                } else {
-                    errors.join("; ")
-                };
-                return Err(rollback_unfinished_qwen35(
-                    format!("MTP head required (mtp=on) but not loaded: {reason}"),
-                    bundle,
-                    vision_weights,
-                    ctx.gpu,
-                ));
+    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
+        if adaptive_blocks_generic_spec
+            || eviction.is_some()
+            || !matches!(arch_id, 5 | 6)
+            || ctx.spec.mtp == Some(false)
+            || mtp_spill_degrade
+            || dflash.is_some()
+            || dspark_speculator.is_some()
+        {
+            None
+        } else {
+            // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
+            // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
+            // daemon clients keep the canonical-sibling lookup.
+            let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+                Path::new(ctx.path),
+                ctx.mtp_path.clone(),
+                (config.dim, config.vocab_size),
+                &mut *ctx.gpu,
+                physical_cap,
+                None,
+            );
+            if resolved.is_none() {
+                if ctx.spec.mtp == Some(true) {
+                    let reason = if errors.is_empty() {
+                        "no bundled trailer or .mtp sidecar found".to_string()
+                    } else {
+                        errors.join("; ")
+                    };
+                    return Err(rollback_unfinished_qwen35(
+                        format!("MTP head required (mtp=on) but not loaded: {reason}"),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
+                if !errors.is_empty() {
+                    eprintln!(
+                        "  MTP head not loaded: {} — falling back to AR/n-gram",
+                        errors.join("; ")
+                    );
+                }
             }
-            if !errors.is_empty() {
-                eprintln!(
-                    "  MTP head not loaded: {} — falling back to AR/n-gram",
-                    errors.join("; ")
-                );
-            }
-        }
-        resolved
-    };
+            resolved
+        };
     if mtp.is_some() {
         if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
             &bundle.weights.layers,
@@ -5647,6 +5651,24 @@ mod registry_tests {
                 .caps()
                 .supports_images,
             "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
+        );
+        // EmbeddingGemma-2 (arch 18) declares the capability: the checkpoint's
+        // vision tower ships in the arch-18 `.vl` pack, and the per-instance
+        // gate is the loaded bundle's tower. It has no generate-side VL route
+        // — embed inputs dispatch through the bundle — so `vision_route(18)`
+        // must stay `None` even with the capability declared.
+        let eg2 = REGISTRY
+            .iter()
+            .find(|c| c.name() == "embeddinggemma2")
+            .expect("embeddinggemma2 carrier missing");
+        assert!(
+            eg2.caps().supports_images,
+            "embeddinggemma2 (arch 18) must declare supports_images — tower-less trunks (no .vl pack) still refuse images via the bundle check"
+        );
+        assert_eq!(
+            super::vision_route(18),
+            super::VisionRoute::None,
+            "embeddinggemma2 is embed-only: no generate-side VL route"
         );
         for name in [
             "qwen2",

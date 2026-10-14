@@ -1811,7 +1811,7 @@ pub fn load_qwen4_rank(
                     host_bytes,
                     &format!("on {}", ctx.gpu.arch),
                 )
-                );
+            );
         }
     }
     // Expert parallelism: this rank's fit line, at the split it applied.
@@ -5148,9 +5148,10 @@ impl Carrier for Qwen35EmbedCarrier {
 //
 // Same non-chat wire-verb shape as arch 17: loads the model, embedding
 // requests flow through the daemon's `embed` verb → hipfire-generate's embed
-// body. Text-only by design — the checkpoint's vision/audio towers are not
-// part of the implementation and image inputs are refused with a pointing
-// error rather than silently embedded.
+// body. The checkpoint's text trunk is tower-less: the vision tower arrives
+// as the shared `.vl` sidecar (admission resolves the path, the arch crate
+// opens it at load), and a load without one refuses image inputs with a
+// pointing error rather than silently embedding them.
 pub struct EmbeddingGemma2Carrier;
 impl Carrier for EmbeddingGemma2Carrier {
     fn name(&self) -> &'static str {
@@ -5168,7 +5169,15 @@ impl Carrier for EmbeddingGemma2Carrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
-            supports_images: false,
+            // Architectural capability: the EmbeddingGemma-2 checkpoint ships
+            // the Gemma4 vision tower in its own arch-18 `.vl` pack (probed
+            // via `vision_tower.patch_embedder.input_proj.weight`, admission.rs
+            // `EMBED_GEMMA_VISION_PROBE_TENSOR`); this flag declares that the
+            // arch CAN accept images when that tower is present. Per-instance
+            // gating still checks `EmbedGemmaBundle.vision.is_some()` — a
+            // tower-less trunk (`vision_mode=off` / no sidecar) refuses images
+            // with the pointing error.
+            supports_images: true,
             reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }

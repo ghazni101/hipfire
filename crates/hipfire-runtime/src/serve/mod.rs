@@ -282,10 +282,13 @@ pub struct SlotEngineConfig {
     /// Directory the swap manager writes cold slot snapshots to.
     pub swap_dir: PathBuf,
     /// The checkpoint is a VL model (vision tower present in the HFQ or in a
-    /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing.
+    /// separate `.vl` sidecar). Affects RoPE/M-RoPE + embed routing. On the
+    /// carrier-delegated slot route this is the load's ladder-gated answer
+    /// (`vision_mode=off` clears it), not a bare probe.
     pub is_vl: bool,
     /// Path to the `.vl` vision sidecar, if the vision weights live outside
-    /// the text HFQ.
+    /// the text HFQ. Ladder-gated like [`Self::is_vl`]: `off` leaves it
+    /// `None`, so an engine must not rediscover a sibling on its own.
     pub vl_path: Option<PathBuf>,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
@@ -345,7 +348,6 @@ pub struct SlotModelPreflight {
     pub vl_path: Option<PathBuf>,
 }
 
-
 /// Which prompt the encoder wraps the input in. Queries and documents carry
 /// different markers and different truncation limits, and the document side
 /// additionally drops the multi-vector mask's punctuated positions — so the
@@ -359,13 +361,23 @@ pub enum EmbedKind {
 /// One embedding encode request handed to a slot engine.
 ///
 /// The engine owns the tokenizer, so the text rides raw — the same split the
-/// sequential `embed` wire body uses. `image` is decoded image bytes; the
-/// engine runs the vision tower itself, on its own GPU thread.
+/// sequential `embed` wire body uses. `images`/`audios` are decoded media
+/// container bytes (PNG/JPEG, WAV), in request order; the engine runs the
+/// vision/audio towers itself, on its own GPU thread. Empty = text-only, and
+/// an arch whose tower is absent refuses a non-empty list per request rather
+/// than ignoring it.
+///
+/// `videos` is the third modality: ONE ENTRY PER VIDEO, each a list of that
+/// clip's FRAMES (encoded PNG/JPEG, in display order) — the sampler's input,
+/// not a container. Video is arch 18 only, and its frames ride the vision
+/// tower, so an arch without one refuses a non-empty list by name.
 #[derive(Clone, Debug)]
 pub struct EmbedRequest {
     pub kind: EmbedKind,
     pub text: String,
-    pub image: Option<Vec<u8>>,
+    pub images: Vec<Vec<u8>>,
+    pub audios: Vec<Vec<u8>>,
+    pub videos: Vec<Vec<Vec<u8>>>,
     /// The wire request id, for diagnostics only.
     pub request_tag: String,
     /// Matryoshka output width (embeddinggemma2, arch 18): truncate the
@@ -389,7 +401,6 @@ pub struct EmbedResponse {
     /// Tokens the input tokenized to, before the mask.
     pub n_input_tokens: usize,
 }
-
 
 /// Arch-erased multi-slot engine. The concrete engine runs its own thread
 /// and is driven through this narrow surface: submit a request, cancel a

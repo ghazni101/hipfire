@@ -39,6 +39,7 @@ pub(crate) mod metrics;
 
 pub mod complete;
 pub(crate) mod decide;
+pub(crate) mod embeddings;
 pub mod http;
 pub(crate) mod responses;
 pub(crate) mod ui;
@@ -1251,12 +1252,7 @@ pub(crate) fn parse_bind(
 
 /// Builds the detached child's argv. `--open` stays a parent-only action; the
 /// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
-fn detached_serve_command(
-    executable: &Path,
-    args: &ServeArgs,
-    host: &str,
-    port: u16,
-) -> Command {
+fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port: u16) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("serve")

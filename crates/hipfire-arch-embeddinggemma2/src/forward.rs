@@ -31,15 +31,39 @@
 //! Weights are f16 GEMM operands, activations and norms f32 — the
 //! qwen35-embed numerics contract.
 
-use crate::config::{EmbedConfig, LayerType};
+use crate::config::EmbedConfig;
 use crate::weights::EmbedWeights;
 use rdna_compute::gemm::LdsTile;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Input assembled by the caller: token ids only (this arch is text-only;
-/// multimodal placeholders are refused at assembly, see [`crate::carrier`]).
+/// Input assembled by the caller: token ids plus the projected rows a media
+/// span replaces.
+///
+/// `ids` is the EXPANDED sequence (media markers already spliced, see
+/// [`crate::carrier::assemble_input`]): every placeholder row is a real row
+/// whose embedding is overwritten by `media`. Nothing about positions or
+/// RoPE changes — this is HF's `masked_scatter` on `inputs_embeds`, so the
+/// media rows participate in attention and pooling like any other row.
 pub struct EncodeInput<'a> {
     pub ids: &'a [u32],
+    /// One entry per media span, in `AssembledInput.media_spans` order.
+    /// Empty for text-only inputs.
+    pub media: &'a [MediaRows<'a>],
+}
+
+/// The projected encoder rows for one media span.
+pub struct MediaRows<'a> {
+    /// First row of the span inside `EncodeInput.ids`.
+    pub start_row: usize,
+    /// `[len, hidden]` row-major — `len` == the span's placeholder count.
+    pub rows: &'a [f32],
+}
+
+impl EncodeInput<'_> {
+    /// A text-only input (no media spans).
+    pub fn text(ids: &[u32]) -> EncodeInput<'_> {
+        EncodeInput { ids, media: &[] }
+    }
 }
 
 // ─── LDS tile tables (mirrors the qwen35-embed attention GEMMs) ─────────────
@@ -68,29 +92,38 @@ fn attention_lds_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTi
 }
 
 /// Small scratch wrapper: alloc/upload/free + the f16 GEMM dispatch (the
-/// qwen35-embed `Enc`, minus that arch's GDN hooks).
-struct Enc<'a> {
+/// qwen35-embed `Enc`, minus that arch's GDN hooks). `pub(crate)` so the
+/// vision tower ([`crate::vision`]) drives the same GEMM dispatch and
+/// attention decomposition rather than a second copy of either.
+pub(crate) struct Enc<'a> {
     gpu: &'a mut Gpu,
 }
 
 impl<'a> Enc<'a> {
-    fn new(gpu: &'a mut Gpu) -> Self {
+    pub(crate) fn new(gpu: &'a mut Gpu) -> Self {
         Self { gpu }
     }
 
-    fn alloc(&mut self, n: usize) -> Result<GpuTensor, String> {
+    /// The raw device handle, for the audio tower's own JIT kernels (clip
+    /// clamp, GLU, causal depthwise conv) — the vision tower needs no escape
+    /// hatch because every kernel it uses is on the shared dispatch.
+    pub(crate) fn gpu_mut(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+
+    pub(crate) fn alloc(&mut self, n: usize) -> Result<GpuTensor, String> {
         self.gpu
             .alloc_tensor(&[n], DType::F32)
             .map_err(|e| format!("embeddinggemma2: alloc: {e:?}"))
     }
 
-    fn upload(&mut self, data: &[f32], n: usize) -> Result<GpuTensor, String> {
+    pub(crate) fn upload(&mut self, data: &[f32], n: usize) -> Result<GpuTensor, String> {
         self.gpu
             .upload_f32(data, &[n])
             .map_err(|e| format!("embeddinggemma2: upload: {e:?}"))
     }
 
-    fn free(&mut self, t: GpuTensor) -> Result<(), String> {
+    pub(crate) fn free(&mut self, t: GpuTensor) -> Result<(), String> {
         self.gpu
             .free_tensor(t)
             .map_err(|e| format!("embeddinggemma2: free: {e:?}"))
@@ -99,7 +132,7 @@ impl<'a> Enc<'a> {
     /// `y[n, out] = x[n, k] · w_f16[out, k]ᵀ` — X operand f32 (mb8) or f16
     /// (LDS-tiled), weight always f16. Same dispatch contract as the
     /// qwen35-embed encoder; `HIPFIRE_EMBED_GEMM=f32` keeps f32 activations.
-    fn gemm(
+    pub(crate) fn gemm(
         &mut self,
         w: &GpuTensor,
         x: &GpuTensor,
@@ -108,7 +141,9 @@ impl<'a> Enc<'a> {
         n: usize,
     ) -> Result<GpuTensor, String> {
         if k == 0 || k % 16 != 0 {
-            return Err(format!("embeddinggemma2: GEMM k={k} is not a multiple of 16"));
+            return Err(format!(
+                "embeddinggemma2: GEMM k={k} is not a multiple of 16"
+            ));
         }
         let y = self.alloc(n * out)?;
         let wmma = self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12();
@@ -140,7 +175,7 @@ impl<'a> Enc<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gemm_ld(
+    pub(crate) fn gemm_ld(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -166,19 +201,23 @@ impl<'a> Enc<'a> {
             .gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
     }
 
-    fn alloc_shaped(&mut self, shape: &[usize], dtype: DType) -> Result<GpuTensor, String> {
+    pub(crate) fn alloc_shaped(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<GpuTensor, String> {
         self.gpu
             .alloc_tensor(shape, dtype)
             .map_err(|e| format!("embeddinggemma2: alloc: {e:?}"))
     }
 
-    fn alloc_f16(&mut self, n: usize) -> Result<GpuTensor, String> {
+    pub(crate) fn alloc_f16(&mut self, n: usize) -> Result<GpuTensor, String> {
         self.gpu
             .alloc_tensor(&[n], DType::F16)
             .map_err(|e| format!("embeddinggemma2: alloc f16: {e:?}"))
     }
 
-    fn cast_f16(&mut self, x: &GpuTensor, n: usize) -> Result<GpuTensor, String> {
+    pub(crate) fn cast_f16(&mut self, x: &GpuTensor, n: usize) -> Result<GpuTensor, String> {
         let dst = self
             .gpu
             .alloc_tensor(&[n], DType::F16)
@@ -189,7 +228,7 @@ impl<'a> Enc<'a> {
         Ok(dst)
     }
 
-    fn rmsnorm(
+    pub(crate) fn rmsnorm(
         &mut self,
         x: &GpuTensor,
         w: &GpuTensor,
@@ -203,16 +242,126 @@ impl<'a> Enc<'a> {
             .map_err(|e| format!("embeddinggemma2: rmsnorm: {e:?}"))
     }
 
-    fn download(&mut self, t: &GpuTensor) -> Result<Vec<f32>, String> {
+    pub(crate) fn download(&mut self, t: &GpuTensor) -> Result<Vec<f32>, String> {
         self.gpu
             .download_f32(t)
             .map_err(|e| format!("embeddinggemma2: download: {e:?}"))
     }
 
-    fn add_inplace(&mut self, a: &GpuTensor, b: &GpuTensor, ctx: &str) -> Result<(), String> {
+    pub(crate) fn add_inplace(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        ctx: &str,
+    ) -> Result<(), String> {
         self.gpu
             .add_inplace_f32(a, b)
             .map_err(|e| format!("embeddinggemma2: {ctx}: {e:?}"))
+    }
+
+    // ── kernels the vision tower shares with the trunk path ─────────────
+
+    /// `HIPFIRE_EMBED_DEBUG=1` finite-value trace of the tower's residual
+    /// stream (the same knob the trunk path uses).
+    pub(crate) fn trace(
+        &mut self,
+        label: impl FnOnce() -> String,
+        t: &GpuTensor,
+        n: usize,
+    ) -> Result<(), String> {
+        trace(self, label, t, n)
+    }
+
+    /// `true` when this GPU has the WMMA path the eager attention needs.
+    pub(crate) fn has_wmma(&self) -> bool {
+        self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12()
+    }
+
+    /// Bidirectional attention, scale 1.0, keys past `n_valid` masked. The
+    /// eager decomposition when it is available at this shape, the
+    /// one-block-per-query-row reference kernel otherwise (which is exact
+    /// only when `n == n_valid` — pass no padding there).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention(
+        &mut self,
+        q: &mut GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        ctx: &GpuTensor,
+        n: usize,
+        n_valid: usize,
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        qd: usize,
+        kvd: usize,
+    ) -> Result<(), String> {
+        let eager =
+            n >= 256 && n % 64 == 0 && hd % 64 == 0 && self.has_wmma() && !embed_attn_naive();
+        if eager {
+            return attention_gemm(
+                self,
+                q,
+                k,
+                v,
+                ctx,
+                n,
+                n_valid,
+                heads,
+                heads / kv_heads,
+                hd,
+                qd,
+                kvd,
+                None,
+            );
+        }
+        if n != n_valid {
+            return Err(format!(
+                "embeddinggemma2: attention at {n} rows with {n_valid} valid keys has no \
+                 masked path here (the padding fallback needs an unmasked row count)"
+            ));
+        }
+        self.gpu
+            .attention_text_f32(q, k, v, None, None, ctx, n, heads, kv_heads, hd, 1.0, false)
+            .map_err(|e| format!("embeddinggemma2: attention: {e:?}"))
+    }
+
+    /// Axial 2-D RoPE over Q and K in place (`crate::vision` builds the
+    /// per-patch tables in the permuted head-dim order).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rope_2d(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        cos: &GpuTensor,
+        sin: &GpuTensor,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Result<(), String> {
+        self.gpu
+            .rope_2d_halfsplit_f32(q, k, cos, sin, rows, heads, kv_heads, hd)
+            .map_err(|e| format!("embeddinggemma2: rope_2d: {e:?}"))
+    }
+
+    /// `x = gelu_tanh(x)` in place.
+    pub(crate) fn gelu_tanh(&mut self, x: &GpuTensor, n: usize) -> Result<(), String> {
+        self.gpu
+            .gelu_tanh_f32(x, x, n)
+            .map_err(|e| format!("embeddinggemma2: gelu: {e:?}"))
+    }
+
+    /// `c = a ⊙ b`.
+    pub(crate) fn mul(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> Result<(), String> {
+        self.gpu
+            .mul_f32(a, b, c)
+            .map_err(|e| format!("embeddinggemma2: mul: {e:?}"))
     }
 }
 
@@ -239,7 +388,12 @@ fn trace(
     n: usize,
 ) -> Result<(), String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1")) {
+    if !*ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }) {
         return Ok(());
     }
     let label = label();
@@ -289,6 +443,52 @@ fn segment_layout(inputs: &[EncodeInput<'_>]) -> Result<Vec<EncodeSegment>, Stri
         row_offset += rows;
     }
     Ok(segs)
+}
+
+/// Write one media span's projected rows over its placeholder rows.
+///
+/// `rows` is the already-gathered, already-scaled `[seg.rows, hidden]` block;
+/// `n` is the input's real row count. The span must fit inside the real rows
+/// and carry exactly `len × hidden` finite floats.
+fn splice_media(
+    rows: &mut [f32],
+    media: &MediaRows<'_>,
+    hidden: usize,
+    n: usize,
+) -> Result<(), String> {
+    if hidden == 0 || media.rows.len() % hidden != 0 {
+        return Err(format!(
+            "embeddinggemma2: media rows are {} floats, not a whole number of {hidden}-wide \
+             hidden rows",
+            media.rows.len()
+        ));
+    }
+    let len = media.rows.len() / hidden;
+    if len == 0 {
+        return Err("embeddinggemma2: media span carries no rows".into());
+    }
+    if media.start_row + len > n {
+        return Err(format!(
+            "embeddinggemma2: media span [{}, {}) runs past the input's {n} rows",
+            media.start_row,
+            media.start_row + len
+        ));
+    }
+    if rows.len() < (media.start_row + len) * hidden {
+        return Err(format!(
+            "embeddinggemma2: media span [{}, {}) does not fit the gathered block",
+            media.start_row,
+            media.start_row + len
+        ));
+    }
+    if let Some(bad) = media.rows.iter().position(|v| !v.is_finite()) {
+        return Err(format!(
+            "embeddinggemma2: media rows contain a non-finite value at element {bad}"
+        ));
+    }
+    let start = media.start_row * hidden;
+    rows[start..start + media.rows.len()].copy_from_slice(media.rows);
+    Ok(())
 }
 
 /// Rows the encoder actually runs: ≥ 256 sequences are padded up to a
@@ -408,6 +608,13 @@ fn encode_hidden_segments(
         for v in rows.iter_mut() {
             *v *= scale;
         }
+        // Media rows are written over the placeholder rows AFTER the
+        // embedding scale: HF replaces already-scaled embedding rows with
+        // the projectors' output, which is not scaled (masked_scatter on
+        // `inputs_embeds`).
+        for media in input.media {
+            splice_media(&mut rows, media, h, input.ids.len())?;
+        }
         host_hidden.extend_from_slice(&rows);
     }
     let mut e = Enc::new(gpu);
@@ -437,7 +644,13 @@ fn encode_hidden_segments(
     // ple_all [n, layers*ple]: gemm → ×hidden^-0.5 → RMSNorm over each
     // [layers, ple] slice row (batched over n*layers rows of width ple).
     let ple_all = if cfg.ple_dim > 0 {
-        let raw = e.gemm(&w.ple_projection, &hidden, cfg.num_layers * cfg.ple_dim, h, n)?;
+        let raw = e.gemm(
+            &w.ple_projection,
+            &hidden,
+            cfg.num_layers * cfg.ple_dim,
+            h,
+            n,
+        )?;
         e.gpu
             .scale_f32(&raw, cfg.ple_scale())
             .map_err(|err| format!("embeddinggemma2: ple scale: {err:?}"))?;
@@ -529,7 +742,12 @@ fn encode_hidden_segments(
         e.rmsnorm(&o, &layer.post_attn_ln, &o, n, h, eps)?;
         e.add_inplace(&hidden, &o, "residual attn")?;
         e.free(o)?;
-        trace(&mut e, || format!("layer {li} post-attn").into(), &hidden, n * h)?;
+        trace(
+            &mut e,
+            || format!("layer {li} post-attn").into(),
+            &hidden,
+            n * h,
+        )?;
 
         // ── gated gelu-tanh MLP ────────────────────────────────────────
         let normed2 = e.alloc(n * h)?;
@@ -549,7 +767,12 @@ fn encode_hidden_segments(
         e.rmsnorm(&d, &layer.post_ff_ln, &d, n, h, eps)?;
         e.add_inplace(&hidden, &d, "residual mlp")?;
         e.free(d)?;
-        trace(&mut e, || format!("layer {li} post-mlp").into(), &hidden, n * h)?;
+        trace(
+            &mut e,
+            || format!("layer {li} post-mlp").into(),
+            &hidden,
+            n * h,
+        )?;
 
         // ── PLE block ──────────────────────────────────────────────────
         let ple_all = ple_all
@@ -560,7 +783,15 @@ fn encode_hidden_segments(
         // identical op — gelu-tanh of the gate times the layer's packed PLE
         // slice; here ple_dim == hidden == 512).
         e.gpu
-            .gemma4_ple_gelu_mul_strided_f32(&t, ple_all, &t, n, cfg.ple_dim, cfg.num_layers * cfg.ple_dim, li)
+            .gemma4_ple_gelu_mul_strided_f32(
+                &t,
+                ple_all,
+                &t,
+                n,
+                cfg.ple_dim,
+                cfg.num_layers * cfg.ple_dim,
+                li,
+            )
             .map_err(|err| format!("embeddinggemma2: ple gate·mul (layer {li}): {err:?}"))?;
         let p = e.gemm(&layer.ple_proj, &t, h, cfg.ple_dim, n)?;
         e.free(t)?;
@@ -633,16 +864,7 @@ fn attention(
         return attention_gemm(e, q, k, v, ctx, n, n_valid, heads, rep, hd, qd, kvd, window);
     }
     let r = e.gpu.attention_text_f32(
-        q,
-        k,
-        v,
-        None,
-        None,
-        ctx,
-        n,
-        heads,
-        kv_heads,
-        hd,
+        q, k, v, None, None, ctx, n, heads, kv_heads, hd,
         1.0, // this family scales attention by 1.0 (QK norms replace 1/√d)
         false,
     );
@@ -742,7 +964,7 @@ fn attention_gemm(
 
 #[cfg(test)]
 mod tests {
-    use super::{padded_rows, segment_layout, EncodeInput};
+    use super::{padded_rows, segment_layout, splice_media, EncodeInput, MediaRows};
 
     fn input(len: usize) -> Vec<u32> {
         vec![0; len]
@@ -762,10 +984,7 @@ mod tests {
     #[test]
     fn segments_tile_the_row_block_in_order() {
         let owned = [input(7), input(302), input(10), input(258)];
-        let inputs: Vec<EncodeInput<'_>> = owned
-            .iter()
-            .map(|ids| EncodeInput { ids })
-            .collect();
+        let inputs: Vec<EncodeInput<'_>> = owned.iter().map(|ids| EncodeInput::text(ids)).collect();
         let segs = segment_layout(&inputs).expect("layout");
         assert_eq!(segs.len(), 4);
         assert_eq!(
@@ -785,7 +1004,57 @@ mod tests {
     #[test]
     fn an_empty_input_is_refused() {
         let empty = input(0);
-        let inp = EncodeInput { ids: &empty };
+        let inp = EncodeInput::text(&empty);
         assert!(segment_layout(&[inp]).is_err());
+    }
+
+    #[test]
+    fn a_media_span_overwrites_its_placeholder_rows() {
+        // 4 rows of 2, span = rows 1..3 → those two rows are replaced, the
+        // others are untouched.
+        let mut rows = vec![9.0f32; 4 * 2];
+        let media = MediaRows {
+            start_row: 1,
+            rows: &[1.0, 2.0, 3.0, 4.0],
+        };
+        splice_media(&mut rows, &media, 2, 4).expect("splice");
+        assert_eq!(rows, vec![9.0, 9.0, 1.0, 2.0, 3.0, 4.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn a_media_span_is_validated_before_it_is_written() {
+        let mut rows = vec![0.0f32; 4 * 2];
+        // Ragged row count.
+        let ragged = MediaRows {
+            start_row: 0,
+            rows: &[1.0, 2.0, 3.0],
+        };
+        assert!(splice_media(&mut rows, &ragged, 2, 4)
+            .unwrap_err()
+            .contains("whole number"));
+        // Past the end of the real rows.
+        let over = MediaRows {
+            start_row: 3,
+            rows: &[1.0, 2.0, 3.0, 4.0],
+        };
+        assert!(splice_media(&mut rows, &over, 2, 4)
+            .unwrap_err()
+            .contains("past the input"));
+        // Non-finite projected value.
+        let nan = MediaRows {
+            start_row: 0,
+            rows: &[1.0, f32::NAN],
+        };
+        assert!(splice_media(&mut rows, &nan, 2, 4)
+            .unwrap_err()
+            .contains("non-finite"));
+        // Empty span.
+        let empty = MediaRows {
+            start_row: 0,
+            rows: &[],
+        };
+        assert!(splice_media(&mut rows, &empty, 2, 4)
+            .unwrap_err()
+            .contains("no rows"));
     }
 }

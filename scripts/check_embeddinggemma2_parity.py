@@ -20,6 +20,19 @@ Usage:
     python3 scripts/check_embeddinggemma2_parity.py \
         --model <dir-with-model.safetensors> --ref <ref.npz> \
         [--daemon target/release/daemon]
+
+Vision legs (default on, --no-vision to skip): require the reference to carry
+the `img_*` keys the extended generator writes, resolve/emit the `.vl` sidecar
+next to the model (see ensure_vision_sidecar), and drive the expanded image
+requests through the same `embed` verb. The tower-less image refusal is
+asserted against a sidecar-less symlink farm so both behaviors are covered in
+one run.
+
+Audio and video legs ride the same `vision_on` guard and are skipped
+individually when the reference predates them. Video goes over the wire as
+`videos_base64`: an array of VIDEOS, each a list of base64 frame images in
+display order (one `<|video|>` marker per video in the text), mirroring the
+frame-per-index pixels of the generator.
 """
 import argparse
 import json
@@ -52,6 +65,162 @@ CASES = [
 
 MRL = [512, 256, 128]
 BAND = 2e-2
+
+# (ref.npz key, kind, prompt+text, png bytes) — keep in lockstep with
+# make_embeddinggemma2_reference.py IMAGE_CASES (same keys, same pixels).
+# The wire field is the contract §C `images_base64` (the v0 refusal leg's
+# singular `image_base64` shape is gone once towers land).
+IMAGE_CASES = [
+    ("img_square_256", "query", "what is in this image <|image|>", (1024, 1024, "grad")),
+    ("img_wide_264tok", "document", "<|image|> a wide screenshot", (270, 480, "checker")),
+    ("img_tiny", "document", "tiny <|image|>", (48, 48, "solid")),
+    ("img_extreme_aspect", "document", "extremely <|image|> wide", (8, 8000, "grad")),
+    ("img_nonmultiple_pool", "query", "non <|image|> multiple of the pool grid", (222, 384, "noise")),
+    ("img_with_marker", "query", "<|image|> describe in detail", (336, 240, "checker")),
+]
+
+# (ref.npz key, kind, prompt+text, duration_s) — lockstep with the generator's
+# AUDIO_CASES. Wire field: `audios_base64` (WAV bytes), mirroring images.
+# M is the uncapped mask-subsample count (15 s → 375 > 280 — no cap exists).
+AUD_TOK = "<" + "|audio|>"  # the marker literal, kept split to survive transport
+AUDIO_CASES = [
+    ("aud_short_3", "query", "what does this sound like <|audio|>", 0.1),
+    ("aud_half_13", "document", "<|audio|> half a second of tone", 0.5),
+    ("aud_1s_25", "query", "one second <|audio|> of sine", 1.0),
+    ("aud_2s_50", "document", "two seconds of <|audio|> sine", 2.0),
+    ("aud_cap_280", "query", "at the <|audio|> cap", 11.2),
+    ("aud_15s_375", "document", "fifteen seconds of " + AUD_TOK + " tone", 15.0),
+]
+
+# Video cases: (key, kind, prompt+text, (num_frames, height, width, pattern)).
+# ONE `<|video|>` marker per VIDEO (id 258884). The processor expands it into
+# one `boi + <|video|>×S + eoi` block PER FRAME (S ≤ 140 soft tokens/frame).
+# Frames differ by index, and the sampler is exercised by a ≤4-frame clip, an
+# exactly-32-frame clip and a 77-frame clip (uniform linspace down to
+# max_frames=32).
+VIDEO_CASES = [
+    ("vid_4_frames", "query", "what is in this clip <|video|>", (4, 240, 336, "checker")),
+    ("vid_32_frames", "document", "<|video|> one full sampling window", (32, 192, 192, "grad")),
+    ("vid_77_sampled", "query", "a longer clip <|video|> sampled down", (77, 168, 288, "noise")),
+    ("vid_tall_aspect", "document", "<|video|> a tall portrait clip", (5, 480, 144, "grad")),
+    ("vid_marker_mid", "query", "clip starts <|video|> clip ends", (3, 96, 96, "solid")),
+]
+
+
+def _wav_b64(seconds):
+    # 440 Hz sine at 16 kHz, float32 — byte-identical samples to the
+    # generator's _sine.
+    import base64
+    import io
+
+    import soundfile as sf
+
+    sr = 16000
+    t = np.arange(int(round(seconds * sr)), dtype=np.float64) / sr
+    wav = (0.1 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, wav, sr, format="WAV", subtype="FLOAT")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _png_bytes(h, w, kind):
+    # Byte-identical pixels to the generator's _pattern/_image_bytes.
+    import base64
+    import io
+
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    y, x = np.mgrid[0:h, 0:w]
+    if kind == "grad":
+        base = ((x * 255) // max(w - 1, 1) + (y * 255) // max(h - 1, 1)) // 2
+        arr = np.stack([base, (base * 3) // 4, 255 - base], -1).astype(np.uint8)
+    elif kind == "checker":
+        block = max(min(h, w) // 8, 2)
+        c = (((x // block) + (y // block)) % 2) * 200 + 40
+        arr = np.stack([c, 255 - c, c], -1).astype(np.uint8)
+    elif kind == "solid":
+        arr = np.full((h, w, 3), 137, np.uint8)
+    elif kind == "noise":
+        arr = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+    else:
+        raise ValueError(kind)
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _video_frame(h, w, kind, t):
+    """Frame `t` of a synthetic clip: a deterministic function of its index,
+    so frame selection and frame order are both exercised."""
+    rng = np.random.default_rng(t)
+    y, x = np.mgrid[0:h, 0:w]
+    if kind == "grad":
+        base = ((x * 255) // max(w - 1, 1) + (y * 255) // max(h - 1, 1) + 17 * t) % 256
+        return np.stack([base, (base * 3) // 4, 255 - base], -1).astype(np.uint8)
+    if kind == "checker":
+        block = max(min(h, w) // 8, 2)
+        c = (((x // block) + (y // block) + t) % 2) * 200 + 40
+        return np.stack([c, 255 - c, c], -1).astype(np.uint8)
+    if kind == "solid":
+        return np.full((h, w, 3), (137 + 13 * t) % 256, np.uint8)
+    if kind == "noise":
+        return rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+    raise ValueError(kind)
+
+
+def _png_frame_b64(h, w, kind, t):
+    # Byte-identical frame pixels to the generator's _video_frame/_video_bytes.
+    import base64
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(_video_frame(h, w, kind, t)).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def ensure_vision_sidecar(model_dir, quantizer_bin):
+    """Return a model dir whose load discovers the arch-18 `.vl` pack.
+
+    Discovery for a dir source probes `<dir>.vl` (a SIBLING of the directory —
+    `hipfire_runtime::sidecar::sidecar_candidates` with no stem to strip), so
+    the helper: (a) accepts an existing sibling pack, else (b) builds a farm —
+    `farm/<dirname>/` symlinked to the model's entries plus the pack emitted by
+    the quantizer at `farm/<dirname>.vl` — and hands back the farm copy. The
+    user's model dir is never written; the quantizer's trunk artifact lands
+    beside the pack as a sibling, never inside the loaded dir.
+    """
+    import glob as globmod
+    import os as osmod
+    import subprocess as sp
+    import tempfile as tf
+
+    name = osmod.path.basename(osmod.path.normpath(model_dir))
+    if osmod.path.exists(osmod.path.join(osmod.path.dirname(osmod.path.normpath(model_dir)), f"{name}.vl")):
+        return model_dir
+    if globmod.glob(osmod.path.join(model_dir, "*.vl")):
+        return model_dir
+    if not quantizer_bin or not osmod.path.exists(quantizer_bin):
+        raise SystemExit(
+            "vision legs requested but no `<dir>.vl` sibling pack for the model; "
+            "emit one with the quantizer (pass --quantizer) or rerun with --no-vision"
+        )
+    farm = tf.mkdtemp(prefix="eg2-parity-vl-")
+    copy = osmod.path.join(farm, name)
+    osmod.mkdir(copy)
+    for entry in osmod.listdir(model_dir):
+        osmod.symlink(osmod.path.join(model_dir, entry), osmod.path.join(copy, entry))
+    r = sp.run([quantizer_bin, "--input", model_dir,
+                "--output", osmod.path.join(farm, f"{name}.hfq")],
+               capture_output=True, text=True)
+    pack = osmod.path.join(farm, f"{name}.vl")
+    if r.returncode != 0 or not osmod.path.exists(pack):
+        raise SystemExit(
+            f"sidecar emission failed ({r.returncode}):\n{r.stdout[-800:]}\n{r.stderr[-800:]}"
+        )
+    return copy
 
 
 class Daemon:
@@ -159,11 +328,21 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--ref", required=True)
     ap.add_argument("--daemon", default="target/release/daemon")
+    ap.add_argument("--no-vision", action="store_true",
+                    help="skip the media legs (v0 text-only contract)")
+    ap.add_argument("--quantizer", default="target/release/hipfire-quantize",
+                    help="quantizer binary used to emit a missing .vl sidecar")
     args = ap.parse_args()
 
     ref = np.load(args.ref)
-    d = Daemon(args.daemon, args.model)
-    print(f"loaded: arch={d.loaded.get('arch')}")
+    have_vision_ref = f"ids_{IMAGE_CASES[0][0]}" in ref
+    vision_on = have_vision_ref and not args.no_vision
+    model_dir = args.model
+    if vision_on:
+        model_dir = ensure_vision_sidecar(args.model, args.quantizer)
+    d = Daemon(args.daemon, model_dir,
+               params={"vision_mode": "auto"} if vision_on else None)
+    print(f"loaded: arch={d.loaded.get('arch')} vision={'on' if vision_on else 'off'}")
 
     failures = 0
     rid = 0
@@ -191,12 +370,156 @@ def main():
             print(f"{'ok  ' if ok2 else 'FAIL'}   mrl {m}: rel-L2 {e2:.2e} dim {r2['dim']}")
             failures += 0 if ok2 else 1
 
+    # ── vision legs ───────────────────────────────────────────────────
+    if vision_on:
+        for key, kind, text, (h, w, pat) in IMAGE_CASES:
+            rid += 1
+            img_b64 = _png_bytes(h, w, pat)
+            r = d.embed(rid, kind, {"text": text, "images_base64": [img_b64]})
+            ref_ids = ref[f"ids_{key}"]
+            if r["n_input_tokens"] != len(ref_ids):
+                print(f"FAIL {key}: n_input_tokens {r['n_input_tokens']} != ref {len(ref_ids)}")
+                failures += 1
+                continue
+            got = np.array(r["embeddings"], dtype=np.float32)
+            e = rel_l2(got, ref[f"emb_{key}"])
+            ok = e <= BAND
+            n_soft = int(ref[f"nsoft_{key}"])
+            print(f"{'ok  ' if ok else 'FAIL'} {key}: n={r['n_input_tokens']} ({n_soft} soft) rel-L2 {e:.2e}")
+            failures += 0 if ok else 1
+            # One MRL width per image case bounds the run; the text cases
+            # already cover the full truncation ladder.
+            rid += 1
+            r2 = d.embed(rid, kind, {"text": text, "images_base64": [img_b64]}, dims=512)
+            got2 = np.array(r2["embeddings"], dtype=np.float32)
+            e2 = rel_l2(got2, ref[f"emb_{key}_512"])
+            ok2 = e2 <= BAND and r2["dim"] == 512 and len(got2) == 512
+            print(f"{'ok  ' if ok2 else 'FAIL'}   mrl 512: rel-L2 {e2:.2e}")
+            failures += 0 if ok2 else 1
+
+        # Marker-count mismatch: two markers, one image → pointing error
+        # (HF validate_inputs parity, mirrored by the wire layer).
+        rid += 1
+        msg = d.embed(rid, "query",
+                      {"text": "<|image|> and <|image|>",
+                       "images_base64": [_png_bytes(48, 48, "solid")]},
+                      expect_error=True)
+        ok = "marker" in msg
+        print(f"{'ok  ' if ok else 'FAIL'} marker-count mismatch refused: {msg[:90]}")
+        failures += 0 if ok else 1
+
+    # ── audio legs ────────────────────────────────────────────────────
+    if vision_on and f"ids_{AUDIO_CASES[0][0]}" in ref:
+        for key, kind, text, seconds in AUDIO_CASES:
+            rid += 1
+            wav_b64 = _wav_b64(seconds)
+            r = d.embed(rid, kind, {"text": text, "audios_base64": [wav_b64]})
+            ref_ids = ref[f"ids_{key}"]
+            if r["n_input_tokens"] != len(ref_ids):
+                print(f"FAIL {key}: n_input_tokens {r['n_input_tokens']} != ref {len(ref_ids)}")
+                failures += 1
+                continue
+            got = np.array(r["embeddings"], dtype=np.float32)
+            e = rel_l2(got, ref[f"emb_{key}"])
+            ok = e <= BAND
+            n_soft = int(ref[f"nsoft_{key}"])
+            print(f"{'ok  ' if ok else 'FAIL'} {key}: n={r['n_input_tokens']} ({n_soft} soft) rel-L2 {e:.2e}")
+            failures += 0 if ok else 1
+            rid += 1
+            r2 = d.embed(rid, kind, {"text": text, "audios_base64": [wav_b64]}, dims=512)
+            got2 = np.array(r2["embeddings"], dtype=np.float32)
+            e2 = rel_l2(got2, ref[f"emb_{key}_512"])
+            ok2 = e2 <= BAND and r2["dim"] == 512 and len(got2) == 512
+            print(f"{'ok  ' if ok2 else 'FAIL'}   mrl 512: rel-L2 {e2:.2e}")
+            failures += 0 if ok2 else 1
+
+        # Audio marker-count mismatch: two markers, one clip.
+        rid += 1
+        msg = d.embed(rid, "query",
+                      {"text": "<|audio|> and <|audio|>",
+                       "audios_base64": [_wav_b64(0.5)]},
+                      expect_error=True)
+        ok = "marker" in msg
+        print(f"{'ok  ' if ok else 'FAIL'} audio marker-count mismatch refused: {msg[:90]}")
+        failures += 0 if ok else 1
+    elif vision_on:
+        print("SKIP audio legs: reference predates the audio cases")
+
+    # ── video legs ────────────────────────────────────────────────────
+    if vision_on and f"ids_{VIDEO_CASES[0][0]}" in ref:
+        for key, kind, text, (n, h, w, pat) in VIDEO_CASES:
+            rid += 1
+            frames = [_png_frame_b64(h, w, pat, t) for t in range(n)]
+            r = d.embed(rid, kind, {"text": text, "videos_base64": [frames]})
+            ref_ids = ref[f"ids_{key}"]
+            if r["n_input_tokens"] != len(ref_ids):
+                print(f"FAIL {key}: n_input_tokens {r['n_input_tokens']} != ref {len(ref_ids)}")
+                failures += 1
+                continue
+            got = np.array(r["embeddings"], dtype=np.float32)
+            e = rel_l2(got, ref[f"emb_{key}"])
+            ok = e <= BAND
+            n_soft = int(ref[f"nsoft_{key}"])
+            n_frames = int(ref[f"nframes_{key}"])
+            print(f"{'ok  ' if ok else 'FAIL'} {key}: n={r['n_input_tokens']} "
+                  f"({n_soft} soft / {n_frames} frames) rel-L2 {e:.2e}")
+            failures += 0 if ok else 1
+            rid += 1
+            r2 = d.embed(rid, kind, {"text": text, "videos_base64": [frames]}, dims=512)
+            got2 = np.array(r2["embeddings"], dtype=np.float32)
+            e2 = rel_l2(got2, ref[f"emb_{key}_512"])
+            ok2 = e2 <= BAND and r2["dim"] == 512 and len(got2) == 512
+            print(f"{'ok  ' if ok2 else 'FAIL'}   mrl 512: rel-L2 {e2:.2e}")
+            failures += 0 if ok2 else 1
+
+        # Video marker-count mismatch: two markers, one video.
+        rid += 1
+        msg = d.embed(rid, "query",
+                      {"text": "<|video|> and <|video|>",
+                       "videos_base64": [[_png_frame_b64(48, 48, "solid", 0)]]},
+                      expect_error=True)
+        ok = "marker" in msg
+        print(f"{'ok  ' if ok else 'FAIL'} video marker-count mismatch refused: {msg[:90]}")
+        failures += 0 if ok else 1
+
+        # A frame that is not PNG/JPEG is refused with the extraction recipe
+        # to run, never handed to the decoder.
+        import base64 as b64mod
+        rid += 1
+        msg = d.embed(rid, "query",
+                      {"text": "clip <|video|>",
+                       "videos_base64": [[b64mod.b64encode(b"not an image at all").decode("ascii")]]},
+                      expect_error=True)
+        ok = "ffmpeg" in msg
+        print(f"{'ok  ' if ok else 'FAIL'} non-image video frame refused: {msg}")
+        failures += 0 if ok else 1
+    elif vision_on:
+        print("SKIP video legs: reference predates the video cases")
+
     # ── edge cases ────────────────────────────────────────────────────
-    rid += 1
-    msg = d.embed(rid, "query", {"text": "a cat", "image_base64": "iVBORw0KGgo="}, expect_error=True)
-    ok = "text-only" in msg
-    print(f"{'ok  ' if ok else 'FAIL'} image input refused: {msg[:90]}")
-    failures += 0 if ok else 1
+    if not vision_on:
+        # Tower-less load (or --no-vision): image input must be refused with a
+        # pointing error naming the modality and a remedy (the daemon gate says
+        # "no vision encoder loaded ... vision_mode is off", the arch const says
+        # "no vision tower is resident ... put the sidecar"), never silently
+        # ignored.
+        rid += 1
+        msg = d.embed(rid, "query", {"text": "a cat", "images_base64": ["iVBORw0KGgo="]}, expect_error=True)
+        ok = "vision" in msg and ("vision_mode" in msg or "sidecar" in msg or "tower" in msg)
+        print(f"{'ok  ' if ok else 'FAIL'} image input refused: {msg[:90]}")
+        failures += 0 if ok else 1
+        rid += 1
+        msg = d.embed(rid, "query", {"text": "a cat", "audios_base64": [_wav_b64(0.5)]}, expect_error=True)
+        ok = "audio" in msg and ("vision_mode" in msg or "sidecar" in msg or "tower" in msg)
+        print(f"{'ok  ' if ok else 'FAIL'} audio input refused: {msg[:90]}")
+        failures += 0 if ok else 1
+        rid += 1
+        msg = d.embed(rid, "query",
+                      {"text": "a clip", "videos_base64": [[_png_frame_b64(48, 48, "solid", 0)]]},
+                      expect_error=True)
+        ok = "vision" in msg and ("vision_mode" in msg or "sidecar" in msg or "tower" in msg)
+        print(f"{'ok  ' if ok else 'FAIL'} video input refused: {msg[:90]}")
+        failures += 0 if ok else 1
 
     rid += 1
     msg = d.embed(rid, "query", {"text": ""}, expect_error=True)

@@ -1323,13 +1323,18 @@ async fn handle_generation(
 /// PNG as `b64_json`. The daemon (not the gateway) is the authority on
 /// sampler/geometry validation — everything it refuses surfaces as a 4xx
 /// here with its message.
-/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17).
+/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17) and
+/// EmbeddingGemma-2 (arch 18).
 ///
-/// Body: `{"input": <string | [string] | {text, image_base64}>, "model"?,
-/// "kind"?: "query"|"document"}`. Reply is OpenAI-shaped `{object:"list",
-/// data:[{object:"embedding", index, n_tokens, embedding:[f32…]}], model,
-/// usage}` where `embedding` is the flat `n_tokens × dim` token matrix
-/// (late interaction), not a pooled vector.
+/// Body: `{"input": <string | [string] | {text, image_base64} |
+/// {text, images_base64:[…]} | [{content:[{type:"text"|"image_url",…}]}]>,
+/// "model"?, "kind"?: "query"|"document", "dims"?}` — see
+/// [`crate::serve::embeddings::lower_embeddings_input`] for the accepted
+/// input spellings and the shape each refusal names. Reply is OpenAI-shaped
+/// `{object:"list", data:[{object:"embedding", index, n_tokens,
+/// embedding:[f32…]}], model, usage}` where `embedding` is the flat
+/// `n_tokens × dim` token matrix (late interaction), not a pooled vector; an
+/// arch-18 single-vector model answers with `n_tokens: 1`.
 async fn handle_embeddings(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -1348,23 +1353,14 @@ async fn handle_embeddings(
         }
     };
     // One input per HTTP request; the multi-slot engine batches concurrent
-    // requests behind this endpoint. A list of length 1 is accepted; longer
-    // lists refuse rather than silently dropping inputs.
+    // requests behind this endpoint. Every accepted spelling (bare string,
+    // one-element list, legacy object, typed content array) lowers to the
+    // daemon `embed` verb's `input`; a longer list or a bare content-part
+    // array refuses rather than silently dropping or half-reading inputs.
     let input = body
         .get("input")
         .ok_or_else(|| "input is required".to_string())?;
-    let input = match input {
-        serde_json::Value::Array(items) => match items.as_slice() {
-            [one] => one.clone(),
-            other => {
-                return Err(format!(
-                    "input has {} entries; this endpoint accepts one input per request",
-                    other.len()
-                ))
-            }
-        },
-        other => other.clone(),
-    };
+    let input = crate::serve::embeddings::lower_embeddings_input(input)?;
 
     let request_model = body
         .get("model")
@@ -1396,7 +1392,11 @@ async fn handle_embeddings(
             }
         }
     } else {
-        match shared.admission.acquire_async(CancellationToken::new()).await {
+        match shared
+            .admission
+            .acquire_async(CancellationToken::new())
+            .await
+        {
             Ok(guard) => guard,
             Err(error) => {
                 return Ok(admission_error_response(
@@ -1416,10 +1416,7 @@ async fn handle_embeddings(
     // with "no model loaded" while chat (which always names a model) kept
     // working.
     let (engine, loaded_model) = {
-        let mut runtime = shared
-            .runtime
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if runtime.current_path.is_none() {
             let name = request_model
                 .clone()
@@ -2613,6 +2610,22 @@ mod tests {
         );
         drop(tx);
         assert!(next(&mut body).await.is_none());
+    }
+
+    /// Every `/v1/embeddings` input-shape refusal is the caller's request, not
+    /// a server fault: bare content arrays, list arity, marker/image count and
+    /// a bad data URL all answer 400.
+    #[test]
+    fn embeddings_refusals_are_client_errors() {
+        for message in [
+            "input is required",
+            "input has 2 entries; this endpoint accepts one input per request",
+            "input looks like a bare content-part array — wrap the parts in a content object",
+            "input content[0]: image_url is not valid base64: Invalid symbol 33",
+            "embed: text carries 2 <|image|> marker(s) but the request has 1 image(s)",
+        ] {
+            assert_eq!(embeddings_error_status(message), 400, "{message}");
+        }
     }
 
     #[tokio::test]

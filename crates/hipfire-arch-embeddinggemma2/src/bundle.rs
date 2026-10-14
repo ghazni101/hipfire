@@ -5,7 +5,9 @@
 //! The loaded-model bundle: what the loader boxes as `Box<dyn ArchModel>`
 //! and what the embed request path downcasts back to.
 
+use crate::audio_tower::AudioTower;
 use crate::config::{EmbedConfig, InputKind};
+use crate::vision::VisionTower;
 use crate::weights::EmbedWeights;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -15,6 +17,15 @@ pub struct EmbedGemmaBundle {
     pub config: EmbedConfig,
     pub weights: EmbedWeights,
     pub tokenizer: Tokenizer,
+    /// The Gemma-4 vision tower, loaded from the `.vl` sidecar when one
+    /// resolved. `None` = this checkpoint was loaded text-only, and an
+    /// image-carrying request is refused with [`crate::carrier::NO_VISION_TOWER`]
+    /// (never silently ignored).
+    pub vision: Option<VisionTower>,
+    /// The Gemma-4 audio tower, from the SAME `.vl` sidecar. `None` = no
+    /// audio tower is resident, and an audio-carrying request is refused with
+    /// [`crate::carrier::NO_AUDIO_TOWER`].
+    pub audio: Option<AudioTower>,
 }
 
 /// Matryoshka dimensions this release advertises (`embedding_dim` plus the
@@ -83,6 +94,12 @@ impl ArchModel for EmbedGemmaBundle {
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
         let bundle = *self;
+        if let Some(vision) = bundle.vision {
+            vision.free_gpu(gpu);
+        }
+        if let Some(audio) = bundle.audio {
+            audio.free_gpu(gpu);
+        }
         bundle.weights.free_gpu(gpu);
     }
 }

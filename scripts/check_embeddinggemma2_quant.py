@@ -19,7 +19,13 @@ import sys
 import numpy as np
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from check_embeddinggemma2_parity import CASES, Daemon, rel_l2  # noqa: E402
+from check_embeddinggemma2_parity import (  # noqa: E402
+    CASES,
+    IMAGE_CASES,
+    Daemon,
+    _png_bytes,
+    rel_l2,
+)
 
 
 def artifact_format(path):
@@ -47,6 +53,7 @@ def artifact_format(path):
 # O(1) a broken dequant arm produces.
 BANDS = {
     "MQ4G256": 5.0e-1, "MQ4G256V2": 5.0e-1, "HFQ4G256": 5.0e-1, "HFQ4G128": 5.0e-1,
+    "Q4_K": 5.0e-1,
     "MQ6G256": 1.5e-1, "MQ6G256V2": 1.5e-1, "HFQ6G256": 1.5e-1,
     "Q8_0": 3.0e-2, "Q8F16": 3.0e-2, "MQ8G256": 3.0e-2,
     "dir": 2.0e-3,
@@ -63,6 +70,22 @@ def main():
     ref = np.load(args.ref)
     fixtures = [(k, kind, text) for k, kind, text in CASES if k in
                 ("short_query", "short_doc", "code_doc", "unicode", "medium_doc")]
+    vision_ref = f"ids_{IMAGE_CASES[1][0]}" in ref
+    # One image fixture per artifact: the towers ride F16 in the sidecar for
+    # every tier, so the trunk's own band governs the image legs too — a
+    # separate (looser) image band would only hide a splice bug.
+    img_key, img_kind, img_text, img_dims = IMAGE_CASES[1]
+    img_b64 = _png_bytes(*img_dims)
+
+    def sibling_vl(path):
+        import glob as globmod
+
+        if os.path.isdir(path):
+            hits = globmod.glob(os.path.join(path, "*.vl"))
+            return hits[0] if hits else None
+        stem = os.path.basename(path).rsplit(".", 1)[0]
+        cand = os.path.join(os.path.dirname(path) or ".", f"{stem}.vl")
+        return cand if os.path.exists(cand) else None
 
     failures = 0
     for path in args.artifacts:
@@ -72,7 +95,9 @@ def main():
         if band is None:
             print(f"SKIP {name}: unknown format {fmt}")
             continue
-        d = Daemon(args.daemon, path)
+        vl = sibling_vl(path)
+        d = Daemon(args.daemon, path,
+                   params={"vision_mode": "auto"} if vl else None)
         worst, worst_key = 0.0, ""
         for key, kind, text in fixtures:
             r = d.embed(key, kind, {"text": text})
@@ -82,9 +107,21 @@ def main():
             if r["n_input_tokens"] != len(ref[f"ids_{key}"]):
                 print(f"FAIL {name} {key}: token count {r['n_input_tokens']} != ref")
                 failures += 1
+        img_note = ""
+        if vision_ref and vl:
+            r = d.embed("img", img_kind, {"text": img_text, "images_base64": [img_b64]})
+            e = rel_l2(r["embeddings"], ref[f"emb_{img_key}"])
+            if e > worst:
+                worst, worst_key = e, img_key
+            if r["n_input_tokens"] != len(ref[f"ids_{img_key}"]):
+                print(f"FAIL {name} {img_key}: token count {r['n_input_tokens']} != ref")
+                failures += 1
+            img_note = " +img"
+        elif vision_ref and not vl:
+            print(f"SKIP img legs for {name}: no sibling .vl sidecar")
         d.stop()
         ok = worst <= band
-        print(f"{'ok  ' if ok else 'FAIL'} {name:14s} [{fmt:10s}] worst rel-L2 {worst:.2e} on {worst_key} (band {band:.1e})")
+        print(f"{'ok  ' if ok else 'FAIL'} {name:14s} [{fmt:10s}] worst rel-L2 {worst:.2e} on {worst_key}{img_note} (band {band:.1e})")
         failures += 0 if ok else 1
 
     if failures:

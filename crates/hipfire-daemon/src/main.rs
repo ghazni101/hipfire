@@ -532,20 +532,86 @@ fn client_seed_or_refuse(
     }
 }
 
-/// Refuse an image sent to a model with no vision encoder: the client asked
-/// for a capability this load lacks (`unsupported`), not a server fault.
+/// Which tower a media-carrying request needs, for the refusal text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaTower {
+    Vision,
+    Audio,
+}
+
+impl MediaTower {
+    fn noun(self) -> &'static str {
+        match self {
+            MediaTower::Vision => "vision",
+            MediaTower::Audio => "audio",
+        }
+    }
+}
+
+/// Refuse media sent to a model with no encoder for it: the client asked for a
+/// capability this load lacks (`unsupported`), not a server fault. The tower is
+/// named because the two are separate artifacts on paper and one load can have
+/// either (arch 18 keeps both in the one `.vl` sidecar).
+fn refuse_media_without_tower(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    tower: MediaTower,
+    vision_gated_off: Option<&str>,
+) {
+    let message = media_refusal_message(tower, vision_gated_off);
+    write_typed_error(stdout, id, &message, "unsupported", false, false);
+}
+
+/// The refusal text, split out from the writer so the tower noun and the knob
+/// that dropped the sidecar are directly testable.
+fn media_refusal_message(tower: MediaTower, vision_gated_off: Option<&str>) -> String {
+    let noun = tower.noun();
+    match vision_gated_off {
+        Some(sidecar) => format!(
+            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+        ),
+        None => format!("model has no {noun} encoder"),
+    }
+}
+
+/// The vision-only spelling the generate route uses.
 fn refuse_image_without_vision(
     stdout: &mut impl std::io::Write,
     id: &str,
     vision_gated_off: Option<&str>,
 ) {
-    let message = match vision_gated_off {
-        Some(sidecar) => format!(
-            "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
-        ),
-        None => "model has no vision encoder".to_owned(),
+    refuse_media_without_tower(stdout, id, MediaTower::Vision, vision_gated_off);
+}
+
+/// Which tower an `embed` request asks for — the wire's `images_base64` /
+/// `audios_base64` / `videos_base64` lists, or the one-image `image_base64`
+/// legacy field. Vision wins when a request carries both, so a tower-less
+/// load refuses the input the caller listed first.
+///
+/// A video asks for the VISION tower: arch 18's video leg has no tower of its
+/// own, it runs the image tower once per frame.
+///
+/// Wire shape only: this arm must not name an arch type, so it answers "did
+/// the caller ask for a tower", not "is a tower resident" (the encode body in
+/// `hipfire_generate::embed` owns that, and decodes the bytes).
+fn embed_request_media(msg: &serde_json::Value) -> Option<MediaTower> {
+    let input = msg.get("input").and_then(|v| v.as_object())?;
+    let list_present = |key: &str| {
+        input
+            .get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|media| !media.is_empty())
     };
-    write_typed_error(stdout, id, &message, "unsupported", false, false);
+    if list_present("images_base64") || input.get("image_base64").is_some_and(|v| !v.is_null()) {
+        return Some(MediaTower::Vision);
+    }
+    if list_present("audios_base64") {
+        return Some(MediaTower::Audio);
+    }
+    if list_present("videos_base64") {
+        return Some(MediaTower::Vision);
+    }
+    None
 }
 
 /// Resident KV backend metadata for `loaded` ACK and `diag`.
@@ -2574,7 +2640,10 @@ fn main() {
                         // session cache (`ArchModel::session_cache_attached`).
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            13 | 16 => m.state.as_deref().is_some_and(|state| state.session_cache_attached()),
+                            13 | 16 => m
+                                .state
+                                .as_deref()
+                                .is_some_and(|state| state.session_cache_attached()),
                             _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
@@ -2833,7 +2902,6 @@ fn main() {
                 let _ = stdout.flush();
             }
             "generate" => {
-
                 let gen_attempt_id = match require_wire_attempt_id(msg.get("attempt_id")) {
                     Ok(id) => id,
                     Err(reason) => {
@@ -4528,9 +4596,9 @@ fn main() {
 
             "embed" => {
                 // Embedding encode (arch 17, the qwen3.5 multi-vector
-                // encoder). The img_generate shape: dispatch + refusals
-                // here, the body in hipfire-generate so main.rs names no
-                // arch-crate type.
+                // encoder; arch 18, EmbeddingGemma-2). The img_generate shape:
+                // dispatch + refusals here, the body in hipfire-generate so
+                // main.rs names no arch-crate type.
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -4598,6 +4666,25 @@ fn main() {
                     );
                     let _ = stdout.flush();
                     continue;
+                }
+                // A media-carrying embed needs its tower. Whether a tower is
+                // resident is arch-side state (`bundle.vision` / `bundle.audio`)
+                // this arm must not name; the load-time knob it DOES own is
+                // named here — `vision_mode=off` dropped the sidecar (which
+                // carries both towers) that this request needs. Placed after
+                // the verb refusal so a generation model still answers "use
+                // generate" (the actionable fix there).
+                if let Some(tower) = embed_request_media(&msg) {
+                    if vision_gated_off.is_some() {
+                        refuse_media_without_tower(
+                            &mut stdout,
+                            id.as_str(),
+                            tower,
+                            vision_gated_off.as_deref(),
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                 }
                 hipfire_generate::embed::generate_embed(m, &mut gpu, &mut stdout, &id, &msg);
                 let _ = stdout.flush();
@@ -5390,8 +5477,8 @@ mod tests {
 
     use super::{
         announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
-        emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,
-        TERMINAL_TEST_LOCK,
+        embed_request_media, emit_batch_admission_error, media_refusal_message,
+        refuse_image_without_vision, require_wire_attempt_id, MediaTower, TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -5419,6 +5506,76 @@ mod tests {
                 Some("/models/qwen3.8-27b-vision.hfq".to_owned())
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
+        }
+    }
+
+    /// The embed arm's media predicate decides which refusal a media request
+    /// gets, so its spelling sensitivity is load-bearing: the canonical
+    /// `images_base64` / `audios_base64` lists and the one-image
+    /// `image_base64` legacy field count, and the *wrong* list spelling does
+    /// not — that request is refused by field name in
+    /// `hipfire_generate::embed`, and answering it with the tower-knob refusal
+    /// instead would point the caller at the wrong fix.
+    #[test]
+    fn an_embed_request_reports_which_tower_it_asked_for() {
+        let media = |prompt: serde_json::Value| embed_request_media(&prompt);
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images_base64": ["QUJD"]}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "image_base64": "QUJD"}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "audios_base64": ["QUJD"]}})),
+            Some(MediaTower::Audio)
+        );
+        // Video asks for the VISION tower: arch 18's video leg runs the image
+        // tower once per frame, it has no tower of its own.
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos_base64": [["QUJD"]]}})),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos_base64": []}})),
+            None
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "videos": [["QUJD"]]}})),
+            None
+        );
+        // Both media: vision first, the tower whose refusal the caller sees.
+        assert_eq!(
+            media(serde_json::json!({
+                "input": {"images_base64": ["QUJD"], "audios_base64": ["REVG"]}
+            })),
+            Some(MediaTower::Vision)
+        );
+        assert_eq!(media(serde_json::json!({"input": {"text": "t"}})), None);
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images_base64": []}})),
+            None
+        );
+        assert_eq!(
+            media(serde_json::json!({"input": {"text": "t", "images": ["QUJD"]}})),
+            None
+        );
+        assert_eq!(media(serde_json::json!({"input": "t"})), None);
+        assert_eq!(media(serde_json::json!({"input": null})), None);
+    }
+
+    /// The refusal names the tower the caller asked for, and the knob that
+    /// dropped the one sidecar both towers live in.
+    #[test]
+    fn a_media_refusal_names_the_tower_the_caller_asked_for() {
+        for (tower, noun) in [(MediaTower::Vision, "vision"), (MediaTower::Audio, "audio")] {
+            let gated = media_refusal_message(tower, Some("/models/m.vl"));
+            assert!(gated.contains(&format!("no {noun} encoder")), "{gated}");
+            assert!(gated.contains("vision_mode is off"), "{gated}");
+            assert!(gated.contains("/models/m.vl"), "{gated}");
+            let bare = media_refusal_message(tower, None);
+            assert_eq!(bare, format!("model has no {noun} encoder"), "{bare}");
         }
     }
 

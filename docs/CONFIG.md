@@ -676,6 +676,7 @@ Acceptance evidence for this default (fresh-process determinism, the batching C1
 - **`off`** (default) — never load a tower sidecar. The registry/sibling file is not wired, and even an explicit `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR` path is skipped with one stderr line. The daemon enforces the same hard override for non-CLI clients, mirroring `dflash_mode=off`. Text loads pay no tower VRAM (~1 GB).
 - **`auto`** — use the registry `vision` slot (or the `<trunk-stem>-vision.hfq` sibling beside the trunk) when present; silently text-only when absent.
 - **`on`** — require the declared sidecar: the load fails closed with a pull hint when it cannot be resolved. A trunk with an embedded tower declares no sidecar and is unaffected by this key.
+- **EmbeddingGemma 2 (arch 18, `hipfire embed`)** reads the same ladder against its own discovery: the quantizer's `<trunk>.vl` pack beside the checkpoint, which carries **every** bundled tower group (`vision_tower.*`, `audio_tower.*`, `embed_vision.*`, `embed_audio.*`) — one pack, one decision. Under `auto` (or `on`) the pack is loaded and image/audio/video input is served on the embed verb; under `off`, the default, the load is text-only and any input carrying media is refused per modality, naming the knob. The `serve.multi_slot` slot route applies the same ladder (its engine is told the resolved tower path, never left to rediscover one).
 
 ```bash
 hipfire config set vision_mode auto
