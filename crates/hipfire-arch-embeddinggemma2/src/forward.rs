@@ -239,7 +239,7 @@ fn trace(
     n: usize,
 ) -> Result<(), String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1")) {
+    if !*ON.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1")) {
         return Ok(());
     }
     let label = label();

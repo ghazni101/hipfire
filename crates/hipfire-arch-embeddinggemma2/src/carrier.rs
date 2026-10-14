@@ -150,7 +150,7 @@ pub fn load_embed_gemma_from_source(
         config.document_length,
     );
 
-    if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
         let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
         eprintln!(
             "  [embed-debug] after load: VRAM {} MB free / {} MB",

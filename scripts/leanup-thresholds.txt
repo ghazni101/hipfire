@@ -68,7 +68,6 @@ required_features_daemon    == 0
 # through `hipfire_loader::wire_verb`, so the daemon still carries no arch_id
 # literal (`daemon_arch_id` stays 0). Paid down when the message loop's
 # per-verb refusal boilerplate is factored out, as noted at the 5392 raise.
-daemon_lines                <= 5460
 # RATCHET-RAISE 5460 -> 5495: the arch-17 embedding arms in the daemon message
 # loop (#855, beta-base replay) — the generate refusal that is keyed after the
 # attempt id and admission token are bound (its attempt-0 twin hung requests),
@@ -90,7 +89,13 @@ daemon_lines                <= 5460
 # Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
 # stays 0. Paid down when the message loop's per-verb refusal boilerplate is
 # factored out.
-daemon_lines                <= 5515
+# RATCHET-RAISE 5515 -> 5680 (arch 18, EmbeddingGemma 2): the embed arm's
+# arch-18 branch — dims forwarding to the wire request, the text-only
+# image-input refusal and the widened not-an-embedding-checkpoint refusal —
+# plus the merge's carrying of beta's arch-17 arms. The body still lives in
+# hipfire-generate::embed; same paydown: factor the per-verb refusal
+# boilerplate out.
+daemon_lines                <= 5680
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

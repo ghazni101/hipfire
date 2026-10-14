@@ -54,7 +54,7 @@ impl EmbedEngineConfig {
 }
 
 fn batch_window_from_env() -> Duration {
-    match std::env::var("HIPFIRE_EMBED_BATCH_WINDOW_US") {
+    match hipfire_config::developer_var("HIPFIRE_EMBED_BATCH_WINDOW_US") {
         Ok(v) => match v.trim().parse::<u64>() {
             Ok(us) => Duration::from_micros(us),
             Err(_) => BATCH_WINDOW,
@@ -131,7 +131,10 @@ impl EmbedSlotEngine {
 
 impl SlotEngineHandle for EmbedSlotEngine {
     fn submit(&self, _req: SubmitRequest) -> Result<(), String> {
-        Err("embeddinggemma2: this engine serves embeddings only; there is no generate route".into())
+        Err(
+            "embeddinggemma2: this engine serves embeddings only; there is no generate route"
+                .into(),
+        )
     }
 
     fn cancel_waiting(&self, _request_tag: u64) {}
@@ -245,8 +248,7 @@ fn serve_batch(
             // Truncate a nonsense dims ask here so it fails per-request,
             // before any GPU work, without failing its neighbours.
             let dims = req.dims.unwrap_or(0);
-            let dims_ok = dims == 0
-                || dims <= bundle.config.embedding_dim;
+            let dims_ok = dims == 0 || dims <= bundle.config.embedding_dim;
             if !dims_ok {
                 errs.push(Some(format!(
                     "{}: dims {dims} exceeds this model's embedding width {}",
@@ -301,7 +303,10 @@ fn serve_batch(
         .map(|errs| errs.into_iter().map(|e| e.map(Err)).collect())
         .collect();
 
-    let trace = std::env::var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_EMBED_ENGINE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     for group in &groups {
         let inputs: Vec<EncodeInput<'_>> = group
             .iter()
@@ -365,7 +370,9 @@ fn serve_batch(
     for row in results {
         out.push(
             row.into_iter()
-                .map(|r| r.unwrap_or_else(|| Err("embeddinggemma2: request was not encoded".into())))
+                .map(|r| {
+                    r.unwrap_or_else(|| Err("embeddinggemma2: request was not encoded".into()))
+                })
                 .collect(),
         );
     }
