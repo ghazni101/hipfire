@@ -64,41 +64,74 @@ fusions is a separate, measured change.
 
 ## Evidence (gfx1151, halo)
 
-Base: beta `901e44fdd`. Route oracle: a throwaway dump driver
-(`~/mesh-validation/HIPF-14/lfm2_route_dump.rs`, built unchanged in both
-trees) runs `decode_step` over a fixed 24-token prompt plus 48 greedy tokens
-and records at every committed position the fed token, argmax, the full logits
-and digests of all convolution state and all KV bytes, plus the final state
-bytes. Beta is deterministic run to run (two beta runs identical).
+Base: beta `1be80ed54`; head: this branch rebased on it. Route oracle: a
+throwaway dump driver (`~/mesh-validation/HIPF-14/lfm2_route_dump.rs`, built
+unchanged in both trees) runs `decode_step` over a fixed 24-token prompt plus
+48 greedy tokens and records at every committed position the fed token,
+argmax, the full logits and digests of all convolution state and all KV
+bytes, plus the final state bytes. Beta is deterministic run to run.
 
-| Fixture | Positions | Tokens | Logits | Conv state | KV |
+| Fixture (sha256) | Positions | Tokens | Logits | Conv state | KV |
 |---|---|---|---|---|---|
-| `lfm2.5-350m.q8` | 72 | identical | bitwise | bitwise | bitwise |
-| `lfm2.5-350m.mq4` | 72 | identical | bitwise | bitwise | bitwise |
-| `lfm2.5-1.2b.mq4` | 72 | identical | bitwise | bitwise | bitwise |
-| `lfm2.5-8b-a1b.mq4` (MoE, sealed route) | 72 | identical | bitwise | bitwise | bitwise |
+| `lfm2.5-350m.q8` (`7cd38949…`) | 72 | identical | bitwise | bitwise | bitwise |
+| `lfm2.5-350m.mq4` (`4885d1ce…`) | 72 | identical | bitwise | bitwise | bitwise |
+| `lfm2.5-1.2b.mq4` (`a7aeba87…`) | 72 | identical | bitwise | bitwise | bitwise |
+| `lfm2.5-8b-a1b.mq4` (`07da9942…`, MoE, sealed route) | 72 | identical | bitwise | bitwise | bitwise |
+| `lfm2.5-vl-3b.mq4v2.hfq` (`ce009cd0…`, MQ4G256V2 text, VL tower) | 72 | identical | bitwise | bitwise | bitwise |
 
-The same parity holds on the hipGraph route (`HIPFIRE_LFM2_GRAPH=1`, beta vs
-head, and both equal to the default route) on `lfm2.5-350m.q8` and
-`lfm2.5-8b-a1b.mq4`.
+The VL fixture is `LiquidAI/LFM2.5-VL-3B` at revision `35a118d9`
+(safetensors sha256 `8413ba08…`) quantized with
+`hipfire-quantize --format mq4v2 --include-vision` (census 167 MQ4G256V2,
+99 Q8F16, 441 vision/projector F16/F32). The hipGraph route
+(`HIPFIRE_LFM2_GRAPH=1`) is bitwise on it too, beta vs head and vs the
+default route.
+
+LFM2.5-8B-A1B output is incoherent on beta until #878 (MoE down GEMV read
+2 of 7 groups at K = 1792) lands. Every 8B row below that needs coherent text
+therefore compares beta + #878 + #879 against head + #878 + #879; the route
+oracle is bitwise there as well (and differs from the unfixed arms, so it
+sees the kernel change).
+
+Against the HF `transformers` CPU f32 reference on the bf16 checkpoints
+(per-layer hidden states, chat-framed prompts; base and head dumps are
+bitwise equal, so this is a quantization-noise check, not a port check):
+
+| Model | Prompt | Layer 0 cos (last pos) | Last layer cos (last pos) | Greedy |
+|---|---|---|---|---|
+| 8B-A1B + #878 | France / hello / ocean | 0.983 / 0.983 / 0.983 | 0.925 / 0.881 / 0.936 | coherent think + answer, beta == head |
+| VL-3B (text) | France / ocean | 0.988 / 0.988 | 0.987 / 0.974 | "The capital of France is Paris." equals HF greedy; beta == head |
 
 Serve (`serve_harness.py --thinking off --sampling greedy
---compare-transcript`, beta daemon vs head daemon): `transcript_byte_identical=true`
-for battery and chain on `lfm2.5-1.2b.mq4` and `lfm2.5-8b-a1b.mq4`. The 8B-A1B
-text is degenerate on both beta and head (empty turns, whitespace attractors);
-that is a pre-existing defect tracked separately, not a change of this port.
+--compare-transcript`): `transcript_byte_identical=true` for battery and
+chain on `lfm2.5-350m.q8`, `lfm2.5-1.2b.mq4`, `lfm2.5-vl-3b.mq4v2.hfq` (beta vs
+head) and on `lfm2.5-8b-a1b.mq4` (fix arms, `--max-tokens 1024`: 5 / 5 turns
+with a closed think block and a coherent answer, 0 empty, 0 attractor).
 
-Redline (`redline_daemon_harness.py --pm4 --skip-prefill`, `lfm2.5-350m.mq4`):
-decode launch sequence unchanged (280 launches, 11 kernels, hash
-`de9b61e3ebd1de33` on both), PM4 shadow exact on both.
+VL image route (`prefill_embed_step`, daemon protocol, greedy, 128 tokens):
+`doge_napping.png`, `scene_2.jpg` and `barney_cigar.jpg`, two prompts each,
+token streams identical beta vs head. The doge OCR turn reads all six meme
+captions; scene_2 reads Yves Saint Laurent / OPIUM / Ermenegildo Zegna.
+
+Lifecycle (`dense_rollback_gpu`, G4.10 seams: fault after prefill and after
+the first decode, one error terminal, rollback, retry equals fresh,
+unload/reload, reset-phase error visible): 3 / 3 on `lfm2.5-1.2b.mq4` on beta
+and head. On 8B-A1B the after-first-decode fault never fires without #878
+(beta and head alike); with #878 the head passes.
+
+Redline (`redline_daemon_harness.py --pm4 --skip-prefill`): decode launch
+sequence unchanged and PM4 shadow exact on both arms, `lfm2.5-350m.mq4`
+(280 launches, hash `de9b61e3ebd1de33`) and `lfm2.5-350m.q8` (220 launches,
+hash `0cc5dc6b514f31c9`).
 
 Decode, A/B alternating under the halo lock, no other cargo/rustc running:
 
 | Model | Measure | beta | head | ratio |
 |---|---|---|---|---|
-| `lfm2.5-1.2b.mq4` | `hipfire bench --matrix` tg128 @ ctx 128, 2 runs | 232.5 / 231.6 | 231.2 / 231.5 | 0.997 |
-| `lfm2.5-1.2b.mq4` | same @ ctx 2048 | 125.78 / 125.77 | 125.73 / 125.70 | 0.9995 |
-| `lfm2.5-8b-a1b.mq4` | 256 greedy tokens through `decode_step`, 4 rounds | 166.6 / 166.6 / 167.7 / 167.5 | 166.8 / 166.0 / 166.9 / 167.3 | 0.999 |
+| `lfm2.5-1.2b.mq4` | `hipfire bench --matrix` tg128 @ ctx 128, 2 runs | 232.2 / 232.0 | 231.6 / 231.8 | 0.998 |
+| `lfm2.5-1.2b.mq4` | same @ ctx 2048 | 125.78 / 125.76 | 125.69 / 125.68 | 0.999 |
+| `lfm2.5-vl-3b.mq4v2.hfq` | same @ ctx 128 | 119.07 / 119.24 | 118.72 / 118.87 | 0.997 |
+| `lfm2.5-vl-3b.mq4v2.hfq` | same @ ctx 2048 | 75.31 / 75.38 | 75.22 / 75.32 | 0.999 |
+| `lfm2.5-8b-a1b.mq4` (+#878) | 256 greedy tokens via `decode_step`, 4 rounds | 154.5 / 154.3 / 153.9 / 153.4 | 154.3 / 153.9 / 154.6 / 154.4 | 1.002 |
 
 The sealed MoE first ran the 8B-A1B gate/up through the top-8 launcher
 (`gemv_hfq4g256_moe_gate_up_k8_indexed`): bitwise identical, but 1.2 % slower
@@ -106,10 +139,8 @@ at k = 4 on gfx1151. Below top-8 (only the biased route reaches those arms)
 the executor now takes the batched HFQ4 and HFQ6 gate/up launchers the hand
 path used.
 
-Not covered on halo: LFM2-VL (`prefill_embed_step` runs the same program; no
-VL fixture on halo) and the `.mq6e` MQ6-expert artifact (no fixture; the
-sealed route calls the same MQ6 gate/up, activation, down and combine kernels
-with the same arguments as the hand path, but it was not run). The gfx1201
-retained-PM4 admission row in `docs/admissions.yml` was screened on gfx1201;
-the gfx1151 launch sequence is unchanged, but the gfx1201 sequence hash is not
-re-measured.
+Not covered: the `.mq6e` MQ6-expert artifact (not published, and the current
+quantizer has no MQ6-expert recipe for LFM2; the sealed route calls the same
+MQ6 kernels with the same arguments as the hand path, but it was not run) and
+the gfx1201 retained-PM4 admission row in `docs/admissions.yml` (needs
+gfx1201; the gfx1151 launch sequences are unchanged).
