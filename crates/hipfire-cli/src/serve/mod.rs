@@ -235,6 +235,12 @@ pub(crate) struct ServePidRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LoadedInfo {
     pub(crate) vision: bool,
+    /// An audio tower is resident (arch 18's `.vl` pack). `false` from a
+    /// pre-`audio` daemon ack, matching the modality the serve then refuses.
+    pub(crate) audio: bool,
+    /// The embed route's video leg is served (arch 18; frames ride the
+    /// vision tower). `false` from a pre-`video` daemon ack.
+    pub(crate) video: bool,
     /// Hidden size (`dim`) — llama.cpp's `meta.n_embd`.
     pub(crate) n_embd: u64,
     /// Vocabulary size (`vocab`) — llama.cpp's `meta.n_vocab`.
@@ -2096,6 +2102,14 @@ impl ServeRuntime {
                     .get("vl")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                audio: loaded
+                    .get("audio")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                video: loaded
+                    .get("video")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 n_embd: loaded
                     .get("dim")
                     .and_then(serde_json::Value::as_u64)
@@ -3600,6 +3614,8 @@ mod tests {
             n_ctx: 32768,
             loaded: LoadedInfo {
                 vision: true,
+                audio: true,
+                video: true,
                 n_embd: 5120,
                 n_vocab: 248320,
                 reasoning_contract: "qwen_jinja".into(),

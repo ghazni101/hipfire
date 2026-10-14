@@ -230,6 +230,11 @@ pub struct SlotBackend {
     layers: usize,
     vocab: usize,
     is_vl: bool,
+    /// Post-gate audio-tower / video-leg residency, published verbatim in
+    /// the `loaded` ack (`audio` / `video`) so `/v1/models` can advertise
+    /// the modalities the serve actually accepts.
+    is_audio: bool,
+    is_video: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Per-slot context cap handed to the engine at load. Admission-side
     /// only (the engine re-enforces it per token); kept here so an
@@ -408,6 +413,8 @@ impl SlotBackend {
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
+        let is_audio = preflight.audio;
+        let is_video = preflight.video;
         let vision_config = preflight.vision_config;
         let rec_temperature = preflight.rec_temperature;
         let rec_top_p = preflight.rec_top_p;
@@ -553,6 +560,8 @@ impl SlotBackend {
             layers,
             vocab,
             is_vl,
+            is_audio,
+            is_video,
             vision_config,
             cap_tokens,
             arch_id,
@@ -578,6 +587,12 @@ impl SlotBackend {
     }
     pub fn is_vl(&self) -> bool {
         self.is_vl
+    }
+    pub fn is_audio(&self) -> bool {
+        self.is_audio
+    }
+    pub fn is_video(&self) -> bool {
+        self.is_video
     }
 
     pub fn active_count(&self) -> usize {
@@ -1759,6 +1774,10 @@ struct Preflight {
     tokenizer: Tokenizer,
     chat_template: Option<String>,
     is_vl: bool,
+    /// Post-gate audio-tower and video-leg residency (arch 18 only; both
+    /// ride the one `.vl` sidecar the vision gate already resolved).
+    audio: bool,
+    video: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
@@ -1815,6 +1834,10 @@ fn cpu_preflight(
             // tower is loaded and driven by the arch crate itself.
             chat_template: None,
             is_vl,
+            // Both towers ride the ONE `.vl` pack, so the mode gate that
+            // stripped `vl_path` strips audio and the video leg with it.
+            audio: p.audio && vl_path.is_some(),
+            video: p.video && vl_path.is_some(),
             vision_config: None,
             vl_path,
             rec_temperature: None,
@@ -1907,6 +1930,9 @@ fn cpu_preflight(
         tokenizer,
         chat_template,
         is_vl,
+        // The HFQ slot route (chat arches) has no embed media legs.
+        audio: false,
+        video: false,
         vision_config,
         vl_path,
     })

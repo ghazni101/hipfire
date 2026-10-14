@@ -1545,6 +1545,8 @@ fn main() {
                             let layers = backend.layers();
                             let vocab = backend.vocab();
                             let vl = backend.is_vl();
+                            let audio = backend.is_audio();
+                            let video = backend.is_video();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
@@ -1560,6 +1562,8 @@ fn main() {
                                 "layers": layers,
                                 "vocab": vocab,
                                 "vl": vl,
+                                "audio": audio,
+                                "video": video,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],
@@ -2454,6 +2458,8 @@ fn main() {
                                 Default::default()
                             });
                         let vl = m.has_vision_encoder();
+                        let audio = m.has_audio_encoder();
+                        let video = m.has_video_route();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // MTP config from load params; `None` (auto) keeps the carrier-resolved K (Qwen4 native MTP) else the skeleton MTP_K_DEFAULT.
@@ -2686,12 +2692,14 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                audio,
+                                video,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -2714,12 +2722,14 @@ fn main() {
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                audio,
+                                video,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,

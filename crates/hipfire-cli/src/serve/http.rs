@@ -854,11 +854,22 @@ fn model_entry(
         // load window — resident id set, ack not yet in — cannot advertise
         // text-only for a model whose facts are simply not known yet.
         if loaded.n_embd > 0 {
-            let input_modalities = if loaded.vision {
-                vec!["text", "image"]
-            } else {
-                vec!["text"]
-            };
+            // One entry per input the serve actually accepts, in wire order:
+            // text always; image on a resident vision tower; audio on a
+            // resident audio tower; video on the embed route's video leg
+            // (arch 18 — its frames ride the vision tower). An arch that
+            // refuses a modality by name (arch 17's audio/video refusals)
+            // must not advertise it.
+            let mut input_modalities = vec!["text"];
+            if loaded.vision {
+                input_modalities.push("image");
+            }
+            if loaded.audio {
+                input_modalities.push("audio");
+            }
+            if loaded.video {
+                input_modalities.push("video");
+            }
             // Same facts /health publishes from `meta.loaded`, so a client
             // discovering models the OpenAI way doesn't also need a bespoke
             // /health probe to learn the effort rungs. `reasoning_contract`
@@ -2819,6 +2830,8 @@ mod tests {
     fn model_entry_publishes_runtime_facts_only_for_the_resident_model() {
         let loaded = LoadedInfo {
             vision: false,
+            audio: false,
+            video: false,
             n_embd: 2048,
             n_vocab: 248320,
             reasoning_contract: String::new(),
@@ -2851,6 +2864,8 @@ mod tests {
     fn model_entry_advertises_image_input_only_when_a_tower_loaded() {
         let vision = LoadedInfo {
             vision: true,
+            audio: false,
+            video: false,
             n_embd: 5120,
             n_vocab: 248320,
             reasoning_contract: String::new(),
@@ -2861,6 +2876,49 @@ mod tests {
         assert_eq!(
             entry["architecture"]["input_modalities"],
             serde_json::json!(["text", "image"])
+        );
+    }
+
+    #[test]
+    fn model_entry_advertises_every_resident_embed_modality() {
+        // arch 18 with both towers resident: all four inputs. The wire order
+        // is text, image, audio, video — a harness keying on position or
+        // membership must see the same list the embed body admits.
+        let eg2 = LoadedInfo {
+            vision: true,
+            audio: true,
+            video: true,
+            n_embd: 512,
+            n_vocab: 262144,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
+        };
+        let entry = model_entry("embeddinggemma-2:q8f16", None, Some((&eg2, 8192)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "image", "audio", "video"])
+        );
+
+        // Audio without video cannot happen today (both ride the arch-18
+        // `.vl` pack), but the list is per-fact, not a package deal: a
+        // video-capable ack whose vision tower is absent advertises no
+        // image and no video — the tower the frames would ride is the one
+        // that refused the load.
+        let audio_only = LoadedInfo {
+            vision: false,
+            audio: true,
+            video: false,
+            n_embd: 512,
+            n_vocab: 262144,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
+        };
+        let entry = model_entry("embeddinggemma-2:q8f16", None, Some((&audio_only, 8192)));
+        assert_eq!(
+            entry["architecture"]["input_modalities"],
+            serde_json::json!(["text", "audio"])
         );
     }
 

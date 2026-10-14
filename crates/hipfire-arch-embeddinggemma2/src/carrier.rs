@@ -1023,8 +1023,15 @@ pub fn preflight_slot(
         vocab: config.vocab_size,
         tokenizer,
         // A resident tower only: the daemon's slot arm passes this pair
-        // through to the engine, which loads the tower from `vl_path`.
+        // through to the engine, which loads the towers from `vl_path`.
+        // `audio`/`video` are capability flags, not discovery results: both
+        // towers (and the video leg, which runs the vision tower per frame)
+        // ride the ONE `.vl` pack, so an arch-18 pack always carries them and
+        // the daemon's own gate (`&& vl_path.is_some()` after the
+        // vision-mode ladder resolves the sidecar) owns the residency truth.
         is_vl: vl_path.is_some(),
+        audio: true,
+        video: true,
         vl_path,
     }))
 }

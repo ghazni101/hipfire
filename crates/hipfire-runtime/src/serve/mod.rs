@@ -344,6 +344,15 @@ pub struct SlotModelPreflight {
     pub tokenizer: crate::tokenizer::Tokenizer,
     /// A vision tower will be resident.
     pub is_vl: bool,
+    /// An audio tower will be resident (arch 18's `.vl` pack carries it next
+    /// to the vision tower; every other arch answers `false`). Capability,
+    /// not discovery: the load's sidecar gate turns it into residency.
+    pub audio: bool,
+    /// The embed route's video leg will be served (arch 18 only — its frames
+    /// ride the vision tower, so this tracks the same residency as `is_vl`
+    /// there and is `false` on every arch without a video leg). Capability,
+    /// not discovery: the load's sidecar gate turns it into residency.
+    pub video: bool,
     /// Resolved `.vl` sidecar path, when the tower lives outside the trunk.
     pub vl_path: Option<PathBuf>,
 }

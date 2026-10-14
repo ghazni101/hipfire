@@ -108,7 +108,13 @@ required_features_daemon    == 0
 # `cpu_preflight` now applies `off`/`on`/explicit-path to the carrier's report
 # and the slot engine honors that decision instead of rediscovering the `.vl`
 # sibling. Same paydown: the per-verb, now per-modality, refusal boilerplate.
-daemon_lines                <= 5835
+# RATCHET-RAISE 5835 -> 5845: the `loaded` ack publishes two more residency
+# facts (`audio`, `video`) on both the slot and the sequential arm, so
+# `/v1/models` `input_modalities` can advertise every modality the serve
+# actually accepts instead of image-only — the facts a discovery client needs
+# are per-modality, so the ack grows per-modality too. Paydown: the ack
+# builders (three spellings of one envelope) want a single serializer.
+daemon_lines                <= 5845
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

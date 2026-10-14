@@ -1200,6 +1200,15 @@ impl LoadedModel {
         })
     }
 
+    /// Read-only twin of [`Self::embeddinggemma2_mut`] for the residency
+    /// probes (`has_vision_encoder` / `has_audio_encoder` / `has_video_route`)
+    /// and any other inspection that needs no mutation.
+    pub fn embeddinggemma2(&self) -> Option<&hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref().and_then(|s| {
+            (s as &dyn Any).downcast_ref::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
+        })
+    }
+
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
         self.state
             .as_deref_mut()
@@ -1311,9 +1320,11 @@ impl LoadedModel {
     }
 
     /// Declared vision capability across ALL carriers that can carry a
-    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
-    /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
-    /// this instead of the qwen-typed accessors above.
+    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8),
+    /// lfm2-vl (arch-11 bundle field), and embeddinggemma2 (arch 18, whose
+    /// `.vl` pack carries the Gemma4 tower). The daemon's image gate and the
+    /// `loaded` ack's `vl` fact consult this instead of the qwen-typed
+    /// accessors above.
     pub fn has_vision_encoder(&self) -> bool {
         if self.dots_ocr().is_some() {
             return true;
@@ -1323,7 +1334,27 @@ impl LoadedModel {
                 return true;
             }
         }
+        if self.embeddinggemma2().is_some_and(|b| b.vision.is_some()) {
+            return true;
+        }
         self.qwen35().is_some_and(|b| b.vision_config.is_some())
+    }
+
+    /// Declared audio capability: an audio tower is resident in this load.
+    /// Today only embeddinggemma2 (arch 18) carries one (in the same `.vl`
+    /// pack as the vision tower); every other arch answers `false`, matching
+    /// the embed body's per-modality refusals.
+    pub fn has_audio_encoder(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.audio.is_some())
+    }
+
+    /// Declared video capability: the arch serves the embed route's video
+    /// leg. Video has no tower of its own — arch 18's frames ride the vision
+    /// tower, one pass per frame — so this is the vision tower's residency on
+    /// the one arch with a video leg, and `false` everywhere else (arch 17's
+    /// encoder has no video leg; chat VL arches take no video input).
+    pub fn has_video_route(&self) -> bool {
+        self.embeddinggemma2().is_some_and(|b| b.vision.is_some())
     }
 
     /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
