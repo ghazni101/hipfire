@@ -114,7 +114,14 @@ required_features_daemon    == 0
 # actually accepts instead of image-only — the facts a discovery client needs
 # are per-modality, so the ack grows per-modality too. Paydown: the ack
 # builders (three spellings of one envelope) want a single serializer.
-daemon_lines                <= 5845
+# RATCHET-RAISE 5845 -> 5850: merging `beta` at cb0dbdf9c carries beta's own
+# five added daemon lines (`mod emu_daemon` + its two imports, the Windows
+# serve and wait-block bits) on top of the arch-18 embed verb this branch
+# already declared. beta's own daemon is 5515 lines at this tip, against 5510
+# at the previous merge base, so the arch-18 delta is unchanged: 5515 + 335 =
+# 5850. No new arch-18 daemon code; paydown unchanged — the per-verb,
+# per-modality refusal boilerplate wants factoring.
+daemon_lines                <= 5850
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

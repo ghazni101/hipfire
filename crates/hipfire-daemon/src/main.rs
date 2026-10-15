@@ -80,7 +80,6 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
 mod emu_daemon;
 use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
