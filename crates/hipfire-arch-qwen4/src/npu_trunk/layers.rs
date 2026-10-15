@@ -2,7 +2,9 @@
 //! First-light bank bindings reuse the ordinary typed layer operations.
 use super::*;
 pub(super) struct BankProgram<'a> {
-    pub steps: SmallVec<[Step<'a>; QWEN4_STEP_INLINE_CAPACITY]>,
+    /// Heap, not an inline `SmallVec<[Step; 384]>` (~567 KiB moved through the
+    /// builder and runner frames; safe only on the main thread's stack).
+    pub steps: Vec<Step<'a>>,
     pub ranges: SmallVec<[std::ops::Range<usize>; 64]>,
     pub ple_rows_f16: bool,
     pub rows: usize,
@@ -17,7 +19,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
     let expert_stage = None;
     let bf16_state = gpu.qwen4_bf16_streams(n);
     let route_n = gpu.route_rows(n);
-    let mut steps = SmallVec::new();
+    let mut steps = Vec::with_capacity(QWEN4_STEP_INLINE_CAPACITY);
     let mut ranges = SmallVec::new();
     let mut gdn_slot = 0;
     let mut qsa_slot = 0;

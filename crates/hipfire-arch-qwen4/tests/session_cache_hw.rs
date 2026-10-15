@@ -30,6 +30,19 @@
 //! only) checks that a terminal stop inside a committed MTP window restores
 //! the retained pre-window state, replays only the consumed prefix and
 //! commits live.
+//!
+//! Each test loads Flash-Next (tens of GiB of pinned host memory), so run them
+//! one per process thread and only inside a fabric hold that declares that
+//! memory and holds the Flash-Next host lock, e.g. on an R9700:
+//!
+//! ```text
+//! fabric-run.sh --class correct --card B --mem-gb 30 --hostmem-gb 50 --hostmem-lock \
+//!   --max-secs 3600 -- session_cache_hw --ignored --test-threads=1 --exact <test>
+//! ```
+//!
+//! (Halo: `--card halo --mem-gb 120 --hostmem-lock`.) [`load`] refuses to run
+//! outside such a hold, naming the processes that hold the host lock, and
+//! without `--test-threads=1`.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -177,6 +190,157 @@ fn assert_four_deltas(route: &str, stored: u64, one: u64) {
     );
 }
 
+/// The Flash-Next host lock fabric takes with `--hostmem-lock` (shared for
+/// correct, exclusive for timing holds).
+const HOSTMEM_LOCK: &str = "hostmem-flashnext.lock";
+
+/// `/proc/<pid>/stat` fields after the command: 1 = ppid, 19 = starttime.
+fn proc_stat(pid: u32, index: usize) -> Option<u64> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.get(raw.rfind(')')? + 2..)?.split_whitespace().nth(index)?.parse().ok()
+}
+
+/// Granted flocks on files named [`HOSTMEM_LOCK`] that `pids` hold, read from
+/// `/proc/locks` through each process's open files: `(pid, mode)`.
+fn hostmem_lock_holders(pids: impl Iterator<Item = u32>) -> Vec<(u32, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
+    let mut held = Vec::new();
+    for pid in pids {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+            if target.file_name().and_then(|n| n.to_str()) != Some(HOSTMEM_LOCK) {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(&target) else { continue };
+            let inode = format!(":{}", meta.ino());
+            for line in locks.lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() >= 6 && !f.contains(&"->") && f[1] == "FLOCK"
+                    && f[4] == pid.to_string() && f[5].ends_with(&inode)
+                    && !held.iter().any(|(p, _): &(u32, String)| *p == pid)
+                {
+                    held.push((pid, f[3].to_string()));
+                }
+            }
+        }
+    }
+    held
+}
+
+/// Why a Flash-Next load must not run here, or `None` inside its own hold:
+/// the harness runs one test at a time (two loads in one process exhaust
+/// host memory), `chain` (this process, then its ancestors) contains the live
+/// fabric wrapper `FABRIC_JOB` names (`pid:starttime:cards`), and a process
+/// on the chain up to that wrapper holds [`HOSTMEM_LOCK`].
+fn hold_refusal(
+    threads_one: bool,
+    marker: &str,
+    chain: &[u32],
+    start_of: impl Fn(u32) -> Option<u64>,
+    holds_lock: impl Fn(&[u32]) -> bool,
+) -> Option<String> {
+    if !threads_one {
+        return Some("each test loads Flash-Next: run with --test-threads=1".into());
+    }
+    let mut parts = marker.splitn(3, ':');
+    let wrapper = parts.next().and_then(|p| p.parse::<u32>().ok());
+    let start = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let Some((wrapper, start)) = wrapper.zip(start) else {
+        return Some("no fabric hold (FABRIC_JOB unset)".into());
+    };
+    let Some(depth) = chain.iter().position(|&pid| pid == wrapper) else {
+        return Some(format!("fabric wrapper {wrapper} is not an ancestor of this process"));
+    };
+    if start_of(wrapper) != Some(start) {
+        return Some(format!("fabric wrapper {wrapper} is gone (stale FABRIC_JOB)"));
+    }
+    if !holds_lock(&chain[..=depth]) {
+        return Some(format!("fabric job {marker} does not hold {HOSTMEM_LOCK} (no --hostmem-lock)"));
+    }
+    None
+}
+
+/// Panic before a Flash-Next load outside its own fabric hold
+/// ([`hold_refusal`]), naming the processes that hold the host lock.
+fn require_fabric_hold() {
+    let args: Vec<String> = std::env::args().collect();
+    let threads_one = std::env::var("RUST_TEST_THREADS").is_ok_and(|v| v == "1")
+        || args.iter().any(|a| a == "--test-threads=1")
+        || args.windows(2).any(|w| w[0] == "--test-threads" && w[1] == "1");
+    let mut chain = vec![std::process::id()];
+    while let Some(ppid) = proc_stat(*chain.last().unwrap(), 1).filter(|&p| p > 1) {
+        chain.push(ppid as u32);
+    }
+    let marker = std::env::var("FABRIC_JOB").unwrap_or_default();
+    let refusal = hold_refusal(threads_one, &marker, &chain, |pid| proc_stat(pid, 19), |pids| {
+        !hostmem_lock_holders(pids.iter().copied()).is_empty()
+    });
+    if let Some(why) = refusal {
+        let all = std::fs::read_dir("/proc").into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok());
+        panic!(
+            "refusing to load Flash-Next: {why}. {HOSTMEM_LOCK} holders (pid, mode): {:?}. Run \
+             inside `fabric-run.sh ... --hostmem-gb <true peak> --hostmem-lock -- session_cache_hw \
+             --ignored --test-threads=1 ...` (see the module docs)",
+            hostmem_lock_holders(all)
+        );
+    }
+}
+
+#[test]
+fn fabric_hold_guard_refuses_loads_outside_a_hold() {
+    let chain = [30, 20, 10];
+    let start = |pid| (pid == 20).then_some(77);
+    let refusal = |threads, marker: &str, holds: bool| {
+        hold_refusal(threads, marker, &chain, start, |pids: &[u32]| holds && pids.contains(&20))
+    };
+    assert!(refusal(false, "20:77:B", true).unwrap().contains("--test-threads=1"));
+    assert!(refusal(true, "", true).unwrap().contains("FABRIC_JOB unset"));
+    assert!(refusal(true, "40:77:B", true).unwrap().contains("not an ancestor"));
+    assert!(refusal(true, "20:78:B", true).unwrap().contains("stale"));
+    assert!(refusal(true, "20:77:B", false).unwrap().contains("--hostmem-lock"));
+    assert_eq!(refusal(true, "20:77:B", true), None);
+}
+
+/// The holder scan finds a real shared flock on a file named like the host
+/// lock, held by a child `flock(1)` process, and nothing for this process.
+#[test]
+fn hostmem_lock_holders_reads_proc_locks() {
+    let dir = std::env::temp_dir().join(format!("session-cache-hw-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = dir.join(HOSTMEM_LOCK);
+    std::fs::write(&lock, b"").unwrap();
+    // `flock` holds the lock while its `cat` child waits on our stdin pipe,
+    // which closing below ends.
+    let Ok(mut child) = std::process::Command::new("flock")
+        .arg("-s")
+        .arg(&lock)
+        .arg("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        eprintln!("skip: flock(1) unavailable");
+        return;
+    };
+    let pid = child.id();
+    let mut held = Vec::new();
+    for _ in 0..100 {
+        held = hostmem_lock_holders(std::iter::once(pid));
+        if !held.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(hostmem_lock_holders(std::iter::once(std::process::id())).is_empty());
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(held, vec![(pid, "READ".to_string())]);
+}
+
 /// A loaded Flash-Next bundle with the session cache attached.
 struct Loaded {
     bundle: Qwen4Bundle,
@@ -193,6 +357,7 @@ struct Loaded {
 /// whatever `HIPFIRE_QWEN4_TURN_SNAPSHOTS` says (the `<|im_end|>` token is
 /// still the caller's `set_turn_end_token`).
 fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
+    require_fabric_hold();
     let model = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));

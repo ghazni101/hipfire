@@ -459,8 +459,11 @@ pub struct ScratchState {
 /// CPU workers; nothing of it is on the GPU yet. The first kernel request or
 /// launch drains it ([`prepare_route_modules`]) into `Prepared`: every
 /// planned HIP and embedded image loaded and every planned symbol bound.
-/// `Sealed` follows a successful model load: an unplanned module request then
-/// fails instead of compiling or loading between dispatches.
+/// After a successful model load a route without an `open` label is
+/// `Sealed`: an unplanned module request then fails instead of compiling or
+/// loading between dispatches. A route with one (walked plans) is `Open`: an
+/// unplanned kernel still loads lazily, with one warning line naming it and
+/// the route, and is counted.
 #[derive(Default)]
 pub(crate) enum RouteLoad {
     #[default]
@@ -468,15 +471,40 @@ pub(crate) enum RouteLoad {
     Pending {
         plan: crate::kernel_registry::RouteKernelPlan,
         batch: Option<crate::compiler::KernelBatch>,
+        open: Option<String>,
     },
-    Prepared,
+    Prepared {
+        open: Option<String>,
+    },
     Sealed,
+    Open {
+        route: String,
+        unplanned: usize,
+    },
 }
 
 impl RouteLoad {
     /// Planned modules are not yet loaded: raw launches must refuse.
     pub(crate) fn pending(&self) -> bool {
         matches!(self, Self::Pending { .. })
+    }
+
+    /// Gate a kernel request the preloaded plan did not bind: a sealed route
+    /// refuses it, an open route counts it and warns once per request with
+    /// the module and route, and any other state loads it silently.
+    pub(crate) fn admit_unplanned(&mut self, module_name: &str, func_name: &str) -> HipResult<()> {
+        match self {
+            Self::Sealed => Err(unplanned_route_kernel(module_name, func_name)),
+            Self::Open { route, unplanned } => {
+                *unplanned += 1;
+                eprintln!(
+                    "  kernels: WARNING unplanned kernel {func_name} (module {module_name}) loaded lazily on \
+                     the {route} route plan [{unplanned} unplanned this load]"
+                );
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -498,7 +526,7 @@ pub(crate) fn prepare_route_modules(
     if !route.pending() {
         return Ok(());
     }
-    let RouteLoad::Pending { plan, batch } = std::mem::take(route) else {
+    let RouteLoad::Pending { plan, batch, open } = std::mem::take(route) else {
         unreachable!("checked pending");
     };
     if let Some(batch) = batch {
@@ -522,7 +550,7 @@ pub(crate) fn prepare_route_modules(
             }
         }
     }
-    *route = RouteLoad::Prepared;
+    *route = RouteLoad::Prepared { open };
     Ok(())
 }
 
@@ -533,7 +561,8 @@ pub(crate) fn prepare_route_modules(
 /// A pending planned route is drained first, before the cached-function
 /// early return, so no request can run ahead of the whole-plan barrier. A
 /// sealed route refuses an unplanned module instead of compiling or loading
-/// it between dispatches.
+/// it between dispatches; an open one loads it with a warning
+/// ([`RouteLoad::admit_unplanned`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_and_load_kernel(
     compiler: &mut crate::compiler::KernelCompiler,
@@ -550,9 +579,7 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    if matches!(route, RouteLoad::Sealed) {
-        return Err(unplanned_route_kernel(module_name, func_name));
-    }
+    route.admit_unplanned(module_name, func_name)?;
     load_kernel_module(compiler, hip, modules, functions, pm_decode, module_name, source, func_name)
 }
 
@@ -3168,6 +3195,27 @@ fn alloc_tensor_on(
         shape: shape.to_vec(),
         dtype,
     })
+}
+
+#[cfg(test)]
+mod route_load_tests {
+    use super::*;
+
+    /// A kernel a walked (open) route did not plan loads lazily and is
+    /// counted; a sealed route refuses it; an unplanned route loads silently.
+    #[test]
+    fn unwalked_kernel_warns_and_loads_on_an_open_route() {
+        let mut open = RouteLoad::Open { route: "Flash-Next gfx1201 NativeMtp".into(), unplanned: 0 };
+        assert!(open.admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2").is_ok());
+        assert!(open.admit_unplanned("topk8_rescore_mq6g256v2", "topk8_rescore_mq6g256v2_k2560").is_ok());
+        assert!(matches!(open, RouteLoad::Open { unplanned: 2, .. }));
+        let mut sealed = RouteLoad::Sealed;
+        let error = sealed.admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2").unwrap_err();
+        assert!(error.to_string().contains("outside this load's planned kernel route"));
+        for mut lazy in [RouteLoad::Idle, RouteLoad::Prepared { open: None }] {
+            assert!(lazy.admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2").is_ok());
+        }
+    }
 }
 
 #[cfg(test)]

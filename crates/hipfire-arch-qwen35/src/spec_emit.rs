@@ -1048,4 +1048,85 @@ mod tests {
         assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));
         assert!(cfg.stop_at.iter().any(|s| s == b"<|endoftext|>"));
     }
+
+    /// A Qwen4-framed emitter (template think close) with a think budget.
+    fn budget_emit<'a>(
+        tok: &'a Tokenizer,
+        max_think: usize,
+        assistant_prefix: AssistantPrefix,
+    ) -> Box<dyn SpecEmit + 'a> {
+        Qwen35Emit::from_ctx_template_think_close(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think,
+            max_tokens: 256,
+            assistant_prefix,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        })
+    }
+
+    /// Thinking off reaches the emitter as `max_think_tokens == 1` behind a
+    /// closed-think prefix. `window_cap` is the per-window emit clamp of
+    /// native Qwen4 MTP, so the answer must never be capped: a cap of 1 turns
+    /// every window into one token (τ 0).
+    #[test]
+    fn thinking_off_never_caps_mtp_windows() {
+        let tok = test_tokenizer();
+        let mut emit = budget_emit(&tok, 1, AssistantPrefix::ClosedThink);
+        assert_eq!(emit.window_cap(), None);
+        let ids = tok.encode("Hello world, a plain answer with no thinking.");
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            assert!(outcome.stop.is_none(), "token {i}");
+            assert_eq!(emit.window_cap(), None, "token {i}");
+        }
+        assert!(emit.take_forced().is_empty());
+    }
+
+    /// An explicit budget still caps windows inside the span, so the
+    /// force-close lands on a window's last token, and over the queued close
+    /// tokens; the answer after the close is uncapped.
+    #[test]
+    fn think_budget_caps_windows_in_span_and_over_close() {
+        const MAX: usize = 4;
+        let tok = test_tokenizer();
+        let mut emit = budget_emit(&tok, MAX, AssistantPrefix::OpenThink);
+        assert_eq!(emit.window_cap(), Some(MAX));
+        let ids = tok.encode("abcd");
+        assert_eq!(ids.len(), MAX);
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            assert!(outcome.stop.is_none(), "token {i}");
+            if i + 1 < MAX {
+                assert_eq!(emit.window_cap(), Some(MAX - 1 - i), "token {i}");
+            }
+        }
+        // The MAX-th thinking token forced the close.
+        let forced = emit.take_forced();
+        assert!(!forced.is_empty());
+        assert_eq!(emit.window_cap(), Some(forced.len() + 1));
+        for (j, id) in forced.iter().enumerate() {
+            assert!(emit.observe(*id).stop.is_none(), "close token {j}");
+            let left = forced.len() - 1 - j;
+            let want = (left > 0).then_some(left + 1);
+            assert_eq!(emit.window_cap(), want, "close token {j}");
+        }
+        for id in tok.encode("The answer.") {
+            assert!(emit.observe(id).stop.is_none());
+            assert_eq!(emit.window_cap(), None);
+        }
+    }
 }

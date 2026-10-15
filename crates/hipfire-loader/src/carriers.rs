@@ -2254,16 +2254,17 @@ pub fn load_qwen4_rank(
         }
     }
     // One snapshot of the PLE page-cache budgets, taken before admission:
-    // the prewarm after ready sets exactly these budgets, and the
-    // admission reserves the pages they keep resident. On unified memory
-    // those clean page-cache pages count in `MemAvailable` (and so in the
-    // device free memory) while being reclaimable, so without the charge a
-    // context could consume the host RAM the PLE rows are meant to occupy.
+    // the prewarm after ready sets these budgets (capped at what admission
+    // leaves them), and the admission sizes the pages they keep resident.
+    // On unified memory those clean page-cache pages count in
+    // `MemAvailable` (and so in the device free memory) while being
+    // reclaimable, so the admission shrinks them to what the context leaves
+    // free: the context takes precedence over the PLE page cache.
     // The in-load fill's own target (`ple_load_fill`, fixed when it
     // started) covers the part already resident; no residency census runs
     // against the still-reading fill.
-    let ple_prewarm = ple_prewarm_budget();
-    let ple_hot_prewarm = ple_hot_prewarm_budget();
+    let mut ple_prewarm = ple_prewarm_budget();
+    let mut ple_hot_prewarm = ple_hot_prewarm_budget();
     let ple_resident = if let Some(worker) = &ple_table_worker {
         ple_resident_bytes(ple_prewarm.0, ple_load_fill, worker.store().data_bytes())
     } else if let Some(store) = bundle.ple_hot_store() {
@@ -2318,7 +2319,7 @@ pub fn load_qwen4_rank(
         None => ctx.max_seq,
         Some(Ok(admission)) => {
             eprintln!(
-                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context incl. any F16 arena + {} MiB gather workspace + {} MiB MTP request) + {} MiB resident PLE + {} MiB headroom; card_cap {} tokens (with the current free host memory the context fits up to {} tokens; this limit moves with free host memory and the PLE prewarm budget)",
+                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context incl. any F16 arena + {} MiB gather workspace + {} MiB MTP request) + {} MiB resident PLE + {} MiB headroom; card_cap {} tokens (with the current free host memory the context fits up to {} tokens; this limit moves with free host memory)",
                     admission.free / MIB,
                     admission.max_seq,
                     admission.growth() / MIB,
@@ -2330,6 +2331,19 @@ pub fn load_qwen4_rank(
                     admission.card_cap,
                     admission.card_cap
                 );
+            if admission.ple_shrunk() {
+                eprintln!(
+                    "  qwen4 ple budget: {} MiB of {} MiB kept resident so the {}-token context fits (the context takes precedence over the reclaimable PLE page cache)",
+                    admission.resident_ple / MIB,
+                    admission.ple_budget / MIB,
+                    admission.max_seq
+                );
+            }
+            // The in-load fill already read its target, so pages beyond the
+            // admitted budget stay as reclaimable page cache: this only caps
+            // what the prewarm reads on from here.
+            ple_prewarm.0 = ple_prewarm.0.min(admission.resident_ple);
+            ple_hot_prewarm.0 = ple_hot_prewarm.0.min(admission.resident_ple);
             if let Some(sequence) = ctx.sequence.as_mut() {
                 sequence.card_cap = admission.card_cap;
             }

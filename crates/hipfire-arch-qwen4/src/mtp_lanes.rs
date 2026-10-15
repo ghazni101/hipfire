@@ -295,7 +295,7 @@ impl LaneSpecPolicy {
         }
         match self.floor.route(&self.agreement, k, provisional) {
             FloorRoute::Ar => LaneRoute::ArRetired,
-            FloorRoute::Interleaved => LaneRoute::ArSynced,
+            FloorRoute::ArSample | FloorRoute::Interleaved => LaneRoute::ArSynced,
             FloorRoute::Batched(depth) => batched(depth),
         }
     }

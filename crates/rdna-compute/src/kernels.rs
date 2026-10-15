@@ -9,6 +9,9 @@ use crate::arch_caps::ArchCaps;
 /// Exact sampled-threshold QSA selection with certified compaction and radix repair.
 pub const QSA_FILTER_SELECT_SRC: &str = include_str!("../../../kernels/src/qsa_filter_select.hip");
 
+/// Exact serial-FMA BF16 pooled-key scoring, portable across gfx11/gfx12.
+pub const QSA_BF16_SCORES_SRC: &str = include_str!("../../../kernels/src/qsa_bf16_scores.hip");
+
 /// G80 activation producer and exact integer BF16 epilogue (logged PM gaps).
 pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
 /// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.

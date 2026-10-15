@@ -44,6 +44,12 @@ use rdna_compute::spec_sampling_cpu_ar::{
 };
 use std::time::Instant;
 
+/// `HIPFIRE_MTP_FLOOR_TRACE=1`: one `QWEN4_FLOOR_TRACE` JSON line per AR
+/// token, calibration, native and external window on stderr.
+fn floor_trace_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_TRACE").is_ok_and(|value| value == "1")
+}
+
 /// `HIPFIRE_MTP_PHASE_TIMING=1`: per-window phase lines on stderr.
 fn phase_timing_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_MTP_PHASE_TIMING").is_ok_and(|value| value == "1")
@@ -815,6 +821,23 @@ const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
 /// Continuous-batching lanes keep retirement at the probe budget.
 const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 
+/// Ordinary AR tokens a singleton request's floor times, at the moment it
+/// would retire, to re-price AR where the request is now (not where it
+/// started).  The first decode token is not a representative AR sample under
+/// the Flash-Next expert hot set: its cost is a property of that one token's
+/// routed experts (VRAM hot set against host-mapped), 7–26% off the request's
+/// mean AR token on the R9700 traces (humaneval_0 19.6 ms against 23.7 ms,
+/// bare_factual 23.2 against 29.5), and AR tokens spread 20–28 ms inside one
+/// response.  Six probes bound the mean's error to a few percent.
+const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
+
+/// Per-window decay of the realized-cost memory a retirement must be
+/// confirmed against (at least the floor's own decay): about 25 windows.
+/// The 8-window `combined` memory dips below AR on any streak of rejected
+/// drafts (records_parser_1k: 27.8 ms/token at window 15 against a 19.2
+/// ms/token mean) and a retirement is sticky.
+const MTP_FLOOR_RETIRE_DECAY: f32 = 0.96;
+
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
@@ -842,9 +865,11 @@ pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FloorRoute {
-    /// Ordinary target-only token, no head work (after sticky retirement).
+pub(crate) enum FloorRoute {    /// Ordinary target-only token, no head work (after sticky retirement).
     Ar,
+    /// Ordinary target-only token timed for the floor, head kept synced (an
+    /// AR probe of a would-be retirement).
+    ArSample,
     Interleaved,
     Batched(usize),
 }
@@ -858,6 +883,17 @@ pub(crate) enum NativeWindow {
 
 fn valid_us(us: f32) -> bool {
     us.is_finite() && us > 0.0
+}
+
+/// Fresh AR samples a singleton request's floor takes at a would-be
+/// retirement (see [`MtpFloor::with_retire_evidence`]).
+/// `HIPFIRE_MTP_FLOOR_AR_PROBE=<n>` overrides it; `0` is the kill switch and
+/// restores the single-calibration-token floor.
+fn singleton_floor_ar_probe_tokens() -> usize {
+    hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_AR_PROBE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS)
 }
 
 /// Add one observation to a `decay`-decayed `(sum, weight)` pair; only the
@@ -948,6 +984,18 @@ pub(crate) fn batched_depth(agreement: &Agreement, k: usize) -> usize {
 /// the cheapest measured native option within `k`, else interleaved; it
 /// retires, stickily, at the first window where that stops holding.  A
 /// measured native option that beats AR needs no external help.
+///
+/// Retire evidence (the singleton request, [`Self::with_retire_evidence`]):
+/// the calibration token is one token, and under the Flash-Next expert hot
+/// set one token's AR cost is a property of its routed experts, not of the
+/// request (7–26% off the request's mean AR token on the R9700 traces).  A
+/// verdict that would retire therefore first spends `probe_tokens` ordinary
+/// AR tokens (the calibration step again, head kept synced; they are real
+/// tokens, and retirement would run them anyway) and re-prices AR by their
+/// mean, at most once per `retire_after` observed windows.  The verdict then
+/// also needs the slow-memory (`slow`, ~25 windows) realized cost of all
+/// windows to lose to that price: the 8-window memories dip on any streak of
+/// rejected drafts and a retirement is sticky.
 #[derive(Clone, Debug)]
 pub(crate) struct MtpFloor {
     calibrated: bool,
@@ -972,6 +1020,18 @@ pub(crate) struct MtpFloor {
     combined: (f32, f32),
     /// Per-window decay of every decayed pair above.
     decay: f32,
+    /// Realized (wall us, emitted tokens) over every valid window after
+    /// calibration with the slower [`MTP_FLOOR_RETIRE_DECAY`] memory.
+    slow: (f32, f32),
+    /// AR probe tokens a would-be retirement takes (0 disables the probes
+    /// and the `slow` confirmation).
+    probe_tokens: usize,
+    /// AR probe tokens still to run.
+    probe_left: usize,
+    /// Valid wall times of the probe tokens run so far.
+    probe_samples: Vec<f32>,
+    /// `observed` when the last probe set started.
+    probed_at: Option<usize>,
 }
 
 impl MtpFloor {
@@ -996,6 +1056,21 @@ impl MtpFloor {
             external_blocked: false,
             combined: (0.0, 0.0),
             decay: MTP_AGREEMENT_DECAY,
+            slow: (0.0, 0.0),
+            probe_tokens: 0,
+            probe_left: 0,
+            probe_samples: Vec::new(),
+            probed_at: None,
+        }
+    }
+
+    /// The same floor giving a would-be retirement `probe_tokens` fresh AR
+    /// samples to re-price AR (0: none, and no realized-cost confirmation:
+    /// the floor retires on its first verdict, the lanes' behavior).
+    pub(crate) fn with_retire_evidence(self, probe_tokens: usize) -> Self {
+        Self {
+            probe_tokens,
+            ..self
         }
     }
 
@@ -1032,10 +1107,38 @@ impl MtpFloor {
         self.observed < self.retire_after
     }
 
+    /// One finished ordinary AR token with wall time `us`.  The request's
+    /// first prices AR (an invalid timing prices it 0, which retires at the
+    /// probe budget); the tokens a would-be retirement asked for
+    /// ([`Self::retire_or_probe`]) re-price it by their mean and re-decide.
     pub(crate) fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
-        self.calibrated = true;
-        self.ar_us = if valid_us(us) { us } else { 0.0 };
-        self.decide(agreement);
+        if !self.calibrated {
+            self.calibrated = true;
+            self.ar_us = if valid_us(us) { us } else { 0.0 };
+            self.decide(agreement);
+            return;
+        }
+        if self.probe_left == 0 || self.retired {
+            return;
+        }
+        self.probe_left -= 1;
+        if valid_us(us) {
+            self.probe_samples.push(us);
+        }
+        if self.probe_left == 0 {
+            if !self.probe_samples.is_empty() {
+                self.ar_us =
+                    self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
+            }
+            self.decide(agreement);
+        }
+    }
+
+    /// Whether the next window must be an ordinary AR token timed for the
+    /// floor: the request's first, or one of the probes of a would-be
+    /// retirement.
+    pub(crate) fn needs_ar_sample(&self) -> bool {
+        !self.calibrated || self.probe_left > 0
     }
 
     /// One finished native window of `k > 0` budget with wall time `us`.
@@ -1055,6 +1158,12 @@ impl MtpFloor {
         if valid_us(us) {
             let decay = self.decay;
             decay_add(&mut self.combined, us, window.committed.len() as f32, decay);
+            decay_add(
+                &mut self.slow,
+                us,
+                window.committed.len() as f32,
+                decay.max(MTP_FLOOR_RETIRE_DECAY),
+            );
             match route {
                 NativeWindow::Interleaved => {
                     let emitted = window.committed.len() as f32;
@@ -1091,6 +1200,7 @@ impl MtpFloor {
                 let decay = self.decay;
                 if self.calibrated {
                     decay_add(&mut self.combined, wall_us, emitted as f32, decay);
+                    decay_add(&mut self.slow, wall_us, emitted as f32, decay.max(MTP_FLOOR_RETIRE_DECAY));
                 }
                 if emitted > 0 {
                     decay_add(&mut self.external, wall_us, emitted as f32, decay);
@@ -1132,11 +1242,48 @@ impl MtpFloor {
         self.combined.1 > 0.0 && self.combined.0 / self.combined.1 < self.ar_us
     }
 
+    /// The fresh AR price this verdict would retire on is not yet measured:
+    /// the floor was given AR probes
+    /// ([`Self::with_retire_evidence`]), has a valid price to replace, and has
+    /// not taken a probe set within the last `retire_after` windows.
+    fn should_probe(&self) -> bool {
+        self.probe_tokens > 0
+            && self.probe_left == 0
+            && valid_us(self.ar_us)
+            && self.probed_at.map_or(true, |at| {
+                self.observed >= at.saturating_add(self.retire_after)
+            })
+    }
+
+    /// A losing verdict past the grace: sticky retirement, unless AR has not
+    /// been re-priced where the request is now, in which case the next
+    /// windows are AR probe tokens and the verdict is re-evaluated on their
+    /// mean (`observe_calibration`).  Returns the route for the next window.
+    fn retire_or_probe(&mut self) -> FloorRoute {
+        if self.should_probe() {
+            self.probe_left = self.probe_tokens;
+            self.probe_samples.clear();
+            self.probed_at = Some(self.observed);
+            FloorRoute::ArSample
+        } else {
+            self.retired = true;
+            FloorRoute::Ar
+        }
+    }
+
+    /// The slow-memory realized per-token cost of every window is strictly
+    /// below AR.  Only floors given retire evidence consult it.
+    fn slow_wins(&self) -> bool {
+        self.probe_tokens > 0 && self.slow.1 > 0.0 && self.slow.0 / self.slow.1 < self.ar_us
+    }
+
     /// Retire when, after the probe budget and at least `retire_after`
-    /// observed windows, nothing measured beats AR, and external windows are
-    /// not alive on a mixture that beats AR.
+    /// observed windows, nothing measured beats AR, external windows are
+    /// not alive on a mixture that beats AR, and (with retire evidence) the
+    /// slow-memory realized cost does not beat AR either; first re-pricing
+    /// AR with fresh probes ([`Self::retire_or_probe`]).
     fn decide(&mut self, agreement: &Agreement) {
-        if self.retired || !self.calibrated || self.probing() {
+        if self.retired || !self.calibrated || self.probing() || self.probe_left > 0 {
             return;
         }
         if self.ar_us <= 0.0 {
@@ -1148,8 +1295,12 @@ impl MtpFloor {
         let native_wins = self
             .best_native(agreement, usize::MAX)
             .is_some_and(|(_, cost)| cost < self.ar_us);
-        if !native_wins && !(self.external_alive() && self.combined_wins()) && !self.in_grace() {
-            self.retired = true;
+        if !native_wins
+            && !(self.external_alive() && self.combined_wins())
+            && !self.slow_wins()
+            && !self.in_grace()
+        {
+            self.retire_or_probe();
         }
     }
 
@@ -1160,10 +1311,13 @@ impl MtpFloor {
     /// when there is none (an external-only budget, `k` below every winning
     /// measured depth, a losing measured option, no valid AR price) the
     /// request retires, stickily, and runs AR: no unmeasured or losing route
-    /// is ever run after the budget.  Exception: inside the retirement grace
+    /// is ever run after the budget.  Exceptions: inside the retirement grace
     /// (`retire_after` observed windows) a request with a valid AR price keeps
     /// drafting on its cheapest measured option within `k`, else the
-    /// provisional depth.
+    /// provisional depth; and a floor with retire evidence
+    /// ([`Self::with_retire_evidence`]) first runs [`FloorRoute::ArSample`]
+    /// probe tokens, then keeps drafting while the slow-memory realized cost
+    /// beats the probed AR price.
     pub(crate) fn route(
         &mut self,
         agreement: &Agreement,
@@ -1172,6 +1326,9 @@ impl MtpFloor {
     ) -> FloorRoute {
         if self.retired {
             return FloorRoute::Ar;
+        }
+        if self.probe_left > 0 {
+            return FloorRoute::ArSample;
         }
         if self.probing() || !self.calibrated {
             return match provisional {
@@ -1185,9 +1342,10 @@ impl MtpFloor {
                 return route;
             }
         }
-        if self.external_alive() && self.combined_wins() {
-            // Losing native route kept alive for the external windows: the
-            // cheapest measured option within `k`, else interleaved.
+        if (self.external_alive() && self.combined_wins()) || self.slow_wins() {
+            // Losing native route kept alive for the external windows or the
+            // realized mixture: the cheapest measured option within `k`,
+            // else interleaved.
             return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
         }
         if self.in_grace() && valid_us(self.ar_us) {
@@ -1199,8 +1357,56 @@ impl MtpFloor {
                 |(route, _)| route,
             );
         }
-        self.retired = true;
-        FloorRoute::Ar
+        self.retire_or_probe()
+    }
+
+    /// One `QWEN4_FLOOR_TRACE` JSON line (`HIPFIRE_MTP_FLOOR_TRACE=1`): the
+    /// floor's state after `event`, with every priced option in
+    /// microseconds per emitted token next to `ar_us`.
+    pub(crate) fn trace_line(
+        &self,
+        agreement: &Agreement,
+        event: &str,
+        us: f32,
+        emitted: usize,
+        drafts: usize,
+    ) -> String {
+        let mut options = String::new();
+        if self.interleaved.1 > 0.0 {
+            options.push_str(&format!(
+                "{{\"route\":\"interleaved\",\"us_per_tok\":{:.1}}}",
+                self.interleaved.0 / self.interleaved.1
+            ));
+        }
+        for depth in 1..self.batched.len() {
+            let (sum, windows) = self.batched[depth];
+            if windows <= 0.0 {
+                continue;
+            }
+            if !options.is_empty() {
+                options.push(',');
+            }
+            options.push_str(&format!(
+                "{{\"route\":\"batched{depth}\",\"win_us\":{:.1},\"pred_emit\":{:.3},\"us_per_tok\":{:.1}}}",
+                sum / windows,
+                expected_emitted(agreement, depth),
+                sum / windows / expected_emitted(agreement, depth)
+            ));
+        }
+        let combined = if self.combined.1 > 0.0 {
+            self.combined.0 / self.combined.1
+        } else {
+            0.0
+        };
+        let slow = if self.slow.1 > 0.0 {
+            self.slow.0 / self.slow.1
+        } else {
+            0.0
+        };
+        format!(
+            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"options\":[{options}]}}",
+            self.ar_us, self.observed, self.probes, self.retire_after, self.retired, self.probe_left
+        )
     }
 }
 
@@ -3133,12 +3339,19 @@ impl Qwen4MtpDrafter {
             // Only rank 0's clocks price the floor; a replica rank's floor is
             // never consulted.
             if !self.follower {
+                let event = if self.floor.calibrated { "ar_probe" } else { "calibration" };
                 self.floor.observe_calibration(us, &self.agreement);
+                if floor_trace_enabled() {
+                    eprintln!("{}", self.floor.trace_line(&self.agreement, event, us, 1, 0));
+                }
             }
             self.stats.mtp_windows += 1;
             self.stats.mtp_retired = self.floor.retired;
         } else {
             self.owe_head_row(gpu, target, position, seed)?;
+            if floor_trace_enabled() {
+                eprintln!("{}", self.floor.trace_line(&self.agreement, "ar", us, 1, 0));
+            }
             self.stats.ar_windows += 1;
         }
         Ok(MtpWindow {
@@ -3406,6 +3619,22 @@ impl Qwen4MtpDrafter {
         if !bypass && !self.follower {
             self.floor
                 .observe_native(route, window, us, k, &self.agreement);
+            if floor_trace_enabled() {
+                let event = match route {
+                    NativeWindow::Interleaved => "native_interleaved",
+                    NativeWindow::Batched => "native_batched",
+                };
+                eprintln!(
+                    "{}",
+                    self.floor.trace_line(
+                        &self.agreement,
+                        event,
+                        us,
+                        window.committed.len(),
+                        window.drafts_generated
+                    )
+                );
+            }
             self.stats.mtp_retired = self.floor.retired;
         }
     }
@@ -3419,14 +3648,16 @@ impl Qwen4MtpDrafter {
         self.floor.retired
     }
 
-    /// Whether the request's first window, the AR calibration token, has yet
-    /// to run.  False for a developer-forced route (`HIPFIRE_MTP_INCREMENTAL`
-    /// `0|1`) and with the floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`), which
-    /// bypass the floor.  A caller that composes an external drafter must not
-    /// take over while this is true: the calibration window must be the
-    /// request's first.
+    /// Whether the next window must be a timed AR token: the request's first
+    /// (the calibration token), or one of the AR probes a would-be retirement
+    /// takes ([`MtpFloor::with_retire_evidence`]).  False for a
+    /// developer-forced route (`HIPFIRE_MTP_INCREMENTAL` `0|1`) and with the
+    /// floor opted out (`HIPFIRE_MTP_AR_FLOOR=0`), which bypass the floor.  A
+    /// caller that composes an external drafter must not take over while this
+    /// is true: the calibration window must be the request's first and the
+    /// probes consecutive.
     pub(crate) fn floor_needs_calibration(&self) -> bool {
-        self.floor_enabled && !self.floor.calibrated && !Self::floor_forced()
+        self.floor_enabled && self.floor.needs_ar_sample() && !Self::floor_forced()
     }
 
     /// `floor_retired() || floor_needs_calibration()`: the exact guard an
@@ -3488,6 +3719,13 @@ impl Qwen4MtpDrafter {
         let stop = self
             .floor
             .observe_external(emitted, wall_us, drafts, &self.agreement);
+        if floor_trace_enabled() {
+            eprintln!(
+                "{}",
+                self.floor
+                    .trace_line(&self.agreement, "external", wall_us, emitted, drafts)
+            );
+        }
         self.stats.mtp_retired = self.floor.retired;
         stop
     }
@@ -4569,7 +4807,7 @@ impl Qwen4MtpDrafter {
         if floor_active && self.floor.retired {
             return Ok(ar(WindowRoute::ArRetired));
         }
-        if floor_active && !self.floor.calibrated {
+        if floor_active && self.floor.needs_ar_sample() {
             return Ok(ar(WindowRoute::ArCalibrate));
         }
         // A pool hit may take this window, but only if the head's own first
@@ -4595,6 +4833,7 @@ impl Qwen4MtpDrafter {
                 route
             } {
                 FloorRoute::Ar => return Ok(ar(WindowRoute::ArRouted)),
+                FloorRoute::ArSample => return Ok(ar(WindowRoute::ArCalibrate)),
                 FloorRoute::Interleaved => 0,
                 FloorRoute::Batched(depth) => depth,
             },
@@ -5484,7 +5723,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.head_lag.clear();
         self.retained = None;
         self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
-            .with_decay(self.agreement_decay);
+            .with_decay(self.agreement_decay)
+            .with_retire_evidence(singleton_floor_ar_probe_tokens());
         self.floor_enabled =
             hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
         if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
@@ -7056,6 +7296,254 @@ mod tests {
         assert_eq!(floor.batched.len(), MTP_WINDOW_COST.len());
         assert!(!floor.retired);
         assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top));
+    }
+
+    /// A window of `emitted` committed tokens that drafted `drafts`.
+    fn emitted_window(emitted: usize, drafts: usize) -> MtpWindow {
+        MtpWindow {
+            committed: vec![0; emitted],
+            accepted: emitted.saturating_sub(1),
+            drafts_generated: drafts,
+        }
+    }
+
+    /// Run the AR probe tokens a would-be retirement asks for, each costing
+    /// `us`, asserting the route stays `ArSample` until the last.
+    fn run_probes(floor: &mut MtpFloor, agreement: &Agreement, n: usize, us: f32) {
+        for _ in 0..n {
+            assert!(floor.needs_ar_sample());
+            assert_eq!(floor.route(agreement, 3, 3), FloorRoute::ArSample);
+            floor.observe_calibration(us, agreement);
+        }
+    }
+
+    /// humaneval_0 on the Flash-Next hot set (trace of `a-tier-1`): the
+    /// calibration token cost 19.6 ms against 24-28 ms for the AR tokens
+    /// after it; the native windows that lost to the 19.6 ms price retired a
+    /// request whose mixture of n-gram and native windows cost 20.5 ms per
+    /// token.  Fresh AR probes price AR where the request is, and the
+    /// mixture then wins.
+    #[test]
+    fn floor_retire_evidence_reprices_ar_before_a_sticky_retirement() {
+        let poor = agreement(0.5, 2.0);
+        let run = |evidence: usize| {
+            let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
+            floor.observe_calibration(19_600.0, &poor);
+            for _ in 0..5 {
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    60_000.0,
+                    3,
+                    &poor,
+                );
+            }
+            for _ in 0..8 {
+                floor.observe_external(4, 55_000.0, 3, &poor);
+            }
+            for _ in 0..4 {
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    70_000.0,
+                    3,
+                    &poor,
+                );
+            }
+            floor
+        };
+        // Without evidence the single calibration price retires it.
+        let mut floor = run(0);
+        assert!(floor.retired);
+        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
+        // With evidence the verdict first asks for the probes.
+        let mut floor = run(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
+        assert!(
+            !floor.retired,
+            "a verdict on one early token must not retire"
+        );
+        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::ArSample);
+        assert!(floor.needs_ar_sample());
+        let probes = MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS;
+        run_probes(&mut floor, &poor, probes - 1, 30_000.0);
+        assert!(floor.needs_ar_sample());
+        floor.observe_calibration(30_000.0, &poor);
+        assert!(!floor.needs_ar_sample());
+        assert_eq!(
+            floor.ar_us, 30_000.0,
+            "the probe mean replaces the calibration price"
+        );
+        assert!(
+            !floor.retired,
+            "the realized mixture (~27 ms/token) beats 30 ms"
+        );
+        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Batched(3));
+        // Probes ask for nothing while the verdict stays a win.
+        assert!(!floor.needs_ar_sample());
+    }
+
+    /// records_parser_1k (trace of `a-tier-1`): a streak of rejected drafts
+    /// at windows 12-15 pushed the 8-window cost to 27.8 ms/token against a
+    /// 19.2 ms/token mean; the verdict at the first post-grace window is a
+    /// coin flip around AR.  The slow realized memory keeps it alive.
+    #[test]
+    fn floor_retire_evidence_slow_realized_cost_survives_a_rejection_streak() {
+        let poor = agreement(0.5, 2.0);
+        let run = |evidence: usize| {
+            let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
+            floor.observe_calibration(25_000.0, &poor);
+            for _ in 0..11 {
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(4, 3),
+                    60_000.0,
+                    3,
+                    &poor,
+                );
+            }
+            for _ in 0..5 {
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    62_000.0,
+                    3,
+                    &poor,
+                );
+            }
+            floor
+        };
+        let floor = run(0);
+        assert!(floor.combined.0 / floor.combined.1 > 25_000.0);
+        assert!(floor.retired, "the fast memory alone retires on the streak");
+        let mut floor = run(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
+        assert!(floor.combined.0 / floor.combined.1 > 25_000.0);
+        assert!(floor.slow.0 / floor.slow.1 < 25_000.0);
+        assert!(!floor.retired && !floor.needs_ar_sample());
+        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Batched(3));
+        assert!(!floor.retired);
+    }
+
+    /// A request whose windows really lose retires after its probes, at no
+    /// more than the probe tokens' cost, and a retired request never probes.
+    #[test]
+    fn floor_retire_evidence_still_retires_a_losing_request_after_its_probes() {
+        let poor = agreement(0.0, 2.0);
+        let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(6);
+        floor.observe_calibration(25_000.0, &poor);
+        for observed in 1..=15 {
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                70_000.0,
+                3,
+                &poor,
+            );
+            assert!(
+                !floor.retired && !floor.needs_ar_sample(),
+                "grace window {observed}"
+            );
+        }
+        floor.observe_native(
+            NativeWindow::Batched,
+            &emitted_window(1, 3),
+            70_000.0,
+            3,
+            &poor,
+        );
+        assert!(!floor.retired);
+        assert!(floor.needs_ar_sample());
+        run_probes(&mut floor, &poor, 5, 24_000.0);
+        // The probes are not windows: nothing observed, nothing decayed.
+        assert_eq!(floor.observed, 16);
+        floor.observe_calibration(f32::NAN, &poor);
+        assert!(
+            floor.retired,
+            "an invalid probe is skipped, the rest price AR"
+        );
+        assert_eq!(floor.ar_us, 24_000.0);
+        assert!(!floor.needs_ar_sample());
+        assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
+        floor.observe_calibration(24_000.0, &poor);
+        assert_eq!(floor.probe_left, 0);
+    }
+
+    /// A winning request is re-probed at most once per `retire_after`
+    /// windows, and only when a verdict would retire it.
+    #[test]
+    fn floor_retire_evidence_probes_at_most_once_per_grace() {
+        let poor = agreement(0.5, 2.0);
+        let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(2);
+        floor.observe_calibration(10_000.0, &poor);
+        for _ in 0..16 {
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                60_000.0,
+                3,
+                &poor,
+            );
+        }
+        assert!(floor.needs_ar_sample() && !floor.retired);
+        let started = floor.probed_at;
+        assert_eq!(started, Some(16));
+        // Fresh AR now costs more than the windows (60 ms for 1 token loses
+        // to nothing under 60 ms): the verdict flips to a win.
+        run_probes(&mut floor, &poor, 2, 70_000.0);
+        assert!(!floor.retired);
+        // The same windows keep winning against 70 ms: no new probe.
+        for _ in 0..15 {
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                60_000.0,
+                3,
+                &poor,
+            );
+            assert!(!floor.needs_ar_sample() && !floor.retired);
+        }
+        // AR gets cheap again; the verdict loses, but only once 16 windows
+        // passed since the last probe does it ask for fresh evidence first.
+        floor.ar_us = 10_000.0;
+        floor.observe_native(
+            NativeWindow::Batched,
+            &emitted_window(1, 3),
+            60_000.0,
+            3,
+            &poor,
+        );
+        assert_eq!(floor.observed, 32);
+        assert!(floor.needs_ar_sample() && !floor.retired);
+        assert_eq!(floor.probed_at, Some(32));
+    }
+
+    /// The singleton path turns retire evidence on (default
+    /// `MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS`), the lane floor does not, and
+    /// a pending probe blocks every takeover and is planned as an AR token.
+    #[test]
+    fn floor_retire_evidence_is_singleton_only_and_blocks_takeover_while_probing() {
+        assert_eq!(MtpFloor::new().probe_tokens, 0);
+        let mut drafter = floor_drafter(true);
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        assert_eq!(
+            drafter.floor.probe_tokens,
+            singleton_floor_ar_probe_tokens()
+        );
+        assert_eq!(
+            drafter.floor.probe_tokens,
+            MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS
+        );
+        drafter.floor.calibrated = true;
+        drafter.floor.ar_us = 30_000.0;
+        drafter.floor.probe_left = 2;
+        assert!(drafter.floor_needs_calibration());
+        assert!(drafter.floor_takeover_blocked());
+        assert_eq!(
+            plan_of(&mut drafter, 3, None).route,
+            WindowRoute::ArCalibrate
+        );
+        drafter.floor.probe_left = 0;
+        assert!(!drafter.floor_needs_calibration());
+        assert!(!drafter.floor_takeover_blocked());
     }
 
     fn floor_drafter(floor_enabled: bool) -> Qwen4MtpDrafter {

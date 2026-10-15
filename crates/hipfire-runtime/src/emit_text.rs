@@ -124,14 +124,19 @@ impl ThinkBudget {
     /// [`ThinkBudgetStep::ForceClose`] or [`ThinkBudgetStep::Exhausted`]: a
     /// non-`Continue` step can only fall on the `n`-th (last) token, so a
     /// speculative window of that size never needs repair after the fact.
-    /// `None` when the budget is disabled. Always `>= 1` otherwise.
+    /// `None` when no cap applies: the budget is disabled, or the stream is
+    /// outside a span with no close queued. `Some` is always `>= 1`.
     ///
     /// `in_think` is the stream state after the last observed token.
     ///
     /// - In a span (`in_think`, no queued close): `max - count` more tokens
     ///   fit before the count reaches `max`, and the `max`-th lands on the last.
-    /// - Outside a span: `max`. The very next token may open a span and count
-    ///   as 1, so reaching `max` takes `max` tokens and falls on the last one.
+    /// - Outside a span: uncapped. Nothing can trip until a committed token
+    ///   opens a span. Capping at `max` here would hold every answer window to
+    ///   `max` tokens for the rest of the turn, and thinking-off requests
+    ///   carry `max == 1`, so speculation would stop entirely. A span that
+    ///   opens and trips inside the same window is a strict-prefix window,
+    ///   which the decode loop repairs or realigns like any other.
     /// - While close tokens are queued (`closing > 0`): `closing` plus the
     ///   in-span cap. The queued tokens never count, but they never reset the
     ///   count either: a stream still inside the span afterwards continues the
@@ -150,7 +155,7 @@ impl ThinkBudget {
         } else if in_think {
             self.max.saturating_sub(self.count)
         } else {
-            self.max
+            return None;
         };
         Some(cap.max(1))
     }
@@ -2063,6 +2068,25 @@ mod tests {
         last
     }
 
+    /// Window length the uncapped (out-of-span) checks commit.
+    const UNCAPPED_LEN: usize = 7;
+
+    /// Commit `UNCAPPED_LEN` tokens following `pattern` from an uncapped
+    /// (out-of-span) state and assert that any intervention falls on a token
+    /// inside a span: one this window opened, since it started outside any.
+    /// The decode loop repairs such a strict-prefix window.
+    fn uncapped_window(b: &ThinkBudget, pattern: u32, context: &str) {
+        let mut b = b.clone();
+        for i in 0..UNCAPPED_LEN {
+            let in_think = (pattern >> i) & 1 == 1;
+            let step = budget_step(&mut b, in_think);
+            assert!(
+                step == ThinkBudgetStep::Continue || in_think,
+                "{context}: uncapped window intervened outside a span it opened (token {i}, pattern {pattern:b})"
+            );
+        }
+    }
+
     #[test]
     fn window_cap_disabled_is_none() {
         let b = ThinkBudget::new(0);
@@ -2098,17 +2122,13 @@ mod tests {
     }
 
     #[test]
-    fn window_cap_out_of_span_is_max() {
+    fn window_cap_out_of_span_is_uncapped() {
         const MAX: usize = 5;
         // Fresh budget, stream not in a span.
         let b = ThinkBudget::new(MAX);
-        assert_eq!(b.window_cap(false), Some(MAX));
-        assert_eq!(
-            commit_window(&b, MAX, (1u32 << MAX) - 1, "fresh out of span"),
-            ThinkBudgetStep::ForceClose
-        );
-        for pattern in 0..(1u32 << MAX) {
-            commit_window(&b, MAX, pattern, "fresh out of span");
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "fresh out of span");
         }
         // After a span closed on its own (the count is stale and must not leak).
         let mut b = ThinkBudget::new(MAX);
@@ -2116,14 +2136,46 @@ mod tests {
             assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
         }
         assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
-        assert_eq!(b.window_cap(false), Some(MAX));
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "closed span");
+        }
+        // A re-opened span counts from 1: the in-span cap applies again and
+        // the force-close lands on its last token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
         assert_eq!(
-            commit_window(&b, MAX, (1u32 << MAX) - 1, "closed span"),
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "re-opened span"),
             ThinkBudgetStep::ForceClose
         );
-        for pattern in 0..(1u32 << MAX) {
-            commit_window(&b, MAX, pattern, "closed span");
+    }
+
+    /// Thinking off reaches the budget as `max_think_tokens == 1` behind a
+    /// closed-think prefix, so the answer streams outside any span: no MTP
+    /// window may be capped (a cap of 1 turns speculation off). The in-span
+    /// and close-token caps still engage if the answer opens a span.
+    #[test]
+    fn window_cap_thinking_off_never_caps_answer_windows() {
+        let mut b = ThinkBudget::new(1);
+        for _ in 0..256 {
+            assert_eq!(b.window_cap(false), None);
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
         }
+        assert_eq!(b.window_cap(false), None);
+        // An opened span trips on its opening token (count 1 == max) and the
+        // queued close tokens are capped.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+        assert_eq!(b.window_cap(true), Some(CLOSE_TOKENS + 1));
+        for left in (0..CLOSE_TOKENS).rev() {
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+            if left > 0 {
+                assert_eq!(b.window_cap(false), Some(left + 1));
+            }
+        }
+        // Back in the answer: uncapped again.
+        assert_eq!(b.window_cap(false), None);
+        // A second opened span ends the turn on its opening token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
     }
 
     #[test]
@@ -2153,18 +2205,21 @@ mod tests {
         assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
         assert_eq!(b.window_cap(false), Some(CLOSE_TOKENS - 2 + 1));
 
-        // The close text ended the span: a re-opened span counts from 1 and
-        // its Exhausted lands exactly on the last token of a `max` window.
+        // The close text ended the span: uncapped again. A re-opened span
+        // counts from 1 and its Exhausted lands exactly on the last token of
+        // the in-span cap.
         assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
-        assert_eq!(b.window_cap(false), Some(MAX));
+        assert_eq!(b.window_cap(false), None);
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
         assert_eq!(
-            commit_window(&b, MAX, (1u32 << MAX) - 1, "reopened span"),
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "reopened span"),
             ThinkBudgetStep::Exhausted
         );
     }
 
     #[test]
-    fn window_cap_never_intervenes_inside_window_for_any_reachable_state() {
+    fn window_cap_holds_for_any_reachable_state() {
         for max in 1..=3usize {
             for start_in_think in [false, true] {
                 // Every prefix of up to 9 committed tokens reaches a state;
@@ -2185,12 +2240,21 @@ mod tests {
                         if ended {
                             continue;
                         }
-                        let cap = b.window_cap(last_in_think).expect("enabled");
-                        assert!(cap >= 1, "max={max} prefix={prefix:b}/{len}");
-                        assert!(cap <= CLOSE_TOKENS + max);
                         let ctx = format!("max={max} prefix={prefix:b}/{len}");
-                        for pattern in 0..(1u32 << cap) {
-                            commit_window(&b, cap, pattern, &ctx);
+                        match b.window_cap(last_in_think) {
+                            Some(cap) => {
+                                assert!(cap >= 1, "{ctx}");
+                                assert!(cap <= CLOSE_TOKENS + max, "{ctx}");
+                                for pattern in 0..(1u32 << cap) {
+                                    commit_window(&b, cap, pattern, &ctx);
+                                }
+                            }
+                            None => {
+                                assert!(!last_in_think, "{ctx}: uncapped inside a span");
+                                for pattern in 0..(1u32 << UNCAPPED_LEN) {
+                                    uncapped_window(&b, pattern, &ctx);
+                                }
+                            }
                         }
                     }
                 }

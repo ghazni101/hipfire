@@ -603,6 +603,14 @@ fn stage_qwen4_lanes(
             free >> 20
         ));
     }
+    // The fn-lanes route is outside Flash-Next's walked kernel plan: return the
+    // load to lazy kernel loading before staging dispatches anything.
+    if gpu.route_kernels_finished() {
+        if let Err(e) = gpu.abort_route_kernel_load() {
+            return refuse(&format!("kernel route reset failed: {e}"));
+        }
+        eprintln!("  kernels: {} [left the planned route: qwen4 fn-lanes]", crate::LAZY_KERNELS_NOTE);
+    }
     if let Err(e) = bundle.stage_lanes(gpu, requested, row_budget, spec) {
         return refuse(&format!("staging failed: {e}"));
     }

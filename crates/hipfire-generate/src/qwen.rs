@@ -4398,10 +4398,13 @@ pub fn generate_spec(
     // Native Qwen4 MTP commits a whole window before the emitter observes it,
     // so an emitter intervention (think-budget force-close or think-cap stop)
     // that lands strictly inside a window would leave committed state past the
-    // intervention. The loop clamps each window to the emitter's
-    // `window_cap()` for this speculator so the intervention only ever falls
-    // on a window's last token — no Realign re-prefill, no window repair.
-    // Other speculators keep their own handling.
+    // intervention. Inside a think span (or over a queued close) the loop
+    // clamps each window to the emitter's `window_cap()` for this speculator
+    // so the intervention only ever falls on a window's last token — no
+    // Realign re-prefill, no window repair. Outside a span the cap is `None`
+    // (thinking off is `max_think_tokens == 1`, so capping there would stop
+    // speculation): a span opened and tripped inside one window takes the
+    // window repair below. Other speculators keep their own handling.
     let native_qwen4_mtp = spec
         .drafter_any_mut()
         .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());

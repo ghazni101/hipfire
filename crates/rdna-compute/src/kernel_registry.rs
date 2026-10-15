@@ -190,6 +190,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!("qsa_filter_select", kernels::QSA_FILTER_SELECT_SRC,
             ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"]);
+        add!("qsa_bf16_scores", kernels::QSA_BF16_SCORES_SRC,
+            ["indexed_attention_select_scores_rows8_bf16", "indexed_attention_select_scores_rows16_bf16"]);
     }
 
     // Common Qwen3.5 kernels (historical whole-model precompile set).
@@ -1243,13 +1245,18 @@ pub fn lookup(arch: &str, module: &str, extra_flags: &str) -> Result<KernelEntry
 // loader can compile and load the whole closure before the first dispatch.
 // It is CPU-only and pure: no weight payload, compiler, or HIP call.
 //
-// Only routes whose closure was walked from source and cross-checked against
-// a module-load audit of every request family are admitted; everything else
-// (other models/arches, explicit drafter routes, non-default feature flags or
-// policy axes) is `UnsupportedRoute`, and the caller keeps lazy loading.
-// Closures assume the default developer environment (no `HIPFIRE_*`
-// developer override of a launcher selector); such overrides are outside
-// this plan and are caught by the loader's post-ready barrier, not here.
+// Two kinds of routes are admitted. The Qwen3.6-27B closure was walked from
+// source and cross-checked against a module-load audit of every request
+// family. Walked routes (`route_plans/*.tsv`) are generated, not written:
+// `scripts/route_plan_walk.py` drives the real dispatch through a route's
+// request axes under `HIPFIRE_MODULE_LOAD_AUDIT`, and
+// `scripts/route_plan_build.py` records every (module, symbol) it bound
+// with its source or image identity. Everything else (other models/arches,
+// explicit drafter routes, non-default feature flags or policy axes) is
+// `UnsupportedRoute`, and the caller keeps lazy loading. Closures assume the
+// default developer environment (no `HIPFIRE_*` developer override of a
+// launcher selector); such overrides are outside this plan and are caught by
+// the loader's post-ready barrier, not here.
 
 /// Borrowed header tensor metadata: name, storage dtype and shape.
 #[derive(Clone, Copy, Debug)]
@@ -1288,6 +1295,10 @@ pub struct RouteKernelInput<'a> {
     pub retained_decode: bool,
     pub hipcc_extra_flags: &'a str,
     pub flags: &'a crate::feature_flags::FeatureFlags,
+    /// Model-specific policy axes a walked route plan must match exactly
+    /// (`#! axis` lines of `route_plans/*.tsv`), e.g. `("qsa", "fp8")`.
+    /// Empty for routes without a walked plan.
+    pub route_axes: &'a [(&'a str, String)],
 }
 
 #[derive(Debug)]
@@ -1530,10 +1541,14 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
             (hip, embedded)
         }
         None => {
+            if let Some(plan) = walked_route_entries(input)? {
+                validate_route_plan(&plan)?;
+                return Ok(plan);
+            }
             return refuse(format!(
                 "model arch {} on {} has no closed route",
                 input.model_arch, input.arch
-            ))
+            ));
         }
     };
     let corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
@@ -1745,6 +1760,236 @@ fn qwen36_27b_route(input: &RouteKernelInput<'_>) -> Result<Option<bool>, Regist
     }
 }
 
+// ── Walked route plans ──────────────────────────────────────────────────
+
+/// Generated route plans, one per model family and exact arch: the union of
+/// every (module, symbol) the dispatch bound during a recorded route walk
+/// (`scripts/route_plan_walk.py` + `scripts/route_plan_build.py`). Never
+/// edited by hand; regenerate after a dispatch or kernel-source change.
+const WALKED_ROUTE_PLAN_FILES: &[&str] = &[include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv")];
+
+/// One parsed `route_plans/*.tsv`.
+#[derive(Debug)]
+pub struct WalkedRoutePlan {
+    pub family: &'static str,
+    pub model_arch: u32,
+    pub arch: &'static str,
+    /// [`route_layout_sha256`] of the walked model header.
+    pub layout: &'static str,
+    /// Largest admitted `max_seq`: the walks' context ceiling.
+    pub max_seq: usize,
+    /// Policy axis name and every value the walks covered.
+    pub axes: Vec<(&'static str, Vec<&'static str>)>,
+    pub rows: Vec<WalkedRouteRow>,
+}
+
+/// One walked module of one spec route: the symbols the dispatch bound and
+/// the SHA-256 of the effective HIP source or embedded image it loaded.
+#[derive(Debug)]
+pub struct WalkedRouteRow {
+    pub native_mtp: bool,
+    pub embedded: bool,
+    pub module: &'static str,
+    pub symbols: Vec<&'static str>,
+    pub sha256: &'static str,
+}
+
+fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String> {
+    let mut directive = std::collections::HashMap::new();
+    let mut axes = Vec::new();
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("#! ") {
+            let mut words = rest.split(' ');
+            match (words.next(), words.next()) {
+                (Some("axis"), Some(name)) => axes.push((name, words.collect::<Vec<_>>())),
+                (Some(key), Some(value)) => {
+                    directive.insert(key, value);
+                }
+                _ => return Err(format!("malformed directive {line:?}")),
+            }
+            continue;
+        }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let [route, kind, module, symbols, sha256] = line.split('\t').collect::<Vec<_>>()[..] else {
+            return Err(format!("malformed row {line:?}"));
+        };
+        rows.push(WalkedRouteRow {
+            native_mtp: match route {
+                "ar" => false,
+                "native_mtp" => true,
+                _ => return Err(format!("unknown route in {line:?}")),
+            },
+            embedded: match kind {
+                "hip" => false,
+                "embedded" => true,
+                _ => return Err(format!("unknown kind in {line:?}")),
+            },
+            module,
+            symbols: symbols.split(',').collect(),
+            sha256,
+        });
+    }
+    let get = |key: &str| directive.get(key).copied().ok_or_else(|| format!("missing #! {key}"));
+    Ok(WalkedRoutePlan {
+        family: get("family")?,
+        model_arch: get("model_arch")?.parse().map_err(|e| format!("model_arch: {e}"))?,
+        arch: get("arch")?,
+        layout: get("layout")?,
+        max_seq: get("max_seq")?.parse().map_err(|e| format!("max_seq: {e}"))?,
+        axes,
+        rows,
+    })
+}
+
+static WALKED_ROUTE_PLANS: std::sync::LazyLock<Result<Vec<WalkedRoutePlan>, String>> =
+    std::sync::LazyLock::new(|| WALKED_ROUTE_PLAN_FILES.iter().map(|text| parse_walked_route_plan(text)).collect());
+
+/// Every checked-in walked route plan, parsed once.
+pub fn walked_route_plans() -> Result<&'static [WalkedRoutePlan], RegistryError> {
+    WALKED_ROUTE_PLANS
+        .as_deref()
+        .map_err(|e| RegistryError::ConflictingPlan(format!("route plan file: {e}")))
+}
+
+/// Model-header layout fingerprint of a walked plan: SHA-256 over the sorted
+/// `name\tdtype\tshape` lines of every header tensor (`route_plan_build.py`
+/// computes the same digest from the HFQM header).
+pub fn route_layout_sha256(tensors: &[KernelTensorMeta<'_>]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut lines: Vec<String> = tensors
+        .iter()
+        .map(|t| {
+            let shape: Vec<String> = t.shape.iter().map(usize::to_string).collect();
+            format!("{}\t{:?}\t{}\n", t.name, t.dtype, shape.join(","))
+        })
+        .collect();
+    lines.sort();
+    format!("{:x}", Sha256::digest(lines.concat().as_bytes()))
+}
+
+/// Runtime image of a walked embedded module, with its Radiowave manifest
+/// when the module has one: accepted `pm_decode` twins and the native
+/// objects the dispatch admits as in-memory code objects under these module
+/// names (`ensure_embedded_kernel` callsites). A walked module missing here
+/// refuses the plan.
+fn walked_embedded_image(
+    arch: &str,
+    module: &str,
+) -> Option<(&'static str, &'static [u8], Option<&'static str>)> {
+    if arch == "gfx1201" {
+        if let Some(twin) = crate::pm_decode_twins::GFX1201_TWINS.iter().find(|t| t.module == module) {
+            return Some((twin.module, twin.image, Some(twin.radiowave_json)));
+        }
+        let (name, image, _) = crate::pm_mtp_gemm::route_object();
+        if name == module {
+            return Some((name, image, None));
+        }
+        if let Some((name, image, _)) = crate::pm_xbatch::route_objects().into_iter().find(|o| o.0 == module) {
+            return Some((name, image, None));
+        }
+        // Flash-Next (Qwen4) native objects: `gemm.rs` MQ6 x4 and symmetric
+        // IU4 MoE, `tensor_ops.rs` QSA gathered attention.
+        const QWEN4_GFX1201: &[(&str, &[u8])] = &[
+            ("qwen4_mq6_x4_pm_gfx1201", kernels::QWEN4_MQ6_X4_PM_GFX1201),
+            ("qwen4_moe_iu4_sym_pm_gfx1201", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201),
+            ("qwen4_moe_iu4_sym_w3_pm_gfx1201", kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201),
+            ("qsa_gather_pm_gfx1201", kernels::QSA_GATHER_PM_GFX1201),
+        ];
+        if let Some(&(name, image)) = QWEN4_GFX1201.iter().find(|(name, _)| *name == module) {
+            return Some((name, image, None));
+        }
+    }
+    None
+}
+
+/// The walked plan for this load, when one exists for its model arch and
+/// exact GPU arch. `Ok(None)` when no plan names the pair; `Err` when one
+/// does but the header layout, a policy axis, `max_seq` or the feature
+/// flags are outside the walks, or when a recorded identity no longer
+/// matches the registry (a stale plan never loads).
+fn walked_route_entries(input: &RouteKernelInput<'_>) -> Result<Option<RouteKernelPlan>, RegistryError> {
+    use sha2::{Digest, Sha256};
+    let candidates: Vec<&WalkedRoutePlan> = walked_route_plans()?
+        .iter()
+        .filter(|plan| plan.model_arch == input.model_arch && plan.arch == input.arch)
+        .collect();
+    let Some(family) = candidates.first().map(|plan| plan.family) else {
+        return Ok(None);
+    };
+    let refuse = |why: String| Err(RegistryError::UnsupportedRoute(format!("{family}: {why}")));
+    let layout = route_layout_sha256(input.tensors);
+    let Some(plan) = candidates.into_iter().find(|plan| plan.layout == layout) else {
+        return refuse(format!("header layout {layout} has no walked route on {}", input.arch));
+    };
+    if input.max_seq > plan.max_seq {
+        return refuse(format!("max_seq {} above the walked {}", input.max_seq, plan.max_seq));
+    }
+    if input.flags.pm_decode != default_feature_flags(input.arch)?.pm_decode {
+        return refuse("non-default kernel.pm_decode".into());
+    }
+    for (name, admitted) in &plan.axes {
+        match input.route_axes.iter().find(|(axis, _)| axis == name) {
+            Some((_, value)) if admitted.contains(&value.as_str()) => {}
+            Some((_, value)) => return refuse(format!("{name} = {value} is outside the walked {admitted:?}")),
+            None => return refuse(format!("the loader did not resolve the walked axis {name}")),
+        }
+    }
+    if let Some((name, _)) = input.route_axes.iter().find(|(axis, _)| !plan.axes.iter().any(|(n, _)| n == axis)) {
+        return refuse(format!("axis {name} was not walked"));
+    }
+    let native_mtp = input.spec == KernelSpecRoute::NativeMtp;
+    let stale = |module: &str, what: &str| {
+        RegistryError::ConflictingPlan(format!(
+            "{family} route plan: {module} {what} differs from the walked dispatch; regenerate route_plans/"
+        ))
+    };
+    let inventory = entries(input.arch, input.hipcc_extra_flags)?;
+    let mut planned = Vec::new();
+    for row in plan.rows.iter().filter(|row| row.native_mtp == native_mtp) {
+        if row.embedded {
+            let (module, image, radiowave_json) = walked_embedded_image(input.arch, row.module).ok_or_else(|| {
+                RegistryError::ConflictingPlan(format!("{family} route plan: no runtime image for embedded {}", row.module))
+            })?;
+            if format!("{:x}", Sha256::digest(image)) != row.sha256 {
+                return Err(stale(row.module, "image"));
+            }
+            planned.push(PlannedKernel::Embedded { module, image, radiowave_json, symbols: &row.symbols });
+            continue;
+        }
+        // HIP rows come from the installer inventory, so a walked plan is
+        // always served by the release kernel pack.
+        let mut matches = inventory.iter().filter(|entry| entry.module == row.module);
+        let found = matches.next().ok_or_else(|| RegistryError::UnsupportedModule {
+            arch: input.arch.to_owned(),
+            module: row.module.to_owned(),
+        })?;
+        if matches.next().is_some() {
+            return Err(RegistryError::ConflictingPlan(format!("module {} has two registry recipes", row.module)));
+        }
+        if format!("{:x}", Sha256::digest(found.source.as_bytes())) != row.sha256 {
+            return Err(stale(row.module, "registry source"));
+        }
+        if let Some(symbol) = row.symbols.iter().find(|symbol| !found.symbols.contains(symbol)) {
+            return Err(RegistryError::ConflictingPlan(format!(
+                "{family} route plan: packaged {} does not export walked symbol {symbol}",
+                row.module
+            )));
+        }
+        planned.push(PlannedKernel::Hip(KernelEntry {
+            arch: found.arch,
+            module: found.module,
+            symbols: &row.symbols,
+            source: found.source.clone(),
+            flags: found.flags.clone(),
+            scheduler_profile: found.scheduler_profile.clone(),
+        }));
+    }
+    Ok(Some(RouteKernelPlan { entries: planned }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,10 +2127,11 @@ mod tests {
         // the O4×R8 pipe gate/up twin `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`
         // (gfx1151-routed, likewise packaged) and the Gemma 4 decode twins
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
-        // and the exact sampled-filter QSA module `qsa_filter_select`
+        // and the exact sampled-filter QSA module `qsa_filter_select`, plus the
+        // portable BF16 rows8/rows16 QSA score module `qsa_bf16_scores`
         // and the Flash-Next expert-slab K1 lane-union planner `qwen4_slab_union_plan`
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 153, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 154, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -2170,7 +2416,7 @@ mod tests {
                 n_heads: 24, n_kv_heads: 4, head_dim: 256, max_seq: 16448,
                 prefill_chunk_rows: 512, kv_k: "fp8", kv_v: "fp8", state_quant: "q8",
                 spec: KernelSpecRoute::NativeMtp, host_mapped_experts: false,
-                retained_decode: false, hipcc_extra_flags: "", flags: &flags,
+                retained_decode: false, hipcc_extra_flags: "", flags: &flags, route_axes: &[],
             };
             let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
             let plan = route_entries(&input).expect("native MTP closed route");

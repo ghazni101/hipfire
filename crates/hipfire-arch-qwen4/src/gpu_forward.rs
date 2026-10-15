@@ -6517,7 +6517,10 @@ impl Qwen4GpuForward {
             stage.slab_prime(gpu, self.moe.len())?;
         }
         let ctx = DispatchCtx::new(gpu);
-        let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
+        // Heap, not an inline SmallVec: 384 inline steps are ~567 KiB, and the `attempt`
+        // closure below moves `steps`, so the frame held three copies (~1.7 MiB). That
+        // overflowed the 2 MiB stack of an EP peer rank's worker thread in a chunk forward.
+        let mut steps: Vec<Step<'_>> = Vec::with_capacity(QWEN4_STEP_INLINE_CAPACITY);
         let mut gdn_slot = 0usize;
         let mut qsa_slot = 0usize;
         // `HIPFIRE_QWEN4_PLE_FUSE`: the PLE rows are staged straight as F16 for

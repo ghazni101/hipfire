@@ -3709,10 +3709,21 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        if matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed) {
-            return Err(crate::scratch::unplanned_route_kernel(module_name, func_name));
-        }
+        self.scratch.route_load.admit_unplanned(module_name, func_name)?;
         if !self.modules.contains_key(module_name) {
+            if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
+                // Developer-only route-closure audit, as `scratch::load_embedded_module`.
+                eprintln!(
+                    "HIPFIRE_MODULE_LOAD_AUDIT\tembedded\t{}",
+                    serde_json::json!({
+                        "arch": self.arch,
+                        "module": module_name,
+                        "symbol": func_name,
+                        "origin": "native_embedded",
+                        "image_sha256": crate::code_object::CodeObjectId::of(image.as_bytes()).to_hex(),
+                    })
+                );
+            }
             let module = self.hip.module_load_data(image.as_bytes())?;
             self.compiler
                 .code_objects_mut()
@@ -3743,11 +3754,14 @@ impl Gpu {
     /// Start loading a planner-closed route's kernels: freeze the plan and
     /// start its missing HIP compiles on at most `jobs` CPU workers, so they
     /// overlap the caller's non-dispatching weight read/upload. Nothing is
-    /// loaded on the GPU here. Replaces any earlier route state.
+    /// loaded on the GPU here. Replaces any earlier route state. `open`
+    /// names a route that stays unsealed after load: an unplanned kernel
+    /// then loads lazily with a warning instead of failing (`None` seals).
     pub fn begin_route_kernel_load(
         &mut self,
         plan: crate::kernel_registry::RouteKernelPlan,
         jobs: usize,
+        open: Option<String>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.abort_route_kernel_load()?;
@@ -3774,6 +3788,7 @@ impl Gpu {
         self.scratch.route_load = crate::scratch::RouteLoad::Pending {
             plan,
             batch: Some(batch),
+            open,
         };
         Ok(())
     }
@@ -3799,19 +3814,22 @@ impl Gpu {
         )
     }
 
-    /// Seal a route after its weights loaded: preload if no dispatch has yet,
-    /// then refuse any unplanned kernel compile/module load. No-op when no
-    /// route was begun (lazy loading stays).
+    /// Finish a route after its weights loaded: preload if no dispatch has
+    /// yet, then seal it (refuse any unplanned kernel compile/module load)
+    /// or, for an open route, keep loading unplanned kernels lazily with a
+    /// warning and a count. No-op when no route was begun (lazy loading stays).
     pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        match self.scratch.route_load {
-            crate::scratch::RouteLoad::Idle | crate::scratch::RouteLoad::Sealed => Ok(()),
-            _ => {
-                self.ensure_route_modules_preloaded()?;
-                self.scratch.route_load = crate::scratch::RouteLoad::Sealed;
-                Ok(())
-            }
+        use crate::scratch::RouteLoad;
+        if matches!(self.scratch.route_load, RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }) {
+            return Ok(());
         }
+        self.ensure_route_modules_preloaded()?;
+        self.scratch.route_load = match std::mem::take(&mut self.scratch.route_load) {
+            RouteLoad::Prepared { open: Some(route) } => RouteLoad::Open { route, unplanned: 0 },
+            _ => RouteLoad::Sealed,
+        };
+        Ok(())
     }
 
     /// Drop any route state and return to lazy loading, joining every
@@ -3830,6 +3848,28 @@ impl Gpu {
     pub fn route_kernels_pending(&self) -> bool {
         // bind_thread: skip — pure state query.
         self.scratch.route_load.pending()
+    }
+
+    /// True once a planned route finished loading (sealed or open): its
+    /// preload covers only the planned kernels.
+    pub fn route_kernels_finished(&self) -> bool {
+        // bind_thread: skip — pure state query.
+        matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed | crate::scratch::RouteLoad::Open { .. })
+    }
+
+    /// True once a planned route is sealed: unplanned kernels are refused.
+    pub fn route_kernels_sealed(&self) -> bool {
+        // bind_thread: skip — pure state query.
+        matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed)
+    }
+
+    /// Unplanned kernels an open route loaded lazily since it finished.
+    pub fn unplanned_route_kernels(&self) -> usize {
+        // bind_thread: skip — pure state query.
+        match self.scratch.route_load {
+            crate::scratch::RouteLoad::Open { unplanned, .. } => unplanned,
+            _ => 0,
+        }
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the

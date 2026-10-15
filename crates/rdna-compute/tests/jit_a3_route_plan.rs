@@ -99,6 +99,7 @@ fn plan(load: &Load<'_>) -> Result<RouteKernelPlan, RegistryError> {
         retained_decode: true,
         hipcc_extra_flags: &load.flags.hipcc_extra_flags,
         flags: load.flags,
+        route_axes: &[],
     })
 }
 

@@ -2757,6 +2757,7 @@ struct RouteRequest<'a> {
     state_quant_override: Option<&'a str>,
     cask: &'a CaskConfig,
     spec: SpecLoadCfg,
+    kv_backend: KvBackend,
 }
 
 /// A begun route: the speculative route its plan was resolved for, checked
@@ -2783,9 +2784,16 @@ fn resolve_route_plan(
     let ModelSource::Hfq(hfq) = req.source else {
         return Err("safetensors directory source".into());
     };
-    // Only the Qwen3.5 dense carrier has closed plans; it shares this policy.
-    if hfq.arch_id != 5 {
-        return Err(format!("model arch {}", hfq.arch_id));
+    // Developer kill switch, and how route walks (scripts/route_plan_walk.py)
+    // observe a route's whole lazy closure without the plan they regenerate.
+    if !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true) {
+        return Err("HIPFIRE_ROUTE_PLAN=0".into());
+    }
+    match hfq.arch_id {
+        // Qwen3.5 dense: the hand-walked 27B closure shares this policy.
+        5 => {}
+        hipfire_arch_qwen4::ARCH_ID => return resolve_qwen4_route_plan(req, gpu, hfq),
+        other => return Err(format!("model arch {other}")),
     }
     if req.pp != 1 {
         return Err(format!("pp={}", req.pp));
@@ -2931,6 +2939,107 @@ fn resolve_route_plan(
         retained_decode: true,
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
+        route_axes: &[],
+    })
+    .map_err(|e| format!("{e:?}"))?;
+    Ok((plan, spec))
+}
+
+/// Flash-Next (Qwen4) route plan: the walked plan (`kernel_registry`
+/// `route_plans/`) for this header layout and exact arch, resolved with the
+/// carrier's own policy resolvers. Every option the walks did not cover
+/// refuses here, so the load keeps lazy kernel loading.
+fn resolve_qwen4_route_plan(
+    req: &RouteRequest<'_>,
+    gpu: &Gpu,
+    hfq: &HfqFile,
+) -> Result<
+    (
+        rdna_compute::kernel_registry::RouteKernelPlan,
+        rdna_compute::kernel_registry::KernelSpecRoute,
+    ),
+    String,
+> {
+    use rdna_compute::kernel_registry::{KernelSpecRoute, KernelTensorMeta, RouteKernelInput};
+    use rdna_compute::tensor_ops::QsaKvFormat;
+    if req.pp != 1 {
+        return Err(format!("pp={}", req.pp));
+    }
+    let ep = hipfire_config::topology::qwen4_ep()?;
+    if ep > 1 {
+        return Err(format!("expert parallelism (topology.ep = {ep})"));
+    }
+    if req.draft_path.is_some() || req.cask.sidecar.is_some() {
+        return Err("a drafter or CASK sidecar".into());
+    }
+    if crate::admission::qwen4_kv_adaptive_requested(req.kv_adaptive_override) {
+        return Err("adaptive KV".into());
+    }
+    if hipfire_runtime::config::retained_redline_default(&gpu.arch, "qwen4", req.path, req.pp, 1, ep, true) {
+        return Err("retained Redline route".into());
+    }
+    let default_k = hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, &gpu.arch);
+    if let Some(k) = req.spec.mtp_k.or(hipfire_runtime::config::get().mtp_k).filter(|&k| k != default_k) {
+        return Err(format!("MTP K={k} (walked K={default_k})"));
+    }
+    let native_mtp =
+        crate::admission::qwen4_native_mtp(req.spec, &gpu.arch, req.path, req.pp, 1, ep)?;
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
+        .map_err(|error| error.to_string())?;
+    if hipfire_arch_qwen4::resolve_trunk_overlay(hfq, Path::new(req.path), &gpu.arch, &receipt.config)?.is_some() {
+        return Err("trunk overlay".into());
+    }
+    let kv_mode = req
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let state = hipfire_arch_qwen4::resolve_state_format(
+        &kv_mode,
+        req.state_quant_override.unwrap_or(""),
+        gpu,
+        &receipt.config,
+    )?;
+    // Names as the load log prints them (`qwen4 state:` line), which the
+    // route walk records.
+    let qsa = match state.qsa {
+        QsaKvFormat::Fp8 => "fp8",
+        QsaKvFormat::Fp8Fnuz => "fp8-fnuz",
+        QsaKvFormat::Q8 => "q8",
+        QsaKvFormat::F32 => "f32",
+    };
+    let on_off = |on: bool| if on { "on" } else { "off" }.to_owned();
+    let axes = [
+        ("qsa", qsa.to_owned()),
+        ("kv_backend", hipfire_arch_qwen4::Qwen4KvBackend::from(req.kv_backend).name().to_owned()),
+        ("gdn", state.gdn.name().to_owned()),
+        ("qsa_f16_arena", on_off(state.qsa_f16_arena)),
+        ("qsa_pooled_bf16", on_off(state.qsa_pooled_bf16)),
+    ];
+    let spec = if native_mtp { KernelSpecRoute::NativeMtp } else { KernelSpecRoute::Ar };
+    let owned = hipfire_runtime::loader_api::header_tensor_meta(hfq);
+    let tensors: Vec<KernelTensorMeta<'_>> = owned
+        .iter()
+        .map(|t| KernelTensorMeta { name: &t.name, dtype: t.dtype, shape: &t.shape })
+        .collect();
+    let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
+        arch: gpu.arch.as_str(),
+        model_arch: hfq.arch_id,
+        tensors: &tensors,
+        n_heads: receipt.config.num_attention_heads,
+        n_kv_heads: receipt.config.num_key_value_heads,
+        head_dim: receipt.config.head_dim,
+        max_seq: req.max_seq,
+        prefill_chunk_rows: 0,
+        kv_k: qsa,
+        kv_v: qsa,
+        state_quant: state.gdn.name(),
+        spec,
+        host_mapped_experts: false,
+        retained_decode: true,
+        hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
+        flags: &gpu.flags,
+        route_axes: &axes,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec))
@@ -2961,6 +3070,10 @@ fn begin_route_kernels(
             return Ok(None);
         }
     };
+    // Walked plans (Flash-Next) preload but stay open: a kernel the walks
+    // missed loads lazily with a warning instead of failing the request.
+    let open = matches!(req.source, ModelSource::Hfq(hfq) if hfq.arch_id == hipfire_arch_qwen4::ARCH_ID)
+        .then(|| format!("Flash-Next {} {spec:?}", gpu.arch));
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
@@ -2981,25 +3094,18 @@ fn begin_route_kernels(
     let started = std::time::Instant::now();
     match overlap {
         Ok(jobs) => {
-            gpu.begin_route_kernel_load(plan, jobs)
+            gpu.begin_route_kernel_load(plan, jobs, open)
                 .map_err(|e| format!("kernel route compile: {e}"))?;
             eprintln!(
                 "  kernels: {spec:?} route plan ({modules} modules), compiling with up to {jobs} jobs during weight load"
             );
         }
         Err(overlap) => {
-            let jobs = compile_job_budget(
-                cores,
-                available,
-                ROUTE_COMPILE_SAFETY_RESERVE,
-                override_jobs,
-            )
-            .map_err(|e| {
-                format!(
-                    "refusing load: no kernel compile worker fits ({overlap}; before weights: {e})"
-                )
-            })?;
-            gpu.begin_route_kernel_load(plan, jobs)
+            let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
+                .map_err(|e| {
+                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
+                })?;
+            gpu.begin_route_kernel_load(plan, jobs, open)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
                 .map_err(|e| {
                     let _ = gpu.abort_route_kernel_load();
@@ -3042,7 +3148,14 @@ fn finish_route_kernels(
     }
     gpu.finish_route_kernel_load()
         .map_err(|e| format!("kernel route preload: {e}"))?;
-    eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
+    if gpu.route_kernels_sealed() {
+        eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
+    } else {
+        eprintln!(
+            "  kernels: {:?} route preloaded (open: an unplanned kernel loads lazily with a warning)",
+            planned.spec
+        );
+    }
     Ok(())
 }
 
@@ -3111,6 +3224,7 @@ pub fn load_admitted_with_gemma4_drafter(
             state_quant_override,
             cask,
             spec,
+            kv_backend,
         },
         gpu,
     )?;

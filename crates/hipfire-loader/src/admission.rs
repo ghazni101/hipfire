@@ -571,10 +571,9 @@ pub fn effective_ep(arch_id: u32) -> usize {
 }
 
 /// Device memory a Qwen4 load keeps free beyond the growth it can name
-/// (context pages, gather workspace, native MTP request buffers, resident
-/// PLE): the first long request's other lazy allocations (measured ~1.9 GiB
-/// on Strix Halo with 8192-row chunks), kernel-cache warmup and VMM page
-/// rounding.
+/// (context pages, gather workspace, native MTP request buffers): the first
+/// long request's other lazy allocations (measured ~1.9 GiB on Strix Halo
+/// with 8192-row chunks), kernel-cache warmup and VMM page rounding.
 pub const QWEN4_MEMORY_HEADROOM_BYTES: u64 = 2 << 30;
 
 /// Smallest context an automatic Qwen4 load accepts.
@@ -594,12 +593,18 @@ pub struct Qwen4MemoryAdmission {
     pub gather_growth: u64,
     /// Buffers the first native MTP request allocates and keeps.
     pub mtp_request: u64,
-    /// Host page cache the PLE prewarm / in-load fill keeps resident at
-    /// serve time. On unified memory it is part of the free memory
-    /// measured, so it is reserved here (0 when no PLE rows are cached).
+    /// The PLE page cache budget the PLE prewarm / in-load fill was asked
+    /// to keep resident at serve time (0 when no PLE rows are cached).
+    pub ple_budget: u64,
+    /// The PLE page cache budget admitted: `ple_budget` shrunk to what the
+    /// free memory leaves after the context, the gather workspace, the MTP
+    /// request buffers and the headroom. On unified memory the page cache
+    /// counts as free memory but is reclaimable, so it yields to the
+    /// context; this is 0 when only the context itself fits.
     pub resident_ple: u64,
     pub headroom: u64,
-    /// Largest context whose growth fits (at most the assembled capacity).
+    /// Largest context whose growth fits with no PLE page cache resident
+    /// (at most the assembled capacity).
     pub card_cap: usize,
     /// The admitted context.
     pub max_seq: usize,
@@ -613,12 +618,18 @@ impl Qwen4MemoryAdmission {
             .saturating_add(self.mtp_request)
     }
 
-    /// What must be free after load: [`Self::growth`] plus the resident PLE
-    /// and the headroom.
+    /// What must be free after load: [`Self::growth`] plus the admitted
+    /// resident PLE and the headroom.
     pub fn required(&self) -> u64 {
         self.growth()
             .saturating_add(self.resident_ple)
             .saturating_add(self.headroom)
+    }
+
+    /// Whether the context took part of the requested PLE page cache budget
+    /// (`resident_ple` < `ple_budget`).
+    pub fn ple_shrunk(&self) -> bool {
+        self.resident_ple < self.ple_budget
     }
 }
 
@@ -626,10 +637,12 @@ impl Qwen4MemoryAdmission {
 /// memory its own allocations left, keeping `headroom` free: VMM context
 /// pages and the gathered workspace through a context of `t` tokens
 /// (`growth(t)` = `(context, gather)`, monotone, assembled for `capacity`
-/// tokens), the native MTP request buffers and the `resident_ple` bytes of
-/// PLE page cache that stay resident at serve time (unified memory counts
-/// them as free, so the context must leave them room). `card_cap` is the
-/// largest context that fits. An automatic load (`requested` = `None`)
+/// tokens) and the native MTP request buffers. `card_cap` is the largest
+/// context that fits with no PLE page cache resident. The `resident_ple`
+/// bytes of PLE page cache the prewarm / in-load fill ask to keep resident
+/// (unified memory counts them as free) are reclaimable, so the context
+/// takes precedence: the admitted PLE budget is shrunk to what the free
+/// memory leaves after the context. An automatic load (`requested` = `None`)
 /// admits `min(capacity, card_cap)`; an explicit `max_seq` must fit whole.
 /// The session cache is not charged: its snapshots yield to context growth.
 pub fn qwen4_memory_admission(
@@ -641,9 +654,7 @@ pub fn qwen4_memory_admission(
     headroom: u64,
     growth: impl Fn(usize) -> (u64, u64),
 ) -> Result<Qwen4MemoryAdmission, String> {
-    let fixed = mtp_request
-        .saturating_add(resident_ple)
-        .saturating_add(headroom);
+    let fixed = mtp_request.saturating_add(headroom);
     let fits = |tokens: usize| {
         let (context, gather) = growth(tokens);
         context.saturating_add(gather).saturating_add(fixed) <= free
@@ -665,30 +676,35 @@ pub fn qwen4_memory_admission(
     };
     let max_seq = requested.unwrap_or(capacity.min(card_cap));
     let (context_growth, gather_growth) = growth(max_seq);
+    let left_for_ple = free
+        .saturating_sub(context_growth)
+        .saturating_sub(gather_growth)
+        .saturating_sub(fixed);
     let admission = Qwen4MemoryAdmission {
         free,
         context_growth,
         gather_growth,
         mtp_request,
-        resident_ple,
+        ple_budget: resident_ple,
+        resident_ple: resident_ple.min(left_for_ple),
         headroom,
         card_cap,
         max_seq,
     };
     let detail = || {
         format!(
-            "a {max_seq}-token context needs {} bytes free after load ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {resident_ple} bytes resident PLE + {headroom} bytes headroom), and {free} bytes is free after load",
-            admission.required(),
+            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom), and {free} bytes is free after load",
+            admission.growth().saturating_add(headroom),
             admission.growth(),
         )
     };
     match requested {
         None if max_seq < QWEN4_MIN_AUTO_CONTEXT.min(capacity) => Err(format!(
-            "qwen4: device memory cannot hold an automatic context: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory and the PLE prewarm budget); free host memory or lower the PLE prewarm budget",
+            "qwen4: device memory cannot hold an automatic context: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory); free host memory",
             detail()
         )),
         Some(requested) if requested > card_cap => Err(format!(
-            "qwen4: max_seq {requested} does not fit device memory: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory and the PLE prewarm budget); lower memory.max_seq to at most {card_cap} or omit it",
+            "qwen4: max_seq {requested} does not fit device memory: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory); lower memory.max_seq to at most {card_cap} or omit it",
             detail()
         )),
         _ => Ok(admission),
@@ -3829,9 +3845,10 @@ mod tests {
                 "{error}"
             );
             assert!(
-                error.contains("moves with free host memory and the PLE prewarm budget"),
+                error.contains("this limit moves with free host memory)"),
                 "{error}"
             );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
             assert!(
                 error.contains(&format!(
                     "{} bytes QSA context incl. any F16 arena + {} bytes QSA gather workspace + {} bytes native MTP request buffers",
@@ -3860,9 +3877,99 @@ mod tests {
                 "{error}"
             );
             assert!(
-                error.contains("moves with free host memory and the PLE prewarm budget"),
+                error.contains("this limit moves with free host memory)"),
                 "{error}"
             );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
+        }
+
+        /// Strix Halo serve receipt (Flash-Next, native MTP on, max_seq
+        /// 262144): 62,336 bytes of QSA context and 2,048 bytes of gather
+        /// workspace per token.
+        mod halo_256k {
+            use super::{qwen4_memory_admission, QWEN4_MEMORY_HEADROOM_BYTES};
+
+            const CAPACITY: usize = 262_144;
+            const FREE: u64 = 34_674_597_888;
+            const MTP_REQUEST: u64 = 1_237_893_184;
+            /// Requested resident PLE: 14 GiB.
+            const PLE: u64 = 15_032_385_536;
+
+            fn growth(tokens: usize) -> (u64, u64) {
+                (tokens as u64 * 62_336, tokens as u64 * 2_048)
+            }
+
+            fn admit(
+                requested: Option<usize>,
+                free: u64,
+                ple: u64,
+            ) -> Result<super::super::super::Qwen4MemoryAdmission, String> {
+                qwen4_memory_admission(
+                    CAPACITY,
+                    requested,
+                    free,
+                    MTP_REQUEST,
+                    ple,
+                    QWEN4_MEMORY_HEADROOM_BYTES,
+                    growth,
+                )
+            }
+
+            #[test]
+            fn halo_256k_serve_fits_by_shrinking_ple() {
+                assert_eq!(growth(CAPACITY), (16_341_008_384, 536_870_912));
+                for requested in [Some(CAPACITY), None] {
+                    let admission = admit(requested, FREE, PLE).unwrap();
+                    assert_eq!(admission.max_seq, 262_144);
+                    assert_eq!(admission.card_cap, 262_144);
+                    assert_eq!(admission.ple_budget, 15_032_385_536);
+                    assert_eq!(admission.resident_ple, 14_411_341_760);
+                    assert!(admission.ple_shrunk());
+                    // The shrunk PLE takes the card to exactly its free memory.
+                    assert_eq!(admission.required(), FREE);
+                }
+            }
+
+            #[test]
+            fn halo_256k_refuses_when_the_context_itself_does_not_fit() {
+                let free = 19_000_000_000;
+                let error = admit(Some(CAPACITY), free, PLE).unwrap_err();
+                assert!(error.contains("max_seq 262144 does not fit"), "{error}");
+                // The cap is the largest context that fits with PLE 0.
+                let cap = 242_523;
+                let total = |tokens: usize| {
+                    let (context, gather) = growth(tokens);
+                    context + gather + MTP_REQUEST + QWEN4_MEMORY_HEADROOM_BYTES
+                };
+                assert!(total(cap) <= free);
+                assert!(total(cap + 1) > free);
+                assert!(error.contains(&format!("at most {cap}")), "{error}");
+                assert!(
+                    error.contains("needs 20263256128 bytes free after load"),
+                    "{error}"
+                );
+                assert!(!error.contains("PLE prewarm budget"), "{error}");
+                // The cap does not depend on the requested PLE budget.
+                for ple in [0, PLE, u64::MAX] {
+                    assert_eq!(admit(None, free, ple).unwrap().card_cap, cap);
+                }
+                let auto = admit(None, free, PLE).unwrap();
+                assert_eq!(auto.max_seq, cap);
+                // The 22,336 bytes the cap leaves free are all the PLE gets.
+                assert_eq!(auto.resident_ple, 22_336);
+                assert!(auto.ple_shrunk());
+            }
+
+            #[test]
+            fn halo_256k_keeps_the_full_ple_when_everything_fits() {
+                let free = 40u64 << 30;
+                let admission = admit(Some(CAPACITY), free, PLE).unwrap();
+                assert_eq!(admission.max_seq, 262_144);
+                assert_eq!(admission.resident_ple, 15_032_385_536);
+                assert_eq!(admission.ple_budget, 15_032_385_536);
+                assert!(!admission.ple_shrunk());
+                assert_eq!(admission.required(), 20_263_256_128 + PLE);
+            }
         }
     }
 
@@ -3892,6 +3999,10 @@ mod tests {
         /// Resident PLE budget: `ple_prewarm_budget_for(Auto, 23,038 MiB
         /// MemAvailable)` = 23,038 - 8,192 MiB (below the 15 GiB cap).
         const PLE: u64 = 14_846 * MIB;
+        /// Free device memory with the whole PLE budget already taken out:
+        /// what a context must fit in when the PLE page cache yields to it
+        /// (18,759 MiB, the card the pre-shrink admission refused on).
+        const TIGHT_FREE: u64 = FREE - PLE;
 
         fn config() -> Qwen4Config {
             let layers: Vec<_> = (0..48)
@@ -4010,10 +4121,19 @@ mod tests {
             arena: bool,
             resident_ple: u64,
         ) -> Result<super::super::Qwen4MemoryAdmission, String> {
+            admit_at(FREE, requested, arena, resident_ple)
+        }
+
+        fn admit_at(
+            free: u64,
+            requested: Option<usize>,
+            arena: bool,
+            resident_ple: u64,
+        ) -> Result<super::super::Qwen4MemoryAdmission, String> {
             qwen4_memory_admission(
                 CAPACITY,
                 requested,
-                FREE,
+                free,
                 0,
                 resident_ple,
                 QWEN4_MEMORY_HEADROOM_BYTES,
@@ -4039,61 +4159,89 @@ mod tests {
         }
 
         #[test]
-        fn pre_fix_arithmetic_passed_the_oversized_arena_context() {
-            // Without the PLE charge: 20,352 + 2,048 <= 33,605 MiB.
+        fn halo_arena_context_fits_by_shrinking_ple() {
+            // Without any PLE: 20,352 + 2,048 <= 33,605 MiB.
             let admission = admit(Some(CAPACITY), true, 0).unwrap();
             assert_eq!(admission.max_seq, CAPACITY);
             assert_eq!(admission.card_cap, CAPACITY);
             assert_eq!(admission.required(), (20_352 + 2_048) * MIB);
-            // The PLE budget the prewarm then sets takes it over the card:
-            // 20,352 + 2,048 + 14,846 = 37,246 MiB > 33,605 MiB (3,641 MiB).
+            assert!(!admission.ple_shrunk());
+            // The requested 14,846 MiB PLE budget on top would take it over
+            // the card (20,352 + 2,048 + 14,846 = 37,246 MiB > 33,605 MiB by
+            // 3,641 MiB); the context takes precedence and the PLE shrinks to
+            // the 11,205 MiB the card has left.
             assert_eq!((20_352 + 2_048 + 14_846) * MIB - FREE, 3_641 * MIB);
+            let admission = admit(Some(CAPACITY), true, PLE).unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.ple_budget, PLE);
+            assert_eq!(admission.resident_ple, 11_205 * MIB);
+            assert!(admission.ple_shrunk());
+            assert_eq!(admission.required(), FREE);
+            // Auto resolves to the same whole context and PLE.
+            assert_eq!(admit(None, true, PLE).unwrap(), admission);
         }
 
         #[test]
         fn halo_arena_context_over_the_card_is_refused_with_exact_cap() {
-            let error = admit(Some(CAPACITY), true, PLE).unwrap_err();
-            assert_eq!(FREE - PLE - QWEN4_MEMORY_HEADROOM_BYTES, 17_522_753_536);
+            let error = admit_at(TIGHT_FREE, Some(CAPACITY), true, PLE).unwrap_err();
+            assert_eq!(TIGHT_FREE - QWEN4_MEMORY_HEADROOM_BYTES, 17_522_753_536);
             assert!(
                 error.contains("max_seq 262144 does not fit device memory"),
                 "{error}"
             );
             assert!(error.contains("at most 215245"), "{error}");
             for part in [
-                format!("needs {} bytes free after load", 37_246 * MIB),
+                format!("needs {} bytes free after load", (20_352 + 2_048) * MIB),
                 format!("{} bytes QSA context incl. any F16 arena", 20_352 * MIB),
                 "0 bytes QSA gather workspace".to_string(),
                 "0 bytes native MTP request buffers".to_string(),
                 format!("= {} bytes growth", 20_352 * MIB),
-                format!("{PLE} bytes resident PLE"),
                 format!("{} bytes headroom", QWEN4_MEMORY_HEADROOM_BYTES),
-                format!("{FREE} bytes is free after load"),
+                format!("{TIGHT_FREE} bytes is free after load"),
             ] {
                 assert!(error.contains(&part), "{part}: {error}");
             }
             assert!(
-                error.contains("with the current free host memory the context fits up to 215245 tokens"),
+                error.contains(
+                    "with the current free host memory the context fits up to 215245 tokens"
+                ),
                 "{error}"
             );
             assert!(
-                error.contains("moves with free host memory and the PLE prewarm budget"),
+                error.contains("this limit moves with free host memory)"),
                 "{error}"
             );
+            assert!(!error.contains("PLE prewarm budget"), "{error}");
         }
 
         #[test]
         fn halo_arena_card_cap_is_the_largest_fit() {
-            let admission = admit(None, true, PLE).unwrap();
+            let admission = admit_at(TIGHT_FREE, None, true, PLE).unwrap();
             assert_eq!(admission.card_cap, 215_245);
             assert_eq!(admission.max_seq, 215_245);
-            assert_eq!(admission.resident_ple, PLE);
-            assert!(admission.required() <= FREE);
-            assert_eq!(FREE - admission.required(), 10_240);
-            let next = growth(true)(215_246).0 + PLE + QWEN4_MEMORY_HEADROOM_BYTES;
-            assert_eq!(next - FREE, 45_056);
+            // The cap leaves 10,240 bytes: all the PLE the context allows.
+            assert_eq!(admission.ple_budget, PLE);
+            assert_eq!(admission.resident_ple, 10_240);
+            assert!(admission.ple_shrunk());
+            assert_eq!(admission.required(), TIGHT_FREE);
+            let next = growth(true)(215_246).0 + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert_eq!(next - TIGHT_FREE, 45_056);
+            // The cap does not depend on the requested PLE budget.
+            for ple in [0, PLE, u64::MAX] {
+                assert_eq!(
+                    admit_at(TIGHT_FREE, None, true, ple).unwrap().card_cap,
+                    215_245
+                );
+            }
             // An explicit context at the cap is honored, one past it refuses.
-            assert_eq!(admit(Some(215_245), true, PLE).unwrap().max_seq, 215_245);
-            assert!(admit(Some(215_246), true, PLE).is_err());
+            assert_eq!(
+                admit_at(TIGHT_FREE, Some(215_245), true, PLE)
+                    .unwrap()
+                    .max_seq,
+                215_245
+            );
+            assert!(admit_at(TIGHT_FREE, Some(215_246), true, PLE).is_err());
         }
 
         /// The default-on pooled BF16 mirror is charged row-exact
@@ -4108,15 +4256,35 @@ mod tests {
                 assert_eq!(on(t).0 - off(t).0, 12 * 256 * t_u.div_ceil(4), "{t}");
             }
             assert_eq!(on(CAPACITY).0 - off(CAPACITY).0, 192 * MIB);
-            let admission =
-                qwen4_memory_admission(CAPACITY, None, FREE, 0, PLE, QWEN4_MEMORY_HEADROOM_BYTES, &on)
-                    .unwrap();
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                TIGHT_FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap();
             let cap = admission.card_cap;
             assert!(cap < 215_245, "the mirror lowers the cap: {cap}");
-            let total = |t: usize| on(t).0 + on(t).1 + PLE + QWEN4_MEMORY_HEADROOM_BYTES;
-            assert!(total(cap) <= FREE);
-            assert!(total(cap + 1) > FREE);
+            let total = |t: usize| on(t).0 + on(t).1 + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert!(total(cap) <= TIGHT_FREE);
+            assert!(total(cap + 1) > TIGHT_FREE);
             let error = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                TIGHT_FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("at most {cap}")), "{error}");
+            // On the measured card the whole context fits with the mirror
+            // counted: the PLE shrinks to 33,605 - 20,544 - 2,048 MiB.
+            let whole = qwen4_memory_admission(
                 CAPACITY,
                 Some(CAPACITY),
                 FREE,
@@ -4125,8 +4293,10 @@ mod tests {
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 &on,
             )
-            .unwrap_err();
-            assert!(error.contains(&format!("at most {cap}")), "{error}");
+            .unwrap();
+            assert_eq!(whole.context_growth, 20_544 * MIB);
+            assert_eq!(whole.resident_ple, 11_013 * MIB);
+            assert!(whole.ple_shrunk());
         }
 
         #[test]
@@ -4137,7 +4307,10 @@ mod tests {
                 assert_eq!(admission.card_cap, CAPACITY);
                 assert_eq!(admission.context_growth, 14_208 * MIB);
                 assert_eq!(admission.gather_growth, 512 * MIB);
-                // 14,208 + 512 + 14,846 + 2,048 = 31,614 MiB <= 33,605 MiB.
+                // 14,208 + 512 + 14,846 + 2,048 = 31,614 MiB <= 33,605 MiB:
+                // the whole PLE budget is kept.
+                assert_eq!(admission.resident_ple, PLE);
+                assert!(!admission.ple_shrunk());
                 assert_eq!(admission.required(), 31_614 * MIB);
             }
         }
