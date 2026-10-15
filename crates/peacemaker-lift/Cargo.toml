@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 peacemaker-ir = { path = "../peacemaker-ir" }
-object = { version = "0.38", features = ["write"] }
+object = { version = "0.38", default-features = false, features = ["read", "write"] }
 smallvec = "1"
 rmpv = "1"
 thiserror.workspace = true

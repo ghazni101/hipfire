@@ -3750,6 +3750,13 @@ mod tests {
         });
         let lease = WeightHostClient::connect(&sock, hello_for(&f)).unwrap();
         host.join().unwrap().unwrap();
+        // join() waits for the host thread to return, but the peer hangup
+        // reaches this socket asynchronously: on a loaded runner a single
+        // nonblocking MSG_PEEK can still see the socket Empty. Poll for the
+        // hangup, then confirm through the lease's own probe.
+        if lease.host_alive().unwrap() {
+            wait_fd(lease.conn.fd(), libc::POLLIN, Some(Instant::now() + T), "host hangup").unwrap();
+        }
         assert!(!lease.host_alive().unwrap());
         // FDs and manifest stay valid for draining the current request
         assert_eq!(lease.allocation_fds().len(), 1);
