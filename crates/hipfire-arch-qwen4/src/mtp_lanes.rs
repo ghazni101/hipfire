@@ -703,6 +703,7 @@ pub(crate) fn finish_lane_window(
                 pending_hidden,
                 verify_hidden: &verify_hidden,
                 ple_normed: &ple_normed,
+                retain: false,
             },
             None,
         )

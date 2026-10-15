@@ -149,6 +149,10 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
+# MoE-GEMV byte oracle (certified R1 records via S2's I4ExpertFinalCodeRecord, ExpertFormat/slab
+# geometry). hipfire-quantize depends on this crate as a normal edge; dev-dep cycles are legal.
+hipfire-quantize = { path = "../hipfire-quantize", default-features = false }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
 # Property tests (`ple_q4::tests::props`).
@@ -160,6 +164,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # consumed as dev-dependencies (no `arch-*` feature gating). Examples
 # not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
 # feature combination.
+
+# Raw PM dense-row K1 GPU byte oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_rows_byte_oracle"
+required-features = ["lab"]
+
+# K2 G1 oracle for the MQ3-I4 NT1 gate/up (raw PM module; no production dispatch).
+[[example]]
+name = "qwen4_moe_sym_w3_g1_oracle"
+required-features = ["lab"]
+
+# Raw PM K3 (R128 / K640 A4 producer) GPU runner for the byte oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_a4_byte_oracle"
+required-features = ["lab"]
+
+# Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_byte_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "coherence_probe"

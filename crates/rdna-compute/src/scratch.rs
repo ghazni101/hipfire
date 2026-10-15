@@ -383,6 +383,14 @@ pub struct ScratchState {
     /// `int4_mmq_x_scratch`; generation-checked like it.
     pub qwen4_moe_down_i4_scratch: Option<DeviceBuffer>,
     pub qwen4_moe_down_i4_scratch_bytes: usize,
+    /// Sealed expert-slab route: the decode lane-union descriptor words
+    /// (`Gpu::qwen4_slab_union_plan`) and the two codec-masked tile-id arrays
+    /// of the K2 prefill. Fixed or grows-never-shrinks; reserved before capture
+    /// by `Gpu::reserve_qwen4_slab`.
+    pub qwen4_slab_union_scratch: Option<DeviceBuffer>,
+    pub qwen4_slab_union_scratch_bytes: usize,
+    pub qwen4_slab_tiles_scratch: Option<DeviceBuffer>,
+    pub qwen4_slab_tiles_scratch_bytes: usize,
     pub qwen4_moe_down_i4_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
@@ -974,6 +982,13 @@ fn grow_scratch_buffer(
 }
 
 /// [`grow_scratch_buffer`] for slots owned outside this module's helpers.
+/// Words of the sealed expert-slab lane-union descriptor of `lanes` decode
+/// lanes (`S = 10 * lanes` slots): two buckets of `S` expert ids, `S + 1`
+/// offsets and `S` slot ids.
+pub const fn qwen4_slab_union_words(lanes: usize) -> usize {
+    6 * (10 * lanes) + 2
+}
+
 pub(crate) fn grow_scratch_slot(
     hip: &HipRuntime,
     slot: &mut Option<DeviceBuffer>,
@@ -2373,6 +2388,31 @@ impl ScratchState {
             &mut self.qwen4_moe_group_scratch_bytes,
             needed,
         )
+    }
+
+    /// Reserve the sealed expert-slab scratch: the union descriptor for
+    /// `max_lanes` decode lanes and `tiles` masked tile ids per codec.
+    pub fn reserve_qwen4_slab(
+        &mut self,
+        hip: &HipRuntime,
+        max_lanes: usize,
+        tiles: usize,
+    ) -> HipResult<()> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.qwen4_slab_union_scratch,
+            &mut self.qwen4_slab_union_scratch_bytes,
+            qwen4_slab_union_words(max_lanes) * 4,
+        )?;
+        if tiles != 0 {
+            grow_scratch_buffer(
+                hip,
+                &mut self.qwen4_slab_tiles_scratch,
+                &mut self.qwen4_slab_tiles_scratch_bytes,
+                2 * tiles * 4,
+            )?;
+        }
+        Ok(())
     }
 
     /// Grow the Qwen4 symmetric IU4 MoE down sidecar for `[k/128, n]`

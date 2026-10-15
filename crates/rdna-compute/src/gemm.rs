@@ -47137,6 +47137,19 @@ const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
     ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4"],
     ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"],
 ];
+/// MQ3-I4 NT1 module (gfx1201 only), same 60-byte ABI as the MQ4 16-slot
+/// entries; the embedded image is `kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201`.
+/// No NT4/NT8 or host-mapped widths exist: the module's exports are the two
+/// NT1 GEMMs and their F32 accumulator twins (`_acc`, qualification only).
+const QWEN4_MOE_SYM_W3_PM_MODULE: &str = "qwen4_moe_iu4_sym_w3_pm_gfx1201";
+const QWEN4_MOE_SYM_W3_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201";
+const QWEN4_MOE_SYM_W3_DOWN: &str = "qwen4_moe_down_iu4_sym_w3_pm_gfx1201";
+const QWEN4_MOE_SYM_W3_PM_ENTRIES: [&str; 4] = [
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201",
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201_acc",
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1201",
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1201_acc",
+];
 /// gfx1151 builder down entries with a row repeat of 2 and 4 (NT4 expert-run
 /// tiles, `rr` contiguous 64-row blocks per workgroup), `[rr2, rr4]`. Same
 /// bytes as the rr1 entry above; the VRAM-resident and host-mapped residency
@@ -47415,6 +47428,32 @@ impl Gpu {
         let image = if arch == 0 { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 } else { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 };
         self.bind_thread()?;
         self.ensure_embedded_kernel(QWEN4_MOE_SYM_PM_MODULE[arch], image, func)
+    }
+
+    /// `[gate/up, down]` entries of the MQ3-I4 NT1 module on this device:
+    /// `Some` on gfx1201 only (no gfx1151 image, no host-mapped width).
+    pub fn qwen4_moe_sym_w3_gemm_symbols(&self) -> Option<[&'static str; 2]> {
+        (self.arch == "gfx1201").then_some([QWEN4_MOE_SYM_W3_GATE_UP, QWEN4_MOE_SYM_W3_DOWN])
+    }
+
+    /// Loads entry `func` (one of [`QWEN4_MOE_SYM_W3_PM_ENTRIES`]: the two NT1
+    /// GEMMs and their `_acc` F32 twins) of the embedded MQ3-I4 module, for
+    /// launch by name. gfx1201 only.
+    pub fn ensure_qwen4_moe_sym_w3_pm_entry(&mut self, func: &str) -> HipResult<()> {
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: the MQ3-I4 grouped IU4 MoE module is gfx1201-only, got {}", self.arch),
+            ));
+        }
+        if !QWEN4_MOE_SYM_W3_PM_ENTRIES.contains(&func) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: not an export of {QWEN4_MOE_SYM_W3_PM_MODULE}"),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(QWEN4_MOE_SYM_W3_PM_MODULE, kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201, func)
     }
 
     /// True when every K128 header of `experts` experts behind `ptrs`
@@ -47898,6 +47937,167 @@ impl Gpu {
             xp,
             [m, k, x_row_div, grouped_rows, x_src_rows],
         )
+    }
+
+    /// MQ3-I4 (`WeightCodec::Mq3I4`) grouped IU4 gate/up with the SwiGLU
+    /// epilogue, NT1 (one 16-slot tile per CTA): the 60-byte ABI, `xq`
+    /// producer, `y` layout and padding/sentinel semantics of
+    /// [`Gpu::gemm_qwen4_moe_gate_up_silu_iu4_sym`]. `ptrs[e]` addresses the
+    /// planar `[codes: m*k*3/8 B][scales: m*(k/128) f16]` tensor of expert
+    /// `e`. gfx1201 only; there is no host-mapped width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_w3_gate_up_silu_iu4_sym: need m % 64 == 0 and k % 256 == 0",
+            ));
+        }
+        crate::moe::require_span(y, &[grouped_rows, m / 2, 2], "gemm_qwen4_moe_w3_gate_up_silu_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_w3_gate_up_silu_iu4_sym sorted slots")?;
+        let (generation, live) = self.scratch.int4_mmq_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_w3_gemm(
+            false,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// MQ3-I4 grouped IU4 down, NT1: `y` `[grouped_rows, m]` BF16 per grouped
+    /// row, as [`Gpu::gemm_qwen4_moe_down_iu4_sym`]. `xq` is the
+    /// [`Gpu::qwen4_moe_rotate128_i4`] handle of `x_src_rows` flat slots;
+    /// `x_row_div` = 1. `ptrs[e]` addresses the planar `[m, k]` W3 tensor
+    /// (`k % 128 == 0`). gfx1201 only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_w3_down_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_w3_down_iu4_sym: need m % 64 == 0 and k % 128 == 0",
+            ));
+        }
+        crate::moe::require_span(y, &[grouped_rows, m, 2], "gemm_qwen4_moe_w3_down_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_w3_down_iu4_sym sorted slots")?;
+        let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_w3_gemm(
+            true,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Shared 60-byte kernarg launch of the two MQ3-I4 NT1 entries of the
+    /// embedded `qwen4_moe_iu4_sym_w3_pm_gfx1201` module: grid
+    /// `(m / 64, grouped_rows / 16)`, block 64 (gate/up, two waves) or 128
+    /// (down, four waves).
+    fn qwen4_moe_sym_w3_gemm(
+        &mut self,
+        down: bool,
+        [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
+        xp: *mut c_void,
+        dims: [usize; 5],
+    ) -> HipResult<()> {
+        let (what, func, block) = if down {
+            ("gemm_qwen4_moe_w3_down_iu4_sym", QWEN4_MOE_SYM_W3_DOWN, 128u32)
+        } else {
+            ("gemm_qwen4_moe_w3_gate_up_silu_iu4_sym", QWEN4_MOE_SYM_W3_GATE_UP, 64u32)
+        };
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{what}: the MQ3-I4 grouped IU4 MoE route is gfx1201-only, got {}", self.arch),
+            ));
+        }
+        if dims[0] % 64 != 0 {
+            return Err(hip_bridge::HipError::new(0, &format!("{func}: need m % 64 == 0")));
+        }
+        let grid = [(dims[0] / 64) as u32, (dims[3] / 16) as u32, 1];
+        let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
+            dims.map(|value| i32::try_from(value).ok())
+        else {
+            return Err(hip_bridge::HipError::new(0, &format!("{func}: extent overflow")));
+        };
+        if dv <= 0 || gv % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: need x_row_div > 0 and grouped_rows % 16 == 0"),
+            ));
+        }
+        if dims[2].saturating_mul(dims[4]) > QWEN4_MOE_SYM_PM_MAX_SLOTS {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: x_row_div * x_src_rows must not exceed {QWEN4_MOE_SYM_PM_MAX_SLOTS}"),
+            ));
+        }
+        if down {
+            pm_check_moe_down_extent(func, dims[3], dims[0])?;
+        }
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(QWEN4_MOE_SYM_W3_PM_MODULE, kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201, func)?;
+        let pp = ptrs.buf.as_ptr();
+        let tp = tiles.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut params = [
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+            &gv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+        ];
+        let (m, k, rows) = (dims[0], dims[1], dims[3]);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, rows * (k * 3 / 8 / 4 + m));
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b.push_i32(dv);
+            b.push_i32(gv);
+            b.push_i32(sv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Shared 60-byte kernarg launch of the two grouped IU4 GEMMs: the
@@ -49721,5 +49921,43 @@ mod route_selector_tests {
                 assert_eq!(lds256_tile_source_selected(halo, entry), previous);
             }
         }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn qwen4_moe_sym_w3_module_registry_count_and_identity() {
+        // Four exports (two NT1 entries and their F32 `_acc` twins), gfx1201 only.
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_ENTRIES.len(), 4);
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_ENTRIES[0], QWEN4_MOE_SYM_W3_GATE_UP);
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_ENTRIES[2], QWEN4_MOE_SYM_W3_DOWN);
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_ENTRIES[1], format!("{QWEN4_MOE_SYM_W3_GATE_UP}_acc"));
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_ENTRIES[3], format!("{QWEN4_MOE_SYM_W3_DOWN}_acc"));
+        assert_eq!(QWEN4_MOE_SYM_W3_PM_MODULE, "qwen4_moe_iu4_sym_w3_pm_gfx1201");
+        let mut distinct = QWEN4_MOE_SYM_W3_PM_ENTRIES.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4);
+        let w3 = kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201;
+        let mq4 = kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201;
+        // Image identity: the committed W3 module, separate from the unchanged MQ4 module.
+        assert_eq!(
+            crate::code_object::CodeObjectId::of(w3).to_string(),
+            "3512c8a74c6e915e00a7433a6c963cb4c60bce7dc619ebfc97f9c69d111018df"
+        );
+        assert_ne!(
+            crate::code_object::CodeObjectId::of(w3),
+            crate::code_object::CodeObjectId::of(mq4)
+        );
+        for name in QWEN4_MOE_SYM_W3_PM_ENTRIES {
+            assert!(contains_bytes(w3, name.as_bytes()), "{name} missing from the W3 image");
+            assert!(contains_bytes(w3, format!("{name}.kd").as_bytes()), "{name}.kd missing from the W3 image");
+            assert!(!contains_bytes(mq4, name.as_bytes()), "{name} leaked into the MQ4 image");
+        }
+        assert!(!contains_bytes(mq4, b"_w3_pm_"));
+        // The MQ4 module table and image selection are untouched.
+        assert_eq!(QWEN4_MOE_SYM_PM_MODULE[1], "qwen4_moe_iu4_sym_pm_gfx1201");
     }
 }

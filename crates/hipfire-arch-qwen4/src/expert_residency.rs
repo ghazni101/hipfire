@@ -175,7 +175,9 @@ fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
 }
 
 fn is_routed_expert(name: &str) -> bool {
-    name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+    name.ends_with(".mlp.experts.gate_up_proj")
+        || name.ends_with(".mlp.experts.down_proj")
+        || name.ends_with(crate::expert_arena::ARENA_SUFFIX)
 }
 
 /// Resident bytes outside the routed experts, and the routed-expert bytes of
@@ -198,6 +200,9 @@ pub fn resident_split_ranks(
 ) -> Result<(u64, u64), String> {
     let mut non_expert = 0u64;
     let mut layer_experts = 0u64;
+    // Slab arenas differ in size from layer to layer (the hot set is not
+    // uniform), so the per-layer charge is the largest arena, never layer 0.
+    let mut layer_arena_max = 0u64;
     for entry in weights {
         if entry.residency.is_external() || matches!(entry.policy, ShardPolicy::Tied { .. }) {
             continue;
@@ -205,11 +210,13 @@ pub fn resident_split_ranks(
         let bytes = bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
+        } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
+            layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
             layer_experts += rank_share(entry, bytes, ranks)?;
         }
     }
-    Ok((non_expert, layer_experts))
+    Ok((non_expert, layer_experts + layer_arena_max))
 }
 
 /// Stored dtype of the language head, which the native MTP draft head ranks
@@ -321,6 +328,70 @@ pub fn auto_vram_layers(
     }
 }
 
+/// Device bytes an expert-tier lease's frozen tables take beyond the payload:
+/// the gate/up and down pointer tables (8 bytes per expert each) and the
+/// 1-byte-per-expert codec table, over every trunk expert
+/// (`expert_tier_owners::materialize`).
+pub const EXPERT_TIER_TABLE_BYTES: u64 = crate::expert_slabs::TRUNK_LAYERS as u64
+    * crate::expert_slabs::EXPERTS_PER_LAYER as u64
+    * (2 * 8 + 1);
+
+/// Device bytes kept free beyond every other budget term when sizing the
+/// `HIPFIRE_QWEN4_EXPERT_HOTSET` payload (driver/allocator headroom).
+pub const EXPERT_HOTSET_VRAM_MARGIN_BYTES: u64 = 512 << 20;
+
+/// Device bytes the `HIPFIRE_QWEN4_EXPERT_HOTSET` payload may take:
+/// `free_vram` less the non-expert weights, `reserve` ([`auto_vram_reserve`],
+/// the caller's own value, not recomputed here), the lease's frozen tables
+/// ([`EXPERT_TIER_TABLE_BYTES`]) and [`EXPERT_HOTSET_VRAM_MARGIN_BYTES`].
+/// Every subtraction is checked; exactly zero left is `Ok(0)`, any shortfall
+/// is `Err`.
+pub fn expert_hotset_budget(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    reserve: u64,
+) -> Result<u64, String> {
+    free_vram
+        .checked_sub(non_expert_bytes)
+        .and_then(|bytes| bytes.checked_sub(reserve))
+        .and_then(|bytes| bytes.checked_sub(EXPERT_TIER_TABLE_BYTES))
+        .and_then(|bytes| bytes.checked_sub(EXPERT_HOTSET_VRAM_MARGIN_BYTES))
+        .ok_or_else(|| {
+            format!(
+                "expert hotset has no device budget: free VRAM {free_vram} bytes is below the \
+                 non-expert weights {non_expert_bytes} + reserve {reserve} + expert tier tables \
+                 {EXPERT_TIER_TABLE_BYTES} + safety margin {EXPERT_HOTSET_VRAM_MARGIN_BYTES}"
+            )
+        })
+}
+
+/// Whether a load on `arch` builds the long-prefill expert stage (the same
+/// switch `Qwen4ExpertStage::new` reads), so its buffers need a budget.
+pub fn expert_stage_enabled(arch: &str) -> bool {
+    hipfire_config::developer_bool(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV, arch == "gfx1201")
+}
+
+/// Device bytes the tier long-prefill staging allocates for `plan`: one VRAM
+/// stage buffer per layer parity, each the largest host-tier payload of a
+/// layer of that parity (projections 256-byte aligned) plus the zeroed tail
+/// pad, as `gpu_forward::slab_stage` sizes them. An upper bound of what it
+/// allocates, so the hot set budget can hold it.
+pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -> u64 {
+    use crate::expert_slabs::{EXPERTS_PER_LAYER, TRUNK_LAYERS};
+    use crate::expert_tier_plan::Placement;
+    let align = |len: u64| len.div_ceil(256) * 256;
+    let mut largest = [0u64; 2];
+    for layer in 0..TRUNK_LAYERS as usize {
+        let host: u64 = (0..EXPERTS_PER_LAYER as usize)
+            .filter_map(|expert| plan.entry(layer, expert))
+            .filter(|entry| entry.tier == Placement::HostMapped)
+            .map(|entry| align(entry.gate_up_len) + align(entry.down_len))
+            .sum();
+        largest[layer % 2] = largest[layer % 2].max(host);
+    }
+    largest.iter().map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).sum()
+}
+
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
 /// the MTP layer, [`WeightResidency::HostMapped`]. Returns the number of
 /// entries moved to host RAM.
@@ -352,6 +423,47 @@ pub fn host_mapped_bytes(
                 bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
             total += bytes + HOST_MAPPED_PAD_BYTES;
         }
+    }
+    Ok(total)
+}
+
+/// Pinned host bytes the manifest will hold after
+/// `place_routed_experts(weights, vram_layers)` and `with_expert_tiers`,
+/// computed without mutating or cloning `weights` so every host RAM/GTT check
+/// can run before the manifest changes. `with_expert_tiers` drops every trunk
+/// routed-expert tensor (non-`mtp.` with a layer), whatever its placement, so
+/// those are never counted. Counted, each with [`HOST_MAPPED_PAD_BYTES`]: every
+/// other entry already [`WeightResidency::HostMapped`], and every other
+/// [`WeightResidency::Resident`] routed entry [`place_routed_experts`] would
+/// move to host (the MTP layer's experts). Sums are checked.
+pub fn hotset_host_mapped_bytes(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    vram_layers: usize,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in weights {
+        let routed = is_routed_expert(&entry.name);
+        let mtp = entry.name.starts_with("mtp.");
+        if routed && !mtp && entry.layer.is_some() {
+            continue;
+        }
+        let host = match entry.residency {
+            WeightResidency::HostMapped => true,
+            WeightResidency::Resident => {
+                routed && !(entry.layer.is_some_and(|layer| layer < vram_layers) && !mtp)
+            }
+            _ => false,
+        };
+        if !host {
+            continue;
+        }
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        total = bytes
+            .checked_add(HOST_MAPPED_PAD_BYTES)
+            .and_then(|charge| total.checked_add(charge))
+            .ok_or_else(|| "hotset host-mapped byte total overflows".to_string())?;
     }
     Ok(total)
 }
@@ -676,6 +788,55 @@ mod tests {
         entry
     }
 
+    fn arena_entry(layer: usize, bytes: usize) -> WeightEntry {
+        let mut entry = WeightEntry::model(
+            format!("model.language_model.layers.{layer}.mlp.experts.slab_arena"),
+            vec![bytes],
+            DType::Raw,
+            ShardPolicy::Replicate,
+        );
+        entry.layer = Some(layer);
+        entry
+    }
+
+    #[test]
+    fn slab_arenas_are_routed_experts_and_the_layer_charge_is_the_largest_arena() {
+        // Non-uniform arenas (the hot set is not spread evenly): layer 0 is the
+        // smallest, layer 2 the largest. `element_bytes` doubles the shape product.
+        let mut weights = vec![
+            arena_entry(0, 100),
+            arena_entry(1, 300),
+            arena_entry(2, 700),
+            arena_entry(3, 200),
+            entry("model.language_model.layers.0.self_attn.q_proj.weight", 0),
+        ];
+        assert!(weights[..4].iter().all(|entry| is_routed_expert(&entry.name)));
+        let (non_expert, layer_experts) =
+            resident_split(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2))
+                .expect("split");
+        assert_eq!(layer_experts, 700 * 2, "the charge is the max arena, never layer 0's");
+        assert_eq!(non_expert, 4 * 4 * 256 * 2);
+        // Admission totals every arena's physical bytes.
+        assert_eq!(
+            routed_expert_bytes(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)),
+            Ok((100 + 300 + 700 + 200) * 2)
+        );
+        // Per-rank shares of a max arena split the same way.
+        let (_, per_rank) = resident_split_ranks(
+            &weights,
+            |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2),
+            2,
+        )
+        .expect("split");
+        assert_eq!(per_rank, 700);
+        // Layers past the budget host-map their arenas.
+        assert_eq!(place_routed_experts(&mut weights, 2), 2);
+        assert_eq!(weights[0].residency, WeightResidency::Resident);
+        assert_eq!(weights[1].residency, WeightResidency::Resident);
+        assert_eq!(weights[2].residency, WeightResidency::HostMapped);
+        assert_eq!(weights[3].residency, WeightResidency::HostMapped);
+    }
+
     #[test]
     fn layers_past_the_budget_and_mtp_go_to_host() {
         let mut weights = vec![
@@ -697,6 +858,82 @@ mod tests {
                 "model.language_model.layers.2.mlp.experts.gate_up_proj",
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
+        );
+    }
+
+    #[test]
+    fn hotset_host_mapped_bytes_matches_place_then_drop_trunk_routed() {
+        let mut weights = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("model.language_model.layers.2.mlp.experts.down_proj", 2),
+            entry("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", 1),
+            entry("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("mtp.layers.0.mlp.experts.down_proj", 0),
+            entry("model.language_model.embed_tokens.weight", 0),
+        ];
+        weights[5].layer = None;
+        weights[5].residency = WeightResidency::HostMapped;
+        let bytes_of = |entry: &WeightEntry| Some(entry.name.len() as u64 * 1000);
+        let before: Vec<_> = weights.iter().map(|entry| entry.residency).collect();
+        for vram_layers in [0usize, 1, 3] {
+            let got = hotset_host_mapped_bytes(&weights, bytes_of, vram_layers).unwrap();
+            let mut placed = weights.clone();
+            place_routed_experts(&mut placed, vram_layers);
+            placed.retain(|entry| {
+                !(is_routed_expert(&entry.name) && !entry.name.starts_with("mtp.") && entry.layer.is_some())
+            });
+            assert_eq!(got, host_mapped_bytes(&placed, bytes_of).unwrap(), "vram_layers={vram_layers}");
+        }
+        // MTP experts and the preexisting host entry only; the input never mutates.
+        let expected = (weights[3].name.len() + weights[4].name.len() + weights[5].name.len()) as u64
+            * 1000
+            + 3 * HOST_MAPPED_PAD_BYTES;
+        assert_eq!(hotset_host_mapped_bytes(&weights, bytes_of, 3), Ok(expected));
+        assert_eq!(before, weights.iter().map(|entry| entry.residency).collect::<Vec<_>>());
+        assert!(hotset_host_mapped_bytes(&weights, |_| None, 3).is_err());
+        assert!(hotset_host_mapped_bytes(&weights, |_| Some(u64::MAX), 3).is_err());
+    }
+
+    #[test]
+    fn expert_hotset_budget_subtracts_weights_reserve_tables_and_margin_checked() {
+        assert_eq!(EXPERT_TIER_TABLE_BYTES, 2 * 24576 * 8 + 24576);
+        assert_eq!(EXPERT_HOTSET_VRAM_MARGIN_BYTES, 512 << 20);
+        let (free, non_expert, reserve) = (30u64 << 30, 5_364_000_000u64, 6_656u64 << 20);
+        assert_eq!(
+            expert_hotset_budget(free, non_expert, reserve).unwrap(),
+            free - non_expert - reserve - EXPERT_TIER_TABLE_BYTES - EXPERT_HOTSET_VRAM_MARGIN_BYTES
+        );
+        // Exactly zero left is a (useless but valid) budget; one byte short is not.
+        let exact =
+            non_expert + reserve + EXPERT_TIER_TABLE_BYTES + EXPERT_HOTSET_VRAM_MARGIN_BYTES;
+        assert_eq!(expert_hotset_budget(exact, non_expert, reserve).unwrap(), 0);
+        assert_eq!(expert_hotset_budget(exact + 1, non_expert, reserve).unwrap(), 1);
+        assert!(expert_hotset_budget(exact - 1, non_expert, reserve).is_err());
+        assert!(expert_hotset_budget(0, 1, 0).is_err());
+        assert!(expert_hotset_budget(u64::MAX, u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn expert_hotset_budget_margin_alone_can_exhaust_the_budget() {
+        // Everything but the margin fits; the margin shortfall must not underflow.
+        let free = EXPERT_TIER_TABLE_BYTES + EXPERT_HOTSET_VRAM_MARGIN_BYTES - 1;
+        let err = expert_hotset_budget(free, 0, 0).unwrap_err();
+        assert!(err.contains("safety margin"), "{err}");
+        // Tables fit but not the margin, with weights and reserve consuming the rest.
+        assert!(expert_hotset_budget(1 << 20, 0, 0).is_err());
+        assert_eq!(
+            expert_hotset_budget(
+                EXPERT_TIER_TABLE_BYTES + EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+                0,
+                0
+            )
+            .unwrap(),
+            0
+        );
+        // Full-range inputs do not overflow the chain.
+        assert_eq!(
+            expert_hotset_budget(u64::MAX, 0, 0).unwrap(),
+            u64::MAX - EXPERT_TIER_TABLE_BYTES - EXPERT_HOTSET_VRAM_MARGIN_BYTES
         );
     }
 

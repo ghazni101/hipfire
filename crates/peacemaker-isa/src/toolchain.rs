@@ -513,9 +513,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // (M7's gfx1201 tables).
         let qsa_pm=contract.symbol.starts_with("indexed_attention_")&&contract.symbol.contains("_pm_gfx");
         let mq6_pm=contract.symbol.starts_with("qwen4_mq6_x4_pm_gfx")||contract.symbol.starts_with("qwen4_mq4_x4_pm_gfx");
+        let mqi4_pm=contract.symbol.starts_with("mq_i4_rows_")||contract.symbol.starts_with("mq_i4_a4_")||contract.symbol.starts_with("mq_i4_moe_gemv_");
         let dflash_accept=contract.symbol.starts_with("dflash_sampled_accept_")&&contract.symbol.contains("_pm_gfx");
         let m7_cert=matches!(arch,"gfx1100"|"gfx1151")
-            || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm || mq6_pm || dflash_accept);
+            || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm || mq6_pm || dflash_accept || mqi4_pm);
         if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {
             let mut highest_v=0u32;
             let mut highest_s=0u32;

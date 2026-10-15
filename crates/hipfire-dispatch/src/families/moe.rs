@@ -56,6 +56,172 @@ pub struct MoePointerEntries<'a> {
     pub down: &'a [usize],
 }
 
+/// Placement byte: the expert's projections live in a device (VRAM) owner.
+pub const EXPERT_TIER_DEVICE: u8 = 0;
+/// Placement byte: the expert's projections live in a host-mapped owner.
+pub const EXPERT_TIER_HOST: u8 = 1;
+
+/// Neutral per-layer metadata of an explicit per-expert tier placement
+/// (model-level device + host-mapped payload owners). Plain data only: the
+/// loader that owns the tier converts its own view/lease into this, so no
+/// arch-private type crosses the dispatch boundary.
+///
+/// `placement` and `codecs` hold one byte per layer-local expert id (the id the
+/// kernels index with; model ids never reach dispatch). `any_host` is derived
+/// from `placement`, never from a representative expert, and is for
+/// conservative capability/path decisions only: it carries no arithmetic
+/// meaning. `generation` is the owner-binding generation (a reload gets a new
+/// one), `logical_digest` the placement plan's logical digest, and `keepalive`
+/// the owner retention every captured or retained resource must hold until its
+/// GPU work is retired.
+#[derive(Clone)]
+pub struct ExpertTierIdentity {
+    generation: u64,
+    logical_digest: [u8; 32],
+    any_host: bool,
+    placement: Box<[u8]>,
+    codecs: Box<[u8]>,
+    gate_up_entries: Box<[usize]>,
+    down_entries: Box<[usize]>,
+    keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl ExpertTierIdentity {
+    /// `placement` entries must be [`EXPERT_TIER_DEVICE`] or
+    /// [`EXPERT_TIER_HOST`]. Every table has one entry per layer-local expert
+    /// and the same non-zero length; pointer entries are non-null absolute
+    /// addresses (the frozen CPU mirrors of the uploaded device tables).
+    pub fn new(
+        generation: u64,
+        logical_digest: [u8; 32],
+        placement: &[u8],
+        codecs: &[u8],
+        gate_up_entries: &[usize],
+        down_entries: &[usize],
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, String> {
+        let n = placement.len();
+        if n == 0 || n != codecs.len() || n != gate_up_entries.len() || n != down_entries.len() {
+            return Err(format!(
+                "expert tier identity tables must be non-empty and equal length \
+                 (placement {n}, codecs {}, gate/up entries {}, down entries {})",
+                codecs.len(),
+                gate_up_entries.len(),
+                down_entries.len()
+            ));
+        }
+        if let Some(index) = (0..n).find(|&i| gate_up_entries[i] == 0 || down_entries[i] == 0) {
+            return Err(format!("expert tier identity has a null pointer entry for expert {index}"));
+        }
+        if let Some(index) = placement
+            .iter()
+            .position(|&tier| tier != EXPERT_TIER_DEVICE && tier != EXPERT_TIER_HOST)
+        {
+            return Err(format!(
+                "expert tier identity placement byte {} for expert {index} is neither device nor host",
+                placement[index]
+            ));
+        }
+        Ok(Self {
+            generation,
+            logical_digest,
+            any_host: placement.iter().any(|&tier| tier == EXPERT_TIER_HOST),
+            placement: placement.into(),
+            codecs: codecs.into(),
+            gate_up_entries: gate_up_entries.into(),
+            down_entries: down_entries.into(),
+            keepalive,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn logical_digest(&self) -> &[u8; 32] {
+        &self.logical_digest
+    }
+
+    /// True when at least one expert of the layer is host-mapped. Capability
+    /// checks only; never select arithmetic from it.
+    pub fn any_host(&self) -> bool {
+        self.any_host
+    }
+
+    /// `(gate_up, down)` host-mapped residency of the layer's projections.
+    /// Both are the layer-wide `any_host` bit: a tier places a pair together.
+    pub fn host_projections(&self) -> (bool, bool) {
+        (self.any_host, self.any_host)
+    }
+
+    pub fn placement(&self) -> &[u8] {
+        &self.placement
+    }
+
+    pub fn codecs(&self) -> &[u8] {
+        &self.codecs
+    }
+
+    /// Absolute GPU-visible gate/up projection addresses per layer-local
+    /// expert: the frozen CPU mirror of the uploaded pointer table.
+    pub fn gate_up_entries(&self) -> &[usize] {
+        &self.gate_up_entries
+    }
+
+    /// Absolute GPU-visible down projection addresses (see
+    /// [`Self::gate_up_entries`]).
+    pub fn down_entries(&self) -> &[usize] {
+        &self.down_entries
+    }
+
+    pub fn keepalive(&self) -> &std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        &self.keepalive
+    }
+}
+
+impl PartialEq for ExpertTierIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.logical_digest == other.logical_digest
+            && self.any_host == other.any_host
+            && self.placement == other.placement
+            && self.codecs == other.codecs
+            && self.gate_up_entries == other.gate_up_entries
+            && self.down_entries == other.down_entries
+            && std::sync::Arc::ptr_eq(&self.keepalive, &other.keepalive)
+    }
+}
+
+impl Eq for ExpertTierIdentity {}
+
+impl std::fmt::Debug for ExpertTierIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertTierIdentity")
+            .field("generation", &self.generation)
+            .field("logical_digest", &self.logical_digest)
+            .field("any_host", &self.any_host)
+            .field("experts", &self.placement.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `(gate_up, down)` host-mapped residency of a layer's routed experts.
+/// An explicit tier binding wins over every adapter override: its answer is
+/// the layer's `any_host`, never a representative expert's residency.
+pub fn routed_host_mapped_projections(experts: &dyn RoutedExpertWeights) -> (bool, bool) {
+    experts
+        .tier_identity()
+        .map_or_else(|| experts.host_mapped_projections(), ExpertTierIdentity::host_projections)
+}
+
+/// Layer-wide host-mapped bit of a layer's routed experts; tier-first like
+/// [`routed_host_mapped_projections`].
+pub fn routed_host_mapped(experts: &dyn RoutedExpertWeights) -> bool {
+    experts
+        .tier_identity()
+        .map_or_else(|| experts.host_mapped(), ExpertTierIdentity::any_host)
+}
+
 /// The complete semantic recipe selected by an architecture binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRecipe {
@@ -138,6 +304,14 @@ pub enum MoeRouteCapability {
     /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
     /// never by generic resolution.
     Fp8B128Grouped,
+    /// gfx1201 sealed expert-slab route (ctl3-hot): the same fixed
+    /// 512/10/2560/640/640 geometry over experts whose codec is per expert
+    /// (MQ4 symmetric QT44/QT53 or MQ3-I4 planar qt131/qt132), addressed
+    /// through the layer's pointer tables. Decode rows (`route_rows <= 8`)
+    /// run the K1 lane-union GEMV over codec buckets; longer prefill runs the
+    /// K2 grouped IU4 kernels over codec-masked tile ids. Declared from the
+    /// slab artifact's per-expert table only, never from a dtype.
+    SlabCodecGrouped,
 }
 
 impl MoeRouteCapability {
@@ -147,7 +321,9 @@ impl MoeRouteCapability {
     /// device-independent predicate (see [`Self::admitted_on_arch`]).
     pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped => {
+                cfg!(feature = "deltanet")
+            }
             Self::Fp8B128Grouped => false,
         }
     }
@@ -157,14 +333,23 @@ impl MoeRouteCapability {
     pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
         match self {
             Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
+            Self::SlabCodecGrouped => self.admitted_on() && arch.is_gfx1201(),
             Self::Fp8B128Grouped => arch.is_gfx942(),
         }
     }
 
-    /// Either QT44/QT53 grouped declaration: both lower through the same
-    /// fixed-shape stages. False for the FP8 route.
+    /// The gfx1201 sealed expert-slab declaration.
+    pub fn is_slab(self) -> bool {
+        matches!(self, Self::SlabCodecGrouped)
+    }
+
+    /// Any QT44/QT53 grouped declaration (the slab one included): they lower
+    /// through the same fixed-shape stages. False for the FP8 route.
     pub fn is_qt44_qt53_grouped(self) -> bool {
-        matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
+        matches!(
+            self,
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped
+        )
     }
 
     /// The gfx942 qt=55 FP8E4M3B128 grouped declaration.
@@ -219,6 +404,72 @@ pub(crate) fn grouped_route_geometry_supported(
         && formats.routed_down == DType::MQ4G128V2
         && gate_up == formats.routed_gate_up
         && down == formats.routed_down
+}
+
+/// Whether `dtype` is a routed gate/up format of the sealed expert-slab route.
+pub fn slab_gate_up_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G256V2 | DType::MQ3I4G128R256)
+}
+
+/// Whether `dtype` is a routed down format of the sealed expert-slab route.
+pub fn slab_down_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G128V2 | DType::MQ3I4G128R128)
+}
+
+/// Whether a routed `(gate_up, down)` pair is one slab codec: MQ4 symmetric
+/// (QT44, QT53) or MQ3-I4 (qt131, qt132), never crossed.
+pub fn slab_codec_pair(gate_up: DType, down: DType) -> bool {
+    matches!(
+        (gate_up, down),
+        (DType::MQ4G256V2, DType::MQ4G128V2) | (DType::MQ3I4G128R256, DType::MQ3I4G128R128)
+    )
+}
+
+/// Exact geometry and operand contract of the sealed expert-slab route: the
+/// fixed geometry, and routed experts that are either all one slab codec
+/// (no per-expert tables) or a per-expert table of slab codec pairs, one entry
+/// per expert, that really varies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn slab_route_geometry_supported(
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtypes: &MoeDtypes<'_>,
+    has_codec_table: bool,
+) -> bool {
+    let geometry = policy.geometry;
+    let shape = policy.capability.is_slab()
+        && geometry == FIXED_ROUTE_GEOMETRY
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate;
+    if !shape {
+        return false;
+    }
+    if dtypes.routed_has_mixed_experts {
+        let (Some(gate_up), Some(down)) = (dtypes.per_expert_gate_up, dtypes.per_expert_down) else {
+            return false;
+        };
+        has_codec_table
+            && gate_up.len() == experts
+            && down.len() == experts
+            && gate_up.iter().zip(down).all(|(g, d)| slab_codec_pair(*g, *d))
+            && gate_up.iter().any(|g| *g != gate_up[0])
+    } else {
+        !has_codec_table
+            && dtypes.per_expert_gate_up.is_none()
+            && dtypes.per_expert_down.is_none()
+            && slab_codec_pair(dtypes.routed_gate_up, dtypes.routed_down)
+    }
 }
 
 /// Exact geometry and wire-format contract of the gfx942 qt=55 grouped
@@ -895,6 +1146,9 @@ pub trait RoutedExpertWeights {
     /// empty sets and borrowed views. Packed adapters must override this using
     /// their allocation owners: a borrowed buffer is not residency metadata.
     fn host_mapped_projections(&self) -> (bool, bool) {
+        if let Some(tier) = self.tier_identity() {
+            return tier.host_projections();
+        }
         self.get(0).map_or((false, false), |(gate_up, down)| {
             (
                 gate_up.buf.buf.is_host_mapped(),
@@ -933,9 +1187,17 @@ pub trait RoutedExpertWeights {
 
     /// Whether the routed experts live in host-mapped memory. Expert views are
     /// borrowed byte views, so the owner's placement must be carried here; a
-    /// layer's experts share one residency. `false` by default.
+    /// layer's experts share one residency. `false` by default; an explicit
+    /// tier binding answers `any_host`.
     fn host_mapped(&self) -> bool {
-        false
+        self.tier_identity().is_some_and(ExpertTierIdentity::any_host)
+    }
+
+    /// Explicit per-expert tier placement of this layer (`None` for every
+    /// legacy layer). When `Some`, residency is never inferred from expert 0,
+    /// and the live binding retains and revalidates this identity.
+    fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+        None
     }
 }
 

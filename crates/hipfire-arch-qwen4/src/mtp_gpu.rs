@@ -925,6 +925,9 @@ struct MtpGpuStateSnapshotArena {
     mark: MtpStateMark,
     model_id: u64,
     active: bool,
+    /// The entry stays active after a committed window so the window can
+    /// still be rolled back (`retain_validated`).
+    retained: bool,
     generation: u64,
 }
 
@@ -960,6 +963,7 @@ impl MtpGpuStateSnapshotArena {
             mark,
             model_id,
             active: false,
+            retained: false,
             generation: 0,
         })
     }
@@ -1025,6 +1029,7 @@ impl MtpGpuStateSnapshotArena {
 
     fn invalidate(&mut self) {
         self.active = false;
+        self.retained = false;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -1445,10 +1450,13 @@ impl MtpGpuState {
 
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
-        self.snapshot_arena.active
+        self.snapshot_arena.active && !self.snapshot_arena.retained
     }
 
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
+        // A retained entry belongs to a window already committed: the next
+        // snapshot supersedes it (its tickets stop validating).
+        self.release_retained();
         let dimensions = MtpGpuStateSnapshotArena::dimensions(self);
         let mark = self.mark();
         {
@@ -1597,6 +1605,24 @@ impl MtpGpuState {
             "MTP commit_validated requires an active snapshot"
         );
         self.snapshot_arena.invalidate();
+    }
+
+    /// Keep a validated ticket's arena entry active after a committed
+    /// window so a terminal stop inside it can still restore the head. The
+    /// next [`Self::snapshot`], any reset or a session restore drops it.
+    pub(crate) fn retain_validated(&mut self, _snapshot: MtpGpuStateSnapshot) {
+        debug_assert!(
+            self.snapshot_arena.active,
+            "MTP retain_validated requires an active snapshot"
+        );
+        self.snapshot_arena.retained = true;
+    }
+
+    /// Drop the retained arena entry, if any (a no-op otherwise).
+    pub(crate) fn release_retained(&mut self) {
+        if self.snapshot_arena.retained {
+            self.snapshot_arena.invalidate();
+        }
     }
     #[cfg(test)]
     fn commit(&mut self, snapshot: MtpGpuStateSnapshot) -> Result<(), MtpGpuError> {
@@ -2054,6 +2080,18 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // The MTP head is never an expert-tier layer: its experts are the
+        // separately loaded `mtp.` tensors (host-mapped by name), and its
+        // runtime label 0 must never resolve trunk layer 0's tier view.
+        // Tiers are single-device only, so an EP head cannot coexist with a
+        // tier lease at all.
+        if ep.is_some() && weights.expert_tiers().is_some() {
+            let _ = state.free_gpu(gpu);
+            let _ = scratch.free_gpu(gpu);
+            return Err(invalid(
+                "expert tiers are single-device: an EP MTP head cannot attach to tiered weights",
+            ));
+        }
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
                 let built = match ep {
@@ -2066,9 +2104,23 @@ impl Qwen4MtpGpu {
                         placement,
                         dummy,
                     ),
-                    None => Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config),
+                    None => Qwen4MoeLayerRuntime::from_moe_untiered(
+                        gpu,
+                        weights,
+                        moe_weights,
+                        0,
+                        config,
+                    ),
                 };
                 match built {
+                    Ok(moe) if moe.tier_lease().is_some() => {
+                        let _ = moe.free_gpu(gpu);
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(invalid(
+                            "the MTP head's MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+                        ));
+                    }
                     Ok(moe) => Some(moe),
                     Err(error) => {
                         let _ = state.free_gpu(gpu);
@@ -2252,6 +2304,10 @@ impl Qwen4MtpGpu {
 
     pub(crate) fn commit_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
         self.state.commit_validated(snapshot);
+    }
+
+    pub(crate) fn retain_validated(&mut self, snapshot: MtpGpuStateSnapshot) {
+        self.state.retain_validated(snapshot);
     }
 
     pub(crate) fn position(&self) -> usize {

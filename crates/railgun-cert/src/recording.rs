@@ -1350,6 +1350,8 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-dispatch/src/pipeline/moe_program.rs", function: "row_gather", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs", function: "tile_exchange_eager_only", occurrences: 4, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/pipeline/sealed_moe.rs", function: "validate_for_gpu", occurrences: 1, decisions: &["eager-only-refusals"] },
+    // Loader-independent qualification launcher refuses before submission under recording/capture.
+    Site { file: "hipfire-dispatch/src/pipeline/slab_moe_decode.rs", function: "launch", occurrences: 2, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/cpu_exec.rs", function: "moe_cpu_experts", occurrences: 2, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-dispatch/src/cpu_exec.rs", function: "with_cpu_transfer", occurrences: 2, decisions: &["eager-only-refusals"] },
     Site { file: "hipfire-generate/src/redline.rs", function: "redline_bench_decode_deepseek4", occurrences: 1, decisions: &["redline-oracle-diagnostics"] },

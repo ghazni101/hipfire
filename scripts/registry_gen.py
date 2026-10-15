@@ -135,6 +135,9 @@ KNOWN_KV_MODES = {
     "legacy-asym3",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
+# Flash-Next split-base PLE row slots (`ple_q4` / `ple_q8`): live-annotated from
+# the HF tree like every other sidecar, and digest-pinned (LFS oid required).
+PLE_SLOT_KINDS = ("ple_q4", "ple_q8")
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
@@ -598,6 +601,11 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+            for kind in PLE_SLOT_KINDS:
+                if isinstance(entry.get(kind), dict):
+                    new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+                    if not new_entry[kind].get("sha256"):
+                        errors.append(f"{tag}: {kind} sidecar has no LFS sha256 pin")
             # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
             # single one — same annotation, once per entry, so a head that is
             # missing from the repo fails the run like any other sidecar.

@@ -3,21 +3,23 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Interactive `hipfire pull <model>`: pick a tier of the model's registry
-//! family, the PLE rows of a split base and the registry's draft/MTP sidecars,
-//! then confirm a summary with the total download and a disk check.
+//! family, the PLE rows of a split base, the registry's draft/MTP sidecars and
+//! the pinned expert hot set of a matching base, then confirm a summary with
+//! the total download and a disk check.
 //!
 //! The registry entry and [`ple::plan_pull`] stay the source of truth; this
 //! module only chooses the inputs the pull already takes (the tag, the `--ple`
-//! selection and whether the draft/MTP sidecars are fetched). A flag skips the
-//! matching question. A non-TTY stdin or `--yes` asks nothing and takes
-//! [`PullChoice::defaults`]: the requested tag, `--ple auto` and every declared
-//! sidecar, which is what the pull did before it asked anything.
+//! selection, whether the draft/MTP sidecars are fetched and whether the
+//! expert hot set is). A flag skips the matching question. A non-TTY stdin or
+//! `--yes` asks nothing and takes [`PullChoice::defaults`]: the requested tag,
+//! `--ple auto`, every declared sidecar and the expert hot set, which is what
+//! the pull did before it asked anything.
 
 use crate::ple::{self, PleSelection};
 use crate::Paths;
 use anyhow::{bail, Result};
 use hipfire_config::memory::{PleFormat, PleFormatRequest};
-use hipfire_registry::{ModelEntry, RegistryV1, Sidecar, TrunkOverlayPin};
+use hipfire_registry::{ExpertHotsetPin, ModelEntry, RegistryV1, Sidecar, TrunkOverlayPin};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -306,6 +308,8 @@ pub(crate) struct PullChoice<'a> {
     pub ple: PleSelection,
     /// Fetch the draft/MTP sidecars.
     pub draft: bool,
+    /// Fetch the expert hot set sidecar when the base has a pinned one.
+    pub expert_hotset: bool,
 }
 
 impl<'a> PullChoice<'a> {
@@ -317,6 +321,7 @@ impl<'a> PullChoice<'a> {
             entry,
             ple: flags.ple.unwrap_or(PleSelection::Auto),
             draft: flags.draft.unwrap_or(true),
+            expert_hotset: true,
         }
     }
 }
@@ -327,6 +332,7 @@ pub(crate) struct PullContext<'r, 'c> {
     pub registry: &'r RegistryV1,
     pub host: &'c HostFacts,
     pub overlay_pins: &'c [TrunkOverlayPin],
+    pub hotset_pins: &'c [ExpertHotsetPin],
     /// Whether `file` (of the given size, when known) is already in the
     /// models directory. The pull itself still verifies the digest.
     pub present: &'c dyn Fn(&str, Option<u64>) -> bool,
@@ -375,11 +381,18 @@ pub(crate) fn select_pull<'a>(
         }
         None => true,
     };
+    let expert_hotset = if hipfire_registry::expert_hotset_in(entry, ctx.hotset_pins).is_some() {
+        asked = true;
+        ask_expert_hotset(prompt)?
+    } else {
+        true
+    };
     let choice = PullChoice {
         tag,
         entry,
         ple,
         draft,
+        expert_hotset,
     };
     if !asked {
         return Ok(Some(choice));
@@ -520,6 +533,15 @@ fn ask_draft(prompt: &mut dyn Prompt, entry: &ModelEntry) -> Result<bool> {
     }
 }
 
+/// Per-sidecar yes/no for the expert hot set, default on. The size is fixed
+/// text because the summary's GB rounding would print it as 0.00 GB.
+fn ask_expert_hotset(prompt: &mut dyn Prompt) -> Result<bool> {
+    match confirm(prompt, "Fetch Expert hot set (R9700 decode, 213 KB)", true)? {
+        Some(answer) => Ok(answer),
+        None => bail!("pull cancelled: no answer for the expert hot set (end of input)"),
+    }
+}
+
 /// One file of the pull plan.
 #[derive(Debug, PartialEq)]
 pub(crate) struct PlanItem {
@@ -577,6 +599,22 @@ pub(crate) fn plan_items(
             &overlay.sidecar.file,
             overlay.sidecar.size_bytes,
         ));
+    }
+    if choice.expert_hotset {
+        if let Some(hotset) = hipfire_registry::expert_hotset_in(entry, ctx.hotset_pins) {
+            // The pull installs it beside the selected base file, whatever
+            // the pin's remote name is.
+            let local = format!(
+                "{}{}",
+                entry.file,
+                hipfire_config::memory::EXPERT_HOTSET_SIDECAR_SUFFIX
+            );
+            items.push(item(
+                "Expert hot set".to_owned(),
+                &local,
+                hotset.sidecar.size_bytes,
+            ));
+        }
     }
     for (name, sidecar) in &entry.heads {
         items.push(item(
@@ -739,6 +777,7 @@ mod tests {
                     "repo": "hipfire-models/qwen3.8-flash-next",
                     "file": "qwen3.8-flash-next-base.mq4-xts",
                     "size_gb": 70.9, "size_bytes": 70_900_000_000_u64,
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "min_vram_gb": 72.0, "arch_id": 16,
                     "desc": "Best quality. Canonical rung.",
                     "ple_q4": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q4", "size_bytes": 28_800_000_000_u64},
@@ -819,19 +858,37 @@ mod tests {
         host: &HostFacts,
         answers: &str,
     ) -> (Result<Picked>, String) {
+        let (result, transcript) = run_pins(input, flags, host, answers, &[]);
+        (
+            result.map(|picked| picked.map(|(tag, ple, draft, _)| (tag, ple, draft))),
+            transcript,
+        )
+    }
+
+    /// [`run`] with expert-hotset pins; also returns the hot-set choice.
+    #[allow(clippy::type_complexity)]
+    fn run_pins(
+        input: &str,
+        flags: PullFlags,
+        host: &HostFacts,
+        answers: &str,
+        hotset_pins: &[ExpertHotsetPin],
+    ) -> (Result<Option<(String, PleSelection, bool, bool)>>, String) {
         let registry = registry();
         let (tag, entry) = registry.model(input).unwrap();
         let ctx = PullContext {
             registry: &registry,
             host,
             overlay_pins: &[],
+            hotset_pins,
             present: &absent,
         };
         let mut output = Vec::new();
         let result = {
             let mut prompt = LinePrompt::new(Cursor::new(answers.as_bytes()), &mut output);
-            select_pull(&ctx, tag, entry, &flags, &mut prompt)
-                .map(|choice| choice.map(|c| (c.tag.to_owned(), c.ple, c.draft)))
+            select_pull(&ctx, tag, entry, &flags, &mut prompt).map(|choice| {
+                choice.map(|c| (c.tag.to_owned(), c.ple, c.draft, c.expert_hotset))
+            })
         };
         (result, String::from_utf8(output).unwrap())
     }
@@ -1062,7 +1119,8 @@ mod tests {
                 tag: "qwen3.8:flash-next",
                 entry,
                 ple: PleSelection::Auto,
-                draft: true
+                draft: true,
+                expert_hotset: true,
             }
         );
         let flags = PullFlags {
@@ -1072,6 +1130,168 @@ mod tests {
         };
         let choice = PullChoice::defaults(tag, entry, &flags);
         assert_eq!((choice.ple, choice.draft), (PleSelection::Skip, false));
+    }
+
+    /// The pin's remote file name; the pull installs it next to the selected
+    /// entry's own file, so the plan lists [`LOCAL_HOTSET_FILE`].
+    const HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
+    const LOCAL_HOTSET_FILE: &str = "qwen3.8-flash-next-base.mq4-xts.expert-hotset";
+    const HOTSET_SIZE: u64 = 217_676;
+    const BASE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_DIGEST: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const HOTSET_DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    const HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+        base_sha256: BASE_DIGEST,
+        base_size: 70_900_000_000,
+        repo: "hipfire-models/qwen3.8-flash-next",
+        file: HOTSET_FILE,
+        sha256: HOTSET_DIGEST,
+        size_bytes: HOTSET_SIZE,
+    }];
+
+    const OTHER_BASE_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+        base_sha256: OTHER_DIGEST,
+        base_size: 70_900_000_000,
+        repo: "hipfire-models/qwen3.8-flash-next",
+        file: HOTSET_FILE,
+        sha256: HOTSET_DIGEST,
+        size_bytes: HOTSET_SIZE,
+    }];
+
+    #[test]
+    fn a_matching_expert_hotset_is_asked_and_defaults_on() {
+        let (result, transcript) = run_pins(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host(),
+            "\n\n\n\n\n",
+            HOTSET_PINS,
+        );
+        let (tag, _, draft, hotset) = result.unwrap().unwrap();
+        assert_eq!(
+            (tag.as_str(), draft, hotset),
+            ("qwen3.8:flash-next", true, true)
+        );
+        for expected in [
+            "Fetch Expert hot set (R9700 decode, 213 KB)? [Y/n]",
+            LOCAL_HOTSET_FILE,
+            "Total download: 125.70 GB",
+        ] {
+            assert!(
+                transcript.contains(expected),
+                "missing {expected:?} in\n{transcript}"
+            );
+        }
+        let summary = transcript.split("Pull summary").nth(1).unwrap();
+        let line = summary
+            .lines()
+            .find(|line| line.contains(LOCAL_HOTSET_FILE))
+            .unwrap();
+        assert!(line.contains("Expert hot set") && line.ends_with("download"));
+    }
+
+    #[test]
+    fn declining_the_expert_hotset_removes_it_from_the_summary_and_total() {
+        let registry = registry();
+        let host = host();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: &[],
+            hotset_pins: HOTSET_PINS,
+            present: &absent,
+        };
+        let mut choice = PullChoice {
+            tag,
+            entry,
+            ple: PleSelection::Skip,
+            draft: false,
+            expert_hotset: true,
+        };
+        let with = plan_items(&ctx, &choice, false);
+        assert!(with
+            .iter()
+            .any(|item| item.label == "Expert hot set" && item.file == LOCAL_HOTSET_FILE));
+        assert_eq!(download_total(&with), (70_900_000_000 + HOTSET_SIZE, 0));
+        choice.expert_hotset = false;
+        let without = plan_items(&ctx, &choice, false);
+        assert!(without.iter().all(|item| item.file != LOCAL_HOTSET_FILE));
+        assert_eq!(download_total(&without), (70_900_000_000, 0));
+
+        // The present check reads the local file beside the base.
+        let present = |file: &str, _: Option<u64>| file == LOCAL_HOTSET_FILE;
+        let ctx = PullContext {
+            present: &present,
+            ..ctx
+        };
+        choice.expert_hotset = true;
+        let items = plan_items(&ctx, &choice, false);
+        let hotset = items
+            .iter()
+            .find(|item| item.file == LOCAL_HOTSET_FILE)
+            .unwrap();
+        assert!(!hotset.download);
+        assert_eq!(download_total(&items), (70_900_000_000, 0));
+
+        // Answering `n` stores the deselection; the summary omits the file.
+        // Answers: tier 1, PLE none (4), no draft, no hot set, confirm.
+        let (result, transcript) = run_pins(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host,
+            "1\n4\nn\nn\n\n",
+            HOTSET_PINS,
+        );
+        let (_, _, _, hotset) = result.unwrap().unwrap();
+        assert!(!hotset);
+        let summary = transcript.split("Pull summary").nth(1).unwrap();
+        assert!(!summary.contains(LOCAL_HOTSET_FILE));
+        assert!(summary.contains("Total download: 70.90 GB"));
+    }
+
+    #[test]
+    fn an_absent_expert_hotset_pin_asks_and_lists_nothing() {
+        // No pins, then a pin for another base identity: no question, no item.
+        for pins in [&[][..], OTHER_BASE_PINS] {
+            let (result, transcript) = run_pins(
+                "qwen3.8:flash-next",
+                PullFlags::default(),
+                &host(),
+                "\n\n\n\n",
+                pins,
+            );
+            assert!(result.unwrap().unwrap().3);
+            assert!(!transcript.contains("Expert hot set"));
+            assert!(!transcript.contains(LOCAL_HOTSET_FILE));
+        }
+    }
+
+    #[test]
+    fn no_input_defaults_the_expert_hotset_on() {
+        let registry = registry();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        assert!(PullChoice::defaults(tag, entry, &PullFlags::default()).expert_hotset);
+        let flags = PullFlags {
+            ple: Some(PleSelection::Skip),
+            draft: Some(false),
+            force: true,
+        };
+        assert!(PullChoice::defaults(tag, entry, &flags).expert_hotset);
+
+        // With every flag given and the tier answered, the hot set is the one
+        // open question; end of input cancels instead of guessing.
+        let flags = PullFlags {
+            ple: Some(PleSelection::Q8),
+            draft: Some(true),
+            force: false,
+        };
+        let (result, _) = run_pins("qwen3.8:flash-next", flags, &host(), "1\n", HOTSET_PINS);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no answer for the expert hot set"));
     }
 
     #[test]
@@ -1084,6 +1304,7 @@ mod tests {
             registry: &registry,
             host: &host,
             overlay_pins: &[],
+            hotset_pins: &[],
             present: &present,
         };
         let choice = PullChoice {
@@ -1091,6 +1312,7 @@ mod tests {
             entry,
             ple: PleSelection::All,
             draft: false,
+            expert_hotset: true,
         };
         let items = plan_items(&ctx, &choice, false);
         let shape: Vec<(&str, bool)> = items

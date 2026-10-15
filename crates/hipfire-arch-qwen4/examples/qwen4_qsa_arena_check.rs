@@ -77,7 +77,7 @@
 //!                                BF16 mirror arms (without / with the F16
 //!                                arena) and require canonical equality
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::gpu_forward::Qwen4QsaTap;
 use hipfire_dispatch::pipeline::IndexedAttentionOp;
@@ -1145,11 +1145,13 @@ fn run() -> Result<i32> {
         return Err(format!("prompt of {n} tokens needs at least one full chunk and a partial tail chunk"));
     }
     let branch = branch_tokens(&tokenizer, &tokens)?;
-    let receipt = admit_hfqm_artifact(&hfq).map_err(err)?;
+    let mut gpu = Gpu::init().map_err(err)?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(err)?;
     if !receipt.config.profile.is_flash_next() {
         return Err("arena oracle requires an admitted real Flash-Next model".into());
     }
-    let mut gpu = Gpu::init().map_err(err)?;
 
     // Device proof.
     let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(err)?;
@@ -1223,6 +1225,13 @@ fn run() -> Result<i32> {
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
             if use_ranges || entry.residency.is_external() {
                 return source
                     .tensor_range(&entry.name)

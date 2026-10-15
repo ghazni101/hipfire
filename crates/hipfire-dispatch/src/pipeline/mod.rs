@@ -25,6 +25,8 @@ pub use sealed_moe::{
 };
 pub(crate) mod moe_program;
 pub(crate) mod qt44_qt53_prefill;
+pub mod slab_moe_decode;
+pub mod slab_route;
 pub use moe_program::{MoeStage, SealedMoeOp};
 pub mod moe_dump;
 pub(crate) mod draft_head;
@@ -61,6 +63,8 @@ pub use steps::{
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+/// Generic-pipeline refusal for the typed-only formats: MQ4G128V2 (qt=53) and
+/// the planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134).
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
     if dtype == DType::MQ4G128V2 {
         return Err(DispatchError::UnsupportedVariant {
@@ -69,6 +73,9 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
             arch: "",
             quant: "MQ4G128V2",
         });
+    }
+    if dtype.is_mq_i4() {
+        return Err(reject_mq_i4(dtype, family));
     }
     Ok(())
 }
@@ -131,6 +138,23 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
         || [dtypes.router, dtypes.routed_gate_up, dtypes.routed_down].contains(&DType::MQ4G128V2)
     {
         return reject_mq4g128v2(DType::MQ4G128V2, "moe");
+    }
+    let first_mq_i4 = dtypes
+        .per_expert_gate_up
+        .into_iter()
+        .chain(dtypes.per_expert_down)
+        .flatten()
+        .copied()
+        .chain(
+            dtypes
+                .shared
+                .into_iter()
+                .flat_map(|shared| [shared.selector, shared.gate, shared.up, shared.down]),
+        )
+        .chain([dtypes.router, dtypes.routed_gate_up, dtypes.routed_down])
+        .find(|dtype| dtype.is_mq_i4());
+    if let Some(dtype) = first_mq_i4 {
+        return reject_mq4g128v2(dtype, "moe");
     }
     Ok(())
 }
@@ -200,6 +224,46 @@ fn select_grouped_route(
                 ]
                 && uniform(dtypes.per_expert_gate_up, formats.routed_gate_up)
                 && uniform(dtypes.per_expert_down, formats.routed_down) =>
+        {
+            Some(policy.capability)
+        }
+        // The sealed expert-slab route: per-expert codecs, the codec table
+        // standing in for the legacy dtype-tag table.
+        MoeRouteCapability::SlabCodecGrouped
+            if policy.capability.admitted_on()
+                && crate::families::moe::slab_route_geometry_supported(
+                    &policy,
+                    n_exp,
+                    k_top,
+                    hidden,
+                    intermediate,
+                    gate_up_k,
+                    down_m,
+                    down_k,
+                    dtypes,
+                    dtype_tags.is_some(),
+                )
+                && shared_intermediate == policy.geometry.shared_intermediate
+                && !dtypes.has_paro_shared
+                && !has_sidecars
+                && formats.router == DType::BF16
+                && formats.shared_selector == DType::BF16
+                && matches!(formats.shared_gate, DType::BF16 | DType::Q8_0)
+                && formats.shared_up == formats.shared_gate
+                && matches!(formats.shared_down, DType::BF16 | DType::Q8_0 | DType::MQ4G128V2)
+                && [
+                    dtypes.router,
+                    shared.selector,
+                    shared.gate,
+                    shared.up,
+                    shared.down,
+                ] == [
+                    formats.router,
+                    formats.shared_selector,
+                    formats.shared_gate,
+                    formats.shared_up,
+                    formats.shared_down,
+                ] =>
         {
             Some(policy.capability)
         }
@@ -3916,6 +3980,22 @@ fn decode_gate_up_stage(
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
         let gate_batch = slice_moe_f32_view(p.gate_batch, 0, routed_slots);
         let up_batch = slice_moe_f32_view(p.up_batch, 0, routed_slots);
+        if route.is_some_and(MoeRouteCapability::is_slab) {
+            // Sealed expert-slab C1 decode: the K1 lane-union GEMV over codec
+            // buckets (per-expert codecs, pointer-addressed).
+            let buckets = slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+            slab_route::k1_gate_up(
+                gpu,
+                buckets,
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                &gate_batch,
+                &up_batch,
+                1,
+            )?;
+            return Ok(());
+        }
         hip!(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
             p.expert_gate_up_ptrs,
             p.topk_indices,
@@ -4270,6 +4350,18 @@ fn decode_down_stage(
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
+        if route.is_some_and(MoeRouteCapability::is_slab) {
+            // Over the union this call's gate/up planned (same stream, no
+            // other slab launch between the two stages).
+            let buckets = slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+            slab_route::k1_down(gpu, buckets, p.expert_down_ptrs, &rot_batch, &down_expanded, 1)?;
+            // The top-10 combine rounds every expert output it reads to BF16; a
+            // deferred combine may read the buffer elsewhere, so it keeps the pass.
+            if p.recipe.bf16_round_trip() && p.defer_routed_combine {
+                hip!(gpu.bf16_round_trip_f32(&down_expanded))?;
+            }
+            return Ok(());
+        }
         hip!(gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
             p.expert_down_ptrs,
             p.topk_indices,
@@ -4941,7 +5033,7 @@ fn prefill_gate_up_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && p.routed_experts.host_mapped_projections().0,
+            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).0,
         )?;
         // The explicit unscatter stage follows this grouped GEMM.
     } else {
@@ -5317,7 +5409,7 @@ fn prefill_down_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && p.routed_experts.host_mapped_projections().1,
+            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {

@@ -792,6 +792,13 @@ pub trait Speculator {
     ///
     /// Returns `true` when the resident target and drafter caches are repaired.
     /// The default is unsupported; callers retain the conservative reset path.
+    ///
+    /// Call it right after observing the window, before any further `step`,
+    /// forced advance, prefill, reset or [`Self::configure_request`] on this
+    /// speculator: an implementation that retains pre-window state (Qwen4
+    /// native MTP) releases it at the next such call. `false` also means "no
+    /// retained window" (see [`SpecRequestConfig::stop_sequences`]), not only
+    /// "unsupported".
     fn repair_terminal_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -975,6 +982,15 @@ pub struct SpecRequestConfig {
     pub presence_penalty: f32,
     /// OpenAI frequency penalty over the window. `0.0` = off.
     pub frequency_penalty: f32,
+    /// The request can end inside a speculative window on a stop sequence,
+    /// which no draft-side signal predicts. A speculator whose cheapest
+    /// windows commit rows one at a time (Qwen4's interleaved MTP routes)
+    /// keeps pre-window state only when this is set, so
+    /// [`Speculator::repair_terminal_prefix`] can still repair such a stop;
+    /// windows that already snapshot for their own rollback retain it
+    /// regardless. A caller sets it from `!stop.is_empty()`; the default is
+    /// `false`, which keeps those windows snapshot-free.
+    pub stop_sequences: bool,
 }
 
 impl Default for SpecRequestConfig {
@@ -993,6 +1009,7 @@ impl Default for SpecRequestConfig {
             repeat_window: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            stop_sequences: false,
         }
     }
 }
@@ -1677,6 +1694,15 @@ pub trait SpecEmit {
     /// enters the force path, so every other emitter is byte-identical no-op.
     fn take_forced(&mut self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// The most tokens the next speculative window may commit so that no
+    /// emitter intervention (think-budget force-close or think-cap stop) lands
+    /// strictly inside it: any intervention may only fall on the window's last
+    /// token, so the loop never has to repair already-committed state.
+    /// `None` = no limit (the default).
+    fn window_cap(&self) -> Option<usize> {
+        None
     }
 }
 

@@ -837,6 +837,18 @@ pub enum DType {
     /// row, the header is the reader's. See `docs/quant-formats/fp8-e4m3.md`.
     FP8E4M3PT,
     Raw, // raw bytes, no element interpretation
+    /// MQ3-I4 gate/up (qt=131): typed-qwen4 expert-slab format, W3 grid
+    /// `±{1,3,5,7}`, R256 FWHT. PLANAR layout — `[M*K*3/8 B codes][M*K/128 f16
+    /// scales]` — so there is no per-row stride (`row_bytes()` is `None`; the
+    /// size needs both M and K). No GPU kernel yet: generic consumers must
+    /// reject it. See `hipfire_runtime::mq_i4`.
+    MQ3I4G128R256,
+    /// MQ3-I4 down (qt=132): W3 codec, R128 FWHT. Same planar layout as qt=131.
+    MQ3I4G128R128,
+    /// MQ2-I4 gate/up (qt=133): W2 grid `±{1,3}`, R256 FWHT. Planar like qt=131.
+    MQ2I4G128R256,
+    /// MQ2-I4 down (qt=134): W2 codec, R128 FWHT. Planar like qt=131.
+    MQ2I4G128R128,
 }
 
 impl DType {
@@ -892,7 +904,11 @@ impl DType {
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
             | DType::ParoQ4G128
-            | DType::Raw => 1, // byte-level
+            | DType::Raw
+            | DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128 => 1, // byte-level
         }
     }
 
@@ -935,8 +951,32 @@ impl DType {
                 .map(|scales| scales & !15)?
                 .checked_add(blocks.checked_mul(16)?)?
                 .checked_add(16),
+            // MQ-I4 is planar (codes plane, then scale plane): no per-row
+            // stride exists, and the size needs M as well as K.
+            DType::MQ3I4G128R256
+            | DType::MQ3I4G128R128
+            | DType::MQ2I4G128R256
+            | DType::MQ2I4G128R128 => None,
             _ => None,
         }
+    }
+
+    /// Canonical name of the typed-qwen4-only planar MQ3-I4 / MQ2-I4 formats
+    /// (qt=131..=134); `None` for every other dtype. Generic consumers use
+    /// this to refuse them with a named error instead of a generic fallback.
+    pub fn mq_i4_name(self) -> Option<&'static str> {
+        match self {
+            DType::MQ3I4G128R256 => Some("MQ3I4G128R256"),
+            DType::MQ3I4G128R128 => Some("MQ3I4G128R128"),
+            DType::MQ2I4G128R256 => Some("MQ2I4G128R256"),
+            DType::MQ2I4G128R128 => Some("MQ2I4G128R128"),
+            _ => None,
+        }
+    }
+
+    /// Whether this is one of the typed-qwen4-only planar MQ-I4 formats.
+    pub fn is_mq_i4(self) -> bool {
+        self.mq_i4_name().is_some()
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
@@ -2080,6 +2120,10 @@ impl Gpu {
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
                 qwen4_moe_down_i4_scratch_bytes: 0,
+                qwen4_slab_union_scratch: None,
+                qwen4_slab_union_scratch_bytes: 0,
+                qwen4_slab_tiles_scratch: None,
+                qwen4_slab_tiles_scratch_bytes: 0,
                 qwen4_moe_down_i4_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
@@ -7818,6 +7862,27 @@ mod tests {
         assert_eq!(DType::MFP3G32E8.row_bytes(256), Some(120));
         assert_eq!(DType::Q8_0.row_bytes(0), None);
         assert_eq!(DType::Raw.row_bytes(8), None);
+    }
+
+    /// qt=131..=134 are planar typed-qwen4-only formats: byte-level `size()`,
+    /// no per-row stride, and a name for generic consumers to refuse by.
+    #[test]
+    fn mq_i4_dtypes_are_planar_and_typed_only() {
+        for (dt, name) in [
+            (DType::MQ3I4G128R256, "MQ3I4G128R256"),
+            (DType::MQ3I4G128R128, "MQ3I4G128R128"),
+            (DType::MQ2I4G128R256, "MQ2I4G128R256"),
+            (DType::MQ2I4G128R128, "MQ2I4G128R128"),
+        ] {
+            assert_eq!(dt.size(), 1);
+            assert_eq!(dt.row_bytes(128), None);
+            assert_eq!(dt.row_bytes(640), None);
+            assert_eq!(dt.row_bytes(2560), None);
+            assert_eq!(dt.mq_i4_name(), Some(name));
+            assert!(dt.is_mq_i4());
+        }
+        assert!(!DType::MQ4G128V2.is_mq_i4());
+        assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
     }
 
     #[test]

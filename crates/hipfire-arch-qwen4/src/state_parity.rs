@@ -1472,10 +1472,15 @@ fn qwen4_use_range_payload(is_uma: bool, residency: WeightResidency) -> bool {
 
 fn qwen4_oracle_payload<'a>(
     source: &'a hipfire_runtime::hfq::HfqModelSource,
+    recipe: &crate::weights::Qwen4TierRecipe,
     entry: &WeightEntry,
     use_ranges: bool,
 ) -> Result<hipfire_runtime::model_source::SourcePayload<'a>, String> {
     use hipfire_runtime::model_source::SourcePayload;
+    // An expert-slab layer arena is one span of the container, not a tensor.
+    if let Some(payload) = crate::expert_arena::recipe_arena_payload(source, recipe, entry) {
+        return payload;
+    }
     if qwen4_use_range_payload(use_ranges, entry.residency) {
         return source
             .tensor_range(&entry.name)
@@ -1523,8 +1528,12 @@ fn run_profile_inner(
     let open_ns = profile_duration_ns(open_started);
     emit_profile_load_checkpoint("open_hfq", open_ns);
 
+    let gpu_init_started = Instant::now();
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let gpu_init_ns = profile_duration_ns(gpu_init_started);
+    emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     let admission_started = Instant::now();
-    let receipt = crate::admit_hfqm_artifact(&hfq)
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let admission_ns = profile_duration_ns(admission_started);
     emit_profile_load_checkpoint("admission", admission_ns);
@@ -1532,11 +1541,6 @@ fn run_profile_inner(
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-
-    let gpu_init_started = Instant::now();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let gpu_init_ns = profile_duration_ns(gpu_init_started);
-    emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode =
@@ -1553,8 +1557,9 @@ fn run_profile_inner(
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
     let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
@@ -1581,7 +1586,7 @@ fn run_profile_inner(
             };
             emit_profile_source_callback(index, entry, elapsed_ns, cumulative_ns);
 
-            qwen4_oracle_payload(&source, entry, use_ranges)
+            qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges)
         },
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
@@ -1857,13 +1862,13 @@ pub fn run_state_parity(
     let (tokens, corpus) = read_state_tokens(corpus_path)?;
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
-    let receipt = crate::admit_hfqm_artifact(&hfq)
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode =
@@ -1877,13 +1882,14 @@ pub fn run_state_parity(
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
+        |entry| qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -2235,13 +2241,13 @@ pub fn run_mtp_fill_digest(
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("tokenizer: {error}"))?;
     let prompt_ids = prompt_text.map(|text| tokenizer.encode(text));
-    let receipt = crate::admit_hfqm_artifact(&hfq)
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     let domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
         &hfq,
         &tokenizer,
@@ -2269,7 +2275,7 @@ pub fn run_mtp_fill_digest(
         config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
+        |entry| qwen4_oracle_payload(&source, &manifest.identity.recipe, entry, use_ranges),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
@@ -2786,9 +2792,9 @@ pub fn run_mtp_takeover_fill_oracle(
     let prompt = tokenizer.encode(&rendered);
     const REF_STEPS: usize = 40;
     assert!(!prompt.is_empty() && prompt.len() + REF_STEPS + 8 < max_seq, "oracle context");
-    let receipt = crate::admit_hfqm_artifact(&hfq)
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let mut gpu = Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = crate::artifact::source_forward_scratch_mode(
@@ -2809,7 +2815,7 @@ pub fn run_mtp_takeover_fill_oracle(
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, entry, use_ranges),
+        |entry| qwen4_oracle_payload(&source, &receipt.manifest.identity.recipe, entry, use_ranges),
     ).map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     // Match run_mtp_fill_digest: the reusable family walker uses logical
     // F32 row widths. This is a head-fill/rollback oracle, not a KV-format

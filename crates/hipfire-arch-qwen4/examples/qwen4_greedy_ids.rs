@@ -9,6 +9,12 @@
 //! must agree bit-for-bit) run the same JSONL and their output files are
 //! compared byte for byte.
 //!
+//! Model load follows `qwen4_kld`: admission on the GPU architecture
+//! (`admit_hfqm_artifact_on`), slab layer arenas served by
+//! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
+//! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
+//! rest host-mapped and borrowed from the resident source bytes.
+//!
 //! Usage:
 //!   qwen4_greedy_ids --model MODEL.hfq --input PROMPTS.jsonl --output IDS.jsonl \
 //!                    --max-new-tokens N [--max-seq 8192] [--thinking on|off]
@@ -57,11 +63,11 @@
 //! `len + max_new_tokens + 1` exceeds `--max-seq` is an error (the daemon
 //! would silently shrink the budget; an identity run must not).
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message};
 use hipfire_runtime::tokenizer::{maybe_normalize_prompt, Tokenizer};
@@ -305,7 +311,8 @@ impl Model {
             },
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
-        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+            .map_err(|e| format!("qwen4 admission: {e}"))?;
         let trunk_overlay =
             hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
@@ -334,13 +341,52 @@ impl Model {
         let expected = WeightOrigin::for_single(&mesh, &gpu);
         let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+        // and host-maps the rest (a slab artifact larger than one card).
+        let weights = {
+            let mut weights = receipt.manifest.weights.clone();
+            match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+                None => {}
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                    if gpu.is_uma() {
+                        return Err("host-mapped experts are only for discrete GPUs".into());
+                    }
+                    let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                        &mut weights,
+                        layers,
+                    );
+                    eprintln!(
+                        "qwen4_greedy_ids: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                    );
+                }
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                    return Err("qwen4_greedy_ids takes a fixed expert layer count, not auto".into());
+                }
+            }
+            weights
+        };
         let transaction = fulfill_manifest_from_payloads(
-            &receipt.manifest.weights,
+            &weights,
             &mesh,
             receipt.config.num_hidden_layers,
             &mut gpu,
             expected,
             |entry| {
+                if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                    &source,
+                    &receipt.manifest.identity.recipe,
+                    entry,
+                ) {
+                    return payload;
+                }
+                // The store rejects a host-mapped entry as a range: borrow it
+                // from the resident source bytes, as the product loader does.
+                if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                    let (info, bytes) = source
+                        .tensor_data(&entry.name)
+                        .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                    return Ok(SourcePayload::Borrowed { info, bytes });
+                }
                 source
                     .tensor_range(&entry.name)
                     .map_err(|e| e.to_string())?
@@ -370,6 +416,7 @@ impl Model {
             receipt.ple_rows,
             state_format,
             backend,
+            None,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle.attach_npu_trunk_identity(npu_identity);

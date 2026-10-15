@@ -547,13 +547,22 @@ pub(crate) fn announce_pull_plan<'a>(
         } else {
             "download"
         };
+        let state = if is_shared_slot(entry, *format, sidecar) {
+            format!(
+                "{state}, shared; linked as {}.{}",
+                entry.file,
+                format.sidecar_suffix()
+            )
+        } else {
+            state.to_owned()
+        };
         eprintln!(
             "{}",
             plan_line(
                 &format!("ple-{}", format.name()),
                 &sidecar.file,
                 sidecar.size_bytes,
-                state
+                &state
             )
         );
     }
@@ -598,8 +607,87 @@ fn selection_name(selection: PleSelection) -> &'static str {
     }
 }
 
-/// Download one PLE sidecar to `destination` unless a verified copy exists.
-pub(crate) fn fetch_ple_sidecar(
+/// True when `sidecar` is the family-shared PLE file of a Flash-Next split base
+/// (`qwen3.8-flash-next.ple-q4`) rather than the per-base `<base file>.ple-q4`.
+/// The runtime loader only ever opens `<base file>.ple-qN`, so a shared slot is
+/// installed as a link under that name ([`install_shared_alias`]).
+pub(crate) fn is_shared_slot(entry: &ModelEntry, format: PleFormat, sidecar: &Sidecar) -> bool {
+    sidecar.file != format!("{}.{}", entry.file, format.sidecar_suffix())
+}
+
+/// Make `alias` (`<base file>.ple-qN`, the name the loader opens) a link to the
+/// verified shared file `canonical`, never copying its bytes.
+///
+/// The caller has verified `canonical` against the registry pin. An alias that
+/// is already the same file is left alone. A different one is replaced
+/// (atomically, through a temporary link) only when it is a dangling symlink or
+/// verifies against the same pin; any other file is somebody else's sidecar
+/// (e.g. a private `hipfire ple split` output) and is never touched.
+fn install_shared_alias(
+    canonical: &Path,
+    alias: &Path,
+    sidecar: &Sidecar,
+    format: PleFormat,
+) -> Result<()> {
+    match fs::symlink_metadata(alias) {
+        Ok(link) => {
+            if crate::same_installed_file(alias, canonical) {
+                return Ok(());
+            }
+            let dangling = link.file_type().is_symlink() && fs::metadata(alias).is_err();
+            if !dangling
+                && !crate::existing_artifact_valid(
+                    alias,
+                    sidecar.sha256.as_deref(),
+                    sidecar.size_bytes,
+                )
+            {
+                bail!(
+                    "{} exists but is not the verified shared {}; remove it to install the \
+                     shared pair (nothing was changed)",
+                    alias.display(),
+                    sidecar.file
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", alias.display()));
+        }
+    }
+    let mut temporary = alias.as_os_str().to_owned();
+    temporary.push(format!(".link.{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("clearing {}", temporary.display()));
+        }
+    }
+    if !crate::install_verified_link(canonical, &temporary)? {
+        bail!(
+            "cannot link {} to {}: the filesystem supports neither hard links nor symlinks",
+            alias.display(),
+            canonical.display()
+        );
+    }
+    if let Err(error) = fs::rename(&temporary, alias) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("installing {}", alias.display()));
+    }
+    eprintln!(
+        "  ple-{} linked: {} -> {}",
+        format.name(),
+        alias.display(),
+        canonical.display()
+    );
+    Ok(())
+}
+
+/// Download `destination` unless a verified copy exists (`force` re-downloads).
+/// On `Ok` the file matches the registry pin.
+fn fetch_verified_slot(
     entry: &ModelEntry,
     format: PleFormat,
     sidecar: &Sidecar,
@@ -639,6 +727,25 @@ pub(crate) fn fetch_ple_sidecar(
         false,
     )
     .with_context(|| format!("downloading {}", sidecar.file))
+}
+
+/// Install one PLE sidecar of `entry` into `models` unless a verified copy
+/// exists. A per-base slot is the file the loader opens. A shared slot is
+/// fetched once under its family name, then linked as `<base file>.ple-qN`
+/// once the canonical file has verified.
+pub(crate) fn fetch_ple_sidecar(
+    entry: &ModelEntry,
+    format: PleFormat,
+    sidecar: &Sidecar,
+    models: &Path,
+    force: bool,
+) -> Result<()> {
+    fetch_verified_slot(entry, format, sidecar, &models.join(&sidecar.file), force)?;
+    if is_shared_slot(entry, format, sidecar) {
+        let alias = ple_sidecar_path(&models.join(&entry.file), format);
+        install_shared_alias(&models.join(&sidecar.file), &alias, sidecar, format)?;
+    }
+    Ok(())
 }
 
 /// Make the PLE rows of a resolved registry model available before a load:
@@ -682,7 +789,19 @@ pub(crate) fn ensure_ple_sidecar(
     };
     let sidecar = ple_slot(entry, format)
         .ok_or_else(|| anyhow!("registry slot ple-{} vanished", format.name()))?;
-    if !allow_download {
+    let shared = is_shared_slot(entry, format, sidecar);
+    let alias = ple_sidecar_path(model_path, format);
+    let destination = if shared {
+        model_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(&sidecar.file)
+    } else {
+        alias.clone()
+    };
+    // A shared file another base already downloaded only needs linking.
+    let local_shared = shared && destination.is_file();
+    if !allow_download && !local_shared {
         bail!(
             "ple: {} is missing; run `hipfire pull {label} --ple {}` on the server first \
              ({}; downloads named by a request are off: serve.allow_request_pull)",
@@ -691,13 +810,32 @@ pub(crate) fn ensure_ple_sidecar(
             format_size(sidecar.size_bytes)
         );
     }
+    if local_shared {
+        eprintln!("ple: verifying shared {}", sidecar.file);
+        if crate::existing_artifact_valid(
+            &destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+        ) {
+            return install_shared_alias(&destination, &alias, sidecar, format);
+        }
+        if !allow_download {
+            bail!(
+                "ple: shared {} fails verification; run `hipfire pull {label} --ple {}` on the \
+                 server to refresh it (downloads named by a request are off: \
+                 serve.allow_request_pull)",
+                sidecar.file,
+                format.name()
+            );
+        }
+        eprintln!("ple: shared {} is stale, refreshing", sidecar.file);
+    }
     eprintln!(
         "ple: downloading {} ({}) for memory.ple_format={}",
         sidecar.file,
         format_size(sidecar.size_bytes),
         request.name()
     );
-    let destination = ple_sidecar_path(model_path, format);
     crate::download_verified(
         &crate::artifact_url(entry, &sidecar.file),
         &destination,
@@ -705,7 +843,11 @@ pub(crate) fn ensure_ple_sidecar(
         sidecar.size_bytes,
         false,
     )
-    .with_context(|| format!("downloading {}", sidecar.file))
+    .with_context(|| format!("downloading {}", sidecar.file))?;
+    if shared {
+        install_shared_alias(&destination, &alias, sidecar, format)?;
+    }
+    Ok(())
 }
 
 fn note_monolithic(label: &str, file: &str) {

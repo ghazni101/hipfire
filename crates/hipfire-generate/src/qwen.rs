@@ -3474,6 +3474,10 @@ pub fn generate_dflash(
             repeat_window,
             presence_penalty,
             frequency_penalty,
+            // A stop sequence can end a native Qwen4 window strictly inside it;
+            // the drafter keeps its pre-window target/head snapshots reopenable
+            // for `repair_terminal_prefix` only when the request may need that.
+            stop_sequences: !stop.is_empty(),
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -4391,6 +4395,16 @@ pub fn generate_spec(
             return None;
         }
     };
+    // Native Qwen4 MTP commits a whole window before the emitter observes it,
+    // so an emitter intervention (think-budget force-close or think-cap stop)
+    // that lands strictly inside a window would leave committed state past the
+    // intervention. The loop clamps each window to the emitter's
+    // `window_cap()` for this speculator so the intervention only ever falls
+    // on a window's last token — no Realign re-prefill, no window repair.
+    // Other speculators keep their own handling.
+    let native_qwen4_mtp = spec
+        .drafter_any_mut()
+        .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -4869,7 +4883,11 @@ pub fn generate_spec(
         // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
         // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
         // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let max_emit = max_tokens.saturating_sub(generated);
+        let max_emit = spec_window_emit_budget(
+            max_tokens.saturating_sub(generated),
+            native_qwen4_mtp,
+            emit.window_cap(),
+        );
         let window_seed = seed_token;
         let mtp_outer_t0 = std::time::Instant::now();
         let step = match spec.step(
@@ -5030,9 +5048,15 @@ pub fn generate_spec(
         };
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter. Continue-generation paths rebuild the exact
-        // KV-resident prefix; completed requests reset and invalidate cache
-        // metadata so they do not pay a full-history replay before returning.
+        // target + drafter. Native Qwen4 MTP first tries a window-local repair
+        // (restore the pre-window target/head, replay only the consumed prefix)
+        // for both a terminal strict prefix and a non-terminal one (a forced
+        // intervention the window cap did not absorb), so neither pays a
+        // full-history re-prefill nor drops live cache metadata. Other
+        // speculators keep the terminal-only repair attempt. Unrepaired
+        // continue-generation paths rebuild the exact KV-resident prefix;
+        // unrepaired completed requests reset and invalidate cache metadata so
+        // they do not pay a full-history replay before returning.
         // Full-window observe keeps the step's already-committed GPU state.
         //
         // Capacity-aware: admit BEFORE reset/prefill. Realign is full-history
@@ -5041,14 +5065,16 @@ pub fn generate_spec(
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
-        let strict_prefix_action =
+        let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
-            // Prefer a window-local repair: restore the pre-window target/drafter
-            // snapshot and replay only the consumed prefix. Speculators without
-            // that capability drop live state via the target's terminal reset
-            // and conversation-LCP invalidation at turn end. Qwen4's durable
-            // session snapshots remain available for the next request.
+        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp) {
+            // Must run right after the window is observed and before any
+            // further step / forced advance / prefill / reset on the
+            // speculator: the retained pre-window snapshot is only valid until
+            // then. `true` leaves target + drafter at the pre-window state plus
+            // the replayed consumed prefix, with the last consumed token
+            // pending for the normal terminal flush / forced advance — the
+            // exact state a Realign or terminal reset would reconstruct.
             let repaired = match spec.repair_terminal_prefix(
                 gpu,
                 slot,
@@ -5080,29 +5106,37 @@ pub fn generate_spec(
                     return None;
                 }
             };
-            if repaired
-                && hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
             {
                 eprintln!(
-                    "[qwen-cache terminal-repair] window_start={} consumed={} replayed={}",
-                    position_before, keep, keep
+                    "[qwen-cache window-repair] window_start={} consumed={} terminal={} repaired={}",
+                    position_before,
+                    keep,
+                    strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal,
+                    repaired
                 );
             }
-            let reset_error = if repaired {
-                None
-            } else {
-                slot.reset_after_unrepaired_terminal(gpu)
-                    .err()
-                    .map(|e| format!("reset_after_unrepaired_terminal: {e}"))
-                    .or_else(|| {
-                        spec.reset_for_realign(gpu)
-                            .err()
-                            .map(|e| format!("spec.reset_for_realign: {e}"))
-                    })
-            };
+            if repaired {
+                strict_prefix_action = SpecStrictPrefixAction::None;
+            }
+        }
+        if strict_prefix_action == SpecStrictPrefixAction::RepairForTerminal {
+            // Unrepaired terminal: speculators without a repairable window drop
+            // live state via the target's terminal reset and conversation-LCP
+            // invalidation at turn end. Qwen4's durable session snapshots
+            // remain available for the next request.
+            let reset_error = slot
+                .reset_after_unrepaired_terminal(gpu)
+                .err()
+                .map(|e| format!("reset_after_unrepaired_terminal: {e}"))
+                .or_else(|| {
+                    spec.reset_for_realign(gpu)
+                        .err()
+                        .map(|e| format!("spec.reset_for_realign: {e}"))
+                });
             if let Some(msg) = reset_error {
                 let ep = production_fail_closed_rollback_live(
                     &mut m.seq_pos,
@@ -5125,11 +5159,9 @@ pub fn generate_spec(
                 drop(guard);
                 return None;
             }
-            if !repaired {
-                terminal_cache_invalidated = true;
-                pending_seed_committable = false;
-                position = 0;
-            }
+            terminal_cache_invalidated = true;
+            pending_seed_committable = false;
+            position = 0;
         }
         if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
@@ -7327,6 +7359,67 @@ pub fn spec_strict_prefix_action(
         SpecStrictPrefixAction::RepairForTerminal
     } else {
         SpecStrictPrefixAction::Realign
+    }
+}
+
+/// Whether to try [`Speculator::repair_terminal_prefix`] for a strict-prefix
+/// window before any reset or re-prefill. A terminal strict prefix always
+/// tries (the speculator answers `false` when it cannot repair); a
+/// non-terminal one (`Realign`, a forced intervention inside the window) tries
+/// only on native Qwen4 MTP, which restores its retained pre-window target and
+/// head and replays the consumed prefix instead of re-prefilling history.
+pub fn spec_window_repair_attempt(action: SpecStrictPrefixAction, native_qwen4_mtp: bool) -> bool {
+    match action {
+        SpecStrictPrefixAction::None => false,
+        SpecStrictPrefixAction::RepairForTerminal => true,
+        SpecStrictPrefixAction::Realign => native_qwen4_mtp,
+    }
+}
+
+/// Output budget for the next speculative window. `remaining` is what
+/// `max_tokens` still allows; native Qwen4 MTP additionally clamps it to the
+/// emitter's [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a
+/// think-budget force-close or think-cap stop only lands on the window's last
+/// token. Other speculators ignore the cap.
+pub fn spec_window_emit_budget(remaining: usize, native_qwen4_mtp: bool, cap: Option<usize>) -> usize {
+    match cap {
+        Some(cap) if native_qwen4_mtp => remaining.min(cap.max(1)),
+        _ => remaining,
+    }
+}
+
+#[cfg(test)]
+mod spec_window_repair_tests {
+    use super::{
+        spec_strict_prefix_action, spec_window_emit_budget, spec_window_repair_attempt,
+        SpecStrictPrefixAction,
+    };
+
+    #[test]
+    fn window_cap_clamps_only_native_qwen4_and_never_to_zero() {
+        assert_eq!(spec_window_emit_budget(9, true, Some(3)), 3);
+        assert_eq!(spec_window_emit_budget(2, true, Some(3)), 2);
+        assert_eq!(spec_window_emit_budget(9, true, Some(0)), 1);
+        assert_eq!(spec_window_emit_budget(9, true, None), 9);
+        assert_eq!(spec_window_emit_budget(9, false, Some(3)), 9);
+    }
+
+    #[test]
+    fn window_repair_precedes_reset_and_realign_on_native_qwen4() {
+        // Full window: nothing to repair.
+        let full = spec_strict_prefix_action(4, 4, true);
+        assert!(!spec_window_repair_attempt(full, true));
+        // Terminal strict prefix: every speculator is asked.
+        let terminal = spec_strict_prefix_action(2, 4, true);
+        assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
+        assert!(spec_window_repair_attempt(terminal, false));
+        assert!(spec_window_repair_attempt(terminal, true));
+        // Non-terminal strict prefix (forced intervention): only native Qwen4
+        // skips the full re-prefill; others keep Realign.
+        let forced = spec_strict_prefix_action(2, 4, false);
+        assert_eq!(forced, SpecStrictPrefixAction::Realign);
+        assert!(spec_window_repair_attempt(forced, true));
+        assert!(!spec_window_repair_attempt(forced, false));
     }
 }
 

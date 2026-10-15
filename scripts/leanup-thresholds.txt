@@ -132,7 +132,8 @@ daemon_lines                <= 5850
 # RATCHET-RAISE 63 -> 64: v0.4.1 shipped at 64 (CI red on this ratchet); the
 # 0.4.1 cycle added QSA/PM oracles in rdna-compute/examples that their gates
 # invoke. Pay down by gating archived probes behind `lab` in 0.4.2.
-ungated_examples            <= 64
+# route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
+ungated_examples            <= 67
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is

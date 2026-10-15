@@ -177,7 +177,7 @@
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{qwen4_ngram_mod_config, Qwen4MtpDrafter};
-use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
+use hipfire_arch_qwen4::Qwen4KvBackend;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
@@ -766,7 +766,6 @@ fn load(model: &Path) -> Result<Loaded, String> {
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
-    let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     if let Some(devices) = hipfire_config::devices::startup_devices() {
         let archs = devices
             .iter()
@@ -780,6 +779,10 @@ fn load(model: &Path) -> Result<Loaded, String> {
         }
     }
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        .map_err(|e| e.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
@@ -807,7 +810,15 @@ fn load(model: &Path) -> Result<Loaded, String> {
             ));
         }
     } else {
+        // A slab layer arena is one span of the container, not an index
+        // tensor: it declares its byte size as its logical shape.
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+            if entry.name.ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX) {
+                return match entry.logical_shape.as_slice() {
+                    [bytes] => Some(*bytes as u64),
+                    _ => None,
+                };
+            }
             hfq.tensor_data(&entry.name)
                 .map(|(_, bytes)| bytes.len() as u64)
         };
@@ -922,6 +933,13 @@ fn load(model: &Path) -> Result<Loaded, String> {
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
             if use_ranges || entry.residency.is_external() {
                 return source
                     .tensor_range(&entry.name)

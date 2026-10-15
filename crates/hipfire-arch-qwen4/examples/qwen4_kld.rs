@@ -25,6 +25,11 @@
 //!                    [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]
 //!   qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref \
 //!                    --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]
+//!   qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json \
+//!                    [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2]
+//! `--product-prompt` uses the product's cold, single-user answer-mode prompt
+//! renderer (no system, tools or history). Speed receipts retain prompt ids,
+//! full generated ids (including warmup), and the product's terminator ids.
 //! `s11ref` writes F64 KL(ref || candidate), in the reference score-index order,
 //! and OUT.npy.json with model/ref/corpus/binary SHA256. S11 refs contain no
 //! prefix tokens: --corpus must be the exact corpus bound by the header SHA.
@@ -48,7 +53,7 @@ use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
 use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -118,7 +123,7 @@ fn verified_hot_store(
     Ok(hot)
 }
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]\n  qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2] [--max-prompt N]";
 
 /// Reuse the backing allocation, but expose exactly this cold window's rows.
 fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
@@ -138,7 +143,7 @@ impl Model {
     /// Same range-loaded path as the serve loader (`hipfire-loader` carriers).
     /// `ple_hot`: bytes of the PLE hot-row pack to prewarm; the store is
     /// attached verified before the first forward.
-    fn load(path: &Path, n_ctx: usize, ple_hot: Option<u64>) -> Result<Self, String> {
+    fn load(path: &Path, n_ctx: usize, logit_rows: usize, ple_hot: Option<u64>) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -160,7 +165,8 @@ impl Model {
             },
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
-        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+            .map_err(|e| format!("qwen4 admission: {e}"))?;
         // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
         // to this base while it is open and applied by `attach_forward`.
         let trunk_overlay =
@@ -243,13 +249,52 @@ impl Model {
             };
         let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+        // and host-maps the rest (a slab artifact larger than one card).
+        let weights = {
+            let mut weights = receipt.manifest.weights.clone();
+            match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+                None => {}
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                    if gpu.is_uma() {
+                        return Err("host-mapped experts are only for discrete GPUs".into());
+                    }
+                    let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                        &mut weights,
+                        layers,
+                    );
+                    eprintln!(
+                        "qwen4_kld: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                    );
+                }
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                    return Err("qwen4_kld takes a fixed expert layer count, not auto".into());
+                }
+            }
+            weights
+        };
         let transaction = fulfill_manifest_from_payloads(
-            &receipt.manifest.weights,
+            &weights,
             &mesh,
             receipt.config.num_hidden_layers,
             &mut gpu,
             expected,
             |entry| {
+                if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                    &source,
+                    &receipt.manifest.identity.recipe,
+                    entry,
+                ) {
+                    return payload;
+                }
+                // The store rejects a host-mapped entry as a range: borrow it
+                // from the resident source bytes, as the product loader does.
+                if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                    let (info, bytes) = source
+                        .tensor_data(&entry.name)
+                        .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                    return Ok(SourcePayload::Borrowed { info, bytes });
+                }
                 source
                     .tensor_range(&entry.name)
                     .map_err(|e| e.to_string())?
@@ -278,6 +323,7 @@ impl Model {
             receipt.ple_rows,
             state_format,
             backend,
+            None,
         )
         .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
         bundle.attach_npu_trunk_identity(npu_identity);
@@ -295,7 +341,7 @@ impl Model {
                 .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
         }
         let logits = gpu
-            .zeros(&[n_ctx * vocab], DType::F32)
+            .zeros(&[logit_rows * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
         eprintln!(
             "qwen4_kld: loaded {} on {} (vocab {vocab})",
@@ -489,7 +535,7 @@ fn build_ref(
     top_k: usize,
     max_chunks: Option<usize>,
 ) -> Result<(), String> {
-    let mut m = Model::load(model, n_ctx, None)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, None)?;
     let text =
         std::fs::read_to_string(slice).map_err(|e| format!("read {}: {e}", slice.display()))?;
     // Qwen tokenizers add no BOS: chunks are plain n_ctx windows of the stream.
@@ -624,7 +670,7 @@ fn score(
     let (n_ctx, window) = (h.n_ctx, h.window);
     let n_chunk = h.n_chunk.min(max_chunks.unwrap_or(usize::MAX));
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
-    let mut m = Model::load(model, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
     if m.vocab != h.n_vocab {
         return Err(format!(
             "candidate vocab {} != reference vocab {}",
@@ -868,7 +914,7 @@ fn write_kl_npy(path: &Path, rows: &[f64]) -> Result<(), String> {
 
 fn score_s11ref(
     model: &Path, ref_path: &Path, corpus_path: &Path, output: &Path,
-    decode: bool, ple_hot: Option<u64>,
+    decode: bool, ple_hot: Option<u64>, smoke_seqs: Option<usize>,
 ) -> Result<(), String> {
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
     // SAFETY: a read-only map of the immutable reference; parsing uses LE bytes.
@@ -881,14 +927,14 @@ fn score_s11ref(
     }
     let corpus: S11Corpus = serde_json::from_slice(&corpus_bytes).map_err(|e| e.to_string())?;
     let n_ctx = validate_s11_corpus(&reference, &corpus)?;
-    let mut m = Model::load(model, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
     if m.vocab != reference.header.n_vocab {
         return Err(format!("candidate vocab {} != S11REF vocab {}", m.vocab, reference.header.n_vocab));
     }
     let mut kls = Vec::with_capacity(reference.header.n_rows);
     let mut block = TopKBlock { residual_logprob: 0.0, top: Vec::with_capacity(reference.header.k) };
     let started = Instant::now();
-    for s in &corpus.sequences {
+    for s in corpus.sequences.iter().take(smoke_seqs.unwrap_or(usize::MAX)) {
         if decode {
             m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
             let row = m.logits.sub_offset(0, m.vocab);
@@ -919,7 +965,19 @@ fn score_s11ref(
                     .map_err(|e| e.to_string())?);
             }
         }
-        eprintln!("  {}: {} rows scored, {:.0}s", s.id, kls.len(), started.elapsed().as_secs_f64());
+        let seq_rows = s.score_positions.len();
+        let seq_mean = kls[kls.len() - seq_rows..].iter().sum::<f64>() / seq_rows.max(1) as f64;
+        eprintln!("  {}: {} rows scored, seq mean KLD {:.6}, {:.0}s", s.id, kls.len(), seq_mean, started.elapsed().as_secs_f64());
+    }
+    if smoke_seqs.is_some() {
+        if kls.iter().any(|v| !v.is_finite()) {
+            return Err("non-finite KL rows".into());
+        }
+        // The prefix rows are kept (never a receipt) so two smoke runs compare byte for byte.
+        write_kl_npy(output, &kls)?;
+        eprintln!("qwen4_kld s11ref SMOKE (first {} sequences, not a gate, no receipt): mean KLD = {:.12}  ({} rows)",
+            smoke_seqs.unwrap_or(0), kls.iter().sum::<f64>() / kls.len().max(1) as f64, kls.len());
+        return Ok(());
     }
     if kls.len() != reference.header.n_rows || kls.iter().any(|v| !v.is_finite()) {
         return Err("invalid or incomplete KL rows".into());
@@ -950,12 +1008,138 @@ fn score_s11ref(
     Ok(())
 }
 
+/// `speed`: TTFT of one chunked prefill of a prompt file (production
+/// `forward_chunk_final`, one logits row) and C1 greedy decode tok/s
+/// (`forward_token_or_argmax`, the serve decode step), `reps` fresh-state
+/// repetitions in one process. Rep 0 absorbs page-cache and kernel-cache
+/// warmup; the receipt keeps every rep.
+fn speed(
+    model: &Path, prompt: &Path, output: &Path, decode_tokens: usize, warmup: usize, reps: usize,
+    max_prompt: Option<usize>, product_prompt: bool,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(prompt).map_err(|e| format!("read {}: {e}", prompt.display()))?;
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let probe = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer: {e}"))?;
+    let mut terminator_ids = vec![probe.eos_id];
+    if let Some(id) = probe.eot_id {
+        terminator_ids.push(id);
+    }
+    let mut tokens = if product_prompt {
+        // Match render_qwen4_prompt_cold's AR answer-mode branch. A template
+        // render error is fatal, never silently replaced by a raw completion.
+        let text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&text);
+        let template = hfq.chat_template();
+        let jinja = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok().as_deref() != Some("0");
+        if let Some(template) = template.as_ref().filter(|_| jinja) {
+            let rendered = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer: &probe,
+                template,
+                system: None,
+                user: &text,
+                enable_thinking: false,
+                bos_token: None,
+                reasoning_strength: None,
+                // qwen_jinja_reasoning disables thinking AND omits effort
+                // for the product's answer-mode request.
+                reasoning_effort: None,
+            }.render().map_err(|e| format!("qwen4 Jinja render failed: {e}"))?;
+            probe.encode(&rendered)
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer: &probe,
+                system: None,
+                user: &text,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                raw: false,
+            }.build()
+        }
+    } else {
+        probe.encode(&text)
+    };
+    drop(hfq);
+    drop(probe);
+    if let Some(cap) = max_prompt {
+        tokens.truncate(cap);
+    }
+    if tokens.is_empty() {
+        return Err("empty prompt".into());
+    }
+    let n_ctx = tokens.len() + warmup + decode_tokens + 8;
+    let mut m = Model::load(model, n_ctx, 1, None)?;
+    terminator_ids.push(m.bundle.config.eos_token_id);
+    terminator_ids.sort_unstable();
+    terminator_ids.dedup();
+    let row = m.logits.sub_offset(0, m.vocab);
+    let mut rep_rows = Vec::new();
+    for rep in 0..reps {
+        m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        m.bundle.forward_chunk_final(&mut m.gpu, &tokens, &row, None).map_err(|e| e.to_string())?;
+        let first = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+        let ttft = t0.elapsed().as_secs_f64();
+        if first.iter().any(|v| !v.is_finite()) {
+            return Err("non-finite prefill logits".into());
+        }
+        let logits_sha = {
+            let mut digest = Sha256::new();
+            for v in &first {
+                digest.update(v.to_bits().to_le_bytes());
+            }
+            format!("{:x}", digest.finalize())
+        };
+        let mut ids = Vec::with_capacity(warmup + decode_tokens);
+        let mut t1 = Instant::now();
+        for i in 0..warmup + decode_tokens {
+            if i == warmup {
+                t1 = Instant::now();
+            }
+            let id = m.bundle.forward_token_or_argmax(&mut m.gpu, None, &row).map_err(|e| e.to_string())?;
+            ids.push(id);
+        }
+        m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+        let decode_s = t1.elapsed().as_secs_f64();
+        let tps = decode_tokens as f64 / decode_s;
+        eprintln!(
+            "qwen4_kld speed rep {rep}: prompt {} tokens, TTFT {:.1} ms, decode {decode_tokens} tok in {:.3} s = {tps:.2} tok/s",
+            tokens.len(), ttft * 1e3, decode_s
+        );
+        rep_rows.push(serde_json::json!({
+            "rep": rep, "ttft_ms": ttft * 1e3, "decode_tok_s": tps,
+            "decode_s": decode_s, "first_ids": ids.iter().take(16).collect::<Vec<_>>(),
+            "generated_ids": ids,
+            "prefill_logits_sha256": logits_sha,
+        }));
+    }
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.speed.v1",
+        "model": model.display().to_string(),
+        "prompt": prompt.display().to_string(),
+        "prompt_sha256": artifact_id(prompt)?.sha256,
+        "binary_sha256": artifact_id(&binary)?.sha256,
+        "prompt_tokens": tokens.len(), "decode_tokens": decode_tokens, "warmup_tokens": warmup,
+        "product_prompt": product_prompt, "prompt_ids": tokens, "terminator_ids": terminator_ids,
+        "expert_vram_layers": std::env::var("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS").ok(),
+        "arch": m.gpu.arch.to_string(),
+        "reps": rep_rows,
+    });
+    std::fs::write(output, serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mode = args.next().ok_or(USAGE)?;
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
     let (mut logits, mut teacher, mut corpus) = (None, None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     let (mut ple_hot, mut append_rows) = (None, Vec::new());
+    let mut smoke_seqs: Option<usize> = None;
+    let mut prompt_file: Option<PathBuf> = None;
+    let mut product_prompt = false;
+    let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) = (128usize, 8usize, 2usize, None::<usize>);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -980,11 +1164,18 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     }
                 }
             }
+            "--smoke-seqs" => smoke_seqs = Some(number(value()?)?),
+            "--prompt-file" => prompt_file = Some(PathBuf::from(value()?)),
+            "--product-prompt" => product_prompt = true,
+            "--decode-tokens" => decode_tokens = number(value()?)?,
+            "--speed-warmup" => speed_warmup = number(value()?)?,
+            "--reps" => reps = number(value()?)?,
+            "--max-prompt" => max_prompt = Some(number(value()?)?),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
     if mode == "s11ref" && (max_chunks.is_some() || slice.is_some() || logits.is_some() || teacher.is_some()) {
-        return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported".into());
+        return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported (--smoke-seqs scores a prefix and is never a gate)".into());
     }
     if !append_rows.is_empty() && (mode != "eval" || decode) {
         return Err("--append-rows is an eval route and excludes --decode".into());
@@ -998,7 +1189,26 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
             let corpus = corpus.ok_or("s11ref requires --corpus CORPUS.json (prefix tokens are not stored in S11REF)")?;
-            score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot)
+            score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot, smoke_seqs)
+        }
+        ("speed", Some(model), None, None, Some(output)) => {
+            let prompt = prompt_file.ok_or("speed requires --prompt-file")?;
+            speed(&model, &prompt, &output, decode_tokens, speed_warmup, reps, max_prompt, product_prompt)
+        }
+        ("ple-derive", Some(model), None, None, None) => {
+            // CPU-only: writes `<model>.ple-q4` (row order) from the embedded
+            // Q8 rows, bound to this exact base file; refuses an existing one.
+            let report = hipfire_runtime::ple_convert::derive_q4(&model, None, &mut |p| {
+                if p.total_bytes > 0 && p.done_bytes % (4 << 30) < (32 << 20) {
+                    eprintln!("qwen4_kld ple-derive {}: {}/{} bytes", p.phase, p.done_bytes, p.total_bytes);
+                }
+            })?;
+            eprintln!(
+                "qwen4_kld ple-derive: wrote {} ({} bytes), payload sha256 {}, rows sha256 {}, {:.1} s",
+                report.output.display(), report.bytes, report.payload_sha256,
+                report.source_rows_sha256, report.elapsed.as_secs_f64()
+            );
+            Ok(())
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {

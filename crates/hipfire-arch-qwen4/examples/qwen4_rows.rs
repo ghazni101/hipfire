@@ -3,13 +3,19 @@
 //! position after a real prompt prefill, plus a bitwise comparison of the two
 //! routes' logits.
 //!
+//! Model load follows `qwen4_kld`: admission on the GPU architecture
+//! (`admit_hfqm_artifact_on`), slab layer arenas served by
+//! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
+//! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
+//! rest host-mapped and borrowed from the resident source bytes.
+//!
 //! usage: qwen4_rows MODEL.hfq PROMPT.txt [ROWS=1,2,3,4] [ITERS=6]
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu};
@@ -28,8 +34,10 @@ fn main() -> Result<(), String> {
 
     let mut hfq = HfqFile::open(path).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
-    let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(|e| e.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
@@ -45,13 +53,52 @@ fn main() -> Result<(), String> {
     let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+    // and host-maps the rest (a slab artifact larger than one card).
+    let weights = {
+        let mut weights = receipt.manifest.weights.clone();
+        match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+            None => {}
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                if gpu.is_uma() {
+                    return Err("host-mapped experts are only for discrete GPUs".into());
+                }
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
+                eprintln!(
+                    "qwen4_rows: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                );
+            }
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                return Err("qwen4_rows takes a fixed expert layer count, not auto".into());
+            }
+        }
+        weights
+    };
     let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
+        &weights,
         &mesh,
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // The store rejects a host-mapped entry as a range: borrow it
+            // from the resident source bytes, as the product loader does.
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             source
                 .tensor_range(&entry.name)
                 .map_err(|e| e.to_string())?

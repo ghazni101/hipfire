@@ -70,6 +70,26 @@ pub fn monolithic_file_for_split_base(file: &str) -> Option<String> {
     )
 }
 
+/// Stem (before `-base`) of the one split-base family that shares its PLE row
+/// files between bases (`qwen3.8-flash-next-base.<ext>`). Every other file
+/// keeps strictly per-base sidecar names.
+const SHARED_PLE_FAMILY: &str = "qwen3.8-flash-next";
+
+/// The family-wide PLE row file a split base may name instead of its own
+/// `<file><suffix>` (`qwen3.8-flash-next-base.mq3-xts` + `.ple-q4` ->
+/// `qwen3.8-flash-next.ple-q4`). `None` unless `base_file` is a Flash-Next
+/// split base; `suffix` is [`PLE_Q4_SIDECAR_SUFFIX`] or [`PLE_Q8_SIDECAR_SUFFIX`].
+///
+/// The rows are bound to the base by the row table, not by the file name, so
+/// one shared pair serves every split base of the family; consumers install
+/// `<base file><suffix>` as a link to it for the runtime loader.
+pub fn shared_ple_file(base_file: &str, suffix: &str) -> Option<String> {
+    monolithic_file_for_split_base(base_file)?;
+    let stem = Path::new(base_file).file_stem()?.to_str()?;
+    (stem.strip_suffix(SPLIT_BASE_STEM_SUFFIX)? == SHARED_PLE_FAMILY)
+        .then(|| format!("{SHARED_PLE_FAMILY}{suffix}"))
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("failed to read {path}: {source}")]
@@ -159,6 +179,63 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
     pins.iter()
         .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
         .map(|pin| TrunkOverlay {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
+}
+
+/// Content identity of one expert-hotset sidecar and of the exact base
+/// artifact it is bound to.
+///
+/// The pin lives in the client instead of a registry field, like
+/// [`TrunkOverlayPin`], so that older clients' strict `deny_unknown_fields` v1
+/// parser keeps accepting the published registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertHotsetPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the hotset file.
+    pub repo: &'static str,
+    /// Hotset file name: the canonical base file name plus `.expert-hotset`.
+    pub file: &'static str,
+    /// SHA-256 of the hotset file.
+    pub sha256: &'static str,
+    /// Size in bytes of the hotset file.
+    pub size_bytes: u64,
+}
+
+/// Expert hotsets known to this client, keyed by exact base artifact identity.
+pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+    base_sha256: FLASH_NEXT_XTS_SHA256,
+    base_size: FLASH_NEXT_XTS_SIZE,
+    repo: FLASH_NEXT_XTS_REPO,
+    file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
+    sha256: "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
+    size_bytes: 217_676,
+}];
+
+/// A resolved expert hotset: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpertHotset {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as an [`ExpertHotset`]. An entry without a pinned digest and
+/// size never matches.
+pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<ExpertHotset> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| ExpertHotset {
             repo: pin.repo,
             sidecar: Sidecar {
                 file: pin.file.to_owned(),
@@ -382,9 +459,36 @@ impl ModelEntry {
         trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
     }
 
+    /// The Flash-Next expert-hotset sidecar of this entry's base artifact, from
+    /// the compiled-in [`EXPERT_HOTSET_PINS`]; `None` for every other entry.
+    pub fn expert_hotset(&self) -> Option<ExpertHotset> {
+        expert_hotset_in(self, EXPERT_HOTSET_PINS)
+    }
+
     /// True when this entry is a split base that publishes PLE row sidecars.
     pub fn has_ple_sidecars(&self) -> bool {
         self.ple_q4.is_some() || self.ple_q8.is_some()
+    }
+
+    /// True when this split base is published split-only: there is no
+    /// monolithic artifact it is a view of, so it has no monolithic sibling.
+    /// Derived from the entry's shape, not a flag: every published PLE slot
+    /// names the Flash-Next family's shared rows-bound file
+    /// ([`shared_ple_file`]), and the name without `-base` is not the
+    /// published MQ4 XTS monolithic, whose split views must keep it
+    /// catalogued. A split base naming its own `<file>.ple-q*` rows is a view
+    /// of a monolithic.
+    pub fn is_split_only(&self) -> bool {
+        let slot_is_shared = |slot: Option<&Sidecar>, suffix: &str| {
+            slot.is_none_or(|sidecar| {
+                shared_ple_file(&self.file, suffix).as_deref() == Some(sidecar.file.as_str())
+            })
+        };
+        self.has_ple_sidecars()
+            && monolithic_file_for_split_base(&self.file)
+                .is_some_and(|monolithic| monolithic != FLASH_NEXT_XTS_CANONICAL_FILE)
+            && slot_is_shared(self.ple_q4.as_ref(), PLE_Q4_SIDECAR_SUFFIX)
+            && slot_is_shared(self.ple_q8.as_ref(), PLE_Q8_SIDECAR_SUFFIX)
     }
 
     /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
@@ -531,6 +635,7 @@ impl RegistryV1 {
         if self.models.is_empty() {
             return Err(fail("model catalog is empty".into()));
         }
+        let mut shared_pins: BTreeMap<String, (Option<&str>, Option<u64>)> = BTreeMap::new();
         for (tag, entry) in &self.models {
             if tag.trim().is_empty() || entry.file.trim().is_empty() {
                 return Err(fail(format!("model '{tag}' has an empty tag or file")));
@@ -580,12 +685,32 @@ impl RegistryV1 {
                         entry.file
                     )));
                 }
-                let expected = format!("{}{suffix}", entry.file);
-                if sidecar.file != expected {
+                let own = format!("{}{suffix}", entry.file);
+                if sidecar.file == own {
+                    continue;
+                }
+                let Some(shared) =
+                    shared_ple_file(&entry.file, suffix).filter(|shared| *shared == sidecar.file)
+                else {
                     return Err(fail(format!(
-                        "model '{tag}' {slot} file '{}' must be '{expected}'",
+                        "model '{tag}' {slot} file '{}' must be '{own}'",
                         sidecar.file
                     )));
+                };
+                // Every split base of the family shares one file, so each one
+                // must pin the same bytes.
+                let pin = (sidecar.sha256.as_deref(), sidecar.size_bytes);
+                match shared_pins.get(&shared) {
+                    Some(first) if *first != pin => {
+                        return Err(fail(format!(
+                            "model '{tag}' {slot} shared file '{shared}' is pinned differently \
+                             by another model"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        shared_pins.insert(shared, pin);
+                    }
                 }
             }
             if let Some(format) = entry.default_tool_format.as_deref() {
@@ -1224,7 +1349,10 @@ mod tests {
         assert_eq!(settings.temperature, Some(1.0));
         assert_eq!(settings.top_p, Some(0.95));
         assert_eq!(settings.top_k, Some(20));
-        assert_eq!(serde_json::to_value(&wire.aliases).unwrap(), curated["aliases"]);
+        assert_eq!(
+            serde_json::to_value(&wire.aliases).unwrap(),
+            curated["aliases"]
+        );
         assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
         assert!(!wire.aliases.values().any(|target| target == tag));
         for stock in FLASH_NEXT_FIXTURE_TAGS {
@@ -1352,6 +1480,119 @@ mod tests {
         let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
         assert_eq!(alias_tag, "qwen3.8:flash-next");
         assert_eq!(aliased.trunk_overlay().as_ref(), Some(&first));
+    }
+
+    const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
+
+    #[test]
+    fn expert_hotset_pin_has_exact_metadata_and_canonical_name() {
+        assert_eq!(EXPERT_HOTSET_PINS.len(), 1);
+        let pin = &EXPERT_HOTSET_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!("{FLASH_NEXT_XTS_CANONICAL_FILE}.expert-hotset")
+        );
+        assert_eq!(pin.file, EXPERT_HOTSET_FILE);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086"
+        );
+        assert_eq!(pin.size_bytes, 217_676);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn expert_hotset_lookup_matches_the_base_identity_only() {
+        let entry = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        let hotset = entry.expert_hotset().unwrap();
+        assert_eq!(hotset.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            hotset.sidecar,
+            Sidecar {
+                file: EXPERT_HOTSET_FILE.into(),
+                sha256: Some(EXPERT_HOTSET_PINS[0].sha256.into()),
+                size_bytes: Some(217_676),
+            }
+        );
+        // The legacy spelling of the same pinned bytes resolves to the canonical hotset name.
+        let legacy = pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE);
+        assert_eq!(legacy.expert_hotset(), Some(hotset));
+
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = Some(digest('a'));
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1);
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = None;
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = None;
+        assert!(other.expert_hotset().is_none());
+    }
+
+    #[test]
+    fn expert_hotset_in_uses_the_supplied_pin_table() {
+        let mut entry = pinned_flash_next_entry("custom.mq4");
+        entry.sha256 = Some(digest('b'));
+        entry.size_bytes = Some(123);
+        assert!(expert_hotset_in(&entry, EXPERT_HOTSET_PINS).is_none());
+        let pins = [ExpertHotsetPin {
+            base_sha256: "b".repeat(64).leak(),
+            base_size: 123,
+            repo: "test/repo",
+            file: "custom.mq4.expert-hotset",
+            sha256: "c".repeat(64).leak(),
+            size_bytes: 7,
+        }];
+        let hotset = expert_hotset_in(&entry, &pins).unwrap();
+        assert_eq!(hotset.repo, "test/repo");
+        assert_eq!(hotset.sidecar.file, "custom.mq4.expert-hotset");
+        assert_eq!(hotset.sidecar.sha256, Some(digest('c')));
+        assert_eq!(hotset.sidecar.size_bytes, Some(7));
+        assert!(expert_hotset_in(&entry, &[]).is_none());
+    }
+
+    #[test]
+    fn bundled_registry_resolves_the_expert_hotset_on_exactly_the_stock_xts_tags() {
+        let parsed = bundled().unwrap();
+        let mut resolved: Vec<&str> = parsed
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.expert_hotset().is_some())
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        resolved.sort_unstable();
+        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(resolved, expected);
+        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
+            .expert_hotset()
+            .is_none());
+        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
+            .expert_hotset()
+            .is_none());
+        let first = parsed.models["qwen3.8:flash-next"].expert_hotset().unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            assert_eq!(
+                parsed.models[tag].expert_hotset().as_ref(),
+                Some(&first),
+                "{tag}"
+            );
+        }
+        let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(alias_tag, "qwen3.8:flash-next");
+        assert_eq!(aliased.expert_hotset().as_ref(), Some(&first));
+        assert!(!BUNDLED_REGISTRY.contains("expert_hotset"));
+        assert!(!include_str!("../../../registry/models.json").contains("expert_hotset"));
     }
 
     #[test]
@@ -1552,6 +1793,126 @@ mod tests {
         );
     }
 
+    const SHARED_Q4: &str = "qwen3.8-flash-next.ple-q4";
+    const SHARED_Q8: &str = "qwen3.8-flash-next.ple-q8";
+
+    /// The split registry with the shared Flash-Next pair on the MQ4 split base
+    /// and on a second (MQ3) split base of the same family.
+    fn shared_pair_registry_json() -> serde_json::Value {
+        let mut value = split_registry_json();
+        let models = value["models"].as_object_mut().unwrap();
+        let mut mq3 = models["qwen3.8:flash-next"].clone();
+        mq3["file"] = "qwen3.8-flash-next-base.mq3-xts".into();
+        models.insert("qwen3.8:flash-next-mq3".into(), mq3);
+        for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
+            models[tag]["ple_q4"]["file"] = SHARED_Q4.into();
+            models[tag]["ple_q8"]["file"] = SHARED_Q8.into();
+        }
+        value
+    }
+
+    #[test]
+    fn flash_next_split_bases_may_share_one_ple_pair() {
+        let registry = parse_split(&shared_pair_registry_json()).unwrap();
+        for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
+            let entry = &registry.models[tag];
+            assert_eq!(entry.ple_q4.as_ref().unwrap().file, SHARED_Q4, "{tag}");
+            assert_eq!(entry.ple_q8.as_ref().unwrap().file, SHARED_Q8, "{tag}");
+        }
+        // Own per-base names stay valid next to the shared ones (mixed slots).
+        let mut mixed = shared_pair_registry_json();
+        mixed["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+            "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
+        parse_split(&mixed).unwrap();
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq3-xts", PLE_Q4_SIDECAR_SUFFIX).as_deref(),
+            Some(SHARED_Q4)
+        );
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", PLE_Q8_SIDECAR_SUFFIX).as_deref(),
+            Some(SHARED_Q8)
+        );
+        for (file, why) in [
+            ("qwen3.8-flash-next.mq4-xts", "monolithic"),
+            ("model-base.mq4", "other family"),
+            ("Qwen3.8-Flash-Next-base.mq4-xts", "case"),
+            ("dir/qwen3.8-flash-next-base.mq4-xts", "path"),
+        ] {
+            assert_eq!(
+                shared_ple_file(file, PLE_Q4_SIDECAR_SUFFIX),
+                None,
+                "{file}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_ple_names_are_refused_outside_the_flash_next_split_family() {
+        let cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>, &str); 6] = [
+            (
+                "shared file on the monolithic mq4 entry",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "qwen3.8-flash-next.mq4-xts".into();
+                }),
+                "not a split base",
+            ),
+            (
+                "another family cannot borrow the Flash-Next pair",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "other-model-base.mq4".into();
+                }),
+                "must be 'other-model-base.mq4.ple-q",
+            ),
+            (
+                "q4 slot names the shared q8",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = SHARED_Q8.into();
+                }),
+                "must be",
+            ),
+            (
+                "arbitrary family file",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = "qwen3.8-flash-next.other-q4".into();
+                }),
+                "must be",
+            ),
+            (
+                "shared name in a subdirectory",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["file"] = format!("sub/{SHARED_Q8}").into();
+                }),
+                "must be",
+            ),
+            (
+                "different case",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["file"] = "Qwen3.8-Flash-Next.ple-q8".into();
+                }),
+                "must be",
+            ),
+        ];
+        for (name, mutate, needle) in cases {
+            let mut value = shared_pair_registry_json();
+            mutate(&mut value["models"]["qwen3.8:flash-next"]);
+            let error = parse_split(&value).expect_err(name).to_string();
+            assert!(error.contains(needle), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn bases_naming_the_same_shared_file_must_pin_the_same_bytes() {
+        for (field, value) in [
+            ("sha256", serde_json::Value::from(digest('d'))),
+            ("size_bytes", serde_json::Value::from(1_u64)),
+        ] {
+            let mut value_json = shared_pair_registry_json();
+            value_json["models"]["qwen3.8:flash-next-mq3"]["ple_q4"][field] = value;
+            let error = parse_split(&value_json).unwrap_err().to_string();
+            assert!(error.contains("pinned differently"), "{field}: {error}");
+        }
+    }
+
     #[test]
     fn split_base_file_helpers_mirror_the_converter_naming() {
         for (base, monolithic) in [
@@ -1611,17 +1972,58 @@ mod tests {
             .is_none());
     }
 
+    /// Split tags that are views of a monolithic (not split-only) and whose
+    /// grandfathered monolithic is not catalogued.
+    fn missing_monolithic_siblings(registry: &RegistryV1) -> Vec<&str> {
+        registry
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.has_ple_sidecars() && !entry.is_split_only())
+            .filter(|(_, entry)| registry.monolithic_sibling(entry).is_none())
+            .map(|(tag, _)| tag.as_str())
+            .collect()
+    }
+
     #[test]
     fn bundled_split_entries_name_their_monolithic_sibling() {
         let registry = bundled().unwrap();
-        for (tag, entry) in &registry.models {
-            if entry.has_ple_sidecars() {
-                assert!(
-                    registry.monolithic_sibling(entry).is_some(),
-                    "{tag}: a split entry must keep its grandfathered monolithic catalogued"
-                );
-            }
+        assert_eq!(
+            missing_monolithic_siblings(&registry),
+            Vec::<&str>::new(),
+            "a split view of a monolithic must keep its grandfathered monolithic catalogued"
+        );
+    }
+
+    #[test]
+    fn only_a_shared_pair_split_base_without_a_published_monolithic_is_split_only() {
+        let mut value = shared_pair_registry_json();
+        for tag in ["qwen3.8:flash-next-mq4", "qwen3.8:flash-next-mq4-xts"] {
+            value["models"].as_object_mut().unwrap().remove(tag);
         }
+        let registry = parse_split(&value).unwrap();
+        // Both slots on the shared rows-bound pair and no published monolithic.
+        assert!(registry.models["qwen3.8:flash-next-mq3"].is_split_only());
+        // The MQ4 XTS split base is a view of the published monolithic even on
+        // the shared pair, so dropping that monolithic still fails.
+        assert!(!registry.models["qwen3.8:flash-next"].is_split_only());
+        assert_eq!(
+            missing_monolithic_siblings(&registry),
+            ["qwen3.8:flash-next"]
+        );
+
+        // Without the marker (one slot naming its own per-base rows) the MQ3
+        // split base is a view of an uncatalogued monolithic: it fails too.
+        value["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+            "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
+        let unmarked = parse_split(&value).unwrap();
+        assert!(!unmarked.models["qwen3.8:flash-next-mq3"].is_split_only());
+        assert_eq!(
+            missing_monolithic_siblings(&unmarked),
+            ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"]
+        );
+        // A monolithic entry is never split-only.
+        let split = parse_split(&split_registry_json()).unwrap();
+        assert!(!split.models["qwen3.8:flash-next-mq4-xts"].is_split_only());
     }
 
     #[test]

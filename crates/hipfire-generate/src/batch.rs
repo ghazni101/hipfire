@@ -2088,6 +2088,9 @@ fn spec_request_config(s: &BatchSampling, rng_seed: u64) -> hipfire_runtime::spe
         repeat_window: s.repeat_window,
         presence_penalty: s.presence_penalty,
         frequency_penalty: s.frequency_penalty,
+        // A lane window's tickets are its own (`finish_native_window` consumes
+        // them); only the singleton drafter retains a window for a terminal repair.
+        stop_sequences: false,
     }
 }
 

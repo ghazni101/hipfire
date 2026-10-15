@@ -41,6 +41,7 @@ pub mod kernel_registry;
 pub mod kernels;
 pub mod kv_slots;
 pub mod moe;
+pub mod slab_moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 #[cfg(feature = "deltanet")]

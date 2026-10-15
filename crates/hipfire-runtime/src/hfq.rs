@@ -828,14 +828,17 @@ impl HfqFile {
             .cloned()
     }
 
-    /// Bind a PLE row sidecar to this base. The sidecar must have been built
-    /// for exactly this file: same length and same sha256 over
-    /// `[0, data_offset)`. A split base (marker, no shard tensors) must also
-    /// agree on the rows' source digest (`q8_rows_sha256 ==
-    /// source_rows_sha256`) and geometry; a monolithic base's embedded shard
-    /// tensors must match the sidecar's geometry (Q8_0 `[rows_per_shard,
-    /// row_width]`). One attach only. The sidecar takes no part in the
-    /// effective source identity, overlays or [`Self::tensor_range`].
+    /// Bind a PLE row sidecar to this base. A monolithic base (embedded shard
+    /// tensors, no marker) is bound to exactly one file: the sidecar must
+    /// carry this file's length and sha256 over `[0, data_offset)`, and the
+    /// embedded shards must match the sidecar's geometry (Q8_0
+    /// `[rows_per_shard, row_width]`). A split base (marker, no shard
+    /// tensors) is bound by row identity instead: the marker's geometry and
+    /// `q8_rows_sha256` must equal the sidecar's geometry and
+    /// `source_rows_sha256`; its own file length and index hash are free, so
+    /// one sidecar serves every split base marked for the same rows. One
+    /// attach only. The sidecar takes no part in the effective source
+    /// identity, overlays or [`Self::tensor_range`].
     pub fn attach_ple_rows(&mut self, rows: PleRowsFile) -> Result<(), String> {
         use crate::ple_sidecar::{
             embedded_shard_count, ple_shard_name, short_hex, PLE_BASE_MARKER_KEY, Q8_QUANT_TYPE,
@@ -849,7 +852,7 @@ impl HfqFile {
             crate::external_rows::RowEncoding::Q4Lm => {
                 "delete it and run `hipfire ple derive --format q4 <model>` to rebuild it for this base, or re-pull the matching files with `hipfire pull <model tag> --ple q4`"
             }
-            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar is bound to exactly one base file)",
+            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar must match its base: the same file for a monolithic base, the same source rows for a split base)",
         };
         if let Some(existing) = &self.ple_rows {
             return Err(format!(
@@ -857,16 +860,16 @@ impl HfqFile {
                 existing.path().display()
             ));
         }
-        if self.file_len() != table.base_file_bytes {
-            return Err(format!(
-                "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
-                table.base_file_bytes,
-                self.file_len()
-            ));
-        }
         let embedded = embedded_shard_count(&self.tensors).map_err(|e| format!("{base}: {e}"))?;
         let marker = self.ple_rows_marker();
         if embedded > 0 {
+            if self.file_len() != table.base_file_bytes {
+                return Err(format!(
+                    "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
+                    table.base_file_bytes,
+                    self.file_len()
+                ));
+            }
             if marker.is_some() {
                 return Err(format!(
                     "{base} carries `{PLE_BASE_MARKER_KEY}` (rows in a sidecar) but its index also holds {embedded} embedded PLE shard tensors; PLE sidecar {sidecar} cannot bind to it"
@@ -890,6 +893,18 @@ impl HfqFile {
                         rows_per_shard, row_width, info.quant_type, info.shape
                     ));
                 }
+            }
+            let actual = crate::ple_sidecar::hex_lower(
+                &self
+                    .index_sha256()
+                    .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
+            );
+            if actual != table.base_index_sha256 {
+                return Err(format!(
+                    "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
+                    short_hex(&table.base_index_sha256),
+                    short_hex(&actual)
+                ));
             }
         } else {
             let marker = marker.ok_or_else(|| {
@@ -917,18 +932,6 @@ impl HfqFile {
                     short_hex(&table.source_rows_sha256)
                 ));
             }
-        }
-        let actual = crate::ple_sidecar::hex_lower(
-            &self
-                .index_sha256()
-                .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
-        );
-        if actual != table.base_index_sha256 {
-            return Err(format!(
-                "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
-                short_hex(&table.base_index_sha256),
-                short_hex(&actual)
-            ));
         }
         self.ple_rows = Some(rows);
         Ok(())
@@ -2041,6 +2044,51 @@ impl HfqFile {
         .map(Some)
     }
 
+    /// A checked positional descriptor over an arbitrary byte span of the
+    /// BASE container (not an index entry). Used for derived views such as a
+    /// layer's contiguous expert slab arena.
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        let source_identity = self.effective_source_identity()?;
+        let file_identity = source_identity
+            .files
+            .first()
+            .ok_or_else(|| SourceError::MissingEffectiveSeal {
+                reason: "HFQ source file index 0 is not sealed".to_string(),
+            })?
+            .clone();
+        let file = self._file.try_clone().map_err(|source| SourceError::Io {
+            offset: offset as u64,
+            source,
+        })?;
+        let reader = SourceReader::from_inner(HfqRangeReader {
+            identity: source_identity.clone(),
+            file,
+            file_identity,
+            evict_after_upload: self.evict_page_cache,
+        });
+        SourceRangeDescriptor::from_parts(
+            source_identity,
+            offset as u64,
+            len as u64,
+            dtype.to_string(),
+            logical_shape,
+            reader,
+        )
+    }
+
+    /// The mapped bytes of `[offset, offset + len)`; `None` when the mapping
+    /// was dropped or the span overruns the file.
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        mmap.get(offset..offset.checked_add(len)?)
+    }
+
     /// Full tensor index of this HFQ file, in on-disk order.
     pub fn tensor_infos(&self) -> &[HfqTensorInfo] {
         &self.tensors
@@ -2172,6 +2220,10 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         54 => "I64",
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
+        131 => "MQ3I4G128R256",
+        132 => "MQ3I4G128R128",
+        133 => "MQ2I4G128R256",
+        134 => "MQ2I4G128R128",
         _ => "?",
     }
 }
@@ -2215,6 +2267,22 @@ impl HfqModelSource {
 
     pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
         self.hfq.tensor_range(name)
+    }
+
+    /// See [`HfqFile::span_range`].
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        self.hfq.span_range(offset, len, dtype, logical_shape)
+    }
+
+    /// See [`HfqFile::span_bytes`].
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        self.hfq.span_bytes(offset, len)
     }
 }
 
@@ -4696,5 +4764,80 @@ mod ple_rows_binding_tests {
         .unwrap();
         let marker = HfqFile::open(&marked).unwrap().ple_rows_marker().unwrap();
         assert_eq!(marker["location"], "sidecar");
+    }
+}
+
+#[cfg(test)]
+mod mq_i4_header_tests {
+    use super::*;
+    use crate::mq_i4::{decode_tensor, encode_tensor, tensor_bytes, MqI4Profile, GROUP};
+
+    /// Tiny legal shape per profile: R256 profiles `[2,256]`, R128 `[2,128]`.
+    fn shape_for(profile: MqI4Profile) -> (usize, usize) {
+        (2, profile.rotation.width())
+    }
+
+    fn fixture(profile: MqI4Profile) -> (Vec<u8>, Vec<u16>, Vec<u8>) {
+        let (m, k) = shape_for(profile);
+        let levels = usize::from(profile.codec.levels()) + 1;
+        let codes: Vec<u8> = (0..m * k).map(|i| ((i * 5 + 1) % levels) as u8).collect();
+        let scales: Vec<u16> = (0..m * (k / GROUP))
+            .map(|g| 0x3C00 + g as u16)
+            .collect();
+        let bytes = encode_tensor(profile, m, k, &codes, &scales).unwrap();
+        (codes, scales, bytes)
+    }
+
+    #[test]
+    fn qt131_to_134_round_trip_through_hfqm_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqi4.hfq");
+
+        let mut tensors = Vec::new();
+        let mut expected = Vec::new();
+        for profile in MqI4Profile::ALL {
+            let (codes, scales, bytes) = fixture(profile);
+            let (m, k) = shape_for(profile);
+            assert_eq!(bytes.len(), tensor_bytes(profile, m, k).unwrap());
+            let name = format!("model.layers.0.mlp.experts.0.{}", profile.name());
+            tensors.push(HfqMemTensor {
+                name: name.clone(),
+                quant_type: profile.quant_type(),
+                shape: vec![m as u32, k as u32],
+                group_size: GROUP as u32,
+                data: bytes,
+            });
+            expected.push((name, profile, m, k, codes, scales));
+        }
+        write_hfqm_package_mem(&path, 16, r#"{"x":1}"#, &tensors).unwrap();
+
+        let f = HfqFile::open(&path).unwrap();
+        assert_eq!(f.tensors().len(), 4);
+        for (i, (name, profile, m, k, codes, scales)) in expected.iter().enumerate() {
+            let info = &f.tensors()[i];
+            assert_eq!(&info.name, name);
+            assert_eq!(info.quant_type, profile.quant_type());
+            assert_eq!(info.shape, vec![*m as u32, *k as u32]);
+            assert_eq!(info.group_size, 128);
+            assert_eq!(info.data_size, tensor_bytes(*profile, *m, *k).unwrap());
+            assert_eq!(quant_type_to_dtype(info.quant_type), profile.name());
+
+            let (_, payload) = f.tensor_data(name).expect("tensor payload");
+            assert_eq!(payload, &tensors[i].data[..]);
+            let decoded = decode_tensor(*profile, *m, *k, payload).unwrap();
+            assert_eq!(&decoded.codes, codes);
+            assert_eq!(&decoded.scale_bits, scales);
+        }
+    }
+
+    #[test]
+    fn quant_type_to_dtype_names_131_to_134() {
+        assert_eq!(quant_type_to_dtype(131), "MQ3I4G128R256");
+        assert_eq!(quant_type_to_dtype(132), "MQ3I4G128R128");
+        assert_eq!(quant_type_to_dtype(133), "MQ2I4G128R256");
+        assert_eq!(quant_type_to_dtype(134), "MQ2I4G128R128");
+        // Neighbours stay unknown (130 is the compact-Hessian record id).
+        assert_eq!(quant_type_to_dtype(130), "?");
+        assert_eq!(quant_type_to_dtype(135), "?");
     }
 }

@@ -16,6 +16,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
 | `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
+| `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default in the CLI and as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice in the TUI, from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
@@ -111,6 +112,33 @@ weights and `=1` applies the overlay on any architecture.
   zab tier) has no overlay.
 - **`rm` and listings.** `rm <tag>` removes the overlay with the base
   (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
+  or served as models.
+
+### Flash-Next expert hotset
+
+The same four stock Flash-Next MQ4 XTS tags (one base artifact, sha256
+`8b15b6fe…`, 125288544792 B) also have an expert-hotset sidecar. As for the
+trunk overlay, the client carries the pin, not the registry: it names
+`qwen3.8-flash-next.mq4-xts.expert-hotset` (the canonical base file name plus
+`.expert-hotset`; 217676 B, ~213 KiB, sha256 `7f6760e1…`) in the
+`hipfire-models/qwen3.8-flash-next` repo, matched by the base's exact size and
+SHA-256. `registry/v1.json` is unchanged, so older clients keep parsing the
+published registry.
+
+- **Pull.** `hipfire pull <tag>` selects the hotset by default. The TUI fetch
+  screen has an independent default-on yes/no choice, **Expert hot set (R9700
+  decode, 213 KB)**, shown in the summary only when selected; the "213 KB" is
+  the rounded display label, the pinned file is 217676 B (~213 KiB). The hotset
+  is downloaded and SHA-256 verified with the other sidecars to the sidecar path
+  of the local base file, which may be a renamed local file as long as it matches
+  the pinned base identity; a valid file already on disk is not downloaded again,
+  a stale one is refreshed. As for other sidecars, a failed hotset download
+  prints a warning and the pull still succeeds. Any other registry entry (e.g.
+  the RTN-asym file or the local-only zab tier) has no hotset.
+- **Runtime.** The hotset applies by default on a single R9700 (gfx1201) when
+  the sidecar is present and bound to the base by size and index SHA-256.
+- **`rm` and listings.** `rm <tag>` removes the hotset with the base
+  (`<file>.expert-hotset`). `*.expert-hotset` files are sidecars: never listed
   or served as models.
 
 ## Inference

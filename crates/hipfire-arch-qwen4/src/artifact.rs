@@ -12,6 +12,9 @@
 
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
+use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
+use crate::expert_hotset::HOTSET_ENV;
+use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, WeightError,
@@ -173,25 +176,169 @@ pub struct Qwen4HfqmArtifact {
 /// lets loader/evaluator callers preserve one diagnostic convention without
 /// exposing private parser helpers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Qwen4ArtifactError {
-    message: String,
+pub enum Qwen4ArtifactError {
+    /// Existing admission diagnostics retain their exact text.
+    Message(String),
+    ExpertSlabsMetadata(ExpertSlabsError),
+    ExpertSlabTable(ExpertSlabTableError),
+    ExpertSlabsMetadataRequired { name: String, quant_type: u8 },
+    ExpertSlabQuantTypeUnavailable { name: String, quant_type: u8 },
+    ExpertSlabKernelsUnavailable { w3: usize, w2: usize, mq4: usize },
 }
 
 impl Qwen4ArtifactError {
     fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+        Self::Message(message.into())
     }
 }
 
 impl fmt::Display for Qwen4ArtifactError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            Self::Message(message) => f.write_str(message),
+            Self::ExpertSlabsMetadata(error) => write!(f, "qwen4: expert slab metadata: {error}"),
+            Self::ExpertSlabTable(error) => write!(f, "qwen4: expert slab table: {error}"),
+            Self::ExpertSlabsMetadataRequired { name, quant_type } => write!(
+                f,
+                "qwen4: new I4 expert types or per-expert slab names without \
+                 qwen4.expert_slabs v1 metadata are not admitted: {name} (qt={quant_type})"
+            ),
+            Self::ExpertSlabQuantTypeUnavailable { name, quant_type } => write!(
+                f,
+                "qwen4: tensor {name} qt={quant_type} is a planar I4 expert type; \
+                 routed GPU kernels are unavailable in this build"
+            ),
+            Self::ExpertSlabKernelsUnavailable { w3, w2, mq4 } => write!(
+                f,
+                "qwen4: per-expert slab artifact recognized and validated \
+                 (W3={w3}, W2={w2}, MQ4={mq4}); MQ3-I4/MQ2-I4/pointer-addressed MQ4 \
+                 routed kernels are not available on any GPU in this build, refusing to load"
+            ),
+        }
     }
 }
 
-impl std::error::Error for Qwen4ArtifactError {}
+impl std::error::Error for Qwen4ArtifactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ExpertSlabsMetadata(error) => Some(error),
+            Self::ExpertSlabTable(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Recognize the new layout before legacy config/manifest admission. No
+/// payload reads or GPU work: scale validation is a separate callable API.
+fn refuse_expert_slabs(
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+) -> Result<(), Qwen4ArtifactError> {
+    let metadata = match expert_slabs::parse(metadata_json) {
+        Ok(metadata) => metadata,
+        // Invalid legacy JSON still receives the existing config diagnostic.
+        Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => None,
+        Err(error) => return Err(Qwen4ArtifactError::ExpertSlabsMetadata(error)),
+    };
+    if let Some(metadata) = metadata {
+        let table = build_expert_slab_table(&metadata, tensors)
+            .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+        let counts = table.counts();
+        return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+            w3: counts.w3,
+            w2: counts.w2,
+            mq4: counts.mq4,
+        });
+    }
+    if let Some(info) = tensors.iter().find(|info| {
+        matches!(info.quant_type, 131..=134) || parse_expert_entry_name(&info.name).is_some()
+    }) {
+        return Err(Qwen4ArtifactError::ExpertSlabsMetadataRequired {
+            name: info.name.clone(),
+            quant_type: info.quant_type,
+        });
+    }
+    Ok(())
+}
+
+/// Set because the real-layer G1 receipts of BOTH gfx1201 slab kernels are in
+/// `rcpt/`, both with 0 mismatches: K1 decode
+/// (`r5.k1.g1.L0-records.raw.json`, sha256 `2bb0cfa1…8239`) and K2 prefill
+/// (`g1.k2.real.json`, sha256 `bb1bde6b…c226`, with the A4 identity
+/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). gfx1201 only; every other
+/// architecture keeps refusing in [`slab_route_admitted`].
+pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
+
+/// Whether the sealed expert-slab route may load on GPU architecture `arch`.
+/// gfx1201 only; every other architecture keeps refusing.
+pub fn slab_route_admitted(arch: &str) -> bool {
+    arch == "gfx1201" && SLAB_ROUTE_RECEIPTS_LANDED
+}
+
+/// The arena plan of a version-1 expert-slab artifact when the route is
+/// admitted on `device`; otherwise the unchanged fail-closed refusal
+/// ([`refuse_expert_slabs`]). `Ok(None)` is an ordinary (non-slab) artifact.
+fn expert_slab_plan(
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+    device: Option<&str>,
+) -> Result<Option<Arc<crate::expert_arena::ExpertArenaPlan>>, Qwen4ArtifactError> {
+    if !device.is_some_and(slab_route_admitted) {
+        refuse_expert_slabs(metadata_json, tensors)?;
+        return Ok(None);
+    }
+    let metadata = match expert_slabs::parse(metadata_json) {
+        Ok(metadata) => metadata,
+        Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => None,
+        Err(error) => return Err(Qwen4ArtifactError::ExpertSlabsMetadata(error)),
+    };
+    let Some(metadata) = metadata else {
+        refuse_expert_slabs(metadata_json, tensors)?;
+        return Ok(None);
+    };
+    let table = build_expert_slab_table(&metadata, tensors)
+        .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+    let counts = table.counts();
+    if counts.w2 != 0 {
+        return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+            w3: counts.w3,
+            w2: counts.w2,
+            mq4: counts.mq4,
+        });
+    }
+    let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table)
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
+    plan.check_executable()
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
+    Ok(Some(Arc::new(plan)))
+}
+
+/// `manifest` (declared under the packed recipe) re-declared under
+/// [`crate::weights::Qwen4TierRecipe::FlashNextSlab`] with `plan`'s arenas.
+fn slab_manifest(
+    config: &Qwen4Config,
+    manifest: &Qwen4Manifest,
+    plan: &Arc<crate::expert_arena::ExpertArenaPlan>,
+) -> Result<Qwen4Manifest, Qwen4ArtifactError> {
+    let crate::weights::Qwen4TierRecipe::FlashNextPacked {
+        trunk_tier,
+        mtp_source,
+    } = &manifest.identity.recipe
+    else {
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: an expert-slab artifact is admitted under the packed Flash-Next recipe only",
+        ));
+    };
+    Qwen4Manifest::build_with_recipe(
+        config,
+        crate::weights::Qwen4TierRecipe::FlashNextSlab {
+            trunk_tier: *trunk_tier,
+            mtp_source: *mtp_source,
+            arenas: plan.clone(),
+        },
+    )
+    .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: slab manifest admission failed: {error}")))
+}
 
 /// Escape hatch for deliberately loading an artifact whose manifest target is
 /// quantized while its bytes are BF16 (the unpacked decode path).
@@ -286,6 +433,12 @@ fn validate_weight_geometry(
     entry: &WeightEntry,
     info: &HfqTensorInfo,
 ) -> Result<(), Qwen4ArtifactError> {
+    if matches!(info.quant_type, 131..=134) {
+        return Err(Qwen4ArtifactError::ExpertSlabQuantTypeUnavailable {
+            name: info.name.clone(),
+            quant_type: info.quant_type,
+        });
+    }
     let expected_shape = entry
         .logical_shape
         .iter()
@@ -688,7 +841,14 @@ fn is_vision_tensor(name: &str) -> bool {
     .any(|prefix| name.starts_with(prefix))
 }
 
-fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4ArtifactError> {
+/// `slab`: the artifact's per-expert entries (qt 44/53/131/132, named
+/// `...experts.{N}.gate_up_proj`) are validated end to end by the span table
+/// and read as layer arenas; the per-tensor identity loop skips them (it knows
+/// only the dtypes of the ordinary source tensors).
+fn validate_source_identity(
+    hfq: &HfqFile,
+    slab: bool,
+) -> Result<Arc<SourceIdentity>, Qwen4ArtifactError> {
     let effective = hfq.source_identity().map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: source identity seal failed: {error}"))
     })?;
@@ -732,6 +892,9 @@ fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4A
         ));
     }
     for (index, info) in hfq.tensors().iter().enumerate() {
+        if slab && parse_expert_entry_name(&info.name).is_some() {
+            continue;
+        }
         let range_identity = &effective.manifest[index];
         let loaded_identity = &loaded.manifest[index];
         let expected_dtype = source_dtype_name(info.quant_type).ok_or_else(|| {
@@ -1154,6 +1317,7 @@ pub fn admit_inventory_headers(
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    refuse_expert_slabs(metadata_json, tensors)?;
     let config = Qwen4Config::from_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
@@ -1170,6 +1334,7 @@ pub fn admit_developer_inventory_headers(
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+    refuse_expert_slabs(metadata_json, tensors)?;
     let config = Qwen4Config::from_developer_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
@@ -1193,6 +1358,17 @@ pub fn admit_developer_inventory_headers(
 /// inferred from geometry), still under its exact inventory and extents.  No
 /// environment variable or config key crosses this boundary.
 pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
+    admit_hfqm_artifact_on(hfq, None)
+}
+
+/// [`admit_hfqm_artifact`] for a known GPU architecture: an expert-slab
+/// artifact is admitted only where [`slab_route_admitted`] holds for `arch`;
+/// every other arch (and `None`) keeps the `ExpertSlabKernelsUnavailable`
+/// refusal.
+pub fn admit_hfqm_artifact_on(
+    hfq: &HfqFile,
+    slab_device: Option<&str>,
+) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: source arch_id={} does not match reserved arch_id={ARCH_ID}",
@@ -1210,8 +1386,12 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
             "qwen4: REAP/head overlays are not admitted for exact HFQM inventory",
         ));
     }
+    let slab = expert_slab_plan(&hfq.metadata_json, hfq.tensors(), slab_device)?;
     let config = parse_artifact_config(&hfq.metadata_json)?;
     let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json)?;
+    if let Some(plan) = &slab {
+        manifest = slab_manifest(&config, &manifest, plan)?;
+    }
     let ple_config = config.ple.as_ref();
     let sidecar = hfq.ple_rows().is_some();
     if sidecar && manifest.identity.recipe.is_stock_fp8() {
@@ -1226,9 +1406,34 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
     if sidecar {
         manifest = manifest.without_ple_shards();
     }
+    let slab_inventory;
+    let (inventory_tensors, inventory_manifest): (&[HfqTensorInfo], &Qwen4Manifest) =
+        if slab.is_some() {
+            // The 49,152 per-expert entries were validated end to end by the
+            // span table; the manifest declares them as per-layer arenas.
+            // The remaining tensors face the ordinary exact-inventory check
+            // against the manifest with the arenas taken out.
+            slab_inventory = (
+                hfq.tensors()
+                    .iter()
+                    .filter(|info| parse_expert_entry_name(&info.name).is_none())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                {
+                    let mut without_arenas = manifest.clone();
+                    without_arenas
+                        .weights
+                        .retain(|entry| !entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX));
+                    without_arenas
+                },
+            );
+            (&slab_inventory.0, &slab_inventory.1)
+        } else {
+            (hfq.tensors(), &manifest)
+        };
     let source_tensor_count = validate_manifest_inventory(
-        hfq.tensors(),
-        &manifest,
+        inventory_tensors,
+        inventory_manifest,
         shadowed_ple_shards,
         ple_config.map_or(0, |ple| ple.shard_count),
     )?;
@@ -1237,7 +1442,7 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
     // Seal every descriptor before reading the three tiny records.  This
     // keeps the bounded host reads tied to the same source identity as all
     // later external-row reads.
-    let source_identity = validate_source_identity(hfq)?;
+    let source_identity = validate_source_identity(hfq, slab.is_some())?;
     let ple_rows = match (ple_config, &ple) {
         (Some(ple_config), Some(ple)) => {
             validate_ple_records(hfq, ple_config, ple)?;
@@ -1430,6 +1635,214 @@ pub fn routed_headers_symmetric(
         .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>();
     routed_tensors_symmetric(hfq, &names)
+}
+
+fn hotset_refusal(reason: impl fmt::Display) -> String {
+    format!(
+        "qwen4: {HOTSET_ENV} requires the packed Flash-Next aggregate MQ4-XTS routed experts \
+         (48 trunk layers x 512 experts, top-10, qt44 gate_up + qt53 down): {reason}"
+    )
+}
+
+/// Header-only check, with no payload read, that the artifact's layout can
+/// back [`hotset_aggregate_slabs`]: the legacy aggregate routed tensors of
+/// the packed recipe.  Refuses (naming [`HOTSET_ENV`]) an expert-slab
+/// artifact (qwen4.expert_slabs metadata, per-expert entry names, qt131..134
+/// planar I4 experts, i.e. the slab arena / K4 route), a stock-FP8 artifact
+/// (qt55 routed experts), any trunk routed tensor that is not qt44/qt53, and
+/// an overlaid source.  This is an optional eligibility check, called from
+/// [`hotset_aggregate_slabs`] during hotset preparation after
+/// [`admit_hfqm_artifact_on`]'s generic admission has already succeeded; a
+/// failure here means the hotset is not eligible and the caller must fall
+/// back to the exact whole-layer placement, not refuse the load.
+pub fn hotset_source_preflight(hfq: &HfqFile) -> Result<(), String> {
+    if hfq.arch_id != ARCH_ID {
+        return Err(hotset_refusal(format!(
+            "source arch_id={} is not the Qwen4 arch_id={ARCH_ID}",
+            hfq.arch_id
+        )));
+    }
+    if hfq.has_overlay() {
+        return Err(hotset_refusal(
+            "REAP/head overlays are not admitted (the hotset reads the base mmap directly)",
+        ));
+    }
+    match expert_slabs::parse(&hfq.metadata_json) {
+        Ok(None) | Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => {}
+        Ok(Some(_)) => {
+            return Err(hotset_refusal(
+                "this is a per-expert slab artifact (qwen4.expert_slabs v1 metadata: slab arena / \
+                 K4 route), not an aggregate artifact",
+            ));
+        }
+        Err(error) => {
+            return Err(hotset_refusal(format!(
+                "the artifact carries invalid qwen4.expert_slabs metadata ({error})"
+            )));
+        }
+    }
+    for info in hfq.tensors() {
+        if parse_expert_entry_name(&info.name).is_some() {
+            return Err(hotset_refusal(format!(
+                "per-expert slab entry {} is present (slab arena / K4 route), not an aggregate \
+                 artifact",
+                info.name
+            )));
+        }
+        if matches!(info.quant_type, 131..=134) {
+            return Err(hotset_refusal(format!(
+                "tensor {} is a planar I4 expert type (qt={}), not aggregate MQ4-XTS",
+                info.name, info.quant_type
+            )));
+        }
+        let routed_gate_up = info.name.ends_with(ROUTED_GATE_UP_SUFFIX);
+        let routed_down = info.name.ends_with(ROUTED_DOWN_SUFFIX);
+        if !(routed_gate_up || routed_down) {
+            continue;
+        }
+        if info.quant_type == QWEN4_QT_FP8E4M3B128 {
+            return Err(hotset_refusal(format!(
+                "routed tensor {} is qt=55 FP8E4M3B128 (the stock-FP8 artifact keeps every \
+                 routed expert resident on gfx942 and has no MQ4 experts)",
+                info.name
+            )));
+        }
+        if !info.name.starts_with("model.language_model.layers.") {
+            // The MTP head's experts stay host-mapped legacy tensors, outside the hotset.
+            continue;
+        }
+        let expected = if routed_gate_up {
+            QWEN4_QT_MQ4G256V2
+        } else {
+            QWEN4_QT_MQ4G128V2
+        };
+        if info.quant_type != expected {
+            return Err(hotset_refusal(format!(
+                "trunk routed tensor {} is qt={}, expected qt={expected}",
+                info.name, info.quant_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The per-expert `(layer * 512 + expert)` source slabs of the artifact's
+/// aggregate MQ4-XTS routed experts, for the load-time hotset.  Each span is
+/// an **absolute** artifact mmap offset (`HfqTensorInfo::data_offset` plus
+/// the expert stride), readable through [`HfqFile::data_range`]; no payload
+/// is read, hashed or copied.
+///
+/// Strict contract: the packed Flash-Next recipe (not stock FP8, not the
+/// slab arena), `config.num_hidden_layers == 48`, 512 experts, top-10 (the
+/// authoritative `config.ffn` and its scalar mirrors); every trunk layer has
+/// qt44 `[512, 1280, 2560]` gate_up and qt53 `[512, 2560, 640]` down of the
+/// exact byte length, fully inside the mapping.  Every violation is a
+/// refusal naming [`HOTSET_ENV`].  `hfq` and `manifest` must be the admitted
+/// artifact (`admit_hfqm_artifact_on`) the slabs are used with: the slab
+/// list is bound to the source by structure (names, qt, shape, length,
+/// absolute offsets of the sealed index), not by a payload digest.
+pub fn hotset_aggregate_slabs(
+    hfq: &HfqFile,
+    config: &Qwen4Config,
+    manifest: &Qwen4Manifest,
+) -> Result<Vec<crate::expert_slab_table::ExpertSlab>, String> {
+    use crate::expert_slab_aggregate::{slabs_from_aggregate_mq4, AggregateLayer, AggregateProjection};
+    use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
+
+    hotset_source_preflight(hfq)?;
+    if !matches!(config.profile, crate::config::Qwen4Profile::FlashNext) {
+        return Err(hotset_refusal(format!(
+            "profile {} is not the packed Flash-Next profile",
+            config.profile.id()
+        )));
+    }
+    if !matches!(manifest.identity.recipe, Qwen4TierRecipe::FlashNextPacked { .. }) {
+        return Err(hotset_refusal(
+            "the manifest recipe is not the packed Flash-Next recipe (stock-FP8 and slab-arena \
+             recipes are not aggregate MQ4)",
+        ));
+    }
+    let layers = TRUNK_LAYERS as usize;
+    let experts = EXPERTS_PER_LAYER as usize;
+    if config.num_hidden_layers != layers
+        || config.num_experts != experts
+        || config.num_experts_per_tok != 10
+        || !matches!(
+            config.ffn,
+            crate::config::Qwen4FfnConfig::Moe { num_experts: 512, top_k: 10, .. }
+        )
+    {
+        return Err(hotset_refusal(format!(
+            "config has {} layers / {} experts / top-{} (need {layers} / {experts} / top-10)",
+            config.num_hidden_layers, config.num_experts, config.num_experts_per_tok
+        )));
+    }
+
+    let (gate_up_qt, down_qt) = ExpertFormat::Mq4Xts.pair();
+    let gate_up_len = ExpertFormat::Mq4Xts.gate_up_bytes() * experts;
+    let down_len = ExpertFormat::Mq4Xts.down_bytes() * experts;
+    let projection = |layer: usize,
+                      suffix: &str,
+                      qt: u8,
+                      shape: [u32; 3],
+                      len: usize|
+     -> Result<AggregateProjection, String> {
+        let name = format!("model.language_model.layers.{layer}.mlp{suffix}");
+        if !manifest.weights.iter().any(|entry| entry.name == name && entry.layer == Some(layer)) {
+            return Err(hotset_refusal(format!(
+                "the manifest declares no aggregate routed tensor {name} (nonaggregate layout)"
+            )));
+        }
+        let info = hfq
+            .find_tensor_info(&name)
+            .ok_or_else(|| hotset_refusal(format!("routed tensor {name} is missing")))?;
+        if info.quant_type != qt {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} is qt={}, expected qt={qt}",
+                info.quant_type
+            )));
+        }
+        if info.shape != shape {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} shape {:?}, expected {shape:?}",
+                info.shape
+            )));
+        }
+        if info.data_size != len {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} is {} bytes, expected {len}",
+                info.data_size
+            )));
+        }
+        if hfq.data_range(info.data_offset, info.data_size).is_none() {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} bytes [{}, +{}) are not inside the artifact mmap",
+                info.data_offset, info.data_size
+            )));
+        }
+        Ok(AggregateProjection {
+            offset: info.data_offset as u64,
+            len: info.data_size as u64,
+            quant_type: info.quant_type,
+            shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+        })
+    };
+    let aggregates = (0..layers)
+        .map(|layer| -> Result<AggregateLayer, String> {
+            Ok(AggregateLayer {
+                gate_up: projection(
+                    layer,
+                    ROUTED_GATE_UP_SUFFIX,
+                    gate_up_qt,
+                    [512, 1280, 2560],
+                    gate_up_len,
+                )?,
+                down: projection(layer, ROUTED_DOWN_SUFFIX, down_qt, [512, 2560, 640], down_len)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    slabs_from_aggregate_mq4(&aggregates)
+        .map_err(|error| hotset_refusal(format!("aggregate adapter: {error}")))
 }
 
 /// Whether every PLE key/value projection runs as BF16 weights: the manifest
@@ -1832,6 +2245,130 @@ mod tests {
     };
     use hipfire_runtime::ple_sidecar::ple_shard_name;
     use std::path::{Path, PathBuf};
+    fn slab_metadata() -> String {
+        json!({
+            (expert_slabs::EXPERT_SLABS_METADATA_KEY): expert_slabs::ExpertSlabsV1::fn_v1().to_json_value()
+        })
+        .to_string()
+    }
+
+    fn container_refusal(
+        fixture: &str,
+        metadata: &str,
+        tensors: &[HfqMemTensor],
+    ) -> Qwen4ArtifactError {
+        let path = fixture_path(fixture);
+        write_hfqm_package_mem(&path, ARCH_ID, metadata, tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        let error = admit_hfqm_artifact(&hfq).expect_err("CPU admission must refuse slabs");
+        drop(hfq);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        error
+    }
+
+    #[test]
+    fn slab_container_invalid_table_refuses_before_config_admission() {
+        assert!(matches!(
+            container_refusal("slab-empty-table", &slab_metadata(), &[]),
+            Qwen4ArtifactError::ExpertSlabTable(_)
+        ));
+    }
+
+    #[test]
+    fn slab_container_i4_without_metadata_refuses_each_new_qtype() {
+        for quant_type in 131..=134 {
+            let tensor = HfqMemTensor {
+                name: "stray.weight".into(),
+                quant_type,
+                shape: vec![1, 256],
+                group_size: 128,
+                data: vec![],
+            };
+            assert!(matches!(
+                container_refusal(&format!("slab-no-key-{quant_type}"), "{}", &[tensor]),
+                Qwen4ArtifactError::ExpertSlabsMetadataRequired {
+                    quant_type: found, ..
+                } if found == quant_type
+            ));
+        }
+    }
+
+    #[test]
+    fn slab_container_per_expert_mq4_name_without_metadata_refuses() {
+        let tensor = HfqMemTensor {
+            name: expert_slabs::expert_entry_name(0, 0, expert_slabs::ExpertProj::GateUp),
+            quant_type: 44,
+            shape: vec![1, 256],
+            group_size: 256,
+            data: vec![],
+        };
+        assert!(matches!(
+            container_refusal("slab-name-no-key", "{}", &[tensor]),
+            Qwen4ArtifactError::ExpertSlabsMetadataRequired { quant_type: 44, .. }
+        ));
+    }
+
+    #[test]
+    fn slab_container_malformed_metadata_is_a_typed_refusal() {
+        let metadata = json!({(expert_slabs::EXPERT_SLABS_METADATA_KEY): {"version": 2}});
+        assert!(matches!(
+            container_refusal("slab-bad-key", &metadata.to_string(), &[]),
+            Qwen4ArtifactError::ExpertSlabsMetadata(ExpertSlabsError::Mismatch {
+                field: "version", ..
+            })
+        ));
+    }
+
+    #[test]
+    fn slab_valid_full_inventory_refuses_unavailable_kernels_with_counts() {
+        use expert_slabs::ExpertFormat;
+        let headers = crate::expert_slab_table::full_fn_headers(|layer, expert| {
+            match (layer * 512 + expert) % 3 {
+                0 => ExpertFormat::Mq3I4,
+                1 => ExpertFormat::Mq2I4,
+                _ => ExpertFormat::Mq4Xts,
+            }
+        });
+        let error = refuse_expert_slabs(&slab_metadata(), &headers).unwrap_err();
+        assert_eq!(
+            error,
+            Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+                w3: 8192, w2: 8192, mq4: 8192,
+            }
+        );
+        assert!(error.to_string().contains("not available on any GPU"));
+    }
+
+    #[test]
+    fn slab_recognition_leaves_legacy_headers_and_invalid_json_to_existing_checks() {
+        refuse_expert_slabs(&flash_next_json(), &flash_next_headers()).unwrap();
+        refuse_expert_slabs("invalid JSON", &[]).unwrap();
+        refuse_expert_slabs("[]", &[]).unwrap();
+    }
+
+    #[test]
+    fn weight_geometry_explicitly_refuses_each_planar_i4_qtype() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let entry = &manifest.weights[0];
+        for quant_type in 131..=134 {
+            let info = HfqTensorInfo {
+                name: entry.name.clone(),
+                quant_type,
+                shape: entry.logical_shape.iter().map(|&d| d as u32).collect(),
+                group_size: 128,
+                data_offset: 4096,
+                data_size: 0,
+            };
+            assert!(matches!(
+                validate_weight_geometry(entry, &info),
+                Err(Qwen4ArtifactError::ExpertSlabQuantTypeUnavailable {
+                    quant_type: found, ..
+                }) if found == quant_type
+            ));
+        }
+    }
+
 
     const PLE_MULTIPLIERS_NAME: &str =
         "model.language_model.layers.1.ple.ple_embedding.layer_multipliers";

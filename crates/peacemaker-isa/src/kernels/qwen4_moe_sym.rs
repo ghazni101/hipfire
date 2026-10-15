@@ -49,6 +49,10 @@ use peacemaker_author::{End, Gfx1151, Gfx1201, Scc, Target, WgUniform, Workgroup
 
 type Wg<'b, T> = Workgroup<'b, T, Builder>;
 
+/// `WeightCodec::Mq3I4` NT1 gate/up (own generator; the MQ4 entries above and below are untouched).
+#[path = "qwen4_moe_sym_w3.rs"]
+pub mod w3;
+
 /// A `K`-derived trip counter: workgroup-uniform.
 fn trips_cmp<T: Target>(wg: &mut Wg<T>, cmp: &str, trips: u8) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(format!("{cmp} s{trips}, 0"), vec![], vec![s(trips)]))
@@ -91,13 +95,21 @@ impl std::str::FromStr for Kind {
     }
 }
 
+/// Expert weight codec of a grouped IU4 GEMM. `Mq4Sym` is the shipped
+/// pointer-addressed QT44/QT53 symmetric MQ4 (every existing symbol and byte);
+/// `Mq3I4` is the planar qt131/132 W3 grid (`d * (2c - 7)`, codes plane then
+/// f16 scale plane, see `hipfire_runtime::mq_i4`) with the same exact IU4 fold.
+/// Its numerics are frozen in `mq_i4_reference` (`iu4_gemm_f32`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WeightCodec { Mq4Sym, Mq3I4 }
+
 /// One entry: arch, GEMM kind, expert-run tile width `nt` (16-slot tiles
 /// per weight stream) and row repeat `rr` (contiguous 64-row blocks folded
 /// per CTA, gfx1151 down NT4 only). `nt == 1` is the frozen 16-slot entry,
 /// the byte anchor of every wider tile; `rr == 1` is the anchor of every
 /// row repeat.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8, pub rr: u8 }
+pub struct Spec { pub arch: Arch, pub kind: Kind, pub nt: u8, pub rr: u8, pub codec: WeightCodec }
 
 /// Tile widths built per arch: the anchor and the shipped expert-run tiles
 /// (gfx1151 NT4; gfx1201 NT4 for VRAM-resident, NT8 for host-mapped experts).
@@ -113,26 +125,43 @@ pub fn row_repeats(arch: Arch) -> &'static [u8] {
 
 /// Every entry of one architecture's module, in emission order: both kinds at
 /// every tile width, then the down NT4 row repeats.
-pub fn module_specs(arch: Arch) -> Vec<Spec> {
+pub fn module_specs(arch: Arch) -> Vec<Spec> { module_specs_codec(arch, WeightCodec::Mq4Sym) }
+
+/// [`module_specs`] for one weight codec. The MQ3-I4 module (gfx1201) holds the
+/// NT1 gate/up and down entries; the MQ4 module is the shipped one.
+pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
+    if codec == WeightCodec::Mq3I4 {
+        return if arch == Arch::Gfx1201 { Kind::ALL.into_iter().map(|kind| Spec { arch, kind, nt: 1, rr: 1, codec }).collect() } else { Vec::new() };
+    }
     tile_widths(arch).iter()
-        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt, rr: 1 }))
-        .chain(row_repeats(arch).iter().map(|&rr| Spec { arch, kind: Kind::Down, nt: 4, rr }))
+        .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt, rr: 1, codec }))
+        .chain(row_repeats(arch).iter().map(|&rr| Spec { arch, kind: Kind::Down, nt: 4, rr, codec }))
         .collect()
 }
 
 impl Spec {
     pub fn symbol(self) -> String {
+        let infix = if self.codec == WeightCodec::Mq3I4 { "_w3" } else { "" };
         let base = match self.kind {
-            Kind::GateUp => format!("qwen4_moe_gate_up_silu_iu4_sym_pm_{}", self.arch.name()),
-            Kind::Down => format!("qwen4_moe_down_iu4_sym_pm_{}", self.arch.name()),
+            Kind::GateUp => format!("qwen4_moe_gate_up_silu_iu4_sym{infix}_pm_{}", self.arch.name()),
+            Kind::Down => format!("qwen4_moe_down_iu4_sym{infix}_pm_{}", self.arch.name()),
         };
         if self.nt == 1 { base } else if self.rr == 1 { format!("{base}_nt{}", self.nt) } else { format!("{base}_nt{}r{}", self.nt, self.rr) }
     }
-    /// Contract/variant tag: `gate_up`, `down_nt4`, `down_nt4r2`.
+    /// Contract/variant tag: `gate_up`, `down_nt4`, `down_nt4r2`; a non-MQ4
+    /// codec appends `_w3`.
     pub fn variant(self) -> String {
-        if self.nt == 1 { self.kind.tag().into() } else if self.rr == 1 { format!("{}_nt{}", self.kind.tag(), self.nt) } else { format!("{}_nt{}r{}", self.kind.tag(), self.nt, self.rr) }
+        let tag = if self.nt == 1 { self.kind.tag().into() } else if self.rr == 1 { format!("{}_nt{}", self.kind.tag(), self.nt) } else { format!("{}_nt{}r{}", self.kind.tag(), self.nt, self.rr) };
+        if self.codec == WeightCodec::Mq3I4 { format!("{tag}_w3") } else { tag }
     }
-    pub fn module(arch: Arch) -> String { format!("qwen4_moe_iu4_sym_pm_{}", arch.name()) }
+    /// The committed MQ4 module (`WeightCodec::Mq4Sym`).
+    pub fn module(arch: Arch) -> String { Self::module_codec(arch, WeightCodec::Mq4Sym) }
+    pub fn module_codec(arch: Arch, codec: WeightCodec) -> String {
+        match codec {
+            WeightCodec::Mq4Sym => format!("qwen4_moe_iu4_sym_pm_{}", arch.name()),
+            WeightCodec::Mq3I4 => format!("qwen4_moe_iu4_sym_w3_pm_{}", arch.name()),
+        }
+    }
     pub fn validate(self) -> Result<(), String> {
         if !matches!(self.arch, Arch::Gfx1151 | Arch::Gfx1201) { return Err("qwen4_moe_sym: built for gfx1151 and gfx1201 only".into()) }
         // gfx11 operands are twice gfx12's per lane: NT8 exceeds the VGPR file.
@@ -141,6 +170,9 @@ impl Spec {
         if !matches!(self.rr, 1 | 2 | 4) { return Err(format!("qwen4_moe_sym: row repeat {} (1, 2 or 4)", self.rr)) }
         if self.rr > 1 && (self.kind != Kind::Down || self.nt != 4 || self.arch.gfx12()) {
             return Err(format!("qwen4_moe_sym: row repeat {} is built for the gfx1151 down NT4 entry only", self.rr))
+        }
+        if self.codec == WeightCodec::Mq3I4 && !(self.arch == Arch::Gfx1201 && self.nt == 1 && self.rr == 1) {
+            return Err("qwen4_moe_sym: the MQ3-I4 codec is built for the gfx1201 NT1 entries only".into())
         }
         Ok(())
     }
@@ -224,11 +256,15 @@ const MASKT: [u8; 2] = [60, 62];
 const SILU_MASK: u8 = 24;
 const SRD_Y: u8 = 64;
 
-struct Gen { spec: Spec }
+struct Gen { spec: Spec, acc: bool }
 
 impl Gen {
     fn arch(&self) -> Arch { self.spec.arch }
-    fn label(&self, name: &str) -> String { format!(".Lq4s_{}_{name}", self.spec.kind.tag()) }
+    /// Local labels are unique per module entry: the MQ3-I4 NT1 entry and its F32 qualification entry share a module.
+    fn label(&self, name: &str) -> String {
+        let entry = match (self.spec.codec, self.acc) { (WeightCodec::Mq4Sym, _) => "", (_, false) => "_w3", (_, true) => "_w3acc" };
+        format!(".Lq4s_{}{entry}_{name}", self.spec.kind.tag())
+    }
     fn t(&self) -> u8 { self.spec.kind.tensors() }
     fn aw(&self) -> u8 { self.spec.aw() }
     /// Set `p`'s registers: A of tensor t, X, header word of tensor t, d.
@@ -575,8 +611,9 @@ fn epilogue(b: &mut Builder, g: &Gen) -> Result<(), String> {
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
+    if spec.codec == WeightCodec::Mq3I4 { return w3::emit(spec) }
     if spec.nt > 1 { return nt::emit(spec) }
-    let g = Gen { spec };
+    let g = Gen { spec, acc: false };
     let kspec = KernelSpec {
         kernel_id: "qwen4_moe_sym".into(), variant: spec.kind.tag().into(), arch: spec.arch, symbol: spec.symbol(),
         kernargs: spec.kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
@@ -601,6 +638,19 @@ fn body<T: Target>(wg: &mut Wg<T>, g: &Gen) -> Result<(), String> {
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
     let emitted = module_specs(arch).into_iter().map(emit).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
+    Ok((emitted, text, proof))
+}
+
+/// One architecture's module for one weight codec. [`WeightCodec::Mq4Sym`] is
+/// [`emit_module`] (the committed bundle); [`WeightCodec::Mq3I4`] is its own
+/// module ([`Spec::module_codec`]), so no existing MQ4 byte moves.
+pub fn emit_module_codec(arch: Arch, codec: WeightCodec) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let mut emitted = module_specs_codec(arch, codec).into_iter().map(emit).collect::<Result<Vec<_>, _>>()?;
+    if codec == WeightCodec::Mq3I4 {
+        // The qualification entry follows the shipped one in the module.
+        for spec in module_specs_codec(arch, codec) { emitted.push(w3::emit_acc(spec)?); }
+    }
+    let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module_codec(arch, codec))?;
     Ok((emitted, text, proof))
 }
 

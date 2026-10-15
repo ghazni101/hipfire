@@ -62,6 +62,10 @@ pub mod loop_guard;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
+/// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
+pub mod mq_i4;
+/// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.
+pub mod mq_i4_reference;
 pub mod multi_gpu;
 pub mod offload_calibrate;
 pub mod paro;

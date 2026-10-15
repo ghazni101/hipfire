@@ -23,12 +23,18 @@
 //!
 //! # Binding
 //!
-//! A sidecar is bound to exactly one base HFQM file by the sha256 of the base
-//! bytes `[0, data_offset)` (header, metadata JSON, tensor index, padding) and
-//! the base file length (`PleTableFields::{base_index_sha256, base_file_bytes}`)
-//! — see [`HfqFile::attach_ple_rows`]. A base split from a monolithic file
-//! additionally carries the [`PLE_BASE_MARKER_KEY`] metadata entry, whose
-//! `q8_rows_sha256` must equal the table's `source_rows_sha256`.
+//! A table's header records a base file binding (`PleTableFields::{base_index_sha256,
+//! base_file_bytes}`: the sha256 of the base bytes `[0, data_offset)` — header,
+//! metadata JSON, tensor index, padding — and the base file length). How
+//! [`HfqFile::attach_ple_rows`] uses it depends on the base:
+//!
+//! * a **monolithic** base (embedded PLE shards) is bound to exactly one file:
+//!   both fields must match it;
+//! * a **split** base carries the [`PLE_BASE_MARKER_KEY`] metadata entry and is
+//!   bound by row identity: the marker's geometry must equal the table's and its
+//!   `q8_rows_sha256` must equal the table's `source_rows_sha256`. The two file
+//!   binding fields are not compared, so one table serves every split base
+//!   marked for the same rows.
 //!
 //! # API
 //!
@@ -1791,9 +1797,13 @@ mod tests {
         let base = dir.path().join("m-base.hfqm");
         let sha = q8_rows_sha(1);
         write_split(&base, &sha);
-        let side = dir.path().join("side.ple-q8");
-        let good = write_bound_sidecar(&side, &base, RowEncoding::Q8F16, &sha, 1);
-        let good_index = good.table.as_ref().unwrap().base_index_sha256.clone();
+        write_bound_sidecar(
+            &dir.path().join("side.ple-q8"),
+            &base,
+            RowEncoding::Q8F16,
+            &sha,
+            1,
+        );
         let bad = dir.path().join("bad.ple-q8");
         let attach = |mutate: &dyn Fn(&mut PleHotPackHeader), rows_per_shard: usize| {
             let hfq = HfqFile::open(&base).unwrap();
@@ -1806,17 +1816,10 @@ mod tests {
         };
         attach(&|_| {}, ROWS).unwrap();
 
-        // index sha differs
-        let err = attach(&|h| table_mut(h).base_index_sha256 = "cd".repeat(32), ROWS).unwrap_err();
-        assert!(err.contains("cdcdcdcdcdcd"), "{err}");
-        assert!(err.contains(short_hex(&good_index)), "{err}");
-        assert!(err.contains(bad.to_str().unwrap()), "{err}");
-        assert!(err.contains("pull"), "{err}");
-
-        // file bytes differ
-        let err = attach(&|h| table_mut(h).base_file_bytes += 1, ROWS).unwrap_err();
-        assert!(err.contains("bytes"), "{err}");
-        assert!(err.contains(bad.to_str().unwrap()), "{err}");
+        // a split base is bound by row identity, not file bytes: a different
+        // index sha or file length does not refuse it
+        attach(&|h| table_mut(h).base_index_sha256 = "cd".repeat(32), ROWS).unwrap();
+        attach(&|h| table_mut(h).base_file_bytes += 1, ROWS).unwrap();
 
         // marker sha differs from the table's source digest
         let err = attach(&|h| table_mut(h).source_rows_sha256 = "ef".repeat(32), ROWS).unwrap_err();
@@ -1827,28 +1830,17 @@ mod tests {
         let err = attach(&|_| {}, ROWS + 1).unwrap_err();
         assert!(err.contains("rows_per_shard"), "{err}");
 
-        // a q4 table bound to a different base mentions the derive remedy
+        // a q4 table built from different rows mentions the derive remedy
         let q4_path = dir.path().join("bad.ple-q4");
         let hfq = HfqFile::open(&base).unwrap();
         write_mutated_sidecar(&q4_path, &hfq, RowEncoding::Q4Lm, ROWS, &sha, |h| {
-            table_mut(h).base_file_bytes += 1
+            table_mut(h).source_rows_sha256 = "ef".repeat(32)
         });
         let err = HfqFile::open(&base)
             .unwrap()
             .attach_ple_rows(PleRowsFile::open(&q4_path).unwrap())
             .unwrap_err();
         assert!(err.contains("hipfire ple derive --format q4"), "{err}");
-
-        // changed base bytes (same length, inside the index padding): index sha differs
-        let data_offset = HfqFile::open(&base).unwrap().data_offset() as usize;
-        let mut raw = std::fs::read(&base).unwrap();
-        raw[data_offset - 1] ^= 0x01;
-        std::fs::write(&base, raw).unwrap();
-        let err = HfqFile::open(&base)
-            .unwrap()
-            .attach_ple_rows(PleRowsFile::open(&side).unwrap())
-            .unwrap_err();
-        assert!(err.contains("index"), "{err}");
 
         // a base without marker and without shards
         let plain = dir.path().join("plain.hfqm");
@@ -1864,6 +1856,154 @@ mod tests {
             "{err}"
         );
         assert!(err.contains(PLE_BASE_MARKER_KEY), "{err}");
+    }
+
+    /// A split base carrying `marker` and an extra tensor + metadata key, so its
+    /// file length and index differ from every other base built with a
+    /// different `extra`.
+    fn write_split_variant(path: &Path, marker: &str, extra: usize) {
+        let mut tensors = vec![i64_tensor(
+            "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+        )];
+        for i in 0..extra {
+            tensors.push(i64_tensor(&format!("extra.{i}")));
+        }
+        let metadata = marker.replacen('{', &format!("{{\"pad\":\"{}\",", "x".repeat(extra * 7)), 1);
+        write_hfqm_package_mem(path, 16, &metadata, &tensors).unwrap();
+    }
+
+    #[test]
+    fn one_table_binds_two_split_bases_of_different_length_and_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = q8_rows_sha(1);
+        let marker = marker_json(&sha);
+        let a = dir.path().join("a-base.hfqm");
+        let b = dir.path().join("b-base.hfqm");
+        write_split_variant(&a, &marker, 0);
+        write_split_variant(&b, &marker, 3);
+        let (ha, hb) = (HfqFile::open(&a).unwrap(), HfqFile::open(&b).unwrap());
+        assert_ne!(ha.file_len(), hb.file_len());
+        assert_ne!(ha.index_sha256().unwrap(), hb.index_sha256().unwrap());
+
+        // one shared table, bound (for its header fields only) to base `a`
+        let shared = dir.path().join("shared.ple-q8");
+        let header = write_bound_sidecar(&shared, &a, RowEncoding::Q8F16, &sha, 1);
+        assert_eq!(header.table.as_ref().unwrap().base_file_bytes, ha.file_len());
+
+        for base in [&a, &b] {
+            let mut hfq = HfqFile::open(base).unwrap();
+            hfq.attach_ple_rows(PleRowsFile::open(&shared).unwrap())
+                .unwrap();
+            assert_eq!(hfq.ple_rows().unwrap().path(), shared);
+        }
+
+        // a base marked for different rows (R') refuses the same table
+        let other = dir.path().join("other-base.hfqm");
+        write_split_variant(&other, &marker_json(&q8_rows_sha(2)), 1);
+        let err = HfqFile::open(&other)
+            .unwrap()
+            .attach_ple_rows(PleRowsFile::open(&shared).unwrap())
+            .unwrap_err();
+        assert!(err.contains("was split from q8 rows"), "{err}");
+        assert!(err.contains(short_hex(&q8_rows_sha(2))), "{err}");
+        assert!(err.contains(short_hex(&sha)), "{err}");
+
+        // a base marked R with different geometry refuses it
+        for (from, to) in [
+            (format!("\"row_width\":{WIDTH}"), format!("\"row_width\":{}", WIDTH + 32)),
+            (
+                format!("\"rows_per_shard\":{ROWS}"),
+                format!("\"rows_per_shard\":{}", ROWS + 1),
+            ),
+            (
+                format!("\"shard_count\":{SHARDS}"),
+                format!("\"shard_count\":{}", SHARDS + 1),
+            ),
+        ] {
+            let skewed = dir.path().join("skewed-base.hfqm");
+            let json = marker.replace(&from, &to);
+            assert_ne!(json, marker, "{from}");
+            write_split_variant(&skewed, &json, 2);
+            let err = HfqFile::open(&skewed)
+                .unwrap()
+                .attach_ple_rows(PleRowsFile::open(&shared).unwrap())
+                .unwrap_err();
+            let field = from.split('"').nth(1).unwrap();
+            assert!(err.contains(field) && err.contains("declares"), "{err}");
+        }
+    }
+
+    #[test]
+    fn monolithic_attach_still_requires_file_length_and_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("m.hfqm");
+        write_monolithic(&base, &all_shards(RowEncoding::Q8F16, 6));
+        let bad = dir.path().join("m.ple-q8");
+        let attach = |mutate: &dyn Fn(&mut PleHotPackHeader)| {
+            let hfq = HfqFile::open(&base).unwrap();
+            write_mutated_sidecar(&bad, &hfq, RowEncoding::Q8F16, ROWS, &q8_rows_sha(6), |h| {
+                mutate(h)
+            });
+            HfqFile::open(&base)
+                .unwrap()
+                .attach_ple_rows(PleRowsFile::open(&bad).unwrap())
+        };
+        attach(&|_| {}).unwrap();
+
+        let err = attach(&|h| table_mut(h).base_file_bytes += 1).unwrap_err();
+        assert!(err.contains("bytes"), "{err}");
+        assert!(err.contains(bad.to_str().unwrap()), "{err}");
+
+        let err = attach(&|h| table_mut(h).base_index_sha256 = "cd".repeat(32)).unwrap_err();
+        assert!(err.contains("cdcdcdcdcdcd"), "{err}");
+        assert!(err.contains("index"), "{err}");
+        assert!(err.contains("pull"), "{err}");
+
+        // same length, one flipped byte inside the index padding: index sha differs
+        let side = dir.path().join("side.ple-q8");
+        write_bound_sidecar(&side, &base, RowEncoding::Q8F16, &q8_rows_sha(1), 1);
+        let data_offset = HfqFile::open(&base).unwrap().data_offset() as usize;
+        let mut raw = std::fs::read(&base).unwrap();
+        raw[data_offset - 1] ^= 0x01;
+        std::fs::write(&base, raw).unwrap();
+        let err = HfqFile::open(&base)
+            .unwrap()
+            .attach_ple_rows(PleRowsFile::open(&side).unwrap())
+            .unwrap_err();
+        assert!(err.contains("index"), "{err}");
+    }
+
+    #[test]
+    fn absent_marker_still_refuses_even_with_matching_length_and_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.hfqm");
+        write_hfqm_package_mem(&plain, 16, "{}", &[i64_tensor("t")]).unwrap();
+        // bound to this very file's length and index: only the missing marker is wrong
+        let side = dir.path().join("plain.ple-q8");
+        write_bound_sidecar(&side, &plain, RowEncoding::Q8F16, &q8_rows_sha(1), 1);
+        let err = HfqFile::open(&plain)
+            .unwrap()
+            .attach_ple_rows(PleRowsFile::open(&side).unwrap())
+            .unwrap_err();
+        assert!(
+            err.contains("neither embedded PLE shard tensors nor"),
+            "{err}"
+        );
+        assert!(err.contains(PLE_BASE_MARKER_KEY), "{err}");
+
+        // a table bound to some other marked split base does not help
+        let marked = dir.path().join("marked-base.hfqm");
+        write_split(&marked, &q8_rows_sha(1));
+        let shared = dir.path().join("shared.ple-q8");
+        write_bound_sidecar(&shared, &marked, RowEncoding::Q8F16, &q8_rows_sha(1), 1);
+        let err = HfqFile::open(&plain)
+            .unwrap()
+            .attach_ple_rows(PleRowsFile::open(&shared).unwrap())
+            .unwrap_err();
+        assert!(
+            err.contains("neither embedded PLE shard tensors nor"),
+            "{err}"
+        );
     }
 
     #[test]

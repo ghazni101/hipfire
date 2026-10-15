@@ -25,6 +25,11 @@
 //! `retired_turn_commits_live_on_flash_next` (`--features lab` only) checks
 //! that a native MTP turn the AR floor retired still ends with its head at
 //! the target and commits live for the conversation's next turn.
+//!
+//! `terminal_stop_inside_window_repairs_live_on_flash_next` (`--features lab`
+//! only) checks that a terminal stop inside a committed MTP window restores
+//! the retained pre-window state, replays only the consumed prefix and
+//! commits live.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -712,6 +717,189 @@ fn retired_turn_commits_live_on_flash_next() {
         mismatches.is_empty(),
         "caught-up retired turns differ from the teacher-forced reference \
          (owed, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
+    );
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// A terminal stop inside a committed window (a stop sequence the emitter
+/// observes after the window committed more rows than it consumed) is
+/// repaired in place and commits live. The window is an n-gram takeover over
+/// the target's own greedy continuation, so it accepts every candidate and
+/// commits four tokens; the emitter consumes only the first `n` of them.
+/// `Speculator::repair_terminal_prefix` restores the pre-window target and head
+/// tickets the window retained and replays the seed plus the first `n - 1`
+/// consumed tokens; the pending token is then flushed as the caller does. The
+/// conversation must continue live (no re-prefill), and its next turn must
+/// seed exactly as the same tokens teacher-forced do.
+///
+/// `stop_sequences` is set, so `HIPFIRE_MTP_INCREMENTAL=1` runs the same test
+/// on the interleaved takeover route (which snapshots only then); the default
+/// runs the batched takeover. Built only with `--features lab`
+/// (`lab_ar_window` gives the greedy stream):
+/// `cargo test -p hipfire-arch-qwen4 --release --features lab --test
+/// session_cache_hw -- --ignored terminal_stop_inside_window_repairs_live_on_flash_next`.
+#[cfg(feature = "lab")]
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL; build with --features lab"]
+fn terminal_stop_inside_window_repairs_live_on_flash_next() {
+    use hipfire_runtime::spec::SpecRequestConfig;
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let never = || false;
+    let cfg = SpecRequestConfig {
+        stop_sequences: true,
+        ..SpecRequestConfig::default()
+    };
+    let a = prompt(0x7e7, 1500);
+
+    // The target's greedy continuation: the seed and four more tokens, from
+    // head-free AR windows.
+    MtpDrafter::configure_request(&mut drafter, cfg);
+    let seed = drafter
+        .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+        .expect("MTP prefill");
+    let mut stream = vec![seed];
+    for i in 0..4 {
+        let window = drafter
+            .lab_ar_window(&mut gpu, &mut bundle, a.len() + i, stream[i], false)
+            .expect("AR window");
+        stream.extend(window.committed);
+    }
+    assert_eq!(stream.len(), 5);
+
+    let mut mismatches = Vec::new();
+    for n in 1..=3usize {
+        MtpDrafter::configure_request(&mut drafter, cfg);
+        let cold_seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .expect("MTP prefill");
+        assert_eq!(cold_seed, seed, "n {n}: cold seed");
+        let window = drafter
+            .mtp_takeover_step(
+                &mut gpu,
+                &mut bundle,
+                a.len(),
+                seed,
+                &[seed],
+                &stream[1..4],
+                u32::MAX,
+            )
+            .expect("takeover window");
+        assert_eq!(
+            window.committed,
+            stream[1..5].to_vec(),
+            "n {n}: the window accepts the whole greedy continuation"
+        );
+        let consumed = &window.committed[..n];
+        let repaired = MtpDrafter::mtp_repair_terminal_prefix(
+            &mut drafter,
+            &mut gpu,
+            &mut bundle,
+            a.len(),
+            seed,
+            consumed,
+        )
+        .expect("terminal repair");
+        assert!(repaired, "n {n}: the retained window repairs the stop");
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &consumed[n - 1..],
+                a.len() + n,
+                &never
+            )
+            .expect("terminal flush"),
+            "n {n}: the drafter advances the flush itself"
+        );
+        let history: Vec<u32> = a
+            .iter()
+            .chain(&[seed])
+            .chain(consumed)
+            .copied()
+            .collect();
+        assert_eq!(
+            SessionState::live_position(&bundle, SessionRoute::Mtp),
+            Some(history.len()),
+            "n {n}: head and target end at the consumed history"
+        );
+        let repaired_state = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, history.len());
+        let next: Vec<u32> = history.iter().copied().chain(prompt(0x2e7, 64)).collect();
+        bundle.session_commit_live(&history);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            history.len(),
+            "n {n}: the next turn continues live"
+        );
+        let live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[history.len()..],
+                history.len(),
+                true,
+                &never,
+            )
+            .expect("live prefill after the repaired turn");
+        bundle.session_commit();
+
+        // Reference: the same history teacher-forced.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .expect("reference MTP prefill");
+        let forced: Vec<u32> = std::iter::once(seed).chain(consumed.iter().copied()).collect();
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &forced,
+                a.len(),
+                &never
+            )
+            .expect("teacher-forced reference"),
+            "n {n}: the reference advance runs on the drafter"
+        );
+        let reference = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, history.len());
+        bundle.session_commit_live(&history);
+        let reference_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[history.len()..],
+                history.len(),
+                true,
+                &never,
+            )
+            .expect("live prefill after the reference turn");
+        bundle.session_commit();
+
+        let parts: Vec<usize> = (0..reference.len().max(repaired_state.len()))
+            .filter(|&i| reference.get(i) != repaired_state.get(i))
+            .collect();
+        println!(
+            "n {n}: history {} live seeds repaired {live_seed} reference {reference_seed}; \
+             state parts differing from the teacher-forced reference: {parts:?} of {}",
+            history.len(),
+            reference.len()
+        );
+        if live_seed != reference_seed {
+            mismatches.push((n, parts, live_seed, reference_seed));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "a repaired terminal differs from the teacher-forced reference \
+         (n, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
     );
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }

@@ -810,8 +810,8 @@ pub fn admit_qwen4_source(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
-    let receipt =
-        hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
+        .map_err(|error| error.to_string())?;
     // An inventory-valid developer profile the executor cannot run (a
     // synthetic MoE, a RoPE base the QSA kernels lack, a build without
     // `qwen4-dev-profiles`) is refused here, not after the weights upload.
@@ -2574,7 +2574,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("minimal probe must fail later on invalid Qwen4 config");
             assert!(
-                !err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                !err.contains("qwen4: unsupported option(s)"),
                 "resolved schema defaults must pass the DDTree source gate: {err}"
             );
             assert!(
@@ -2591,7 +2591,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("active DDTree must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                err.contains("qwen4: unsupported option(s): DDTree;"),
                 "active DDTree must be refused at source admission: {err}"
             );
 
@@ -2604,7 +2604,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("non-default top-K must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree"),
+                err.contains("qwen4: unsupported option(s): DDTree;"),
                 "non-default DDTree top-K must be refused at source admission: {err}"
             );
 
@@ -2612,7 +2612,7 @@ mod tests {
                 .map(|_| ())
                 .expect_err("active adaptive KV must refuse");
             assert!(
-                err.contains("requested DFlash, DSpark, n-gram, DDTree, adaptive-KV"),
+                err.contains("qwen4: unsupported option(s): adaptive KV;"),
                 "active adaptive KV must be refused at source admission: {err}"
             );
             for (option, options) in [

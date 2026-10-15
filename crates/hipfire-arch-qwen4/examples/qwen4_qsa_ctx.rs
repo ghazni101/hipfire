@@ -61,7 +61,7 @@
 //! usage: qwen4_qsa_ctx MODEL TEXT OUT.jsonl [CTX=2048,4096,8192,16384,32768]
 //!        [STRIDE=256] [DECODE=4]
 
-use hipfire_arch_qwen4::admit_hfqm_artifact;
+use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::gpu_forward::Qwen4QsaTap;
 use hipfire_arch_qwen4::ops;
@@ -905,6 +905,9 @@ fn main() -> Result<()> {
     // The GPU arch drives `memory.ple_format = auto`; initialising it allocates
     // no model memory, so admission still precedes every upload.
     let mut gpu = Gpu::init().map_err(err)?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(err)?;
     eprintln!("gpu {} uma={} n_ctx={n_ctx}", gpu.arch, gpu.is_uma());
     // `<model>.ple-q4` / `.ple-q8` sidecar rows (a split base is refused by
     // admission without one); never derived here (`hipfire ple derive` first).
@@ -1002,6 +1005,15 @@ fn main() -> Result<()> {
         &mut gpu,
         expected,
         |entry| {
+            // An expert-slab layer arena is one span of the container, not a
+            // tensor (host-mapped arenas are copied from the live mapping).
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
             // The carrier's rule: ranges on UMA and for external rows,
             // borrowed mmap bytes for resident tensors on a discrete card.
             if use_ranges || entry.residency.is_external() {

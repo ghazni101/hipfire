@@ -27,10 +27,10 @@
 //!       --mode cache-quality --model /abs/model.hfq \
 //!       --tokens /abs/cache-quality-fixture.json --out /abs/cache-quality-result.json
 
-use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
+use hipfire_arch_qwen4::{PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::tensor_ops::{
     bf16_roundtrip_f32, gated_delta_params_f32, gated_delta_step, hyper_read, hyper_write,
@@ -3854,7 +3854,10 @@ fn run_quality_candidate(
     let (tokens, corpus) = read_quality_tokens(corpus_path)?;
     let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
-    let receipt = admit_hfqm_artifact(&hfq)
+    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let artifact_sha256 = sha256_path(model_path)?;
     let identity_sha256 = artifact_identity_digest(&receipt)?;
@@ -3862,7 +3865,6 @@ fn run_quality_candidate(
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
-    let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
@@ -3878,13 +3880,52 @@ fn run_quality_candidate(
     let mesh = DeviceMesh::single().map_err(|error| format!("qwen4 mesh: {error}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+    // and host-maps the rest (a slab artifact larger than one card).
+    let weights = {
+        let mut weights = manifest.weights.clone();
+        match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+            None => {}
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                if gpu.is_uma() {
+                    return Err("host-mapped experts are only for discrete GPUs".into());
+                }
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
+                eprintln!(
+                    "qwen4_parity: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                );
+            }
+            Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                return Err("qwen4_parity takes a fixed expert layer count, not auto".into());
+            }
+        }
+        weights
+    };
     let transaction = fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
+            // The store rejects a host-mapped entry as a range: borrow it
+            // from the resident source bytes, as the product loader does.
+            if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                let (info, bytes) = source
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             source
                 .tensor_range(&entry.name)
                 .map_err(|error| error.to_string())?

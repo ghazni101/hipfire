@@ -779,6 +779,28 @@ fn upload_resident_bytes(
         }
     }
 }
+/// Name suffix of a layer's expert slab arena entry
+/// (`<prefix>.layers.{L}.mlp.experts.slab_arena`): raw bytes holding every
+/// expert of the layer back to back.
+pub const SLAB_ARENA_SUFFIX: &str = ".mlp.experts.slab_arena";
+
+/// Zeroed bytes every slab arena allocation carries past its last entry. The
+/// MQ3-I4 grouped kernels load a dword scale pair per two-epoch trip, so the
+/// last row of the last expert's down tensor is read up to 2 bytes past the
+/// scale plane; a device allocation is exact-fit, so the pad is explicit. A
+/// host-mapped arena already carries `Gpu::upload_raw_host_mapped`'s 1 MiB
+/// zeroed tail.
+pub const SLAB_ARENA_TAIL_PAD_BYTES: usize = 4096;
+
+/// Tail pad a resident range upload of `entry` allocates and zeroes.
+fn range_tail_pad(entry: &WeightEntry) -> usize {
+    if entry.dtype == DType::Raw && entry.name.ends_with(SLAB_ARENA_SUFFIX) {
+        SLAB_ARENA_TAIL_PAD_BYTES
+    } else {
+        0
+    }
+}
+
 /// Maximum host staging allocation for a range upload. The final device tensor
 /// is allocated once; only this bounded staging buffer is proportional to the
 /// source range.
@@ -1010,6 +1032,7 @@ fn upload_range_pooled(
     descriptor: &SourceRangeDescriptor,
     dtype: DType,
     logical_shape: &[usize],
+    tail_pad: usize,
 ) -> Result<GpuTensor, String> {
     let payload_len = usize::try_from(descriptor.length)
         .map_err(|_| "source range length does not fit usize".to_string())?;
@@ -1023,9 +1046,15 @@ fn upload_range_pooled(
         ));
     }
     let mut tensor = gpu
-        .alloc_tensor(&[payload_len], DType::Raw)
+        .alloc_tensor(&[payload_len + tail_pad], DType::Raw)
         .map_err(|error| format!("pooled allocation failed: {error}"))?;
     let result = (|| {
+        if tail_pad != 0 {
+            // A pooled buffer may be recycled: the pad must read as zeros.
+            gpu.hip
+                .memcpy_htod_offset(&tensor.buf, payload_len, &vec![0u8; tail_pad])
+                .map_err(|error| format!("pooled tail pad upload failed: {error}"))?;
+        }
         let mut offset = 0usize;
         let mut staging = vec![0u8; next_range_chunk(0, payload_len, alignment)];
         while offset < payload_len {
@@ -1930,7 +1959,13 @@ where
                     ));
                 }
                 let tensor =
-                    match upload_range_pooled(gpu, &descriptor, dtype, &entry.logical_shape) {
+                    match upload_range_pooled(
+                        gpu,
+                        &descriptor,
+                        dtype,
+                        &entry.logical_shape,
+                        range_tail_pad(entry),
+                    ) {
                         Ok(mut tensor) => {
                             tensor.dtype = dtype;
                             tensor

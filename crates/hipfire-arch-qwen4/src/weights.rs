@@ -15,7 +15,6 @@ use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
-#[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
@@ -56,6 +55,28 @@ fn qwen4_quantized_dtype(dtype: DType) -> bool {
         dtype,
         DType::MQ4G256V2 | DType::MQ4G128V2 | DType::MQ6G256V2 | DType::MFP4G32E8SOA | DType::Q8_0
     )
+}
+
+/// The four planar expert-slab dtypes (qt=131..=134) that no qwen4 route has a
+/// kernel for yet.  The qwen4 planner never produces them, but a caller-supplied
+/// [`DType`] could otherwise ride through [`qwen4_target_dtype`]'s
+/// pass-through arm into a declaration and fail much later in a generic
+/// consumer.
+fn qwen4_expert_slab_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ3I4G128R256 | DType::MQ3I4G128R128 | DType::MQ2I4G128R256 | DType::MQ2I4G128R128
+    )
+}
+
+/// Typed refusal of an expert-slab dtype at a result-returning boundary that
+/// receives a caller-supplied [`DType`].
+fn reject_expert_slab_dtype(dtype: DType) -> Result<(), WeightError> {
+    if qwen4_expert_slab_dtype(dtype) {
+        Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype })
+    } else {
+        Ok(())
+    }
 }
 
 /// Payloads that stay source-exact BF16 even though they are rank-2 matrices.
@@ -140,6 +161,14 @@ fn qwen4_quantizable_matrix(name: &str, shape: &[usize]) -> bool {
 /// lossier tier does there: a four-bit trunk opened a reasoning block the model
 /// could not close.  Q8F16 costs 8.5 bpw but needs no rotation basis at all, and
 /// the trunk is a rounding error next to the experts.
+///
+/// Invariant: this takes only a shape, so it can never receive an expert-slab
+/// dtype (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) and always returns
+/// one of the MQ4/Q8 tiers above.  The public entries that carry a caller
+/// [`DType`] ([`TensorRef::new`], [`Qwen4Manifest::build_with_recipe`],
+/// [`Qwen4Manifest::with_expert_parallel`] and [`Qwen4Weights::assemble`])
+/// refuse those dtypes with [`WeightError::ExpertSlabDtypeKernelsUnavailable`]
+/// before any mapping runs.
 fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     let k = shape.last().copied().unwrap_or_default();
     if shape.len() == 3 {
@@ -156,6 +185,10 @@ fn qwen4_matrix_dtype(shape: &[usize]) -> DType {
     }
 }
 
+/// Pure mapping: a `requested` dtype that is neither BF16 nor a recognised
+/// packed format is returned unchanged, so this function would preserve an
+/// expert-slab dtype.  It is infallible by design; every public caller that
+/// can hold such a dtype rejects it first (see [`qwen4_matrix_dtype`]).
 fn qwen4_target_dtype(name: &str, shape: &[usize], requested: DType) -> DType {
     if matches!(requested, DType::BF16 | DType::Q8_0) {
         if name == QWEN4_LM_HEAD {
@@ -306,7 +339,7 @@ impl Qwen4TierRecipe {
     /// Flash-Next recipes.
     pub const fn synthetic_id(&self) -> Option<&'static str> {
         match self {
-            Self::FlashNextPacked { .. } | Self::StockFp8 => None,
+            Self::FlashNextPacked { .. } | Self::FlashNextSlab { .. } | Self::StockFp8 => None,
             Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
             Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
         }
@@ -348,6 +381,17 @@ impl Qwen4TierRecipe {
     /// a device with `Qwen4Capabilities::fp8_experts` (gfx942) may load.
     pub const fn fp8_experts(&self) -> bool {
         self.is_stock_fp8()
+    }
+
+    /// Refuses a recipe whose trunk tier names an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`): no qwen4 kernel
+    /// exists for them yet.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        match self {
+            Self::FlashNextPacked { trunk_tier, .. }
+            | Self::FlashNextSlab { trunk_tier, .. } => reject_expert_slab_dtype(*trunk_tier),
+            Self::SyntheticSourceBf16 | Self::SyntheticPacked | Self::StockFp8 => Ok(()),
+        }
     }
 }
 
@@ -526,6 +570,8 @@ pub enum TensorRole {
     SharedExpertDown,
     RoutedGateUp,
     RoutedDown,
+    /// A trunk layer's contiguous expert slab arena (`FlashNextSlab` recipe).
+    RoutedArena,
     DenseFfnGate,
     DenseFfnUp,
     DenseFfnDown,
@@ -563,6 +609,7 @@ impl TensorRef {
         if name.is_empty() || shape.is_empty() || shape.iter().any(|&dim| dim == 0) {
             return Err(WeightError::InvalidShape { name, shape });
         }
+        reject_expert_slab_dtype(dtype)?;
         let dtype = qwen4_target_dtype(&name, &shape, dtype);
         Ok(Self {
             name,
@@ -604,6 +651,17 @@ pub enum Qwen4TierRecipe {
     /// Q8 embedding, MQ6 head, Q8F16 PLE rows.  `trunk_tier` and `mtp_source`
     /// are the two producer/loader-shared knobs, resolved once.
     FlashNextPacked { trunk_tier: DType, mtp_source: bool },
+    /// [`Self::FlashNextPacked`] with the 48 trunk layers' routed experts held
+    /// as per-layer slab arenas (version-1 expert-slab artifact): each layer
+    /// declares ONE `slab_arena` entry (raw bytes, resident or host-mapped)
+    /// instead of the two aggregate expert tensors, and `arenas` carries the
+    /// validated per-expert format and offsets. The MTP head's experts stay
+    /// the legacy aggregates.
+    FlashNextSlab {
+        trunk_tier: DType,
+        mtp_source: bool,
+        arenas: std::sync::Arc<crate::expert_arena::ExpertArenaPlan>,
+    },
     /// The stock FP8 checkpoint (rev `236dfdf2`) converted byte-for-byte:
     /// routed experts qt=55 `FP8E4M3B128` (OCP e4m3 codes + BF16 `s_inv`
     /// 128x128 blocks, gate_up `[E, 1280, 2560]`, down `[E, 2560, 640]`),
@@ -709,11 +767,17 @@ impl Qwen4Manifest {
         config: &Qwen4Config,
         recipe: Qwen4TierRecipe,
     ) -> Result<Self, WeightError> {
+        recipe.reject_expert_slab_dtypes()?;
         config.validate().map_err(WeightError::Config)?;
         let (packed, trunk_tier, mtp_source) = match &recipe {
             Qwen4TierRecipe::FlashNextPacked {
                 trunk_tier,
                 mtp_source,
+            }
+            | Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier,
+                mtp_source,
+                ..
             } => (true, *trunk_tier, *mtp_source),
             Qwen4TierRecipe::StockFp8
             | Qwen4TierRecipe::SyntheticSourceBf16
@@ -722,7 +786,7 @@ impl Qwen4Manifest {
         let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
         let stock_fp8 = recipe.is_stock_fp8();
         let profile_admits_recipe = match &recipe {
-            Qwen4TierRecipe::FlashNextPacked { .. } => {
+            Qwen4TierRecipe::FlashNextPacked { .. } | Qwen4TierRecipe::FlashNextSlab { .. } => {
                 matches!(config.profile, Qwen4Profile::FlashNext)
             }
             Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
@@ -1254,6 +1318,9 @@ impl Qwen4Manifest {
         if let Some(ple) = ple {
             state.push(StateEntry::new(StateKind::Conv, ple.layer));
         }
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = &recipe {
+            apply_expert_arenas(&mut weights, arenas)?;
+        }
         let identity = Qwen4ManifestIdentity {
             profile_id: config.profile.id().to_string(),
             developer_only: config.profile.developer_only(),
@@ -1270,6 +1337,29 @@ impl Qwen4Manifest {
             state,
             metadata,
         })
+    }
+
+    /// Refuses a manifest (built here or assembled by hand from its public
+    /// fields) that declares or admits an expert-slab dtype
+    /// (`MQ3I4G128R256`/`R128`, `MQ2I4G128R256`/`R128`) for any weight or
+    /// source constraint, or whose recipe names one.  Pure; no GPU is touched.
+    pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
+        self.identity.recipe.reject_expert_slab_dtypes()?;
+        for entry in &self.weights {
+            reject_expert_slab_dtype(entry.dtype)?;
+            match &entry.dtype_constraint.source {
+                hipfire_runtime::weight_manifest::SourceDType::Any => {}
+                hipfire_runtime::weight_manifest::SourceDType::Exact(dtype) => {
+                    reject_expert_slab_dtype(*dtype)?;
+                }
+                hipfire_runtime::weight_manifest::SourceDType::OneOf(dtypes) => {
+                    for dtype in dtypes {
+                        reject_expert_slab_dtype(*dtype)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn entry(&self, name: &str, layer: Option<usize>) -> Option<&WeightEntry> {
@@ -1338,6 +1428,7 @@ impl Qwen4Manifest {
                 ep.rank, ep.ranks
             )));
         }
+        self.reject_expert_slab_dtypes()?;
         if ep.ranks < 2 || ep.rank >= ep.ranks {
             return Err(WeightError::EpPlacement(format!(
                 "rank {} of {} is not an expert-parallel placement",
@@ -1370,6 +1461,122 @@ impl Qwen4Manifest {
         }
         Ok(self)
     }
+
+    /// This manifest declared for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the
+    /// 48 trunk layers' aggregate routed `gate_up`/`down` entries are owned by
+    /// the expert-tier lease instead of the weight store, so they are removed
+    /// (and so leave [`Self::resident_keys`]).  Everything else, the MTP
+    /// head's aggregate experts included, is unchanged.
+    ///
+    /// Only the dense-aggregate Flash-Next declaration qualifies: exactly the
+    /// expected 96 trunk entries (`[512,1280,2560]` MQ4G256V2 gate_up and
+    /// `[512,2560,640]` MQ4G128V2 down, replicated, resident, one pair per
+    /// layer) must be present.  The slab-arena and stock-FP8 recipes, a
+    /// dense FFN, synthetic profiles and expert-parallel shards are refused.
+    pub fn with_expert_tiers(mut self) -> Result<Self, WeightError> {
+        self.check_expert_tiers()?;
+        self.weights
+            .retain(|entry| !is_trunk_routed_expert_entry(entry));
+        Ok(self)
+    }
+
+    /// The validation half of [`Self::with_expert_tiers`], with no mutation:
+    /// `Ok(())` exactly when `with_expert_tiers` would accept this manifest.
+    pub fn check_expert_tiers(&self) -> Result<(), WeightError> {
+        let refuse = |why: &str| {
+            WeightError::Config(format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {why}"))
+        };
+        match &self.identity.recipe {
+            Qwen4TierRecipe::FlashNextPacked { .. } => {}
+            Qwen4TierRecipe::FlashNextSlab { .. } => {
+                return Err(refuse(
+                    "the slab-arena recipe already holds its experts in per-layer arenas",
+                ))
+            }
+            Qwen4TierRecipe::StockFp8 => {
+                return Err(refuse("the stock-FP8 recipe's qt=55 experts have no tier owner"))
+            }
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                return Err(refuse("synthetic profiles have no Flash-Next expert tiers"))
+            }
+        }
+        if self.identity.ffn_kind != "moe" {
+            return Err(refuse("the dense FFN declares no routed experts"));
+        }
+        let layers = crate::expert_slabs::TRUNK_LAYERS as usize;
+        let trunk_routed = self
+            .weights
+            .iter()
+            .filter(|entry| is_trunk_routed_expert_entry(entry))
+            .count();
+        if trunk_routed != 2 * layers {
+            return Err(refuse(&format!(
+                "the manifest declares {trunk_routed} trunk routed expert entries, expected {}",
+                2 * layers
+            )));
+        }
+        for layer in 0..layers {
+            for (suffix, shape, dtype) in [
+                (
+                    "gate_up_proj",
+                    crate::expert_slab_aggregate::GATE_UP_SHAPE,
+                    ROUTED_GATE_UP_DTYPE,
+                ),
+                (
+                    "down_proj",
+                    crate::expert_slab_aggregate::DOWN_SHAPE,
+                    ROUTED_DOWN_DTYPE,
+                ),
+            ] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
+                let Some(entry) = self.entry(&name, Some(layer)) else {
+                    return Err(refuse(&format!("the manifest lacks {name}")));
+                };
+                if entry.logical_shape != shape
+                    || entry.dtype != dtype
+                    || entry.policy != ShardPolicy::Replicate
+                    || entry.residency != WeightResidency::Resident
+                {
+                    return Err(refuse(&format!(
+                        "{name} is not the dense aggregate {shape:?} {dtype:?} replicated \
+                         resident entry (expert-parallel, host-mapped or reshaped declarations \
+                         are refused)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A trunk layer's aggregate routed expert entry (`layers.{L}.mlp.experts.*`);
+/// the MTP head's (`mtp.…`, no layer) is not one.
+fn is_trunk_routed_expert_entry(entry: &WeightEntry) -> bool {
+    entry.layer.is_some()
+        && entry.name.starts_with("model.language_model.layers.")
+        && is_routed_expert_tensor(&entry.name)
+}
+
+/// The placement set must be exactly the manifest's resident keys.
+fn check_placement_set(
+    manifest: &Qwen4Manifest,
+    placements: &[Qwen4Placement],
+) -> Result<(), WeightError> {
+    let expected = manifest
+        .resident_keys()
+        .map(|(name, layer)| (name.to_string(), layer))
+        .collect::<BTreeSet<_>>();
+    let provided = placements
+        .iter()
+        .map(|placement| (placement.name.clone(), placement.layer))
+        .collect::<BTreeSet<_>>();
+    if expected != provided {
+        return Err(WeightError::PlacementSetMismatch {
+            expected: expected.len(),
+            actual: provided.len(),
+        });
+    }
+    Ok(())
 }
 
 fn mtp_entry(
@@ -1901,6 +2108,10 @@ pub struct PleWeights {
 pub struct MoeWeights {
     pub experts_down: TensorRef,
     pub experts_gate_up: TensorRef,
+    /// `Some` on a `FlashNextSlab` trunk layer: the one raw arena holding all
+    /// 512 experts (per-expert format and offsets live in the recipe's plan).
+    /// `experts_gate_up` / `experts_down` then name no fulfilled tensor.
+    pub expert_arena: Option<TensorRef>,
     /// The pinned checkpoint carries one stacked gate/up source.  Gate and up
     /// remain distinct logical projection slices in the sealed runtime plan;
     /// do not rewrite the artifact merely to spell them as separate sources.
@@ -2135,6 +2346,7 @@ pub struct Qwen4Weights {
     /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
+    pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
 }
 
 impl Qwen4Weights {
@@ -2153,21 +2365,36 @@ impl Qwen4Weights {
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
     ) -> Result<Self, WeightError> {
-        let manifest = assembly_manifest(config, recipe)?;
-        let expected = manifest
-            .resident_keys()
-            .map(|(name, layer)| (name.to_string(), layer))
-            .collect::<BTreeSet<_>>();
-        let provided = placements
-            .iter()
-            .map(|placement| (placement.name.clone(), placement.layer))
-            .collect::<BTreeSet<_>>();
-        if expected != provided {
-            return Err(WeightError::PlacementSetMismatch {
-                expected: expected.len(),
-                actual: provided.len(),
-            });
+        Self::assemble_impl(tx, config, recipe, placements, None)
+    }
+
+    /// [`Self::assemble`] for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the trunk
+    /// layers' aggregate routed experts are owned by `lease`, not the
+    /// transaction, so the manifest is [`Qwen4Manifest::with_expert_tiers`]
+    /// and `placements` must cover exactly its remaining resident keys.  The
+    /// lease is retained by the returned weights ([`Self::expert_tiers`]).
+    pub fn assemble_with_expert_tiers(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        lease: crate::expert_tier_owners::ExpertTierLease,
+    ) -> Result<Self, WeightError> {
+        Self::assemble_impl(tx, config, recipe, placements, Some(lease))
+    }
+
+    fn assemble_impl(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    ) -> Result<Self, WeightError> {
+        let mut manifest = assembly_manifest(config, recipe)?;
+        if expert_tiers.is_some() {
+            manifest = manifest.with_expert_tiers()?;
         }
+        check_placement_set(&manifest, placements)?;
         let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
         if recipe.is_stock_fp8() {
             // Checked before anything is taken, so a refusal leaves every
@@ -2220,7 +2447,34 @@ impl Qwen4Weights {
                 .push(slot);
         }
         let root = build_root_refs(config)?;
-        let layer_refs = build_layer_refs(config)?;
+        let mut layer_refs = build_layer_refs(config)?;
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = recipe {
+            for layer in &mut layer_refs {
+                let Qwen4FfnWeights::Moe(moe) = &mut layer.ffn else {
+                    continue;
+                };
+                let plan = arenas.layer(layer.layer).ok_or_else(|| {
+                    WeightError::DescriptorMismatch(format!(
+                        "expert arena plan has no layer {}",
+                        layer.layer
+                    ))
+                })?;
+                let prefix = moe
+                    .experts_gate_up
+                    .name
+                    .strip_suffix(".mlp.experts.gate_up_proj")
+                    .ok_or_else(|| {
+                        WeightError::DescriptorMismatch(moe.experts_gate_up.name.clone())
+                    })?;
+                moe.expert_arena = Some(TensorRef::new(
+                    format!("{prefix}{}", crate::expert_arena::ARENA_SUFFIX),
+                    TensorRole::RoutedArena,
+                    Some(layer.layer),
+                    vec![plan.bytes],
+                    DType::Raw,
+                )?);
+            }
+        }
         let mtp = config
             .mtp
             .is_some()
@@ -2234,7 +2488,19 @@ impl Qwen4Weights {
             layer_refs,
             mtp,
             ep,
+            expert_tiers,
         })
+    }
+
+    pub fn expert_tiers(&self) -> Option<&crate::expert_tier_owners::ExpertTierLease> {
+        self.expert_tiers.as_ref()
+    }
+
+    pub fn expert_tier_layer(
+        &self,
+        layer: usize,
+    ) -> Option<crate::expert_tier_owners::LayerExpertTierView<'_>> {
+        self.expert_tiers.as_ref()?.layer(layer)
     }
 
     /// The expert-parallel placement these weights were assembled for, or
@@ -2964,8 +3230,63 @@ fn assembly_manifest(
     config: &Qwen4Config,
     recipe: &Qwen4TierRecipe,
 ) -> Result<Qwen4Manifest, WeightError> {
+    recipe.reject_expert_slab_dtypes()?;
     admit_executable_profile(config)?;
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
+}
+
+/// Replace each trunk layer's two aggregate routed-expert entries with the one
+/// `slab_arena` entry of its [`crate::expert_arena::ExpertArenaLayer`]: raw
+/// bytes (`DType::Raw`, shape `[arena_bytes]`), replicated. The MTP head's
+/// experts (`mtp.…`, not `layers.{L}.`) keep their aggregate entries.
+fn apply_expert_arenas(
+    weights: &mut Vec<WeightEntry>,
+    arenas: &crate::expert_arena::ExpertArenaPlan,
+) -> Result<(), WeightError> {
+    use crate::expert_arena::ARENA_SUFFIX;
+    let mut seen = 0usize;
+    let mut out = Vec::with_capacity(weights.len());
+    for entry in weights.drain(..) {
+        let trunk = entry.layer.filter(|_| entry.name.starts_with("model.language_model.layers."));
+        let projection = if entry.name.ends_with(".mlp.experts.gate_up_proj") {
+            Some(".mlp.experts.gate_up_proj")
+        } else if entry.name.ends_with(".mlp.experts.down_proj") {
+            Some(".mlp.experts.down_proj")
+        } else {
+            None
+        };
+        let (Some(layer), Some(suffix)) = (trunk, projection) else {
+            out.push(entry);
+            continue;
+        };
+        if suffix == ".mlp.experts.down_proj" {
+            continue;
+        }
+        let plan = arenas.layer(layer).ok_or_else(|| {
+            WeightError::DescriptorMismatch(format!("expert arena plan has no layer {layer}"))
+        })?;
+        let prefix = entry
+            .name
+            .strip_suffix(suffix)
+            .expect("suffix checked above");
+        out.push(WeightEntry::layer_with_dtype_constraint(
+            format!("{prefix}{ARENA_SUFFIX}"),
+            layer,
+            vec![plan.bytes],
+            DType::Raw,
+            DTypeConstraint::source_exact(DType::Raw),
+            ShardPolicy::Replicate,
+        ));
+        seen += 1;
+    }
+    *weights = out;
+    if seen != arenas.layers().len() {
+        return Err(WeightError::DescriptorMismatch(format!(
+            "expert arena plan has {} layers but the manifest declares {seen} trunk MoE layers",
+            arenas.layers().len()
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `name` is a routed expert stack (trunk `…mlp.experts.*` or the MTP
@@ -3115,6 +3436,7 @@ fn build_ffn_refs(
         } => {
             let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
+                expert_arena: None,
                 experts_down: tr(
                     "experts.down_proj",
                     TensorRole::RoutedDown,
@@ -3242,6 +3564,12 @@ pub enum WeightError {
     /// An expert-parallel placement that is malformed, or a transaction whose
     /// routed expert tensors do not agree on one.
     EpPlacement(String),
+    /// A planar expert-slab dtype (`MQ3I4G128R256`/`R128`,
+    /// `MQ2I4G128R256`/`R128`) reached a declaration boundary.  The format is
+    /// recognised but no qwen4 GPU kernel route exists for it yet.
+    ExpertSlabDtypeKernelsUnavailable {
+        dtype: DType,
+    },
 }
 
 impl fmt::Display for WeightError {
@@ -3286,6 +3614,11 @@ impl fmt::Display for WeightError {
             Self::UnsupportedProfile { profile, reason } => {
                 write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
             }
+            Self::ExpertSlabDtypeKernelsUnavailable { dtype } => write!(
+                f,
+                "Qwen4 expert-slab dtype {dtype:?} is unsupported: no GPU kernels exist for the \
+                 MQ3I4G128R256/MQ3I4G128R128/MQ2I4G128R256/MQ2I4G128R128 planar formats yet"
+            ),
             Self::EpPlacement(reason) => write!(f, "Qwen4 expert-parallel placement: {reason}"),
         }
     }
@@ -3446,6 +3779,117 @@ mod tests {
         ] {
             let error = Fp8B128ExpertTable::from_tensor("t", &tensor).unwrap_err();
             assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
+
+    const EXPERT_SLAB_DTYPES: [DType; 4] = [
+        DType::MQ3I4G128R256,
+        DType::MQ3I4G128R128,
+        DType::MQ2I4G128R256,
+        DType::MQ2I4G128R128,
+    ];
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_tensor_ref() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            for (name, role, shape) in [
+                (
+                    "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                    TensorRole::RoutedGateUp,
+                    vec![512, 1280, 2560],
+                ),
+                (
+                    "model.language_model.layers.0.mlp.experts.down_proj",
+                    TensorRole::RoutedDown,
+                    vec![512, 2560, 640],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    TensorRole::QsaQ,
+                    vec![4096, 2560],
+                ),
+            ] {
+                assert_eq!(
+                    TensorRef::new(name, role, Some(0), shape, dtype),
+                    Err(WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }),
+                    "{dtype:?} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_by_recipe_guard() {
+        let config = pinned_config();
+        for dtype in EXPERT_SLAB_DTYPES {
+            let recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                Qwen4Manifest::build_with_recipe(&config, recipe.clone()).err(),
+                Some(expected.clone()),
+                "{dtype:?}"
+            );
+            assert_eq!(
+                assembly_manifest(&config, &recipe).err(),
+                Some(expected),
+                "{dtype:?}"
+            );
+        }
+        // The legacy tiers still build.
+        for tier in [DType::Q8_0, DType::MQ6G256V2] {
+            assert!(Qwen4Manifest::build_with_trunk_tier(&config, tier).is_ok());
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtypes_are_rejected_in_raw_manifests() {
+        use hipfire_runtime::weight_manifest::SourceDType;
+        let base = Qwen4Manifest::build(&pinned_config()).unwrap();
+        assert_eq!(base.reject_expert_slab_dtypes(), Ok(()));
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        for dtype in EXPERT_SLAB_DTYPES {
+            let expected = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype };
+            let mut target = base.clone();
+            target.weights[0].dtype = dtype;
+            assert_eq!(target.reject_expert_slab_dtypes(), Err(expected.clone()));
+            assert_eq!(
+                target.with_expert_parallel(placement).err(),
+                Some(expected.clone())
+            );
+            for source in [
+                SourceDType::Exact(dtype),
+                SourceDType::OneOf(vec![DType::BF16, dtype]),
+            ] {
+                let mut constraint = base.clone();
+                constraint.weights[0].dtype_constraint.source = source;
+                assert_eq!(
+                    constraint.reject_expert_slab_dtypes(),
+                    Err(expected.clone())
+                );
+                assert_eq!(
+                    constraint.with_expert_parallel(placement).err(),
+                    Some(expected.clone())
+                );
+            }
+            let mut recipe = base.clone();
+            recipe.identity.recipe = Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: dtype,
+                mtp_source: false,
+            };
+            assert_eq!(recipe.reject_expert_slab_dtypes(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn expert_slab_dtype_error_names_the_dtype() {
+        for dtype in EXPERT_SLAB_DTYPES {
+            let message = WeightError::ExpertSlabDtypeKernelsUnavailable { dtype }.to_string();
+            assert!(message.contains(&format!("{dtype:?}")), "{message}");
+            assert!(message.contains("unsupported"), "{message}");
         }
     }
 
@@ -4554,6 +4998,146 @@ mod tests {
             matches!(error, WeightError::UnsupportedProfile { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn expert_tier_manifest_removes_only_trunk_routed_entries() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        assert_eq!(tiered.identity, base.identity);
+        assert_eq!(tiered.weights.len() + 96, base.weights.len());
+        assert_eq!(tiered.state, base.state);
+        assert_eq!(tiered.metadata, base.metadata);
+        let removed = |name: &str, layer: Option<usize>| {
+            layer.is_some()
+                && name.starts_with("model.language_model.layers.")
+                && (name.ends_with(".mlp.experts.gate_up_proj")
+                    || name.ends_with(".mlp.experts.down_proj"))
+        };
+        let kept = base
+            .resident_keys()
+            .filter(|(name, layer)| !removed(name, *layer))
+            .collect::<Vec<_>>();
+        assert_eq!(tiered.resident_keys().collect::<Vec<_>>(), kept);
+        // The MTP head's aggregate experts stay declared.
+        for name in [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ] {
+            assert!(tiered.entry(name, None).is_some(), "{name}");
+        }
+        // A second application, expert parallelism and a stock/synthetic/dense
+        // declaration are each refused under the HOTSET name.
+        let refused = [
+            tiered.clone().with_expert_tiers(),
+            base.clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+                .and_then(Qwen4Manifest::with_expert_tiers),
+            Qwen4Manifest::build(&synthetic(dense_ffn(), 256, 4, true, true))
+                .and_then(Qwen4Manifest::with_expert_tiers),
+        ];
+        for result in refused {
+            let error = result.expect_err("tier manifest refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_expert_tiers_accepts_base_and_refuses_without_mutation() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let base_keys = base.resident_keys().collect::<Vec<_>>();
+        let base_len = base.weights.len();
+        base.check_expert_tiers().expect("base manifest qualifies");
+        assert_eq!(base.weights.len(), base_len);
+        assert_eq!(base.resident_keys().collect::<Vec<_>>(), base_keys);
+
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let tiered_keys = tiered.resident_keys().collect::<Vec<_>>();
+        let tiered_len = tiered.weights.len();
+        let ep = base
+            .clone()
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .expect("ep manifest");
+        let ep_keys = ep.resident_keys().collect::<Vec<_>>();
+        let ep_len = ep.weights.len();
+        for (manifest, keys, len) in [
+            (&tiered, &tiered_keys, tiered_len),
+            (&ep, &ep_keys, ep_len),
+        ] {
+            let error = manifest.check_expert_tiers().expect_err("refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+            assert_eq!(manifest.weights.len(), len);
+            assert_eq!(&manifest.resident_keys().collect::<Vec<_>>(), keys);
+        }
+    }
+
+    #[test]
+    fn placement_set_accepts_missing_tier_entries_but_not_missing_nonexpert() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let placements = |manifest: &Qwen4Manifest| {
+            manifest
+                .resident_keys()
+                .map(|(name, layer)| Qwen4Placement {
+                    name: name.to_string(),
+                    layer,
+                    device: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        // The tier-owned entries are absent from the tier placement set.
+        let tier_placements = placements(&tiered);
+        check_placement_set(&tiered, &tier_placements).expect("tier set accepted");
+        // A regular load still requires them.
+        assert!(matches!(
+            check_placement_set(&base, &tier_placements),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // And a missing non-expert tensor is rejected under the tier manifest.
+        let mut missing = tier_placements.clone();
+        let at = missing
+            .iter()
+            .position(|placement| {
+                !placement.name.contains(".mlp.experts.") && placement.layer.is_some()
+            })
+            .expect("a trunk non-expert placement");
+        missing.remove(at);
+        assert!(matches!(
+            check_placement_set(&tiered, &missing),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // A tier-owned tensor offered as a placement is not expected either.
+        let mut extra = tier_placements;
+        extra.push(Qwen4Placement {
+            name: "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+            layer: Some(0),
+            device: 0,
+        });
+        assert!(matches!(
+            check_placement_set(&tiered, &extra),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
     }
 
     #[test]

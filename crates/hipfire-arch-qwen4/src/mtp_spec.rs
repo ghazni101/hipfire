@@ -27,9 +27,11 @@ use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
 use hipfire_runtime::sampler::{sample_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, GreedyAccept, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow,
-    SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, terminal_prefix_replay, GreedyAccept, MtpDrafter, MtpRequestStats,
+    MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep,
+    SpecTarget, Speculator,
 };
+use smallvec::SmallVec;
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
@@ -2400,6 +2402,47 @@ impl HeadLag {
     }
 }
 
+/// Where a committed window sat: its first row's position (`start`, the
+/// seed's), the position of the owners after it (`end`) and its seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSpan {
+    start: usize,
+    end: usize,
+    seed: u32,
+}
+
+/// The last committed window and the two pre-window tickets whose arena
+/// entries were kept active past the commit ([`Qwen4Bundle::retain_window`]),
+/// so a terminal stop inside the window can restore both owners to its start
+/// and replay only the consumed prefix. Held until the next window, forced
+/// advance, prefill, reset or request configuration; the next snapshot, reset
+/// or session restore of either owner also supersedes the tickets, which then
+/// stop validating.
+#[derive(Clone, Copy)]
+struct RetainedWindow {
+    span: WindowSpan,
+    target: Qwen4StateSnapshot,
+    head: MtpGpuStateSnapshot,
+}
+
+/// The tokens a terminal repair replays after restoring `span`'s pre-window
+/// state: `seed` plus all but the last of `consumed` (the last stays pending
+/// for the terminal flush). `None` when the repair does not apply: it is for
+/// another window, nothing was consumed (the pre-window pending hidden is not
+/// kept), or the replay would pass the rows the window committed.
+fn terminal_repair_replay(
+    span: WindowSpan,
+    window_start: usize,
+    window_seed: u32,
+    consumed: &[u32],
+) -> Option<SmallVec<[u32; 8]>> {
+    if consumed.is_empty() || (span.start, span.seed) != (window_start, window_seed) {
+        return None;
+    }
+    let replay = terminal_prefix_replay(window_seed, consumed);
+    (span.start + replay.len() <= span.end).then_some(replay)
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -2485,6 +2528,10 @@ pub struct Qwen4MtpDrafter {
     /// [`Self::push_replay`]): at most one configure and at most three entries,
     /// whether or not a mesh ever drains it.
     replay: Vec<ReplayOp>,
+    /// The last committed window, while a terminal stop inside it is still
+    /// repairable ([`RetainedWindow`]). Dropped by the next window, forced
+    /// advance, prefill, reset or request configuration.
+    retained: Option<RetainedWindow>,
 }
 
 impl Qwen4MtpDrafter {
@@ -2518,6 +2565,7 @@ impl Qwen4MtpDrafter {
             device_spare: Vec::new(),
             follower: false,
             replay: Vec::new(),
+            retained: None,
         }
     }
 
@@ -3200,6 +3248,149 @@ impl Qwen4MtpDrafter {
         Ok(())
     }
 
+    /// Drop the retained window (see [`RetainedWindow`]): the owners move on,
+    /// so a terminal stop can no longer be repaired from it.
+    fn release_retained(&mut self, target: &mut dyn SpecTarget) {
+        if let Some(window) = self.retained.take() {
+            if let Ok(bundle) = Self::bundle(target) {
+                bundle.release_window(window.target, window.head);
+            }
+        }
+    }
+
+    /// Whether the one-row windows (interleaved native and takeover) take
+    /// pre-window tickets: only when the request has stop sequences, which
+    /// can end a turn inside a window no other signal predicts. The batched
+    /// routes snapshot for their own rollback and retain those tickets for
+    /// free; the one-row routes pay a snapshot copy per window for it. Never
+    /// under EP (state snapshots are refused there).
+    fn keeps_one_row_windows(&self, target: &mut dyn SpecTarget) -> bool {
+        self.request.stop_sequences
+            && Self::bundle(target).is_ok_and(|bundle| bundle.ep_mesh().is_none())
+    }
+
+    /// Snapshot target and head before a one-row window.
+    fn open_window_tickets(
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+    ) -> Result<(Qwen4StateSnapshot, MtpGpuStateSnapshot), String> {
+        let bundle = Self::bundle(target)?;
+        let target_ticket = bundle.snapshot(gpu).map_err(|error| error.to_string())?;
+        match bundle.mtp_snapshot(gpu) {
+            Ok(head_ticket) => Ok((target_ticket, head_ticket)),
+            Err(error) => {
+                bundle.commit_validated(target_ticket);
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// End a one-row window's tickets: a committed window retains them (it
+    /// ended at the target's position), a failed one releases them; the
+    /// window's own error handling is unchanged.
+    fn close_window_tickets(
+        &mut self,
+        target: &mut dyn SpecTarget,
+        tickets: Option<(Qwen4StateSnapshot, MtpGpuStateSnapshot)>,
+        start: usize,
+        seed: u32,
+        committed: bool,
+    ) {
+        let Some((target_ticket, head_ticket)) = tickets else {
+            return;
+        };
+        let Ok(bundle) = Self::bundle(target) else {
+            return;
+        };
+        if committed && bundle.retain_window(target_ticket, head_ticket).is_ok() {
+            self.retained = Some(RetainedWindow {
+                span: WindowSpan {
+                    start,
+                    end: bundle.state.position,
+                    seed,
+                },
+                target: target_ticket,
+                head: head_ticket,
+            });
+        } else {
+            bundle.release_window(target_ticket, head_ticket);
+        }
+    }
+
+    /// The restore-and-replay body of [`MtpDrafter::mtp_repair_terminal_prefix`]:
+    /// both owners back to the window's start, then `replay` forwarded through
+    /// the target and appended to the head teacher-forced, exactly as a
+    /// takeover appends its kept rows. The retained tickets stay active for
+    /// the caller to release.
+    fn replay_window_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window: RetainedWindow,
+        replay: &[u32],
+    ) -> Result<(), String> {
+        let start = window.span.start;
+        let end = start + replay.len();
+        let bundle = Self::bundle(target)?;
+        bundle
+            .restore_retain(gpu, window.target)
+            .map_err(|error| format!("Qwen4 terminal repair target restore: {error}"))?;
+        bundle
+            .mtp_restore_retain(gpu, window.head)
+            .map_err(|error| format!("Qwen4 terminal repair head restore: {error}"))?;
+        // `replay` is never empty: a repair needs a consumed token.
+        bundle
+            .spec_forward_rows_resident(gpu, replay, true)
+            .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))?;
+        let fill = self
+            .append_scratch
+            .as_mut()
+            .filter(|fill| replay.len() >= 2 && replay.len() <= fill.rows() && mtp_batched_fill_enabled());
+        match fill {
+            Some(fill) => bundle
+                .mtp_append_rows(
+                    gpu,
+                    MtpFillContext::DecodeFill,
+                    fill,
+                    replay,
+                    0,
+                    None,
+                    None,
+                    start,
+                )
+                .map_err(|error| format!("Qwen4 terminal repair head fill: {error}"))?,
+            None => {
+                let row_hidden = self
+                    .row_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+                for (row, &token) in replay.iter().enumerate() {
+                    bundle
+                        .copy_spec_hidden_row_to(gpu, row, row_hidden)
+                        .map_err(|error| error.to_string())?;
+                    bundle
+                        .mtp_append_token(gpu, token, Some(row_hidden), start + row)
+                        .map_err(|error| format!("Qwen4 terminal repair head fill: {error}"))?;
+                }
+            }
+        }
+        let pending = self
+            .pending_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+        bundle
+            .copy_spec_hidden_row_to(gpu, replay.len() - 1, pending)
+            .map_err(|error| error.to_string())?;
+        let head = bundle.mtp_position().map_err(|error| error.to_string())?;
+        if bundle.state.position != end || head != end {
+            return Err(format!(
+                "Qwen4 terminal repair ended at target={} mtp={head}, expected {end}",
+                bundle.state.position
+            ));
+        }
+        Ok(())
+    }
+
     /// Count one finished native window; observe it for the floor unless
     /// `bypass` (a developer-forced route, `HIPFIRE_MTP_INCREMENTAL=0|1`, or
     /// `HIPFIRE_MTP_AR_FLOOR=0`) skips the floor.
@@ -3248,10 +3439,13 @@ impl Qwen4MtpDrafter {
     /// hidden, the per-depth agreement and whether the floor retired the
     /// request (the head then lags the target, so the lane must stay
     /// head-free). Err when no prefill ran (the drafter holds no pending
-    /// hidden). The drafter keeps no window state between windows; an
-    /// active target snapshot in its verify scratch is a ticket of the
+    /// hidden). The drafter keeps no in-flight window state between windows;
+    /// an active target snapshot in its verify scratch is a ticket of the
     /// bundle's trunk arena, which `Qwen4Bundle::prepare_promotion` refuses
-    /// (the scratch cannot be downcast through `&self`).
+    /// (the scratch cannot be downcast through `&self`). The last committed
+    /// window's retained tickets (`RetainedWindow`) do not block a
+    /// promotion: they only serve a terminal repair, and the promoted request
+    /// leaves this drafter.
     pub fn promotion_parts(&self) -> Result<Qwen4PromotionParts<'_>, String> {
         let pending_hidden = self.pending_hidden.as_ref().ok_or_else(|| {
             "Qwen4 MTP promotion: the drafter holds no request resources".to_string()
@@ -3393,7 +3587,12 @@ impl Qwen4MtpDrafter {
             .is_ok_and(|value| value == "1");
         let mut sampled = self.sampled.take();
         let window = if interleaved {
-            self.takeover_interleaved(
+            let tickets = if self.keeps_one_row_windows(target) {
+                Some(Self::open_window_tickets(gpu, target)?)
+            } else {
+                None
+            };
+            let window = self.takeover_interleaved(
                 gpu,
                 target,
                 position,
@@ -3403,7 +3602,9 @@ impl Qwen4MtpDrafter {
                 trace,
                 sampled.as_mut(),
                 probe,
-            )
+            );
+            self.close_window_tickets(target, tickets, position, seed, window.is_ok());
+            window
         } else {
             self.takeover_batched(
                 gpu,
@@ -3702,15 +3903,19 @@ impl Qwen4MtpDrafter {
                 .copied()
                 .expect("MTP snapshot remains active until transaction commit");
             bundle
-                .validate_commit(target_snapshot)
+                .retain_window(target_snapshot, mtp_ticket)
                 .map_err(|error| error.to_string())?;
-            bundle
-                .mtp_validate_commit(mtp_ticket)
-                .map_err(|error| error.to_string())?;
-            bundle.commit_validated(target_snapshot);
-            bundle.mtp_commit_validated(mtp_ticket);
             target_scratch.target_snapshot = None;
             snapshot = None;
+            self.retained = Some(RetainedWindow {
+                span: WindowSpan {
+                    start: position,
+                    end: committed_end,
+                    seed,
+                },
+                target: target_snapshot,
+                head: mtp_ticket,
+            });
             emitted_len = acceptance.committed.len();
             Ok(MtpWindow {
                 committed: acceptance.committed,
@@ -4145,6 +4350,11 @@ pub(crate) struct NativeFinish<'a> {
     pub verify_hidden: &'a GpuTensor,
     /// The verify's PLE convolution input rows from block row 0.
     pub ple_normed: &'a GpuTensor,
+    /// Keep both pre-window tickets rollback-able after the commit
+    /// ([`Qwen4Bundle::retain_window`]) instead of consuming them: the
+    /// singleton drafter's windows, which a terminal stop may cut short. The
+    /// caller records the tickets and releases them.
+    pub retain: bool,
 }
 
 /// A batched window's tail, from the target's accepted length through the
@@ -4169,6 +4379,7 @@ pub(crate) fn finish_native_window(
         pending_hidden,
         verify_hidden,
         ple_normed,
+        retain,
     } = f;
     let drafts = block
         .get(1..)
@@ -4268,15 +4479,22 @@ pub(crate) fn finish_native_window(
     };
     // All fallible GPU operations are complete. Validate both tickets
     // before invalidating either arena, then perform the no-copy commit
-    // boundary.
-    picks
-        .validate_commit(target_snapshot)
-        .map_err(|error| error.to_string())?;
-    picks
-        .mtp_validate_commit(mtp_ticket)
-        .map_err(|error| error.to_string())?;
-    picks.commit_validated(target_snapshot);
-    picks.mtp_commit_validated(mtp_ticket);
+    // boundary; a retaining window keeps both arena entries instead, so a
+    // terminal stop inside it can still roll both owners back.
+    if retain {
+        picks
+            .retain_window(target_snapshot, mtp_ticket)
+            .map_err(|error| error.to_string())?;
+    } else {
+        picks
+            .validate_commit(target_snapshot)
+            .map_err(|error| error.to_string())?;
+        picks
+            .mtp_validate_commit(mtp_ticket)
+            .map_err(|error| error.to_string())?;
+        picks.commit_validated(target_snapshot);
+        picks.mtp_commit_validated(mtp_ticket);
+    }
     Ok(window)
 }
 
@@ -4521,6 +4739,8 @@ impl Qwen4MtpDrafter {
         }
         let (hit, k, trace, floor_active) =
             (plan.ngram_hit, plan.k, plan.trace, plan.floor_active);
+        // The window before this one stays repairable only until now.
+        self.release_retained(target);
         if plan.route == WindowRoute::ArRetired {
             return self.mtp_ar_step(gpu, target, position, seed, false);
         }
@@ -4540,6 +4760,11 @@ impl Qwen4MtpDrafter {
                 let probe = takeover_probe(gpu, window_start);
                 return self.run_takeover(gpu, target, position, seed, emitted, eos, Some(probe));
             }
+            let tickets = if self.keeps_one_row_windows(target) {
+                Some(Self::open_window_tickets(gpu, target)?)
+            } else {
+                None
+            };
             let mut sampled = self.sampled.take();
             let window = self.mtp_step_incremental(
                 gpu,
@@ -4552,6 +4777,7 @@ impl Qwen4MtpDrafter {
                 sampled.as_mut(),
             );
             self.sampled = sampled;
+            self.close_window_tickets(target, tickets, position, seed, window.is_ok());
             let window = window?;
             self.observe_agreement(&window);
             self.floor_observe_native(
@@ -4765,11 +4991,21 @@ impl Qwen4MtpDrafter {
                     pending_hidden,
                     verify_hidden: &verify_hidden,
                     ple_normed: &ple_normed,
+                    retain: true,
                 },
                 Some(&mut timers),
             )?;
             target_scratch.target_snapshot = None;
             snapshot = None;
+            self.retained = Some(RetainedWindow {
+                span: WindowSpan {
+                    start: position,
+                    end: picks.state.position,
+                    seed,
+                },
+                target: target_snapshot,
+                head: mtp_ticket,
+            });
             Ok(NativeOutcome::Window(window))
         })();
         self.sampled = sampled;
@@ -4917,6 +5153,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // row is owed afterwards (the prefill overwrites spec hidden).
         let reused = if cache_hit { start_pos } else { 0 };
         self.head_lag.clear();
+        self.release_retained(target);
         Self::bundle(target)?
             .session_begin(gpu, prompt_tokens, reused, SessionRoute::Mtp)
             .map_err(|error| error.to_string())?;
@@ -5102,6 +5339,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             );
         }
         self.ensure_resources(gpu, target)?;
+        self.release_retained(target);
         // A retired request's head lags by the rows it owes: append them
         // first, so these rows follow them and the advance (the terminal
         // pending-seed flush among them) ends with head and target together.
@@ -5128,9 +5366,56 @@ impl MtpDrafter for Qwen4MtpDrafter {
         Ok(true)
     }
 
+    /// Repair a terminal stop inside the last committed window: restore the
+    /// pre-window target and head tickets the window retained, then replay
+    /// only the consumed prefix (`seed` plus all but the last consumed token,
+    /// which stays pending for the caller's terminal flush). Target and head
+    /// both advance teacher-forced over the replay, the pending hidden becomes
+    /// the last replayed row's, and the retained tickets are released.
+    ///
+    /// `Ok(false)` leaves the caller on its reset path: nothing retained (a
+    /// one-row window without `SpecRequestConfig::stop_sequences`, an AR
+    /// window, an EP mesh, anything between the window and this call), a
+    /// different window, no consumed token, or a state that moved since the
+    /// window. An `Err` means the restore or replay itself failed and the
+    /// owners are in an unknown state.
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let Some(window) = self.retained.take() else {
+            return Ok(false);
+        };
+        let replay = terminal_repair_replay(window.span, window_start, window_seed, consumed);
+        let bundle = Self::bundle(target)?;
+        let usable = replay.is_some()
+            && bundle.ep_mesh().is_none()
+            && bundle.state.position == window.span.end
+            && bundle
+                .mtp_position()
+                .is_ok_and(|head| head == window.span.end)
+            && bundle.validate_commit(window.target).is_ok()
+            && bundle.mtp_validate_commit(window.head).is_ok();
+        let replay = match replay {
+            Some(replay) if usable => replay,
+            _ => {
+                bundle.release_window(window.target, window.head);
+                return Ok(false);
+            }
+        };
+        let repaired = self.replay_window_prefix(gpu, target, window, &replay);
+        Self::bundle(target)?.release_window(window.target, window.head);
+        repaired.map(|()| true)
+    }
+
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.push_replay(ReplayOp::Reset);
         self.head_lag.clear();
+        self.retained = None;
         if let Some(scratch) = self.scratch.as_mut() {
             if let Some(scratch) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
                 scratch.target_snapshot = None;
@@ -5197,6 +5482,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
         self.head_lag.clear();
+        self.retained = None;
         self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
             .with_decay(self.agreement_decay);
         self.floor_enabled =
@@ -5685,6 +5971,60 @@ mod tests {
             native_commit_position(7, target_commit_accept_len(&zero) + 1).unwrap(),
             8
         );
+    }
+
+    #[test]
+    fn terminal_repair_replays_the_seed_and_all_but_the_last_consumed_token() {
+        // A window at position 10 that kept the seed and three tokens.
+        let span = WindowSpan {
+            start: 10,
+            end: 14,
+            seed: 7,
+        };
+        let replay = |consumed: &[u32]| {
+            terminal_repair_replay(span, 10, 7, consumed).map(|replay| replay.to_vec())
+        };
+        // The last consumed token stays pending for the terminal flush.
+        assert_eq!(replay(&[20]), Some(vec![7]));
+        assert_eq!(replay(&[20, 21]), Some(vec![7, 20]));
+        assert_eq!(replay(&[20, 21, 22]), Some(vec![7, 20, 21]));
+        // Consuming a whole window with an accepted end-of-turn left pending
+        // replays exactly the rows the window committed.
+        assert_eq!(replay(&[20, 21, 22, 23]), Some(vec![7, 20, 21, 22]));
+    }
+
+    #[test]
+    fn terminal_repair_declines_what_it_cannot_restore() {
+        let span = WindowSpan {
+            start: 10,
+            end: 14,
+            seed: 7,
+        };
+        // Nothing consumed: the pre-window pending hidden is not kept.
+        assert!(terminal_repair_replay(span, 10, 7, &[]).is_none());
+        // Another window (position or seed).
+        assert!(terminal_repair_replay(span, 11, 7, &[20]).is_none());
+        assert!(terminal_repair_replay(span, 10, 8, &[20]).is_none());
+        // More consumed than the window committed.
+        assert!(terminal_repair_replay(span, 10, 7, &[20, 21, 22, 23, 24]).is_none());
+    }
+
+    #[test]
+    fn stop_sequences_is_off_by_default_and_replays_to_peers() {
+        assert!(!SpecRequestConfig::default().stop_sequences);
+        let cfg = SpecRequestConfig {
+            stop_sequences: true,
+            ..SpecRequestConfig::default()
+        };
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        MtpDrafter::configure_request(&mut drafter, cfg);
+        assert!(drafter.request.stop_sequences);
+        assert_eq!(drafter.pending_replay(), &[ReplayOp::Configure(cfg)]);
+        // A new request without stop sequences drops the flag and any window
+        // kept for the previous one.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        assert!(!drafter.request.stop_sequences);
+        assert!(drafter.retained.is_none());
     }
 
     #[test]

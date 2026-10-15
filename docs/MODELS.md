@@ -40,6 +40,8 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
 
+Optional split-base PLE fields (`ple_q4`, `ple_q8`, each `{file, sha256, size_bytes}`) name the PLE row sidecars of a split entry; `registry_gen.py` pins them from the live Hugging Face tree. A slot's `file` is either the per-base `<file>.ple-q4` / `<file>.ple-q8` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-q4` / `.ple-q8`. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-q4` / `.ple-q8` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without PLE fields are unchanged.
+
 ### Qwen 3.5 dense / hybrid
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
@@ -111,6 +113,7 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 |---|---|---:|---:|---|
 | `qwen3.8:flash-next-mq4-xts` | `qwen3.8-flash-next.mq4-xts` | 125.3 | 128 | MQ4 XTS; canonical pinned arch 16 fixture |
 | `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4`, `qwen3.8:flash-next-gptq3` | `qwen3.8-flash-next-gptq3.mq4` | 125.3 | 128 | Compatibility names for the same MQ4 XTS bytes |
+| `qwen3.8:flash-next-mq3-xts` | `qwen3.8-flash-next-base.mq3-xts` | 59.3 | 64 | MQ3 XTS split base: W3 GPTQ on 16,839 of 24,576 routed experts, PLE rows from the shared sidecar (below) |
 
 The short user-facing name is `qwen3.8:flash`, an alias for `qwen3.8:flash-next`.
 For example: `hipfire pull qwen3.8:flash` and
@@ -141,6 +144,26 @@ Other Flash-Next registry entries, retained for provenance and not the default:
 | `qwen3.8:flash-next-mq4-xts-zab` | `qwen3.8-flash-next.mq4-xts-zab` | 125.1 | 128 | **Local-only** (empty `repo`): not uploaded, not pullable |
 | `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | Previous canonical rung (RTN-asymmetric experts), superseded by MQ4 XTS |
 | `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | Earlier canonical rung, superseded |
+
+**MQ3 XTS tier (split base).** `qwen3.8:flash-next-mq3-xts` is a split base
+(`qwen3.8-flash-next-base.mq3-xts`, 59.3 GB) with no PLE rows of its own:
+16,839 of the 24,576 trunk routed experts are 3-bit GPTQ (W3), and the other
+7,737 experts and every other tensor are the MQ4 XTS bytes. Sidecars use the
+existing `hipfire pull <tag> --ple q4|q8|auto` pick: a plain pull follows
+`memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere), `--ple q4` pulls
+the q4 rows explicitly, and `--ple q8` opts in to the exact Q8 rows, which
+`memory.ple_format = q8` then requires. The MQ4 XTS tags above are unchanged.
+Split bases share one published pair of row files in
+`hipfire-models/qwen3.8-flash-next`, `qwen3.8-flash-next.ple-q4` (29.12 GB,
+rank-ordered rows) and `qwen3.8-flash-next.ple-q8` (54.4 GB), bound by the
+base marker's row geometry and the q8 source-rows SHA-256 (split bases only;
+the monolithic MQ4 XTS file and its binding are unchanged). The download is
+about 88.37 GB with the q4 rows and about 113.65 GB with the q8 rows; the q4
+rows save about 25.28 GB of disk and download, not VRAM (the PLE rows are
+external). Loader gates on hipfire a6f241ce2's split-base loader: greedy AR
+token ids equal the `qwen4_kld` reference on 8 prompts, MTP output equals AR,
+and the q4 and q8 sidecars both load.
+Row-table semantics: [`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables).
 
 ### DFlash draft artifacts (registry)
 
@@ -173,6 +196,8 @@ MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above 
 Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to one base artifact (sha256 `8b15b6fe…`, 125288544792 B), and the client carries a compiled-in pin for it naming `qwen3.8-flash-next.mq4-xts.trunk-overlay` (305543168 B, sha256 `df49bc0a…`, always the canonical base file name plus `.trunk-overlay`, whichever legacy spelling the wire entry uses) in `hipfire-models/qwen3.8-flash-next`. `hipfire pull <tag>` fetches it next to the base. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
 - `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
 - `hipfire rm` removes the overlay with its base; the local-only `qwen3.8:flash-next-mq4-xts-zab` tier is the same bytes baked into one file and declares no overlay.
+
+Flash-Next expert-hotset **fetching** is likewise pinned in the client, not declared in the registry. The same four stock tags resolve through that base identity (sha256 `8b15b6fe…`, 125288544792 B) to `qwen3.8-flash-next.mq4-xts.expert-hotset` (217676 B, ~213 KiB, sha256 `7f6760e1…`, always the canonical base file name plus `.expert-hotset`) in `hipfire-models/qwen3.8-flash-next`. `hipfire pull <tag>` selects it by default; the TUI offers it as an independent default-on yes/no **Expert hot set (R9700 decode, 213 KB)** choice (the "213 KB" is the rounded display label; the file is 217676 B), shown in the summary only when selected. It is verified by SHA-256 and stored at the sidecar path of the local base file, which may be a renamed local file that matches the pinned base identity. `registry/v1.json` is unchanged. At runtime it applies by default on a single R9700 (gfx1201) when present and bound to the base by size and index SHA-256. `hipfire rm` removes it with its base, and `*.expert-hotset` files are sidecars, never listed or served as models. See [`CLI.md`](CLI.md#flash-next-expert-hotset).
 
 ### Qwen3 (non-3.5) dense HF4
 

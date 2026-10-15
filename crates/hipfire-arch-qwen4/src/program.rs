@@ -12,8 +12,8 @@
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
-    MoeQ8RouterPolicy, MoeRecipe, MoeRoutePolicy, MoeSharedDecode, MoeSharedDtypes,
-    MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
+    MoeQ8RouterPolicy, MoeRecipe, MoeRouteCapability, MoeRoutePolicy, MoeSharedDecode,
+    MoeSharedDtypes, MoeSharedPrefill, MoeSharedWeights, RoutedExpertWeights,
 };
 use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
 use hipfire_dispatch::pipeline::{
@@ -275,6 +275,12 @@ pub struct Qwen4MoeBinding<'a> {
     pub route_policy: MoeRoutePolicy,
     pub intermediate: usize,
     pub experts_all_gate_up_mq4: bool,
+    /// Expert-slab layers whose experts mix codecs: every expert's gate/up and
+    /// down dtype, and the codec-tag tensor. `None` on every other layer (a
+    /// slab layer of one codec carries no table; its dtype names the codec).
+    pub expert_gate_up_dtypes: Option<&'a [DType]>,
+    pub expert_down_dtypes: Option<&'a [DType]>,
+    pub expert_codec_tags: Option<&'a GpuTensor>,
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     pub expert_stage_ptrs: Option<hipfire_dispatch::families::moe::MoeStageTables<'a>>,
@@ -851,6 +857,9 @@ pub fn seal_moe_for_layer<'a>(
     rows: usize,
     route_rows: usize,
 ) -> Result<hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>, DispatchError> {
+    if moe.routed_experts.tier_identity().is_some() {
+        validate_tier_moe_binding(&moe, moe_dims(dims)?.num_experts)?;
+    }
     let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
     if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
@@ -862,6 +871,67 @@ pub fn seal_moe_for_layer<'a>(
         seal_prefill(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 prefill MoE: {error:?}")))
     }
+}
+
+/// Constant-time per-seal proof that a tier layer's binding is the exact
+/// incumbent aggregate-MQ4 single-device route and nothing else.
+///
+/// A tier layer's identity (`RoutedExpertWeights::tier_identity`: generation,
+/// logical digest, per-expert placement and codec bytes, owner keepalive) is
+/// built once by the runtime from the loader's `LayerExpertTierView`; the sealed
+/// call retains it through the bound expert set. Its absolute pointer tables
+/// (`expert_gate_up_ptrs`/`expert_down_ptrs` device views and the host
+/// `expert_*_entries` mirrors) are the view's frozen tables, range-checked once
+/// at build against both tier owners (`Qwen4MoeLayerRuntime::build`). Nothing
+/// here derives placement from expert 0 or from an aggregate resident tensor.
+///
+/// Refused for a tier layer: EP (row gather / tile exchange), the sealed
+/// expert-slab route and its codec tables (tier codecs are all MQ4 and the
+/// route must stay the uniform MQ4 one, so no `expert_codec_tags` and no
+/// per-expert dtype tables) and stock FP8. `expert_stage_ptrs` is allowed: the
+/// tier staging path supplies dedicated host-only sparse stage tables, and dispatch
+/// keeps validating those staged pointers as for any staged layer.
+fn validate_tier_moe_binding(
+    moe: &Qwen4MoeBinding<'_>,
+    num_experts: usize,
+) -> Result<(), DispatchError> {
+    let refuse = |why: &str| {
+        DispatchError::Hip(format!(
+            "Qwen4 expert-tier layer {}: {why}",
+            moe.layer_idx
+        ))
+    };
+    if !matches!(
+        moe.route_policy.capability,
+        MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
+    ) {
+        return Err(refuse(
+            "tiers run only the aggregate MQ4 QT44/QT53 route (no FP8 or expert-slab capability)",
+        ));
+    }
+    if moe.row_gather.is_some() || moe.tile_exchange.is_some() || moe.shared_down_out.is_some() {
+        return Err(refuse("expert parallelism cannot use expert tiers"));
+    }
+    if moe.expert_codec_tags.is_some()
+        || moe.expert_gate_up_dtypes.is_some()
+        || moe.expert_down_dtypes.is_some()
+    {
+        return Err(refuse(
+            "tier layers are uniform MQ4 and carry no codec tag or per-expert dtype tables",
+        ));
+    }
+    if !moe.experts_all_gate_up_mq4 {
+        return Err(refuse("tier layers require MQ4 gate/up experts"));
+    }
+    if moe.routed_experts.len() != num_experts
+        || moe.expert_gate_up_entries.len() != num_experts
+        || moe.expert_down_entries.len() != num_experts
+    {
+        return Err(refuse(
+            "tier pointer entries and expert views must cover every expert of the layer",
+        ));
+    }
+    Ok(())
 }
 
 /// MoE extents of a program whose FFN is MoE; a dense program has no MoE
@@ -922,10 +992,10 @@ fn build_moe_decode<'a>(
         experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     Ok(MoeParams {
         dtypes,
@@ -970,7 +1040,7 @@ fn build_moe_decode<'a>(
             down: moe.expert_down_entries,
         }),
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         routed_gate_up_k: dims.hidden,
         routed_down_m: dims.hidden,
         routed_down_k: moe_dims.intermediate,
@@ -1030,10 +1100,10 @@ fn build_moe_prefill<'a>(
         experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     let prelude = MoePrefillPrelude {
         normalization: MoeNormalization::Provided,
@@ -1073,7 +1143,7 @@ fn build_moe_prefill<'a>(
         expert_stage_ptrs: moe.expert_stage_ptrs,
         routed_experts: moe.routed_experts,
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         gate_batch: scratch.moe_gate_batch,
         up_batch: scratch.moe_up_batch,
         rot_batch: scratch.moe_rot_batch,

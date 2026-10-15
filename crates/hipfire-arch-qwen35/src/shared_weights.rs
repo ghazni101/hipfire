@@ -177,6 +177,7 @@ dtype_table! {
     MFP3G32E8 = 41, MFP2G32E8 = 42, MFP4G32E8G128 = 43, HFQ2G256 = 44, HFQ2G128 = 45,
     TQ2G128 = 46, BQ1G128 = 47, HFQ6G256 = 48, ParoQ4G128 = 49, Raw = 50, FP8E4M3B128 = 51,
     FP8E4M3PT = 52,
+    MQ3I4G128R256 = 53, MQ3I4G128R128 = 54, MQ2I4G128R256 = 55, MQ2I4G128R128 = 56,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> u8 {
@@ -2662,6 +2663,7 @@ mod tests {
                 assert!(seen.insert(dtype_name(d)));
             }
         }
+
     }
 
     #[test]

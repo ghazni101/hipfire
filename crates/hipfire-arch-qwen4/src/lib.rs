@@ -19,6 +19,19 @@ pub mod chunk_dump;
 pub mod config;
 pub mod ep;
 pub mod expert_residency;
+/// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
+pub mod expert_hotset;
+/// Version-1 expert-slab container schema (qt=131..=134 / `(44,53)` per-expert entries).
+pub mod expert_slabs;
+/// Validated CPU-only per-expert payload spans and optional scale validation.
+pub mod expert_slab_table;
+/// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
+pub mod expert_arena;
+/// Aggregate MQ4-XTS expert tensors to per-expert slab spans (B5-C1 adapter).
+pub mod expert_slab_aggregate;
+/// Pure per-expert device/host-mapped placement plan (B5-C1).
+pub mod expert_tier_plan;
+pub mod expert_tier_owners;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
@@ -50,7 +63,7 @@ pub use admission::{
     RequestKind,
 };
 pub use artifact::{
-    admit_hfqm_artifact, admit_inventory_headers, Qwen4ArtifactError, Qwen4HfqmArtifact,
+    admit_hfqm_artifact, admit_hfqm_artifact_on, admit_inventory_headers, Qwen4ArtifactError, Qwen4HfqmArtifact,
     Qwen4InventoryReceipt, Qwen4PleRows, SidecarRows,
 };
 #[cfg(feature = "qwen4-dev-profiles")]

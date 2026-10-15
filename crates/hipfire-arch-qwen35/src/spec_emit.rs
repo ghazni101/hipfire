@@ -559,6 +559,15 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     fn take_forced(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.forced)
     }
+
+    fn window_cap(&self) -> Option<usize> {
+        if !self.think_budget.enabled() {
+            return None;
+        }
+        let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
+        let in_think = currently_in_think(raw_str, self.open_think_prefix);
+        self.think_budget.window_cap(in_think)
+    }
 }
 
 // ── Deterministic non-GPU producer tests ────────────────────────────────────

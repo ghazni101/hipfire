@@ -7909,6 +7909,19 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of a Flash-Next expert hot set sidecar: the decode-ranked
+    /// per-expert VRAM placement of a Qwen4 aggregate-MQ4 base (JSON, bound to
+    /// its base by size and index sha256).
+    pub const EXPERT_HOTSET_SIDECAR_SUFFIX: &str = ".expert-hotset";
+
+    /// Path of the expert hot set sidecar of `model`: `<model file
+    /// name>.expert-hotset`, the same placement as [`trunk_overlay_sidecar_path`].
+    pub fn expert_hotset_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EXPERT_HOTSET_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
     pub fn ple_hot_rank_file() -> Option<String> {
@@ -8372,6 +8385,18 @@ pub mod memory {
             assert_eq!(
                 trunk_overlay_sidecar_path(Path::new("model")),
                 PathBuf::from("model.trunk-overlay")
+            );
+        }
+
+        #[test]
+        fn expert_hotset_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                expert_hotset_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.expert-hotset")
+            );
+            assert_eq!(
+                expert_hotset_sidecar_path(Path::new("model")),
+                PathBuf::from("model.expert-hotset")
             );
         }
 

@@ -433,6 +433,7 @@ def build_config(args):
         "request_max_think_tokens": request_think_cap,
         "max_tokens": max_tokens,
         "max_tokens_source": max_tokens_source,
+        "stop": list(getattr(args, "stop", None) or []),
         "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
@@ -552,6 +553,7 @@ def show_config(cfg):
                    else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail'))
     print(f"  max_tokens     : {cfg['max_tokens']}"
           f" [{cfg.get('max_tokens_source', 'unknown')}]  ({_note})")
+    print(f"  stop          : {cfg['stop'] if cfg.get('stop') else '(none)'}")
     print("  sampling (what IS set):")
     for k in SAMPLE_KEYS:
         if k in cfg["sampling"]:
@@ -2249,6 +2251,31 @@ def _self_test_thinking_effort():
     body = _request_body(cfg, [{"role": "user", "content": "test"}])
     assert body["max_think_tokens"] == 4096
 
+    # --stop: absent => body byte-identical to the no-stop body; present => "stop" list.
+    msgs = [{"role": "user", "content": "test"}]
+    cfg_nostop = build_config(_ns())
+    assert cfg_nostop["stop"] == [], cfg_nostop["stop"]
+    body_nostop = _request_body(cfg_nostop, msgs)
+    assert "stop" not in body_nostop, body_nostop
+    legacy_cfg = {k: v for k, v in cfg_nostop.items() if k != "stop"}
+    assert (json.dumps(_request_body(legacy_cfg, msgs), ensure_ascii=False)
+            == json.dumps(body_nostop, ensure_ascii=False))
+    cfg_stop = build_config(_ns(stop=["</answer>", "\n\nUser:"]))
+    assert cfg_stop["stop"] == ["</answer>", "\n\nUser:"], cfg_stop["stop"]
+    body_stop = _request_body(cfg_stop, msgs)
+    assert body_stop["stop"] == ["</answer>", "\n\nUser:"], body_stop
+    assert {k: v for k, v in body_stop.items() if k != "stop"} == body_nostop
+    from contextlib import redirect_stdout
+    from io import StringIO
+    buf = StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg_stop)
+    assert "stop          : ['</answer>', '\\n\\nUser:']" in buf.getvalue(), buf.getvalue()
+    buf = StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg_nostop)
+    assert "stop          : (none)" in buf.getvalue(), buf.getvalue()
+
     print("serve_harness: thinking-effort self-test OK", flush=True)
 
 
@@ -3291,6 +3318,8 @@ def _request_body(cfg, messages, tools=None, max_tokens=None, max_think_tokens=N
         body["max_think_tokens"] = think_cap
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
+    if cfg.get("stop"):
+        body["stop"] = list(cfg["stop"])
     if tools is not None:
         body["tools"] = tools
     return body
@@ -4697,6 +4726,9 @@ def main():
              "independent of --thinking-effort and overrides the named --thinking cap "
              "(0=uncapped, 1=disabled, >=2=force-close at that token count)",
     )
+    ap.add_argument("--stop", action="append", default=None, metavar="TEXT",
+                    help="OpenAI `stop` sequence sent on every chat request body; repeatable "
+                         "(each use appends). Omitted: no `stop` key is sent.")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="generation cap; omitted resolves canonical-tag policy then 2048")
     ap.add_argument("--max-seq", type=int, default=None,

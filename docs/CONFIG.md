@@ -249,6 +249,7 @@ The EP2 owner-routed prefill and the expert-staging levers have no typed schema 
 | `developer.qwen4_expert_stage_min_rows` | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | `2048` | Forwards with at least this many rows stage (integer ≥ 2); smaller ones, decode and verify keep the mapped reads. |
 | `developer.qwen4_expert_stage_capture` | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | on | `0` keeps the native-MTP prompt-fill tiles on the mapped reads. |
 | `developer.qwen4_expert_vram_layers` | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | unset (automatic placement) | `N` keeps the routed experts of trunk layers before `N` in VRAM and places layers at or past `N` in pinned host RAM. |
+| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset: `<model>.expert-hotset` is used when it exists (gfx1201) | Lever1 expert hotset, a decode-ranked per-expert VRAM placement (sidecar `kind` `hipfire.qwen4.expert_hotset`, version 1; format and binding in `docs/env-vars.md` and below). Unset applies the sidecar beside the model when one exists; `0` is the kill switch (whole-layer placement); an absolute path names the sidecar explicitly; a relative or empty value is a policy error. A sidecar that does not apply (missing, unreadable, bound to another base, wrong dimensions, another architecture, explicit `developer.qwen4_expert_vram_layers`) keeps whole-layer placement and never fails the load. The expert budget keeps a 512 MiB VRAM margin. |
 | `developer.ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | unset (canonical) | `1` selects the legacy unrooted peer all-reduce diagnostic, `0` selects RCCL. |
 
 ---
@@ -984,6 +985,46 @@ to (delete it and re-derive, or re-pull). A `.ple-q4` derived from a base
 is bound to that base the same way. A split base cannot load without the
 sidecar for the selected format.
 
+**MQ3 XTS split tier (`qwen3.8:flash-next-mq3-xts`).** This tier is a split
+base (`qwen3.8-flash-next-base.mq3-xts`) that carries no PLE rows. Its row
+tables come from sidecars chosen by the same `--ple q4|q8|auto` pick as every
+split entry, with no tier-specific default. A plain `hipfire pull` (`--ple
+auto`) follows `memory.ple_format`, whose own `auto` is q4 on gfx1151 and q8
+elsewhere, so on other architectures a plain pull selects q8. To get the q4
+rows on any architecture, pull them explicitly:
+`hipfire pull qwen3.8:flash-next-mq3-xts --ple q4`. The exact Q8 rows are an
+explicit opt-in the same way: `--ple q8` fetches `.ple-q8` and nothing else.
+
+At load, `memory.ple_format = q8` (or `HIPFIRE_PLE_FORMAT=q8`) requires the
+`.ple-q8` sidecar and refuses to load without it; it is never substituted
+with q4. `auto` takes the architecture's preferred format if that file is
+present and the other one if it is absent (it never downloads), so after a
+q8-only pull `auto` loads the q8 rows.
+
+To go back to q4 once a `.ple-q8` file is on disk, set
+`memory.ple_format = q4` or `HIPFIRE_PLE_FORMAT=q4`, with the `.ple-q4`
+sidecar present. Pulling with `--ple q4` does not remove the q8 sidecar and
+does not change which format a later load selects, so with both files present
+`auto` still follows the architecture's preference (q8 off gfx1151), not the
+pull. Shared row files: the split bases of the Flash-Next family share one
+published pair of row files in `hipfire-models/qwen3.8-flash-next`,
+`qwen3.8-flash-next.ple-q4` (28,800,142,336 B) and
+`qwen3.8-flash-next.ple-q8` (54,400,269,312 B). A split entry may name these
+shared file names. The CLI then downloads each shared file once and gives
+every base a hardlink alias at that base's `<base>.ple-q4` / `<base>.ple-q8`
+path, which is what the loader reads. A split base binds a sidecar by the base
+marker's row geometry and the SHA-256 of the q8 source rows, not by the base's
+file size and header/index hash, so a base with the same marker geometry and
+q8 source rows can use the same shared file; a mismatch is refused. This
+applies to split bases only: a monolithic model (the MQ4 XTS tags included)
+keeps the file-size plus header/index binding described above, gets no
+shared-file slot, and is unchanged. The MQ3 XTS base file itself is not
+published yet, pending its release gates. With the q4 rows the MQ3 XTS download
+is about 88.05 GB (base plus `.ple-q4`), with the q8 rows about 113.65 GB; the
+q4 rows are about 25.6 GB smaller on disk and in the download. The PLE rows are
+read from the external file, not held in VRAM, so this is not a VRAM reduction.
+No GPU gate result is claimed here.
+
 `memory.ple_hot_store_bytes` (above) also applies to the sidecars: the
 hot-row pack is cut from, and verified against, the rows file in use.
 With the q4 sidecar and no hot-row pack attached, the sidecar's data is
@@ -1027,6 +1068,30 @@ value fails the load. `HIPFIRE_QWEN4_TRUNK_IU4=0` keeps the overlay weights
 and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
 from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
 (repeatable), `--trunk-iu4-default`, `--output`).
+
+### Qwen4 expert hotset sidecar
+
+`<model>.expert-hotset` (JSON, `kind` `hipfire.qwen4.expert_hotset`, version
+1) is the decode-ranked per-expert VRAM placement of a Qwen4 aggregate-MQ4
+base. On an exact gfx1201 discrete card it replaces whole-layer expert
+placement by keeping the highest-ranked experts of every trunk layer in VRAM
+and the rest in pinned host RAM. It is bound to its base by two required
+fields, `base_size` (`u64`, the base file's length in bytes) and
+`base_index_sha256` (lowercase hex sha256 of the base's HFQ header and
+index); there is no whole-artifact hash. Like the trunk overlay it is looked
+up next to the model file `hipfire serve`/`run` resolve.
+
+Env `HIPFIRE_QWEN4_EXPERT_HOTSET` (`developer.qwen4_expert_hotset`) selects
+the policy: unset (default) applies `<model>.expert-hotset` when it exists,
+`0` never applies it (kill switch: whole-layer placement), an absolute path
+names the sidecar explicitly, and a relative or empty value is a policy error.
+A sidecar that does not apply (absent, unreadable or malformed, bound to a
+different base, dimensions that do not match the model, another architecture,
+unified memory, expert parallelism, or an explicit
+`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) keeps whole-layer placement and never
+fails the load. The expert byte budget is derived at load, never read from the
+file: free VRAM less the non-expert weights, the `auto` reserve, the frozen
+expert tables and a 512 MiB margin.
 
 ---
 

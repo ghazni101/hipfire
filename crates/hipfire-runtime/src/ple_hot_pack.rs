@@ -101,9 +101,11 @@
 //!   `[padded_rows]`.
 //! * A ple-table has `shard_offsets = []`, `model_file_bytes = 0`, `source_encoding "Q8_0"`,
 //!   `codebook` / `scale` objects exactly for Q4LM rows, a base binding (`base_index_sha256`,
-//!   `base_file_bytes`), `segment_bytes` > 0 (writers use [`TABLE_SEGMENT_BYTES`]) with one
-//!   `segment_sha256` per segment of the data, and `data_sha256` = sha256 of the concatenated raw
-//!   segment digests.  v3 JSON key order is the one `json_table_header` writes.
+//!   `base_file_bytes`; checked against the base only for a monolithic base, ignored when
+//!   attaching to a split base, which binds by row identity), `segment_bytes` > 0 (writers use
+//!   [`TABLE_SEGMENT_BYTES`]) with one `segment_sha256` per segment of the data, and
+//!   `data_sha256` = sha256 of the concatenated raw segment digests.  v3 JSON key order is the
+//!   one `json_table_header` writes.
 //!
 //! `check_header_fields` lists every rule; [`read_ple_hot_pack_header`] checks all of them
 //! plus the offsets and the exact file length (data and rank bytes are not read).
@@ -222,9 +224,10 @@ pub struct PleTableFields {
     pub segment_sha256: Vec<String>,
     /// sha256 of the concatenated raw segment digests.
     pub data_sha256: String,
-    /// sha256 of the base HFQM file's bytes `[0, data_offset)`.
+    /// sha256 of the base HFQM file's bytes `[0, data_offset)`. Checked on attach to a
+    /// monolithic base only; a split base is bound by row identity instead.
     pub base_index_sha256: String,
-    /// Length of that base file.
+    /// Length of that base file (same attach rule as `base_index_sha256`).
     pub base_file_bytes: u64,
 }
 

@@ -25,6 +25,7 @@ use crate::bundle::Qwen4Bundle;
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_spec::Qwen4MtpDrafter;
 use hipfire_runtime::arch_model::ArchModel;
+use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::serve_contract::CacheDomain;
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
 use hipfire_runtime::spec::MtpDrafter;
@@ -1189,14 +1190,29 @@ fn place_rig_experts(weights: &mut [WeightEntry], gpu: &Gpu) -> Result<(), Strin
     }
 }
 
-fn qwen4_range_payload(
-    source: &hipfire_runtime::hfq::HfqModelSource,
+/// One fulfillment payload of the rig loader: a slab layer arena is one span of
+/// the container; a host-mapped entry (which the store rejects as a range) is
+/// borrowed from the resident source bytes, as the product loader does; every
+/// other tensor streams as a bounded range.
+fn qwen4_rig_payload<'a>(
+    source: &'a hipfire_runtime::hfq::HfqModelSource,
+    recipe: &crate::weights::Qwen4TierRecipe,
     entry: &WeightEntry,
-) -> Result<hipfire_runtime::model_source::SourcePayload<'static>, String> {
+) -> Result<hipfire_runtime::model_source::SourcePayload<'a>, String> {
+    use hipfire_runtime::model_source::SourcePayload;
+    if let Some(payload) = crate::expert_arena::recipe_arena_payload(source, recipe, entry) {
+        return payload;
+    }
+    if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+        let (info, bytes) = source
+            .tensor_data(&entry.name)
+            .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+        return Ok(SourcePayload::Borrowed { info, bytes });
+    }
     source
         .tensor_range(&entry.name)
         .map_err(|error| error.to_string())?
-        .map(hipfire_runtime::model_source::SourcePayload::Range)
+        .map(SourcePayload::Range)
         .ok_or_else(|| format!("missing tensor '{}'", entry.name))
 }
 
@@ -1231,7 +1247,7 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|error| format!("tokenizer from {}: {error}", model_path.display()))?;
-    let receipt = crate::admit_hfqm_artifact(&hfq)
+    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let mut manifest = receipt.manifest.clone();
@@ -1258,7 +1274,7 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
         config.num_hidden_layers,
         gpu,
         expected,
-        |entry| qwen4_range_payload(&source, entry),
+        |entry| qwen4_rig_payload(&source, &manifest.identity.recipe, entry),
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let state_format = crate::state::resolve_state_format(

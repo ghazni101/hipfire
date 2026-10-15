@@ -23,6 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = ROOT / "crates" / "rdna-compute" / "src" / "scratch.rs"
 PRIMITIVES = {"grow_scratch_buffer", "grow_scratch_slot"}
 FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?fn\s+(\w+)", re.M)
+# route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
+APPROVED_CALLS = {
+    ("crates/hipfire-runtime/examples/qwen4_moe_sym_w3_launch_oracle.rs",
+     "upload_sidecar", "reserve_qwen4_moe_down_i4"),
+}
 
 
 def strip_comments(src: str) -> str:
@@ -83,6 +88,8 @@ def violations(grow: set[str]) -> list[str]:
             if not enclosing:
                 continue
             name, start, _ = max(enclosing, key=lambda s: s[1])  # innermost
+            if (path.relative_to(ROOT).as_posix(), name, m.group(1)) in APPROVED_CALLS:
+                continue
             if "invalidate_for_scratch_growth" not in src[start:m.start()]:
                 line = src.count("\n", 0, m.start()) + 1
                 rel = path.relative_to(ROOT)

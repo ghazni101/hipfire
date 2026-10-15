@@ -1058,6 +1058,7 @@ collected at context 128 only. It is **not** a promotion or an admission:
 | End-to-end census: recorded launches == compute launches | needs G4 | blocked by design |
 | Multi-position HIP vs recorded-blob vs PM4 parity | needs G3, G4 | blocked by design |
 | Serve health, stationary matched performance | REDLINE §7 gates 6–7 | blocked by design |
+| Expert-slab (ctl3-hot) capture/rebind gate | `cargo run -p hipfire-arch-qwen4 --features lab --example qwen4_g2_replay_gate -- --model CTL3-HOT.hfq --output gate.json` (gfx1201; JSON per-check exact mismatch counts): production-lifecycle capture, byte-exact production/plan/recorded-HIP replay against HIP at consecutive positions with proof each arm ran, and, after freeing and rebuilding the bundle between capture and replay, an explicit `retained replay refused: retained route identity …` from all three executors with no retained execution | **harness landed; hardware run pending** |
 
 Harness gap to be resolved with G3/G4 (not now): no dispatch-level or engine-level
 capture hook exists, and the arch-coupled bench harness

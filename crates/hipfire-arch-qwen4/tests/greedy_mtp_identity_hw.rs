@@ -79,7 +79,7 @@ use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{
     native_mtp_row_capture, qwen4_ngram_mod_config, Qwen4MtpDrafter,
 };
-use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend};
+use hipfire_arch_qwen4::{GdnStateFormat, Qwen4KvBackend};
 use hipfire_dispatch::pipeline::DraftHeadPolicy;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -373,6 +373,23 @@ fn first_difference(ar: &[u32], mtp: &[u32]) -> Option<usize> {
         .zip(mtp)
         .position(|(a, b)| a != b)
         .or_else(|| (ar.len() != mtp.len()).then(|| ar.len().min(mtp.len())))
+}
+
+/// Payload bytes of a manifest entry for expert placement sizing: an ordinary
+/// tensor reads its stored size; a slab layer arena is one span of the
+/// container, not an index tensor, and declares its byte size as its logical
+/// shape.
+fn slab_payload_bytes(
+    hfq: &HfqFile,
+    entry: &hipfire_runtime::weight_manifest::WeightEntry,
+) -> Option<u64> {
+    if entry.name.ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX) {
+        return match entry.logical_shape.as_slice() {
+            [bytes] => Some(*bytes as u64),
+            _ => None,
+        };
+    }
+    hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
 }
 
 #[test]
@@ -696,7 +713,6 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             tokens
         }
     };
-    let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     if let Some(devices) = hipfire_config::devices::startup_devices() {
         let archs = devices
             .iter()
@@ -707,6 +723,10 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         }
     }
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
+    // supported arch. Initialising the GPU allocates no model memory.
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+        .map_err(|e| e.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
@@ -736,10 +756,10 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         explicit
     } else {
         let (non_expert, per_layer) = residency::resident_split(&weights, |entry| {
-            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            slab_payload_bytes(&hfq, entry)
         })?;
         let experts = residency::routed_expert_bytes(&weights, |entry| {
-            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            slab_payload_bytes(&hfq, entry)
         })?;
         let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
         let free = free as u64;
@@ -823,7 +843,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         vram_layers = layers.min(receipt.config.num_hidden_layers);
     }
     let host_bytes = residency::host_mapped_bytes(&weights, |entry| {
-        hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+        slab_payload_bytes(&hfq, entry)
     })?;
     residency::check_host_ram(
         host_bytes,
@@ -845,6 +865,13 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         &mut gpu,
         expected,
         |entry| {
+            if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+            ) {
+                return payload;
+            }
             if use_ranges || entry.residency.is_external() {
                 return source
                     .tensor_range(&entry.name)

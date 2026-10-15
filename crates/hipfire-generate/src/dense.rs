@@ -559,6 +559,8 @@ pub fn generate_deepseek4_spec(
             repeat_window: 0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            // The DSpark speculator keeps no one-row windows to retain.
+            stop_sequences: false,
         });
     }
 

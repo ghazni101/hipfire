@@ -74,6 +74,10 @@ impl QuantType {
             53 => Some(Self::MQ4G128V2),
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
+            131 => Some(Self::MQ3I4G128R256),
+            132 => Some(Self::MQ3I4G128R128),
+            133 => Some(Self::MQ2I4G128R256),
+            134 => Some(Self::MQ2I4G128R128),
             _ => None,
         }
     }
@@ -249,6 +253,19 @@ pub(crate) enum QuantType {
     /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
     /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
     FP8E4M3PT = 56,
+    /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
+    /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
+    /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
+    /// slab only (`qwen4.expert_slabs` v1); no GPU kernel yet. See
+    /// `hipfire_runtime::mq_i4`.
+    MQ3I4G128R256 = 131,
+    /// MQ3-I4 down (qt=132, DESIGN F1/F2): W3 codec, R128 FWHT (seeds 43/1043).
+    MQ3I4G128R128 = 132,
+    /// MQ2-I4 gate/up (qt=133, DESIGN F1/F2): W2 grid ±{1,3} (2-bit planar
+    /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042).
+    MQ2I4G128R256 = 133,
+    /// MQ2-I4 down (qt=134, DESIGN F1/F2): W2 codec, R128 FWHT (seeds 43/1043).
+    MQ2I4G128R128 = 134,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -816,6 +833,41 @@ mod maple_dtype_tests {
                     "id {v} already resolves to MQ2G256LloydU"
                 );
             }
+        }
+    }
+
+    const MQ_I4: [(u8, QuantType); 4] = [
+        (131, QuantType::MQ3I4G128R256),
+        (132, QuantType::MQ3I4G128R128),
+        (133, QuantType::MQ2I4G128R256),
+        (134, QuantType::MQ2I4G128R128),
+    ];
+
+    #[test]
+    fn mq_i4_qtypes_131_to_134_round_trip() {
+        for (id, qt) in MQ_I4 {
+            assert_eq!(qt as u8, id);
+            assert_eq!(QuantType::from_u8(id), Some(qt));
+        }
+        // Neighbours are unassigned: 130 is the compact-Hessian record id
+        // (not a QuantType) and 135 is unallocated.
+        assert_eq!(QuantType::from_u8(130), None);
+        assert_eq!(QuantType::from_u8(135), None);
+    }
+
+    #[test]
+    fn mq_i4_qtypes_do_not_collide_with_any_existing_id() {
+        for v in 0u8..=255 {
+            if let Some(qt) = QuantType::from_u8(v) {
+                assert_eq!(qt as u8, v, "from_u8({v}) returned a mismatched variant");
+                if let Some((id, _)) = MQ_I4.iter().find(|(_, mq)| *mq == qt) {
+                    assert_eq!(*id, v, "{qt:?} resolves from id {v}");
+                }
+            }
+        }
+        for (id, qt) in MQ_I4 {
+            let hits = (0u8..=255).filter(|v| QuantType::from_u8(*v) == Some(qt)).count();
+            assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
         }
     }
 }

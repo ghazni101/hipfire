@@ -751,6 +751,7 @@ fn hfq_weight(
             })
         }
         53 => panic!("dflash: MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dflash has no consumer for {name}"),
+        131..=134 => panic!("dflash: MQ-I4 (qt={}) is a typed-Qwen4 expert-slab format; generic dflash has no consumer for {name}", info.quant_type),
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same allow-list as hfq.rs::load_weight_tensor
@@ -2455,6 +2456,13 @@ fn gemm_dispatch(
         DType::MQ4G128V2 => Err(hip_bridge::HipError::new(
             0,
             "dflash GEMM cannot consume MQ4G128V2: qt=53 is admitted only by typed Qwen4 sealed/dense consumers",
+        )),
+        DType::MQ3I4G128R256
+        | DType::MQ3I4G128R128
+        | DType::MQ2I4G128R256
+        | DType::MQ2I4G128R128 => Err(hip_bridge::HipError::new(
+            0,
+            "dflash GEMM cannot consume MQ-I4 (qt=131..=134): typed-Qwen4 expert-slab format with no GPU kernel",
         )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {

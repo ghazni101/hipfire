@@ -5213,6 +5213,10 @@ pub struct ReplayController {
     /// mapping for the same key means the tape names different tensors. Keyed,
     /// not single-valued: one model has one mapping per layer.
     route_identities: BTreeMap<u64, String>,
+    /// Set when the capture that latched `route_identities` closed: the tape's
+    /// key set is then final, and a key first seen afterwards is a table the
+    /// tape never validated, not a valid new map.
+    route_identities_sealed: bool,
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
@@ -5324,6 +5328,7 @@ impl ReplayController {
             fallback_effect_launches: 0,
             route_proof_log: route_proof_log_requested(),
             route_identities: BTreeMap::new(),
+            route_identities_sealed: false,
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
@@ -5448,6 +5453,7 @@ impl ReplayController {
         self.unknown_effect_launches = 0;
         self.prepared_max_position = None;
         self.route_identities.clear();
+        self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
         self.shadow_body_route = None;
@@ -5954,6 +5960,7 @@ impl ReplayController {
             graph,
             dynamic_gdn_frames,
         });
+        self.route_identities_sealed = true;
         self.state = ReplayState::Ready;
         Ok(summary)
     }
@@ -6892,6 +6899,7 @@ impl ReplayController {
             bound_exempt_ranges,
             encoded_revision: self.binding_revision,
         });
+        self.route_identities_sealed = true;
         self.state = ReplayState::Ready;
         Ok((prefix, command_dwords, queue_id))
     }
@@ -7071,6 +7079,7 @@ impl ReplayController {
         self.prepared = None;
         self.prepared_max_position = None;
         self.route_identities.clear();
+        self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
         Ok(())
@@ -7102,6 +7111,8 @@ impl ReplayController {
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
+        self.route_identities.clear();
+        self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
         // Fresh `ResourceId` space per tape: a recycled device address must
@@ -7127,6 +7138,7 @@ impl ReplayController {
             return Err("no replay capture is active");
         }
         self.window_effects = memory_effects::snapshot().since(self.window_effects_base);
+        self.route_identities_sealed = true;
         let summary = self.capture_summary();
         self.state = if self.certified_speedups.len() >= 2 {
             ReplayState::ShadowValidated
@@ -8005,6 +8017,7 @@ impl ReplayController {
         if self.request == ReplayBackendRequest::Shadow {
             return Err("shadow mode never changes the launch route");
         }
+        self.route_identities_sealed = true;
         self.state = ReplayState::Ready;
         Ok(())
     }
@@ -8049,6 +8062,11 @@ impl ReplayController {
     /// so replaying it would dereference tensors the plan never validated.
     pub fn note_route_identity(&mut self, key: u64, identity: &str) -> Result<(), String> {
         match self.route_identities.get(&key) {
+            None if self.route_identities_sealed => Err(format!(
+                "retained route identity for table {key:#x} first appeared after the tape was \
+                 sealed (observed {identity}): a table id the capture never saw is not a valid \
+                 new mapping"
+            )),
             None => {
                 self.route_identities.insert(key, identity.to_owned());
                 Ok(())
@@ -8059,6 +8077,40 @@ impl ReplayController {
                  {latched}, observed {identity}"
             )),
         }
+    }
+
+    /// Validate the complete captured binding at the top level, before a
+    /// retained replay (`replay_pm4_routed` / `replay_linear_aql`) bypasses the
+    /// per-call [`Self::note_route_identity`] of the HIP body: every
+    /// `(key, identity)` the tape latched must be observed again, equal.
+    /// `observed` may carry more pairs (layers outside the tape's forward).
+    pub fn validate_route_identities<'a>(
+        &self,
+        observed: impl Fn(u64) -> Option<&'a str>,
+    ) -> Result<(), String> {
+        for (key, latched) in &self.route_identities {
+            match observed(*key) {
+                None => {
+                    return Err(format!(
+                        "retained route identity for table {key:#x} (latched {latched}) is not \
+                         bound at replay"
+                    ))
+                }
+                Some(identity) if identity == latched => {}
+                Some(identity) => {
+                    return Err(format!(
+                        "retained route identity for table {key:#x} changed since capture: \
+                         latched {latched}, bound {identity}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The identities latched for the tape being recorded or replayed.
+    pub fn route_identity_count(&self) -> usize {
+        self.route_identities.len()
     }
 
     pub fn poison(&mut self, reason: impl Into<String>) {
@@ -11237,6 +11289,35 @@ mod tests {
         assert!(!controller.should_route_aql());
         controller.install_prepared_plan().unwrap();
         assert!(controller.should_route_aql());
+    }
+
+    #[test]
+    fn route_identities_latch_seal_and_validate_the_whole_binding() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.note_route_identity(1, "a").unwrap();
+        controller.note_route_identity(2, "b").unwrap();
+        controller.note_route_identity(1, "a").unwrap();
+        assert!(controller.note_route_identity(1, "other").is_err());
+        // A table never seen mid-recording still latches (the tape is open).
+        controller.note_route_identity(3, "c").unwrap();
+        controller.record_hip_launch("k", None, [1; 3], [32, 1, 1], 0, &[]);
+        controller.observe_shadow(passing(1.08));
+        controller.observe_shadow(passing(1.06));
+        controller.install_prepared_plan().unwrap();
+        // Sealed: a new table id is not a valid new map, a known one still matches.
+        assert!(controller.note_route_identity(4, "d").is_err());
+        controller.note_route_identity(2, "b").unwrap();
+        let check = |pairs: &'static [(u64, &'static str)]| {
+            controller.validate_route_identities(|key| {
+                pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+            })
+        };
+        check(&[(1, "a"), (2, "b"), (3, "c"), (9, "extra")]).unwrap();
+        // Missing, changed, or replaced (a rebuilt table has a new id) tables
+        // fail the whole binding.
+        assert!(check(&[(1, "a"), (2, "b")]).unwrap_err().contains("not bound"));
+        assert!(check(&[(1, "a"), (2, "B"), (3, "c")]).is_err());
+        assert!(check(&[(1, "a"), (2, "b"), (30, "c")]).unwrap_err().contains("not bound"));
     }
 
     #[test]

@@ -65,6 +65,15 @@ pub enum QuantType {
     Mq3G256V2 = 49,
     Mq2G256V2 = 50,
     Mq2G256LloydU = 51,
+    /// MQ3-I4 gate/up (qt=131): 3-bit planar codes + per-128 f16 scales, R256 FWHT.
+    /// Typed-qwen4 expert-slab only; no GPU kernel yet.
+    Mq3I4G128R256 = 131,
+    /// MQ3-I4 down (qt=132): 3-bit planar codes + per-128 f16 scales, R128 FWHT.
+    Mq3I4G128R128 = 132,
+    /// MQ2-I4 gate/up (qt=133): 2-bit planar codes + per-128 f16 scales, R256 FWHT.
+    Mq2I4G128R256 = 133,
+    /// MQ2-I4 down (qt=134): 2-bit planar codes + per-128 f16 scales, R128 FWHT.
+    Mq2I4G128R128 = 134,
 }
 impl QuantType {
     /// Wire tag → enum. `None` for tags this build does not know, which is a
@@ -109,6 +118,10 @@ impl QuantType {
             49 => Mq3G256V2,
             50 => Mq2G256V2,
             51 => Mq2G256LloydU,
+            131 => Mq3I4G128R256,
+            132 => Mq3I4G128R128,
+            133 => Mq2I4G128R256,
+            134 => Mq2I4G128R128,
             _ => return None,
         })
     }
@@ -242,5 +255,21 @@ mod tests {
         assert_eq!(QuantType::from_tag(46), None);
         assert_eq!(QuantType::from_tag(51), Some(QuantType::Mq2G256LloydU));
         assert_eq!(QuantType::Mq2G256LloydU as u8, 51);
+    }
+
+    #[test]
+    fn mq_i4_qtypes_131_to_134_round_trip() {
+        for (tag, qt) in [
+            (131u8, QuantType::Mq3I4G128R256),
+            (132, QuantType::Mq3I4G128R128),
+            (133, QuantType::Mq2I4G128R256),
+            (134, QuantType::Mq2I4G128R128),
+        ] {
+            assert_eq!(QuantType::from_tag(tag), Some(qt));
+            assert_eq!(qt as u8, tag);
+        }
+        // 130 is the compact-Hessian record id, 135 is unallocated.
+        assert_eq!(QuantType::from_tag(130), None);
+        assert_eq!(QuantType::from_tag(135), None);
     }
 }

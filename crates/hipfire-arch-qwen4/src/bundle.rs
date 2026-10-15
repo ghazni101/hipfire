@@ -471,6 +471,7 @@ impl Qwen4Bundle {
             ple_source,
             state_format,
             backend,
+            None,
         )
     }
 
@@ -499,6 +500,7 @@ impl Qwen4Bundle {
         ple_source: Qwen4PleRows,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
     ) -> Result<Self, BundleError> {
         let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
             Ok(inputs) => inputs,
@@ -506,7 +508,13 @@ impl Qwen4Bundle {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
-        let weights = match Qwen4Weights::assemble(&mut transaction, &config, recipe, placements) {
+        let assembled = match expert_tiers {
+            Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
+                &mut transaction, &config, recipe, placements, lease,
+            ),
+            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements),
+        };
+        let weights = match assembled {
             Ok(weights) => weights,
             Err(error) => {
                 return Err(cleanup_transaction(
@@ -3199,6 +3207,36 @@ impl Qwen4Bundle {
 
     pub(crate) fn commit_validated(&mut self, snapshot: Qwen4StateSnapshot) {
         self.state.commit_validated(snapshot);
+    }
+
+    /// Keep a committed window's two tickets rollback-able ([`Self::restore_retain`]
+    /// and [`Self::mtp_restore_retain`]) until the next snapshot, reset or
+    /// [`Self::release_window`]: both validate first, so a stale pair retains
+    /// neither.
+    pub(crate) fn retain_window(
+        &mut self,
+        target: Qwen4StateSnapshot,
+        head: MtpGpuStateSnapshot,
+    ) -> Result<(), BundleError> {
+        self.validate_commit(target)?;
+        self.mtp_validate_commit(head)?;
+        self.state.retain_validated(target);
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.retain_validated(head);
+        }
+        Ok(())
+    }
+
+    /// Release a window retained by [`Self::retain_window`]. A ticket that no
+    /// longer validates (a snapshot, reset or session restore already
+    /// superseded it) is left alone.
+    pub(crate) fn release_window(&mut self, target: Qwen4StateSnapshot, head: MtpGpuStateSnapshot) {
+        if self.validate_commit(target).is_ok() {
+            self.commit_validated(target);
+        }
+        if self.mtp_validate_commit(head).is_ok() {
+            self.mtp_commit_validated(head);
+        }
     }
 
     pub fn commit(

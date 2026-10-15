@@ -15,8 +15,9 @@ use super::moe_program::{self, MoeKernelSelection};
 use crate::context::DispatchCtx;
 use crate::families::gemv::WeightRef;
 use crate::families::moe::{
-    MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries, MoePrefillParams, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, RoutedExpertWeights,
+    ExpertTierIdentity, MoeEpMode, MoeNormalization, MoeParams, MoePointerEntries,
+    MoePrefillParams, MoeQ8RouterPolicy, MoeRecipe, MoeResolution, MoeRouteCapability,
+    RoutedExpertWeights,
 };
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1015,22 +1016,30 @@ impl ExpertTable {
 struct LiveTensorIdentity {
     ptr: usize,
     byte_capacity: usize,
+    /// Allocation bytes past the tensor's logical shape (see
+    /// [`dtype_tag_tail_bytes`]); zero for every other resource.
+    tail: usize,
     shape: Box<[usize]>,
     dtype: DType,
 }
 
 impl LiveTensorIdentity {
     fn capture(tensor: &GpuTensor, name: &str) -> Result<Self, DispatchError> {
+        Self::capture_with_tail(tensor, name, 0)
+    }
+
+    fn capture_with_tail(tensor: &GpuTensor, name: &str, tail: usize) -> Result<Self, DispatchError> {
         let tensor_bytes = tensor_capacity_bytes(tensor)?;
         let byte_capacity = tensor.buf.size();
-        if byte_capacity != tensor_bytes {
+        if byte_capacity != tensor_bytes + tail {
             return Err(invalid(format!(
-                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes}"
+                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes} + tail {tail}"
             )));
         }
         Ok(Self {
             ptr: tensor.buf.as_ptr() as usize,
             byte_capacity,
+            tail,
             shape: tensor.shape.clone().into_boxed_slice(),
             dtype: tensor.dtype,
         })
@@ -1051,7 +1060,7 @@ impl LiveTensorIdentity {
         if self.ptr != tensor.buf.as_ptr() as usize {
             return Err(invalid(format!("{name} live buffer identity differs")));
         }
-        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes {
+        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes + self.tail {
             return Err(invalid(format!(
                 "{name} live buffer capacity {byte_capacity} differs from bound {}",
                 self.byte_capacity
@@ -1141,6 +1150,11 @@ struct LiveMoeBinding {
     /// entry check compares whole slices.
     gate_up_entries: Box<[usize]>,
     down_entries: Box<[usize]>,
+    /// Explicit per-expert tier identity the bound expert set carried
+    /// ([`RoutedExpertWeights::tier_identity`]); `None` for every legacy
+    /// layer. Its owner keepalive is retained for as long as this binding
+    /// lives.
+    tier: Option<ExpertTierIdentity>,
 }
 
 /// The live gate/up and down buffer pointers of `experts`, in order.
@@ -1163,6 +1177,195 @@ fn live_entry_ptrs(
 pub struct CompactLiveWeight<'a> {
     pub gate_up: crate::families::gemv::WeightRef<'a>,
     pub down: crate::families::gemv::WeightRef<'a>,
+}
+
+/// `ExpertResource::source_fingerprint` of an expert-slab layer's resident views.
+pub const SLAB_RESOURCE_FORMAT: &str = "qwen4-resident-slab-v1";
+
+/// Neutral plain data a layer's retained-route identities derive from (no
+/// arch-private types, so loaders outside this crate can build it too).
+#[derive(Clone, Debug)]
+pub struct RetainedRouteInputs<'a> {
+    pub layer: u32,
+    /// Stable id of the layer's expert table (`ExpertTable` identity).
+    pub table_identity: u64,
+    /// The live binding's pointer-level mapping fingerprint.
+    pub mapping_fingerprint: &'a str,
+    /// `Some` on an expert-slab layer: the codec byte of every expert
+    /// (`0` = MQ4, `1` = W3, `2` = W2 reserved, `255` = unknown).
+    pub codecs: Option<&'a [u8]>,
+    /// `(device address, bytes)` of the gate/up and down pointer tables and of
+    /// the layer's codec-tag tensor, when it has one.
+    pub gate_up_table: (u64, u64),
+    pub down_table: (u64, u64),
+    pub tag_table: Option<(u64, u64)>,
+    /// Generation of the bound expert set (the arena set); `0` when none.
+    pub owner_generation: u64,
+    /// `Some` on an explicit per-expert tier layer: generation, logical
+    /// digest, per-expert placement (so the layer host bit), codecs and the
+    /// frozen pointer-table mirrors all move the identity. `None` keeps the
+    /// legacy/slab identity byte-identical.
+    pub tier: Option<&'a ExpertTierIdentity>,
+}
+
+/// The exact `(key, identity)` pairs a layer passes to
+/// `ReplayController::note_route_identity` (and that the top-level validation
+/// before a retained replay compares). A legacy layer yields its one
+/// `(table identity, mapping fingerprint)` pair, byte-identical to before; a
+/// slab layer's pair also carries the route profile, the per-expert codec
+/// digest and the arena generation, and a second pair keyed by the layer binds
+/// the tables, codec digest and generation separately.
+pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, String)> {
+    let suffix = input.tier.map_or_else(String::new, tier_identity_suffix);
+    let tags = input
+        .tag_table
+        .map_or_else(|| "none".to_owned(), |(ptr, bytes)| format!("{ptr:x}:{bytes}"));
+    let Some(codecs) = input.codecs else {
+        if input.tier.is_none() {
+            return vec![(input.table_identity, input.mapping_fingerprint.to_owned())];
+        }
+        let layer_key = fnv1a_u64(
+            format!("tier-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes(),
+        ) | (1 << 63);
+        return vec![
+            (
+                input.table_identity,
+                format!("{}{suffix}", input.mapping_fingerprint),
+            ),
+            (
+                layer_key,
+                format!(
+                    "tier-layer/v1|layer={}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
+                    input.layer,
+                    input.gate_up_table.0,
+                    input.gate_up_table.1,
+                    input.down_table.0,
+                    input.down_table.1,
+                    input.owner_generation
+                ),
+            ),
+        ];
+    };
+    let codec = fnv1a_u64(codecs);
+    let layer_key = fnv1a_u64(
+        format!("slab-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes(),
+    ) | (1 << 63);
+    vec![
+        (
+            input.table_identity,
+            format!(
+                "{}|slab-v1|codec={codec:016x}|gen={}{suffix}",
+                input.mapping_fingerprint, input.owner_generation
+            ),
+        ),
+        (
+            layer_key,
+            format!(
+                "slab-layer/v1|layer={}|profile=slab-codec-grouped|codec={codec:016x}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
+                input.layer,
+                input.gate_up_table.0,
+                input.gate_up_table.1,
+                input.down_table.0,
+                input.down_table.1,
+                input.owner_generation
+            ),
+        ),
+    ]
+}
+
+/// Canonical identity suffix of an explicit tier layer: owner generation,
+/// logical digest, the layer-wide host bit, and digests of the per-expert
+/// placement, codec and frozen pointer-table mirrors.
+fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
+    let mut digest = String::with_capacity(64);
+    for byte in tier.logical_digest() {
+        digest.push_str(&format!("{byte:02x}"));
+    }
+    let entry_hash = |entries: &[usize]| {
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| (*entry as u64).to_le_bytes())
+            .collect();
+        fnv1a_u64(&bytes)
+    };
+    format!(
+        "|tier-v1|gen={}|digest={digest}|host={}|place={:016x}|codec={:016x}|gu={:016x}|dn={:016x}",
+        tier.generation(),
+        u8::from(tier.any_host()),
+        fnv1a_u64(tier.placement()),
+        fnv1a_u64(tier.codecs()),
+        entry_hash(tier.gate_up_entries()),
+        entry_hash(tier.down_entries()),
+    )
+}
+
+/// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `2` = W2
+/// reserved, `255` = unknown.
+fn expert_codec_byte(down: DType) -> u8 {
+    match down {
+        DType::MQ4G128V2 => 0,
+        DType::MQ3I4G128R128 => 1,
+        DType::MQ2I4G128R128 => 2,
+        _ => 255,
+    }
+}
+
+/// A tier identity must describe exactly this table: one placement and codec
+/// per expert, each codec the one the expert's sealed down dtype implies.
+fn validate_tier_binding(
+    table: &ExpertTable,
+    tier: &ExpertTierIdentity,
+) -> Result<(), DispatchError> {
+    let n_experts = table.n_experts();
+    if tier.placement().len() != n_experts {
+        return Err(invalid(format!(
+            "expert tier identity covers {} experts, expected {n_experts}",
+            tier.placement().len()
+        )));
+    }
+    for (index, expert) in table.experts().iter().enumerate() {
+        let expected = expert_codec_byte(expert.resources().down().dtype());
+        if tier.codecs()[index] != expected {
+            return Err(invalid(format!(
+                "expert {index} tier codec {} differs from the sealed down dtype codec {expected}",
+                tier.codecs()[index]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The live call's tier identity must be the bound one: same owner
+/// generation, logical digest, placement, codecs, pointer-table content and
+/// the very same owner retention.
+fn check_tier_identity(
+    expected: &ExpertTierIdentity,
+    actual: &ExpertTierIdentity,
+) -> Result<(), DispatchError> {
+    if expected == actual {
+        return Ok(());
+    }
+    let field = if expected.generation() != actual.generation() {
+        "owner generation"
+    } else if expected.logical_digest() != actual.logical_digest() {
+        "logical digest"
+    } else if expected.placement() != actual.placement() {
+        "placement"
+    } else if expected.codecs() != actual.codecs() {
+        "codec table"
+    } else if expected.gate_up_entries() != actual.gate_up_entries() {
+        "gate/up pointer entries"
+    } else if expected.down_entries() != actual.down_entries() {
+        "down pointer entries"
+    } else {
+        "owner retention"
+    };
+    Err(invalid(format!(
+        "live expert tier identity differs from the bound identity: {field} \
+         (generation {} bound, {} live)",
+        expected.generation(),
+        actual.generation()
+    )))
 }
 
 /// Reject a cache/table generation mismatch before any bind work.
@@ -1220,6 +1423,64 @@ pub struct ExpertBindingCache {
 }
 
 impl ExpertBindingCache {
+    /// The retained-route `(key, identity)` pairs of this live binding for
+    /// `layer` ([`retained_route_identities`]), derived from the table's
+    /// per-expert dtypes and the live tensor identities. The one derivation
+    /// both the per-call note and the top-level replay validation use.
+    pub fn retained_route_identities(
+        &self,
+        table: &ExpertTable,
+        layer: u32,
+    ) -> Result<Vec<(u64, String)>, DispatchError> {
+        check_cache_table(self, table)?;
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| invalid("expert binding cache has no live resource binding"))?;
+        let slab = table.experts().first().is_some_and(|expert| {
+            expert
+                .resources()
+                .gate_up()
+                .is_some_and(|resource| resource.source_fingerprint() == SLAB_RESOURCE_FORMAT)
+        });
+        let codecs: Option<Vec<u8>> = slab.then(|| {
+            table
+                .experts()
+                .iter()
+                .map(|expert| expert_codec_byte(expert.resources().down().dtype()))
+                .collect()
+        });
+        Ok(retained_route_identities(&RetainedRouteInputs {
+            layer,
+            table_identity: live.table_identity,
+            mapping_fingerprint: &live.mapping_fingerprint,
+            codecs: codecs.as_deref(),
+            gate_up_table: (live.gate_up_ptrs.ptr as u64, live.gate_up_ptrs.byte_capacity as u64),
+            down_table: (live.down_ptrs.ptr as u64, live.down_ptrs.byte_capacity as u64),
+            tag_table: live
+                .dtype_tags
+                .as_ref()
+                .map(|tags| (tags.ptr as u64, tags.byte_capacity as u64)),
+            tier: live.tier.as_ref(),
+            owner_generation: live.tier.as_ref().map_or(
+                live.source_identity.unwrap_or(0),
+                ExpertTierIdentity::generation,
+            ),
+        }))
+    }
+
+    /// The explicit tier identity this cache was bound with, if any.
+    pub fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+        self.live.as_ref().and_then(|live| live.tier.as_ref())
+    }
+
+    /// The tier owner retention bound into this cache. Anything that keeps
+    /// the cache's tables or tapes alive (captured graphs, retained bodies)
+    /// must hold it until its GPU work is retired.
+    pub fn tier_keepalive(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.tier_identity().map(|tier| tier.keepalive().clone())
+    }
+
     pub fn new(
         table: &ExpertTable,
         local_rank: usize,
@@ -2232,19 +2493,34 @@ impl SealedMoeCall<'_> {
             SealedParams::Decode(params) => params.route_policy.is_some(),
             SealedParams::Prefill(params) => params.route_policy.is_some(),
         };
-        if !specialized {
+        let tier_bound = self
+            .experts
+            .cache
+            .live
+            .as_ref()
+            .is_some_and(|live| live.tier.is_some());
+        if !specialized && !tier_bound {
             return Ok(());
         }
-        let Some(live) = self.experts.cache.live.as_ref() else {
+        if self.experts.cache.live.is_none() {
             return Err(invalid(
                 "specialized sealed MoE retained body requires a live expert binding",
             ));
+        }
+        let layer = match &self.params {
+            SealedParams::Decode(params) => params.layer_idx as u32,
+            SealedParams::Prefill(params) => params.ep_layer_idx as u32,
         };
-        let identity = live.mapping_fingerprint.clone();
-        let key = live.table_identity;
-        gpu.replay
-            .note_route_identity(key, &identity)
-            .map_err(|reason| invalid(reason))
+        for (key, identity) in self
+            .experts
+            .cache
+            .retained_route_identities(self.experts.table, layer)?
+        {
+            gpu.replay
+                .note_route_identity(key, &identity)
+                .map_err(|reason| invalid(reason))?;
+        }
+        Ok(())
     }
 }
 
@@ -3122,6 +3398,17 @@ fn validate_decode(
         params.expert_dtype_tags,
         params.expert_ptrs_host,
     )?;
+    // An explicit tier layer's replay dereferences the uploaded pointer
+    // tables: their host mirror is mandatory on every call, not only on a
+    // specialized retained body.
+    if experts.cache.live.as_ref().is_some_and(|live| live.tier.is_some())
+        && params.expert_ptrs_host.is_none()
+    {
+        return Err(invalid(
+            "tier-bound sealed MoE decode requires the host expert pointer entries \
+             (expert_ptrs_host) that the tier pointer tables were uploaded from",
+        ));
+    }
     validate_dtype_tag_table(
         params.expert_dtype_tags,
         params.n_exp,
@@ -3659,14 +3946,19 @@ fn build_live_binding(
         validate_pointer_table(table, n_experts, "live down AWQ")?;
     }
     validate_dtype_tag_table(dtype_tags, n_experts, table_has_mixed_dtypes(table)?)?;
+    let tier = routed_experts.tier_identity().cloned();
+    if let Some(tier) = &tier {
+        validate_tier_binding(table, tier)?;
+    }
 
     let gate_up_identity = LiveTensorIdentity::capture(gate_up_ptrs, "live gate/up")?;
     let down_identity = LiveTensorIdentity::capture(down_ptrs, "live down")?;
     let down_awq_identity = down_awq_ptrs
         .map(|table| LiveTensorIdentity::capture(table, "live down AWQ"))
         .transpose()?;
+    let dtype_tag_tail = dtype_tag_tail_bytes(table)?;
     let dtype_tag_identity = dtype_tags
-        .map(|table| LiveTensorIdentity::capture(table, "live dtype tags"))
+        .map(|tags| LiveTensorIdentity::capture_with_tail(tags, "live dtype tags", dtype_tag_tail))
         .transpose()?;
 
     let mut live_experts = Vec::with_capacity(n_experts);
@@ -3711,8 +4003,26 @@ fn build_live_binding(
         }
         None => canonical.push_str("none;"),
     }
+    if let Some(tier) = &tier {
+        canonical.push_str(&tier_identity_suffix(tier));
+    }
 
     let (gate_up_entries, down_entries) = live_entry_ptrs(&live_experts);
+    if let Some(tier) = &tier {
+        for index in 0..n_experts {
+            if tier.gate_up_entries()[index] != gate_up_entries[index]
+                || tier.down_entries()[index] != down_entries[index]
+            {
+                return Err(invalid(format!(
+                    "expert {index} tier pointer entries ({:x}, {:x}) do not name its live tensors ({:x}, {:x})",
+                    tier.gate_up_entries()[index],
+                    tier.down_entries()[index],
+                    gate_up_entries[index],
+                    down_entries[index]
+                )));
+            }
+        }
+    }
     Ok(LiveMoeBinding {
         table_identity: table.identity,
         table_ptr: table.experts.as_ptr() as usize,
@@ -3726,6 +4036,7 @@ fn build_live_binding(
         source_identity: routed_experts.immutable_identity(),
         gate_up_entries,
         down_entries,
+        tier,
     })
 }
 
@@ -3965,6 +4276,7 @@ fn build_compact_live_binding(
         source_identity: None,
         gate_up_entries,
         down_entries,
+        tier: None,
     })
 }
 
@@ -4100,6 +4412,24 @@ fn resource_dims(
     Ok((resource.shape()[0], resource.shape()[1]))
 }
 
+/// Extra allocation bytes behind the logical u8 tag table of a mixed layer
+/// that carries a slab codec: the i32 owner table of the codec-masked tile
+/// ids (`slab_route::codec_i32`) rides after the one-byte-per-expert table in
+/// the same allocation. Every other tag table has no tail.
+fn dtype_tag_tail_bytes(table: &ExpertTable) -> Result<usize, DispatchError> {
+    if !table_has_mixed_dtypes(table)? {
+        return Ok(0);
+    }
+    let slab = table.experts().iter().any(|metadata| {
+        let resources = metadata.resources();
+        resources
+            .gate_up()
+            .or_else(|| resources.gate())
+            .is_some_and(|resource| resource.dtype() == DType::MQ3I4G128R256)
+    });
+    Ok(if slab { 4 * table.n_experts() } else { 0 })
+}
+
 fn table_has_mixed_dtypes(table: &ExpertTable) -> Result<bool, DispatchError> {
     let mut representative = None;
     let mut mixed = false;
@@ -4158,6 +4488,20 @@ fn validate_live_binding(
             routed_experts.len(),
             live.experts.len()
         )));
+    }
+    match (&live.tier, routed_experts.tier_identity()) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) => check_tier_identity(expected, actual)?,
+        (Some(_), None) => {
+            return Err(invalid(
+                "live routed experts carry no tier identity but the binding was made with one",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "live routed experts carry a tier identity the binding was not made with",
+            ));
+        }
     }
     // The set this binding was captured from promised immutability: its id
     // stands for every expert identity checked at bind time.
@@ -4858,6 +5202,193 @@ mod tests {
         .is_err());
     }
 
+    use crate::families::moe::{EXPERT_TIER_DEVICE, EXPERT_TIER_HOST};
+
+    struct TierRouted {
+        inner: FakeRouted,
+        tier: ExpertTierIdentity,
+    }
+
+    impl RoutedExpertWeights for TierRouted {
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn get(
+            &self,
+            expert_idx: usize,
+        ) -> Option<(
+            crate::families::gemv::WeightRef<'_>,
+            crate::families::gemv::WeightRef<'_>,
+        )> {
+            self.inner.get(expert_idx)
+        }
+
+        fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+            Some(&self.tier)
+        }
+    }
+
+    fn tier_for(
+        fixture: &LiveFixture,
+        generation: u64,
+        placement: &[u8],
+        codecs: &[u8],
+        keep: &std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> ExpertTierIdentity {
+        let gate_up: Vec<usize> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|expert| expert.gate_up.buf.buf.as_ptr() as usize)
+            .collect();
+        let down: Vec<usize> = fixture
+            .routed
+            .experts
+            .iter()
+            .map(|expert| expert.down.buf.buf.as_ptr() as usize)
+            .collect();
+        ExpertTierIdentity::new(generation, [3; 32], placement, codecs, &gate_up, &down, keep.clone())
+            .unwrap()
+    }
+
+    #[test]
+    fn tier_binding_validates_generation_content_and_keeps_owners_alive() {
+        let table = table(2, DType::MQ4G128V2);
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let fixture = live_fixture(&table, 0x90_0000);
+        // Expert 0 is device-resident, expert 1 host-mapped.
+        let tier = tier_for(&fixture, 5, &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST], &[0, 0], &keep);
+        let entries = (tier.gate_up_entries().to_vec(), tier.down_entries().to_vec());
+        let routed = TierRouted {
+            inner: fixture.routed,
+            tier,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(&table, &routed, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cache.tier_keepalive().unwrap(), &keep));
+        assert_eq!(routed.host_mapped_projections(), (true, true));
+        assert!(crate::families::moe::routed_host_mapped(&routed));
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let host_entries = MoePointerEntries {
+            gate_up: &entries.0,
+            down: &entries.1,
+        };
+        validate_live_binding(
+            &bound,
+            Some(&routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap();
+        let identities = cache.retained_route_identities(&table, 3).unwrap();
+        assert_eq!(identities.len(), 2);
+        assert!(identities.iter().all(|(_, identity)| identity.contains("|tier-v1|gen=5|")));
+        assert!(identities.iter().all(|(_, identity)| identity.contains("|host=1|")));
+
+        // A reloaded owner set (new generation) at identical addresses is refused.
+        let twin = live_fixture(&table, 0x90_0000);
+        let reloaded = TierRouted {
+            tier: tier_for(&twin, 6, &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST], &[0, 0], &keep),
+            inner: twin.routed,
+        };
+        let error = validate_live_binding(
+            &bound,
+            Some(&reloaded),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("owner generation"));
+
+        // A flipped placement byte is refused.
+        let flipped_fixture = live_fixture(&table, 0x90_0000);
+        let flipped = TierRouted {
+            tier: tier_for(&flipped_fixture, 5, &[EXPERT_TIER_HOST, EXPERT_TIER_HOST], &[0, 0], &keep),
+            inner: flipped_fixture.routed,
+        };
+        let error = validate_live_binding(
+            &bound,
+            Some(&flipped),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("placement"));
+
+        // A call without any tier identity is refused (no silent legacy fallback).
+        let plain = live_fixture(&table, 0x90_0000);
+        let error = validate_live_binding(
+            &bound,
+            Some(&plain.routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(host_entries),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("tier identity"));
+
+        // Host pointer entries that do not name the live tensors are refused.
+        let mut bad = entries.0.clone();
+        bad[1] += 0x100;
+        let error = validate_live_binding(
+            &bound,
+            Some(&routed),
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+            None,
+            Some(MoePointerEntries {
+                gate_up: &bad,
+                down: &entries.1,
+            }),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("does not point at its live tensor"));
+    }
+
+    #[test]
+    fn tier_bind_refuses_wrong_codec_and_pointer_entries_off_the_live_tensors() {
+        let table = table(2, DType::MQ4G128V2);
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let fixture = live_fixture(&table, 0xA0_0000);
+        // W3 codec for an MQ4 expert.
+        let wrong_codec = TierRouted {
+            tier: tier_for(&fixture, 1, &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE], &[0, 1], &keep),
+            inner: live_fixture(&table, 0xA0_0000).routed,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let error = cache
+            .bind_live(&table, &wrong_codec, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("tier codec"));
+
+        // Entries minted from a different base than the live tensors.
+        let other = live_fixture(&table, 0xB0_0000);
+        let misplaced = TierRouted {
+            tier: tier_for(&other, 1, &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE], &[0, 0], &keep),
+            inner: live_fixture(&table, 0xA0_0000).routed,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let error = cache
+            .bind_live(&table, &misplaced, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("tier pointer entries"));
+    }
+
     fn table(n: usize, dtype: DType) -> ExpertTable {
         let records = (0..n)
             .map(|id| {
@@ -4989,6 +5520,54 @@ mod tests {
         assert!(validate_dtype_tag_table(Some(&tags), 3, false).is_err());
         let short_tags = live_tensor(0xa0_1000, 2, &[2], DType::Raw);
         assert!(validate_dtype_tag_table(Some(&short_tags), 3, true).is_err());
+    }
+
+    #[test]
+    fn slab_mixed_tag_allocation_carries_the_i32_owner_table_behind_the_u8_table() {
+        // Regression: the first real-artifact forward refused the 2560 B tag
+        // allocation (u8 table + i32 owner table) against its 512 B logical shape.
+        let expert = |index: usize, gate: DType, down: DType| {
+            ExpertMetadata::new(
+                index,
+                0,
+                index,
+                ExpertResources::fused(
+                    resource(&format!("gu{index}"), gate, &[8, 256]),
+                    resource(&format!("dn{index}"), down, &[4, 256]),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let slab = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&slab).unwrap(), 4 * 2);
+        // A uniform slab layer (no tag table) and a legacy mixed layer have no tail.
+        let uniform = ExpertTable::new(vec![
+            expert(0, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&uniform).unwrap(), 0);
+        let legacy = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ6G256, DType::MQ6G256),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&legacy).unwrap(), 0);
+
+        // Allocation 2 + 8 bytes behind a [2] u8 logical table.
+        let tags = live_tensor(0xb0_0000, 2 + 8, &[2], DType::Raw);
+        validate_dtype_tag_table(Some(&tags), 2, true).unwrap();
+        assert!(LiveTensorIdentity::capture(&tags, "tags").is_err());
+        let bound = LiveTensorIdentity::capture_with_tail(&tags, "tags", 8).unwrap();
+        bound.matches(&tags, "tags").unwrap();
+        assert!(bound.matches(&live_tensor(0xb0_0000, 2, &[2], DType::Raw), "tags").is_err());
+        assert!(bound.matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags").is_err());
+        assert!(LiveTensorIdentity::capture_with_tail(&tags, "tags", 4).is_err());
     }
 
     #[test]
@@ -7274,5 +7853,154 @@ mod tests {
         assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
         let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
         assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+    }
+}
+
+#[cfg(test)]
+mod retained_route_identity_tests {
+    use super::*;
+
+    fn input<'a>(codecs: Option<&'a [u8]>, generation: u64) -> RetainedRouteInputs<'a> {
+        RetainedRouteInputs {
+            layer: 3,
+            table_identity: 7,
+            mapping_fingerprint: "fp",
+            codecs,
+            gate_up_table: (0x1000, 8),
+            down_table: (0x2000, 8),
+            tag_table: codecs.map(|_| (0x3000, 512)),
+            owner_generation: generation,
+            tier: None,
+        }
+    }
+
+    #[test]
+    fn legacy_layers_keep_their_one_pair() {
+        assert_eq!(retained_route_identities(&input(None, 9)), vec![(7, "fp".to_owned())]);
+    }
+
+    fn tier(
+        generation: u64,
+        placement: &[u8],
+        keep: &std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> ExpertTierIdentity {
+        let n = placement.len();
+        let gate_up: Vec<usize> = (0..n).map(|i| 0x10_0000 + i * 0x1000).collect();
+        let down: Vec<usize> = (0..n).map(|i| 0x20_0000 + i * 0x1000).collect();
+        ExpertTierIdentity::new(generation, [9; 32], placement, &vec![0u8; n], &gate_up, &down, keep.clone())
+            .unwrap()
+    }
+
+    #[test]
+    fn tier_identity_rejects_malformed_tables() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        assert!(ExpertTierIdentity::new(1, [0; 32], &[], &[], &[], &[], keep.clone()).is_err());
+        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 2], &[0, 0], &[1, 2], &[3, 4], keep.clone()).is_err());
+        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0], &[1, 2], &[3, 4], keep.clone()).is_err());
+        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0, 0], &[1, 0], &[3, 4], keep).is_err());
+    }
+
+    #[test]
+    fn tier_host_bit_is_any_host_not_expert_zero() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        assert!(!tier(1, &[0, 0, 0], &keep).any_host());
+        assert!(tier(1, &[0, 0, 1], &keep).any_host());
+        assert!(tier(1, &[1, 0, 0], &keep).any_host());
+        assert_eq!(tier(1, &[0, 0, 1], &keep).host_projections(), (true, true));
+    }
+
+    #[test]
+    fn tier_layers_move_identity_with_generation_digest_host_bit_and_content() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let base_tier = tier(5, &[0, 0, 0], &keep);
+        let mut base = input(None, 5);
+        base.tier = Some(&base_tier);
+        let reference = retained_route_identities(&base);
+        assert_eq!(reference.len(), 2);
+        assert_ne!(reference, retained_route_identities(&input(None, 5)), "tier vs legacy");
+        assert_ne!(reference[1].0, 7, "the tier layer key never collides with a table id");
+        let check = |changed: ExpertTierIdentity, name: &str| {
+            let mut other = input(None, 5);
+            other.tier = Some(&changed);
+            assert_ne!(reference, retained_route_identities(&other), "{name}");
+        };
+        check(tier(6, &[0, 0, 0], &keep), "generation");
+        check(tier(5, &[0, 0, 1], &keep), "host bit via a non-zero expert");
+        check(tier(5, &[1, 0, 0], &keep), "host bit via expert 0");
+        let digest = ExpertTierIdentity::new(
+            5,
+            [8; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            base_tier.gate_up_entries(),
+            base_tier.down_entries(),
+            keep.clone(),
+        )
+        .unwrap();
+        check(digest, "logical digest");
+        let moved = ExpertTierIdentity::new(
+            5,
+            [9; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            &[0x10_0000, 0x10_1000, 0x10_2000],
+            &[0x20_0000, 0x20_1000, 0x30_2000],
+            keep.clone(),
+        )
+        .unwrap();
+        check(moved, "down pointer content");
+        let same = tier(5, &[0, 0, 0], &keep);
+        let mut equal = input(None, 5);
+        equal.tier = Some(&same);
+        assert_eq!(reference, retained_route_identities(&equal));
+    }
+
+    #[test]
+    fn slab_identity_moves_with_codec_arena_generation_and_layer() {
+        let base = retained_route_identities(&input(Some(&[0, 1, 1]), 1));
+        assert_eq!(base.len(), 2);
+        assert_ne!(base[1].0, 7, "the layer key never collides with a table id");
+        assert_ne!(base, retained_route_identities(&input(Some(&[1, 1, 1]), 1)), "codec");
+        assert_ne!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 2)), "generation");
+        assert_eq!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 1)));
+    }
+
+    #[test]
+    fn every_input_field_moves_a_slab_identity_and_a_rebuilt_table_is_unbound() {
+        let codecs = [0u8, 1, 1];
+        let base = input(Some(&codecs), 1);
+        let reference = retained_route_identities(&base);
+        let vary: [(&str, Box<dyn Fn(&mut RetainedRouteInputs<'_>)>); 7] = [
+            ("layer", Box::new(|i| i.layer += 1)),
+            ("table", Box::new(|i| i.table_identity += 1)),
+            ("fingerprint", Box::new(|i| i.mapping_fingerprint = "other")),
+            ("gate_up table", Box::new(|i| i.gate_up_table.0 += 16)),
+            ("down table", Box::new(|i| i.down_table.1 += 8)),
+            ("tag table", Box::new(|i| i.tag_table = Some((0x3100, 512)))),
+            ("generation", Box::new(|i| i.owner_generation += 1)),
+        ];
+        for (name, change) in vary {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(reference, retained_route_identities(&changed), "{name}");
+        }
+        // A reload at reused addresses builds a new table (new id): the key
+        // sets are disjoint, so a tape latched on the old ones finds none bound.
+        let mut reloaded = base.clone();
+        reloaded.table_identity += 100;
+        let fresh = retained_route_identities(&reloaded);
+        assert!(reference.iter().all(|(key, _)| fresh.iter().all(|(other, _)| other != key)));
+        let mut controller =
+            rdna_compute::replay::ReplayController::new(rdna_compute::replay::ReplayBackendRequest::Auto);
+        for (key, identity) in &reference {
+            controller.note_route_identity(*key, identity).unwrap();
+        }
+        let bound = |pairs: &'static [(u64, String)]| {
+            controller.validate_route_identities(|key| {
+                pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+            })
+        };
+        let fresh: &'static [(u64, String)] = Box::leak(fresh.into_boxed_slice());
+        assert!(bound(fresh).unwrap_err().contains("not bound"));
     }
 }

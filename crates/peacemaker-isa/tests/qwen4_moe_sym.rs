@@ -28,15 +28,15 @@ fn entries_are_deterministic_and_target_only_their_arches() {
             assert_eq!(a.s_text.contains("ds_store") || a.s_text.contains("ds_load"), handoff, "{spec:?}");
         }
     }
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1, rr: 1 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1100, kind: Kind::Down, nt: 1, rr: 1, codec: qwen4_moe_sym::WeightCodec::Mq4Sym }).is_err());
     // gfx11 NT8 does not fit the VGPR file.
-    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8, rr: 1 }).is_err());
+    assert!(qwen4_moe_sym::emit(Spec { arch: Arch::Gfx1151, kind: Kind::GateUp, nt: 8, rr: 1, codec: qwen4_moe_sym::WeightCodec::Mq4Sym }).is_err());
 }
 
 /// Row repeats exist only as 2 or 4 blocks of the gfx1151 down NT4 entry.
 #[test]
 fn row_repeat_shapes_are_validated() {
-    let spec = |arch, kind, nt, rr| Spec { arch, kind, nt, rr };
+    let spec = |arch, kind, nt, rr| Spec { arch, kind, nt, rr, codec: qwen4_moe_sym::WeightCodec::Mq4Sym };
     for rr in [0, 3, 8] { assert!(qwen4_moe_sym::emit(spec(Arch::Gfx1151, Kind::Down, 4, rr)).is_err(), "rr {rr}"); }
     for bad in [
         spec(Arch::Gfx1151, Kind::GateUp, 4, 2),
@@ -62,6 +62,49 @@ fn committed_bundles_equal_fresh_emission() {
         let text = qwen4_moe_sym::emit_module(arch).unwrap().1;
         assert!(text_section(&link(&text, arch.name(), &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
     }
+}
+
+fn w3_specs() -> Vec<Spec> { qwen4_moe_sym::module_specs_codec(Arch::Gfx1201, qwen4_moe_sym::WeightCodec::Mq3I4) }
+
+/// The MQ3-I4 codec is built for the gfx1201 NT1 gate/up entry only, emits
+/// deterministically and never changes the MQ4 module (its symbols are not in it).
+#[test]
+fn w3_entry_is_deterministic_and_isolated_from_the_mq4_module() {
+    use qwen4_moe_sym::WeightCodec::Mq3I4;
+    let specs = w3_specs();
+    assert_eq!(specs.len(), 2);
+    let spec = specs[0];
+    assert_eq!(spec.symbol(), "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201");
+    assert_eq!(specs[1].symbol(), "qwen4_moe_down_iu4_sym_w3_pm_gfx1201");
+    assert_eq!(Spec::module_codec(Arch::Gfx1201, Mq3I4), "qwen4_moe_iu4_sym_w3_pm_gfx1201");
+    for spec in specs {
+        let (a, b) = (qwen4_moe_sym::emit(spec).unwrap(), qwen4_moe_sym::emit(spec).unwrap());
+        assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
+        assert_eq!((a.shape.barriers, a.s_text.contains("ds_store") || a.s_text.contains("ds_load")), (0, false));
+        let acc = peacemaker_isa::kernels::qwen4_moe_sym::w3::emit_acc(spec).unwrap();
+        assert!(acc.s_text.contains(&format!("{}_acc", spec.symbol())));
+    }
+    for bad in [
+        Spec { arch: Arch::Gfx1151, ..spec },
+        Spec { arch: Arch::Gfx1100, ..spec },
+        Spec { nt: 4, ..spec },
+    ] {
+        assert!(qwen4_moe_sym::emit(bad).is_err(), "{bad:?}");
+    }
+    let mq4 = qwen4_moe_sym::emit_module(Arch::Gfx1201).unwrap().1;
+    assert!(!mq4.contains("_w3"), "the MQ4 module must not mention the W3 entries");
+}
+
+/// The runtime embeds the W3 module: it must be exactly what the builder emits.
+#[test]
+fn committed_w3_bundle_equals_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    let module = Spec::module_codec(Arch::Gfx1201, qwen4_moe_sym::WeightCodec::Mq3I4);
+    let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
+    let text = qwen4_moe_sym::emit_module_codec(Arch::Gfx1201, qwen4_moe_sym::WeightCodec::Mq3I4).unwrap().1;
+    assert!(text_section(&link(&text, "gfx1201", &module)) == text_section(&committed), "{module}: fresh emission differs from the committed bundle");
 }
 
 
@@ -127,6 +170,33 @@ mod toolchain {
                 let contract = serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))).unwrap();
                 certify(&toolchain, &build, &s, arch.name(), &dir.join(format!("{tag}.manifest.json")), Some(&contract), "test", "test")
                     .unwrap_or_else(|e| panic!("{symbol}: {e}"));
+            }
+        }
+    }
+
+    /// Both MQ3-I4 symbols (the shipped entry and its F32 qualification entry)
+    /// lift byte-exact with no M7 obligations and replay their wait ledger.
+    #[test]
+    fn w3_module_passes_m7_for_both_symbols() {
+        let _ = require_rocm_tool!("llvm-mc");
+        let _ = require_rocm_tool!("ld.lld");
+        let _ = require_rocm_tool!("clang-offload-bundler");
+        let _ = require_rocm_tool!("llvm-objdump");
+        let _ = require_rocm_tool!("llvm-readobj");
+        let arch = Arch::Gfx1201;
+        let (emitted, text, _) = qwen4_moe_sym::emit_module_codec(arch, qwen4_moe_sym::WeightCodec::Mq3I4).unwrap();
+        assert_eq!(emitted.len(), 4);
+        for e in &emitted { ledger_replay::replay_waits(&e.s_text, arch).unwrap(); }
+        let dir = std::env::temp_dir().join(format!("peacemaker-isa-q4s-w3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = dir.join("module.s");
+        std::fs::write(&s, &text).unwrap();
+        let build = build(&Toolchain::oracle(), &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+        for spec in w3_specs() {
+            let base = spec.symbol();
+            for symbol in [base.clone(), format!("{base}_acc")] {
+                let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
+                assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
             }
         }
     }

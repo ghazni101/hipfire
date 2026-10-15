@@ -473,6 +473,12 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
         }
     }
 
+    /// Qwen3.5 residency: packed bucket owners, else expert 0. Qwen4's
+    /// per-expert tier lease (`ExpertTierLease`) cannot reach this adapter:
+    /// this crate does not depend on `hipfire-arch-qwen4`, `MoeFfnWeights` never
+    /// carries a lease, and the trait's `tier_identity` stays its default
+    /// `None`, so the expert-0 / packed-owner rules here never apply to a
+    /// tier layer (those derive placement from the tier identity instead).
     fn host_mapped_projections(&self) -> (bool, bool) {
         if let Some(owners) = &self.packed_expert_owners {
             owners.host_mapped_projections()

@@ -59,6 +59,10 @@ name = "qwen4_greedy_ids"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_g2_replay_gate"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_rows"
 required-features = ["lab"]
 

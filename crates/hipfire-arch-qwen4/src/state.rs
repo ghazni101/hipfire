@@ -843,6 +843,10 @@ pub(crate) struct Qwen4StateSnapshotArena {
     gdn_live: Option<usize>,
     model_id: u64,
     active: bool,
+    /// The entry stays active after a committed window so the window can
+    /// still be rolled back ([`Qwen4State::retain_validated`]); the next
+    /// snapshot, reset or session restore drops it.
+    retained: bool,
     generation: u64,
 }
 
@@ -954,6 +958,7 @@ impl Qwen4StateSnapshotArena {
             gdn_live: None,
             model_id,
             active: false,
+            retained: false,
             generation: 0,
         })
     }
@@ -1096,6 +1101,7 @@ impl Qwen4StateSnapshotArena {
 
     fn invalidate(&mut self) {
         self.active = false;
+        self.retained = false;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -1614,7 +1620,7 @@ impl Qwen4State {
 
     /// A snapshot ticket of this state's arena is outstanding.
     pub(crate) fn snapshot_active(&self) -> bool {
-        self.snapshot_arena.active
+        self.snapshot_arena.active && !self.snapshot_arena.retained
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
@@ -2162,6 +2168,9 @@ impl Qwen4State {
     /// Capture the fixed-size rollback state into the model-owned arena.
     /// Full-capacity append-only QSA K/V and raw arenas are never copied.
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, StateError> {
+        // A retained entry belongs to a window already committed: the next
+        // snapshot supersedes it (its tickets stop validating).
+        self.release_retained();
         let dimensions = Qwen4StateSnapshotArena::dimensions(self);
         {
             let arena = &self.snapshot_arena;
@@ -2276,6 +2285,26 @@ impl Qwen4State {
             "Qwen4 commit_validated requires an active snapshot"
         );
         self.snapshot_arena.invalidate();
+    }
+
+    /// Keep a validated ticket's arena entry active after a committed window
+    /// so the caller can still roll the state back to the ticket (a terminal
+    /// stop inside the window). The next [`Self::snapshot`], any reset or a
+    /// session restore releases it; [`Self::release_retained`] does so
+    /// explicitly. The ticket stays valid for [`Self::restore_retain`].
+    pub(crate) fn retain_validated(&mut self, _snapshot: Qwen4StateSnapshot) {
+        debug_assert!(
+            self.snapshot_arena.active,
+            "Qwen4 retain_validated requires an active snapshot"
+        );
+        self.snapshot_arena.retained = true;
+    }
+
+    /// Drop the retained arena entry, if any (a no-op otherwise).
+    pub(crate) fn release_retained(&mut self) {
+        if self.snapshot_arena.retained {
+            self.snapshot_arena.invalidate();
+        }
     }
 
     /// Commit and consume a model-owned arena ticket without copying.
