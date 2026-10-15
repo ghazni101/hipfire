@@ -388,6 +388,13 @@ pub enum RowEncoding {
     /// Q4LM: `width / 32` blocks of `[f16 scale][16 bytes of 4-bit Lloyd-Max
     /// labels]` (18 bytes), the derived tier of [`crate::ple_q4`].
     Q4Lm,
+    /// qt=56 `FP8E4M3PT`: one OCP e4m3fn code byte per value, `width` bytes
+    /// per row, behind a [`rdna_compute::fp8_e4m3::PT_HEADER_BYTES`]-byte
+    /// shard header carrying the shard's single BF16 scale.  A row decodes to
+    /// `bf16_rne(f32(e4m3(q)) * f32(scale))` through
+    /// [`rdna_compute::fp8_e4m3::dequant_row_pt`], so the scale is a property
+    /// of the shard, read once when the row store opens.
+    Fp8PerTensor,
 }
 
 /// Bytes of one Q8F16 block: an f16 scale followed by 32 signed bytes.
@@ -412,7 +419,17 @@ impl RowEncoding {
             Self::Q4Lm if width % Q8_BLOCK_WEIGHTS == 0 => {
                 Some(width / Q8_BLOCK_WEIGHTS * crate::ple_q4::Q4LM_BLOCK_BYTES)
             }
+            Self::Fp8PerTensor => Some(width),
             _ => None,
+        }
+    }
+
+    /// Bytes ahead of row 0 in one shard's payload: the qt=56 per-tensor
+    /// header for [`Self::Fp8PerTensor`], none for the other encodings.
+    pub const fn shard_header_bytes(self) -> usize {
+        match self {
+            Self::Fp8PerTensor => rdna_compute::fp8_e4m3::PT_HEADER_BYTES,
+            Self::Bf16 | Self::Q8F16 | Self::Q4Lm => 0,
         }
     }
 
@@ -437,6 +454,7 @@ impl RowEncoding {
             Self::Bf16 => "BF16",
             Self::Q8F16 => "Q8_0",
             Self::Q4Lm => "Q4LM",
+            Self::Fp8PerTensor => "FP8E4M3PT",
         }
     }
 
@@ -451,6 +469,7 @@ impl RowEncoding {
             "BF16" | "BFLOAT16" => Some(Self::Bf16),
             "Q8_0" | "Q8F16" | "Q8" | "Q8_F16" => Some(Self::Q8F16),
             "Q4LM" => Some(Self::Q4Lm),
+            "FP8E4M3PT" => Some(Self::Fp8PerTensor),
             _ => None,
         }
     }
@@ -459,8 +478,15 @@ impl RowEncoding {
     ///
     /// `out` fixes the row width; `encoded` must be exactly
     /// [`Self::encoded_row_bytes`] of that width, so a short row can never be
-    /// silently padded.
-    fn decode_row(self, encoded: &[u8], out: &mut [u8]) -> Result<(), RowStoreError> {
+    /// silently padded.  `shard_scale` is the BF16 bits of the row's shard
+    /// scale: required by [`Self::Fp8PerTensor`] (a missing scale is refused),
+    /// ignored by the other encodings.
+    fn decode_row(
+        self,
+        shard_scale: Option<u16>,
+        encoded: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), RowStoreError> {
         match self {
             Self::Bf16 => {
                 if encoded.len() != out.len() {
@@ -493,6 +519,34 @@ impl RowEncoding {
                 }
                 crate::ple_q4::decode_q4lm_row_bf16(encoded, out)
                     .map_err(|reason| RowStoreError::InvalidLease { reason })?;
+            }
+            Self::Fp8PerTensor => {
+                if Some(encoded.len()) != self.checked_encoded_row_bytes(out.len() / 2)
+                    || out.len() % 2 != 0
+                {
+                    return Err(RowStoreError::InvalidLease {
+                        reason: "FP8E4M3PT row length mismatch".to_string(),
+                    });
+                }
+                let scale = shard_scale.ok_or_else(|| RowStoreError::InvalidLease {
+                    reason: "FP8E4M3PT row has no shard scale".to_string(),
+                })?;
+                // The one decoder of the format (the teacher's twin); a
+                // bounded stack chunk adapts its u16 output to the lease's
+                // byte layout without allocating per row.
+                const CHUNK: usize = 64;
+                let mut bits = [0u16; CHUNK];
+                for (codes, cells) in encoded.chunks(CHUNK).zip(out.chunks_mut(2 * CHUNK)) {
+                    let bits = &mut bits[..codes.len()];
+                    rdna_compute::fp8_e4m3::dequant_row_pt(codes, scale, bits).map_err(
+                        |error| RowStoreError::InvalidLease {
+                            reason: format!("FP8E4M3PT row decode: {error}"),
+                        },
+                    )?;
+                    for (cell, value) in cells.chunks_exact_mut(2).zip(bits.iter()) {
+                        cell.copy_from_slice(&value.to_le_bytes());
+                    }
+                }
             }
         }
         Ok(())
@@ -929,9 +983,13 @@ impl RowStore {
         wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
-        let layout = validate_descriptors(&descriptors, valid_rows)?;
+        let mut layout = validate_descriptors(&descriptors, valid_rows)?;
+        if layout.encoding == RowEncoding::Fp8PerTensor {
+            layout.shard_scales = read_pt_shard_scales(&descriptors)?;
+        }
         let source: Arc<dyn PositionalRowSource> = Arc::new(DescriptorRowSource {
             descriptors: descriptors.clone(),
+            data_offset: layout.encoding.shard_header_bytes() as u64,
         });
         Self::spawn(
             name,
@@ -973,6 +1031,13 @@ impl RowStore {
             )));
         }
         let encoding = store.encoding();
+        if encoding == RowEncoding::Fp8PerTensor {
+            // A pack carries no per-shard scales, so it cannot hold these rows.
+            return Err(invalid(
+                "a PLE table store cannot carry FP8E4M3PT rows (their scale is per shard)"
+                    .to_string(),
+            ));
+        }
         let row_width = store.row_width();
         if encoding.checked_encoded_row_bytes(row_width) != Some(store.encoded_row_bytes()) {
             return Err(invalid(format!(
@@ -988,6 +1053,7 @@ impl RowStore {
             row_width,
             valid_rows,
             encoding,
+            shard_scales: Vec::new().into(),
         };
         let source: Arc<dyn PositionalRowSource> = Arc::new(TableRowSource {
             store: store.clone(),
@@ -1034,6 +1100,7 @@ impl RowStore {
             padded_rows: layout.shard_count as u64 * layout.rows_per_shard as u64,
             encoding: layout.encoding,
             encoded_row_bytes: layout.encoding.encoded_row_bytes(layout.row_width),
+            shard_scales: layout.shard_scales,
             decoded_row_bytes,
             staging_bytes,
             max_readers: if wide_readers {
@@ -1489,6 +1556,12 @@ impl RowStore {
     /// store.  Errs (and attaches nothing) when the store's geometry or row
     /// encoding is not this table's.
     pub fn attach_hot_store(&self, store: Arc<HotRowStore>) -> Result<(), String> {
+        if self.inner.encoding == RowEncoding::Fp8PerTensor {
+            return Err(
+                "a hot-row store cannot serve FP8E4M3PT rows (a pack carries no per-shard scale)"
+                    .to_string(),
+            );
+        }
         let inner = &self.inner;
         if store.padded_rows() != inner.padded_rows
             || store.rows_per_shard() != inner.rows_per_shard
@@ -1735,6 +1808,9 @@ struct RowStoreInner {
     padded_rows: u64,
     /// Stored row representation, fixed by the sealed shard dtype.
     encoding: RowEncoding,
+    /// Per-shard BF16 scale bits of [`RowEncoding::Fp8PerTensor`] rows, read
+    /// from each shard's header at open; empty for every other encoding.
+    shard_scales: Arc<[u16]>,
     encoded_row_bytes: usize,
     /// BF16 width of one published row.
     decoded_row_bytes: usize,
@@ -1761,6 +1837,12 @@ struct RowStoreInner {
 }
 
 impl RowStoreInner {
+    /// The shard scale [`RowEncoding::Fp8PerTensor`] rows decode with; `None`
+    /// for every other encoding (they carry their scales in-row).
+    fn shard_scale(&self, shard: usize) -> Option<u16> {
+        self.shard_scales.get(shard).copied()
+    }
+
     fn locate_row(&self, row: u64) -> Result<RowLocation, RowStoreError> {
         if row >= self.padded_rows {
             return Err(RowStoreError::GlobalRowOutOfRange {
@@ -2037,6 +2119,7 @@ impl RowStoreInner {
             if let Some(cached) = state.cache.pages.get(&page) {
                 copy_requested_rows(
                     self.encoding,
+                    self.shard_scale(page.shard),
                     self.encoded_row_bytes,
                     self.decoded_row_bytes,
                     page,
@@ -2315,8 +2398,13 @@ impl RowStoreInner {
             // pages), positions are `decoded_row_bytes` apart, and every run
             // is decoded by exactly one reader.
             let destination = unsafe { output.range_mut(item.output_offset..end) };
-            self.encoding
-                .decode_row(&buffer[at..at + self.encoded_row_bytes], destination)?;
+            // A hot store is never attached to FP8E4M3PT rows
+            // (`attach_hot_store`), so no shard scale is needed here.
+            self.encoding.decode_row(
+                None,
+                &buffer[at..at + self.encoded_row_bytes],
+                destination,
+            )?;
         }
         Ok(())
     }
@@ -2499,6 +2587,7 @@ impl RowStoreInner {
             if let Some(rows) = requested.get(&page) {
                 copy_requested_rows(
                     self.encoding,
+                    self.shard_scale(page.shard),
                     self.encoded_row_bytes,
                     self.decoded_row_bytes,
                     page,
@@ -2560,6 +2649,7 @@ impl RowStoreInner {
             if let Some(rows) = requested.get(&page) {
                 copy_requested_rows_shared(
                     self.encoding,
+                    self.shard_scale(page.shard),
                     self.encoded_row_bytes,
                     self.decoded_row_bytes,
                     page,
@@ -2799,6 +2889,7 @@ struct RowCopy {
 /// same encoding ratio.
 fn copy_requested_rows(
     encoding: RowEncoding,
+    shard_scale: Option<u16>,
     encoded_row_bytes: usize,
     decoded_row_bytes: usize,
     page: PageKey,
@@ -2815,7 +2906,7 @@ fn copy_requested_rows(
             output.len(),
             row,
         )?;
-        encoding.decode_row(&page_bytes[page_range], &mut output[output_range])?;
+        encoding.decode_row(shard_scale, &page_bytes[page_range], &mut output[output_range])?;
     }
     Ok(())
 }
@@ -2829,6 +2920,7 @@ fn copy_requested_rows(
 /// positions, and every page of a request is read by exactly one thread.
 fn copy_requested_rows_shared(
     encoding: RowEncoding,
+    shard_scale: Option<u16>,
     encoded_row_bytes: usize,
     decoded_row_bytes: usize,
     page: PageKey,
@@ -2852,7 +2944,7 @@ fn copy_requested_rows_shared(
         // (strictly ascending, so unique) page to exactly one thread.  No
         // other slice of this row exists while this one is live.
         let destination = unsafe { output.range_mut(output_range) };
-        encoding.decode_row(&page_bytes[page_range], destination)?;
+        encoding.decode_row(shard_scale, &page_bytes[page_range], destination)?;
     }
     Ok(())
 }
@@ -3199,6 +3291,8 @@ trait PositionalRowSource: Send + Sync {
 
 struct DescriptorRowSource {
     descriptors: Arc<[SourceRangeDescriptor]>,
+    /// Bytes ahead of row 0 in every shard ([`RowEncoding::shard_header_bytes`]).
+    data_offset: u64,
 }
 
 impl DescriptorRowSource {
@@ -3215,14 +3309,14 @@ impl DescriptorRowSource {
             .ok_or_else(|| SourceError::InvalidSource {
                 reason: format!("row shard {shard} is absent"),
             })?;
-        let absolute =
-            descriptor
-                .offset
-                .checked_add(local_offset)
-                .ok_or(SourceError::Overflow {
-                    offset: descriptor.offset,
-                    length: local_offset,
-                })?;
+        let absolute = descriptor
+            .offset
+            .checked_add(self.data_offset)
+            .and_then(|start| start.checked_add(local_offset))
+            .ok_or(SourceError::Overflow {
+                offset: descriptor.offset,
+                length: local_offset,
+            })?;
         Ok((descriptor, absolute))
     }
 }
@@ -3378,7 +3472,7 @@ impl PageCache {
 }
 
 /// Physical layout of one validated shard set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Layout {
     shard_count: usize,
     rows_per_shard: usize,
@@ -3386,6 +3480,40 @@ struct Layout {
     row_width: usize,
     valid_rows: u64,
     encoding: RowEncoding,
+    /// Per-shard scales of [`RowEncoding::Fp8PerTensor`] rows (empty otherwise).
+    shard_scales: Arc<[u16]>,
+}
+
+/// The scale of every qt=56 shard, read from its 16-byte header
+/// ([`rdna_compute::fp8_e4m3::pt_header_scale`]: bytes 2..16 must be zero).
+/// A non-finite scale is refused here, before any row is served.
+fn read_pt_shard_scales(
+    descriptors: &[SourceRangeDescriptor],
+) -> Result<Arc<[u16]>, RowStoreError> {
+    let mut scales = Vec::with_capacity(descriptors.len());
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        let mut header = [0u8; rdna_compute::fp8_e4m3::PT_HEADER_BYTES];
+        descriptor
+            .read_exact_at(descriptor.offset, &mut header)
+            .map_err(|error| RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard header read failed: {error}"),
+            })?;
+        let scale = rdna_compute::fp8_e4m3::pt_header_scale(&header).map_err(|error| {
+            RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard header: {error}"),
+            }
+        })?;
+        if !rdna_compute::fp8_e4m3::bf16_to_f32(scale).is_finite() {
+            return Err(RowStoreError::Descriptor {
+                index,
+                reason: format!("FP8E4M3PT shard scale 0x{scale:04x} is not finite"),
+            });
+        }
+        scales.push(scale);
+    }
+    Ok(scales.into())
 }
 
 fn validate_descriptors(
@@ -3399,14 +3527,18 @@ fn validate_descriptors(
             reason: "at least one physical shard is required".to_string(),
         })?;
     // The declared dtype is the contract: BF16 shards are `2 * width`-byte raw
-    // rows, Q8F16 shards are `width / 32` 34-byte blocks per row and Q4LM
-    // shards `width / 32` 18-byte blocks per row. Nothing infers the tier from
-    // the byte count, so a mislabelled artifact is refused rather than decoded
-    // as the wrong width.
+    // rows, Q8F16 shards are `width / 32` 34-byte blocks per row, Q4LM
+    // shards `width / 32` 18-byte blocks per row and FP8E4M3PT shards a
+    // 16-byte scale header then `width`-byte code rows. Nothing infers the
+    // tier from the byte count, so a mislabelled artifact is refused rather
+    // than decoded as the wrong width.
     let encoding =
         RowEncoding::from_dtype(first.dtype()).ok_or_else(|| RowStoreError::Descriptor {
             index: 0,
-            reason: format!("rows must be BF16, Q8_0 or Q4LM, got {}", first.dtype()),
+            reason: format!(
+                "rows must be BF16, Q8_0, Q4LM or FP8E4M3PT, got {}",
+                first.dtype()
+            ),
         })?;
     let shape = first.logical_shape();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
@@ -3427,6 +3559,7 @@ fn validate_descriptors(
     }
     let expected_length = (rows as u64)
         .checked_mul(encoding.encoded_row_bytes(width) as u64)
+        .and_then(|bytes| bytes.checked_add(encoding.shard_header_bytes() as u64))
         .ok_or_else(|| RowStoreError::Descriptor {
             index: 0,
             reason: "descriptor length overflow".to_string(),
@@ -3485,6 +3618,7 @@ fn validate_descriptors(
         row_width: width,
         valid_rows,
         encoding,
+        shard_scales: Vec::new().into(),
     })
 }
 
@@ -3682,6 +3816,7 @@ mod tests {
                     row_width: ROW_WIDTH,
                     valid_rows: metadata.valid_rows,
                     encoding,
+                    shard_scales: Vec::new().into(),
                 },
                 0,
                 true,
@@ -4257,7 +4392,7 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..DECODES {
             RowEncoding::Q8F16
-                .decode_row(&encoded, &mut out)
+                .decode_row(None, &encoded, &mut out)
                 .expect("decode");
             std::hint::black_box(&out);
         }
@@ -4270,6 +4405,7 @@ mod tests {
                 RowEncoding::Bf16 => rows_source(2, rows_per_shard),
                 RowEncoding::Q8F16 => rows_source_q8(2, rows_per_shard),
                 RowEncoding::Q4Lm => rows_source_q4(2, rows_per_shard),
+                RowEncoding::Fp8PerTensor => unreachable!("not a probe arm"),
             };
             let tokens: Vec<u32> = (0..256).collect();
             let rows = RowStore::from_test_source_encoded(
@@ -4347,12 +4483,152 @@ mod tests {
         let shards = rows_source_q4(1, 2);
         let row = &shards[0][..90];
         let mut got = vec![0u8; ROW_BYTES];
-        RowEncoding::Q4Lm.decode_row(row, &mut got).unwrap();
+        RowEncoding::Q4Lm.decode_row(None, row, &mut got).unwrap();
         let mut want = vec![0u8; ROW_BYTES];
         crate::ple_q4::decode_q4lm_row_bf16(row, &mut want).unwrap();
         assert_eq!(got, want);
-        assert!(RowEncoding::Q4Lm.decode_row(&row[..89], &mut got).is_err());
-        assert!(RowEncoding::Q4Lm.decode_row(row, &mut got[..318]).is_err());
+        assert!(RowEncoding::Q4Lm.decode_row(None, &row[..89], &mut got).is_err());
+        assert!(RowEncoding::Q4Lm.decode_row(None, row, &mut got[..318]).is_err());
+    }
+
+    /// Deterministic xorshift for the FP8 row fixtures.
+    fn fp8_rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// One random finite e4m3fn code (never the NaN codes 0x7F / 0xFF, which
+    /// the teacher and the decoder refuse; 0x80 = -0 is included).
+    fn fp8_code(state: &mut u64) -> u8 {
+        loop {
+            let code = fp8_rng(state) as u8;
+            if code & 0x7F != 0x7F {
+                return code;
+            }
+        }
+    }
+
+    /// A random positive finite BF16 scale over the range a per-tensor PLE
+    /// scale lives in (2^-20 .. 2^4), full 7-bit mantissa.
+    fn fp8_scale(state: &mut u64) -> u16 {
+        let exponent = 127 - 20 + (fp8_rng(state) % 25) as u16;
+        (exponent << 7) | (fp8_rng(state) & 0x7F) as u16
+    }
+
+    /// `Fp8PerTensor` rows publish exactly the BF16 bits the qt=56 decode
+    /// module produces (`bf16_rne(f32(e4m3(q)) * f32(scale))`), on random rows
+    /// and scales and on every code; NaN codes, a missing scale and a wrong
+    /// row length are refused.
+    #[test]
+    fn fp8_per_tensor_rows_decode_bit_identical_to_the_fp8_module() {
+        let encoding = RowEncoding::Fp8PerTensor;
+        assert_eq!(RowEncoding::from_dtype("FP8E4M3PT"), Some(encoding));
+        assert_eq!(RowEncoding::from_dtype("fp8e4m3pt"), Some(encoding));
+        assert_eq!(encoding.dtype_name(), "FP8E4M3PT");
+        assert_eq!(encoding.encoded_row_bytes(ROW_WIDTH), ROW_WIDTH);
+        assert_eq!(encoding.checked_encoded_row_bytes(0), None);
+        assert_eq!(encoding.shard_header_bytes(), 16);
+        assert_eq!(RowEncoding::Q8F16.shard_header_bytes(), 0);
+
+        let decode_ref = |codes: &[u8], scale: u16| {
+            let mut bits = vec![0u16; codes.len()];
+            rdna_compute::fp8_e4m3::dequant_row_pt(codes, scale, &mut bits).unwrap();
+            bits.iter().flat_map(|bits| bits.to_le_bytes()).collect::<Vec<u8>>()
+        };
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..512 {
+            let width = [ROW_WIDTH, 1, 63, 64, 65, 200][(fp8_rng(&mut state) % 6) as usize];
+            let codes: Vec<u8> = (0..width).map(|_| fp8_code(&mut state)).collect();
+            let scale = fp8_scale(&mut state);
+            let mut got = vec![0u8; 2 * width];
+            encoding.decode_row(Some(scale), &codes, &mut got).unwrap();
+            assert_eq!(got, decode_ref(&codes, scale), "scale 0x{scale:04x}");
+        }
+        // Every finite code, including -0 (0x80 -> BF16 0x8000).
+        let all: Vec<u8> = (0..=255u8).filter(|code| code & 0x7F != 0x7F).collect();
+        for scale in [0x3F80u16, 0x3B80, 0x4100, 0x3000] {
+            let mut got = vec![0u8; 2 * all.len()];
+            encoding.decode_row(Some(scale), &all, &mut got).unwrap();
+            assert_eq!(got, decode_ref(&all, scale));
+        }
+        let mut zero = [0u8; 2];
+        encoding.decode_row(Some(0x3F80), &[0x80], &mut zero).unwrap();
+        assert_eq!(u16::from_le_bytes(zero), 0x8000);
+
+        let mut got = vec![0u8; 2 * ROW_WIDTH];
+        let mut codes = vec![0x38u8; ROW_WIDTH];
+        assert!(encoding.decode_row(None, &codes, &mut got).is_err());
+        assert!(encoding.decode_row(Some(0x3F80), &codes[1..], &mut got).is_err());
+        for nan in [0x7Fu8, 0xFF] {
+            codes[17] = nan;
+            assert!(encoding.decode_row(Some(0x3F80), &codes, &mut got).is_err());
+        }
+    }
+
+    /// One qt=56 shard payload: the 16-byte scale header, then the codes.
+    fn pt_shard(scale: u16, codes: &[u8]) -> Vec<u8> {
+        let mut shard = rdna_compute::fp8_e4m3::pt_header(scale).to_vec();
+        shard.extend_from_slice(codes);
+        shard
+    }
+
+    /// qt=56 shards open through the production descriptor constructor: each
+    /// shard's header scale is read once, rows are addressed past the header,
+    /// and a lease publishes every row decoded with its own shard's scale.  A
+    /// header with stray bytes, a missing header and a hot store are refused.
+    #[test]
+    fn fp8_per_tensor_descriptors_round_trip_through_the_row_store() {
+        let rows_per_shard = 64;
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let scales = [fp8_scale(&mut state), fp8_scale(&mut state)];
+        let codes: Vec<Vec<u8>> = (0..2)
+            .map(|_| (0..rows_per_shard * ROW_WIDTH).map(|_| fp8_code(&mut state)).collect())
+            .collect();
+        let shards: Vec<Vec<u8>> = scales
+            .iter()
+            .zip(&codes)
+            .map(|(&scale, codes)| pt_shard(scale, codes))
+            .collect();
+        let (_dir, descriptors) =
+            shard_descriptors(&shards, "FP8E4M3PT", rows_per_shard, ROW_WIDTH);
+        let rows = RowStore::new("fp8-test-reader", descriptors, 128).unwrap();
+        assert_eq!(rows.inner.shard_scales.as_ref(), scales.as_slice());
+        let ids = [0u64, 1, 5, 63, 64, 100, 127, 64, 0, 3];
+        let want: Vec<u8> = ids
+            .iter()
+            .flat_map(|&id| {
+                let (shard, local) = (id as usize / rows_per_shard, id as usize % rows_per_shard);
+                let row = &codes[shard][local * ROW_WIDTH..(local + 1) * ROW_WIDTH];
+                let mut bits = vec![0u16; ROW_WIDTH];
+                rdna_compute::fp8_e4m3::dequant_row_pt(row, scales[shard], &mut bits).unwrap();
+                bits.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<u8>>()
+            })
+            .collect();
+        assert_eq!(fetch(&rows, &ids), want);
+        // Cached pages keep the one-byte codes.
+        let location = rows.locate_row(100).unwrap();
+        assert_eq!(
+            rows.inner.page_len(location.page_key()).unwrap(),
+            RowEncoding::Fp8PerTensor.page_bytes(ROW_WIDTH)
+        );
+        assert!(rows.unload().unwrap().is_clean());
+
+        let descriptor_reason = |shards: &[Vec<u8>]| {
+            let (_dir, descriptors) = shard_descriptors(shards, "FP8E4M3PT", 4, ROW_WIDTH);
+            match RowStore::new("fp8-test-reader", descriptors, 4).err() {
+                Some(RowStoreError::Descriptor { reason, .. }) => reason,
+                other => panic!("expected a descriptor error, got {other:?}"),
+            }
+        };
+        let mut stray = pt_shard(0x3F80, &[0x38; 4 * ROW_WIDTH]);
+        stray[5] = 1;
+        assert!(descriptor_reason(&[stray]).contains("FP8E4M3PT"));
+        let reason = descriptor_reason(&[vec![0x38; 4 * ROW_WIDTH]]);
+        assert!(reason.contains("FP8E4M3PT"), "{reason}");
+        let infinite = pt_shard(0x7F80, &[0x38; 4 * ROW_WIDTH]);
+        assert!(descriptor_reason(&[infinite]).contains("not finite"));
     }
 
     /// Sealed single-file reader of the descriptor fixtures below.  Its no-wait
@@ -4535,7 +4811,7 @@ mod tests {
         // A dtype with no decoder names the three that exist.
         let reason = descriptor_reason(&[vec![0u8; 4 * 90]], "F32", ROW_WIDTH);
         assert!(
-            reason.contains("BF16, Q8_0 or Q4LM") && reason.contains("F32"),
+            reason.contains("BF16, Q8_0, Q4LM or FP8E4M3PT") && reason.contains("F32"),
             "{reason}"
         );
     }
@@ -5807,6 +6083,7 @@ mod tests {
             let layout = validate_descriptors(&descriptors, 128).unwrap();
             let source = Arc::new(DescriptorRowSource {
                 descriptors: descriptors.clone(),
+                data_offset: layout.encoding.shard_header_bytes() as u64,
             });
             let rows = RowStore::spawn("descriptor-inline-test", source, descriptors, layout, 0, false, true)
                 .unwrap();

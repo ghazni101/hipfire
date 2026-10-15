@@ -489,25 +489,46 @@ peer-access ranks the default is a symmetric direct-peer read; each reduction
 waits on the peer's producer event and, before the next layer overwrites a
 partial, on the peer's consumer-complete event.
 
-Two developer controls, both default off, change only the synchronization:
+Two developer controls, both tri-state (`1` forces on, `0` forces off, unset
+takes the default), change only the synchronization. On an exact gfx1201
+pair the whole-token graph (and with it the alternating protocol) is on by
+default; on every other topology both default off:
 
-- `HIPFIRE_TP_PEER_ALTERNATING=1`: the attention partial and the FFN partial
+- `HIPFIRE_TP_PEER_ALTERNATING`: the attention partial and the FFN partial
   live in different buffers. Once a peer has produced the next partial, it
   has finished reading the previous one, so the reverse wait is dropped.
-- `HIPFIRE_TP_FULL_GRAPH=1`: exact gfx1100, TP=2, peer access, plain AR
-  decode. Each rank's whole decode token is captured as one hipGraph. Every
-  reduction becomes one graph-resident kernel: a device-resident signal
+  Unset follows `HIPFIRE_TP_FULL_GRAPH`.
+- `HIPFIRE_TP_FULL_GRAPH`: exact homogeneous gfx1100 pair or exact
+  homogeneous gfx1201 pair, TP=2, peer access, plain AR decode (a mixed
+  gfx1100/gfx1201 pair, any other arch, and any other rank count are not
+  admitted). Each rank's whole decode token is captured as one hipGraph.
+  Every reduction becomes one graph-resident kernel: a device-resident signal
   barrier plus the residual add, which reads the peer's partial through a
   host-mapped, system-coherent exchange. Captured peer-VRAM reads can be stale
-  on gfx1100. The loader prepares the signal tape and the exchange (about
-  80 KiB for Qwen3.8-27B). This control implies the alternating protocol
-  unless `HIPFIRE_TP_PEER_ALTERNATING=0`.
+  on gfx1100, and the same exchange is used on gfx1201. The loader prepares
+  the signal tape and the exchange (about 80 KiB for Qwen3.8-27B). Enabling
+  this control implies the alternating protocol unless
+  `HIPFIRE_TP_PEER_ALTERNATING=0`.
 
-Neither control is a product default. The whole-token graph needs two gfx1100
-cards, and its evidence so far is the author's 2x W7900 measurement in #830.
-Validate it with the lab oracle `tp2_cross_device_graph_reduce`
-(`--features lab`, `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript
-identity against the default route.
+On gfx1201 the whole-token graph is the default; `HIPFIRE_TP_FULL_GRAPH=0`
+restores the segmented-graph route with event-synchronized reductions. On
+gfx1100 it stays opt-in; its evidence is the author's 2x W7900 measurement in
+#830. Measured 2026-10-15 on 2x R9700 (gfx1201, PCIe 5.0 x16), Qwen3.8-27B
+mq4-xts (sha256 `3e38ccba…`), greedy decode of 64 tokens after a 127- or
+8191-token prefill, 3 fresh processes per arm, median ms/token after the
+first token (fixture-bound, not a floor):
+
+| ctx | 1 card (default FP8 KV) | TP2, `HIPFIRE_TP_FULL_GRAPH=0` (Q8 KV) | TP2 default, whole-token graph (Q8 KV) |
+|---|---|---|---|
+| 128 | 29.86 | 19.99 | 18.55 |
+| 8192 | 26.82 | 20.59 | 18.97 |
+
+Rank-0 logits were byte-identical between the two TP2 routes on every
+token. The first decode token after load runs direct and the second captures
+(about 25 ms). Validate either pair with the lab oracle
+`tp2_cross_device_graph_reduce` (`--features lab`,
+`HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
+`HIPFIRE_TP_FULL_GRAPH=0`.
 
 ### Architectural limits (current)
 

@@ -101,6 +101,54 @@ jobs:
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
+  windows:
+    name: Windows MSVC (advisory, no GPU)
+    runs-on: windows-latest
+    # Promote to a required check after the first green run on beta.
+    # Compile/smoke coverage is not Windows GPU/runtime certification.
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: "12"
+      ROCR_VISIBLE_DEVICES: "-1"
+      HIP_VISIBLE_DEVICES: "-1"
+      HIPFIRE_TEST_REQUIRE_ROCM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native CLI and daemon (MSVC)
+        run: cargo build --release --locked -p hipfire-cli -p hipfire-daemon
+      - name: Test control-plane libraries (no GPU)
+        run: cargo test --locked --lib -p hipfire-config -p hipfire-registry -p hipfire-client
+      - name: Smoke version and JSON diagnostics without HIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:HIPFIRE_HOME = Join-Path $env:RUNNER_TEMP 'hipfire-smoke'
+          New-Item -ItemType Directory -Force -Path $env:HIPFIRE_HOME | Out-Null
+          & ./target/release/hipfire.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire --version failed' }
+          # Missing HIP is reported by diag; it must not fail the CLI or
+          # contaminate stdout. Do not assert GPU values on a hosted runner.
+          $diag = & ./target/release/hipfire.exe diag --json
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire diag --json failed' }
+          $json = $diag -join "`n"
+          if ([string]::IsNullOrWhiteSpace($json)) { throw 'Empty diagnostic output' }
+          $null = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+          Write-Output $json
+      - name: Package unsigned developer artifact
+        run: ./scripts/package-windows.ps1
+      # upload-artifact@v4 is already used in hw-gate.yml and allowed here.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hipfire-windows-msvc
+          path: |
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
+
   gates:
     name: gates (ratchets, layering, registers)
     runs-on: ubuntu-latest

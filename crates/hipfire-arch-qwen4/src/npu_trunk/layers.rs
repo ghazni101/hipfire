@@ -122,7 +122,6 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                 low: &scratch.hc_low,
                 up: &scratch.hc_up,
                 mixed: &scratch.hc_mixed,
-                bf16_scratch: &scratch.gdn_bf16,
                 rows: n,
                 branches: dims.hc_count,
                 hidden: config.hidden_size,
@@ -212,6 +211,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                             selected_indices: &state.selected_indices,
                             // Decode and speculative verify never consume the arena.
                             f16_arena: if owner.prefill_scope { state.f16_arena_ref() } else { None },
+                            pooled_bf16: state.pooled_bf16_ref(),
                             full_capacity: state.full_capacity,
                             raw_capacity: state.raw_capacity,
                             pooled_capacity: state.pooled_capacity,
@@ -288,7 +288,6 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                 low: &scratch.hc_low,
                 up: &scratch.hc_up,
                 mixed: &scratch.hc_mixed,
-                bf16_scratch: &scratch.gdn_bf16,
                 rows: n,
                 branches: dims.hc_count,
                 hidden: config.hidden_size,

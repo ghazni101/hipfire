@@ -82,6 +82,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | `hipfire quantize` operator guide | [`docs/QUANTIZE.md`](QUANTIZE.md) | shipped / ref-pinned | |
 | Image generation (FLUX) | [`docs/IMAGEGEN.md`](IMAGEGEN.md) | shipped / ref-pinned | First release; RDNA3/3.5 measured. CLI `hipfire img`, HTTP `/v1/images/generations` + `/edits`. |
 | Multi-GPU operator guide | [`docs/multi-gpu.md`](multi-gpu.md) | shipped / ref-pinned | |
+| SKU application-capacity emulation (`HIPFIRE_EMU`, `hipfire emu`, `bench --emu`) | [`docs/EMU.md`](EMU.md) | branch-implemented | Developer opt-in; capacity cap plus a CPU-only derating estimate. No CU/clock/power emulation. Does not create admission. |
 | Container install / run | [`docs/CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | |
 | NixOS notes | [`docs/NIXOS.md`](NIXOS.md) | shipped / ref-pinned | |
 | Perf claim protocol (warmup, fresh-process, noise) | [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) | shipped / ref-pinned | Numbers live in measured owners, not here. |

@@ -5988,7 +5988,11 @@ pub fn generate(
                 }
             }
             let mut out_bytes = [0u8; 8];
-            if let Err(e) = gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf) {
+            if let Err(e) = gpu
+                .hip
+                .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
+                .and_then(|()| gpu.take_device_wait_error())
+            {
                 let _ = (config, weights, scratch, kv);
                 crate::dense::dense_fail_closed_error(
                     m,

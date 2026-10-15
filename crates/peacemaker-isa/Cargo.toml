@@ -20,7 +20,17 @@ required-features = ["toolchain"]
 name = "aco_hsa_emit"
 required-features = ["toolchain"]
 
+# Research harness: MI300X card Tier C. Explicit opt-in (`--features lab`);
+# it needs a gfx942 device and the HIP runtime, so it must not be type-checked
+# by the default `cargo build --all-targets`.
+[[example]]
+name = "cdna_card_tierc"
+required-features = ["lab"]
+
 [features]
+# Opt-in research harnesses (examples). Not part of any product build; the
+# UNGATED example count is ratcheted, see scripts/leanup-ratchets.sh.
+lab = []
 # The ROCm assembler/linker/bundler oracle and certification (`toolchain`):
 # the native writer (`native`) is the default path; ROCm is a test oracle.
 toolchain = ["dep:radiowave"]
@@ -33,3 +43,7 @@ peacemaker-author = { path = "../peacemaker-author" }
 radiowave = { path = "../radiowave", optional = true }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-cdna = { path = "../peacemaker-cdna" }
+
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }

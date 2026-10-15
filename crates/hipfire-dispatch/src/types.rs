@@ -145,6 +145,9 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // and whoever adds the next Lloyd variant should be forced to decide
         // which side of this line it belongs on.
         MQ2G256LloydU => RotationPlan::None,
+        // FP8E4M3B128 / FP8E4M3PT are unrotated (natural basis): the expert
+        // GEMM consumes BF16 activations as they are.
+        FP8E4M3B128 | FP8E4M3PT => RotationPlan::None,
         _ => RotationPlan::None,
     }
 }
@@ -509,6 +512,15 @@ pub enum KernelKey {
     MoeIndexedDownLloyd,
     MoeGroupedGemm,
     MoeGroupedI8,
+    // qt=55 FP8E4M3B128 grouped MoE GEMM, BF16 MFMA, gfx942 only
+    // (kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip, launcher
+    // `Gfx942Device::gemm_fp8b128_moe_grouped_bf16mfma`): prefill and decode,
+    // one fixed K order for every launch shape, no split-K, no atomics.
+    MoeGroupedFp8B128Bf16Mfma,
+    // qt=55 expert blocks -> BF16, gfx942 only, model-lifetime/oracle decode
+    // (kernels/src/dequant_fp8b128_to_bf16.gfx942.hip, launcher
+    // `Gfx942Device::dequant_fp8b128_to_bf16`).
+    DequantFp8B128ToBf16,
     // Attention
     AttnFlashAsym4,
     AttnFlashAsym4Fwht,
@@ -1012,6 +1024,10 @@ impl KernelKey {
             // implementation; keep it explicit so it cannot inherit a legacy
             // MQ4G128 route.
             MQ4G128V2 => ArchPredicate::Always,
+            // qt=55/56 have no generic family implementation (only the typed
+            // gfx942 FP8 MoE route reads qt=55; qt=56 is the PLE row store).
+            // Explicit so a future generic route has to decide its arch gate.
+            FP8E4M3B128 | FP8E4M3PT => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

@@ -96,6 +96,15 @@ fn fp8_prod_inreg(k: usize) -> bool {
 fn rmsnorm_p1a_batched() -> bool {
     hipfire_config::developer_bool("HIPFIRE_RMSNORM_P1A_BATCHED", true)
 }
+/// Opt-in gfx1100 AWQ RMSNorm wavegrid (`HIPFIRE_AWQ_NORM_WAVEGRID=1`),
+/// frozen per process. `Gpu` init also reads it to allocate the bounded-wait
+/// error block before any capture.
+pub(crate) fn awq_norm_wavegrid_requested() -> bool {
+    static AWQ_WAVEGRID: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_AWQ_NORM_WAVEGRID").as_deref() == Ok("1")
+    });
+    *AWQ_WAVEGRID
+}
 /// Process-frozen G3 row-scale perturbation, shared by fused and standalone
 /// fp8 producers. Reject unsupported shifts before any producer launch.
 pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
@@ -2764,6 +2773,7 @@ impl Gpu {
             .as_ptr();
         let kv = k as i32;
         let eps_v = eps;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -2773,6 +2783,7 @@ impl Gpu {
             &scratch as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
             &eps_v as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
 
         let bytes = k * 4 * 3 + 2 * 256 * 4;
@@ -2787,6 +2798,7 @@ impl Gpu {
             b.push_ptr(scratch);
             b.push_i32(kv);
             b.push_f32(eps_v);
+            b.push_ptr(wait_block);
             b
         });
         if let Some(t) = timer {
@@ -2821,11 +2833,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        static AWQ_WAVEGRID: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_AWQ_NORM_WAVEGRID").as_deref() == Ok("1")
-        });
         if self.arch_caps.is_gfx1100()
-            && *AWQ_WAVEGRID
+            && awq_norm_wavegrid_requested()
             && k >= 2_048
             && k.is_multiple_of(256)
             && k / 256 <= 32
@@ -2928,6 +2937,7 @@ impl Gpu {
             .as_ptr();
         let kv = k as i32;
         let eps_v = eps;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -2938,6 +2948,7 @@ impl Gpu {
             &scratch as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
             &eps_v as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
 
         let groups = (k / 256) as u32;
@@ -2960,6 +2971,7 @@ impl Gpu {
                 b.push_ptr(scratch);
                 b.push_i32(kv);
                 b.push_f32(eps_v);
+                b.push_ptr(wait_block);
                 b
             },
         );

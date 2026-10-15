@@ -19,11 +19,16 @@
 //      writes -1; tile ids written per 16-position tile. Each output word is
 //      written exactly once per invocation, so replay needs no pre-clear.
 // Complexity O(256 L + E C).
+//
+// Wave-size neutral (gfx1151/gfx1201 wave32, gfx942 wave64): no shuffles,
+// ballots, or wave masks; every cross-thread exchange goes through LDS behind
+// __syncthreads (s_e[256] = 1 KiB, s_pad[1024] = 4 KiB), and every block size
+// (256, or E <= 1024) is a whole number of threads, not of waves.
 
 #include <hip/hip_runtime.h>
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__)
-#error "qwen4_moe_scatter_stable_top10.hip is gfx1151/gfx1201-only"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1151__) && !defined(__gfx1201__) && !defined(__gfx942__)
+#error "qwen4_moe_scatter_stable_top10.hip is gfx1151/gfx1201/gfx942-only"
 #endif
 
 extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_ranks(

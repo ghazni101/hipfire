@@ -46,6 +46,16 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "MODE", default_value = "production",
           value_parser = ["production", "compact-fixture"])]
     pub qwen4_component_mode: String,
+    /// Select a dedicated recipe converter.  `stock-fp8` converts the stock
+    /// Qwen3.8-Flash-Next FP8 checkpoint (a directory holding `fp8.sha256`)
+    /// into an FP8-passthrough Qwen4 artifact plus `<output>.receipt.json`;
+    /// it selects its own route, so `--qwen4-flash-next` is not given.
+    /// `--qwen4-component-mode compact-fixture` is the only other flag read;
+    /// legacy recipe flags, `--format` and the other routes are refused.
+    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8"],
+          conflicts_with_all = ["qwen4_flash_next", "flux_pipe", "mq4v2_final_codes",
+                                "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay"])]
+    pub recipe: Option<String>,
     /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
     /// tiny local Qwen4 checkpoint from a local safetensors directory whose
     /// config.json carries a `hipfire_profile` developer marker.
@@ -55,7 +65,7 @@ pub(crate) struct QuantizeArgs {
     /// Exclusive with `--qwen4-flash-next` and `--qwen4-component-mode`.
     #[cfg(feature = "qwen4-dev-profiles")]
     #[arg(long, value_name = "ENCODING",
-          conflicts_with_all = ["qwen4_flash_next", "qwen4_component_mode", "flux_pipe"],
+          conflicts_with_all = ["qwen4_flash_next", "qwen4_component_mode", "flux_pipe", "recipe"],
           value_parser = ["source-exact", "packed"])]
     pub qwen4_dev_tiny: Option<String>,
 
@@ -340,6 +350,8 @@ pub(crate) enum Route {
     Flux,
     /// `--qwen4-flash-next` streaming artifact.
     Qwen4,
+    /// `--recipe stock-fp8` stock FP8 passthrough converter.
+    Qwen4StockFp8,
     /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
     #[cfg(feature = "qwen4-dev-profiles")]
     Qwen4DevTiny,
@@ -358,21 +370,22 @@ pub(crate) enum Route {
 use Route::*;
 
 #[cfg(not(feature = "qwen4-dev-profiles"))]
-const EVERY: &[Route] = &[Flux, Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+const EVERY: &[Route] = &[Flux, Qwen4, Qwen4StockFp8, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
 #[cfg(feature = "qwen4-dev-profiles")]
-const EVERY: &[Route] = &[Flux, Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+const EVERY: &[Route] = &[Flux, Qwen4, Qwen4StockFp8, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
 
 /// Clap argument id → the routes that read it. Every argument of
 /// [`QuantizeArgs`] must appear (enforced by a test).
 pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     #[cfg(not(feature = "qwen4-dev-profiles"))]
-    ("input", &[Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    ("input", &[Qwen4, Qwen4StockFp8, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
     #[cfg(feature = "qwen4-dev-profiles")]
-    ("input", &[Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    ("input", &[Qwen4, Qwen4StockFp8, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
     ("output", EVERY),
     ("threads", EVERY),
     ("qwen4_flash_next", &[Qwen4]),
-    ("qwen4_component_mode", &[Qwen4]),
+    ("qwen4_component_mode", &[Qwen4, Qwen4StockFp8]),
+    ("recipe", &[Qwen4StockFp8]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
     ("format", &[EarlySpecial, Gguf, Main]),
@@ -430,6 +443,7 @@ fn route_label(route: Route) -> &'static str {
     match route {
         Flux => "--flux-pipe",
         Qwen4 => "--qwen4-flash-next",
+        Qwen4StockFp8 => "--recipe stock-fp8",
         #[cfg(feature = "qwen4-dev-profiles")]
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
@@ -504,6 +518,57 @@ mod route_tests {
             let err = reject_unreachable(&matches(argv), *route).unwrap_err();
             assert!(err.starts_with(&format!("{flag} has no effect")), "{route:?}: {err}");
         }
+    }
+
+    #[test]
+    fn stock_fp8_recipe_selects_its_route_and_refuses_what_it_never_reads() {
+        let base = ["--recipe", "stock-fp8", "--input", "i", "--output", "o"];
+        reject_unreachable(&matches(&base), Qwen4StockFp8).unwrap();
+        let mut fixture = base.to_vec();
+        fixture.extend(["--qwen4-component-mode", "compact-fixture"]);
+        reject_unreachable(&matches(&fixture), Qwen4StockFp8).unwrap();
+        for (flag, value) in [
+            ("--format", Some("mq4")),
+            ("--imatrix", Some("x")),
+            ("--awq-alpha", Some("0.5")),
+            ("--tier", Some("xt")),
+            ("--hessian-dir", Some("d")),
+            ("--awq", None),
+            ("--mq4v2-symmetric", None),
+        ] {
+            let mut argv = base.to_vec();
+            argv.push(flag);
+            argv.extend(value);
+            let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+            assert!(err.starts_with(&format!("{flag} has no effect")), "{flag}: {err}");
+        }
+        // No other route reads --recipe.
+        for route in [Qwen4, Main, Gguf, EarlySpecial] {
+            let err = reject_unreachable(&matches(&base), route).unwrap_err();
+            assert!(err.starts_with("--recipe has no effect"), "{route:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn stock_fp8_recipe_is_exclusive_with_other_routes() {
+        for extra in [
+            &["--qwen4-flash-next"][..],
+            &["--flux-pipe", "p"][..],
+            &["--reap-overlay", "p"][..],
+            &["--mq4v2-final-codes", "r"][..],
+        ] {
+            let mut argv = vec!["--recipe", "stock-fp8", "--input", "i", "--output", "o"];
+            argv.extend_from_slice(extra);
+            assert!(
+                QuantizeArgs::command()
+                    .try_get_matches_from(std::iter::once("hipfire-quantize").chain(argv))
+                    .is_err(),
+                "{extra:?}"
+            );
+        }
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from(["hipfire-quantize", "--recipe", "other", "--input", "i", "--output", "o"])
+            .is_err());
     }
 
     #[test]

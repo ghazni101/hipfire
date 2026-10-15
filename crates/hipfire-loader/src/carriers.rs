@@ -176,8 +176,17 @@ fn start_ple_hot_store(
         pack.display(),
         started.elapsed().as_millis()
     );
-    let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
-    Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+    #[cfg(unix)]
+    {
+        let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
+        Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+    }
+    #[cfg(not(unix))]
+    {
+        // Unreachable: the non-Unix `HotRowStore::open` above always returns
+        // Err, and that match arm returns None before this point.
+        unreachable!("PLE hot-row packs are unsupported on Windows; run on Linux")
+    }
 }
 
 /// Bytes of the PLE hot-row pack to prewarm now that the model is ready: an
@@ -243,10 +252,12 @@ fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
 /// `plehot/hcurve_q4.py`): the smallest prefix whose modelled held-out prose
 /// and agentic 8K prefill (TTFT = 4,177 + (1 − h) × 1,135 ms) is within 1% of
 /// the 15 GiB prewarm's (prose h 0.923 vs 0.937, agentic 0.809 vs 0.836).
+#[cfg_attr(not(unix), allow(dead_code))]
 const PLE_LOAD_FILL_AUTO_BYTES: u64 = 14 << 30;
 
 /// Read rate cap of the in-load fill: a small share of the NVMe's sequential
 /// bandwidth, so the weight upload keeps the drive.
+#[cfg_attr(not(unix), allow(dead_code))]
 const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
 
 /// Bytes of a rank-ordered q4 PLE table to read while the model loads: the
@@ -255,6 +266,7 @@ const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
 /// host RAM available now (`MemAvailable` plus TTM's page pool, which the
 /// weights' GTT allocations take first) minus the weights still to load into
 /// host RAM minus [`PLE_PREWARM_RESERVE_BYTES`] (0 when unknown).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn ple_load_fill_bytes(
     requested: hipfire_config::memory::PleHotStoreBudget,
     prewarm: hipfire_config::memory::PleHotStoreBudget,
@@ -283,6 +295,7 @@ fn ple_load_fill_bytes(
 /// with an in-load fill of its hottest prefix when
 /// [`ple_load_fill_bytes`] allows one. The worker prewarms on from there
 /// once the model is ready; dropping it stops and joins it.
+#[cfg(unix)]
 fn start_ple_table_worker(
     store: &std::sync::Arc<hipfire_runtime::ple_hot_store::HotRowStore>,
     host_weight_bytes: u64,
@@ -1163,31 +1176,27 @@ fn qwen4_placement_inputs(
 }
 
 /// Free VRAM of every device in `devices` (HIP logical ids), in order, as
-/// `hipMemGetInfo` reports it before any rank of the load allocates. Run on
-/// the thread that owns `gpu` (the daemon thread): other devices are queried
-/// by switching the thread's current device, and `gpu`'s is restored with a
-/// raw `hipSetDevice` after every query. `Gpu::bind_thread` cannot restore it:
-/// its per-thread cache still names `gpu`'s device, so it would skip the call
-/// and leave every later rank-0 allocation on the last queried device.
+/// [`rdna_compute::Gpu::device_mem_info_for`] reports it before any rank of
+/// the load allocates. Run on the thread that owns `gpu` (the daemon thread):
+/// other devices are queried by `device_mem_info_for`, which switches the
+/// thread's current device with raw HIP setters and restores the previous
+/// ACTUAL current device on every return path (`Gpu::bind_thread` cannot do
+/// that: its per-thread cache still names `gpu`'s device, so it would skip the
+/// call and leave every later rank-0 allocation on the last queried device).
+///
+/// Under a `HIPFIRE_EMU` profile expert parallelism is refused (single-device
+/// capacity budget); a one-device list is the budget owner's capped query.
 pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Vec<u64>, String> {
+    if devices.len() > 1 {
+        gpu.emu_refuse_multi_device("qwen4 expert parallelism")
+            .map_err(|error| format!("qwen4: {error}"))?;
+    }
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
-        let bytes = if device == gpu.device_id {
-            gpu.device_mem_info().map(|(free, _)| free)
-        } else {
-            let queried = gpu
-                .hip
-                .set_device(device)
-                .and_then(|_| gpu.hip.get_vram_info())
-                .map(|(free, _)| free);
-            gpu.hip
-                .set_device(gpu.device_id)
-                .map_err(|error| format!("qwen4: restoring device {}: {error}", gpu.device_id))?;
-            queried
-        };
-        free.push(
-            bytes.map_err(|error| format!("qwen4: device {device} memory query: {error}"))? as u64,
-        );
+        let (bytes, _) = gpu
+            .device_mem_info_for(device)
+            .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
+        free.push(bytes as u64);
     }
     Ok(free)
 }
@@ -1542,6 +1551,7 @@ pub fn load_qwen4_rank(
         "  qwen4 state: QSA {} K/V ({} context storage), GDN {} recurrent",
         match qsa_format {
             hipfire_arch_qwen4::QsaKvFormat::Fp8 => "fp8",
+            hipfire_arch_qwen4::QsaKvFormat::Fp8Fnuz => "fp8 (gfx942 FNUZ codes, F32 index keys)",
             hipfire_arch_qwen4::QsaKvFormat::Q8 => "q8 (Q8_0 blocks of 32)",
             hipfire_arch_qwen4::QsaKvFormat::F32 => "bf16 (exact F32 state)",
         },
@@ -1550,6 +1560,9 @@ pub fn load_qwen4_rank(
     );
     if state_format.qsa_f16_arena {
         eprintln!("  qwen4 QSA F16 arena: on (BF-1, incremental exact prefill; decode F32)");
+    }
+    if state_format.qsa_pooled_bf16 {
+        eprintln!("  qwen4 QSA pooled BF16 mirror: on (exact PM score input; selection unchanged)");
     }
     use hipfire_arch_qwen4::expert_residency as residency;
     const MIB: u64 = 1 << 20;
@@ -1637,6 +1650,7 @@ pub fn load_qwen4_rank(
                 );
             if !fits {
                 if state_format.qsa_f16_arena
+                    || state_format.qsa_pooled_bf16
                     || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch))
                 {
                     return Err(format!(
@@ -1790,6 +1804,12 @@ pub fn load_qwen4_rank(
             .map_err(|error| format!("qwen4: {error}"))?;
         residency::check_gtt_cap(host_check_bytes, residency::gtt_budget())
             .map_err(|error| format!("qwen4: {error}"))?;
+        // SKU emulation: the same pinned-host (GTT) bytes against the capacity
+        // ledger's shared-host/GTT room, in addition to the real checks above.
+        // No-op when HIPFIRE_EMU is off.
+        ctx.gpu
+            .emu_check_host_allocation(host_check_bytes, true)
+            .map_err(|error| format!("qwen4: {error}"))?;
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
         eprintln!(
                 "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
@@ -1855,6 +1875,7 @@ pub fn load_qwen4_rank(
     // in hand); its worker verifies the pack meanwhile and prewarms it
     // once the model is ready. Dropping either on an error path stops and
     // joins its worker.
+    #[cfg(unix)]
     let ple_table_worker = rank_table.as_ref().map(|store| {
         // What the sweep puts in host RAM: on unified memory every
         // uploaded weight (external PLE rows stay on disk), on a discrete
@@ -1873,6 +1894,13 @@ pub fn load_qwen4_rank(
         };
         start_ple_table_worker(store, host_weight_bytes)
     });
+    #[cfg(not(unix))]
+    let ple_table_worker = {
+        if rank_table.is_some() {
+            return Err("qwen4: rank-ordered PLE table workers are unsupported on Windows; run on Linux".into());
+        }
+        None::<hipfire_arch_qwen4::bundle::PleHotWorker>
+    };
     let ple_hot = match (&metadata, ple_descriptors.as_deref()) {
         (Some(metadata), Some(descriptors)) if config.profile.is_flash_next() => {
             start_ple_hot_store(

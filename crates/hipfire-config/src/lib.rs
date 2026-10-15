@@ -10,7 +10,14 @@
 //! resolved values; they do not parse user configuration in hot paths.
 
 pub mod devices;
+pub mod emu;
+pub mod emu_budget;
+pub mod emu_model;
+pub mod host_memory;
 pub mod rocm;
+pub mod secret;
+
+pub use host_memory::{host_memory, HostMemory};
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -58,6 +65,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0}")]
+    Home(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -337,6 +346,7 @@ pub enum ValueRule {
     NonEmptyString,
     Host,
     PathOrEmpty,
+    AbsolutePathOrEmpty,
     Enum(&'static [&'static str]),
     AutoBool,
     NullableString,
@@ -417,6 +427,8 @@ impl ConfigField {
                     expand_tilde(v).is_file()
                 }
             }),
+            ValueRule::AbsolutePathOrEmpty => matches!(value, ConfigValue::String(v)
+                if v.is_empty() || (v.trim() == v && Path::new(v).is_absolute())),
             ValueRule::Enum(values) => {
                 matches!(value, ConfigValue::String(v) if values.contains(&v.as_str()))
             }
@@ -1395,6 +1407,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_SERVE_ALLOW_REQUEST_PATHS",
         "Let a chat request load any readable file it names. Off: requests may name only installed models (models directory, catalog, pre-warm model)."
+    ),
+    field!(
+        "serve.api_key_file",
+        "api_key_file",
+        Serve,
+        Process,
+        DefaultValue::String(""),
+        ValueRule::AbsolutePathOrEmpty,
+        false,
+        false,
+        Some("HIPFIRE_SERVE_API_KEY_FILE"),
+        "Absolute path of a file holding the serve bearer token (at least 32 bytes after trimming trailing whitespace; Unix mode must grant no group/other access). Empty (unset) keeps serve keyless; the token itself is never stored in configuration."
     ),
     // --- Serving cache/scheduler contract keys (spec §9.1) -----------------
     // All experimental: the cache/scheduler route is planned and has not
@@ -3785,13 +3809,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
         "gfx1151 compute-resource-limits packet policy."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CU masking on RDNA hung the R9700 MES (2026-10-14); refused
     diagnostic_field!(
         "diagnostic.replay.gfx1151_cu_count",
         "gfx1151_redline_cu_count",
         DefaultValue::String("all"),
         ValueRule::String,
         "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
-        "Even gfx1151 CU count below 40, or all."
+        "Refused: any value other than all fails PM4 replay preparation (CU masks on RDNA hung the R9700 MES on 2026-10-14). Default all."
     ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_entry_acquire",
@@ -4172,7 +4197,7 @@ pub fn active_process_config() -> Option<&'static ProcessConfig> {
 /// and developer-tool invocation. Native CLI launches install their already
 /// resolved policy explicitly and never take this fallback.
 pub fn load_local_process_config() -> Result<ProcessConfig> {
-    let paths = ConfigPaths::discover();
+    let paths = ConfigPaths::try_discover()?;
     let loaded = load_global(&paths)?;
     let mut layers = vec![NamedLayer {
         source: ConfigSource::GlobalUser { path: loaded.path },
@@ -4314,20 +4339,11 @@ pub fn is_discrete_memory_arch(arch: &str) -> bool {
         .any(|known| arch.eq_ignore_ascii_case(known))
 }
 
-/// `SwapTotal` (kB) from a /proc/meminfo body; `None` when absent/unreadable.
-fn swap_total_kb_from_meminfo(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-/// Host swap size in kB; `None` when /proc/meminfo cannot be read.
+/// Whether the host has swap; `None` when the host memory snapshot or its
+/// swap size is unavailable. On Linux this is `SwapTotal > 0`; on Windows the
+/// swap size is the pagefile approximation from [`host_memory::host_memory`].
 fn host_has_swap() -> Option<bool> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    Some(swap_total_kb_from_meminfo(&meminfo)? > 0)
+    Some(host_memory::host_memory()?.swap_total_bytes? > 0)
 }
 
 /// Pure auto decision, testable without pinning host state. With a known GPU
@@ -4881,17 +4897,89 @@ pub struct ConfigPaths {
     pub legacy_per_model_json: PathBuf,
 }
 
-impl ConfigPaths {
-    pub fn discover() -> Self {
-        let root = env::var_os("HIPFIRE_HOME")
+/// The hipfire state root every crate shares (`ConfigPaths::root`,
+/// `RegistryPaths::cache`'s parent). Selection order:
+///
+/// - Unix: `HIPFIRE_HOME`, else `$HOME/.hipfire`, else the relative `.hipfire`.
+/// - Windows: `HIPFIRE_HOME`, else `%USERPROFILE%\.hipfire` (the root
+///   `scripts/install.ps1` installs into), else `%HOME%\.hipfire`. A Windows
+///   root is never CWD-relative: a missing home or a non-absolute value is an
+///   actionable [`ConfigError::Home`].
+pub fn hipfire_home() -> Result<PathBuf> {
+    hipfire_home_from(cfg!(windows), |name| env::var_os(name))
+}
+
+/// Pure core of [`hipfire_home`]: `windows` selects the rule set and `get`
+/// supplies environment values, so tests inject both without touching the
+/// process environment.
+fn hipfire_home_from(
+    windows: bool,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if !windows {
+        return Ok(get("HIPFIRE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
-            .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        let mut paths = Self::under(root);
+            .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .unwrap_or_else(|| PathBuf::from(".hipfire")));
+    }
+    if let Some(raw) = get("HIPFIRE_HOME") {
+        return require_windows_absolute("HIPFIRE_HOME", PathBuf::from(raw));
+    }
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(profile) = get(var).filter(|value| !value.is_empty()) {
+            return require_windows_absolute(var, PathBuf::from(profile))
+                .map(|profile| profile.join(".hipfire"));
+        }
+    }
+    Err(ConfigError::Home(
+        "cannot locate the hipfire home: neither HIPFIRE_HOME nor USERPROFILE is set \
+         (and HOME is unset); set HIPFIRE_HOME to an absolute directory such as \
+         C:\\Users\\<you>\\.hipfire"
+            .to_string(),
+    ))
+}
+
+fn require_windows_absolute(var: &str, path: PathBuf) -> Result<PathBuf> {
+    if is_windows_absolute(&path) {
+        Ok(path)
+    } else {
+        Err(ConfigError::Home(format!(
+            "{var}={} is not an absolute Windows path; hipfire will not use a \
+             current-directory-relative home. Set {var} to a full path such as \
+             C:\\Users\\<you>\\.hipfire",
+            path.display()
+        )))
+    }
+}
+
+/// Windows absoluteness decided textually so it is the same on every host:
+/// `C:\` / `C:/` drive roots, or `\\server\share` / `\\?\` style prefixes.
+/// Drive-relative (`C:foo`) and rooted-without-drive (`\foo`) paths are not
+/// absolute.
+fn is_windows_absolute(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2]) {
+        return true;
+    }
+    bytes.len() >= 3 && is_sep(bytes[0]) && is_sep(bytes[1]) && !is_sep(bytes[2])
+}
+
+impl ConfigPaths {
+    /// Infallible form of [`ConfigPaths::try_discover`]; panics with the
+    /// actionable message when no usable Windows home exists. Fallible callers
+    /// use `try_discover`.
+    pub fn discover() -> Self {
+        Self::try_discover().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_discover() -> Result<Self> {
+        let mut paths = Self::under(hipfire_home()?);
         if let Some(models) = env::var_os("HIPFIRE_MODELS_DIR") {
             paths.models = PathBuf::from(models);
         }
-        paths
+        Ok(paths)
     }
 
     pub fn under(root: impl Into<PathBuf>) -> Self {
@@ -5914,10 +6002,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 ConfigValue::String("legacy".to_owned()),
             ),
             (
-                "diagnostic.replay.gfx1151_cu_count",
-                ConfigValue::String("all".to_owned()),
-            ),
-            (
                 "diagnostic.replay.gfx1151_entry_acquire",
                 ConfigValue::String("system".to_owned()),
             ),
@@ -5932,6 +6016,109 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    fn home_env<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn unix_home_selection_is_unchanged() {
+        let both = [("HIPFIRE_HOME", "/srv/hf"), ("HOME", "/home/u")];
+        assert_eq!(
+            hipfire_home_from(false, home_env(&both)).unwrap(),
+            PathBuf::from("/srv/hf")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("HOME", "/home/u")])).unwrap(),
+            PathBuf::from("/home/u/.hipfire")
+        );
+        // USERPROFILE is a Windows-only input.
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("USERPROFILE", "C:\\Users\\u")])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_selection_order() {
+        let all = [
+            ("HIPFIRE_HOME", "D:\\hf"),
+            ("USERPROFILE", "C:\\Users\\u"),
+            ("HOME", "E:\\home"),
+        ];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&all)).unwrap(),
+            PathBuf::from("D:\\hf")
+        );
+        let no_override = [("USERPROFILE", "C:\\Users\\u"), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&no_override)).unwrap(),
+            PathBuf::from("C:\\Users\\u").join(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(true, home_env(&[("HOME", "E:\\home")])).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+        // An empty USERPROFILE falls through to HOME.
+        let empty_profile = [("USERPROFILE", ""), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&empty_profile)).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_never_falls_back_to_relative() {
+        let missing = hipfire_home_from(true, home_env(&[])).unwrap_err().to_string();
+        assert!(missing.contains("HIPFIRE_HOME") && missing.contains("USERPROFILE"));
+        for bad in [
+            ("HIPFIRE_HOME", ".hipfire"),
+            ("HIPFIRE_HOME", ""),
+            ("HIPFIRE_HOME", "\\rooted"),
+            ("HIPFIRE_HOME", "C:drive-relative"),
+            ("USERPROFILE", "Users\\u"),
+            ("HOME", "/c/Users/u"),
+        ] {
+            let pairs = [bad];
+            let error = hipfire_home_from(true, home_env(&pairs)).unwrap_err();
+            assert!(
+                error.to_string().contains(bad.0),
+                "{bad:?} must name its variable: {error}"
+            );
+        }
+        // A bad HIPFIRE_HOME or USERPROFILE does not silently fall through.
+        let bad_override = [("HIPFIRE_HOME", "rel"), ("USERPROFILE", "C:\\Users\\u")];
+        assert!(hipfire_home_from(true, home_env(&bad_override)).is_err());
+        let bad_profile = [("USERPROFILE", "rel"), ("HOME", "E:\\home")];
+        assert!(hipfire_home_from(true, home_env(&bad_profile)).is_err());
+    }
+
+    #[test]
+    fn windows_absolute_classification() {
+        for ok in [
+            "C:\\",
+            "c:/Users/u",
+            "\\\\server\\share\\hf",
+            "//server/share",
+            "\\\\?\\C:\\Users\\u",
+        ] {
+            assert!(is_windows_absolute(Path::new(ok)), "{ok}");
+        }
+        for bad in ["", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x"] {
+            assert!(!is_windows_absolute(Path::new(bad)), "{bad}");
+        }
     }
 
     #[test]
@@ -6210,15 +6397,6 @@ mod tests {
         assert!(oom_guard_auto_for(None, Some(false)));
         // Unreadable /proc/meminfo: fail safe.
         assert!(oom_guard_auto_for(None, None));
-    }
-
-    #[test]
-    fn swap_total_parses_from_meminfo() {
-        let with_swap = "MemTotal:       130000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        2000000 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(with_swap), Some(2_000_000));
-        let no_swap = "MemTotal:       130000000 kB\nSwapTotal:             0 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(no_swap), Some(0));
-        assert_eq!(swap_total_kb_from_meminfo("MemTotal: 100 kB\n"), None);
     }
 
     #[test]
@@ -7205,6 +7383,55 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn serve_api_key_file_schema_is_an_absolute_path_defaulting_to_unset() {
+        let field = field("serve.api_key_file").unwrap();
+        assert_eq!(field.env_compat, Some("HIPFIRE_SERVE_API_KEY_FILE"));
+        assert_eq!(field.scope, ConfigScope::Process);
+        assert_eq!(field.category, ConfigCategory::Serve);
+        assert!(!field.registry_allowed);
+        assert_eq!(field.default.to_value(), ConfigValue::String(String::new()));
+
+        let absolute = env::temp_dir().join("serve.key");
+        let absolute = absolute.to_str().unwrap();
+        let mut layer = ConfigLayer::default();
+        layer
+            .set("serve.api_key_file", ConfigValue::String(String::new()))
+            .unwrap();
+        layer.set_cli("serve.api_key_file", absolute).unwrap();
+        assert_eq!(
+            layer.get("serve.api_key_file"),
+            Some(&ConfigValue::String(absolute.to_owned()))
+        );
+        // Existence is not a schema concern: the token loader owns file checks.
+        layer
+            .set_cli("serve.api_key_file", &format!("{absolute}.missing"))
+            .unwrap();
+
+        let padded_left = format!(" {absolute}");
+        let padded_right = format!("{absolute} ");
+        for bad in [
+            "serve.key",
+            "./serve.key",
+            "~/serve.key",
+            " ",
+            padded_left.as_str(),
+            padded_right.as_str(),
+        ] {
+            let err = layer.set_cli("serve.api_key_file", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("serve.api_key_file"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(layer
+            .set("serve.api_key_file", ConfigValue::Integer(1))
+            .is_err());
+        assert!(layer
+            .set("serve.api_key_file", ConfigValue::Null)
+            .is_err());
     }
 
     #[test]

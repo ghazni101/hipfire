@@ -940,8 +940,14 @@ pub fn validate_ep_batch_compatibility(
         .and_then(|v| v.checked_add(peer_bytes_per_rank as u64))
         .ok_or_else(|| HipError::new(0, "per-rank total overflow"))?;
     // Per-device VRAM check using shared helper, not aggregate total vs min_free.
+    // EP spans several devices, which a single-device HIPFIRE_EMU budget cannot
+    // cover: refuse under emulation (no-op when off). Each rank's room is the
+    // capped per-device query (UMA-safe clamp, then the emu cap).
+    if let Some(first) = gpus.devices.first() {
+        first.emu_refuse_multi_device("qwen35 expert-parallel batch")?;
+    }
     for (idx, dev) in gpus.devices.iter().enumerate() {
-        if let Ok((free, _)) = dev.hip.get_vram_info() {
+        if let Ok((free, _)) = dev.device_mem_info_for(dev.device_id) {
             if per_rank_total > free as u64 {
                 return Err(HipError::new(
                     0,

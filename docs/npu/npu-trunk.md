@@ -30,7 +30,8 @@ kept for provenance and are not current recommendations.
 * **Calibration.** `fusions.npu_trunk_calibration` /
   `HIPFIRE_QWEN4_NPU_TRUNK_CAL` defaults to `<hipfire home>/npu-trunk/calibration.json`.
   A file there wins; only an absent file falls back to the compiled-in measured
-  Halo records, which cover the reference key and never arbitrary devices. The
+  Halo records. Those apply on any Halo kernel/firmware with a 5% safety margin
+  (see below); first-load self-calibration is planned. The
   schema is **4**, BF16-direct only: there is no int32 contract
   (`glue.fold_ms_per_col_8192` is gone and `epilogue` must be `bf16`), and a
   schema-3 record is rejected.
@@ -511,7 +512,7 @@ The measurements schema is the same as the schema-version-4 output record:
   The collector supplies device/firmware, kernel release, model **index** digest,
   epilogue and trunk route. Omitted `key.build` uses the stable release/NPU
   contract. The CLI checks `uname -r` and refuses a kernel mismatch. Serving
-  compares **all** key fields to its runtime identity.
+  compares **all** key fields of a calibration file to its runtime identity.
 * `gpu.trunk_in_ms_per_8192`: required `qkv`, `zab`, `q`, `kvidx` millisecond
   totals across the respective 36/12 layers from kernel-trace attribution.
   `gpu.uniform_per_layer_ms`, `gdn_core_per_layer_ms`, `qsa_per_layer_ms`,
@@ -605,11 +606,20 @@ Only an absent file falls back to compiled-in measured Halo schema-4 records:
 `halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
 `halo-xdna2-stock-v2.json` (`stock`). The stock lab record is schema-compatible,
 keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
-Invalid/unreadable files never fall back. Both sources require identical key
-checks; successful arming logs `cal_source=file|builtin`. The reference key is
+Invalid/unreadable files never fall back. Successful arming logs
+`cal_source=file|builtin`. A file must match every key field. For the built-in
+record, `device.pci_bdf`, `device.npu_fw_version` and `kernel.uname_release` are
+advisory: when any differs, the record is used with `margin` raised to at least
+`ADVISORY_MARGIN` = 0.05 (the pipe must be predicted at least 5% faster than
+GPU-only, since the timings were measured on a different kernel/firmware), and
+the load logs one line
+`npu-trunk: built-in calibration measured on <kernel>/<fw>, this host <kernel>/<fw>; using it with margin 0.05`.
+So the built-in calibration applies on any Halo kernel/firmware; first-load
+self-calibration is planned. The reference key is
 gfx1151, the reference unit's PCI bus ID (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
 model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
-BF16 and the matching stock/overlay route; the builtin does not admit other keys.
+BF16 and the matching stock/overlay route; the builtin does not admit another
+arch, build, model, epilogue or route.
 
 Admission runs in this order, before any stock MQ6 download/packing or NPU allocation:
 
@@ -646,7 +656,8 @@ Quality accepted: S11 j103 BF16-direct family B, ΔKLD WT2 −0.0005 / code24
 | `on` | `calibration=none (forced)`, ALL, natural 8192+B pairs | Use selected families; planned pairs from the first row (no crossover arming) | Use subset; none stays native |
 | `emulate` | Same as `on`, GPU twin | Same as `on`, GPU twin | Same as `on`, GPU twin |
 
-An auto key mismatch logs exactly `npu-trunk: off (calibration key mismatch: <field>)`.
+An auto key mismatch (any field for a file; a hard field for the built-in) logs exactly
+`npu-trunk: off (calibration key mismatch: <field>)`.
 Matching records log `load_log_line` with selection, key/hash, crossover and
 predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
 planning all use that same selected mask. Without a match, forced modes use ALL.
@@ -709,7 +720,8 @@ shared over dma-buf) are planned for 0.4.3.
 ### Installing and testing auto on a Strix Halo host (maintainer hardware gate)
 
 After CPU acceptance, install the **same** release CLI/daemon on the Halo host.
-The built-in calibration covers the reference key, so no calibration file is
+The built-in calibration covers the reference model on any Halo kernel/firmware
+(with the 5% advisory margin off the reference key), so no calibration file is
 needed there. A file at `<hipfire home>/npu-trunk/calibration.json` is needed
 only to override it, and must be a schema-4 BF16-direct record whose key matches
 this device exactly (schema-3 and I32 records are refused). These commands are

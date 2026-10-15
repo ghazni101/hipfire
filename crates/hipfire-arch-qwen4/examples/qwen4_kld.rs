@@ -9,8 +9,8 @@
 //! logits, per-chunk `reset`) so an engine teacher and the candidate share one
 //! route and differ only in weights.
 //!
-//! The engine can only run Qwen4 with MQ4 routed experts, so an engine
-//! teacher (e.g. a BF16-trunk HFQM) measures trunk / head / PLE damage only.
+//! Engine references measure only differences between the supplied artifacts;
+//! use the external source teacher to measure shared expert quantization error.
 //! The source-precision teacher is the BF16 checkpoint itself, run by
 //! `reference_oracle/kld_teacher.py` over a template reference's tokens;
 //! `import` turns its logits into a reference with the same top-k, NLL and
@@ -23,6 +23,14 @@
 //!                    --teacher ID_FILE --output REF.kldref [--top-k 256]
 //!   qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq \
 //!                    [--max-chunks N] [--decode] [--ple-hot BYTES]
+//!   qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref \
+//!                    --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]
+//! `s11ref` writes F64 KL(ref || candidate), in the reference score-index order,
+//! and OUT.npy.json with model/ref/corpus/binary SHA256. S11 refs contain no
+//! prefix tokens: --corpus must be the exact corpus bound by the header SHA.
+//! Every corpus sequence is one cold window, including unequal assistant
+//! sequences; score_positions selects role-masked next-token rows. The estimator
+//! is the same top-k plus exact F64 reference residual as fp8_refs.score_rows.
 //! `--decode` scores the autoregressive route instead: each chunk prefills the
 //! unscored prefix, then runs one `forward_token` per scored position.
 //! `--ple-hot BYTES` attaches the PLE hot-row store (`<model>.plehot` sidecar
@@ -54,6 +62,16 @@ use std::time::Instant;
 /// `<rows source>.plehotrows` pack (`plan.source_path` is the model file or
 /// its PLE sidecar), wait until its worker verified the pack, prewarm
 /// `prewarm` bytes of it, and return it ready to attach.
+#[cfg(not(unix))]
+fn verified_hot_store(
+    _model: &Path,
+    _plan: PleHotPlan,
+    _prewarm: u64,
+) -> Result<PleHotWorker, String> {
+    Err("--ple-hot: PLE hot-row verification and prewarm are unsupported on Windows; run this diagnostic on a Unix host".into())
+}
+
+#[cfg(unix)]
 fn verified_hot_store(
     model: &Path,
     plan: PleHotPlan,
@@ -95,7 +113,12 @@ fn verified_hot_store(
     Ok(hot)
 }
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
+
+/// Reuse the backing allocation, but expose exactly this cold window's rows.
+fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
+    backing.sub_offset(0, tokens * vocab)
+}
 
 struct Model {
     gpu: Gpu,
@@ -286,15 +309,16 @@ impl Model {
 
     /// All-row logits for one chunk from a fresh state.
     fn chunk_logits(&mut self, chunk: &[u32]) -> Result<Vec<f32>, String> {
+        let logits = all_logits_view(&self.logits, chunk.len(), self.vocab);
         self.bundle
             .reset(&mut self.gpu)
             .map_err(|e| e.to_string())?;
         self.bundle
-            .forward_chunk(&mut self.gpu, chunk, &self.logits, None)
+            .forward_chunk(&mut self.gpu, chunk, &logits, None)
             .map_err(|e| e.to_string())?;
         let rows = self
             .gpu
-            .download_f32(&self.logits)
+            .download_f32(&logits)
             .map_err(|e| e.to_string())?;
         if rows.iter().any(|v| !v.is_finite()) {
             return Err("non-finite logits".into());
@@ -309,9 +333,11 @@ impl Model {
         self.bundle
             .reset(&mut self.gpu)
             .map_err(|e| e.to_string())?;
-        self.bundle
-            .forward_chunk_final(&mut self.gpu, &chunk[..from], &row, None)
-            .map_err(|e| e.to_string())?;
+        if from > 0 {
+            self.bundle
+                .forward_chunk_final(&mut self.gpu, &chunk[..from], &row, None)
+                .map_err(|e| e.to_string())?;
+        }
         let mut rows = Vec::with_capacity((to - from) * self.vocab);
         for &token in &chunk[from..to] {
             self.bundle
@@ -667,11 +693,234 @@ fn score(
     Ok(())
 }
 
-fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
+#[derive(serde::Deserialize)]
+struct S11Header {
+    schema: String,
+    n_rows: usize,
+    n_vocab: usize,
+    k: usize,
+    corpus_sha256: String,
+}
+
+struct S11Ref<'a> {
+    header: S11Header,
+    index: &'a [u8],
+    blocks: &'a [u8],
+}
+
+impl<'a> S11Ref<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, String> {
+        if data.get(..8) != Some(b"S11REF\0\x01") || data.len() < 16 {
+            return Err("not an S11REF v1 file".into());
+        }
+        let header_len = usize::try_from(u64::from_le_bytes(data[8..16].try_into().unwrap()))
+            .map_err(|_| "S11REF header length overflow")?;
+        let index_start = 16usize.checked_add(header_len).ok_or("S11REF length overflow")?;
+        let header: S11Header = serde_json::from_slice(
+            data.get(16..index_start).ok_or("truncated S11REF header")?,
+        ).map_err(|e| format!("S11REF header: {e}"))?;
+        if header.schema != "subq4.calib2.s11ref.v1"
+            || header.n_rows == 0 || header.k == 0 || header.k > header.n_vocab
+        {
+            return Err("invalid S11REF schema or geometry".into());
+        }
+        let block_bytes = header.k.checked_mul(8).and_then(|n| n.checked_add(8))
+            .ok_or("S11REF block length overflow")?;
+        let index_bytes = header.n_rows.checked_mul(12).ok_or("S11REF index overflow")?;
+        let blocks_start = index_start.checked_add(index_bytes).ok_or("S11REF index overflow")?;
+        let end = header.n_rows.checked_mul(block_bytes)
+            .and_then(|n| blocks_start.checked_add(n)).ok_or("S11REF length overflow")?;
+        if end != data.len() {
+            return Err("S11REF size mismatch".into());
+        }
+        Ok(Self { header, index: &data[index_start..blocks_start], blocks: &data[blocks_start..] })
+    }
+
+    fn index(&self, row: usize) -> [u32; 3] {
+        let bytes = &self.index[row * 12..(row + 1) * 12];
+        std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
+    }
+
+    fn block(&self, row: usize, block: &mut TopKBlock) -> Result<(), String> {
+        let stride = 8 + 8 * self.header.k;
+        let bytes = &self.blocks[row * stride..(row + 1) * stride];
+        block.residual_logprob = f64::from_le_bytes(bytes[..8].try_into().unwrap());
+        if block.residual_logprob.is_nan() || block.residual_logprob > 0.0 {
+            return Err(format!("S11REF row {row}: invalid residual"));
+        }
+        block.top.clear();
+        for pair in bytes[8..].chunks_exact(8) {
+            let id = u32::from_le_bytes(pair[..4].try_into().unwrap());
+            let lp = f32::from_le_bytes(pair[4..].try_into().unwrap());
+            if id as usize >= self.header.n_vocab || lp.is_nan() || lp > 0.0
+            {
+                return Err(format!("S11REF row {row}: invalid top-k entry"));
+            }
+            block.top.push((id, lp));
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct S11Corpus {
+    schema: String,
+    sequences: Vec<S11Sequence>,
+}
+
+#[derive(serde::Deserialize)]
+struct S11Sequence {
+    id: String,
+    tokens: Vec<u32>,
+    score_positions: Vec<usize>,
+    reset: Option<bool>,
+    stratum: String,
+    role_mask: Option<Vec<u8>>,
+}
+
+fn validate_s11_corpus(reference: &S11Ref<'_>, corpus: &S11Corpus) -> Result<usize, String> {
+    if corpus.schema != "hipfire.qwen4.kl_corpus.v1" || corpus.sequences.is_empty() {
+        return Err("invalid S11 corpus schema or empty corpus".into());
+    }
+    let mut row = 0;
+    let mut n_ctx = 0;
+    for (seq, s) in corpus.sequences.iter().enumerate() {
+        if s.tokens.len() < 2 || s.reset == Some(false)
+            || s.tokens.iter().any(|&t| t as usize >= reference.header.n_vocab)
+        {
+            return Err(format!("corpus sequence {}: invalid tokens or non-cold reset", s.id));
+        }
+        n_ctx = n_ctx.max(s.tokens.len());
+        let mut prior = None;
+        for &p in &s.score_positions {
+            if p >= s.tokens.len() - 1 || prior.is_some_and(|v| p <= v) {
+                return Err(format!("corpus sequence {}: invalid score position {p}", s.id));
+            }
+            if s.stratum == "assistant"
+                && !s.role_mask.as_ref().is_some_and(|mask|
+                    mask.len() == s.tokens.len() && mask[p + 1] == 1)
+            {
+                return Err(format!("corpus sequence {}: scored target is not assistant content", s.id));
+            }
+            if row >= reference.header.n_rows
+                || reference.index(row) != [seq as u32, p as u32, s.tokens[p + 1]]
+            {
+                return Err(format!("corpus differs from S11REF score index at row {row}"));
+            }
+            prior = Some(p);
+            row += 1;
+        }
+    }
+    if row != reference.header.n_rows {
+        return Err(format!("corpus has {row} rows, reference has {}", reference.header.n_rows));
+    }
+    Ok(n_ctx)
+}
+
+fn write_kl_npy(path: &Path, rows: &[f64]) -> Result<(), String> {
+    use std::io::Write;
+    let mut header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({},), }}", rows.len());
+    let padding = (64 - (10 + header.len() + 1) % 64) % 64;
+    header.extend(std::iter::repeat_n(' ', padding));
+    header.push('\n');
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+    file.write_all(b"\x93NUMPY\x01\x00").map_err(|e| e.to_string())?;
+    file.write_all(&(header.len() as u16).to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    for value in rows {
+        file.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+    file.flush().map_err(|e| e.to_string())
+}
+
+fn score_s11ref(
+    model: &Path, ref_path: &Path, corpus_path: &Path, output: &Path,
+    decode: bool, ple_hot: Option<u64>,
+) -> Result<(), String> {
+    let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
+    // SAFETY: a read-only map of the immutable reference; parsing uses LE bytes.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
+    let reference = S11Ref::parse(&mmap)?;
+    let corpus_bytes = std::fs::read(corpus_path).map_err(|e| e.to_string())?;
+    let corpus_sha = format!("{:x}", Sha256::digest(&corpus_bytes));
+    if corpus_sha != reference.header.corpus_sha256 {
+        return Err("corpus SHA256 differs from S11REF header".into());
+    }
+    let corpus: S11Corpus = serde_json::from_slice(&corpus_bytes).map_err(|e| e.to_string())?;
+    let n_ctx = validate_s11_corpus(&reference, &corpus)?;
+    let mut m = Model::load(model, n_ctx, ple_hot)?;
+    if m.vocab != reference.header.n_vocab {
+        return Err(format!("candidate vocab {} != S11REF vocab {}", m.vocab, reference.header.n_vocab));
+    }
+    let mut kls = Vec::with_capacity(reference.header.n_rows);
+    let mut block = TopKBlock { residual_logprob: 0.0, top: Vec::with_capacity(reference.header.k) };
+    let started = Instant::now();
+    for s in &corpus.sequences {
+        if decode {
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            let row = m.logits.sub_offset(0, m.vocab);
+            let from = s.score_positions.first().copied().unwrap_or(s.tokens.len());
+            if from > 0 {
+                m.bundle.forward_chunk_final(&mut m.gpu, &s.tokens[..from], &row, None)
+                    .map_err(|e| e.to_string())?;
+            }
+            let to = s.score_positions.last().map_or(from, |p| p + 1);
+            let mut positions = s.score_positions.iter().copied().peekable();
+            for (p, &token) in s.tokens.iter().enumerate().take(to).skip(from) {
+                m.bundle.forward_token(&mut m.gpu, token, &row, None).map_err(|e| e.to_string())?;
+                if positions.peek() == Some(&p) {
+                    let logits = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+                    if logits.iter().any(|v| !v.is_finite()) {
+                        return Err("non-finite decode logits".into());
+                    }
+                    reference.block(kls.len(), &mut block)?;
+                    kls.push(kld_from_block(&block, &logits).map_err(|e| e.to_string())?);
+                    positions.next();
+                }
+            }
+        } else {
+            let logits = m.chunk_logits(&s.tokens)?;
+            for &p in &s.score_positions {
+                reference.block(kls.len(), &mut block)?;
+                kls.push(kld_from_block(&block, &logits[p * m.vocab..(p + 1) * m.vocab])
+                    .map_err(|e| e.to_string())?);
+            }
+        }
+        eprintln!("  {}: {} rows scored, {:.0}s", s.id, kls.len(), started.elapsed().as_secs_f64());
+    }
+    if kls.len() != reference.header.n_rows || kls.iter().any(|v| !v.is_finite()) {
+        return Err("invalid or incomplete KL rows".into());
+    }
+    write_kl_npy(output, &kls)?;
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.s11ref_klrows.v1",
+        "direction": "KL(ref || hipfire)",
+        "estimator": "top-k + exact reference float64 residual; saddle_quant::kld_from_block",
+        "model_sha256": artifact_id(model)?.sha256,
+        "ref_sha256": artifact_id(ref_path)?.sha256,
+        "corpus_sha256": corpus_sha,
+        "binary_sha256": artifact_id(&binary)?.sha256,
+        "output_sha256": artifact_id(output)?.sha256,
+        "rows": kls.len(), "n_ctx": n_ctx,
+        "sequences": corpus.sequences.len(),
+        "forward_tokens": corpus.sequences.iter().map(|s|
+            if decode { s.score_positions.last().map_or(s.tokens.len(), |p| p + 1) }
+            else { s.tokens.len() }).sum::<usize>(),
+        "route": if decode { "decode" } else { "cold-prefill" }
+    });
+    std::fs::write(format!("{}.json", output.display()),
+        serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    eprintln!("qwen4_kld s11ref: mean KLD = {:.12}  ({} rows)",
+        kls.iter().sum::<f64>() / kls.len() as f64, kls.len());
+    Ok(())
+}
+
+fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mode = args.next().ok_or(USAGE)?;
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
-    let (mut logits, mut teacher) = (None, None);
+    let (mut logits, mut teacher, mut corpus) = (None, None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     let mut ple_hot = None;
     while let Some(flag) = args.next() {
@@ -684,6 +933,7 @@ fn run() -> Result<(), String> {
             "--output" => output = Some(PathBuf::from(value()?)),
             "--logits" => logits = Some(PathBuf::from(value()?)),
             "--teacher" => teacher = Some(PathBuf::from(value()?)),
+            "--corpus" => corpus = Some(PathBuf::from(value()?)),
             "--n-ctx" => n_ctx = number(value()?)?,
             "--top-k" => top_k = number(value()?)?,
             "--max-chunks" => max_chunks = Some(number(value()?)?),
@@ -692,12 +942,19 @@ fn run() -> Result<(), String> {
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
+    if mode == "s11ref" && (max_chunks.is_some() || slice.is_some() || logits.is_some() || teacher.is_some()) {
+        return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported".into());
+    }
     match (mode.as_str(), model, slice, ref_path, output) {
         ("ref", Some(model), Some(slice), None, Some(output)) => {
             build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => {
             score(&model, &ref_path, &output, max_chunks, decode, ple_hot)
+        }
+        ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
+            let corpus = corpus.ok_or("s11ref requires --corpus CORPUS.json (prefix tokens are not stored in S11REF)")?;
+            score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {
@@ -710,8 +967,119 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = run_args(std::env::args().skip(1)) {
         eprintln!("qwen4_kld: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod s11_tests {
+    use super::*;
+    #[test]
+    fn all_output_view_matches_each_unequal_sequence() {
+        let mut storage = [0.0f32; 1479 * 8];
+        let backing = GpuTensor {
+            // CPU storage used only for tensor metadata, never a GPU call.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(
+                storage.as_mut_ptr().cast(), std::mem::size_of_val(&storage)) },
+            shape: vec![storage.len()],
+            dtype: DType::F32,
+        };
+        for tokens in [166, 1479] {
+            let view = all_logits_view(&backing, tokens, 8);
+            assert_eq!(view.numel(), tokens * 8);
+            assert_eq!(view.byte_size(), tokens * 8 * 4);
+            assert_eq!(view.buf.size(), tokens * 8 * 4);
+            assert_eq!(view.buf.as_ptr(), backing.buf.as_ptr());
+        }
+        assert_eq!(backing.numel(), 1479 * 8);
+    }
+
+
+    #[test]
+    fn cli_rejects_missing_corpus_and_partial_rows() {
+        let args = ["s11ref", "--model", "model.hfq", "--ref", "ref.s11ref", "--output", "out.npy"];
+        assert!(run_args(args.into_iter().map(str::to_string)).unwrap_err().contains("--corpus"));
+        assert!(run_args(args.into_iter().chain(["--max-chunks", "1"]).map(str::to_string))
+            .unwrap_err().contains("full corpus"));
+        assert!(run_args(["s11ref", "--ref"].into_iter().map(str::to_string))
+            .unwrap_err().contains("needs a value"));
+    }
+
+    #[test]
+    fn python_helper_reference_and_npy_roundtrip() {
+        // Enable the external helper cross-check explicitly; no torch/GPU is
+        // needed. HIPFIRE_FLOOR_ORACLE selects quality_longref.py when it is
+        // not shipped beside this example. Ordinary tests need no qcal tree.
+        let Some(helper) = std::env::var_os("HIPFIRE_FP8_REFS_DIR") else {
+            eprintln!("cross-reader test skipped: set HIPFIRE_FP8_REFS_DIR to the fp8_refs.py directory");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("qwen4-s11ref-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let oracle = std::env::var_os("HIPFIRE_FLOOR_ORACLE").map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("reference_oracle"));
+        let script = r#"
+import sys, json
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+import fp8_refs as f
+import numpy as np
+f.ORACLE = Path(sys.argv[2])
+f.VOCAB = 8
+d = Path(sys.argv[3])
+sidx = np.array([[0,0,3],[0,2,5],[1,1,7]], dtype='<u4')
+rows = SimpleNamespace(ids=np.array([[1,2],[3,4],[5,6]], dtype='<u4'),
+    logprobs=np.log(np.array([[.4,.3],[.3,.2],[.5,.2]])).astype('<f4'),
+    residual_logprob=np.log(np.array([.3,.5,.3])).astype('<f8'))
+f.write_s11ref(d/'tiny.s11ref', {'corpus_sha256':'test'}, sidx, rows)
+r = f.read_s11ref(d/'tiny.s11ref')
+sys.path.insert(0, str(Path(sys.argv[1]).parent/'w3quality'/'kld'))
+from score_kld import kld_from_block
+candidate = np.array([-1.,.25,1.,-.5,.75,-.25,.5,0.], dtype=np.float32)
+kl = [kld_from_block(r['ids'][i],r['logprobs'][i],r['residual'][i],candidate) for i in range(3)]
+(d/'expected.json').write_text(json.dumps({'sidx':r['sidx'].tolist(),
+    'ids':r['ids'].tolist(), 'lp_bits':r['logprobs'].view(np.uint32).tolist(),
+    'res_bits':r['residual'].view(np.uint64).tolist(), 'kl':kl}))
+"#;
+        let status = std::process::Command::new("python3").args(["-c", script])
+            .arg(&helper).arg(&oracle).arg(&dir).status().unwrap();
+        assert!(status.success());
+        let data = std::fs::read(dir.join("tiny.s11ref")).unwrap();
+        let r = S11Ref::parse(&data).unwrap();
+        let expected: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(r.header.n_rows, 3);
+        assert_eq!(r.header.n_vocab, 8);
+        let mut block = TopKBlock { residual_logprob: 0.0, top: Vec::new() };
+        for row in 0..3 {
+            assert_eq!(serde_json::json!(r.index(row)), expected["sidx"][row]);
+            r.block(row, &mut block).unwrap();
+            assert_eq!(block.residual_logprob.to_bits(), expected["res_bits"][row].as_u64().unwrap());
+            let kl = kld_from_block(&block, &[-1.0,0.25,1.0,-0.5,0.75,-0.25,0.5,0.0]).unwrap();
+            assert!((kl - expected["kl"][row].as_f64().unwrap()).abs() < 1e-12);
+            for j in 0..2 {
+                assert_eq!(serde_json::json!(block.top[j].0), expected["ids"][row][j]);
+                assert_eq!(u64::from(block.top[j].1.to_bits()), expected["lp_bits"][row][j].as_u64().unwrap());
+            }
+        }
+        let corpus = S11Corpus { schema: "hipfire.qwen4.kl_corpus.v1".into(), sequences: vec![
+            S11Sequence { id: "a".into(), tokens: vec![0,3,4,5], score_positions: vec![0,2],
+                reset: Some(true), stratum: "text".into(), role_mask: None },
+            S11Sequence { id: "b".into(), tokens: vec![0,1,7], score_positions: vec![1],
+                reset: Some(true), stratum: "assistant".into(), role_mask: Some(vec![0,0,1]) },
+        ] };
+        assert_eq!(validate_s11_corpus(&r, &corpus).unwrap(), 4);
+        let mut bad = data.clone();
+        bad.pop();
+        assert!(S11Ref::parse(&bad).is_err());
+        write_kl_npy(&dir.join("rows.npy"), &[0.1, 0.2, 0.3]).unwrap();
+        let status = std::process::Command::new("python3").args(["-c",
+            "import numpy as np,sys; a=np.load(sys.argv[1]); assert a.dtype==np.float64 and a.shape==(3,); np.testing.assert_array_equal(a,[.1,.2,.3])"])
+            .arg(dir.join("rows.npy")).status().unwrap();
+        assert!(status.success());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

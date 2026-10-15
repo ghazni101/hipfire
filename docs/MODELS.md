@@ -132,6 +132,8 @@ The historical RTN-asymmetric `qwen3.8-flash-next.mq4`
 (`qwen3.8:flash-next-rtn-asym`) is a different artifact and is never migrated.
 Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-next-bench-fixture).
 
+**Known limit: host RAM on a 16 GB card.** Measured sizing finding: an RX 9070 XT (16 GB) host with 64 GB RAM (TTM cap 31 GiB) cannot load Qwen3.8 Flash-Next, whose 38–61 GB of host-mapped routed experts exceed that cap. Flash-Next on a 16 GB card needs at least 128 GB of host RAM. (Details and the `HIPFIRE_EMU=rx9070xt` capacity profile: [`EMU.md`](EMU.md#measured-sizing-finding-flash-next-on-a-16-gb-card).)
+
 Other Flash-Next registry entries, retained for provenance and not the default:
 
 | Tag | File | Size GB | Min VRAM | Notes |

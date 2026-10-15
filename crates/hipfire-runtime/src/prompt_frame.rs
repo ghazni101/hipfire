@@ -1647,7 +1647,13 @@ pub fn build_cached_history_jinja(
     tools: Option<&[serde_json::Value]>,
     cache_lookup: impl FnMut(&Message) -> Option<CachedAssistantTurn>,
 ) -> Result<Vec<u32>, String> {
-    build_cached_history_jinja_with(frame, messages, tools, ToolTurnSplice::Envelopes, cache_lookup)
+    build_cached_history_jinja_with(
+        frame,
+        messages,
+        tools,
+        ToolTurnSplice::Envelopes,
+        cache_lookup,
+    )
 }
 
 /// How [`build_cached_history_jinja_with`] splices an assistant message that
@@ -4539,7 +4545,11 @@ SYS:{{ build_system_message(system_message) }}:END
     /// Production cache shape (`qwen_cached_turn_entry`): whole generated body in
     /// the content slot (empty text), producer reasoning text-only when the turn
     /// thought.
-    fn qwen_whole_body_entry(t: &Tokenizer, body: &[u32], started_in_think: bool) -> CachedAssistantTurn {
+    fn qwen_whole_body_entry(
+        t: &Tokenizer,
+        body: &[u32],
+        started_in_think: bool,
+    ) -> CachedAssistantTurn {
         CachedAssistantTurn {
             reasoning: cached_producer_reasoning_text(t, body, started_in_think).map(|text| {
                 CachedAssistantBody {
@@ -4575,11 +4585,7 @@ SYS:{{ build_system_message(system_message) }}:END
         let t = make_tokenizer();
         let frame = qwen_tool_frame(&t, true);
         let history = qwen_tool_history(qwen_weather_call_message("", Some("plan A\n")));
-        let r1 = t.encode(
-            &frame
-                .render_messages(&history[..1], None, None)
-                .unwrap(),
-        );
+        let r1 = t.encode(&frame.render_messages(&history[..1], None, None).unwrap());
         let body = t.encode(&format!("plan A\n</think>\n\n{QWEN_TOOL_CALL_BLOCK}"));
         let mut consumed = r1.clone();
         consumed.extend_from_slice(&body);
@@ -4600,7 +4606,10 @@ SYS:{{ build_system_message(system_message) }}:END
         .expect("cached render");
         assert_strict_extension(&rendered, &consumed, "WholeBody");
         for sid in [9u32, 10, 11, 12, 13] {
-            assert!(!rendered.contains(&sid), "sentinel {sid} must be fully replaced");
+            assert!(
+                !rendered.contains(&sid),
+                "sentinel {sid} must be fully replaced"
+            );
         }
         let decoded = t.decode(&rendered);
         assert_eq!(
@@ -4620,7 +4629,9 @@ SYS:{{ build_system_message(system_message) }}:END
         let frame = qwen_tool_frame(&t, true);
         let history = qwen_tool_history(qwen_weather_call_message("checking", Some("plan A\n")));
         let r1 = t.encode(&frame.render_messages(&history[..1], None, None).unwrap());
-        let body = t.encode(&format!("plan A\n</think>\n\nchecking {QWEN_TOOL_CALL_BLOCK}"));
+        let body = t.encode(&format!(
+            "plan A\n</think>\n\nchecking {QWEN_TOOL_CALL_BLOCK}"
+        ));
         let mut consumed = r1.clone();
         consumed.extend_from_slice(&body);
         consumed.push(1);
@@ -4657,7 +4668,10 @@ SYS:{{ build_system_message(system_message) }}:END
             assistant_lookup(&stored),
         )
         .expect("cached render");
-        assert_eq!(explicit, plain, "Envelopes: content-only tool turn must miss");
+        assert_eq!(
+            explicit, plain,
+            "Envelopes: content-only tool turn must miss"
+        );
         let default = build_cached_history_jinja(&frame, &history, None, assistant_lookup(&stored))
             .expect("cached render");
         assert_eq!(default, plain, "default entry point is Envelopes");
@@ -4676,7 +4690,10 @@ SYS:{{ build_system_message(system_message) }}:END
         consumed.extend_from_slice(&body);
         consumed.push(1);
         let stored = qwen_whole_body_entry(&t, &body, false);
-        assert!(stored.reasoning.is_none(), "no reasoning slot when thinking is off");
+        assert!(
+            stored.reasoning.is_none(),
+            "no reasoning slot when thinking is off"
+        );
         let rendered = build_cached_history_jinja_with(
             &frame,
             &history,
@@ -4687,7 +4704,10 @@ SYS:{{ build_system_message(system_message) }}:END
         .expect("cached render");
         assert_strict_extension(&rendered, &consumed, "WholeBody (thinking off)");
         for sid in [9u32, 10, 11, 12, 13] {
-            assert!(!rendered.contains(&sid), "sentinel {sid} must be fully replaced");
+            assert!(
+                !rendered.contains(&sid),
+                "sentinel {sid} must be fully replaced"
+            );
         }
         assert_eq!(t.decode(&rendered).matches("<tool_call>").count(), 1);
     }

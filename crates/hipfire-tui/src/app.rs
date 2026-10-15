@@ -740,8 +740,7 @@ impl App {
         // Fresh cancel flag per generation; Esc flips it (request_abort).
         self.chat.abort = Arc::new(AtomicBool::new(false));
         let abort = self.chat.abort.clone();
-        let host = self.config.probe_host();
-        let port = self.config.port;
+        let config = self.config.clone();
         let model = self.active_model.clone();
         let temp = self.chat.temp;
         let top_p = self.chat.top_p;
@@ -765,8 +764,15 @@ impl App {
                 },
             );
         }
-        thread::spawn(move || {
-            let _ = stream_chat(&host, port, &model, &messages, temp, top_p, tx, abort);
+        // Endpoint (and bearer key-file read) resolves on the worker thread so
+        // file I/O stays off the UI thread; failures surface as a chat error.
+        thread::spawn(move || match config.service_endpoint() {
+            Ok(endpoint) => {
+                let _ = stream_chat(&endpoint, &model, &messages, temp, top_p, tx, abort);
+            }
+            Err(error) => {
+                let _ = tx.send(ChatEvent::Error(error));
+            }
         });
     }
 

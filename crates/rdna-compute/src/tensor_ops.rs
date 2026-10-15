@@ -51,10 +51,11 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
-/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps gfx1201's non-capture batched GDN
-/// recurrence on `gated_delta_step_halves_state128_persistent256_{f32,q8}`
-/// instead of the register-resident `gated_delta_step_pipe128_{f32,q8}`
-/// (bytewise identical results).  Read once.
+/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps the non-capture batched GDN recurrence of
+/// gfx1201 (F32 and Q8 state) and gfx942 (F32 state) on
+/// `gated_delta_step_halves_state128_persistent256_{f32,q8}` instead of the
+/// register-resident `gated_delta_step_pipe128_{f32,q8}` (bytewise identical
+/// results; the Q8 kernel is gfx1201-only).  Read once.
 static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_GDN_PIPE", true)
 });
@@ -547,9 +548,12 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         && format == GdnStateFormat::Q8
         && gpu.qwen4_scope
         && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
-    // gfx1201 non-capture: the register-resident one-thread-per-column
-    // recurrence (bitwise the persistent256 kernel's result), 128 threads.
-    let pipe128 = !canon && p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
+    // gfx1201 (F32 and Q8) and gfx942 (F32 only) non-capture: the
+    // register-resident one-thread-per-column recurrence (bitwise the
+    // persistent256 kernel's result), 128 threads.
+    let pipe128_arch = gpu.arch == "gfx1201"
+        || (gpu.arch == "gfx942" && format == GdnStateFormat::F32);
+    let pipe128 = !canon && p.row_states.is_none() && pipe128_arch && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
         (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
@@ -2577,6 +2581,10 @@ pub enum QsaKvFormat {
     /// Q8_0 K/V (32-element blocks of one f16 scale and 32 int8 codes, the
     /// dense q8 KV row; gfx11 and gfx12), BF16 index keys.
     Q8,
+    /// E4M3 FNUZ K/V with one f16 scale per head and token (the [`Self::Fp8`]
+    /// row layout with the gfx942 FNUZ code points; gfx942 only), F32 index
+    /// keys.
+    Fp8Fnuz,
 }
 
 impl QsaKvFormat {
@@ -2585,6 +2593,7 @@ impl QsaKvFormat {
             Self::F32 => "f32",
             Self::Fp8 => "fp8",
             Self::Q8 => "q8",
+            Self::Fp8Fnuz => "fp8_fnuz",
         }
     }
 
@@ -2594,7 +2603,7 @@ impl QsaKvFormat {
             Self::F32 => head_dim > 0,
             // Whole-head scales over one 256-thread block, and 4-byte aligned
             // code rows (`kv_heads * 258` bytes).
-            Self::Fp8 => head_dim == 256 && kv_heads % 2 == 0,
+            Self::Fp8 | Self::Fp8Fnuz => head_dim == 256 && kv_heads % 2 == 0,
             // One 256-thread block per head, eight 32-lane Q8_0 blocks, and
             // 4-byte aligned block pairs (272-byte heads).
             Self::Q8 => head_dim == 256 && kv_heads > 0,
@@ -2605,7 +2614,7 @@ impl QsaKvFormat {
     pub const fn kv_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 | Self::Q8 => DType::Raw,
+            Self::Fp8 | Self::Q8 | Self::Fp8Fnuz => DType::Raw,
         }
     }
 
@@ -2613,7 +2622,7 @@ impl QsaKvFormat {
     pub const fn kv_row_units(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim,
-            Self::Fp8 => kv_heads * (head_dim + 2),
+            Self::Fp8 | Self::Fp8Fnuz => kv_heads * (head_dim + 2),
             Self::Q8 => kv_heads * (head_dim / 32) * 34,
         }
     }
@@ -2622,20 +2631,20 @@ impl QsaKvFormat {
     pub const fn kv_row_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim * 4,
-            Self::Fp8 | Self::Q8 => self.kv_row_units(kv_heads, head_dim),
+            Self::Fp8 | Self::Q8 | Self::Fp8Fnuz => self.kv_row_units(kv_heads, head_dim),
         }
     }
 
     /// Dtype of the raw and pooled index-key arenas.
     pub const fn index_dtype(self) -> DType {
         match self {
-            Self::F32 => DType::F32,
+            Self::F32 | Self::Fp8Fnuz => DType::F32,
             Self::Fp8 | Self::Q8 => DType::BF16,
         }
     }
 
-    /// This format's entry of a `[f32, fp8, q8]` kernel-name table.
-    fn kernel(self, names: [&'static str; 3]) -> &'static str {
+    /// This format's entry of a `[f32, fp8, q8, fp8_fnuz]` kernel-name table.
+    fn kernel(self, names: [&'static str; 4]) -> &'static str {
         names[self as usize]
     }
 }
@@ -2649,6 +2658,10 @@ pub struct QsaStateLayout {
     /// ([`QsaF16ArenaRef`]); each holds `qsa_f16_arena_rows(max_seq)` rows of
     /// `kv_heads * head_dim` F16 elements.
     pub f16_arena: bool,
+    /// Derived BF16 mirror of the pooled index keys
+    /// (`qsa_pooled_mirror::QsaPooledBf16MirrorRef`); holds `index_dim` BF16
+    /// elements per pooled block, never snapshotted.
+    pub pooled_bf16: bool,
 }
 
 impl QsaStateLayout {
@@ -2659,6 +2672,7 @@ impl QsaStateLayout {
         Self {
             kv,
             f16_arena: false,
+            pooled_bf16: false,
         }
     }
 
@@ -2672,6 +2686,16 @@ impl QsaStateLayout {
     pub const fn f16_arena_bytes_per_token(self, kv_heads: usize, head_dim: usize) -> usize {
         if self.f16_arena {
             2 * kv_heads * head_dim * 2
+        } else {
+            0
+        }
+    }
+
+    /// Bytes per pooled block of the BF16 mirror (2 bytes per index
+    /// channel), `0` without it.
+    pub const fn pooled_bf16_bytes_per_block(self, index_dim: usize) -> usize {
+        if self.pooled_bf16 {
+            2 * index_dim
         } else {
             0
         }
@@ -2784,6 +2808,9 @@ fn check_qsa_format(
     if format == QsaKvFormat::Fp8 && !(gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201()) {
         return Err(HipError::new(0, "QSA fp8 K/V needs a gfx12 device"));
     }
+    if format == QsaKvFormat::Fp8Fnuz && !gpu.arch_caps.is_gfx942() {
+        return Err(HipError::new(0, "QSA fp8 FNUZ K/V needs a gfx942 device"));
+    }
     if format == QsaKvFormat::Q8 && !gpu.arch_caps.has_gfx11_plus_simt() {
         return Err(HipError::new(0, "QSA q8 K/V needs a gfx11 or gfx12 device"));
     }
@@ -2875,6 +2902,7 @@ pub fn indexed_attention_decode_prologue(
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
         "indexed_attention_decode_prologue_q8",
+        "indexed_attention_decode_prologue_fp8_fnuz",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3002,6 +3030,7 @@ pub fn indexed_attention_append_prologue(
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
         "indexed_attention_decode_prologue_q8",
+        "indexed_attention_decode_prologue_fp8_fnuz",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3240,6 +3269,7 @@ pub fn indexed_attention_cache_append_batch(
         "indexed_attention_cache_append_f32_batched",
         "indexed_attention_cache_append_fp8_batched",
         "indexed_attention_cache_append_q8_batched",
+        "indexed_attention_cache_append_fp8_fnuz_batched",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3402,6 +3432,7 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
         return indexed_attention_select_batch(
             gpu,
             &IndexedAttentionSelectBatch {
+                pooled_bf16: None,
                 query: p.query,
                 pooled: p.pooled,
                 selected: p.selected,
@@ -3463,6 +3494,12 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
 pub struct IndexedAttentionSelectBatch<'a> {
     pub query: &'a GpuTensor,
     pub pooled: &'a GpuTensor,
+    /// Exact BF16 copy of `pooled` rows [0, block_count) (pooled values are BF16-rounded
+    /// at pooling). When Some (dtype BF16, numel >= block_count*index_dim) and the gfx1151
+    /// PM BF16 score kernel covers the call (same admission as the PM F32 score: eager,
+    /// `qsa_select_pm_fits`, HIPFIRE_QWEN4_QSA_SCORE_PM on, pooled F32), the score reads it;
+    /// otherwise `pooled`. Selection bytes identical either way.
+    pub pooled_bf16: Option<&'a GpuTensor>,
     pub selected: &'a GpuTensor,
     pub rows: usize,
     pub query_row_stride: usize,
@@ -3498,11 +3535,9 @@ pub fn indexed_attention_select_batch_mirrored(
     indexed_attention_select_batch_impl(gpu, p, Some(mirror))
 }
 
-fn indexed_attention_select_batch_impl(
-    gpu: &mut Gpu,
-    p: &IndexedAttentionSelectBatch<'_>,
-    mirror: Option<&GpuTensor>,
-) -> HipResult<bool> {
+/// Shape, extent and integer admission of a batched select call, shared by the
+/// live route and the lab entries.
+fn qsa_select_batch_validate(p: &IndexedAttentionSelectBatch<'_>) -> HipResult<()> {
     ensure_f32(p.query)?;
     // Pooled keys are F32 or BF16 arenas (`QsaKvFormat::index_dtype`).
     if !matches!(p.pooled.dtype, DType::F32 | DType::BF16) {
@@ -3587,11 +3622,20 @@ fn indexed_attention_select_batch_impl(
             ),
         ));
     }
-    let shape_blocks = p.shape_blocks;
-    shape_blocks
+    p.shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
-    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+    Ok(())
+}
+
+fn indexed_attention_select_batch_impl(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    qsa_select_batch_validate(p)?;
+    let shape_blocks = p.shape_blocks;
+    let parallel = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && shape_blocks > 0
         && !select_forced_serial();
     // Live F32 launches use the score/select pair. Covered BF16 prefill
@@ -3646,7 +3690,7 @@ fn indexed_attention_select_fused(
     let lds_bytes = shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
-    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+    let parallel = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && shape_blocks > 0
         && !select_forced_serial();
     // Past the LDS row the scores go to global rows (one per workgroup, at
@@ -3666,6 +3710,7 @@ fn indexed_attention_select_fused(
             let query = p.query.sub_offset(query_offset, query_elements - query_offset);
             let selected = p.selected.sub_offset(first * row_bytes, selected_bytes - first * row_bytes);
             let group = IndexedAttentionSelectBatch {
+                pooled_bf16: p.pooled_bf16,
                 query: &query,
                 pooled: p.pooled,
                 selected: &selected,
@@ -3727,7 +3772,8 @@ fn indexed_attention_select_fused(
     } else {
         p.block_count.saturating_mul(std::mem::size_of::<f32>())
     });
-    let launch_exact = *QWEN4_QSA_SELECT_EXACT
+    let launch_exact = qsa_select_exact_arch(&gpu.arch_caps)
+        && *QWEN4_QSA_SELECT_EXACT
         && kernel_name == parallel_kernel
         && p.block_count <= QSA_SELECT_EXACT_MAX_BLOCKS
         && p.budget_blocks <= QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS
@@ -3833,6 +3879,13 @@ const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
 /// Prefill admission remains independent of the decode kill switch.
 const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 
+/// The exact selector (`indexed_attention_select_exact.hip`) is `mov_dpp8`
+/// code, gfx11+ ISA only: gfx942 gets the parallel incumbent selector, never
+/// this one, even under `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1`.
+fn qsa_select_exact_arch(caps: &crate::arch_caps::ArchCaps) -> bool {
+    caps.has_gfx11_plus_simt()
+}
+
 /// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
 /// admitted rows, the fixed four-head / 128-dim F32-query geometry with F32 or
 /// BF16 pooled keys, and every buffer addressed through 32-bit raw-buffer
@@ -3934,20 +3987,51 @@ pub fn indexed_attention_select_batch_pm_arm(
 /// BF16 requires the PM rows16 score from `qsa_select_bf16_pm_gfx1151`;
 /// there is no hipcc BF16 rows score. Both dtypes select using hipcc or the
 /// existing PM select module, with identical kernargs, grids and output bytes.
+/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT=1` replaces the select launch of large,
+/// eager, gfx11+ calls with the exact filter trio ([`qsa_filter_production`]).
 fn indexed_attention_select_rows8(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
     mirror: Option<&GpuTensor>,
     pm: QsaSelectPmArm,
 ) -> HipResult<bool> {
+    let filter = qsa_filter_production(gpu, p, pm);
+    indexed_attention_select_rows8_core(gpu, p, mirror, pm, filter, None)
+}
+
+/// [`indexed_attention_select_rows8`] with explicit filter knobs (`None` keeps
+/// the select kernel) and optional per-row `[threshold, count | repaired << 32]`
+/// words of the filter control block, collected in row order (a host
+/// download per group: labs only; production passes `None`).
+fn indexed_attention_select_rows8_core(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    pm: QsaSelectPmArm,
+    filter: Option<QsaFilterCfg>,
+    mut stats: Option<&mut Vec<[u64; 2]>>,
+) -> HipResult<bool> {
     const PM_MODULE: &str = "qsa_select_pm_gfx1151";
     if p.pooled.dtype == DType::BF16 && !pm.score() {
         return Err(HipError::new(0, "QSA select BF16 requires PM score"));
     }
+    if let Some(knobs) = filter {
+        qsa_filter_cfg_check(knobs)?;
+    }
     let stride = p.block_count;
     // PM scores sixteen rows for every admitted call. The hipcc fallback
     // retains eight-row scoring for decode and few-row verify.
-    let (score_kernel, score_rows) = if p.pooled.dtype == DType::BF16 {
+    // A BF16 copy of an F32 pooled arena feeds the BF16 PM score when the call
+    // would run the PM F32 score; it is never read otherwise.
+    let bf16_copy = p.pooled_bf16.filter(|m| {
+        m.dtype == DType::BF16
+            && p.pooled.dtype == DType::F32
+            && pm.score()
+            && p.block_count
+                .checked_mul(p.index_dim)
+                .is_some_and(|elements| m.numel() >= elements)
+    });
+    let (score_kernel, score_rows) = if p.pooled.dtype == DType::BF16 || bf16_copy.is_some() {
         ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
     } else if pm.score() {
         ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
@@ -3961,12 +4045,26 @@ fn indexed_attention_select_rows8(
     } else {
         "indexed_attention_select_from_scores"
     };
-    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
-        .max(16)
-        .min(p.rows);
+    let pooled_ptr = bf16_copy.unwrap_or(p.pooled).buf.as_ptr();
+    let score_group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride.max(1) * 4) / 16 * 16).max(16);
     // Growth goes through the accessor that invalidates captured state first.
-    let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
-    if p.pooled.dtype == DType::BF16 {
+    let (group, scores, cand, ctl) = if let Some(knobs) = filter {
+        let score_rows = qsa_filter_score_group(stride).ok_or_else(|| {
+            HipError::new(0, "QSA filter: one score row exceeds the score scratch budget")
+        })?;
+        let group = score_rows.min(qsa_filter_group_limit(knobs.cap)).min(p.rows);
+        let score_bytes = group
+            .checked_mul(stride)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| HipError::new(0, "QSA filter score scratch overflow"))?;
+        let s = qsa_filter_scratch(gpu, score_bytes, group, knobs.cap)?;
+        (group, s.scores, s.cand, s.ctl)
+    } else {
+        let group = score_group.min(p.rows);
+        let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
+        (group, scores, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    if bf16_copy.is_some() || p.pooled.dtype == DType::BF16 {
         gpu.ensure_embedded_kernel(
             "qsa_select_bf16_pm_gfx1151",
             crate::kernels::QSA_SELECT_BF16_PM_GFX1151,
@@ -3977,7 +4075,9 @@ fn indexed_attention_select_rows8(
     } else {
         gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, score_kernel)?;
     }
-    if pm.select() {
+    if filter.is_some() {
+        qsa_filter_ensure_kernels(gpu)?;
+    } else if pm.select() {
         gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, select_kernel)?;
     } else {
         gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, select_kernel)?;
@@ -3998,35 +4098,63 @@ fn indexed_attention_select_rows8(
         let position_start = checked_i32(p.position_start + g0, "QSA batch select position")?;
         let rows = checked_i32(n, "QSA batch select rows")?;
         let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
-        let mut args = KernargBlob::new();
-        args.push_ptr(query);
-        args.push_ptr(p.pooled.buf.as_ptr());
-        args.push_ptr(scores);
-        args.push_i32(rows);
-        args.push_i32(query_row_stride);
-        args.push_i32(block_count);
-        args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
-        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
-        args.push_i32(position_start);
-        args.push_i32(block_count);
-        args.pad_to(16);
-        gpu.launch_blob_recorded(
-            score_kernel,
-            [
-                block_tiles,
-                checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
-                1,
-            ],
-            [256, 1, 1],
-            0,
-            args.as_mut_slice(),
-            crate::dispatch::ReplayLaunchBindings::NONE,
-        )?;
+        // No live block: nothing to score (a zero grid is not launchable).
+        if p.block_count > 0 {
+            let mut args = KernargBlob::new();
+            args.push_ptr(query);
+            args.push_ptr(pooled_ptr);
+            args.push_ptr(scores);
+            args.push_i32(rows);
+            args.push_i32(query_row_stride);
+            args.push_i32(block_count);
+            args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
+            args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+            args.push_i32(position_start);
+            args.push_i32(block_count);
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                score_kernel,
+                [
+                    block_tiles,
+                    checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
+                    1,
+                ],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )?;
+        }
         // The persistent selection is the final row's: the last group's.
         let last = g0 + n == p.rows;
         let mirror_ptr = mirror
             .filter(|_| last)
             .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
+        if let Some(knobs) = filter {
+            qsa_filter_launch(
+                gpu,
+                &QsaFilterTrio {
+                    scores,
+                    stride: p.block_count.max(1),
+                    ctl,
+                    cand,
+                    selected,
+                    mirror: mirror_ptr,
+                    rows: n,
+                    block_count: p.block_count,
+                    budget: p.budget_blocks,
+                    compress: p.compress,
+                    position_start: p.position_start + g0,
+                    capacity: p.capacity,
+                    knobs,
+                },
+            )?;
+            if let Some(out) = stats.as_mut() {
+                out.extend(qsa_filter_read_ctl(gpu, ctl, n)?);
+            }
+            g0 += n;
+            continue;
+        }
         let mut args = KernargBlob::new();
         args.push_ptr(scores);
         args.push_i32(block_count);
@@ -4050,6 +4178,545 @@ fn indexed_attention_select_rows8(
         g0 += n;
     }
     Ok(mirror.is_some())
+}
+
+/// Exact filter select (`qsa_filter_select.hip`): sampled threshold, tiled
+/// candidate compaction, exact finish with in-kernel repair. Production knobs.
+const QSA_FILTER_SAMPLES: usize = 2048;
+const QSA_FILTER_TARGET: usize = 1024;
+const QSA_FILTER_CAP: usize = 4096;
+/// The kernels stage samples and candidates in LDS: neither may exceed 4096.
+const QSA_FILTER_MAX_SAMPLES: usize = 4096;
+const QSA_FILTER_MAX_CAP: usize = 4096;
+/// Blocks above which the filter replaces select-from-scores. It beats the
+/// hipcc select from 8192 blocks; against the PM select (gfx1151) only past
+/// the measured crossovers (Halo, per call: 1-16 rows PM 18.6 / 50.7 us vs
+/// filter 37 / 39 us at 8192 / 32768 blocks; 256 rows PM 0.26 / 1.15 ms vs
+/// filter 0.35 / 0.80 ms at 32768 / 65536 blocks).
+const QSA_FILTER_MIN_BLOCKS: usize = 4096;
+const QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS: usize = 24576;
+const QSA_FILTER_MIN_BLOCKS_PM: usize = 49152;
+/// Calls of at most this many rows (decode, verify) use the few-row crossover.
+const QSA_FILTER_FEW_ROWS: usize = 16;
+/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT` routes eager gfx11+ calls of more than
+/// [`qsa_filter_min_blocks`] blocks and at most
+/// [`QSA_SELECT_FROM_SCORES_MAX_BUDGET`] budget blocks through the filter
+/// trio instead of select-from-scores. Unset: on for exact gfx1151 (where it
+/// was measured), off elsewhere; `1` forces it on for any gfx11+, `0` is the
+/// kill switch. Read once.
+static QWEN4_QSA_FILTER_SELECT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+    match hipfire_config::process_value("HIPFIRE_QWEN4_QSA_FILTER_SELECT").as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+});
+
+#[derive(Clone, Copy, Debug)]
+struct QsaFilterCfg {
+    samples: usize,
+    target: usize,
+    cap: usize,
+}
+
+const QSA_FILTER_PRODUCTION: QsaFilterCfg = QsaFilterCfg {
+    samples: QSA_FILTER_SAMPLES,
+    target: QSA_FILTER_TARGET,
+    cap: QSA_FILTER_CAP,
+};
+
+fn qsa_filter_cfg_check(k: QsaFilterCfg) -> HipResult<()> {
+    if k.samples == 0
+        || k.samples > QSA_FILTER_MAX_SAMPLES
+        || k.target == 0
+        || k.cap == 0
+        || k.cap > QSA_FILTER_MAX_CAP
+    {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA filter knobs samples {} (1..={QSA_FILTER_MAX_SAMPLES}), target {} (>= 1), cap {} (1..={QSA_FILTER_MAX_CAP}) out of range",
+                k.samples, k.target, k.cap
+            ),
+        ));
+    }
+    checked_i32(k.target, "QSA filter target")?;
+    Ok(())
+}
+
+fn qsa_filter_min_blocks(rows: usize, pm_select: bool) -> usize {
+    match (pm_select, rows <= QSA_FILTER_FEW_ROWS) {
+        (false, _) => QSA_FILTER_MIN_BLOCKS,
+        (true, true) => QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS,
+        (true, false) => QSA_FILTER_MIN_BLOCKS_PM,
+    }
+}
+
+/// Production admission of the filter route for a call the score/select
+/// route already admitted: switch on (default: exact gfx1151), gfx11+ SIMT, eager, more than
+/// [`qsa_filter_min_blocks`] blocks for the select it replaces, budget within
+/// the select bound.
+fn qsa_filter_production(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    pm: QsaSelectPmArm,
+) -> Option<QsaFilterCfg> {
+    (QWEN4_QSA_FILTER_SELECT.unwrap_or(gpu.arch_caps.is_gfx1151())
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.block_count > qsa_filter_min_blocks(p.rows, pm.select())
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
+        && qsa_filter_score_group(p.block_count).is_some())
+        .then_some(QSA_FILTER_PRODUCTION)
+}
+
+/// Rows per group the candidate (`cap` u64 each) and control (16 B) scratch
+/// of a filter group keeps within [`QSA_SELECT_SCORE_SCRATCH_BYTES`].
+fn qsa_filter_group_limit(cap: usize) -> usize {
+    (QSA_SELECT_SCORE_SCRATCH_BYTES / (cap * 8 + 16) / 16 * 16).max(16)
+}
+
+/// Rows per filter group whose F32 scores fit [`QSA_SELECT_SCORE_SCRATCH_BYTES`]:
+/// a multiple of 16 when at least 16 rows fit, else 1; `None` when a single
+/// row's scores already exceed the budget (the filter route is declined).
+fn qsa_filter_score_group(stride: usize) -> Option<usize> {
+    let fit = QSA_SELECT_SCORE_SCRATCH_BYTES / stride.max(1).checked_mul(4)?;
+    match fit {
+        0 => None,
+        1..=15 => Some(1),
+        _ => Some(fit / 16 * 16),
+    }
+}
+
+fn qsa_filter_overflow() -> HipError {
+    HipError::new(0, "QSA filter scratch overflow")
+}
+
+fn qsa_filter_align(bytes: usize) -> HipResult<usize> {
+    bytes
+        .checked_add(255)
+        .map(|n| n & !255)
+        .ok_or_else(qsa_filter_overflow)
+}
+
+struct QsaFilterScratch {
+    scores: *mut std::ffi::c_void,
+    cand: *mut std::ffi::c_void,
+    ctl: *mut std::ffi::c_void,
+}
+
+/// One shared-scratch request holding `score_bytes` of scores, `group * cap`
+/// u64 candidates and `group` 16-byte control rows at 256-byte aligned
+/// offsets (the accessor counts F16 elements: bytes / 2).
+fn qsa_filter_scratch(
+    gpu: &mut Gpu,
+    score_bytes: usize,
+    group: usize,
+    cap: usize,
+) -> HipResult<QsaFilterScratch> {
+    let cand_off = qsa_filter_align(score_bytes)?;
+    let cand_bytes = group
+        .checked_mul(cap)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or_else(qsa_filter_overflow)?;
+    let ctl_off = cand_off
+        .checked_add(qsa_filter_align(cand_bytes)?)
+        .ok_or_else(qsa_filter_overflow)?;
+    let ctl_bytes = group.checked_mul(16).ok_or_else(qsa_filter_overflow)?;
+    let total = qsa_filter_align(ctl_off.checked_add(ctl_bytes).ok_or_else(qsa_filter_overflow)?)?;
+    checked_extent(total, "QSA filter scratch")?;
+    let base = gpu.qwen4_f16_x_scratch(total / 2)?.buf.as_ptr() as *mut u8;
+    // SAFETY: every offset is within the `total`-byte request just made.
+    unsafe {
+        Ok(QsaFilterScratch {
+            scores: base as *mut std::ffi::c_void,
+            cand: base.add(cand_off) as *mut std::ffi::c_void,
+            ctl: base.add(ctl_off) as *mut std::ffi::c_void,
+        })
+    }
+}
+
+fn qsa_filter_ensure_kernels(gpu: &mut Gpu) -> HipResult<()> {
+    for name in ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"] {
+        gpu.ensure_kernel_public("qsa_filter_select", crate::kernels::QSA_FILTER_SELECT_SRC, name)?;
+    }
+    Ok(())
+}
+
+/// One row group of the filter trio. `mirror` is null except for the last
+/// group of a call.
+struct QsaFilterTrio {
+    scores: *mut std::ffi::c_void,
+    ctl: *mut std::ffi::c_void,
+    cand: *mut std::ffi::c_void,
+    selected: *mut std::ffi::c_void,
+    mirror: *mut std::ffi::c_void,
+    stride: usize,
+    rows: usize,
+    block_count: usize,
+    budget: usize,
+    compress: usize,
+    position_start: usize,
+    capacity: usize,
+    knobs: QsaFilterCfg,
+}
+
+fn qsa_filter_launch(gpu: &mut Gpu, t: &QsaFilterTrio) -> HipResult<()> {
+    let rows = checked_i32(t.rows, "QSA filter rows")?;
+    let row_grid = checked_u32(t.rows, "QSA filter row grid")?;
+    let stride = checked_i32(t.stride, "QSA filter score stride")?;
+    let block_count = checked_i32(t.block_count, "QSA filter blocks")?;
+    let budget = checked_i32(t.budget, "QSA filter budget")?;
+    let compress = checked_i32(t.compress, "QSA filter compress")?;
+    let position_start = checked_i32(t.position_start, "QSA filter position")?;
+    let capacity = checked_i32(t.capacity, "QSA filter capacity")?;
+    let samples = checked_i32(t.knobs.samples, "QSA filter samples")?;
+    let target = checked_i32(t.knobs.target, "QSA filter target")?;
+    let cap = checked_i32(t.knobs.cap, "QSA filter cap")?;
+    let tiles = checked_u32(t.block_count.div_ceil(4096).max(1), "QSA filter tiles")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(t.scores);
+    args.push_i32(stride);
+    args.push_ptr(t.ctl);
+    for value in [rows, block_count, compress, position_start, samples, target, cap] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "qsa_filter_threshold",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    // Zero live blocks: no tile to compact (a zero grid is not launchable);
+    // the finish still writes the tail / sentinel slots and the stats.
+    if t.block_count > 0 {
+        let mut args = KernargBlob::new();
+        args.push_ptr(t.scores);
+        args.push_i32(stride);
+        args.push_ptr(t.ctl);
+        args.push_ptr(t.cand);
+        for value in [rows, block_count, compress, position_start, cap] {
+            args.push_i32(value);
+        }
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "qsa_filter_compact",
+            [tiles, row_grid, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+    }
+    let mut args = KernargBlob::new();
+    args.push_ptr(t.scores);
+    args.push_i32(stride);
+    args.push_ptr(t.ctl);
+    args.push_ptr(t.cand);
+    args.push_ptr(t.selected);
+    args.push_ptr(t.mirror);
+    for value in [rows, block_count, budget, compress, position_start, capacity, cap] {
+        args.push_i32(value);
+    }
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "qsa_filter_finish",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Downloads `rows` control rows `[threshold, count | repaired << 32]`
+/// (a host sync: labs only).
+fn qsa_filter_read_ctl(
+    gpu: &Gpu,
+    ctl: *mut std::ffi::c_void,
+    rows: usize,
+) -> HipResult<Vec<[u64; 2]>> {
+    let bytes = rows.checked_mul(16).ok_or_else(qsa_filter_overflow)?;
+    let view = GpuTensor {
+        // SAFETY: non-owning view of the `rows` control rows of the live scratch.
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ctl, bytes) },
+        shape: vec![bytes],
+        dtype: DType::Raw,
+    };
+    let raw = gpu.download_raw_bytes(&view)?;
+    Ok(raw
+        .chunks_exact(16)
+        .map(|c| {
+            [
+                u64::from_le_bytes(c[..8].try_into().unwrap()),
+                u64::from_le_bytes(c[8..].try_into().unwrap()),
+            ]
+        })
+        .collect())
+}
+
+/// Filter knobs of the lab entries; `Default` is the production constants.
+#[cfg(any(test, feature = "lab"))]
+#[derive(Clone, Copy, Debug)]
+pub struct QsaFilterKnobs {
+    pub samples: usize,
+    pub target: usize,
+    pub cap: usize,
+}
+
+#[cfg(any(test, feature = "lab"))]
+impl Default for QsaFilterKnobs {
+    fn default() -> Self {
+        Self {
+            samples: QSA_FILTER_SAMPLES,
+            target: QSA_FILTER_TARGET,
+            cap: QSA_FILTER_CAP,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "lab"))]
+impl QsaFilterKnobs {
+    fn cfg(self) -> QsaFilterCfg {
+        QsaFilterCfg { samples: self.samples, target: self.target, cap: self.cap }
+    }
+}
+
+/// Per-row outcome of the filter: the sampled threshold key, the number of
+/// keys at or above it, and whether the exact repair ran.
+#[cfg(any(test, feature = "lab"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QsaFilterRowStat {
+    pub threshold: u64,
+    pub count: u32,
+    pub repaired: bool,
+}
+
+#[cfg(any(test, feature = "lab"))]
+fn qsa_filter_stats(raw: Vec<[u64; 2]>) -> Vec<QsaFilterRowStat> {
+    raw.into_iter()
+        .map(|[threshold, flags]| QsaFilterRowStat {
+            threshold,
+            count: flags as u32,
+            repaired: flags >> 32 != 0,
+        })
+        .collect()
+}
+
+/// Frozen F32 score rows (`scores[row * score_stride + block]`) for the
+/// from-scores labs; the live-block bound of row `r` is
+/// `(position_start + r + 1) / compress` clamped by `block_count`.
+#[cfg(any(test, feature = "lab"))]
+#[derive(Clone, Copy)]
+pub struct QsaFromScores<'a> {
+    pub scores: &'a GpuTensor,
+    pub score_stride: usize,
+    pub selected: &'a GpuTensor,
+    pub rows: usize,
+    pub block_count: usize,
+    pub budget_blocks: usize,
+    pub compress: usize,
+    pub position_start: usize,
+    pub capacity: usize,
+}
+
+#[cfg(any(test, feature = "lab"))]
+fn qsa_from_scores_check(gpu: &Gpu, p: &QsaFromScores<'_>) -> HipResult<()> {
+    let wrong = || HipError::new(0, &ComputeError::WrongShape.to_string());
+    if !gpu.arch_caps.has_gfx11_plus_simt()
+        || gpu.replay.is_recording()
+        || gpu.graphs.capture_mode
+    {
+        return Err(HipError::new(0, "QSA select from scores: call not covered"));
+    }
+    ensure_f32(p.scores)?;
+    if p.selected.dtype != DType::Raw
+        || p.rows == 0
+        || p.compress == 0
+        || p.capacity == 0
+        || p.budget_blocks > QSA_SELECT_FROM_SCORES_MAX_BUDGET
+        || p.score_stride < p.block_count
+    {
+        return Err(wrong());
+    }
+    let score_need = if p.block_count == 0 {
+        0
+    } else {
+        checked_product(p.rows - 1, p.score_stride, "QSA from-scores rows")?
+            .checked_add(p.block_count)
+            .ok_or_else(wrong)?
+    };
+    let selected_bytes = checked_product(
+        checked_product(p.rows, p.capacity, "QSA from-scores selected")?,
+        std::mem::size_of::<i32>(),
+        "QSA from-scores selected",
+    )?;
+    let end_position = p.position_start.checked_add(p.rows).ok_or_else(wrong)?;
+    if end_position > i32::MAX as usize
+        || p.scores.numel() < score_need
+        || p.selected.numel() < selected_bytes
+    {
+        return Err(wrong());
+    }
+    checked_i32(p.rows, "QSA from-scores rows")?;
+    checked_u32(p.rows, "QSA from-scores row grid")?;
+    checked_i32(p.score_stride, "QSA from-scores stride")?;
+    checked_i32(p.block_count, "QSA from-scores blocks")?;
+    checked_i32(p.budget_blocks, "QSA from-scores budget")?;
+    checked_i32(p.compress, "QSA from-scores compress")?;
+    checked_i32(p.capacity, "QSA from-scores capacity")?;
+    Ok(())
+}
+
+/// Lab: the filter trio over frozen score rows, grouped by the candidate
+/// scratch; returns the per-row stats in row order. `mirror` receives the
+/// final row's selection, as on the live route.
+#[cfg(any(test, feature = "lab"))]
+pub fn qsa_filter_select_from_scores_lab(
+    gpu: &mut Gpu,
+    p: &QsaFromScores<'_>,
+    mirror: Option<&GpuTensor>,
+    knobs: QsaFilterKnobs,
+) -> HipResult<Vec<QsaFilterRowStat>> {
+    qsa_from_scores_check(gpu, p)?;
+    let cfg = knobs.cfg();
+    qsa_filter_cfg_check(cfg)?;
+    qsa_filter_ensure_kernels(gpu)?;
+    let mirror =
+        mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
+    let group = qsa_filter_group_limit(cfg.cap).min(p.rows);
+    let scratch = qsa_filter_scratch(gpu, 0, group, cfg.cap)?;
+    let mut raw = Vec::with_capacity(p.rows);
+    let mut g0 = 0usize;
+    while g0 < p.rows {
+        let n = group.min(p.rows - g0);
+        // SAFETY: `qsa_from_scores_check` bounded `(rows - 1) * stride + blocks`
+        // and `rows * capacity` by the tensors' extents.
+        let scores = unsafe {
+            (p.scores.buf.as_ptr() as *mut f32).add(g0 * p.score_stride) as *mut std::ffi::c_void
+        };
+        let selected = unsafe {
+            (p.selected.buf.as_ptr() as *mut i32).add(g0 * p.capacity) as *mut std::ffi::c_void
+        };
+        let last = g0 + n == p.rows;
+        qsa_filter_launch(
+            gpu,
+            &QsaFilterTrio {
+                scores,
+                ctl: scratch.ctl,
+                cand: scratch.cand,
+                selected,
+                mirror: mirror
+                    .filter(|_| last)
+                    .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()),
+                stride: p.score_stride,
+                rows: n,
+                block_count: p.block_count,
+                budget: p.budget_blocks,
+                compress: p.compress,
+                position_start: p.position_start + g0,
+                capacity: p.capacity,
+                knobs: cfg,
+            },
+        )?;
+        raw.extend(qsa_filter_read_ctl(gpu, scratch.ctl, n)?);
+        g0 += n;
+    }
+    Ok(qsa_filter_stats(raw))
+}
+
+/// Lab: the incumbent exact select-from-scores kernel over frozen score
+/// rows, the PM module (`pm`, gfx1151 only) or the hipcc kernel, same input
+/// and output contract as [`qsa_filter_select_from_scores_lab`].
+#[cfg(any(test, feature = "lab"))]
+pub fn qsa_incumbent_select_from_scores_lab(
+    gpu: &mut Gpu,
+    p: &QsaFromScores<'_>,
+    mirror: Option<&GpuTensor>,
+    pm: bool,
+) -> HipResult<()> {
+    qsa_from_scores_check(gpu, p)?;
+    if pm && (!gpu.arch_caps.is_gfx1151() || p.block_count > QSA_SELECT_PM_MAX_BLOCKS) {
+        return Err(HipError::new(0, "QSA incumbent PM select: call not covered"));
+    }
+    let kernel = if pm {
+        gpu.ensure_embedded_kernel(
+            "qsa_select_pm_gfx1151",
+            crate::kernels::QSA_SELECT_PM_GFX1151,
+            "indexed_attention_select_from_scores_pm_gfx1151",
+        )?;
+        "indexed_attention_select_from_scores_pm_gfx1151"
+    } else {
+        gpu.ensure_kernel_public(
+            "tensor_ops",
+            TENSOR_OPS_SRC,
+            "indexed_attention_select_from_scores",
+        )?;
+        "indexed_attention_select_from_scores"
+    };
+    let mirror =
+        mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.scores.buf.as_ptr());
+    args.push_i32(checked_i32(p.score_stride, "QSA from-scores stride")?);
+    args.push_ptr(p.selected.buf.as_ptr());
+    args.push_i32(checked_i32(p.rows, "QSA from-scores rows")?);
+    args.push_i32(checked_i32(p.block_count, "QSA from-scores blocks")?);
+    args.push_i32(checked_i32(p.budget_blocks, "QSA from-scores budget")?);
+    args.push_i32(checked_i32(p.compress, "QSA from-scores compress")?);
+    args.push_i32(checked_i32(p.position_start, "QSA from-scores position")?);
+    args.push_i32(checked_i32(p.capacity, "QSA from-scores capacity")?);
+    args.push_ptr(mirror.map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [checked_u32(p.rows, "QSA from-scores row grid")?, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Lab entry forcing the filter route (env and block minimum bypassed) with
+/// the production grouping and the PM score when `score_pm` and the PM pair
+/// covers the call, else the hipcc score; BF16 arenas need PM coverage.
+/// Returns whether the mirror was persisted and the per-row stats.
+#[cfg(any(test, feature = "lab"))]
+pub fn indexed_attention_select_batch_filter_arm(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    score_pm: bool,
+    knobs: QsaFilterKnobs,
+) -> HipResult<(bool, Vec<QsaFilterRowStat>)> {
+    qsa_select_batch_validate(p)?;
+    let live = gpu.arch_caps.has_gfx11_plus_simt()
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET;
+    if !live {
+        return Err(HipError::new(0, "QSA select filter arm: call not covered"));
+    }
+    let fits = qsa_select_pm_shape_fits(
+        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, gpu.route_rows(p.rows).max(p.rows),
+        p.index_heads, p.index_dim, p.block_count, p.query_row_stride, p.capacity,
+    );
+    let pm = if score_pm && fits { QsaSelectPmArm::ScoreOnly } else { QsaSelectPmArm::Hipcc };
+    if p.pooled.dtype == DType::BF16 && !pm.score() {
+        return Err(HipError::new(0, "QSA select BF16 requires PM score"));
+    }
+    let mut raw = Vec::with_capacity(p.rows);
+    let persisted =
+        indexed_attention_select_rows8_core(gpu, p, mirror, pm, Some(knobs.cfg()), Some(&mut raw))?;
+    Ok((persisted, qsa_filter_stats(raw)))
 }
 
 /// Device-side stable reuse of a prior MTP QSA selection row.
@@ -4451,11 +5118,13 @@ pub fn indexed_attention_attention(
             "indexed_attention_attention_f32",
             "indexed_attention_attention_fp8",
             "indexed_attention_attention_q8",
+            "indexed_attention_attention_fp8_fnuz",
         ]),
         p.format.kernel([
             "indexed_attention_attention_f32_serial",
             "indexed_attention_attention_fp8_serial",
             "indexed_attention_attention_q8_serial",
+            "indexed_attention_attention_fp8_fnuz_serial",
         ]),
     ];
     let (kernel_name, shared_mem) =
@@ -4550,7 +5219,7 @@ fn qsa_attention_hg4_lds_bytes(
     shape_selected: usize,
 ) -> Option<u32> {
     let group = p.n_heads / p.n_kv_heads;
-    if !gpu.arch_caps.has_gfx11_plus_simt()
+    if !gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
         || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
@@ -4724,7 +5393,7 @@ fn indexed_attention_attention_batch_arena(
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
     let hg12 = allow_fast
         && p.format == QsaKvFormat::F32
-        && gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && p.head_dim == 256
         && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
         && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
@@ -4748,6 +5417,7 @@ fn indexed_attention_attention_batch_arena(
                 "indexed_attention_attention_f32_batched_hg4",
                 "indexed_attention_attention_fp8_batched_hg4",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_fp8_fnuz_batched_hg4",
             ]),
             [
                 checked_u32(
@@ -4764,7 +5434,7 @@ fn indexed_attention_attention_batch_arena(
         let dim_grid = blocks(p.head_dim)?;
         match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
+                if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
                     && shape_selected > 0
                     // The kernel adds 32 bytes of static LDS (per-wave maxes).
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
@@ -4775,6 +5445,7 @@ fn indexed_attention_attention_batch_arena(
                         "indexed_attention_attention_f32_batched",
                         "indexed_attention_attention_fp8_batched",
                         "indexed_attention_attention_q8_batched",
+                        "indexed_attention_attention_fp8_fnuz_batched",
                     ]),
                     [head_grid, dim_grid, row_grid],
                     bytes as u32,
@@ -4785,6 +5456,7 @@ fn indexed_attention_attention_batch_arena(
                     "indexed_attention_attention_f32_batched_serial",
                     "indexed_attention_attention_fp8_batched_serial",
                     "indexed_attention_attention_q8_batched_serial",
+                    "indexed_attention_attention_fp8_fnuz_batched_serial",
                 ]),
                 [head_grid, dim_grid, row_grid],
                 0,
@@ -4951,6 +5623,7 @@ pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
             QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
             QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
             QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
+            QsaKvFormat::Fp8Fnuz => false,
         }
 }
 
@@ -5136,6 +5809,9 @@ fn qsa_gathered_wmma_launch_with(
             built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_kv_f16vb_fp8_pm_gfx1201"),
             built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_gathered_wmma_f16_pm_gfx1201"),
         ),
+        (QsaKvFormat::Fp8Fnuz, _) => {
+            return Err(HipError::new(0, "QSA fp8 FNUZ K/V has no gathered WMMA route"));
+        }
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
     // The persistent arena has no per-launch convert kernel to ensure.
@@ -5479,6 +6155,24 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_exact_selector_stays_gfx11_plus_only() {
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx1100"));
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            assert!(qsa_select_exact_arch(&caps), "{arch}");
+            assert!(caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        // gfx942 gets the parallel incumbent selector, never the mov_dpp8 one.
+        let gfx942 = crate::arch_caps::ArchCaps::new("gfx942", flags.clone());
+        assert!(gfx942.has_qwen4_parallel_qsa_gdn());
+        assert!(!qsa_select_exact_arch(&gfx942));
+        for arch in ["gfx940", "gfx941"] {
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            assert!(!qsa_select_exact_arch(&caps) && !caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+    }
 
     #[test]
     fn qsa_f16_arena_sizing_and_alignment() {
@@ -6561,25 +7255,34 @@ mod tests {
         }
     }
 
-    /// gfx1201's register-resident `gated_delta_step_pipe128_{f32,q8}` must
-    /// equal the persistent256 kernel byte for byte (output, final F32 state,
-    /// and the Q8 codes and scales), across the 256-row parameter-block
-    /// boundary and ragged row counts, on a nonzero random start state at a
-    /// nonzero position.  Both kernels are launched by name, so the
-    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 only.
+    /// The register-resident `gated_delta_step_pipe128_{f32,q8}` must equal
+    /// the persistent256 kernel byte for byte (output, final F32 state, and
+    /// the Q8 codes and scales), across the 256-row parameter-block boundary
+    /// and ragged row counts, on a nonzero random start state at a nonzero
+    /// position.  Both kernels are launched by name, so the
+    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 runs
+    /// the F32 and Q8 kernels over rows 1..=1000; gfx942 has only the F32
+    /// kernel (its persistent256 F32 arithmetic is `__fmaf_rn`-pinned) and
+    /// adds a 1536-row case.  Other archs skip.
     #[test]
     fn gdn_pipe128_is_bytewise_the_persistent256_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
-        if gpu.arch != "gfx1201" {
-            eprintln!("skip: gfx1201 only (arch {})", gpu.arch);
+        let is_gfx942 = gpu.arch == "gfx942";
+        if gpu.arch != "gfx1201" && !is_gfx942 {
+            eprintln!("skip: gfx1201 / gfx942 only (arch {})", gpu.arch);
             return;
         }
         let (key_heads, value_heads, dim) = (16usize, 48usize, 128usize);
-        let row_counts = [1usize, 2, 3, 255, 256, 257, 511, 513, 1000];
-        let max_rows = 1000usize;
+        let row_counts: &[usize] = if is_gfx942 {
+            &[1, 2, 3, 255, 256, 257, 511, 513, 1000, 1536]
+        } else {
+            &[1, 2, 3, 255, 256, 257, 511, 513, 1000]
+        };
+        let max_rows = *row_counts.last().expect("row counts");
+        let q8_arms: &[bool] = if is_gfx942 { &[false] } else { &[false, true] };
         let position = 37usize;
         let qk = key_heads * dim;
         let value = value_heads * dim;
@@ -6602,15 +7305,17 @@ mod tests {
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
-            &mut gpu,
-            "gdn_state_f32_to_q8",
-            state0_gpu.buf.as_ptr(),
-            slot0.buf.as_ptr(),
-            value_heads,
-            Some(7),
-        )
-        .expect("quantize");
+        if !is_gfx942 {
+            gdn_state_convert(
+                &mut gpu,
+                "gdn_state_f32_to_q8",
+                state0_gpu.buf.as_ptr(),
+                slot0.buf.as_ptr(),
+                value_heads,
+                Some(7),
+            )
+            .expect("quantize");
+        }
 
         let launch = |gpu: &mut Gpu,
                       kernel: &str,
@@ -6645,8 +7350,8 @@ mod tests {
             )
             .expect("launch");
         };
-        for &rows in &row_counts {
-            for q8 in [false, true] {
+        for &rows in row_counts {
+            for &q8 in q8_arms {
                 let fresh = |gpu: &mut Gpu| -> GpuTensor {
                     if q8 {
                         let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
@@ -8144,6 +8849,7 @@ mod tests {
         indexed_attention_select_batch(
             &mut gpu,
             &IndexedAttentionSelectBatch {
+                pooled_bf16: None,
                 query: &query_gpu,
                 pooled: &pooled_gpu,
                 selected: &selected_gpu,
@@ -8482,6 +9188,7 @@ mod tests {
             indexed_attention_select_batch(
                 gpu,
                 &IndexedAttentionSelectBatch {
+                    pooled_bf16: None,
                     query: &t.query,
                     pooled: &t.pooled,
                     selected: &t.selected,
@@ -9055,6 +9762,7 @@ mod tests {
             indexed_attention_select_batch(
                 gpu,
                 &IndexedAttentionSelectBatch {
+                    pooled_bf16: None,
                     query: &query_gpu,
                     pooled: &pooled_gpu,
                     selected: &selected,
@@ -9694,6 +10402,7 @@ mod tests {
         indexed_attention_select_batch(
             gpu,
             &IndexedAttentionSelectBatch {
+                pooled_bf16: None,
                 query: &query_gpu,
                 pooled: &pooled_gpu,
                 selected: &selected,
@@ -10213,18 +10922,21 @@ mod tests {
         gpu.free_tensor(norm).expect("free norm");
     }
 
-    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only;
-    /// q8: gfx11 and gfx12).
+    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12;
+    /// fp8 FNUZ: gfx942; q8: gfx11 and gfx12).
     fn quantized_qsa_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
         let mut formats = Vec::new();
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
             formats.push(QsaKvFormat::Fp8);
         }
+        if gpu.arch_caps.is_gfx942() {
+            formats.push(QsaKvFormat::Fp8Fnuz);
+        }
         if gpu.arch_caps.has_gfx11_plus_simt() {
             formats.push(QsaKvFormat::Q8);
         }
         if formats.is_empty() {
-            eprintln!("skip: quantized QSA K/V needs a gfx11 or gfx12 GPU");
+            eprintln!("skip: quantized QSA K/V needs a gfx11, gfx12 or gfx942 GPU");
         }
         formats
     }
@@ -10280,7 +10992,7 @@ mod tests {
             let base = token * row;
             for element in 0..kv_heads * head_dim {
                 values.push(match format {
-                    QsaKvFormat::Fp8 => {
+                    QsaKvFormat::Fp8 | QsaKvFormat::Fp8Fnuz => {
                         let scale = half(base + kv_heads * head_dim + element / head_dim * 2);
                         e4m3_to_f32(bytes[base + element]) * scale
                     }
@@ -10706,6 +11418,7 @@ mod tests {
                 indexed_attention_select_batch(
                     &mut gpu,
                     &IndexedAttentionSelectBatch {
+                        pooled_bf16: None,
                         query: &query_gpu,
                         pooled,
                         selected: &selected,
@@ -11113,6 +11826,7 @@ mod tests {
 
         fn params(&self) -> IndexedAttentionSelectBatch<'_> {
             IndexedAttentionSelectBatch {
+                pooled_bf16: None,
                 query: &self.query,
                 pooled: &self.pooled,
                 selected: &self.selected,
@@ -11358,6 +12072,7 @@ mod tests {
                         None => continue,
                     };
                     let p = IndexedAttentionSelectBatch {
+                        pooled_bf16: None,
                         query: &query_t,
                         pooled: &pooled,
                         selected: &selected,

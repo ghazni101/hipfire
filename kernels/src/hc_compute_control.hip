@@ -20,6 +20,9 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#ifndef HF_DEVICE_WAIT_DEADLINE_H
+#include "device_wait_deadline.h"
+#endif
 
 // Overridable so a wider-block variant can be built from the same source.
 // The finalize kernel's critical path is ONE block's full x_dim reduction:
@@ -156,6 +159,12 @@ extern "C" __global__ void hc_compute_control_vec4(
 // c must contain one extra F32 slot at c[n_ctrl], used as a u32 ticket. The
 // last workgroup resets it to zero before the kernel completes, so the buffer
 // is reusable by a retained tape.
+//
+// With rsqrt_once, rows 1..n_ctrl-1 wait for row 0's rsqrt. That wait is
+// bounded (device_wait_deadline.h) and sleeps between polls. On timeout the
+// row records it in `wait_block` (non-null whenever rsqrt_once is set) and
+// continues with the stale rsqrt slot. It still takes its ticket, so the
+// last workgroup restores `ready` and the ticket for the next launch.
 __launch_bounds__(THREADS_PER_BLOCK)
 extern "C" __global__ void HC_CTRL_FINALIZE_KERNEL(
     const float*  __restrict__ x_flat,
@@ -168,7 +177,8 @@ extern "C" __global__ void HC_CTRL_FINALIZE_KERNEL(
     float hc_eps,
     float post_scale,
     int sinkhorn_iters,
-    int rsqrt_once
+    int rsqrt_once,
+    hf_device_wait_block* __restrict__ wait_block
 ) {
     const int ctrl = blockIdx.x;
     if (ctrl >= n_ctrl) return;
@@ -231,8 +241,10 @@ extern "C" __global__ void HC_CTRL_FINALIZE_KERNEL(
                 __threadfence();
                 atomicExch(ready, 1u);
             } else {
-                while (atomicAdd(ready, 0u) == 0u) {
-                }
+                hf_bounded_wait(
+                    [&] { return atomicAdd(ready, 0u) != 0u; },
+                    wait_block, HF_WAIT_SITE_HC_CONTROL_RSQRT_ONCE,
+                    static_cast<unsigned int>(ctrl));
                 __threadfence();
                 rsqrt = *rsqrt_slot;
             }

@@ -256,5 +256,6 @@ pub fn drive<'a>(arch: Arch, bld: &mut Builder, body: &mut dyn FnMut(&mut Cx<'_>
         Arch::Gfx1151 => drive_t::<Gfx1151>(bld, body),
         Arch::Gfx1201 => drive_t::<Gfx1201>(bld, body),
         Arch::Gfx1100 => drive_t::<Gfx1100>(bld, body),
+        Arch::Gfx942 => Err("the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna".into()),
     }
 }

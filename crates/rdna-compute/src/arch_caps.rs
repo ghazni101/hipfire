@@ -460,6 +460,16 @@ impl ArchCaps {
     pub fn has_gfx11_plus_simt(&self) -> bool {
         self.has_gfx11_plus_simt
     }
+    /// Qwen4 named QSA score/select/attention routes and the persistent
+    /// batched GDN recurrence: every `has_gfx11_plus_simt` arch plus gfx942.
+    /// These kernels are wave-agnostic LDS/reduction bodies; gfx942 (wave64,
+    /// no gfx11 SIMT ISA, no WMMA) runs them. This is NOT a gfx11 ISA
+    /// capability: the exact `mov_dpp8` selector, WMMA/chunked GDN, and every
+    /// other `has_gfx11_plus_simt` caller stay RDNA-only. gfx940/gfx941 are
+    /// not admitted.
+    pub fn has_qwen4_parallel_qsa_gdn(&self) -> bool {
+        self.has_gfx11_plus_simt || self.is_gfx942
+    }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
     }
@@ -822,6 +832,30 @@ mod tests {
         }
         for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx942"] {
             assert!(!make_caps(arch).has_gfx11_plus_simt(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn qwen4_parallel_qsa_gdn_adds_gfx942_to_gfx11_plus_simt_only() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201", "gfx942",
+        ] {
+            assert!(make_caps(arch).has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx940", "gfx941"] {
+            assert!(!make_caps(arch).has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        // gfx942 gains only the parallel capability: the gfx11+ SIMT ISA
+        // (which the exact `mov_dpp8` selector and every other
+        // `has_gfx11_plus_simt` caller need) and WMMA stay RDNA-only.
+        let gfx942 = make_caps("gfx942");
+        assert!(!gfx942.has_gfx11_plus_simt());
+        assert!(!gfx942.has_wmma_w32());
+        assert!(!gfx942.has_wmma());
+        for arch in &["gfx1151", "gfx1201"] {
+            let caps = make_caps(arch);
+            assert!(caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
         }
     }
 

@@ -780,6 +780,13 @@ fn qwen35_tp2_vs_single_oracle() {
     }
     let peer = gpus.can_access_peer_all().expect("tp can_access_peer_all");
     if peer {
+        // As `load_model_tp_qwen35_dense`: the TP2 whole-token graph (gfx1100 /
+        // gfx1201, `HIPFIRE_TP_FULL_GRAPH`) prepares its signal tape before peer
+        // enable. `Ok(false)` touches nothing when it is not admitted.
+        let whole_token_graph = gpus
+            .prepare_tp2_whole_token_graph(global.n_layers * 2, global.dim * std::mem::size_of::<f32>())
+            .expect("tp prepare_tp2_whole_token_graph");
+        eprintln!("{TEST}: tp2 whole-token graph prepared={whole_token_graph}");
         assert!(
             gpus.enable_peer_all().expect("tp enable_peer_all"),
             "complete P2P topology must enable peers"
@@ -877,6 +884,10 @@ fn qwen35_tp2_vs_single_oracle() {
         let tp_logits = gpus.devices[0]
             .download_f32(&scratches[0].logits)
             .expect("tp logits");
+        // As the production decode loop: a bounded device wait that stopped
+        // on its deadline fails the step.
+        gpus.take_device_wait_errors()
+            .expect("tp device wait errors");
         assert_eq!(
             single_logits.len(),
             tp_logits.len(),

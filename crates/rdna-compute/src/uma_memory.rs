@@ -189,6 +189,51 @@ pub fn device_free_from(memory: DeviceMemory) -> Option<u64> {
     Some(memory.device_free.min(memory.host_available?))
 }
 
+/// Apply the emu capacity cap (EMU-DESIGN.md §3) to a raw `(free, total)`
+/// already clamped by [`device_free_from`]. Pure; `Gpu::device_mem_info` feeds
+/// it a ledger snapshot only while an emu profile is installed.
+///
+/// `used` is this process's managed charge (committed + pending), never
+/// `real_total - real_free`.
+///
+/// - Discrete: `total = device_bytes`,
+///   `free = min(raw_free, total - used.device)`.
+/// - UMA: `total = G` (the GTT limit),
+///   `free = min(raw_free, G - used.gtt, S - used.shared_host)`; a device
+///   backing also consumes GTT and shared bytes, so those two dimensions
+///   already include device charges.
+pub fn emu_capped_mem_info(
+    raw_free: u64,
+    snapshot: &hipfire_config::emu_budget::BudgetSnapshot,
+) -> (u64, u64) {
+    let limits = &snapshot.limits;
+    let used = |committed: u64, pending: u64| committed.saturating_add(pending);
+    let total = if limits.uma {
+        limits.gtt_bytes.unwrap_or(limits.device_bytes)
+    } else {
+        limits.device_bytes
+    };
+    let mut free = raw_free.min(limits.device_bytes.saturating_sub(used(
+        snapshot.committed.device_bytes,
+        snapshot.pending.device_bytes,
+    )));
+    if limits.uma {
+        if let Some(gtt) = limits.gtt_bytes {
+            free = free.min(gtt.saturating_sub(used(
+                snapshot.committed.gtt_bytes,
+                snapshot.pending.gtt_bytes,
+            )));
+        }
+        if let Some(shared) = limits.shared_host_bytes {
+            free = free.min(shared.saturating_sub(used(
+                snapshot.committed.shared_host_bytes,
+                snapshot.pending.shared_host_bytes,
+            )));
+        }
+    }
+    (free, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +414,113 @@ mod tests {
         // An unreadable TTM pool counts as empty.
         let no_pool = host_available_from(&host, 0, 0);
         assert_eq!(no_pool, Some(13_824 << 20));
+    }
+
+    mod emu_cap {
+        use super::*;
+        use hipfire_config::emu_budget::{BudgetLimits, BudgetSnapshot, BudgetUsage};
+
+        fn discrete(cap: u64, committed: u64, pending: u64) -> BudgetSnapshot {
+            BudgetSnapshot {
+                limits: BudgetLimits {
+                    device_bytes: cap,
+                    gtt_bytes: None,
+                    shared_host_bytes: None,
+                    uma: false,
+                },
+                committed: BudgetUsage {
+                    device_bytes: committed,
+                    ..Default::default()
+                },
+                pending: BudgetUsage {
+                    device_bytes: pending,
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn uma(g: u64, s: u64, committed: BudgetUsage, pending: BudgetUsage) -> BudgetSnapshot {
+            BudgetSnapshot {
+                limits: BudgetLimits {
+                    device_bytes: g,
+                    gtt_bytes: Some(g),
+                    shared_host_bytes: Some(s),
+                    uma: true,
+                },
+                committed,
+                pending,
+            }
+        }
+
+        #[test]
+        fn discrete_total_is_the_profile_capacity() {
+            let snap = discrete(16 * GIB, 0, 0);
+            assert_eq!(emu_capped_mem_info(32 * GIB, &snap), (16 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_free_subtracts_committed_and_pending() {
+            let snap = discrete(16 * GIB, 5 * GIB, 2 * GIB);
+            assert_eq!(emu_capped_mem_info(30 * GIB, &snap), (9 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_free_is_clamped_by_real_free() {
+            // Another process holds the card: real free is below the virtual room.
+            let snap = discrete(16 * GIB, GIB, 0);
+            assert_eq!(emu_capped_mem_info(3 * GIB, &snap), (3 * GIB, 16 * GIB));
+        }
+
+        #[test]
+        fn discrete_over_charge_saturates_to_zero() {
+            let snap = discrete(16 * GIB, 15 * GIB, 3 * GIB);
+            assert_eq!(emu_capped_mem_info(30 * GIB, &snap), (0, 16 * GIB));
+        }
+
+        #[test]
+        fn uma_total_is_g_and_free_is_min_of_gtt_and_shared_room() {
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let empty = uma(g, s, BudgetUsage::default(), BudgetUsage::default());
+            // Plenty of real memory: the GTT limit G binds.
+            assert_eq!(emu_capped_mem_info(100 * GIB, &empty), (g, g));
+            // 10 GiB of GTT-pinned host + 4 GiB device: gtt used 14, shared 14.
+            let used = BudgetUsage {
+                device_bytes: 4 * GIB,
+                host_bytes: 10 * GIB,
+                gtt_bytes: 14 * GIB,
+                shared_host_bytes: 14 * GIB,
+            };
+            let snap = uma(g, s, used, BudgetUsage::default());
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (2 * GIB, g));
+        }
+
+        #[test]
+        fn uma_shared_host_room_can_bind_before_gtt() {
+            // Userptr host-application bytes consume only shared-host room.
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let used = BudgetUsage {
+                device_bytes: 0,
+                host_bytes: 25 * GIB,
+                gtt_bytes: 0,
+                shared_host_bytes: 25 * GIB,
+            };
+            let snap = uma(g, s, used, BudgetUsage::default());
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (2 * GIB, g));
+        }
+
+        #[test]
+        fn uma_pending_reservations_participate_and_real_free_clamps() {
+            let (g, s) = (16 * GIB, 27 * GIB);
+            let pending = BudgetUsage {
+                device_bytes: 6 * GIB,
+                host_bytes: 0,
+                gtt_bytes: 6 * GIB,
+                shared_host_bytes: 6 * GIB,
+            };
+            let snap = uma(g, s, BudgetUsage::default(), pending);
+            assert_eq!(emu_capped_mem_info(100 * GIB, &snap), (10 * GIB, g));
+            // The existing UMA-safe real free (MemAvailable-clamped) still wins.
+            assert_eq!(emu_capped_mem_info(3 * GIB, &snap), (3 * GIB, g));
+        }
     }
 }

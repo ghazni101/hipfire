@@ -20,16 +20,64 @@ Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
 below. Branch-only model routes (for example LFM framing details) are not
 implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATION.md).
 
-## Security (no auth / no TLS)
+## Security (bearer authentication and HTTPS proxies)
 
-The native handler implements **no authentication and no TLS**.
-Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `127.0.0.1` (loopback only); set
-`serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
+The API key is **optional**. Without one, every route is unauthenticated
+(including on a non-loopback bind, where serve starts and prints one line
+recommending a key); anyone who can reach the bind address can call every
+endpoint, including chat completions. A key is **recommended** whenever you
+bind a non-loopback address. Configure `serve.api_key_file` (or
+`HIPFIRE_SERVE_API_KEY_FILE`), or pass `--api-key-file <absolute-path>`. Only
+the path is stored in configuration. Local CLI/TUI clients read the configured
+file automatically. Native Windows does not generate a key for you: create the
+file yourself.
 
-- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
-- Expose beyond localhost only behind a trusted network or an authenticated
-  TLS reverse proxy you control. Do not publish the raw port to the internet.
+The UTF-8 file must contain at least 32 bytes after trimming trailing whitespace.
+On Unix, group/other permissions are refused: use `chmod 600`. Windows ACLs are
+not checked yet; restrict access to the account running serve yourself.
+For example, create a private random token and persist its **path**, not its contents:
+
+```bash
+umask 077
+openssl rand -hex 32 > "$HOME/.hipfire/api-key"
+hipfire config set serve.api_key_file "$HOME/.hipfire/api-key"
+hipfire serve 127.0.0.1:11435        # key from serve.api_key_file
+```
+
+With a key configured, every route requires `Authorization: Bearer <key>`,
+except `/health`: without valid credentials it returns only minimal liveness
+and version, not process identity or model details. Authenticated `/health`
+retains detailed diagnostics. Missing/wrong credentials receive the same 401.
+The existing instance token identifies a process; it is not the API credential.
+
+Authentication runs before routing or request-body reads, including UI assets
+and `OPTIONS` requests. A 401 has an empty body and `WWW-Authenticate: Bearer`.
+The embedded UI cannot supply credentials and therefore receives 401 when a
+key is configured; browser pairing is not implemented. Without a key it works
+unchanged. Existing successful responses retain permissive CORS
+(`Access-Control-Allow-Origin: *`), but an unauthenticated preflight is
+refused when a key is configured. Native clients do not need CORS.
+
+Serve itself has **no TLS**. A bearer on plaintext HTTP can be intercepted.
+Use loopback behind verified HTTPS for remote access; never publish the raw
+port to the internet. Clients support `http://` and verified `https://` URLs
+(including proxy base paths), with no insecure-certificate fallback.
+
+### Tailscale Serve (tailnet-only HTTPS)
+
+Keep the backend bound to loopback, with bearer authentication enabled (recommended):
+
+```bash
+hipfire serve 127.0.0.1:11435 --api-key-file "$HOME/.hipfire/api-key"
+tailscale serve --bg http://127.0.0.1:11435
+```
+
+Use the HTTPS URL printed by Tailscale Serve and supply the same bearer to
+your client. Retain tailnet ACLs/grants as well as app authentication.
+Do **not** enable public Funnel by default. For a manual LAN proxy, use
+HTTPS with a trusted certificate and forward the Authorization header.
+The embedded browser UI does not provide credential pairing; use a
+bearer-capable API client for protected access.
 
 ## Start and stop
 
@@ -38,15 +86,15 @@ hipfire serve                         # foreground; Ctrl-C stops (default bind 1
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
-hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
+hipfire serve 0.0.0.0:11435 --api-key-file /absolute/private/key -d # key recommended on a non-loopback bind; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
 hipfire serve --spec off -d           # plain AR (no MTP/DFlash) for every load, e.g. an A/B
 hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memory.max_seq)
 
-hipfire ps                            # daemons / quantize / uploads + port state (Linux)
-hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
+hipfire ps                            # tracked process liveness + port state
+hipfire stop                          # tracked serve only: SIGTERM (Unix), graceful HTTP (Windows)
 # Forceful — inspect first (hipfire ps, curl /health):
 hipfire stop --force                  # also kill this install's untracked daemons (TERM, KILL after 5s)
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
@@ -60,15 +108,36 @@ process answering on the port, exits 1 with that reason. Readiness requires
 the `/health` `pid` to be the child it just spawned, and if the child exits
 early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
-**Forceful lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
-pid after ownership checks — use that by default. `--force`, `--all`, and
-`restart` also stop this install's other daemons: PIDs from the pidfile and
+**Forceful lifecycle flags (Unix).** Plain `hipfire stop` only SIGTERMs the
+tracked pid after ownership checks — use that by default. `--force`, `--all`,
+and `restart` also stop this install's other daemons: PIDs from the pidfile and
 the GPU lock, each verified by command line (this install's daemon binary)
 and matching `HIPFIRE_HOME`, sent SIGTERM and then SIGKILL after 5 s. They no
 longer kill processes by name or by port; if something else still holds the
 port, the CLI prints `port N is still in use by a process that is not this
 install's hipfire; not killing it`. `--all` also runs `pkill -f` against
 release quantize binaries.
+
+**Local management (Windows).** Windows has no signal `hipfire stop` can
+send, so each Windows serve process binds a separate `127.0.0.1` listener on
+an OS-assigned port. Only that listener accepts `POST /api/v1/shutdown`,
+authenticated with its own random 32-byte bearer credential. The inference
+listener never serves this route, including requests forwarded by a
+localhost reverse proxy. The management credential is separate from the
+public instance-identity token, which is not authorization. A Windows
+`serve.pid` stores `manage_port` and `manage_token` and inherits ACLs from the
+user's hipfire home. Keep it private: never share its contents or forward the
+management listener through a proxy. Unix serves bind no management listener
+and their `serve.pid` is unchanged.
+
+**Windows stop.** After checking image, creation time, and port ownership,
+`hipfire stop` sends the local management request and waits up to 35 seconds
+for exit. Shutdown cancels the existing token and drains inference requests
+for at most 30 seconds. If exit times out, the command reports an error rather
+than force-terminating the process. Old pid records without management fields
+require Ctrl-C and a restart with the updated CLI. Windows `--force` / `--all`
+do not reap daemons when ownership cannot be proven from process environment;
+the CLI explains this conservative skip and never kills by name or port.
 
 Flags (also accepted by `restart`). In detached mode (`-d`) the parent forwards
 these to the foreground child as CLI arguments; none of them is turned into an
@@ -78,6 +147,7 @@ environment variable.
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
 | `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
+| `--api-key-file <absolute-path>` | Protected UTF-8 bearer file; overrides `serve.api_key_file` for this process |
 | `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |
@@ -244,9 +314,10 @@ redirects to `/ui` only while the UI is enabled.
 
 The UI talks to the same `/v1/chat/completions` gateway as any other
 client and keeps chat history in the browser's IndexedDB — serve stores
-nothing on its behalf. Like every serve endpoint it is **unauthenticated**:
-binding a non-loopback host with the UI enabled prints a warning, since
-that makes the gateway reachable from any browser on the network.
+nothing on its behalf. It cannot send a bearer token: without
+`serve.api_key_file` it works as before (on loopback or any other bind), and on
+a keyed serve its assets and requests receive 401
+(see [Security](#security-bearer-authentication-and-https-proxies)).
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
 Agent / Pi custom-provider configuration, see
@@ -802,7 +873,11 @@ request run alone on the singleton route. **Default off, experimental.**
 - **Eligible requests:** greedy decoding, plain text chat only — no tools,
   images, logprobs or penalties. Ineligible requests keep the singleton route.
 - **Singleton when alone:** a request that is alone at dispatch runs the
-  unchanged singleton route (including native MTP).
+  unchanged singleton route (including native MTP). When a batched peer
+  queues behind it, a greedy singleton moves into a lane at its next
+  committed window boundary (promotion): into an MTP lane with its trunk,
+  head and draft states, or, with `serve.batch_spec = false`, into an AR lane
+  with its trunk state, continuing the AR singleton's text byte for byte.
 - **MTP lanes (default when the MTP head is loaded):** each lane runs its own
   native MTP window per step: a step-synchronous batched draft for every
   drafting lane, then one `(d+1)`-row verify per lane inside the shared lane
@@ -810,7 +885,7 @@ request run alone on the singleton route. **Default off, experimental.**
   drafts nothing, or that the floor retires, decodes one AR row per step.
   `serve.batch_spec = false` (`HIPFIRE_SERVE_BATCH_SPEC=0`) keeps the AR lanes
   of before (one token per lane per step). There is no per-lane session
-  cache, parking or promotion.
+  cache or parking.
 - **Per-lane AR floor:** each lane keeps the singleton's MTP floor (probe
   windows, sticky retirement, decayed per-depth costs), priced in AR-row
   units from a measured model of the shared step (an AR row costs its

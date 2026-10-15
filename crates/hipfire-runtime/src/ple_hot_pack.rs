@@ -69,6 +69,10 @@
 //!     -> Result<PleHotPackHeader, String>      // progress(rows_done, rows_total)
 //! ```
 //!
+//! On non-Unix hosts the two writers return an unsupported error before touching
+//! any file (they need O_DIRECT positional reads and positional writes); header
+//! reading and encoding are platform-independent.
+//!
 //! # Version 3: hot packs and PLE tables in one container
 //!
 //! The PLE row sidecars (`<model>.ple-q8`, `<model>.ple-q4`) are `HFPLEHP1` files of
@@ -105,15 +109,20 @@
 //! plus the offsets and the exact file length (data and rank bytes are not read).
 
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use crate::external_rows::RowEncoding;
-use crate::ple_hot_store::{
-    open_direct, AlignedBuf, PleHotRank, ShardRead, BUCKETS, READ_ALIGN, READ_CHUNK,
-};
+#[cfg(unix)]
+use crate::ple_hot_store::{open_direct, AlignedBuf, ShardRead, READ_ALIGN, READ_CHUNK};
+use crate::ple_hot_store::{PleHotRank, BUCKETS};
 
 pub const PACK_MAGIC: &[u8; 8] = b"HFPLEHP1";
 /// The newest container version (hot pack or ple-table).
@@ -134,9 +143,12 @@ const MAX_HEADER_BYTES: u64 = 16 << 20;
 /// The data section starts on this boundary.
 const DATA_ALIGN: u64 = 4096;
 /// A tier's output buffer is written out when it reaches this size.
+#[cfg(unix)]
 const FLUSH_BYTES: usize = 8 << 20;
 /// `tier_of` value of a bucket that is not kept.
+#[cfg(unix)]
 const NO_TIER: u8 = u8::MAX;
+#[cfg_attr(not(unix), allow(dead_code))]
 const GENERATOR: &str = "hipfire-quantize ple-hot-pack";
 
 /// What a `HFPLEHP1` file holds.
@@ -290,6 +302,7 @@ fn tier_count(kept_buckets: usize, tier_group: usize) -> usize {
     kept_buckets.div_ceil(tier_group)
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn json_header(h: &PleHotPackHeader) -> serde_json::Value {
     serde_json::json!({
         "version": HOT_PACK_VERSION,
@@ -313,6 +326,7 @@ fn json_header(h: &PleHotPackHeader) -> serde_json::Value {
 
 /// Serialise `header`, setting its `data_offset` to the fixed point of
 /// `round_up(16 + len(json(data_offset)), 4096)`.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn encode_header(header: &mut PleHotPackHeader) -> Result<Vec<u8>, String> {
     let mut candidate = DATA_ALIGN;
     loop {
@@ -971,10 +985,12 @@ fn check_table_fields(h: &PleHotPackHeader, total_rows: u64) -> Result<(), Strin
 // Writer
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// Model file read through O_DIRECT (or buffered where the filesystem refuses
 /// the flag).
 struct DirectRead(File);
 
+#[cfg(unix)]
 impl ShardRead for DirectRead {
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -1019,6 +1035,7 @@ pub fn write_ple_hot_pack(
 /// [`write_ple_hot_pack`] reporting `progress(rows_done, rows_total)` after
 /// every model window read.  The pack is written to `<out>.tmp.<pid>` and
 /// renamed into place after `sync_all`; the tmp file is removed on error.
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub fn write_ple_hot_pack_with_progress(
     model_path: &Path,
@@ -1055,8 +1072,32 @@ pub fn write_ple_hot_pack_with_progress(
     )
 }
 
+/// Unsupported off Unix: the writer reads the model with O_DIRECT positional
+/// reads and writes the pack with positional writes.  Fails before any file
+/// is opened, created or renamed.
+#[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
+pub fn write_ple_hot_pack_with_progress(
+    _model_path: &Path,
+    _shard_offsets: &[u64],
+    _rows_per_shard: usize,
+    _row_encoding: RowEncoding,
+    _row_width: usize,
+    _fingerprint_hex: &str,
+    _rank: &PleHotRank,
+    _kept_buckets: usize,
+    _tier_group: usize,
+    _out: &Path,
+    _progress: &mut dyn FnMut(u64, u64),
+) -> Result<PleHotPackHeader, String> {
+    Err("ple hot pack: writing a PLE hot pack is unsupported on Windows (it needs Unix \
+         O_DIRECT positional reads and positional writes); use a Unix host"
+        .to_string())
+}
+
 /// Writer core over any positional model reader (tests drive it with an
 /// in-memory model).
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_pack_with(
     reader: &dyn ShardRead,
@@ -1200,6 +1241,7 @@ pub(crate) fn write_pack_with(
     }
 }
 
+#[cfg(unix)]
 /// One tier's pending output.
 struct TierOut {
     buf: Vec<u8>,
@@ -1209,6 +1251,7 @@ struct TierOut {
     rows: u64,
 }
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn write_tmp(
     reader: &dyn ShardRead,
@@ -1460,7 +1503,7 @@ pub(crate) mod table_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::ple_hot_store::test_support::*;

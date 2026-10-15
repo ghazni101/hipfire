@@ -318,6 +318,10 @@ fn forward_ep_tp_graph(
             .map_err(|error| format!("ds4 TP{n} graph launch rank {rank}: {error:?}"))?;
     }
     sync_ep_ranks(gpus, &format!("ds4 TP{n} graph"))?;
+    // The graph's barriers are bounded device waits. A stalled rank leaves a
+    // timeout on its peers, so fail this token rather than return its logits.
+    gpus.take_device_wait_errors()
+        .map_err(|error| format!("ds4 TP{n} graph: {error}"))?;
     for state in state_per_rank.iter_mut() {
         state.n_tokens += 1;
     }

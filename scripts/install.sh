@@ -8,12 +8,15 @@
 # for exact-registry indexed kernels beside the installed daemon: the tag's
 # prebuilt release kernel pack when it verifies, local hipcc compilation otherwise.
 # Usage: curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
-# Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
+#   (default: the latest published release tag and its prebuilt kernel pack)
+# Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch master
 set -euo pipefail
 
 HIPFIRE_HOME="${HIPFIRE_HOME:-$HOME/.hipfire}"
 # Internal override for deterministic local-remote tests; default is the official repo.
 GITHUB_URL="${HIPFIRE_GITHUB_URL:-https://github.com/warpfront/hipfire.git}"
+# Internal override for tests; default is the official repo's latest-release endpoint.
+RELEASES_LATEST_API="${HIPFIRE_RELEASES_LATEST_API:-https://api.github.com/repos/warpfront/hipfire/releases/latest}"
 
 # Managed-source transaction state (curl|bash reusing $HIPFIRE_HOME/src).
 _TX_ARMED=0
@@ -178,9 +181,12 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --branch NAME              Install from branch NAME
+  --branch NAME              Install from branch NAME (e.g. master, beta)
   --ref REF                  Install from git ref REF (a tag also selects its kernel pack)
   --tag TAG                  Install from tag TAG and its prebuilt kernel pack
+                             (default: latest published release tag; master if the
+                             GitHub releases API is unreachable)
+  --print-selection          Print the resolved source selector and exit (no install)
   --commit SHA               Install from commit SHA
   --compile-kernels          Compile kernels locally with hipcc even when a kernel pack exists
   --kernel-pack-url URL      Directory or URL (https://, file://, path) holding the kernel pack
@@ -198,6 +204,7 @@ Bootstrap only initializes source and builds hipfire-cli, then execs:
   hipfire setup --source <repo> [original args...]
 
 Examples:
+  bash -s -- --tag v0.4.2.1
   bash -s -- --branch beta
   HIPFIRE_INSTALL_REF=beta bash install.sh --yes
 EOF
@@ -208,6 +215,7 @@ REF=""
 TAG=""
 COMMIT=""
 YES=0
+PRINT_SELECTION=0
 SELECTOR=""
 SELECTOR_KIND=""
 SELECTOR_COUNT=0
@@ -262,6 +270,10 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --strict-rocm|--compile-kernels)
+            shift
+            ;;
+        --print-selection)
+            PRINT_SELECTION=1
             shift
             ;;
         --yes|-y|--non-interactive)
@@ -357,6 +369,37 @@ validate_revision() {
     esac
 }
 
+# Resolve the latest published release tag via the GitHub releases API.
+# Prints the tag on success; returns non-zero on any failure (network, parse, unsafe tag).
+resolve_latest_tag() {
+    local body=""
+    if command -v curl >/dev/null 2>&1; then
+        body="$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "$RELEASES_LATEST_API" 2>/dev/null)" || body=""
+    fi
+    if [ -z "$body" ] && command -v wget >/dev/null 2>&1; then
+        body="$(wget -qO- --timeout=15 --header='Accept: application/vnd.github+json' "$RELEASES_LATEST_API" 2>/dev/null)" || body=""
+    fi
+    [ -n "$body" ] || return 1
+    local tag
+    tag="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)"
+    [[ "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || return 1
+    git check-ref-format "refs/tags/$tag" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$tag"
+}
+
+# Default selector when none was given: latest release tag, else master with a warning.
+select_default_source() {
+    local latest=""
+    if latest="$(resolve_latest_tag)"; then
+        SELECTOR="$latest"
+        SELECTOR_KIND="tag"
+    else
+        echo "WARNING: could not resolve the latest hipfire release from $RELEASES_LATEST_API; falling back to the master branch" >&2
+        SELECTOR="master"
+        SELECTOR_KIND="branch"
+    fi
+}
+
 # CLI selector wins; otherwise HIPFIRE_INSTALL_REF is generic --ref for automation.
 ENV_REF_APPLIED=0
 if [ "$SELECTOR_COUNT" -eq 0 ] && [ -n "${HIPFIRE_INSTALL_REF:-}" ]; then
@@ -379,25 +422,33 @@ fi
 
 if [ -f "$REPO_DIR/Cargo.toml" ]; then
     # Local checkout (including `hipfire update`): use as-is, never fetch/switch.
-    :
+    if [ "$PRINT_SELECTION" -eq 1 ]; then
+        echo "local $REPO_DIR"
+        exit 0
+    fi
 else
     # curl|bash path: managed install under $HIPFIRE_HOME/src
     REPO_DIR="$HIPFIRE_HOME/src"
 
     if [ -z "$SELECTOR" ]; then
+        select_default_source
         if [ "$YES" -eq 0 ] && [ -t 0 ]; then
-            printf 'Source channel [master/beta/<branch>] (master): '
+            printf 'Source [%s/master/beta/<branch>] (%s): ' "$SELECTOR" "$SELECTOR"
             read -r answer || true
-            answer="${answer:-master}"
-            SELECTOR="$answer"
-            SELECTOR_KIND="branch"
-        else
-            SELECTOR="master"
-            SELECTOR_KIND="branch"
+            if [ -n "${answer:-}" ] && [ "$answer" != "$SELECTOR" ]; then
+                SELECTOR="$answer"
+                SELECTOR_KIND="branch"
+            fi
         fi
         validate_revision "$SELECTOR" "$SELECTOR_KIND"
-        # Include the chosen/default branch in forwarded args for install metadata.
-        FORWARDED_ARGS=("--branch" "$SELECTOR" "${ORIGINAL_ARGS[@]}")
+        # Include the chosen/default selector in forwarded args so setup records it
+        # (a tag also selects that release's prebuilt kernel pack).
+        FORWARDED_ARGS=("--$SELECTOR_KIND" "$SELECTOR" "${ORIGINAL_ARGS[@]}")
+    fi
+
+    if [ "$PRINT_SELECTION" -eq 1 ]; then
+        echo "$SELECTOR_KIND $SELECTOR"
+        exit 0
     fi
 
     mkdir -p "$REPO_DIR"

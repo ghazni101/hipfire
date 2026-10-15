@@ -343,6 +343,12 @@ pub struct WeightPlacement {
     pub name: String,
     pub layer: Option<usize>,
     pub devices: Vec<usize>,
+    /// Declared shard policy of the source entry. The split-program planner
+    /// reads this to tell column, row, and replicated placements apart;
+    /// device placement alone cannot.
+    pub policy: ShardPolicy,
+    /// Declared logical (unsharded) tensor shape of the source entry.
+    pub logical_shape: Vec<usize>,
 }
 
 /// One ordered collective implied by one manifest operation.
@@ -715,6 +721,8 @@ pub fn plan_manifest(
             name: entry.name.clone(),
             layer: entry.layer,
             devices: placement_devices(entry, mesh, n_layers),
+            policy: entry.policy.clone(),
+            logical_shape: entry.logical_shape.clone(),
         })
         .collect();
     let state_placements = state

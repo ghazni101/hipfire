@@ -10,8 +10,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
-    OpenAiSseEvent,
+    complete_openai_chat, http_get_json, probe_host, service_ready, service_url,
+    stream_openai_chat, Engine, OpenAiSseEvent, ServiceEndpoint,
 };
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
@@ -38,7 +38,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
@@ -51,9 +51,12 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod emu;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
+mod process_identity;
+mod pull_select;
 mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
@@ -122,6 +125,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// SKU capacity emulation: list profiles, validate a profile, or estimate a target.
+    Emu(emu::EmuArgs),
     /// Measure this host's GPU share for a split offload step.
     OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
@@ -411,9 +416,46 @@ pub(crate) struct PullArgs {
     force: bool,
     /// Which PLE row sidecar a split model pulls next to its base: `auto`
     /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
-    /// `all`, or `none` (fetched on first load).
-    #[arg(long, value_enum, default_value_t = ple::PleSelection::Auto)]
-    ple: ple::PleSelection,
+    /// `all`, or `none` (fetched on first load). Omitted: asked on a terminal,
+    /// else `auto`.
+    #[arg(long, value_enum)]
+    ple: Option<ple::PleSelection>,
+    /// Fetch the registry's draft/MTP sidecars without asking (the default).
+    #[arg(long, overrides_with = "no_draft")]
+    draft: bool,
+    /// Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash).
+    #[arg(long, overrides_with = "draft")]
+    no_draft: bool,
+    /// Take the registry defaults without asking. A pull whose stdin is not a
+    /// terminal never asks either.
+    #[arg(short, long)]
+    yes: bool,
+}
+
+impl PullArgs {
+    /// A pull another command starts for a missing model: the requested tag
+    /// with the registry defaults, never a prompt.
+    pub(crate) fn defaults(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            force: false,
+            ple: None,
+            draft: false,
+            no_draft: false,
+            yes: true,
+        }
+    }
+
+    /// `--draft` / `--no-draft`; `None` when neither is given.
+    pub(crate) fn draft_flag(&self) -> Option<bool> {
+        if self.no_draft {
+            Some(false)
+        } else if self.draft {
+            Some(true)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -731,6 +773,11 @@ pub(crate) struct BenchArgs {
     /// no trimming). Mutually exclusive with positional PROMPT words.
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+    /// SKU capacity-emulation profile (`hipfire emu list`) or `off` for every
+    /// spawned bench daemon. Overrides `HIPFIRE_EMU`, including `off`. The host
+    /// still executes at full speed; only application memory capacity is capped.
+    #[arg(long, value_name = "ID|off")]
+    emu: Option<String>,
 }
 
 impl BenchArgs {
@@ -884,6 +931,11 @@ pub(crate) struct ServeArgs {
     /// Open the chat UI in the default browser once serving (implies --ui).
     #[arg(long)]
     open: bool,
+    /// Absolute path of a file holding the bearer token clients must present
+    /// (`Authorization: Bearer <token>`); overrides `serve.api_key_file`.
+    /// Optional; recommended when binding a non-loopback address.
+    #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = crate::serve::parse_api_key_file_arg)]
+    api_key_file: Option<PathBuf>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -910,17 +962,18 @@ pub(crate) struct Paths {
 }
 
 impl Paths {
-    fn discover() -> Self {
-        let config = ConfigPaths::discover();
+    /// A missing home directory is a clean CLI error, not a panic.
+    fn discover() -> Result<Self> {
+        let config = ConfigPaths::try_discover()?;
         let root = config.root.clone();
-        Self {
+        Ok(Self {
             models: config.models.clone(),
             registry: RegistryPaths {
                 cache: root.join("registry.cache.json"),
             },
             root,
             config,
-        }
+        })
     }
 }
 
@@ -942,6 +995,7 @@ fn run() -> Result<()> {
     // head -1`) like any Unix filter instead of panicking in `println!`.
     // Commands that drive a daemon, server or child over pipes keep Rust's
     // ignored SIGPIPE so a dead peer is an EPIPE error, not a silent exit.
+    #[cfg(unix)]
     if matches!(
         cli.command,
         Some(
@@ -956,7 +1010,7 @@ fn run() -> Result<()> {
         // SAFETY: restores the default disposition before any thread starts.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
-    let paths = Paths::discover();
+    let paths = Paths::discover()?;
     match cli.command {
         None => launch_tui(&paths, &[]),
         Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
@@ -970,6 +1024,7 @@ fn run() -> Result<()> {
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::Emu(args)) => emu::emu_command(&paths, args),
         Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
@@ -1991,6 +2046,34 @@ fn pull_with_overlay_pins(
     }
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
+    let flags = pull_select::PullFlags {
+        ple: args.ple,
+        draft: args.draft_flag(),
+        force: args.force,
+    };
+    let choice = if pull_select::is_interactive(io::stdin().is_terminal(), args.yes) {
+        let host = pull_select::HostFacts::detect(paths);
+        let present = |file: &str, size: Option<u64>| {
+            pull_select::file_present(&paths.models.join(file), size)
+        };
+        let context = pull_select::PullContext {
+            registry: &loaded.registry,
+            host: &host,
+            overlay_pins,
+            present: &present,
+        };
+        let mut prompt = pull_select::LinePrompt::new(io::stdin().lock(), io::stderr());
+        match pull_select::select_pull(&context, tag, entry, &flags, &mut prompt)? {
+            Some(choice) => choice,
+            None => {
+                eprintln!("Pull cancelled.");
+                return Ok(());
+            }
+        }
+    } else {
+        pull_select::PullChoice::defaults(tag, entry, &flags)
+    };
+    let (tag, entry) = (choice.tag, choice.entry);
     let destination = paths.models.join(&entry.file);
     let migrated = if args.force {
         None
@@ -2015,7 +2098,7 @@ fn pull_with_overlay_pins(
     };
     let ple_plan = entry
         .has_ple_sidecars()
-        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, args.ple, !needs_base));
+        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, choice.ple, !needs_base));
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -2053,21 +2136,21 @@ fn pull_with_overlay_pins(
             )?;
         }
     }
-    for (label, sidecar) in [
-        ("TriAttention", entry.triattn.as_ref()),
-        ("MTP", entry.mtp.as_ref()),
-        ("DSpark", entry.dspark.as_ref()),
-        ("DFlash", entry.dflash.as_ref()),
-        ("XDNA", entry.xdna.as_ref()),
-        ("Vision", entry.vision.as_ref()),
-        ("T5", entry.t5.as_ref()),
-        ("CLIP", entry.clip.as_ref()),
-        ("Qwen3", entry.qwen3.as_ref()),
-        ("VAE", entry.vae.as_ref()),
-    ] {
-        if let Some(sidecar) = sidecar {
-            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
+    for declared in pull_select::declared_sidecars(entry) {
+        if declared.spec && !choice.draft {
+            eprintln!(
+                "  Skipping {} sidecar (draft/MTP not selected): {}",
+                declared.label, declared.sidecar.file
+            );
+            continue;
         }
+        fetch_registry_sidecar(
+            declared.label,
+            &entry.repo,
+            declared.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     // The trunk overlay is not a registry field: the client carries its pin,
     // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
@@ -2557,14 +2640,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
             );
-            pull_command(
-                paths,
-                PullArgs {
-                    model: args.model.clone(),
-                    force: false,
-                    ple: ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(paths, PullArgs::defaults(args.model.clone()))?;
             // pull already verified either the downloaded canonical or legacy fallback.
             model_path = find_model_path(paths, registry, &args.model);
         }
@@ -2633,11 +2709,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     };
     let host = config_string(&resolved, "serve.host")?;
     let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let force_local = run_should_force_local(&args);
-    if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
+    if !force_local && service_ready(&endpoint, Duration::from_millis(150)) {
         return run_via_http(
-            &host,
-            port,
+            &endpoint,
             &args.model,
             &prompt,
             system_prompt.as_deref(),
@@ -2905,8 +2981,8 @@ fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
         let Ok(pid) = raw.trim().parse::<i32>() else {
             continue;
         };
-        // Safety: signal 0 only probes for existence and permission.
-        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+        let alive = process_identity::pid_signalable(pid);
+        if alive {
             live.push(pid);
         }
     }
@@ -3132,14 +3208,7 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
             );
-            pull_command(
-                paths,
-                PullArgs {
-                    model: args.model.clone(),
-                    force: false,
-                    ple: ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(paths, PullArgs::defaults(args.model.clone()))?;
             model_path = Some(paths.models.join(&entry.file));
         }
     }
@@ -3578,8 +3647,7 @@ fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String 
 
 #[allow(clippy::too_many_arguments)]
 fn run_via_http(
-    host: &str,
-    port: u16,
+    endpoint: &ServiceEndpoint,
     model: &str,
     prompt: &str,
     system: Option<&str>,
@@ -3616,7 +3684,7 @@ fn run_via_http(
         body["stream_options"] = serde_json::json!({"include_usage": true});
     }
     if json || no_stream {
-        let response = complete_openai_chat(host, port, body, timeout)?;
+        let response = complete_openai_chat(endpoint, body, timeout)?;
         let content = response
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -3651,8 +3719,7 @@ fn run_via_http(
     let mut tokens = None;
     let mut timings = serde_json::Value::Null;
     stream_openai_chat(
-        host,
-        port,
+        endpoint,
         body,
         timeout,
         |event| {
@@ -3686,6 +3753,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let model = args
         .model
         .unwrap_or(config_string(&resolved, "serve.default_model")?);
@@ -3706,7 +3774,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         }
     }
 
-    if !service_ready(&host, port, Duration::from_millis(150)) {
+    if !service_ready(&endpoint, Duration::from_millis(150)) {
         let serve_args = ServeArgs {
             positionals: vec![host.clone(), port.to_string()],
             model: None,
@@ -3725,10 +3793,10 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             foreground_child: false,
             ui: false,
             open: false,
+            api_key_file: None,
         };
         detach_serve(paths, &serve_args, &host, port)?;
     }
-    let client_host = probe_host(&host);
     eprintln!("Interactive chat with {model}. Commands: /clear, /exit");
     let mut messages = Vec::new();
     if let Some(system) = args.system {
@@ -3773,8 +3841,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         let mut assistant_reasoning = String::new();
         let mut assistant_content = String::new();
         let result = stream_openai_chat(
-            client_host,
-            port,
+            &endpoint,
             body,
             Duration::from_secs(60 * 60),
             |event| {
@@ -5684,86 +5751,60 @@ struct ProcessRecord {
     command: String,
 }
 
-fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
+fn scan_auxiliary_processes() -> Result<(Vec<ProcessRecord>, Vec<ProcessRecord>), String> {
+    let snapshots = process_identity::scan_processes(|command| {
+        command.contains("hf upload")
+            || command.contains("hipfire-quantize")
+            || command.contains("hipfire quantize")
+    })?;
     let mut quantize = Vec::new();
     let mut uploads = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return (quantize, uploads);
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == std::process::id() {
-            continue;
-        }
-        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let command = String::from_utf8_lossy(&raw)
-            .replace('\0', " ")
-            .trim()
-            .to_owned();
-        if command.is_empty() {
-            continue;
-        }
-        let rss_mb = fs::read_to_string(entry.path().join("status"))
-            .ok()
-            .and_then(|status| {
-                status.lines().find_map(|line| {
-                    line.strip_prefix("VmRSS:")?
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()
-                })
-            })
-            .unwrap_or(0)
-            / 1024;
+    for snapshot in snapshots {
         let record = ProcessRecord {
-            pid,
-            rss_mb,
-            command,
+            pid: snapshot.pid,
+            rss_mb: snapshot.rss_mb,
+            command: snapshot.command,
         };
         if record.command.contains("hf upload") {
             uploads.push(record);
-        } else if record.command.contains("hipfire-quantize")
-            || record.command.contains("hipfire quantize")
-        {
+        } else {
             quantize.push(record);
         }
     }
-    (quantize, uploads)
+    Ok((quantize, uploads))
 }
 
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
     let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = fs::read_to_string(&pid_path)
         .ok()
         .and_then(|raw| parse_pid_record(&raw));
     let pid = pid_record.as_ref().map(|record| record.pid);
-    let alive = pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
-    let health = http_get_json(&host, port, "/health");
-    let stats = http_get_json(&host, port, "/stats");
-    let (quantize, uploads) = scan_auxiliary_processes();
-    let report = serde_json::json!({
+    let alive = pid.is_some_and(process_identity::pid_alive);
+    let health = http_get_json(&endpoint, "/health", Duration::from_secs(1)).ok();
+    let stats = http_get_json(&endpoint, "/stats", Duration::from_secs(1)).ok();
+    let (quantize, uploads, auxiliary_unavailable) = match scan_auxiliary_processes() {
+        Ok((quantize, uploads)) => (quantize, uploads, None),
+        Err(reason) => (Vec::new(), Vec::new(), Some(reason)),
+    };
+    let mut report = serde_json::json!({
         "running": health.is_some(),
         "pid": pid,
-        "pid_record": pid_record,
+        "pid_record": pid_record.as_ref().map(ServePidRecord::to_public_json),
         "pid_alive": alive,
-        "endpoint": service_url(&host, port, ""),
+        "endpoint": service_url(&endpoint, ""),
         "health": health,
         "stats": stats,
         "quantize": quantize,
         "uploads": uploads,
     });
+    if let Some(reason) = &auxiliary_unavailable {
+        report["auxiliary_scan_unavailable"] = serde_json::json!(reason);
+    }
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report["running"].as_bool() == Some(true) {
@@ -5812,21 +5853,28 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             );
         }
     }
+    if !output.json {
+        if let Some(reason) = &auxiliary_unavailable {
+            println!("note: {reason}");
+        }
+    }
     Ok(())
 }
 
-pub(crate) fn http_get_json(host: &str, port: u16, path: &str) -> Option<serde_json::Value> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(1)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent.get(&service_url(host, port, path)).call().ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let text = response.body_mut().read_to_string().ok()?;
-    serde_json::from_str(&text).ok()
+pub(crate) fn local_service_endpoint(
+    resolved: &hipfire_config::ResolvedConfig,
+    host: &str,
+    port: u16,
+) -> Result<ServiceEndpoint> {
+    let key_path = config_string(resolved, "serve.api_key_file")?;
+    let bearer = if key_path.is_empty() {
+        None
+    } else {
+        Some(hipfire_config::secret::BearerToken::load(Path::new(
+            &key_path,
+        ))?)
+    };
+    Ok(ServiceEndpoint::local(host, port, bearer)?)
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -5928,6 +5976,9 @@ fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
 }
 
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+    // An explicit `--emu` is validated before anything else (model lookup, pull,
+    // daemon spawn): an unknown id or a UMA-knob conflict is a hard error here.
+    emu::preflight_bench(paths, args.emu.as_deref())?;
     if args.runs == 0 {
         bail!("--runs must be positive");
     }
@@ -6334,8 +6385,8 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// swap, so an overcommit is an OOM kill of the whole machine rather than a
 /// slow run. Checked between the two backends because that is precisely where
 /// a leaked first model would show up: if the slots engine did not actually
-/// release its weights, `MemAvailable` is still depressed here and this stops
-/// the sweep instead of taking the box down.
+/// release its weights, available physical memory is still depressed here and
+/// this stops the sweep instead of taking the box down.
 ///
 /// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
 /// process never initializes a GPU, so `auto` falls back to host swap state —
@@ -6355,16 +6406,12 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
         return Ok(());
     };
     let need = meta.len();
-    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+    // Available physical memory (`MemAvailable` on Linux); no host memory
+    // source means no check.
+    let Some(host) = hipfire_config::host_memory() else {
         return Ok(());
     };
-    let avail_kb = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let avail = avail_kb * 1024;
+    let avail = host.available_physical_bytes;
     // 20% headroom over the raw weight bytes for KV arenas and scratch.
     let want = need + need / 5;
     if avail < want {
@@ -6638,14 +6685,7 @@ fn open_bench_engine(
         .unwrap_or((None, None));
     let mut path = resolve_model_path(paths, &registry, &args.model)?;
     if path.is_none() && entry.is_some() {
-        pull_command(
-            paths,
-            PullArgs {
-                model: args.model.clone(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )?;
+        pull_command(paths, PullArgs::defaults(args.model.clone()))?;
         // Do not hash a payload twice after a verified pull.
         path = find_model_path(paths, &registry, &args.model);
     }
@@ -6687,6 +6727,13 @@ fn open_bench_engine(
         process_config
             .values
             .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
+    }
+    // `--emu` overrides HIPFIRE_EMU in this child's process snapshot (including
+    // `off`). Every bench arm (standard, matrix, ttft, concurrency, exp) opens its
+    // daemon here, so every spawned arm gets the same profile.
+    let effective_emu = emu::apply_cli_override(&mut process_config, args.emu.as_deref())?;
+    if let Some(line) = effective_emu.log_line() {
+        eprintln!("  {line}");
     }
     let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
@@ -7251,6 +7298,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
+            emu: None,
         };
         let (mut engine, _, _, _, _, _, _) =
             open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
@@ -7491,11 +7539,30 @@ fn ensure_update_not_interrupted() -> Result<()> {
     Ok(())
 }
 
+/// Why `hipfire update` cannot run on `os` (a `std::env::consts::OS` value);
+/// `None` where it is supported. Pure so the policy is testable on any host.
+fn update_unsupported_message(os: &str, version: &str) -> Option<String> {
+    match os {
+        "linux" => None,
+        "windows" => Some(format!(
+            "hipfire update is not available on Windows (installed hipfire {version}); no files were changed. \
+             Windows updates require re-running scripts/install.ps1 after stopping the engine. \
+             For current master run in PowerShell:\n\
+             iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)\n\
+             For a specific revision, use the reviewed, pinned install in docs/GETTING_STARTED.md."
+        )),
+        other => Some(format!(
+            "hipfire update is Linux-only (installed hipfire {version}, running on {other}); \
+             re-run the platform installer with a revision selector on this OS"
+        )),
+    }
+}
+
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!(
-            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
-        );
+    if let Some(message) =
+        update_unsupported_message(std::env::consts::OS, env!("CARGO_PKG_VERSION"))
+    {
+        bail!("{message}");
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -8540,7 +8607,13 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::json!(value)))
         .collect::<serde_json::Map<_, _>>();
-    let report = serde_json::json!({
+    // One DXGI query serves both the JSON and the text report. Failures stay
+    // as text so the report names them instead of showing an empty adapter list.
+    #[cfg(windows)]
+    let gpu_budget_query =
+        hipfire_config::host_memory::dxgi_adapter_budgets().map_err(|error| error.to_string());
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut report = serde_json::json!({
         "registry": registry_source(loaded_registry.source),
         "platform": platform,
         "hardware_probe": if cfg!(target_os = "linux") { "linux" } else { "limited" },
@@ -8557,7 +8630,18 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "config_format": format!("{:?}", loaded_config.format).to_lowercase(),
         "config_overrides": config_overrides,
         "warnings": loaded_registry.warnings,
+        "host_memory": hipfire_config::host_memory(),
     });
+    #[cfg(windows)]
+    {
+        report["gpu_memory_budget"] = gpu_memory_budget_json(
+            std::process::id(),
+            gpu_budget_query
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(String::as_str),
+        );
+    }
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -8654,8 +8738,148 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         } else if daemon.is_some() {
             println!("HIP probe:     failed (run the daemon directly for detailed startup errors)");
         }
+        #[cfg(windows)]
+        for line in gpu_memory_budget_text(
+            std::process::id(),
+            gpu_budget_query
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(String::as_str),
+        ) {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+/// Provenance of every figure in the diag DXGI section. These are budgets as
+/// seen by the calling process (the CLI), not an admission budget: the engine
+/// has to query DXGI itself from its own process before it admits a load.
+#[cfg(any(windows, test))]
+const GPU_MEMORY_BUDGET_SOURCE: &str = hipfire_config::host_memory::DXGI_BUDGET_SOURCE;
+
+#[cfg(any(windows, test))]
+fn dxgi_adapter_is_amd(adapter: &hipfire_config::host_memory::DxgiAdapterBudget) -> bool {
+    hipfire_config::host_memory::amd_adapters(std::slice::from_ref(adapter))
+        .next()
+        .is_some()
+}
+
+#[cfg(any(windows, test))]
+fn dxgi_luid_hex(luid: &[u8; 8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(16);
+    for &byte in luid {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    text
+}
+
+#[cfg(any(windows, test))]
+fn dxgi_mib_text(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// JSON for `hipfire diag --json` key `gpu_memory_budget`. `result` is the
+/// single DXGI query: the adapter list, or the failure rendered as text so a
+/// failed query is reported rather than shown as "no adapters".
+#[cfg(any(windows, test))]
+fn gpu_memory_budget_json(
+    pid: u32,
+    result: Result<&[hipfire_config::host_memory::DxgiAdapterBudget], &str>,
+) -> serde_json::Value {
+    let (adapters, error) = match result {
+        Ok(adapters) => (adapters, None),
+        Err(error) => (&[][..], Some(error)),
+    };
+    let adapters = adapters
+        .iter()
+        .map(|adapter| {
+            let mut entry = match serde_json::to_value(adapter) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return serde_json::json!({ "serialization_error": error.to_string() })
+                }
+            };
+            if let Some(map) = entry.as_object_mut() {
+                let amd = dxgi_adapter_is_amd(adapter);
+                map.insert("amd".into(), serde_json::json!(amd));
+                map.insert(
+                    "vendor_label".into(),
+                    serde_json::json!(if amd { "AMD" } else { "non-AMD" }),
+                );
+                map.insert(
+                    "luid_hex".into(),
+                    serde_json::json!(dxgi_luid_hex(&adapter.luid)),
+                );
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "source": GPU_MEMORY_BUDGET_SOURCE,
+        "calling_process_pid": pid,
+        "adapters": adapters,
+        "error": error,
+    })
+}
+
+/// Text lines for the "GPU memory budget (DXGI, this process)" diag section.
+#[cfg(any(windows, test))]
+fn gpu_memory_budget_text(
+    pid: u32,
+    result: Result<&[hipfire_config::host_memory::DxgiAdapterBudget], &str>,
+) -> Vec<String> {
+    let mut lines = vec![
+        "GPU memory budget (DXGI, this process):".to_string(),
+        format!(
+            "  source: {GPU_MEMORY_BUDGET_SOURCE}; calling process pid {pid}; \
+             not an admission budget"
+        ),
+    ];
+    match result {
+        Err(error) => lines.push(format!("  error: {error}")),
+        Ok([]) => lines
+            .push("  no hardware adapters reported (software adapters are skipped)".to_string()),
+        Ok(adapters) => {
+            for (index, adapter) in adapters.iter().enumerate() {
+                let label = if dxgi_adapter_is_amd(adapter) {
+                    "AMD"
+                } else {
+                    "non-AMD"
+                };
+                lines.push(format!(
+                    "  adapter {index}: {} [{label}]  vendor 0x{:04x}  device 0x{:04x}  \
+                     LUID {}  flags 0x{:x}  node {}",
+                    adapter.description,
+                    adapter.vendor_id,
+                    adapter.device_id,
+                    dxgi_luid_hex(&adapter.luid),
+                    adapter.flags,
+                    adapter.node_index,
+                ));
+                lines.push(format!(
+                    "    dedicated {}   shared {}",
+                    dxgi_mib_text(adapter.dedicated_video_memory_bytes),
+                    dxgi_mib_text(adapter.shared_system_memory_bytes),
+                ));
+                for (name, segment) in [
+                    ("local:", &adapter.local),
+                    ("non-local:", &adapter.non_local),
+                ] {
+                    lines.push(format!(
+                        "    {name:<10} budget {}  usage {}  available-for-reservation {}  reservation {}",
+                        dxgi_mib_text(segment.budget_bytes),
+                        dxgi_mib_text(segment.current_usage_bytes),
+                        dxgi_mib_text(segment.available_for_reservation_bytes),
+                        dxgi_mib_text(segment.current_reservation_bytes),
+                    ));
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
@@ -8795,52 +9019,39 @@ fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> 
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// The hipfire home a process runs under, read from its environment with the
-/// `ConfigPaths::discover` rule (`HIPFIRE_HOME`, else `$HOME/.hipfire`).
-/// `None` when the environment is unreadable (another user's process).
-fn process_hipfire_home(pid: u32) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let mut hipfire_home = None;
-    let mut home = None;
-    for var in environ.split(|byte| *byte == 0) {
-        if let Some(value) = var.strip_prefix(b"HIPFIRE_HOME=") {
-            hipfire_home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
-        } else if let Some(value) = var.strip_prefix(b"HOME=") {
-            home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
-        }
-    }
-    hipfire_home.or_else(|| home.map(|home| home.join(".hipfire")))
-}
-
-fn same_file_path(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// A live (non-zombie) process whose `argv[0]` is `daemon` (this install's
-/// daemon binary) and whose hipfire home is `root`.
+/// A process whose `argv[0]` is `daemon` (this install's daemon binary) and
+/// whose hipfire home is `root`. Linux only: other OSes cannot read another
+/// process's environment, so ownership is unprovable there.
+#[cfg(target_os = "linux")]
 fn is_install_daemon(pid: u32, daemon: &Path, root: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
-    !argv0.is_empty()
-        && same_file_path(Path::new(std::ffi::OsStr::from_bytes(argv0)), daemon)
-        && process_hipfire_home(pid).is_some_and(|home| same_file_path(&home, root))
+    process_identity::process_image_matches(pid, daemon)
+        && process_identity::process_hipfire_home(pid)
+            .is_some_and(|home| process_identity::same_file_path(&home, root))
 }
 
-fn process_gone(pid: u32) -> bool {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        // The state follows the parenthesised command name; `Z` is a zombie.
-        Ok(stat) => stat
-            .rsplit_once(") ")
-            .is_some_and(|(_, rest)| rest.starts_with('Z')),
-        Err(_) => true,
+/// Explanation for daemon candidates `stop --force` refuses to terminate on an
+/// OS that cannot prove a process's `HIPFIRE_HOME`: `matching` are live PIDs
+/// whose image is this install's daemon binary. `None` when there are none.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn unproven_reap_notice(root: &Path, matching: &[u32], windows: bool) -> Option<String> {
+    if matching.is_empty() {
+        return None;
     }
+    let pids = matching
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stop = if windows {
+        "stop it yourself after confirming it belongs to this install (e.g. `Stop-Process -Id <pid>`)"
+    } else {
+        "stop it yourself after confirming it belongs to this install"
+    };
+    Some(format!(
+        "not terminating daemon PID(s) {pids}: the image matches this install's daemon, but this OS \
+         cannot prove the process's HIPFIRE_HOME is {}, so it could belong to another install; {stop}",
+        root.display()
+    ))
 }
 
 /// PIDs this install may own a daemon under: the daemon pidfiles
@@ -8884,20 +9095,13 @@ fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
     for dir in &lock_dirs {
         scan(dir, "gpu-", ".lock", &mut candidates);
     }
-    if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
-        .ok()
-        .and_then(|raw| parse_pid_record(&raw))
+    #[cfg(target_os = "linux")]
     {
-        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", serve.pid)) {
-            for task in tasks.flatten() {
-                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
-                    candidates.extend(
-                        children
-                            .split_whitespace()
-                            .filter_map(|pid| pid.parse::<u32>().ok()),
-                    );
-                }
-            }
+        if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
+            .ok()
+            .and_then(|raw| parse_pid_record(&raw))
+        {
+            candidates.extend(process_identity::child_pids(serve.pid));
         }
     }
     candidates
@@ -8907,6 +9111,7 @@ fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
 /// its pidfiles/GPU locks whose `argv[0]` is this install's daemon binary and
 /// whose hipfire home is this home. SIGTERM, then SIGKILL after 5 s for the
 /// ones still running (re-verified first). Returns the signalled PIDs.
+#[cfg(target_os = "linux")]
 pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
     let Some(daemon) = find_daemon(paths) else {
         return Ok(Vec::new());
@@ -8921,17 +9126,45 @@ pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !targets.iter().all(|&pid| process_gone(pid)) {
+    while Instant::now() < deadline
+        && !targets
+            .iter()
+            .all(|&pid| process_identity::process_gone(pid))
+    {
         thread::sleep(Duration::from_millis(100));
     }
     for &pid in &targets {
-        if !process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
+        if !process_identity::process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
             eprintln!("daemon PID {pid} ignored SIGTERM for 5 s; sending SIGKILL");
             // SAFETY: as above, re-verified immediately before signalling.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
     }
     Ok(targets)
+}
+
+/// `stop --force` off Linux terminates nothing: a process's `HIPFIRE_HOME`
+/// cannot be proven here, and an image match alone may be another install's
+/// daemon. Live candidates matching this install's daemon image are reported
+/// with the reason instead.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
+    let Some(daemon) = find_daemon(paths) else {
+        return Ok(Vec::new());
+    };
+    let own = std::process::id();
+    let matching = install_daemon_candidates(paths)
+        .into_iter()
+        .filter(|&pid| {
+            pid != own
+                && process_identity::pid_alive(pid)
+                && process_identity::process_image_matches(pid, &daemon)
+        })
+        .collect::<Vec<_>>();
+    if let Some(notice) = unproven_reap_notice(&paths.root, &matching, cfg!(windows)) {
+        eprintln!("{notice}");
+    }
+    Ok(Vec::new())
 }
 
 /// Something accepts TCP connections on `host:port`.
@@ -8951,7 +9184,7 @@ fn serve_probe_port(paths: &Paths, configured: u16) -> u16 {
     fs::read_to_string(paths.root.join("serve.pid"))
         .ok()
         .and_then(|raw| parse_pid_record(&raw))
-        .filter(|record| Path::new(&format!("/proc/{}", record.pid)).exists())
+        .filter(|record| process_identity::pid_alive(record.pid))
         .and_then(|record| record.port)
         .unwrap_or(configured)
 }
@@ -9286,6 +9519,9 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::PathOrEmpty => {
             serde_json::json!({ "type": "string", "format": "existing-path-or-empty" })
         }
+        ValueRule::AbsolutePathOrEmpty => {
+            serde_json::json!({ "type": "string", "format": "absolute-path-or-empty" })
+        }
         ValueRule::Enum(values) => {
             serde_json::json!({ "type": "string", "enum": values })
         }
@@ -9351,6 +9587,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NonEmptyString => "nonempty-string",
         ValueRule::Host => "host",
         ValueRule::PathOrEmpty => "path-or-empty",
+        ValueRule::AbsolutePathOrEmpty => "absolute-path-or-empty",
         ValueRule::Enum(_) => "enum",
         ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
@@ -9447,6 +9684,110 @@ mod tests {
 
     use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
+
+    fn test_dxgi_adapter(
+        description: &str,
+        vendor_id: u32,
+        luid: [u8; 8],
+    ) -> hipfire_config::host_memory::DxgiAdapterBudget {
+        use hipfire_config::host_memory::{DxgiAdapterBudget, SegmentBudget};
+        DxgiAdapterBudget {
+            description: description.to_string(),
+            vendor_id,
+            device_id: 0x744c,
+            luid,
+            dedicated_video_memory_bytes: 8 * 1024 * 1024 * 1024,
+            shared_system_memory_bytes: 16 * 1024 * 1024 * 1024,
+            flags: 0,
+            source: GPU_MEMORY_BUDGET_SOURCE,
+            node_index: 0,
+            local: SegmentBudget {
+                budget_bytes: 7 * 1024 * 1024 * 1024,
+                current_usage_bytes: 1024 * 1024 * 1024,
+                available_for_reservation_bytes: 4 * 1024 * 1024 * 1024,
+                current_reservation_bytes: 512 * 1024 * 1024,
+            },
+            non_local: SegmentBudget {
+                budget_bytes: 15 * 1024 * 1024 * 1024,
+                current_usage_bytes: 2 * 1024 * 1024 * 1024,
+                available_for_reservation_bytes: 8 * 1024 * 1024 * 1024,
+                current_reservation_bytes: 256 * 1024 * 1024,
+            },
+        }
+    }
+
+    #[test]
+    fn gpu_memory_budget_json_marks_amd_and_non_amd_adapters() {
+        let adapters = vec![
+            test_dxgi_adapter("AMD Radeon", 0x1002, [1, 0, 0, 0, 0, 0, 0, 0]),
+            test_dxgi_adapter("Other GPU", 0x10de, [2, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let json = gpu_memory_budget_json(4242, Ok(&adapters));
+        assert_eq!(json["source"], GPU_MEMORY_BUDGET_SOURCE);
+        assert_eq!(json["calling_process_pid"], 4242);
+        assert!(json["error"].is_null());
+        let listed = json["adapters"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["amd"], true);
+        assert_eq!(listed[0]["vendor_label"], "AMD");
+        assert_eq!(listed[0]["description"], "AMD Radeon");
+        assert_eq!(listed[0]["luid_hex"], "0100000000000000");
+        assert_eq!(
+            listed[0]["local"]["budget_bytes"],
+            7u64 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            listed[0]["non_local"]["current_reservation_bytes"],
+            256u64 * 1024 * 1024
+        );
+        assert_eq!(listed[1]["amd"], false);
+        assert_eq!(listed[1]["vendor_label"], "non-AMD");
+    }
+
+    #[test]
+    fn gpu_memory_budget_json_reports_error_and_empty_explicitly() {
+        let failed = gpu_memory_budget_json(7, Err("CreateDXGIFactory1 failed: 0x887A0004"));
+        assert_eq!(failed["error"], "CreateDXGIFactory1 failed: 0x887A0004");
+        assert_eq!(failed["adapters"].as_array().unwrap().len(), 0);
+        assert_eq!(failed["calling_process_pid"], 7);
+        let empty = gpu_memory_budget_json(7, Ok(&[]));
+        assert!(empty["error"].is_null());
+        assert_eq!(empty["adapters"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn gpu_memory_budget_text_lists_every_segment_field() {
+        let adapters = vec![
+            test_dxgi_adapter("AMD Radeon", 0x1002, [1, 0, 0, 0, 0, 0, 0, 0]),
+            test_dxgi_adapter("Other GPU", 0x10de, [2, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let text = gpu_memory_budget_text(4242, Ok(&adapters)).join("\n");
+        assert!(text.starts_with("GPU memory budget (DXGI, this process)"));
+        assert!(text.contains("pid 4242"));
+        assert!(text.contains("not an admission budget"));
+        assert!(text.contains("AMD Radeon [AMD]"));
+        assert!(text.contains("Other GPU [non-AMD]"));
+        assert!(text.contains("dedicated 8192.0 MiB"));
+        assert!(text.contains("shared 16384.0 MiB"));
+        assert!(text.contains("non-local:"));
+        assert!(text.contains("budget 7168.0 MiB"));
+        assert!(text.contains("usage 1024.0 MiB"));
+        assert!(text.contains("available-for-reservation 4096.0 MiB"));
+        assert!(text.contains("reservation 512.0 MiB"));
+        assert!(text.contains("budget 15360.0 MiB"));
+        assert!(text.contains("reservation 256.0 MiB"));
+    }
+
+    #[test]
+    fn gpu_memory_budget_text_reports_error_and_empty_explicitly() {
+        let failed = gpu_memory_budget_text(7, Err("QueryVideoMemoryInfo failed")).join("\n");
+        assert!(failed.starts_with("GPU memory budget (DXGI, this process)"));
+        assert!(failed.contains("error: QueryVideoMemoryInfo failed"));
+        let empty = gpu_memory_budget_text(7, Ok(&[])).join("\n");
+        assert!(empty.contains("no hardware adapters reported"));
+        assert!(empty.contains("software adapters are skipped"));
+    }
+
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9681,6 +10022,32 @@ mod tests {
         // A missing root is empty, not a panic.
         let _ = std::fs::remove_dir_all(&paths.root);
         assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    #[test]
+    fn update_policy_is_linux_only_with_windows_guidance() {
+        assert_eq!(update_unsupported_message("linux", "0.4.3"), None);
+        let windows = update_unsupported_message("windows", "0.4.3").unwrap();
+        assert!(windows.contains("hipfire 0.4.3"));
+        assert!(windows.contains("no files were changed"));
+        assert!(windows.contains(
+            "iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)"
+        ));
+        let other = update_unsupported_message("macos", "0.4.3").unwrap();
+        assert!(other.contains("Linux-only") && other.contains("0.4.3") && other.contains("macos"));
+    }
+
+    #[test]
+    fn unproven_reap_notice_names_pids_and_refuses_to_kill() {
+        let root = Path::new("/h/.hipfire");
+        assert_eq!(unproven_reap_notice(root, &[], true), None);
+        let notice = unproven_reap_notice(root, &[11, 22], true).unwrap();
+        assert!(notice.contains("11, 22"));
+        assert!(notice.contains("not terminating"));
+        assert!(notice.contains("HIPFIRE_HOME"));
+        assert!(notice.contains("Stop-Process"));
+        let unix = unproven_reap_notice(root, &[5], false).unwrap();
+        assert!(!unix.contains("Stop-Process"));
     }
 
     /// The recommendation a user pins: a singleton when one format was measured,
@@ -14176,15 +14543,25 @@ mod tests {
     #[cfg(unix)]
     impl Task11HttpHarness {
         fn spawn(label: &str) -> Self {
-            Self::spawn_inner(label, false, Duration::from_millis(0))
+            Self::spawn_inner(label, false, Duration::from_millis(0), None)
         }
 
         /// Retry-enabled variant for the Task 15 one-retry scenarios.
         fn spawn_with_retry(label: &str, retry_backoff: Duration) -> Self {
-            Self::spawn_inner(label, true, retry_backoff)
+            Self::spawn_inner(label, true, retry_backoff, None)
         }
 
-        fn spawn_inner(label: &str, retry_enabled: bool, retry_backoff: Duration) -> Self {
+        /// Keyed server: every route but the minimal `/health` needs `api_key`.
+        fn spawn_with_api_key(label: &str, api_key: hipfire_config::secret::BearerToken) -> Self {
+            Self::spawn_inner(label, false, Duration::from_millis(0), Some(api_key))
+        }
+
+        fn spawn_inner(
+            label: &str,
+            retry_enabled: bool,
+            retry_backoff: Duration,
+            api_key: Option<hipfire_config::secret::BearerToken>,
+        ) -> Self {
             let paths = test_paths(label);
             fs::create_dir_all(&paths.models).unwrap();
             fs::create_dir_all(&paths.root).unwrap();
@@ -14296,6 +14673,7 @@ mod tests {
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
                 ui_enabled: false,
+                api_key,
             });
 
             let std_listener =
@@ -14332,15 +14710,16 @@ mod tests {
             });
 
             // Health probe — proves production Hyper service path is live.
+            let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
+                if hipfire_client::service_ready(&endpoint, Duration::from_millis(200)) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(
-                hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(500)),
+                hipfire_client::service_ready(&endpoint, Duration::from_millis(500)),
                 "task11 harness never became ready on port {port}"
             );
 
@@ -14446,6 +14825,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inference_router_cannot_shutdown_serve() {
+        let harness = Task11HttpHarness::spawn("management-isolation");
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let response = agent
+            .post(&format!(
+                "http://127.0.0.1:{}/api/v1/shutdown",
+                harness.port()
+            ))
+            .header("Authorization", "Bearer unrelated-management-token")
+            .send_empty()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404);
+        assert!(!harness.shutdown.is_cancelled());
+        assert_eq!(serve_health(harness.port()).0, 200);
+    }
+
     // ── 0.4.0 serve lifecycle: max_tokens fit, respawn, request policy ──
 
     #[cfg(unix)]
@@ -14474,6 +14875,200 @@ mod tests {
             .and_then(|start| serde_json::from_str(&text[start..]).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, json, text)
+    }
+
+    /// Writes an owner-only API key file; returns its path and the token text.
+    #[cfg(unix)]
+    fn write_test_api_key(label: &str) -> (PathBuf, String) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "hipfire-auth-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.key");
+        let token = format!("hipfire-auth-test-token-{label}-0123456789abcdef");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(format!("{token}\n").as_bytes()).unwrap();
+        (path, token)
+    }
+
+    /// One request with an optional raw `Authorization` header value; returns
+    /// the status, the `WWW-Authenticate` challenge, and the body text.
+    #[cfg(unix)]
+    fn auth_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> (u16, Option<String>, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut request = ureq::http::Request::builder()
+            .method(method)
+            .uri(format!("http://127.0.0.1:{port}{path}"))
+            .header("Content-Type", "application/json");
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let body = if method == "POST" {
+            body.to_owned()
+        } else {
+            String::new()
+        };
+        let mut response = agent
+            .run(request.body(body).unwrap())
+            .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+        let status = response.status().as_u16();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        (status, challenge, text)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_api_key_gates_every_route_and_redacts_public_health() {
+        let (key_path, token) = write_test_api_key("gate");
+        let bearer = hipfire_config::secret::BearerToken::load(&key_path).unwrap();
+        let h = Task11HttpHarness::spawn_with_api_key("api-key-gate", bearer);
+        let port = h.port();
+        let chat = h.base_body("t11-stop-text", false).to_string();
+        let good = format!("Bearer {token}");
+        let lower = format!("bearer {token}");
+        let wrong = format!("Bearer {token}x");
+        let basic = format!("Basic {token}");
+        let debug = format!("{:?}", h.shared.api_key);
+        assert!(!debug.contains(&token), "{debug}");
+
+        // Unauthenticated and wrong-credential /health: status and version only.
+        for credential in [None, Some(wrong.as_str())] {
+            let (status, challenge, text) = auth_call(port, "GET", "/health", credential, "");
+            assert_eq!(status, 200, "{text}");
+            assert_eq!(challenge, None);
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 2, "{text}");
+            assert_eq!(json["status"], crate::serve::EngineState::Up.as_str());
+            assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+            assert!(!text.contains(&token), "{text}");
+        }
+
+        // Every other route, including the UI namespace and unknown paths,
+        // answers one uniform 401 whatever the credential defect.
+        let routes = [
+            ("GET", "/stats"),
+            ("GET", "/metrics"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/messages"),
+            ("POST", "/v1/responses"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/v1/images/generations"),
+            ("POST", "/v1/systemone"),
+            ("GET", "/ui"),
+            ("GET", "/"),
+            ("GET", "/no-such-route"),
+            ("OPTIONS", "/v1/chat/completions"),
+            ("POST", "/health"),
+            ("GET", "/config"),
+        ];
+        for (method, path) in routes {
+            let mut bodies = Vec::new();
+            for credential in [
+                None,
+                Some(wrong.as_str()),
+                Some(basic.as_str()),
+                Some("Bearer"),
+            ] {
+                let (status, challenge, text) = auth_call(port, method, path, credential, &chat);
+                assert_eq!(status, 401, "{method} {path} {credential:?}: {text}");
+                assert_eq!(challenge.as_deref(), Some("Bearer"), "{method} {path}");
+                assert!(text.is_empty(), "{method} {path}: {text}");
+                assert!(!text.contains(&token), "{method} {path}: {text}");
+                bodies.push(text);
+            }
+            assert!(
+                bodies.windows(2).all(|pair| pair[0] == pair[1]),
+                "{method} {path} 401 bodies differ: {bodies:?}"
+            );
+        }
+        // Reject before waiting for the advertised body or applying its limit.
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            socket,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999\r\n\r\n"
+        ).unwrap();
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(socket), &mut status_line)
+            .unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 401"), "{status_line}");
+        let log = h.read_requests_log();
+        assert!(Task11HttpHarness::ops_of_type(&log, "generate").is_empty());
+        assert!(Task11HttpHarness::ops_of_type(&log, "load").is_empty());
+
+        // The right token (scheme is case-insensitive) opens the routes.
+        for credential in [good.as_str(), lower.as_str()] {
+            for path in ["/stats", "/metrics", "/v1/models"] {
+                let (status, challenge, text) = auth_call(port, "GET", path, Some(credential), "");
+                assert_eq!(status, 200, "{path}: {text}");
+                assert_eq!(challenge, None);
+            }
+        }
+        let (status, _, text) = auth_call(port, "POST", "/v1/chat/completions", Some(&good), &chat);
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains(&token), "{text}");
+
+        // Authenticated /health keeps the full payload; its instance token is
+        // a different secret from the API key.
+        let (status, _, text) = auth_call(port, "GET", "/health", Some(&good), "");
+        assert_eq!(status, 200, "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(json["pid"].is_u64(), "{text}");
+        assert!(json["capabilities"].is_object(), "{text}");
+        assert_ne!(json["token"], serde_json::json!(token));
+        assert!(!text.contains(&token), "{text}");
+
+        // Keyed preflight is gated too; authenticated native clients can use it.
+        let (status, _, text) = auth_call(port, "OPTIONS", "/v1/chat/completions", Some(&good), "");
+        assert_eq!(status, 204, "{text}");
+
+        let _ = fs::remove_dir_all(key_path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_without_api_key_keeps_routes_and_full_health_open() {
+        let h = Task11HttpHarness::spawn("api-key-none");
+        let port = h.port();
+        for credential in [None, Some("Bearer ignored-by-a-keyless-server")] {
+            let (status, challenge, text) = auth_call(port, "GET", "/stats", credential, "");
+            assert_eq!(status, 200, "{text}");
+            assert_eq!(challenge, None);
+        }
+        let health = serve_health(port).1;
+        assert!(health["pid"].is_u64(), "{health}");
+        assert!(health["capabilities"].is_object(), "{health}");
+        let (status, _, text) = post_status(port, &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
     }
 
     /// An omitted max_tokens (config default 4096 against the fake's 4096
@@ -14912,8 +15507,7 @@ mod tests {
     ) -> std::result::Result<StreamCapture, hipfire_client::ClientError> {
         let mut cap = StreamCapture::default();
         stream_openai_chat(
-            "127.0.0.1",
-            port,
+            &ServiceEndpoint::local("127.0.0.1", port, None)?,
             body,
             Duration::from_secs(10),
             |event| {
@@ -14949,7 +15543,11 @@ mod tests {
         port: u16,
         body: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, hipfire_client::ClientError> {
-        complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
+        complete_openai_chat(
+            &ServiceEndpoint::local("127.0.0.1", port, None)?,
+            body,
+            Duration::from_secs(10),
+        )
     }
 
     /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
@@ -16499,6 +17097,7 @@ mod tests {
             temperature: None,
             prompt,
             prompt_file,
+            emu: None,
         }
     }
 
@@ -17669,15 +18268,7 @@ mod tests {
         let (base, handle) = tiny_http_server(files);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         // Pull should download base + both heads
-        pull_command(
-            &paths,
-            PullArgs {
-                model: "test-model".into(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )
-        .unwrap();
+        pull_command(&paths, PullArgs::defaults("test-model")).unwrap();
         assert_eq!(
             fs::read(paths.models.join("test-model.mq4")).unwrap(),
             base_content
@@ -17741,15 +18332,7 @@ mod tests {
         let (base, handle) = tiny_http_server(files);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         // Without --force, stale should still be detected and refreshed
-        pull_command(
-            &paths,
-            PullArgs {
-                model: "test-model".into(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )
-        .unwrap();
+        pull_command(&paths, PullArgs::defaults("test-model")).unwrap();
         assert_eq!(
             fs::read(paths.models.join("test-model.mq4")).unwrap(),
             fresh
@@ -18443,9 +19026,8 @@ mod tests {
             pull_command(
                 &paths,
                 PullArgs {
-                    model: "split-model".into(),
-                    force: false,
-                    ple: selection,
+                    ple: Some(selection),
+                    ..PullArgs::defaults("split-model")
                 },
             )
             .unwrap();
@@ -18486,9 +19068,8 @@ mod tests {
         let error = pull_command(
             &paths,
             PullArgs {
-                model: "split-model".into(),
-                force: false,
-                ple: ple::PleSelection::Q8,
+                ple: Some(ple::PleSelection::Q8),
+                ..PullArgs::defaults("split-model")
             },
         )
         .unwrap_err();
@@ -18499,6 +19080,53 @@ mod tests {
             "a failed verification must not leave the sidecar installed"
         );
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_fetches_draft_sidecars_by_default_and_skips_them_with_no_draft() {
+        const BASE: &[u8] = b"draft-base";
+        const MTP: &[u8] = b"mtp-head";
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let raw = format!(
+            r#"{{"schema_version":1,"generated_at":"2099-01-01T00:00:00Z","models":{{
+                "draft-model":{{"repo":"test/repo","file":"draft-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "mtp":{{"file":"draft-model.mtp","sha256":"{}","size_bytes":{}}}}}
+            }},"aliases":{{}}}}"#,
+            ple_sha(BASE),
+            BASE.len(),
+            ple_sha(MTP),
+            MTP.len()
+        );
+        for (index, no_draft) in [false, true].into_iter().enumerate() {
+            let paths = test_paths(&format!("draft-pull-{index}"));
+            write_test_registry_cache(&paths, &raw);
+            let mut files = std::collections::HashMap::new();
+            files.insert("draft-model.mq4".to_owned(), BASE.to_vec());
+            if !no_draft {
+                files.insert("draft-model.mtp".to_owned(), MTP.to_vec());
+            }
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            pull_command(
+                &paths,
+                PullArgs {
+                    no_draft,
+                    ..PullArgs::defaults("draft-model")
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS
+                .with(|count| assert_eq!(count.get(), if no_draft { 1 } else { 2 }));
+            assert_eq!(
+                fs::read(paths.models.join("draft-model.mtp")).ok(),
+                (!no_draft).then(|| MTP.to_vec())
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
     }
 
     #[test]
@@ -18806,9 +19434,8 @@ mod tests {
         pull_with_overlay_pins(
             paths,
             PullArgs {
-                model: "overlay-model".into(),
                 force,
-                ple: ple::PleSelection::Auto,
+                ..PullArgs::defaults("overlay-model")
             },
             &overlay_pins(),
         )

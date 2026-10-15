@@ -263,10 +263,11 @@ pub fn auto_vram_reserve(
         .ok_or_else(|| overflow(context.max_seq))?;
     let measured_context = trunk(config.qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, qsa_format))
         .ok_or_else(|| overflow(AUTO_VRAM_RESERVE_MAX_SEQ))?;
-    // BF-1's extra storage must fit through the admitted context, including
-    // on UMA VMM loads that otherwise charge only the first mapped chunk.
-    // Do not subtract it with the historical (arena-off) measured layout.
-    let arena = if qsa_layout.f16_arena {
+    // The derived arenas' (BF-1 F16 K/V, pooled BF16 mirror) extra storage
+    // must fit through the admitted context, including on UMA VMM loads that
+    // otherwise charge only the first mapped chunk. Do not subtract it with
+    // the historical (arena-off) measured layout.
+    let arena = if qsa_layout.f16_arena || qsa_layout.pooled_bf16 {
         let capacity = crate::Qwen4ContextCommit { tokens: context.max_seq, ..*context };
         let plain = capacity.committed_layer_bytes(config, qsa_format)
             .ok_or_else(|| overflow(context.max_seq))?;
@@ -715,6 +716,38 @@ mod tests {
                 262148 * layout.f16_arena_bytes_per_token(2, 256) * config.n_full_layers()
             };
             assert_eq!(with - plain, extra as u64);
+        }
+    }
+
+    #[test]
+    fn pooled_bf16_reserve_covers_full_capacity_even_with_vmm() {
+        use hipfire_runtime::kv_backend::{
+            KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+        };
+        let config = crate::config::compact_test_config();
+        let layout = rdna_compute::tensor_ops::QsaStateLayout {
+            pooled_bf16: true, ..rdna_compute::tensor_ops::QsaStateLayout::F32
+        };
+        let blocks = 262145usize.div_ceil(4);
+        let block_bytes = layout.pooled_bf16_bytes_per_block(128);
+        for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
+            let context = crate::Qwen4ContextCommit::new(backend, 262145, 8192, 2 << 20);
+            let plain = auto_vram_reserve(&config, &context, 8192, Full, F32, None, None).unwrap();
+            let with = auto_vram_reserve(&config, &context, 8192, Full, layout, None, None).unwrap();
+            let per_layer = if backend == crate::Qwen4KvBackend::Vmm {
+                KvChunkPlan::new(
+                    block_bytes,
+                    blocks,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    2 << 20,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .and_then(|plan| plan.mapped_bytes_for_tokens(blocks))
+                .unwrap()
+            } else {
+                blocks * block_bytes
+            };
+            assert_eq!(with - plain, (per_layer * config.n_full_layers()) as u64);
         }
     }
 

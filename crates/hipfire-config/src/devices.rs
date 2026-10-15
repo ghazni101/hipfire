@@ -348,6 +348,114 @@ pub fn enumerate_gpus(nodes_dir: &Path) -> Result<Vec<GpuDevice>> {
     Ok(devices)
 }
 
+/// Why CU masking is refused on RDNA devices.
+pub const RDNA_CU_MASK_BAN: &str = "CU masking is refused on RDNA (gfx10/gfx11/gfx12): on 2026-10-14 a CU-masked queue probe hung the R9700 (gfx1201) MES scheduler, forced mode1 resets and took the host down; it stays banned until a safe method is approved.";
+
+/// True iff `device_name` is an RDNA ISA name: `gfx` followed by a four-digit
+/// number starting with `1` (gfx10xx/gfx11xx/gfx12xx). A `:feature` suffix and
+/// ASCII case are ignored.
+#[must_use]
+pub fn cu_mask_refused_on(device_name: &str) -> bool {
+    let base = device_name.split(':').next().unwrap_or("");
+    let Some(digits) = base
+        .get(..3)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("gfx"))
+        .map(|_| &base[3..])
+    else {
+        return false;
+    };
+    digits.len() == 4 && digits.starts_with('1') && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// ROCr's process-wide CU affinity mask.
+pub const HSA_CU_MASK: &str = "HSA_CU_MASK";
+/// ROCclr/HIP's global CU affinity mask.
+pub const ROC_GLOBAL_CU_MASK: &str = "ROC_GLOBAL_CU_MASK";
+
+/// `gfx_target_version` of every GPU node (SIMDs > 0) in a KFD topology
+/// directory, in node order. `None` when the topology cannot be read in full,
+/// so callers can fail closed.
+pub fn kfd_gpu_gfx_target_versions(nodes_dir: &Path) -> Option<Vec<u32>> {
+    let mut nodes = fs::read_dir(nodes_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    nodes.sort_unstable();
+    let mut versions = Vec::new();
+    for node in nodes {
+        let text = fs::read_to_string(nodes_dir.join(node.to_string()).join("properties")).ok()?;
+        let property = |name: &str| {
+            text.lines().find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.trim().parse::<u64>().ok())?
+            })
+        };
+        if property("simd_count").unwrap_or(0) == 0 {
+            continue;
+        }
+        versions.push(u32::try_from(property("gfx_target_version")?).ok()?);
+    }
+    Some(versions)
+}
+
+/// Pure decision of [`cu_mask_env_guard`]. An env var counts as set when it is
+/// present and non-empty after trimming. `gpu_gfx_target_versions` is
+/// `major*10000 + minor*100 + stepping` per GPU node (`None`: topology
+/// unreadable). With a mask variable set, any RDNA device (major >= 10), an
+/// unreadable topology or an empty GPU list is refused: the caller cannot
+/// prove that no RDNA device is visible. Only all-major-9 (GCN/CDNA) passes.
+pub fn cu_mask_env_decision(
+    hsa_cu_mask: Option<&str>,
+    roc_global_cu_mask: Option<&str>,
+    gpu_gfx_target_versions: Option<&[u32]>,
+) -> std::result::Result<(), String> {
+    let set = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    let mut names = Vec::new();
+    if set(hsa_cu_mask) {
+        names.push(HSA_CU_MASK);
+    }
+    if set(roc_global_cu_mask) {
+        names.push(ROC_GLOBAL_CU_MASK);
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    let names = names.join(" / ");
+    let reason = match gpu_gfx_target_versions {
+        None | Some([]) => "cannot prove no RDNA device is visible (KFD topology unreadable or lists no GPU)".to_owned(),
+        Some(versions) => {
+            let rdna = versions
+                .iter()
+                .filter(|&&version| version / 10000 >= 10)
+                .map(|&version| gfx_name(u64::from(version)))
+                .collect::<Vec<_>>();
+            if rdna.is_empty() {
+                return Ok(());
+            }
+            format!("RDNA device(s) present: {}", rdna.join(", "))
+        }
+    };
+    Err(format!("{names} set but refused: {reason}. {RDNA_CU_MASK_BAN}"))
+}
+
+/// Process-start guard: refuse a set `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` when
+/// any RDNA GPU may be visible. Reads the REAL process environment (ROCr reads
+/// the real environment, not hipfire's config snapshot) and every GPU node of
+/// the KFD topology. It deliberately does not honour `ROCR_VISIBLE_DEVICES`: a
+/// filter is not trusted to hide an RDNA card from a mask the runtime would
+/// apply. Call it before any ROCr/HIP library is loaded.
+pub fn cu_mask_env_guard() -> std::result::Result<(), String> {
+    let read = |name: &str| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
+    let hsa = read(HSA_CU_MASK);
+    let roc = read(ROC_GLOBAL_CU_MASK);
+    let is_set = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    if !is_set(&hsa) && !is_set(&roc) {
+        return Ok(());
+    }
+    let versions = kfd_gpu_gfx_target_versions(Path::new(KFD_TOPOLOGY_NODES));
+    cu_mask_env_decision(hsa.as_deref(), roc.as_deref(), versions.as_deref())
+}
+
 /// Parse HIP's `GPU-<hex>` UUID spelling: ROCr's 16 ASCII hex digits, or the
 /// raw 16 UUID bytes as 32 hex digits. All zeros means no UUID.
 fn parse_hip_uuid(value: &str) -> Option<u128> {
@@ -1443,6 +1551,76 @@ mod tests {
         assert_eq!(gfx_name(110501), "gfx1151");
         assert_eq!(override_arch("9.0.10").as_deref(), Some("gfx90a"));
         assert_eq!(override_arch("11.0"), None);
+    }
+
+    #[test]
+    fn cu_mask_refused_on_is_exactly_rdna_gfx1x() {
+        for name in [
+            "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+            "gfx1201:xnack-", "GFX1100", "gfx1100:sramecc+:xnack-",
+        ] {
+            assert!(cu_mask_refused_on(name), "{name} must be refused");
+        }
+        for name in [
+            "gfx906", "gfx908", "gfx90a", "gfx940", "gfx942", "gfx950",
+            "gfx942:sramecc+:xnack-", "gfx90a:xnack+", "", "gfx", "gfx1", "gfx12010", "x1100",
+        ] {
+            assert!(!cu_mask_refused_on(name), "{name} must not be refused");
+        }
+    }
+
+    #[test]
+    fn cu_mask_env_unset_or_blank_is_ok_on_any_hardware() {
+        assert_eq!(cu_mask_env_decision(None, None, Some(&[120001])), Ok(()));
+        assert_eq!(cu_mask_env_decision(None, None, None), Ok(()));
+        assert_eq!(
+            cu_mask_env_decision(Some("  \t"), Some(""), Some(&[120001, 110501])),
+            Ok(())
+        );
+        assert_eq!(cu_mask_env_decision(Some(" "), None, None), Ok(()));
+    }
+
+    #[test]
+    fn cu_mask_env_set_on_rdna_is_refused() {
+        let message = cu_mask_env_decision(Some("0x1"), None, Some(&[120001])).unwrap_err();
+        assert!(message.contains("HSA_CU_MASK"), "{message}");
+        assert!(!message.contains("ROC_GLOBAL_CU_MASK"), "{message}");
+        assert!(message.contains("gfx1201"), "{message}");
+        assert!(message.contains("2026-10-14"), "{message}");
+        assert!(message.contains(RDNA_CU_MASK_BAN), "{message}");
+        let message =
+            cu_mask_env_decision(None, Some("0x1"), Some(&[110501, 110000])).unwrap_err();
+        assert!(message.contains("ROC_GLOBAL_CU_MASK"), "{message}");
+        assert!(message.contains("gfx1151"), "{message}");
+        assert!(cu_mask_env_decision(Some("1"), Some("1"), Some(&[100300])).is_err());
+        // One RDNA card among CDNA cards is enough.
+        assert!(cu_mask_env_decision(Some("1"), None, Some(&[90402, 100300])).is_err());
+    }
+
+    #[test]
+    fn cu_mask_env_set_on_cdna_only_is_ok() {
+        for versions in [&[90402][..], &[90010, 90500, 90008][..]] {
+            assert_eq!(cu_mask_env_decision(Some("0x1"), None, Some(versions)), Ok(()));
+            assert_eq!(cu_mask_env_decision(None, Some("0x1"), Some(versions)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn cu_mask_env_set_without_topology_proof_is_refused() {
+        for versions in [None, Some(&[][..])] {
+            let message = cu_mask_env_decision(Some("0x1"), None, versions).unwrap_err();
+            assert!(message.contains("cannot prove no RDNA device is visible"), "{message}");
+            assert!(message.contains("2026-10-14"), "{message}");
+        }
+    }
+
+    #[test]
+    fn kfd_gpu_versions_skip_cpu_nodes_and_fail_closed() {
+        let host = hipx();
+        let mut versions = kfd_gpu_gfx_target_versions(&host.0).unwrap();
+        versions.sort_unstable();
+        assert_eq!(versions, [100100, 100300, 110000, 110501]);
+        assert_eq!(kfd_gpu_gfx_target_versions(&host.0.join("absent")), None);
     }
 
     #[test]

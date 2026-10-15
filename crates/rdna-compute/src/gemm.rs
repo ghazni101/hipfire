@@ -47558,7 +47558,12 @@ impl Gpu {
         experts: usize,
         grouped_rows: usize,
     ) -> HipResult<()> {
-        self.qwen4_moe_sym_arch("moe_scatter_stable_top10")?;
+        // gfx942 reaches the stable scatter from the sealed FP8 grouped route
+        // (not the symmetric IU4 route), so only the other arches take the
+        // symmetric-IU4 arch refusal.
+        if self.arch != "gfx942" {
+            self.qwen4_moe_sym_arch("moe_scatter_stable_top10")?;
+        }
         if total_slots == 0
             || experts == 0
             || experts > 1024

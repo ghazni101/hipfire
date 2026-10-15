@@ -78,10 +78,18 @@
 //! payload padded_rows bytes, one bucket per global PLE row (0 = hottest)
 //! ```
 
+// Outside Unix the store cannot be constructed: its pack reads, `posix_fadvise`
+// advice, `mincore` residency view and `O_DIRECT` model reads have no
+// implementation here, so the constructors and the worker chain are gated and
+// what only they use is dead code.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -150,6 +158,15 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[usize::from(byte & 15)] as char);
     }
     out
+}
+
+/// The error text of a hot-row store path that needs Unix-only file I/O.
+#[cfg(not(unix))]
+fn unsupported(what: &str) -> String {
+    format!(
+        "{TAG}: {what} is unsupported on Windows: the hot-row store needs Unix \
+         positional reads (pread), posix_fadvise and mincore; run on Linux"
+    )
 }
 
 fn is_hex64(text: &str) -> bool {
@@ -437,6 +454,7 @@ pub(crate) trait ShardRead: Sync {
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize>;
 }
 
+#[cfg(unix)]
 /// Open `path` for O_DIRECT reads, falling back to buffered reads on a
 /// filesystem that refuses the flag.
 pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
@@ -471,6 +489,7 @@ pub fn mem_available_bytes() -> Option<u64> {
     Some(kib * 1024)
 }
 
+#[cfg(unix)]
 /// Read exactly `dst.len()` bytes at `offset`, retrying interrupted and short
 /// reads; a read that hits end of file is a `ShortRead`.
 fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceError> {
@@ -491,6 +510,15 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceE
         }
     }
     Ok(())
+}
+
+/// Unsupported outside Unix: errs without reading.
+#[cfg(not(unix))]
+fn read_exact_at(_file: &File, offset: u64, _dst: &mut [u8]) -> Result<(), SourceError> {
+    Err(SourceError::Io {
+        offset,
+        source: io::Error::new(io::ErrorKind::Unsupported, unsupported("positional pack read")),
+    })
 }
 
 /// Result of a non-blocking positional read ([`read_nowait_at`]).
@@ -588,11 +616,13 @@ pub(crate) fn read_nowait_at(_: &File, _: u64, _: &mut [u8]) -> io::Result<Nowai
 #[cfg(test)]
 pub(crate) type NowaitPolicy = std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
+#[cfg(unix)]
 fn fadvise(file: &File, advice: libc::c_int) {
     // SAFETY: a valid open descriptor; advice only.
     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) };
 }
 
+#[cfg(unix)]
 /// Page-cache residency of a file's first bytes, through `mincore` on a
 /// shared read-only mapping that is never read through (mapping a file does
 /// not read it).
@@ -603,6 +633,7 @@ struct Residency {
     pages: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl Residency {
     /// Map the first `len` bytes of `file`.
     fn map(file: &File, len: u64) -> io::Result<Residency> {
@@ -674,6 +705,7 @@ impl Residency {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Residency {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` created, unmapped once.
@@ -794,6 +826,7 @@ pub struct HotRowStore {
 }
 
 impl HotRowStore {
+    #[cfg(unix)]
     /// Open the hot-row pack at `pack_path` for `rank` and build the row ->
     /// pack-offset index.  Errors when the pack was not cut from this model
     /// (PLE fingerprint, shard offsets, model file size), from this rank
@@ -942,6 +975,25 @@ impl HotRowStore {
         }))
     }
 
+    /// Unsupported outside Unix: errs before opening or reading anything.
+    #[cfg(not(unix))]
+    pub fn open(
+        _rank: PleHotRank,
+        pack_path: &Path,
+        _rows_per_shard: usize,
+        _encoding: RowEncoding,
+        _encoded_row_bytes: usize,
+        _shard_offsets: &[u64],
+        _model_file_bytes: u64,
+    ) -> Result<std::sync::Arc<HotRowStore>, String> {
+        Err(format!(
+            "ple hot pack {}: {}",
+            pack_path.display(),
+            unsupported("opening a hot-row pack")
+        ))
+    }
+
+    #[cfg(unix)]
     /// Open a rank-ordered PLE table (a `ple-table` of `order rank`, the
     /// `<model>.ple-q4` derived with a rank): every row of the PLE table in
     /// tier order, with the rank embedded.  Reads the header and the rank
@@ -1042,6 +1094,16 @@ impl HotRowStore {
             #[cfg(test)]
             nowait_policy: OnceLock::new(),
         }))
+    }
+
+    /// Unsupported outside Unix: errs before opening or reading anything.
+    #[cfg(not(unix))]
+    pub fn open_table(path: &Path) -> Result<std::sync::Arc<HotRowStore>, String> {
+        Err(format!(
+            "ple table {}: {}",
+            path.display(),
+            unsupported("opening a rank-ordered PLE table")
+        ))
     }
 
     /// Values per row (the row store's `row_width`).
@@ -1263,6 +1325,7 @@ impl HotRowStore {
             .store(bytes.min(self.data_bytes), Ordering::Release);
     }
 
+    #[cfg(unix)]
     /// Start the worker: check the sidecar payload hash and spot-check
     /// [`VERIFY_SAMPLES`] kept rows of the pack against the model file
     /// (`shard_offsets[s]` = file offset of PLE shard `s`), then serve; once
@@ -1283,6 +1346,7 @@ impl HotRowStore {
             .expect("spawn ple hot pack thread")
     }
 
+    #[cfg(unix)]
     fn run_worker(&self, model_path: &Path, shard_offsets: &[u64]) {
         match self.verify(model_path, shard_offsets) {
             Ok(summary) => {
@@ -1301,6 +1365,7 @@ impl HotRowStore {
         self.prewarm(budget, 0);
     }
 
+    #[cfg(unix)]
     /// Start the worker of a table store ([`HotRowStore::open_table`]): it
     /// verifies nothing (the table serves from the start).  With `load_fill`
     /// it first reads the table's hottest prefix while the model loads (see
@@ -1324,6 +1389,7 @@ impl HotRowStore {
             .expect("spawn ple table thread")
     }
 
+    #[cfg(unix)]
     /// Read the first `fill.bytes` of the data (hottest tier first) into the
     /// page cache at no more than `fill.bytes_per_sec`, until the prewarm
     /// budget is set (the model is ready) or the store stops.  The weight
@@ -1480,6 +1546,7 @@ impl HotRowStore {
         }
     }
 
+    #[cfg(unix)]
     /// Sidecar payload hash, then [`VERIFY_SAMPLES`] kept rows compared byte
     /// for byte between the pack and the model file.
     fn verify(&self, model_path: &Path, shard_offsets: &[u64]) -> Result<String, String> {
@@ -1561,6 +1628,7 @@ impl HotRowStore {
         ))
     }
 
+    #[cfg(unix)]
     /// Prewarm the pack's hottest `budget` bytes into the page cache while no
     /// request is being served.  Reads only the pack (`pack_path`,
     /// `data_offset`, `tier_base`), never the source model file.
@@ -1623,6 +1691,7 @@ impl HotRowStore {
         );
     }
 
+    #[cfg(unix)]
     /// Read the pack bytes `span` (absolute offsets) in [`PREWARM_CHUNK`]
     /// reads, publishing the bytes of the data read so far (from
     /// `data_offset`) in `progress`, pausing while a
@@ -1700,6 +1769,7 @@ impl LoadFill {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     /// A model "file" in memory.
@@ -1768,6 +1838,7 @@ pub(crate) mod test_support {
     pub(crate) const FINGERPRINT: &str =
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
+    #[cfg(unix)]
     /// A model file and its hot-row pack on disk, and the opened store.
     pub(crate) struct PackFixture {
         pub dir: tempfile::TempDir,
@@ -1779,6 +1850,7 @@ pub(crate) mod test_support {
         pub worker: Option<JoinHandle<()>>,
     }
 
+    #[cfg(unix)]
     impl PackFixture {
         /// Write `shards` as a model file, pack its rows of buckets
         /// `0..kept` (tiers of `group`) under a pseudo-random rank, open the
@@ -1863,6 +1935,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for PackFixture {
         fn drop(&mut self) {
             self.store.stop();
@@ -1873,7 +1946,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::test_support::*;
     use super::*;

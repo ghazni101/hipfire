@@ -32,6 +32,11 @@ pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadReque
 pub(crate) mod layer_ops;
 pub mod sandwich;
 pub(crate) mod steps;
+pub mod step_graph;
+pub use step_graph::{
+    op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
+    StateClass, StepGraph, StepGraphError,
+};
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
     execute_final_hyper, execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm,
@@ -68,7 +73,50 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
     Ok(())
 }
 
+/// qt=55 FP8E4M3B128 has no generic kernel: only the typed gfx942 FP8 route
+/// may read it. Guard for per-dtype generic MoE entrypoints.
+fn reject_fp8_b128(dtype: DType) -> Result<(), DispatchError> {
+    if dtype == DType::FP8E4M3B128 {
+        return Err(crate::families::moe::fp8_b128_generic_refusal());
+    }
+    Ok(())
+}
+
+/// Refuse any layer carrying a qt=55 operand (router, shared, routed, or a
+/// per-expert tier). Every generic route — decode gpu-top-k/CPU fallback and
+/// prefill Path 0/1/2 — MUST pass through this (or the equivalent
+/// `check_generic_route` on a resolution) before launching.
+pub(crate) fn reject_fp8_moe(
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+) -> Result<(), DispatchError> {
+    if dtypes.has_fp8_b128_projection() {
+        return Err(crate::families::moe::fp8_b128_generic_refusal());
+    }
+    Ok(())
+}
+
+/// Guard for stages that only touch the router / shared projections (and so
+/// are legitimately shared with the typed FP8 route): under the FP8 route the
+/// router and shared operands must be non-qt55; for every other route any
+/// qt=55 operand is refused.
+fn reject_fp8_moe_unless_routed(
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+    route: Option<MoeRouteCapability>,
+) -> Result<(), DispatchError> {
+    if !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
+        return reject_fp8_moe(dtypes);
+    }
+    let shared_fp8 = dtypes.shared.is_some_and(|shared| {
+        [shared.selector, shared.gate, shared.up, shared.down].contains(&DType::FP8E4M3B128)
+    });
+    if shared_fp8 || dtypes.router == DType::FP8E4M3B128 {
+        return Err(crate::families::moe::fp8_b128_generic_refusal());
+    }
+    Ok(())
+}
+
 fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<(), DispatchError> {
+    reject_fp8_moe(dtypes)?;
     let tagged = dtypes
         .per_expert_gate_up
         .is_some_and(|values| values.contains(&DType::MQ4G128V2))
@@ -156,6 +204,88 @@ fn select_grouped_route(
             Some(policy.capability)
         }
         _ => None,
+    }
+}
+
+/// Pure selection of the gfx942 qt=55 FP8E4M3B128 grouped route; runs before
+/// [`select_grouped_route`] / generic selection.
+///
+/// * `Ok(None)` — the policy does not declare the FP8 route and no operand is
+///   qt=55: continue with the existing selection.
+/// * `Ok(Some(Fp8B128Grouped))` — gfx942, the policy declares the FP8 route,
+///   and the live operands match the canonical contract exactly (512/10/2560/
+///   640/640, routed gate_up + down qt=55, BF16 router/shared, uniform
+///   experts, no tags or sidecars).
+/// * `Err` — typed refusal: a qt=55 operand without an FP8 declaration (absent
+///   policy included), or an FP8 declaration the device or operands do not
+///   satisfy. qt=55 never falls through to generic selection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_fp8_grouped_route(
+    ctx: &DispatchCtx,
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+    route_policy: Option<crate::families::moe::MoeRoutePolicy>,
+    n_exp: usize,
+    k_top: usize,
+    hidden: usize,
+    intermediate: usize,
+    shared_intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtype_tags: Option<&GpuTensor>,
+    has_sidecars: bool,
+) -> Result<Option<MoeRouteCapability>, DispatchError> {
+    let Some(policy) = route_policy.filter(|policy| policy.capability.is_fp8_grouped()) else {
+        return reject_fp8_moe(dtypes).map(|()| None);
+    };
+    let shared = dtypes.shared.ok_or_else(fp8_route_unsupported)?;
+    let uniform_fp8 = |table: Option<&[DType]>| {
+        table.map_or(true, |values| {
+            values.iter().all(|dtype| *dtype == DType::FP8E4M3B128)
+        })
+    };
+    if policy.capability.admitted_on_arch(&ctx.arch)
+        && crate::families::moe::fp8_grouped_route_geometry_supported(
+            &policy,
+            n_exp,
+            k_top,
+            hidden,
+            intermediate,
+            gate_up_k,
+            down_m,
+            down_k,
+            dtypes.routed_gate_up,
+            dtypes.routed_down,
+        )
+        && shared_intermediate == policy.geometry.shared_intermediate
+        && !dtypes.routed_has_mixed_experts
+        && !dtypes.has_paro_shared
+        && !has_sidecars
+        && dtype_tags.is_none()
+        && [
+            dtypes.router,
+            shared.selector,
+            shared.gate,
+            shared.up,
+            shared.down,
+        ]
+        .iter()
+        .all(|dtype| *dtype == DType::BF16)
+        && uniform_fp8(dtypes.per_expert_gate_up)
+        && uniform_fp8(dtypes.per_expert_down)
+    {
+        Ok(Some(policy.capability))
+    } else {
+        Err(fp8_route_unsupported())
+    }
+}
+
+fn fp8_route_unsupported() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant: "fp8b128-route-unsupported",
+        arch: "",
+        quant: "FP8E4M3B128",
     }
 }
 #[cfg(test)]
@@ -462,6 +592,225 @@ mod qwen4_route_tests {
         let mut dtypes = canonical_dtypes();
         dtypes.routed_gate_up = DType::MQ4G256;
         assert_rejected(&dtypes);
+    }
+}
+
+#[cfg(test)]
+mod fp8_route_tests {
+    use super::*;
+    use crate::families::moe::{
+        MoeDtypes, MoeResolution, MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry,
+        MoeRoutePolicy, MoeSharedDtypes,
+    };
+
+    fn fp8_dtypes() -> MoeDtypes<'static> {
+        MoeDtypes {
+            router: DType::BF16,
+            shared: Some(MoeSharedDtypes {
+                selector: DType::BF16,
+                gate: DType::BF16,
+                up: DType::BF16,
+                down: DType::BF16,
+            }),
+            experts_all_gate_up_mq4: false,
+            routed_gate_up: DType::FP8E4M3B128,
+            routed_down: DType::FP8E4M3B128,
+            routed_has_mixed_experts: false,
+            has_paro_shared: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    fn fp8_policy() -> MoeRoutePolicy {
+        MoeRoutePolicy {
+            capability: MoeRouteCapability::Fp8B128Grouped,
+            geometry: MoeRouteGeometry {
+                experts: 512,
+                top_k: 10,
+                hidden: 2560,
+                routed_intermediate: 640,
+                shared_intermediate: 640,
+            },
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down: DType::BF16,
+                routed_gate_up: DType::FP8E4M3B128,
+                routed_down: DType::FP8E4M3B128,
+            },
+        }
+    }
+
+    fn qt44_policy() -> MoeRoutePolicy {
+        let mut policy = fp8_policy();
+        policy.capability = MoeRouteCapability::Qt44Qt53Grouped;
+        policy.formats.routed_gate_up = DType::MQ4G256V2;
+        policy.formats.routed_down = DType::MQ4G128V2;
+        policy
+    }
+
+    fn select(
+        arch: &str,
+        dtypes: &MoeDtypes<'_>,
+        policy: Option<MoeRoutePolicy>,
+        shape: [usize; 7],
+        has_sidecars: bool,
+    ) -> Result<Option<MoeRouteCapability>, DispatchError> {
+        let [n_exp, k_top, hidden, mi, gate_up_k, down_m, down_k] = shape;
+        select_fp8_grouped_route(
+            &DispatchCtx::for_test(arch),
+            dtypes,
+            policy,
+            n_exp,
+            k_top,
+            hidden,
+            mi,
+            640,
+            gate_up_k,
+            down_m,
+            down_k,
+            None,
+            has_sidecars,
+        )
+    }
+
+    const CANONICAL: [usize; 7] = [512, 10, 2560, 640, 2560, 2560, 640];
+
+    fn is_fp8_refusal(result: Result<Option<MoeRouteCapability>, DispatchError>) -> bool {
+        matches!(
+            result,
+            Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                quant: "FP8E4M3B128",
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn gfx942_qt55_canonical_selects_fp8_route() {
+        let selected = select("gfx942", &fp8_dtypes(), Some(fp8_policy()), CANONICAL, false);
+        assert!(matches!(
+            selected,
+            Ok(Some(MoeRouteCapability::Fp8B128Grouped))
+        ));
+    }
+
+    #[test]
+    fn non_gfx942_qt55_refuses() {
+        for arch in ["gfx1151", "gfx1201", "gfx1100", "gfx1030", "gfx908"] {
+            assert!(
+                is_fp8_refusal(select(arch, &fp8_dtypes(), Some(fp8_policy()), CANONICAL, false)),
+                "{arch} must refuse qt55",
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_foreign_policy_refuses_qt55_generically() {
+        for policy in [None, Some(qt44_policy())] {
+            assert!(is_fp8_refusal(select(
+                "gfx942",
+                &fp8_dtypes(),
+                policy,
+                CANONICAL,
+                false
+            )));
+        }
+        // Generic guards refuse the same operands.
+        assert!(is_fp8_refusal(reject_fp8_moe(&fp8_dtypes()).map(|()| None)));
+        assert!(is_fp8_refusal(
+            reject_mq4g128v2_moe(&fp8_dtypes()).map(|()| None)
+        ));
+        assert!(is_fp8_refusal(
+            reject_fp8_moe_unless_routed(&fp8_dtypes(), None).map(|()| None)
+        ));
+        assert!(is_fp8_refusal(
+            reject_fp8_moe_unless_routed(&fp8_dtypes(), Some(MoeRouteCapability::Qt44Qt53Grouped))
+                .map(|()| None)
+        ));
+        assert!(is_fp8_refusal(reject_fp8_b128(DType::FP8E4M3B128).map(|()| None)));
+        reject_fp8_b128(DType::MQ4G256).unwrap();
+        // Generic resolution carries the refusal state, never a route.
+        let ctx = DispatchCtx::for_test("gfx942");
+        let resolution = MoeResolution::resolve_arch(&fp8_dtypes(), 10, ctx.arch.has_wmma());
+        assert!(resolution.fp8_b128_refused && !resolution.routed_indexable());
+        assert!(resolution.check_generic_route(None).is_err());
+    }
+
+    #[test]
+    fn typed_fp8_route_may_share_only_bf16_router_and_shared_stages() {
+        let fp8 = Some(MoeRouteCapability::Fp8B128Grouped);
+        reject_fp8_moe_unless_routed(&fp8_dtypes(), fp8).unwrap();
+        let mut shared_fp8 = fp8_dtypes();
+        shared_fp8.shared.as_mut().unwrap().down = DType::FP8E4M3B128;
+        assert!(reject_fp8_moe_unless_routed(&shared_fp8, fp8).is_err());
+        let mut router_fp8 = fp8_dtypes();
+        router_fp8.router = DType::FP8E4M3B128;
+        assert!(reject_fp8_moe_unless_routed(&router_fp8, fp8).is_err());
+    }
+
+    #[test]
+    fn non_fp8_layers_are_untouched_by_the_fp8_selector() {
+        let mut qt44 = fp8_dtypes();
+        qt44.routed_gate_up = DType::MQ4G256V2;
+        qt44.routed_down = DType::MQ4G128V2;
+        for arch in ["gfx942", "gfx1151"] {
+            for policy in [None, Some(qt44_policy())] {
+                assert!(matches!(
+                    select(arch, &qt44, policy, CANONICAL, false),
+                    Ok(None)
+                ));
+            }
+        }
+        reject_fp8_moe(&qt44).unwrap();
+    }
+
+    #[test]
+    fn fp8_route_rejects_noncanonical_geometry_formats_and_operands() {
+        let refuses = |dtypes: &MoeDtypes<'_>, policy: MoeRoutePolicy, shape, sidecars| {
+            is_fp8_refusal(select("gfx942", dtypes, Some(policy), shape, sidecars))
+        };
+        assert!(refuses(&fp8_dtypes(), fp8_policy(), [513, 10, 2560, 640, 2560, 2560, 640], false));
+        assert!(refuses(&fp8_dtypes(), fp8_policy(), [512, 8, 2560, 640, 2560, 2560, 640], false));
+        assert!(refuses(&fp8_dtypes(), fp8_policy(), [512, 10, 2560, 640, 2560, 1, 640], false));
+        assert!(refuses(&fp8_dtypes(), fp8_policy(), CANONICAL, true));
+
+        let mut widened = fp8_policy();
+        widened.geometry.experts = 513;
+        assert!(refuses(&fp8_dtypes(), widened, [513, 10, 2560, 640, 2560, 2560, 640], false));
+
+        let mut q8_shared = fp8_policy();
+        q8_shared.formats.shared_gate = DType::Q8_0;
+        assert!(refuses(&fp8_dtypes(), q8_shared, CANONICAL, false));
+
+        let mut qt44_routed = fp8_policy();
+        qt44_routed.formats.routed_gate_up = DType::MQ4G256V2;
+        assert!(refuses(&fp8_dtypes(), qt44_routed, CANONICAL, false));
+
+        let mut not_fp8_operands = fp8_dtypes();
+        not_fp8_operands.routed_down = DType::MQ4G128V2;
+        assert!(refuses(&not_fp8_operands, fp8_policy(), CANONICAL, false));
+
+        let mut quantized_router = fp8_dtypes();
+        quantized_router.router = DType::Q8_0;
+        assert!(refuses(&quantized_router, fp8_policy(), CANONICAL, false));
+
+        let mut no_shared = fp8_dtypes();
+        no_shared.shared = None;
+        assert!(refuses(&no_shared, fp8_policy(), CANONICAL, false));
+
+        let mut mixed = fp8_dtypes();
+        mixed.routed_has_mixed_experts = true;
+        assert!(refuses(&mixed, fp8_policy(), CANONICAL, false));
+
+        static MIXED_TIERS: [DType; 2] = [DType::FP8E4M3B128, DType::MQ4G256V2];
+        let mut tiered = fp8_dtypes();
+        tiered.per_expert_gate_up = Some(&MIXED_TIERS);
+        assert!(refuses(&tiered, fp8_policy(), CANONICAL, false));
     }
 }
 
@@ -963,6 +1312,7 @@ pub fn run_uniform_moe_gate_up(
     k: usize,
     k_top: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_b128(dtype)?;
     reject_mq4g128v2(dtype, "moe")?;
     let hip = |result: hip_bridge::HipResult<()>| {
         result.map_err(|error| DispatchError::Hip(error.to_string()))
@@ -1047,6 +1397,7 @@ pub fn run_uniform_moe_down_expanded(
     k_top: usize,
     batch_size: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_b128(dtype)?;
     reject_mq4g128v2(dtype, "moe")?;
     let hip = |result: hip_bridge::HipResult<()>| {
         result.map_err(|error| DispatchError::Hip(error.to_string()))
@@ -1889,6 +2240,7 @@ fn dispatch_grouped_gemm(
     paro_i8_k8: bool,
     coalesced: bool,
 ) -> Result<(), DispatchError> {
+    reject_fp8_b128(dtype)?;
     reject_mq4g128v2(dtype, "moe")?;
     // Mixed per-expert: the merged grouped kernel carries the per-expert stride
     // via the dtype_tags table; takes priority over the uniform dtype dispatch.
@@ -2495,6 +2847,7 @@ fn prefill_shared_gate_up_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared =
         p.prelude.shared.as_ref().ok_or_else(|| {
             DispatchError::Hip("shared gate/up stage requires shared weights".into())
@@ -2706,6 +3059,7 @@ fn prefill_shared_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared =
         p.prelude.shared.as_ref().ok_or_else(|| {
             DispatchError::Hip("shared activation requires shared weights".into())
@@ -2757,6 +3111,7 @@ fn prefill_shared_down_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, p.route_policy.map(|policy| policy.capability))?;
     let shared = p
         .prelude
         .shared
@@ -2895,6 +3250,7 @@ fn decode_gate_side_stage(
     shared_up: &GpuTensor,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     let shared = p.shared.as_ref().ok_or_else(|| {
         DispatchError::Hip("shared gate-side stage requires shared weights".into())
     })?;
@@ -3179,6 +3535,7 @@ fn decode_route_gpu_stage(
     wave64_router: bool,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     let smi = p
         .shared
         .as_ref()
@@ -3288,6 +3645,7 @@ fn decode_shared_down_stage(
     router_shared_fuse: bool,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     let shared = p
         .shared
         .as_ref()
@@ -3534,6 +3892,7 @@ fn decode_gate_up_stage(
     ninepath_d3: bool,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let xr = activation_input;
     let gate_up_k = p.routed_gate_up_k;
     // ── Routed-expert dispatch via device-indexed merged kernels ──────────
@@ -3783,6 +4142,7 @@ fn decode_activation_stage(
     route: Option<MoeRouteCapability>,
     shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots =
             p.k.checked_mul(p.mi)
@@ -3900,6 +4260,7 @@ fn decode_down_stage(
     down_last_combine: bool,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let out_target = target;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
@@ -4217,6 +4578,7 @@ fn decode_route_cpu_stage(
     runtime: &OnceCell<crate::pipeline::moe_program::HostRoute>,
     router: crate::pipeline::sealed_moe::MoeRouterInput,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let k = p.k;
     let n_exp = p.n_exp;
     match router {
@@ -4322,6 +4684,7 @@ fn decode_cpu_experts_stage(
     topk_indices: &[usize],
     topk_weights: &[f32],
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let mi = p.mi;
     static GEMV_FB: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV_FB.get_or_init(GemvFamily::new);
@@ -4423,6 +4786,7 @@ fn decode_combine_stage(
     target: &GpuTensor,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
     let dump = moe_dump::fold_begin(gpu, p.layer_idx as usize, p.hidden, p.x_residual, target)?;
     if grouped {
@@ -4492,6 +4856,7 @@ fn prefill_scatter_stage(
     p: &crate::families::moe::MoePrefillParams<'_>,
     path2_m_total: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let total_slots = p
         .batch_size
         .checked_mul(p.k_top)
@@ -4540,6 +4905,7 @@ fn prefill_gate_up_stage(
     force_mq4_grouped_fp16: bool,
     coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let (n, mi, k_top) = (p.batch_size, p.mi, p.k_top);
     let gate_up_k = p.gate_up_k;
     if res.use_path2 {
@@ -4783,6 +5149,7 @@ fn prefill_gate_up_unscatter_stage(
     p: &crate::families::moe::MoePrefillParams<'_>,
     path2_m_total: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     hip!(gpu.moe_gate_up_unscatter_k8(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
@@ -4801,6 +5168,7 @@ fn prefill_activation_stage(
     res: &crate::families::moe::MoePrefillResolution,
     total_slots: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let mi = p.mi;
     // ── SwiGLU + rotate over [N*K_TOP × mi] ────────────────────────────
     if res.paro_mode {
@@ -4925,6 +5293,7 @@ fn prefill_down_stage(
     force_mq4_grouped_fp16: bool,
     coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     let (n, k_top) = (p.batch_size, p.k_top);
     let (down_m, down_k) = (p.down_m, p.down_k);
     let out_target = p.routed_out.unwrap_or(p.x_batch);
@@ -5090,6 +5459,7 @@ fn prefill_down_unscatter_stage(
     p: &crate::families::moe::MoePrefillParams<'_>,
     total_slots: usize,
 ) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
     // Grouped GEMM's atomic bucket order is rank-local. Restore canonical
     // flat slot order before this buffer participates in an EP gather.
     hip!(gpu.moe_down_unscatter_k8(
@@ -5109,6 +5479,7 @@ fn prefill_combine_stage(
     target: &GpuTensor,
     canonical_slot_order: bool,
 ) -> Result<(), DispatchError> {
+    res.check_generic_route(None)?;
     if canonical_slot_order {
         if res.down_path0 {
             return Err(DispatchError::Hip(

@@ -66,9 +66,11 @@ GPU device nodes are required for inference. Rootless podman needs
 `--group-add keep-groups` so host `render`/`video` gids reach `/dev/kfd` and
 `/dev/dri`.
 
-**Unauthenticated HTTP.** Serve has no auth and no TLS ([SERVE.md](SERVE.md)).
-Publish the port only on loopback unless a trusted network or authenticated
-TLS reverse proxy protects it. Prefer `-p 127.0.0.1:11435:11435` over bare
+**Authentication optional, no TLS.** Serve has no TLS, and bearer authentication
+is optional ([SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies)).
+Publish the port only on loopback unless a trusted network or TLS reverse
+proxy protects it, and pass `--api-key-file` (a key is recommended off loopback).
+Prefer `-p 127.0.0.1:11435:11435` over bare
 `-p 11435:11435` (the latter binds all host interfaces).
 
 ```bash
@@ -96,9 +98,9 @@ podman run --rm -it \
   hipfire serve qwen3.5:4b 0.0.0.0:11435
 ```
 
-To publish on all host interfaces (no auth, no TLS — trusted network or
-authenticated TLS reverse proxy only): `-p 11435:11435` and keep the in-container
-bind at `0.0.0.0:11435`.
+To publish on all host interfaces (no TLS; a key via `--api-key-file` is
+recommended, otherwise trusted network or TLS reverse proxy only):
+`-p 11435:11435` and keep the in-container bind at `0.0.0.0:11435`.
 
 Do **not** pass `-d` / `--detach` as the container command: that forks a
 background child and lets PID 1 exit, which stops the container. Detach with

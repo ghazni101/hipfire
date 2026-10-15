@@ -19,6 +19,7 @@ use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
 use crate::{is_standalone_model, list_local_models, unix_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
+use hipfire_config::secret::BearerToken;
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::server::conn::http1;
@@ -701,7 +702,7 @@ const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// After shutdown, how long in-flight requests get to finish.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
 
 /// Accept loop. A failed `accept` (out of descriptors, a connection reset
 /// before it was accepted) is logged and retried, never fatal. When
@@ -890,6 +891,57 @@ fn model_entry(
     entry
 }
 
+/// True when the request carries exactly one `Authorization: Bearer <token>`
+/// header whose token matches `key` (constant-time compare; the scheme is
+/// case-insensitive per RFC 9110). Missing, malformed, repeated and wrong
+/// credentials are indistinguishable to the caller.
+fn bearer_authorized(headers: &hyper::HeaderMap, key: &BearerToken) -> bool {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
+        return false;
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer") && key.matches(token.trim())
+}
+
+/// Uniform 401 for a missing or wrong bearer token. The body never says
+/// which, so a probe learns nothing about the key.
+fn unauthorized_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(401)
+        .header(header::WWW_AUTHENTICATE, "Bearer")
+        .body(boxed_empty())
+        .expect("static unauthorized response")
+}
+
+/// Unauthenticated `/health` for a keyed server: status and version only.
+/// Model, pid, instance token and capabilities need the bearer token. The
+/// status code still tracks the engine state so liveness probes keep working.
+fn public_health(shared: &ServeShared) -> Response<BoxBody> {
+    let state = shared
+        .meta
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .engine_state;
+    let status = if state == crate::serve::EngineState::Up {
+        200
+    } else {
+        503
+    };
+    json_response(
+        serde_json::json!({
+            "status": state.as_str(),
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+        status,
+    )
+}
+
 async fn handle_request(
     req: Request<Incoming>,
     shared: Arc<ServeShared>,
@@ -903,6 +955,18 @@ async fn handle_request(
         .unwrap_or(req.uri().path())
         .to_owned();
     let method = req.method().clone();
+    // Authentication gates every route before routing, body reads, and the
+    // UI assets. Only a bare GET `/health` liveness status is public.
+    // Preflight requires authentication too; browser pairing is unsupported.
+    if let Some(key) = &shared.api_key {
+        if !bearer_authorized(req.headers(), key) {
+            return if method == Method::GET && path == "/health" {
+                public_health(&shared)
+            } else {
+                unauthorized_response()
+            };
+        }
+    }
     // Opt-in embedded chat UI (`serve.ui` / `--ui`). A GET on a UI path
     // resolves embedded assets; anything else falls through to 404.
     if shared.ui_enabled && method == Method::GET {
@@ -2462,6 +2526,25 @@ mod tests {
     use std::future::poll_fn;
     use std::task::Waker;
     use std::time::Duration;
+
+    #[test]
+    fn bearer_headers_require_one_matching_utf8_credential() {
+        let text = "é".repeat(32);
+        let key = BearerToken::new(text.clone()).unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        assert!(!bearer_authorized(&headers, &key));
+        for value in ["Bearer".to_owned(), format!("Basic {text}"), format!("Bearer {text}x")] {
+            headers.insert(header::AUTHORIZATION, header::HeaderValue::from_str(&value).unwrap());
+            assert!(!bearer_authorized(&headers, &key));
+        }
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("bEaReR {text}")).unwrap(),
+        );
+        assert!(bearer_authorized(&headers, &key));
+        headers.append(header::AUTHORIZATION, header::HeaderValue::from_static("Bearer other"));
+        assert!(!bearer_authorized(&headers, &key));
+    }
 
     fn noop_cx() -> TaskContext<'static> {
         TaskContext::from_waker(Waker::noop())

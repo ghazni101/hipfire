@@ -21,6 +21,7 @@ use std::{
     thread,
     time::Duration,
 };
+use hipfire_config::secret::BearerToken;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,8 @@ pub enum ClientError {
     Daemon(TypedDaemonError),
     #[error("HTTP service error: {0}")]
     Http(String),
+    #[error("invalid service endpoint: {0}")]
+    InvalidEndpoint(String),
     /// Client explicitly cancelled the stream; never retried client-side.
     #[error("stream cancelled")]
     Cancelled,
@@ -119,46 +122,181 @@ pub fn probe_host(host: &str) -> &str {
     }
 }
 
-pub fn service_url(host: &str, port: u16, path: &str) -> String {
-    let host = probe_host(host);
-    if host.contains(':') {
-        format!("http://[{host}]:{port}{path}")
-    } else {
-        format!("http://{host}:{port}{path}")
+/// Authenticated HTTP service endpoint shared by every first-party client of
+/// `hipfire serve` (CLI, TUI).
+///
+/// The base is an absolute `http`/`https` URI with a host and optional base
+/// path; userinfo, query and fragment are refused so credentials can only ride
+/// the bearer token. HTTPS uses ureq's default verified TLS configuration (no
+/// certificate or hostname verification is ever disabled here). Redirects are
+/// never followed, so the bearer cannot be forwarded to another origin.
+#[derive(Clone, Debug)]
+pub struct ServiceEndpoint {
+    base: ureq::http::Uri,
+    bearer: Option<BearerToken>,
+    /// `Bearer <token>` pre-validated and marked sensitive (redacted Debug).
+    authorization: Option<ureq::http::HeaderValue>,
+}
+
+impl ServiceEndpoint {
+    /// Parse `base` (for example `https://host:8443/api`). Error messages never
+    /// echo the input, which may carry rejected userinfo.
+    pub fn new(base: &str, bearer: Option<BearerToken>) -> Result<Self> {
+        if base.contains('#') {
+            return Err(invalid_endpoint("fragment is not allowed"));
+        }
+        let uri: ureq::http::Uri = base
+            .parse()
+            .map_err(|_| invalid_endpoint("malformed URL"))?;
+        match uri.scheme_str() {
+            Some("http" | "https") => {}
+            Some(_) => return Err(invalid_endpoint("scheme must be http or https")),
+            None => return Err(invalid_endpoint("scheme is required")),
+        }
+        let authority = uri
+            .authority()
+            .ok_or_else(|| invalid_endpoint("authority is required"))?;
+        if authority.as_str().contains('@') {
+            return Err(invalid_endpoint("userinfo is not allowed"));
+        }
+        if uri.host().is_none_or(str::is_empty) {
+            return Err(invalid_endpoint("host is required"));
+        }
+        let port = &authority.as_str()[authority.host().len()..];
+        if !port.is_empty()
+            && port.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).is_none()
+        {
+            return Err(invalid_endpoint("port must be an integer from 0 to 65535"));
+        }
+        if uri.query().is_some() {
+            return Err(invalid_endpoint("query is not allowed"));
+        }
+        let authorization = bearer
+            .as_ref()
+            .map(|token| {
+                let mut value =
+                    ureq::http::HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+                        .map_err(|_| invalid_endpoint("bearer token is not a valid header value"))?;
+                value.set_sensitive(true);
+                Ok::<_, ClientError>(value)
+            })
+            .transpose()?;
+        Ok(Self {
+            base: uri,
+            bearer,
+            authorization,
+        })
+    }
+
+    /// Plain-HTTP endpoint for a locally bound server. Wildcard bind addresses
+    /// map to loopback via [`probe_host`]; IPv6 literals are bracketed.
+    pub fn local(host: &str, port: u16, bearer: Option<BearerToken>) -> Result<Self> {
+        let host = probe_host(host);
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let authority = format!("{host}:{port}");
+        let endpoint = Self::new(&format!("http://{authority}"), bearer)?;
+        // A host carrying `/`, `?`, `:` or similar must not rewrite the
+        // authority or smuggle a path.
+        let exact = endpoint.base.authority().map(|a| a.as_str()) == Some(authority.as_str())
+            && endpoint.base.path() == "/";
+        if !exact {
+            return Err(invalid_endpoint("host is not a plain host name or address"));
+        }
+        Ok(endpoint)
+    }
+
+    /// Bearer token attached to every request, when configured.
+    pub fn bearer(&self) -> Option<&BearerToken> {
+        self.bearer.as_ref()
+    }
+
+    /// Attach the bearer (when configured) to a ureq request.
+    pub fn authorize<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        match &self.authorization {
+            Some(value) => request.header("Authorization", value.clone()),
+            None => request,
+        }
     }
 }
 
-pub fn service_ready(host: &str, port: u16, timeout: Duration) -> bool {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    agent
-        .get(&service_url(host, port, "/health"))
+fn invalid_endpoint(reason: &str) -> ClientError {
+    ClientError::InvalidEndpoint(reason.to_owned())
+}
+
+/// Absolute URL for `path` (empty or `/`-prefixed) under the endpoint base.
+pub fn service_url(endpoint: &ServiceEndpoint, path: &str) -> String {
+    let base = &endpoint.base;
+    let base_path = base.path().trim_end_matches('/');
+    let separator = if path.is_empty() || path.starts_with('/') {
+        ""
+    } else {
+        "/"
+    };
+    format!(
+        "{}://{}{base_path}{separator}{path}",
+        base.scheme_str().unwrap_or("http"),
+        base.authority().map_or("", |authority| authority.as_str()),
+    )
+}
+
+pub fn service_ready(endpoint: &ServiceEndpoint, timeout: Duration) -> bool {
+    endpoint
+        .authorize(http_agent(timeout).get(&service_url(endpoint, "/health")))
         .call()
         .is_ok_and(|response| response.status().is_success())
 }
 
-pub fn complete_openai_chat(
-    host: &str,
-    port: u16,
-    mut body: Value,
-    timeout: Duration,
-) -> Result<Value> {
-    body["stream"] = Value::Bool(false);
-    let agent = http_agent(timeout);
-    let mut response = agent
-        .post(&service_url(host, port, "/v1/chat/completions"))
-        .header("Content-Type", "application/json")
-        .send(body.to_string())
+/// GET `path` and parse a JSON body; non-2xx statuses are errors.
+pub fn http_get_json(endpoint: &ServiceEndpoint, path: &str, timeout: Duration) -> Result<Value> {
+    let mut response = endpoint
+        .authorize(http_agent(timeout).get(&service_url(endpoint, path)))
+        .call()
         .map_err(|error| ClientError::Http(error.to_string()))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
         .map_err(|error| ClientError::Http(error.to_string()))?;
-    if status >= 400 {
+    if !(200..300).contains(&status) {
+        return Err(ClientError::Http(http_error_message(status, &text)));
+    }
+    serde_json::from_str(&text).map_err(|error| {
+        ClientError::Http(format!(
+            "service emitted invalid JSON: {error}; body={}",
+            text.chars().take(512).collect::<String>()
+        ))
+    })
+}
+
+fn post_chat(
+    endpoint: &ServiceEndpoint,
+    body: &Value,
+    timeout: Duration,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    endpoint
+        .authorize(http_agent(timeout).post(&service_url(endpoint, "/v1/chat/completions")))
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|error| ClientError::Http(error.to_string()))
+}
+
+pub fn complete_openai_chat(
+    endpoint: &ServiceEndpoint,
+    mut body: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    body["stream"] = Value::Bool(false);
+    let mut response = post_chat(endpoint, &body, timeout)?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| ClientError::Http(error.to_string()))?;
+    if !(200..300).contains(&status) {
         return Err(ClientError::Http(http_error_message(status, &text)));
     }
     serde_json::from_str(&text).map_err(|error| {
@@ -357,22 +495,16 @@ pub fn read_openai_sse(
 /// [`ClientError::Cancelled`] (no client retry). Successful streams always
 /// deliver a [`OpenAiSseEvent::Finish`] then [`OpenAiSseEvent::Done`].
 pub fn stream_openai_chat(
-    host: &str,
-    port: u16,
+    endpoint: &ServiceEndpoint,
     mut body: Value,
     timeout: Duration,
     mut on_event: impl FnMut(OpenAiSseEvent) -> Result<()>,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<()> {
     body["stream"] = Value::Bool(true);
-    let agent = http_agent(timeout);
-    let mut response = agent
-        .post(&service_url(host, port, "/v1/chat/completions"))
-        .header("Content-Type", "application/json")
-        .send(body.to_string())
-        .map_err(|error| ClientError::Http(error.to_string()))?;
+    let mut response = post_chat(endpoint, &body, timeout)?;
     let status = response.status().as_u16();
-    if status >= 400 {
+    if !(200..300).contains(&status) {
         let text = response.body_mut().read_to_string().unwrap_or_default();
         return Err(ClientError::Http(http_error_message(status, &text)));
     }
@@ -386,6 +518,8 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
         .timeout_global(Some(timeout))
         .timeout_recv_body(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
+        // Never forward the bearer to another origin.
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -4047,5 +4181,381 @@ done
             .register_pending_channel(&no_attempt)
             .expect_err("missing attempt_id rejected");
         assert!(err.to_string().contains("attempt_id"), "{err}");
+    }
+    // ---- ServiceEndpoint / bearer attachment -------------------------------
+
+    const TEST_TOKEN: &str = "test-bearer-token-0123456789abcdef-secret";
+
+    fn test_bearer() -> BearerToken {
+        BearerToken::new(TEST_TOKEN).unwrap()
+    }
+
+    #[test]
+    fn endpoint_accepts_http_https_ipv6_and_base_path() {
+        let plain = ServiceEndpoint::new("http://127.0.0.1:11435", None).unwrap();
+        assert_eq!(service_url(&plain, "/health"), "http://127.0.0.1:11435/health");
+        assert_eq!(service_url(&plain, ""), "http://127.0.0.1:11435");
+
+        let tls = ServiceEndpoint::new("https://example.test:8443/", None).unwrap();
+        assert_eq!(service_url(&tls, "/health"), "https://example.test:8443/health");
+
+        let v6 = ServiceEndpoint::new("http://[::1]:11435", None).unwrap();
+        assert_eq!(service_url(&v6, "/stats"), "http://[::1]:11435/stats");
+
+        let prefixed = ServiceEndpoint::new("https://example.test/api/hipfire/", None).unwrap();
+        assert_eq!(
+            service_url(&prefixed, "/v1/chat/completions"),
+            "https://example.test/api/hipfire/v1/chat/completions"
+        );
+        assert_eq!(
+            service_url(&prefixed, "health"),
+            "https://example.test/api/hipfire/health"
+        );
+    }
+
+    #[test]
+    fn endpoint_rejects_malformed_inputs_without_echoing_them() {
+        for bad in [
+            "",
+            "localhost:11435",
+            "127.0.0.1:11435",
+            "/health",
+            "ftp://example.test/",
+            "file:///etc/passwd",
+            "http://",
+            "http:///path",
+            "http://:80",
+            "http://exa mple.test",
+            "http://example.test:notaport",
+            "http://example.test:99999",
+            "http://example.test/?q=1",
+            "http://example.test/#frag",
+        ] {
+            let err = ServiceEndpoint::new(bad, None).expect_err(bad);
+            assert!(
+                matches!(err, ClientError::InvalidEndpoint(_)),
+                "{bad:?}: {err}"
+            );
+        }
+        let err = ServiceEndpoint::new("http://user:hunter2secret@example.test", Some(test_bearer()))
+            .expect_err("userinfo rejected");
+        let text = err.to_string();
+        assert!(text.contains("userinfo"), "{text}");
+        assert!(!text.contains("hunter2secret"), "{text}");
+        assert!(!text.contains(TEST_TOKEN), "{text}");
+        assert!(ServiceEndpoint::new("http://@example.test", None).is_err());
+    }
+
+    #[test]
+    fn local_endpoint_maps_wildcards_brackets_ipv6_and_rejects_smuggling() {
+        let any = ServiceEndpoint::local("0.0.0.0", 11435, None).unwrap();
+        assert_eq!(service_url(&any, "/health"), "http://127.0.0.1:11435/health");
+        let v6_any = ServiceEndpoint::local("::", 11435, None).unwrap();
+        assert_eq!(service_url(&v6_any, "/health"), "http://[::1]:11435/health");
+        let v6 = ServiceEndpoint::local("fe80::1", 80, None).unwrap();
+        assert_eq!(service_url(&v6, ""), "http://[fe80::1]:80");
+        let bracketed = ServiceEndpoint::local("[::1]", 80, None).unwrap();
+        assert_eq!(service_url(&bracketed, ""), "http://[::1]:80");
+        let empty = ServiceEndpoint::local("", 1, None).unwrap();
+        assert_eq!(service_url(&empty, ""), "http://127.0.0.1:1");
+
+        for bad in ["evil.test/path", "user@evil.test", "evil.test?x", "a b", "evil.test#x"] {
+            assert!(ServiceEndpoint::local(bad, 80, None).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn endpoint_debug_and_errors_never_contain_the_token() {
+        let endpoint = ServiceEndpoint::local("127.0.0.1", 1, Some(test_bearer())).unwrap();
+        let debug = format!("{endpoint:?}");
+        assert!(!debug.contains(TEST_TOKEN), "{debug}");
+        assert!(endpoint.bearer().is_some_and(|token| token.matches(TEST_TOKEN)));
+    }
+
+    /// One recorded HTTP request: request line, lowercase-named headers, body.
+    struct Seen {
+        request_line: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Seen {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Seen {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            if let Some(pos) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "connection closed before request headers");
+            raw.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap().to_owned();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        let length = headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while raw.len() < header_end + length {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "connection closed before request body");
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        Seen {
+            request_line,
+            headers,
+        }
+    }
+
+    /// Serve exactly one request with `response` (raw HTTP/1.1 bytes) and
+    /// return the bound port plus a handle yielding what the server saw.
+    fn serve_once(response: String) -> (u16, thread::JoinHandle<Seen>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let seen = read_request(&mut stream);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            seen
+        });
+        (port, handle)
+    }
+
+    fn json_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn sse_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    const SSE_OK: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    fn assert_bearer(seen: &Seen, expect_token: bool) {
+        match (seen.header("authorization"), expect_token) {
+            (Some(value), true) => assert_eq!(value, format!("Bearer {TEST_TOKEN}")),
+            (None, false) => {}
+            (got, _) => panic!("unexpected authorization header presence: {got:?}"),
+        }
+    }
+
+    #[test]
+    fn service_ready_attaches_bearer() {
+        for authenticated in [true, false] {
+            let (port, server) = serve_once(json_response("200 OK", "{}"));
+            let endpoint =
+                ServiceEndpoint::local("127.0.0.1", port, authenticated.then(test_bearer)).unwrap();
+            assert!(service_ready(&endpoint, Duration::from_secs(5)));
+            let seen = server.join().unwrap();
+            assert_eq!(seen.request_line, "GET /health HTTP/1.1");
+            assert_bearer(&seen, authenticated);
+        }
+    }
+
+    #[test]
+    fn service_ready_is_false_on_unauthorized() {
+        let (port, server) = serve_once(json_response("401 Unauthorized", "{}"));
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
+        assert!(!service_ready(&endpoint, Duration::from_secs(5)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_get_json_attaches_bearer_and_reports_errors() {
+        for authenticated in [true, false] {
+            let (port, server) = serve_once(json_response("200 OK", r#"{"ok":true}"#));
+            let endpoint =
+                ServiceEndpoint::local("127.0.0.1", port, authenticated.then(test_bearer)).unwrap();
+            let value = http_get_json(&endpoint, "/health", Duration::from_secs(5)).unwrap();
+            assert_eq!(value["ok"], true);
+            let seen = server.join().unwrap();
+            assert_eq!(seen.request_line, "GET /health HTTP/1.1");
+            assert_bearer(&seen, authenticated);
+        }
+
+        let (port, server) = serve_once(json_response(
+            "401 Unauthorized",
+            r#"{"error":{"message":"bad key"}}"#,
+        ));
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, Some(test_bearer())).unwrap();
+        let err = http_get_json(&endpoint, "/stats", Duration::from_secs(5)).unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Http(m) if m == "HTTP 401: bad key"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains(TEST_TOKEN));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn complete_openai_chat_attaches_bearer_and_reports_errors() {
+        for authenticated in [true, false] {
+            let (port, server) = serve_once(json_response("200 OK", r#"{"id":"c1"}"#));
+            let endpoint =
+                ServiceEndpoint::local("127.0.0.1", port, authenticated.then(test_bearer)).unwrap();
+            let value = complete_openai_chat(
+                &endpoint,
+                serde_json::json!({"model":"m","messages":[]}),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert_eq!(value["id"], "c1");
+            let seen = server.join().unwrap();
+            assert_eq!(seen.request_line, "POST /v1/chat/completions HTTP/1.1");
+            assert_eq!(seen.header("content-type"), Some("application/json"));
+            assert_bearer(&seen, authenticated);
+        }
+
+        let (port, server) = serve_once(json_response(
+            "401 Unauthorized",
+            r#"{"error":{"message":"missing bearer"}}"#,
+        ));
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
+        let err = complete_openai_chat(
+            &endpoint,
+            serde_json::json!({"model":"m"}),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Http(m) if m == "HTTP 401: missing bearer"),
+            "{err}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stream_openai_chat_attaches_bearer_and_keeps_sse_semantics() {
+        for authenticated in [true, false] {
+            let (port, server) = serve_once(sse_response(SSE_OK));
+            let endpoint =
+                ServiceEndpoint::local("127.0.0.1", port, authenticated.then(test_bearer)).unwrap();
+            let mut events = Vec::new();
+            stream_openai_chat(
+                &endpoint,
+                serde_json::json!({"model":"m"}),
+                Duration::from_secs(5),
+                |event| {
+                    events.push(event);
+                    Ok(())
+                },
+                || false,
+            )
+            .unwrap();
+            assert!(matches!(&events[0], OpenAiSseEvent::Content { text } if text == "hi"));
+            assert!(matches!(
+                &events[1],
+                OpenAiSseEvent::Finish { reason, .. } if reason == "stop"
+            ));
+            assert!(matches!(events[2], OpenAiSseEvent::Done));
+            let seen = server.join().unwrap();
+            assert_eq!(seen.request_line, "POST /v1/chat/completions HTTP/1.1");
+            assert_bearer(&seen, authenticated);
+        }
+    }
+
+    #[test]
+    fn stream_openai_chat_error_status_and_premature_eof_preserved() {
+        let (port, server) = serve_once(json_response(
+            "401 Unauthorized",
+            r#"{"error":{"message":"bad key"}}"#,
+        ));
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, Some(test_bearer())).unwrap();
+        let err = stream_openai_chat(
+            &endpoint,
+            serde_json::json!({"model":"m"}),
+            Duration::from_secs(5),
+            |_| Ok(()),
+            || false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Http(m) if m == "HTTP 401: bad key"),
+            "{err}"
+        );
+        server.join().unwrap();
+
+        let (port, server) = serve_once(sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        ));
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, Some(test_bearer())).unwrap();
+        let err = stream_openai_chat(
+            &endpoint,
+            serde_json::json!({"model":"m"}),
+            Duration::from_secs(5),
+            |_| Ok(()),
+            || false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClientError::PrematureEof(_)), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn base_path_prefixes_every_helper_request() {
+        let (port, server) = serve_once(json_response("200 OK", "{}"));
+        let endpoint =
+            ServiceEndpoint::new(&format!("http://127.0.0.1:{port}/api/"), Some(test_bearer()))
+                .unwrap();
+        assert!(service_ready(&endpoint, Duration::from_secs(5)));
+        let seen = server.join().unwrap();
+        assert_eq!(seen.request_line, "GET /api/health HTTP/1.1");
+        assert_bearer(&seen, true);
+    }
+
+    #[test]
+    fn redirects_are_not_followed_so_bearer_cannot_leave_the_origin() {
+        let (target_port, target) = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handle = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_millis(800);
+                while std::time::Instant::now() < deadline {
+                    if listener.accept().is_ok() {
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                false
+            });
+            (port, handle)
+        };
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/health\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (port, server) = serve_once(redirect);
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, Some(test_bearer())).unwrap();
+        assert!(!service_ready(&endpoint, Duration::from_secs(5)));
+        server.join().unwrap();
+        assert!(!target.join().unwrap(), "redirect target was contacted");
     }
 }

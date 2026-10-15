@@ -35,6 +35,16 @@
 //!   is compared bitwise with a fresh whole-prefix existing GPU conversion.
 //!   Decode and non-gathered routes do not convert or advance the arena.
 //!   Prefix restore invalidates it; the next gathered attend rebuilds it.
+//! * Pooled BF16 mirror (BF-2, opt-in `HIPFIRE_QWEN4_QSA_POOLED_BF16=1`): a
+//!   derived BF16 copy of the canonical F32 pooled index keys. The arm must
+//!   reproduce the off arm's selection, attention, state, logits and ids
+//!   through prefill, rollback, branch and restore. After every phase each
+//!   layer's mirror prefix `[0, valid)` is downloaded and compared with the
+//!   high half of the canonical F32 pooled rows, whose low half must be zero
+//!   (the exactness the mirror relies on). Prefill phases must leave the
+//!   watermark at every pooled block, rollback must clamp it to the restored
+//!   pooled length, no phase may leave it beyond the pooled length, and
+//!   decode never rewinds it. Without the flag no layer may hold a mirror.
 //!
 //! The output protocol (stdout, one line each, parsed fail-closed):
 //!
@@ -63,6 +73,9 @@
 //!   QSA_ORACLE_COMPARE=1        run fresh off/on children and compare every
 //!                                canonical hash before emitting PASS
 //!   QSA_ORACLE_KV_BACKEND=auto|legacy|vmm  exercise either KV backend
+//!   QSA_ORACLE_POOLED=1          with QSA_ORACLE_COMPARE: also run the pooled
+//!                                BF16 mirror arms (without / with the F16
+//!                                arena) and require canonical equality
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
@@ -583,6 +596,110 @@ fn take_records(probe: &SharedProbe) -> Vec<TapRec> {
     std::mem::take(&mut probe.lock().unwrap().records)
 }
 
+// ------------------------------------------------- pooled BF16 mirror
+
+/// What a layer's pooled BF16 mirror watermark must be at a check point.
+enum MirrorRule {
+    /// A prefill just ran: the mirror caught up to every pooled block.
+    Caught,
+    /// Restore or decode: any prefix of the canonical pooled rows.
+    Within,
+    /// Exactly these per-layer marks (rollback clamps to the restored length).
+    Exact(Vec<usize>),
+}
+
+/// Per-layer mirror watermark in blocks (0 without a mirror).
+fn pooled_marks(bundle: &Qwen4Bundle) -> Vec<usize> {
+    bundle
+        .state
+        .qsa
+        .iter()
+        .map(|s| s.pooled_bf16.as_ref().map_or(0, |a| a.valid_blocks.get()))
+        .collect()
+}
+
+/// Compare every layer's mirror prefix with the canonical pooled rows: the
+/// mirror holds the high 16 bits of each F32, whose low 16 bits are zero.
+fn pooled_check(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    probe: &SharedProbe,
+    geo: &Geo,
+    phase: &str,
+    want: bool,
+    rule: &MirrorRule,
+) -> Result<()> {
+    gpu.hip.device_synchronize().map_err(err)?;
+    let dim = geo.index_dim;
+    let mut failures: Vec<String> = Vec::new();
+    let (mut blocks, mut present) = (0usize, 0usize);
+    let mut marks: Vec<usize> = Vec::new();
+    for (slot, layer) in bundle.state.qsa.iter().enumerate() {
+        let Some(arena) = layer.pooled_bf16.as_ref() else {
+            if want {
+                failures.push(format!("{phase} layer {slot}: pooled BF16 mirror missing"));
+            }
+            continue;
+        };
+        if !want {
+            failures.push(format!("{phase} layer {slot}: pooled BF16 mirror present but the flag is off"));
+            continue;
+        }
+        present += 1;
+        let valid = arena.valid_blocks.get();
+        marks.push(valid);
+        if valid > layer.pooled_len {
+            failures.push(format!(
+                "{phase} layer {slot}: mirror claims {valid} valid blocks beyond the {} pooled blocks",
+                layer.pooled_len
+            ));
+            continue;
+        }
+        match rule {
+            MirrorRule::Caught if valid != layer.pooled_len => failures.push(format!(
+                "{phase} layer {slot}: mirror valid {valid}, expected every one of {} pooled blocks",
+                layer.pooled_len
+            )),
+            MirrorRule::Exact(expected) if valid != expected[slot] => failures.push(format!(
+                "{phase} layer {slot}: mirror valid {valid}, expected {}",
+                expected[slot]
+            )),
+            _ => {}
+        }
+        let (mut bad_high, mut bad_low) = (0usize, 0usize);
+        let mut first: Option<String> = None;
+        for b0 in (0..valid).step_by(4096) {
+            let b1 = (b0 + 4096).min(valid);
+            let pooled = read_bytes(gpu, &layer.pooled_keys, b0 * dim * 4, (b1 - b0) * dim * 4)?;
+            let mirror = read_bytes(gpu, &arena.mirror, b0 * dim * 2, (b1 - b0) * dim * 2)?;
+            for (i, (word, half)) in pooled.chunks_exact(4).zip(mirror.chunks_exact(2)).enumerate() {
+                if word[..2] != [0, 0] {
+                    bad_low += 1;
+                    first.get_or_insert_with(|| format!("block {} channel {} low half nonzero", b0 + i / dim, i % dim));
+                }
+                if word[2..] != *half {
+                    bad_high += 1;
+                    first.get_or_insert_with(|| format!("block {} channel {} mirror differs from the F32 high half", b0 + i / dim, i % dim));
+                }
+            }
+        }
+        blocks += valid;
+        if bad_high + bad_low > 0 {
+            failures.push(format!(
+                "{phase} layer {slot}: pooled mirror prefix of {valid} blocks has {bad_high} high-half and {bad_low} low-half violations (first: {})",
+                first.unwrap_or_default()
+            ));
+        }
+    }
+    let mut p = probe.lock().map_err(err)?;
+    p.checks.push(json!({"kind":"pooled_mirror","phase":phase,"layers":present,"blocks":blocks,
+        "marks":marks,"failures":failures.len()}));
+    for message in failures {
+        p.fail(message);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------- state hashing
 
 struct StateRoll {
@@ -748,10 +865,15 @@ fn decode_steps(
     let mut next = first;
     for i in 0..steps {
         let valid_before: Vec<usize> = bundle.state.qsa.iter().map(|s| s.f16_valid_len()).collect();
+        let mirror_before = pooled_marks(bundle);
         bundle.forward_token(gpu, next, logits, None).map_err(err)?;
         let valid_after: Vec<usize> = bundle.state.qsa.iter().map(|s| s.f16_valid_len()).collect();
+        let mirror_after = pooled_marks(bundle);
         if valid_before != valid_after {
             return Err(format!("decode step {i} advanced or invalidated the F16 watermark"));
+        }
+        if mirror_before.iter().zip(&mirror_after).any(|(b, a)| a < b) {
+            return Err(format!("decode step {i} rewound or invalidated the pooled BF16 mirror watermark"));
         }
         let values = download_logits(gpu, logits)?;
         let picked = argmax(&values) as u32;
@@ -773,6 +895,7 @@ fn run_cold_tapped(
     logits: &GpuTensor,
     tokens: &[u32],
     decode: usize,
+    want_pooled: bool,
     failures: &mut Vec<String>,
 ) -> Result<Run> {
     bundle.reset(gpu).map_err(err)?;
@@ -789,6 +912,7 @@ fn run_cold_tapped(
         chunk_logits.push(hash_f32(&values));
         let geo = geo_of(probe)?;
         boundaries.push(hash_state(bundle, gpu, &geo, end, Some(&mut roll))?);
+        pooled_check(bundle, gpu, probe, &geo, &format!("cold chunk ending {end}"), want_pooled, &MirrorRule::Caught)?;
         pos = end;
         if end == CHUNK {
             rollback = Some(bundle.state.snapshot(gpu).map_err(err)?);
@@ -804,6 +928,7 @@ fn run_cold_tapped(
     let first = argmax(&values) as u32;
     let steps = decode_steps(bundle, gpu, logits, first, decode)?;
     let after_decode = hash_state(bundle, gpu, &geo, n + decode, None)?;
+    pooled_check(bundle, gpu, probe, &geo, "cold decode", want_pooled, &MirrorRule::Within)?;
     install_tap(bundle, probe, false)?;
     let cold = Run {
         records: take_records(probe),
@@ -816,6 +941,7 @@ fn run_cold_tapped(
         after_decode,
     };
     let before: Vec<usize> = bundle.state.qsa.iter().map(|s| s.f16_valid_len()).collect();
+    let pooled_before = pooled_marks(bundle);
     if bundle.state.qsa.iter().any(|s| s.f16_arena.is_some())
         && !before.iter().any(|&valid| valid > CHUNK)
     {
@@ -830,6 +956,17 @@ fn run_cold_tapped(
             }
         }
     }
+    let pooled_expected: Vec<usize> = bundle
+        .state
+        .qsa
+        .iter()
+        .zip(&pooled_before)
+        .map(|(s, &valid)| valid.min(s.pooled_len))
+        .collect();
+    if want_pooled && pooled_expected == pooled_before {
+        failures.push("rollback never clamped a pooled BF16 mirror beyond its restored length; use a longer prompt".into());
+    }
+    pooled_check(bundle, gpu, probe, &geo, "rollback restore", want_pooled, &MirrorRule::Exact(pooled_expected))?;
     begin_phase(probe, "rollback", Some(n));
     install_tap(bundle, probe, true)?;
     let mut pos = CHUNK;
@@ -839,9 +976,11 @@ fn run_cold_tapped(
         pos = end;
     }
     let values = download_logits(gpu, logits)?;
+    pooled_check(bundle, gpu, probe, &geo, "rollback continuation prefill", want_pooled, &MirrorRule::Caught)?;
     let final_state = hash_state(bundle, gpu, &geo, n, None)?;
     let steps = decode_steps(bundle, gpu, logits, argmax(&values) as u32, decode)?;
     let after_decode = hash_state(bundle, gpu, &geo, n + decode, None)?;
+    pooled_check(bundle, gpu, probe, &geo, "rollback continuation decode", want_pooled, &MirrorRule::Within)?;
     install_tap(bundle, probe, false)?;
     let continued = Run {
         records: take_records(probe),
@@ -990,6 +1129,7 @@ fn run() -> Result<i32> {
         return Err("QSA_ORACLE_DECODE must be at least 2".into());
     }
     let want_arena = env_flag("HIPFIRE_QWEN4_QSA_F16_ARENA")?;
+    let want_pooled = env_flag("HIPFIRE_QWEN4_QSA_POOLED_BF16")?;
 
     let mut hfq = HfqFile::open(model_path).map_err(err)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(err)?;
@@ -1024,7 +1164,8 @@ fn run() -> Result<i32> {
     let model_bytes = std::fs::metadata(model_path).map_err(err)?.len();
     let device = json!({
         "arch": gpu.arch, "pci": pci, "device_id": gpu.device_id, "uma": gpu.is_uma(),
-        "flags": {"HIPFIRE_QWEN4_QSA_F16_ARENA": std::env::var("HIPFIRE_QWEN4_QSA_F16_ARENA").ok()},
+        "flags": {"HIPFIRE_QWEN4_QSA_F16_ARENA": std::env::var("HIPFIRE_QWEN4_QSA_F16_ARENA").ok(),
+            "HIPFIRE_QWEN4_QSA_POOLED_BF16": std::env::var("HIPFIRE_QWEN4_QSA_POOLED_BF16").ok()},
         "visible": {"HIP_VISIBLE_DEVICES": std::env::var("HIP_VISIBLE_DEVICES").ok(),
             "ROCR_VISIBLE_DEVICES": std::env::var("ROCR_VISIBLE_DEVICES").ok()},
         "model": {"path": model_path.display().to_string(), "bytes": model_bytes,
@@ -1057,6 +1198,9 @@ fn run() -> Result<i32> {
     }
     if state_format.qsa_f16_arena != want_arena {
         return Err("requested arena route is not admitted (requires gfx1151, F32 K/V, head_dim 256 and gathered WMMA enabled)".into());
+    }
+    if state_format.qsa_pooled_bf16 != want_pooled {
+        return Err("requested pooled BF16 mirror route is not admitted (requires gfx1151, F32 K/V, index_dim 128 and the PM BF16 score module)".into());
     }
     if hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env().map_err(err)?.is_some() {
         return Err("host-mapped experts are not supported by the arena oracle".into());
@@ -1129,7 +1273,7 @@ fn run() -> Result<i32> {
     }));
 
     // R0: cold, tapped, chunk by chunk.
-    let cold = run_cold_tapped(&mut bundle, &mut gpu, &probe, &logits, &tokens, decode, &mut failures)?;
+    let cold = run_cold_tapped(&mut bundle, &mut gpu, &probe, &logits, &tokens, decode, want_pooled, &mut failures)?;
     let geo = geo_of(&probe)?;
     if geo.slots != n_qsa {
         failures.push(format!("tap saw {} QSA layers, the state holds {n_qsa}", geo.slots));
@@ -1145,6 +1289,7 @@ fn run() -> Result<i32> {
     let route = json!({
         "state_format": format!("{state_format:?}"), "qsa_kv": geo.kv_format.name(),
         "index_dtype": format!("{:?}", geo.index_dtype), "f16_arena_present": geo.arena,
+        "pooled_bf16_layers": bundle.state.qsa.iter().filter(|s| s.pooled_bf16.is_some()).count(),
         "qsa_layers": n_qsa, "backend": backend.name(), "chunk_rows": chunk_rows,
         "scratch_mode": scratch_label,
         "wmma_gather": rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, state_format.qsa),
@@ -1161,9 +1306,11 @@ fn run() -> Result<i32> {
     bundle.prefill_final(&mut gpu, &tokens, 0, &logits).map_err(err)?;
     let values = download_logits(&gpu, &logits)?;
     let control_state = hash_state(&mut bundle, &mut gpu, &geo, n, None)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "untapped prefill", want_pooled, &MirrorRule::Caught)?;
     let control_logits = hash_f32(&values);
     bundle.session_commit();
     let control_steps = decode_steps(&mut bundle, &mut gpu, &logits, argmax(&values) as u32, decode)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "untapped decode", want_pooled, &MirrorRule::Within)?;
     if control_state.combined != cold.final_state.combined {
         failures.push("untapped production prefill state differs from the tapped cold prefill".into());
     }
@@ -1186,6 +1333,7 @@ fn run() -> Result<i32> {
     }
     bundle.prefill_final(&mut gpu, &branch, 0, &logits).map_err(err)?;
     let branch_state = hash_state(&mut bundle, &mut gpu, &geo, branch.len(), None)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "branch prefill", want_pooled, &MirrorRule::Caught)?;
     bundle.session_commit();
     if branch_state.combined == cold.final_state.combined || branch_state.position == n {
         failures.push("branch prefill did not overwrite the live state".into());
@@ -1200,6 +1348,7 @@ fn run() -> Result<i32> {
     }
     bundle.prefill_final(&mut gpu, &tokens[..reused], reused, &logits).map_err(err)?;
     let restored = hash_state(&mut bundle, &mut gpu, &geo, reused, None)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "prefix restore", want_pooled, &MirrorRule::Within)?;
     match cold.boundaries.iter().find(|b| b.position == reused) {
         Some(b) if b.combined == restored.combined => {}
         Some(_) => failures.push(format!("state restored at {reused} differs from the cold state at that boundary")),
@@ -1229,9 +1378,11 @@ fn run() -> Result<i32> {
     bundle.prefill_final(&mut gpu, &tokens, reused, &logits).map_err(err)?;
     let values = download_logits(&gpu, &logits)?;
     let restored_final = hash_state(&mut bundle, &mut gpu, &geo, n, None)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "restored tail prefill", want_pooled, &MirrorRule::Caught)?;
     let first = argmax(&values) as u32;
     let steps = decode_steps(&mut bundle, &mut gpu, &logits, first, decode)?;
     let after_decode = hash_state(&mut bundle, &mut gpu, &geo, n + decode, None)?;
+    pooled_check(&bundle, &gpu, &probe, &geo, "restored decode", want_pooled, &MirrorRule::Within)?;
     install_tap(&mut bundle, &probe, false)?;
     let warm = Run {
         records: take_records(&probe),
@@ -1280,6 +1431,12 @@ fn finish(
         for check in &p.checks {
             emit(out, check)?;
         }
+        let mirror_checks: Vec<&Value> =
+            p.checks.iter().filter(|c| c["kind"] == "pooled_mirror").collect();
+        let layers = mirror_checks.iter().filter_map(|c| c["layers"].as_u64()).max().unwrap_or(0);
+        let blocks: u64 = mirror_checks.iter().filter_map(|c| c["blocks"].as_u64()).sum();
+        println!("ARENA_MIRROR {}", json!({"present": layers > 0, "layers": layers,
+            "checks": mirror_checks.len(), "blocks": blocks}));
     }
     for (i, b) in cold.boundaries.iter().enumerate() {
         emit(out, &b.json(&format!("cold_boundary_{i}")))?;
@@ -1367,13 +1524,20 @@ fn finish(
 /// external driver, but do not report PASS until cross-arm bytes agree.
 fn compare_processes(args: &[String]) -> Result<i32> {
     let exe = std::env::current_exe().map_err(err)?;
+    // (name, F16 arena flag, pooled BF16 mirror flag)
+    let mut arms: Vec<(&str, &str, &str)> = vec![("off", "0", "0"), ("on", "1", "0")];
+    if env_flag("QSA_ORACLE_POOLED")? {
+        arms.push(("pooled", "0", "1"));
+        arms.push(("pooled_arena", "1", "1"));
+    }
     let mut outputs = Vec::new();
-    for (name, flag) in [("off", "0"), ("on", "1")] {
+    for (name, arena, pooled) in &arms {
         let jsonl = format!("{}.{}.jsonl", args[3], name);
         let child = std::process::Command::new(&exe)
             .args([&args[1], &args[2], &jsonl])
             .env("QSA_ORACLE_COMPARE", "0")
-            .env("HIPFIRE_QWEN4_QSA_F16_ARENA", flag)
+            .env("HIPFIRE_QWEN4_QSA_F16_ARENA", arena)
+            .env("HIPFIRE_QWEN4_QSA_POOLED_BF16", pooled)
             .output().map_err(err)?;
         let stdout = String::from_utf8(child.stdout).map_err(err)?;
         std::fs::write(format!("{}.{}.stdout.txt", args[3], name), &stdout).map_err(err)?;
@@ -1388,15 +1552,28 @@ fn compare_processes(args: &[String]) -> Result<i32> {
         if canonical_count != 7 || !hashes.iter().any(|l| l.starts_with("ARENA_LAYER_HASH ")) {
             return Err(format!("{name} child has incomplete canonical/per-layer hashes"));
         }
+        let mirror: Value = stdout.lines()
+            .find_map(|l| l.strip_prefix("ARENA_MIRROR "))
+            .ok_or_else(|| format!("{name} child printed no ARENA_MIRROR line"))
+            .and_then(|l| serde_json::from_str(l).map_err(err))?;
+        let want = *pooled == "1";
+        let exercised = mirror["checks"].as_u64().unwrap_or(0) > 0 && mirror["blocks"].as_u64().unwrap_or(0) > 0;
+        if mirror["present"].as_bool() != Some(want) || (want && !exercised) {
+            return Err(format!("{name} child pooled mirror evidence is wrong for pooled={want}: {mirror}"));
+        }
         outputs.push((stdout, hashes));
     }
-    if outputs[0].1 != outputs[1].1 {
-        return Err("off/on canonical or per-layer attention hashes differ".into());
+    for (i, (name, _, _)) in arms.iter().enumerate().skip(1) {
+        if outputs[0].1 != outputs[i].1 {
+            return Err(format!("off/{name} canonical or per-layer attention hashes differ"));
+        }
     }
-    for line in outputs[1].0.lines().filter(|l| *l != "ARENA_RESULT PASS") {
+    let last = outputs.len() - 1;
+    for line in outputs[last].0.lines().filter(|l| *l != "ARENA_RESULT PASS") {
         println!("{line}");
     }
-    std::fs::write(&args[3], json!({"kind":"comparison","off":"0","on":"1","equal":true}).to_string()).map_err(err)?;
+    let names: Vec<&str> = arms.iter().map(|a| a.0).collect();
+    std::fs::write(&args[3], json!({"kind":"comparison","off":"0","on":"1","arms":names,"equal":true}).to_string()).map_err(err)?;
     println!("ARENA_ARMS_EQUAL");
     println!("ARENA_RESULT PASS");
     Ok(0)

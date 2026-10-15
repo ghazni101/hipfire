@@ -36,6 +36,9 @@ mod dev_tiny;
 #[cfg(feature = "qwen4-dev-profiles")]
 pub(crate) use dev_tiny::{run_dev_tiny_cli, Qwen4DevTinyEncoding};
 
+mod stock_fp8;
+pub(crate) use stock_fp8::run_stock_fp8_cli;
+
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
 /// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale
 /// block is why this cannot go through the uniform `(group, bytes)` model.
@@ -2114,6 +2117,8 @@ fn parse_safetensors_header_from_shard(
             "I64" => checked_product(&shape, name)?
                 .checked_mul(8)
                 .ok_or_else(|| Qwen4Error::Invalid(format!("{name} I64 length overflows")))?,
+            // One byte per element: stock FP8 checkpoints (`--recipe stock-fp8`).
+            "F8_E4M3" => checked_product(&shape, name)?,
             _ => relative_len,
         };
         if relative_len != expected_len {
@@ -3334,6 +3339,46 @@ fn build_metadata(
     ple: &PleMetadata,
     tokenizer: Option<&TokenizerMetadata>,
 ) -> Result<String, Qwen4Error> {
+    let recipe = json!({
+        "version": 2,
+        "stacked_experts": true,
+        "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
+        "matrix": plan_matrix_recipe(plan),
+        "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
+        "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
+        // The eight-bit classes: the token embedding and the language head,
+        // which every MoE recipe in this tree holds at Q8F16 rather than at
+        // a four-bit matrix tier.
+        "eight_bit": ["embed_tokens.weight", "lm_head.weight"],
+        // Parameters that keep source BF16 bytes; they are covered by
+        // neither format above.
+        "source_exact": [
+            "hyper_connection",
+            "mtp.fc_embedding.weight",
+            "mtp.fc_hidden.weight"
+        ],
+        "mtp_experts": "same_as_trunk"
+    });
+    let streaming = json!({
+        "version": 1,
+        "row_chunk": plan.row_chunk,
+        "resident_entries": plan.resident_entries,
+        "expert_entries": plan.expert_entries,
+        "external_ple_entries": plan.ple_shards,
+    });
+    build_metadata_document(config, recipe, streaming, ple, tokenizer)
+}
+
+/// Shared HFQM metadata envelope.  `recipe` becomes `qwen4_recipe` and
+/// `streaming` becomes `qwen4_streaming`; config, the PLE marker and the
+/// tokenizer are identical across recipes.
+fn build_metadata_document(
+    config: Option<&Value>,
+    recipe: Value,
+    streaming: Value,
+    ple: &PleMetadata,
+    tokenizer: Option<&TokenizerMetadata>,
+) -> Result<String, Qwen4Error> {
     let _valid_rows =
         validate_ple_metadata(&ple.multipliers, &ple.vocab_sizes, &ple.prefix_offsets)?;
     let physical_rows = (PLE_SHARD_COUNT as u64)
@@ -3354,29 +3399,7 @@ fn build_metadata(
             .cloned()
             .unwrap_or_else(|| json!({"model_type": "qwen4_exp"})),
     );
-    root.insert(
-        "qwen4_recipe".to_string(),
-        json!({
-            "version": 2,
-            "stacked_experts": true,
-            "routing": {"num_experts": ROUTED_EXPERTS, "top_k": ROUTER_TOP_K},
-            "matrix": plan_matrix_recipe(plan),
-            "gate_up": {"quant_type": MQ4G256V2_QUANT_TYPE, "format": "MQ4G256V2", "group_size": MQ4G256V2_GROUP_SIZE, "k": HIDDEN_WIDTH},
-            "down": {"quant_type": MQ4G128V2_QUANT_TYPE, "format": "MQ4G128V2", "group_size": MQ4G128V2_GROUP_SIZE, "k": DOWN_INTERMEDIATE},
-            // The eight-bit classes: the token embedding and the language head,
-            // which every MoE recipe in this tree holds at Q8F16 rather than at
-            // a four-bit matrix tier.
-            "eight_bit": ["embed_tokens.weight", "lm_head.weight"],
-            // Parameters that keep source BF16 bytes; they are covered by
-            // neither format above.
-            "source_exact": [
-                "hyper_connection",
-                "mtp.fc_embedding.weight",
-                "mtp.fc_hidden.weight"
-            ],
-            "mtp_experts": "same_as_trunk"
-        }),
-    );
+    root.insert("qwen4_recipe".to_string(), recipe);
     root.insert(
         "qwen4_ple".to_string(),
         json!({
@@ -3387,16 +3410,7 @@ fn build_metadata(
             "padded_rows": physical_rows,
         }),
     );
-    root.insert(
-        "qwen4_streaming".to_string(),
-        json!({
-            "version": 1,
-            "row_chunk": plan.row_chunk,
-            "resident_entries": plan.resident_entries,
-            "expert_entries": plan.expert_entries,
-            "external_ple_entries": plan.ple_shards,
-        }),
-    );
+    root.insert("qwen4_streaming".to_string(), streaming);
     if let Some(tokenizer) = tokenizer {
         root.insert(
             "tokenizer".to_string(),

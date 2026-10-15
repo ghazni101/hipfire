@@ -8,21 +8,25 @@
 //! and the `serve` subcommand entrypoints. Centralises all state that must be
 //! shared across HTTP workers so transport changes stay isolated.
 
+use crate::process_identity::{
+    pid_alive, pid_owns_listen_port, process_start_time, serve_process_matches,
+};
 use crate::{
     apply_kv_axis_overrides, apply_speculation_selector, config_bool, config_f64, config_i64,
     config_string, config_u64, find_daemon, find_model_path, http_get_json, list_local_models,
     load_params, port_in_use, probe_host, pull_command, reap_install_daemons,
     resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
-    Paths, PullArgs, ServeArgs, StopArgs,
+    Paths, PullArgs, ServeArgs, ServiceEndpoint, StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
+use hipfire_config::secret::BearerToken;
 use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
 use hipfire_registry::{load as load_registry, RegistryV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -35,6 +39,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod anthropic;
+// Windows-only at runtime; compiled everywhere so its tests run on Linux.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod management;
 pub(crate) mod metrics;
 
 pub mod complete;
@@ -209,7 +216,14 @@ pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bo
         && meta.last_activity.elapsed() >= idle_timeout
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `serve.pid`: which process is serve and how to reach it.
+///
+/// `token` is the `/health` instance token and is not a secret. `manage_token`
+/// is the Windows management credential (see [`management`]); it is a secret,
+/// so this type's `Debug` redacts it and [`ServePidRecord::to_public_json`]
+/// omits it. Unix serves and records written before management existed have
+/// no `manage_*` fields, and none are serialized when absent.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ServePidRecord {
     pub(crate) pid: u32,
     #[serde(default)]
@@ -218,8 +232,52 @@ pub(crate) struct ServePidRecord {
     pub(crate) port: Option<u16>,
     #[serde(default)]
     pub(crate) token: Option<String>,
+    /// Loopback port of the authenticated management listener (Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manage_port: Option<u16>,
+    /// Management bearer credential. Secret: never log, print, or `Debug` it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manage_token: Option<String>,
     #[serde(skip)]
     pub(crate) legacy: bool,
+}
+
+impl ServePidRecord {
+    /// The record as shown to users (`hipfire ps`): every serialized field
+    /// except the management credential, which is replaced by a presence flag.
+    /// A record without management fields renders exactly as it serializes.
+    pub(crate) fn to_public_json(&self) -> serde_json::Value {
+        let mut public = serde_json::json!({
+            "pid": self.pid,
+            "start_time": self.start_time,
+            "port": self.port,
+            "token": self.token,
+        });
+        if let Some(port) = self.manage_port {
+            public["manage_port"] = port.into();
+        }
+        if self.manage_token.is_some() {
+            public["manage_token_present"] = true.into();
+        }
+        public
+    }
+}
+
+impl std::fmt::Debug for ServePidRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServePidRecord")
+            .field("pid", &self.pid)
+            .field("start_time", &self.start_time)
+            .field("port", &self.port)
+            .field("token", &self.token)
+            .field("manage_port", &self.manage_port)
+            .field(
+                "manage_token",
+                &self.manage_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("legacy", &self.legacy)
+            .finish()
+    }
 }
 
 /// Facts about the resident model taken from the daemon's load ack.
@@ -379,6 +437,10 @@ pub(crate) struct ServeShared {
     /// `serve.ui` / `--ui`: the /ui chat-frontend routes are live. Immutable
     /// for the process lifetime, like `capabilities`.
     pub(crate) ui_enabled: bool,
+    /// Bearer token every route except the minimal `/health` requires. `None`
+    /// (no API key configured) leaves every route open, as before. Never
+    /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
+    pub(crate) api_key: Option<BearerToken>,
 }
 
 /// Build the route capability advertisement from the resolved serve
@@ -1142,6 +1204,59 @@ pub(crate) fn batch_messages_are_text_chat(body: &serde_json::Value) -> bool {
     })
 }
 
+/// Shown when the embedded chat UI is enabled alongside an API key.
+const UI_AUTH_NOTICE: &str = "chat UI routes require the API key bearer token, which the \
+     embedded UI cannot send; browsers will receive 401 for /ui";
+
+/// `--api-key-file` value parser: an absolute, non-empty path. The file
+/// content is read later by `BearerToken::load`, never by clap.
+pub(crate) fn parse_api_key_file_arg(raw: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if raw.is_empty() || !path.is_absolute() {
+        return Err("must be a non-empty absolute path".to_owned());
+    }
+    Ok(path)
+}
+
+/// Effective serve bearer token: `--api-key-file` wins over
+/// `serve.api_key_file` (config file / `HIPFIRE_SERVE_API_KEY_FILE`). `None`
+/// when neither is set. Errors name the file path, never its content.
+pub(crate) fn resolve_api_key(
+    args: &ServeArgs,
+    resolved: &hipfire_config::ResolvedConfig,
+) -> Result<Option<BearerToken>> {
+    let path = match &args.api_key_file {
+        Some(path) => path.clone(),
+        None => {
+            let configured = config_string(resolved, "serve.api_key_file")?;
+            if configured.is_empty() {
+                return Ok(None);
+            }
+            PathBuf::from(configured)
+        }
+    };
+    BearerToken::load(&path)
+        .map(Some)
+        .with_context(|| format!("failed to load serve API key file {}", path.display()))
+}
+
+/// Notice for a non-loopback bind with no API key: every client that can
+/// reach the address can use the model. `None` when a key is set or the bind
+/// is loopback. Advisory only; serving is never refused for lack of a key.
+pub(crate) fn unauthenticated_bind_notice(
+    host: &str,
+    port: u16,
+    api_key: Option<&BearerToken>,
+) -> Option<String> {
+    if api_key.is_some() || host_is_loopback(host) {
+        return None;
+    }
+    Some(format!(
+        "serving on {host}:{port} without authentication; set serve.api_key_file \
+         (or --api-key-file) to require a bearer token"
+    ))
+}
+
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let default_host = config_string(&resolved, "serve.host")?;
@@ -1166,7 +1281,8 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
             bail!("vision sidecar not found: {}", vision.display());
         }
     }
-    serve_foreground(paths, &args, &host, port, resolved)
+    let api_key = resolve_api_key(&args, &resolved)?;
+    serve_foreground(paths, &args, &host, port, resolved, api_key)
 }
 pub(crate) fn resolve_serve_positionals(
     paths: &Paths,
@@ -1306,6 +1422,9 @@ fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port:
     if args.ui || args.open {
         command.arg("--ui");
     }
+    if let Some(api_key_file) = &args.api_key_file {
+        command.arg("--api-key-file").arg(api_key_file);
+    }
     command
 }
 
@@ -1314,6 +1433,12 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     let log_path = paths.root.join("serve.log");
     let pid_path = paths.root.join("serve.pid");
     let health_host = probe_host(host);
+    let (_, resolved) = resolved_global(paths, true)?;
+    let api_key = resolve_api_key(args, &resolved)?;
+    let has_api_key = api_key.is_some();
+    // Credential-aware readiness/identity probe: a keyed server answers the
+    // pid/token payload only to a request bearing the token.
+    let endpoint = ServiceEndpoint::local(health_host, port, api_key)?;
     // An existing server must be reported, not raced: a second child would
     // die on the GPU lock or the bind while the old server's /health made
     // the readiness loop below report a false success.
@@ -1338,7 +1463,7 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
             );
         }
     }
-    if let Some(health) = http_get_json(health_host, port, "/health") {
+    if let Ok(health) = http_get_json(&endpoint, "/health", Duration::from_secs(1)) {
         match health.get("pid").and_then(serde_json::Value::as_u64) {
             Some(pid) => bail!(
                 "port {port} is already served by hipfire (pid {pid}) not tracked by {}; \
@@ -1380,9 +1505,10 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
         }
         // Only this child counts as ready: another responder on the port
         // must not turn a failed spawn into a reported success.
-        let ours = http_get_json(health_host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
-        });
+        let ours =
+            http_get_json(&endpoint, "/health", Duration::from_secs(1)).is_ok_and(|health| {
+                health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
+            });
         if ours {
             println!(
                 "hipfire serve running at http://{}:{} (PID {}, log {})",
@@ -1399,7 +1525,9 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                 .unwrap_or(false);
             if args.ui || args.open || ui_via_config {
                 println!("chat UI: {}", serve_ui_url(host, port));
-                if !host_is_loopback(host) {
+                if has_api_key {
+                    println!("{UI_AUTH_NOTICE}");
+                } else if !host_is_loopback(host) {
                     println!(
                         "WARNING: chat UI is unauthenticated and bound to {host} — \
                          reachable from non-loopback clients"
@@ -1490,6 +1618,7 @@ pub(crate) fn serve_foreground(
     host: &str,
     port: u16,
     global: hipfire_config::ResolvedConfig,
+    api_key: Option<BearerToken>,
 ) -> Result<()> {
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let registry = load_registry(&paths.registry).registry;
@@ -1614,13 +1743,22 @@ pub(crate) fn serve_foreground(
     // `--open` implies `--ui`: the launcher promise is meaningless without
     // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
     let ui_enabled = args.ui || args.open || config_bool(&global, "serve.ui")?;
-    if ui_enabled && !host_is_loopback(host) {
-        // The gateway already answers /v1/chat/completions cross-origin; the
-        // UI flag makes that reachable from any browser on the network.
-        eprintln!(
-            "[hipfire] WARNING: chat UI is unauthenticated and bound to {host} — \
-             reachable from non-loopback clients"
-        );
+    if ui_enabled {
+        if api_key.is_some() {
+            eprintln!("[hipfire] {UI_AUTH_NOTICE}");
+        } else if !host_is_loopback(host) {
+            // The gateway already answers /v1/chat/completions cross-origin; the
+            // UI flag makes that reachable from any browser on the network.
+            eprintln!(
+                "[hipfire] WARNING: chat UI is unauthenticated and bound to {host} — \
+                 reachable from non-loopback clients"
+            );
+        }
+    }
+    // Foreground only: a detached parent never prints this, its child does
+    // (into serve.log) when it re-enters here as the foreground process.
+    if let Some(notice) = unauthenticated_bind_notice(host, port, api_key.as_ref()) {
+        eprintln!("[hipfire] {notice}");
     }
     let instance_token = serve_instance_token();
     // Admission width: experimental multi-slot projects N concurrent daemon
@@ -1705,6 +1843,7 @@ pub(crate) fn serve_foreground(
         backoff_hook: Mutex::new(None),
         stream_stall_timeout,
         ui_enabled,
+        api_key,
     });
     let bind = format_bind(host, port);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1714,23 +1853,59 @@ pub(crate) fn serve_foreground(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(&bind))
         .map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
+    // Windows management listener: a separate loopback port and credential,
+    // owned only by `management::serve_management`; `ServeShared` and the
+    // inference listener never see either. Windows has no signal `hipfire
+    // stop` can deliver, so stop reaches the shutdown token through it. Unix
+    // keeps SIGTERM and binds nothing extra.
+    #[cfg(windows)]
+    let (manage_listener, manage_credential) = (
+        runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .context("failed to bind serve management listener")?,
+        Arc::new(management::ManagementCredential::generate()?),
+    );
+    #[cfg(windows)]
+    let (manage_port, manage_token) = (
+        Some(
+            manage_listener
+                .local_addr()
+                .context("management listener address")?
+                .port(),
+        ),
+        Some(manage_credential.expose().to_owned()),
+    );
+    #[cfg(not(windows))]
+    let (manage_port, manage_token) = (None, None);
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = ServePidRecord {
         pid: std::process::id(),
-        start_time: proc_start_time(std::process::id()),
+        start_time: process_start_time(std::process::id()),
         port: Some(port),
         token: Some(instance_token),
+        manage_port,
+        manage_token,
         legacy: false,
     };
+    #[cfg(windows)]
+    write_pid_record(&pid_path, &pid_record)?;
+    #[cfg(not(windows))]
     fs::write(
         &pid_path,
         format!("{}\n", serde_json::to_string(&pid_record)?),
     )?;
     let cleanup = pid_path.clone();
-    // SIGINT/SIGTERM stops accepting and lets requests in flight finish
-    // (bounded, see http::serve_listener_until); a second signal exits now.
+    // SIGINT/SIGTERM (and on Windows an authenticated management shutdown)
+    // stops accepting and lets requests in flight finish (bounded, see
+    // http::serve_listener_until); a second signal exits now.
     let shutdown = CancellationToken::new();
+    #[cfg(windows)]
+    runtime.spawn(management::serve_management(
+        manage_listener,
+        manage_credential,
+        shutdown.clone(),
+    ));
     let signal_shutdown = shutdown.clone();
     ctrlc::set_handler(move || {
         if signal_shutdown.is_cancelled() {
@@ -1850,6 +2025,49 @@ pub(crate) fn serve_foreground(
     Ok(())
 }
 
+/// Write the Windows `serve.pid`, which carries the management credential,
+/// without following a file planted at its name.
+///
+/// The record goes to a fresh temp file created exclusively (never reuses an
+/// existing file), then renamed over `serve.pid` (rename replaces the name
+/// itself). The file inherits the ACL of the hipfire home directory, which is
+/// the user's profile. Unix records carry no secret and are written as before.
+#[cfg(windows)]
+fn write_pid_record(pid_path: &Path, record: &ServePidRecord) -> Result<()> {
+    let tmp_path = pid_path.with_file_name(format!("serve.pid.{}.tmp", std::process::id()));
+    let body = format!("{}\n", serde_json::to_string(record)?);
+    let create = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+    };
+    let mut file = match create() {
+        Ok(file) => file,
+        // A leftover from a crashed serve with this PID; remove (the name
+        // itself, never a symlink target) and retry once.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to clear stale {}", tmp_path.display()))?;
+            create().with_context(|| format!("failed to create {}", tmp_path.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", tmp_path.display()))
+        }
+    };
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, pid_path)
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error).with_context(|| format!("failed to write {}", pid_path.display()));
+    }
+    Ok(())
+}
+
 pub(crate) fn format_bind(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
@@ -1936,14 +2154,7 @@ impl ServeRuntime {
                 ))
                 .into());
             }
-            pull_command(
-                &self.paths,
-                PullArgs {
-                    model: model.to_owned(),
-                    force: false,
-                    ple: crate::ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(&self.paths, PullArgs::defaults(model))?;
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
@@ -2450,74 +2661,28 @@ pub(crate) fn serve_instance_token() -> String {
     format!("{:x}", digest.finalize())
 }
 
-pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
-    let mut listen_inodes = BTreeSet::new();
-    let port_hex = format!("{port:04X}");
-    let mut read_any = false;
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(raw) = fs::read_to_string(table) else {
-            continue;
-        };
-        read_any = true;
-        for line in raw.lines().skip(1) {
-            let columns = line.split_whitespace().collect::<Vec<_>>();
-            if columns.len() < 10 || columns[3] != "0A" {
-                continue;
-            }
-            let Some((_, local_port)) = columns[1].rsplit_once(':') else {
-                continue;
-            };
-            if local_port.eq_ignore_ascii_case(&port_hex) {
-                listen_inodes.insert(columns[9].to_owned());
-            }
-        }
-    }
-    if !read_any {
-        return None;
-    }
-    if listen_inodes.is_empty() {
-        return Some(false);
-    }
-    let entries = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
-    for entry in entries.flatten() {
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        if let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|value| value.strip_suffix(']'))
-        {
-            if listen_inodes.contains(inode) {
-                return Some(true);
-            }
-        }
-    }
-    Some(false)
-}
-
 pub(crate) fn validate_serve_pid(
     record: &ServePidRecord,
     host: &str,
     fallback_port: u16,
 ) -> Result<()> {
-    let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
-    if !proc_dir.is_dir() {
+    if !pid_alive(record.pid) {
         bail!("tracked serve PID {} is no longer alive", record.pid);
     }
-    let cmdline = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
-    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-    if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
+    if !serve_process_matches(record.pid) {
         bail!("PID {} is not a hipfire serve process", record.pid);
     }
+    // Windows has no cmdline/legacy fallback: the process creation time is
+    // the identity that survives PID reuse, so a record without one cannot be
+    // trusted there.
+    if cfg!(windows) && record.start_time.is_none() {
+        bail!(
+            "serve.pid has no process creation identity for PID {}; cannot prove it is the recorded serve",
+            record.pid
+        );
+    }
     if let Some(expected) = record.start_time {
-        if proc_start_time(record.pid) != Some(expected) {
+        if process_start_time(record.pid) != Some(expected) {
             bail!("PID {} was reused after serve.pid was written", record.pid);
         }
     }
@@ -2530,19 +2695,112 @@ pub(crate) fn validate_serve_pid(
             record.pid
         );
     }
-    let health_matches = record.token.as_deref().is_some_and(|expected| {
-        http_get_json(host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
-                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-    });
-    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
+    // Windows accepts only an owned listen port: no health-token or legacy
+    // fallback. Elsewhere a matching /health token (or a legacy record on a
+    // host that cannot enumerate sockets) also proves ownership. The probe
+    // carries the configured bearer: a keyed serve redacts pid/token from
+    // unauthenticated /health.
+    let health_matches = || -> Result<bool> {
+        let Some(expected) = record.token.as_deref() else {
+            return Ok(false);
+        };
+        let (_, resolved) = resolved_global(&Paths::discover()?, true)?;
+        let endpoint = crate::local_service_endpoint(&resolved, host, port)?;
+        Ok(http_get_json(&endpoint, "/health", Duration::from_secs(1))
+            .ok()
+            .is_some_and(|health| {
+                health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
+                    && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
+            }))
+    };
+    let proven = owns_port == Some(true)
+        || !cfg!(windows) && (health_matches()? || record.legacy && owns_port.is_none());
+    if proven {
         Ok(())
     } else {
         bail!(
             "could not prove ownership of PID {} with port or health token",
             record.pid
         )
+    }
+}
+
+/// Stop a serve whose identity `validate_serve_pid` has proven: SIGTERM, then
+/// wait up to 5 s for the process to disappear.
+#[cfg(unix)]
+fn stop_validated_serve(record: &ServePidRecord) -> Result<()> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(record.pid.to_string())
+        .status()
+        .context("failed to invoke kill")?;
+    if !status.success() {
+        bail!("failed to stop native serve PID {}", record.pid);
+    }
+    for _ in 0..50 {
+        if !pid_alive(record.pid) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// How long `hipfire stop` waits for a management-requested shutdown: serve's
+/// listener drain (30 s) plus a 5 s margin for exit.
+#[cfg(windows)]
+const MANAGED_STOP_WAIT: Duration = http::SHUTDOWN_DRAIN.saturating_add(Duration::from_secs(5));
+
+/// Stop a validated serve through its authenticated management endpoint.
+/// Windows never terminates a process: a record without management fields
+/// (written by an older serve) cannot be stopped from here.
+#[cfg(windows)]
+fn stop_validated_serve(record: &ServePidRecord) -> Result<()> {
+    let (Some(manage_port), Some(credential)) =
+        (record.manage_port, record.manage_token.as_deref())
+    else {
+        bail!(
+            "serve PID {} was started by a hipfire without authenticated management, so this \
+             version will not terminate it; press Ctrl-C in its console to stop it, then start \
+             serve again with this hipfire (serve.pid left in place)",
+            record.pid
+        );
+    };
+    // Never hand the credential to a socket the recorded serve does not own.
+    if pid_owns_listen_port(record.pid, manage_port) != Some(true) {
+        bail!(
+            "PID {} does not own its recorded management port {manage_port}; not sending the \
+             management credential (serve.pid left in place)",
+            record.pid
+        );
+    }
+    management::request_shutdown(manage_port, credential)?;
+    wait_for_serve_exit(record, MANAGED_STOP_WAIT, Duration::from_millis(100))
+}
+
+/// Wait until the recorded serve is gone (or its PID now belongs to a process
+/// with a different creation time). If it is still running at `timeout`,
+/// report that instead of claiming it stopped.
+#[cfg(any(windows, test))]
+fn wait_for_serve_exit(record: &ServePidRecord, timeout: Duration, poll: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let gone = !pid_alive(record.pid)
+            || record.start_time.is_some_and(|expected| {
+                process_start_time(record.pid).is_some_and(|actual| actual != expected)
+            });
+        if gone {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "serve PID {} accepted the shutdown request but is still running after {} s; \
+                 serve.pid left in place",
+                record.pid,
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(poll);
     }
 }
 
@@ -2570,6 +2828,10 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
                 })
                 .unwrap_or(11435);
             if let Err(error) = validate_serve_pid(&record, probe_host(&host), fallback_port) {
+                #[cfg(windows)]
+                if pid_alive(record.pid) {
+                    bail!("{error}; serve.pid left in place. Stop the original serve with Ctrl-C, then restart it with this hipfire");
+                }
                 fs::remove_file(&pid_path)?;
                 if !args.force {
                     bail!("{error}; removed stale pidfile without signaling");
@@ -2578,20 +2840,7 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
                     "warning: {error}; refusing direct PID signal and continuing forced reap"
                 );
             } else {
-                let status = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(record.pid.to_string())
-                    .status()
-                    .context("failed to invoke kill")?;
-                if !status.success() {
-                    bail!("failed to stop native serve PID {}", record.pid);
-                }
-                for _ in 0..50 {
-                    if !Path::new(&format!("/proc/{}", record.pid)).exists() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
+                stop_validated_serve(&record)?;
                 let _ = fs::remove_file(&pid_path);
                 println!("hipfire serve stopped (PID {})", record.pid);
             }
@@ -2610,6 +2859,7 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
         // this install's daemon binary and whose HIPFIRE_HOME is this home);
         // never `pkill -x daemon`, which hit every user's process named daemon.
         let reaped = reap_install_daemons(paths)?;
+        #[cfg(unix)]
         if args.all {
             let _ = Command::new("pkill")
                 .args(["-f", "target/release/hipfire-quantize"])
@@ -2641,6 +2891,8 @@ pub(crate) fn parse_pid_record(raw: &str) -> Option<ServePidRecord> {
             start_time: None,
             port: None,
             token: None,
+            manage_port: None,
+            manage_token: None,
             legacy: true,
         });
     }
@@ -2729,6 +2981,31 @@ mod tests {
     }
 
     #[test]
+    fn management_pid_record_roundtrip_redacts_public_output() {
+        let legacy = parse_pid_record("42").unwrap();
+        assert!(legacy.manage_port.is_none());
+        assert!(legacy.manage_token.is_none());
+        let record = parse_pid_record(r#"{"pid":43,"start_time":7,"port":8080,"token":"instance","manage_port":8081,"manage_token":"secret"}"#).unwrap();
+        assert_eq!(
+            parse_pid_record(&serde_json::to_string(&record).unwrap()),
+            Some(record.clone())
+        );
+        let public = record.to_public_json();
+        assert_eq!(public["manage_token_present"], true);
+        assert!(public.get("manage_token").is_none());
+        assert!(!public.to_string().contains("secret"));
+        assert!(!format!("{record:?}").contains("secret"));
+        // A unix record (no management) serializes and renders as before.
+        let unix = r#"{"pid":44,"start_time":9,"port":8080,"token":"instance"}"#;
+        let unix_record = parse_pid_record(unix).unwrap();
+        assert_eq!(serde_json::to_string(&unix_record).unwrap(), unix);
+        assert_eq!(
+            unix_record.to_public_json(),
+            serde_json::to_value(&unix_record).unwrap()
+        );
+    }
+
+    #[test]
     fn detach_failure_line_prefers_fatal_then_hipfire() {
         let gpu_lock = "[daemon] loading\n\
                         FATAL: failed to install process configuration: GPU 1 reserved by holder PID 7\n\
@@ -2808,6 +3085,53 @@ mod tests {
             panic!("expected serve command")
         };
         args
+    }
+
+    #[test]
+    fn api_key_file_flag_is_absolute_and_forwarded_to_the_detached_child() {
+        for bad in ["relative/api.key", ""] {
+            assert!(parse_api_key_file_arg(bad).is_err(), "{bad:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["hipfire", "serve", "--api-key-file", "relative/api.key"])
+                .is_err()
+        );
+
+        let key = if cfg!(windows) {
+            r"C:\hipfire\api key.txt"
+        } else {
+            "/etc/hipfire/api key.txt"
+        };
+        let args = parse_serve_args(&["hipfire", "serve", "--api-key-file", key, "--detach"]);
+        let command = detached_serve_command(Path::new("hipfire"), &args, "127.0.0.1", 11435);
+        let argv = command_args(&command);
+        assert_eq!(
+            flag_values(&argv, "--api-key-file"),
+            vec![Some(&std::ffi::OsString::from(key))]
+        );
+        assert_eq!(
+            reparse_child(&argv).api_key_file.as_deref(),
+            Some(Path::new(key))
+        );
+
+        let keyless = parse_serve_args(&["hipfire", "serve", "--detach"]);
+        let argv = command_args(&detached_serve_command(
+            Path::new("hipfire"),
+            &keyless,
+            "127.0.0.1",
+            11435,
+        ));
+        assert!(flag_values(&argv, "--api-key-file").is_empty());
+
+        // Neither CLI nor config names a key: keyless. A CLI path that cannot
+        // be loaded fails and names the path, which is not secret content.
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert!(resolve_api_key(&keyless, &resolved).unwrap().is_none());
+        let missing = std::env::temp_dir().join("hipfire-missing-api-key-for-test");
+        let missing_text = missing.to_str().unwrap();
+        let args = parse_serve_args(&["hipfire", "serve", "--api-key-file", missing_text]);
+        let error = resolve_api_key(&args, &resolved).unwrap_err();
+        assert!(format!("{error:#}").contains(missing_text), "{error:#}");
     }
 
     #[test]
@@ -4166,6 +4490,58 @@ mod capabilities_tests {
         }
         for host in ["0.0.0.0", "::", "192.168.1.5", "example.local", ""] {
             assert!(!host_is_loopback(host), "{host}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_bearer(label: &str) -> BearerToken {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-bind-key-{label}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.key");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"0123456789abcdef0123456789abcdef-test\n")
+            .unwrap();
+        drop(file);
+        let token = BearerToken::load(&path).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        token
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unauthenticated_bind_notice_covers_keyless_external_binds_only() {
+        let key = test_bearer("bind");
+        for host in ["0.0.0.0", "::", "192.168.1.5", "example.local"] {
+            let notice = unauthenticated_bind_notice(host, 8080, None).expect(host);
+            assert_eq!(
+                notice,
+                format!(
+                    "serving on {host}:8080 without authentication; set serve.api_key_file \
+                     (or --api-key-file) to require a bearer token"
+                )
+            );
+            assert!(
+                unauthenticated_bind_notice(host, 8080, Some(&key)).is_none(),
+                "{host}"
+            );
+        }
+        for host in ["localhost", "127.0.0.1", "127.1.2.3", "::1"] {
+            assert!(
+                unauthenticated_bind_notice(host, 8080, None).is_none(),
+                "{host}"
+            );
+            assert!(
+                unauthenticated_bind_notice(host, 8080, Some(&key)).is_none(),
+                "{host}"
+            );
         }
     }
 }

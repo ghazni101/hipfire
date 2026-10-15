@@ -329,6 +329,11 @@ pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// enough for offloaded weights — the GEMV/GEMM kernels read them directly.
 pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
+/// `hipHostMalloc` flag: fine-grained, coherent host memory. Overrides
+/// `HIP_HOST_COHERENT` for this allocation, so device system-scope stores are
+/// visible to the host without waiting for a kernel-boundary release.
+pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
+
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
@@ -524,10 +529,12 @@ pub struct HipRuntime {
         Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
     fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
     /// `hipMemExportToShareableHandle(void *out, handle, type, flags)`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn_mem_export_to_shareable_handle: Option<
         unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32,
     >,
     /// `hipMemImportFromShareableHandle(handle *out, void *osHandle, type)`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn_mem_import_from_shareable_handle: Option<
         unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32,
     >,
@@ -813,6 +820,9 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // CU masks on RDNA hung the R9700 MES (2026-10-14): refuse before any
+        // ROCm library is mapped.
+        hipfire_config::devices::cu_mask_env_guard().map_err(|message| HipError::new(0, &message))?;
         keep_pageable_copies_out_of_reclaim();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
@@ -1569,6 +1579,19 @@ impl HipRuntime {
     // ── Memory management ───────────────────────────────────────
 
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.malloc_raw(size);
+        };
+        let (buf, token) = crate::emu_budget::charged_alloc(
+            &budget,
+            crate::emu_budget::Class::Device,
+            size,
+            || self.malloc_raw(size),
+        )?;
+        Ok(buf.with_charge(token))
+    }
+
+    fn malloc_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: FFI out-params are stack locals with valid writable provenance;
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
@@ -1579,6 +1602,7 @@ impl HipRuntime {
             ptr,
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
+            token: None,
         })
     }
 
@@ -1588,6 +1612,19 @@ impl HipRuntime {
     /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
     /// callers receive a scoped error only when they request signal memory.
     pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.malloc_signal_raw(size);
+        };
+        let (buf, token) = crate::emu_budget::charged_alloc(
+            &budget,
+            crate::emu_budget::Class::Device,
+            size,
+            || self.malloc_signal_raw(size),
+        )?;
+        Ok(buf.with_charge(token))
+    }
+
+    fn malloc_signal_raw(&self, size: usize) -> HipResult<DeviceBuffer> {
         const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
         let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
             return Err(HipError::new(
@@ -1605,24 +1642,30 @@ impl HipRuntime {
             ptr,
             size,
             ownership: crate::DeviceBufferOwnership::HipMalloc,
+            token: None,
         })
     }
 
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
-    pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
+    pub fn free(&self, mut buf: DeviceBuffer) -> HipResult<()> {
         if !buf.is_hip_allocation() {
             return Err(HipError::new(
                 0,
                 "hipFree rejected a borrowed or VMM DeviceBuffer",
             ));
         }
-        // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
-        // caller must ensure GPU work on it is quiesced (documented on free).
-        let code = unsafe { (self.fn_free)(buf.ptr) };
-        self.check(code, "hipFree")?;
-        crate::registry::forget(buf.ptr as usize);
-        Ok(())
+        // Emu charge (None when off): released only if hipFree succeeds; a
+        // failed free drops the token without releasing, keeping the charge.
+        let token = buf.take_charge();
+        crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
+            // caller must ensure GPU work on it is quiesced (documented on free).
+            let code = unsafe { (self.fn_free)(buf.ptr) };
+            self.check(code, "hipFree")?;
+            crate::registry::forget(buf.ptr as usize);
+            Ok(())
+        })
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -1632,6 +1675,20 @@ impl HipRuntime {
     /// is then the *host* pointer — use [`Self::host_get_device_pointer`] for the
     /// address to hand a kernel.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.host_malloc_raw(size, flags);
+        };
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::HOST_TOKENS,
+            crate::emu_budget::Class::HostPinned,
+            size,
+            |ptr: &*mut c_void| *ptr as usize,
+            || self.host_malloc_raw(size, flags),
+        )
+    }
+
+    fn host_malloc_raw(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
         let func = self.missing_vmm_symbol("hipHostMalloc", self.fn_host_malloc)?;
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -1662,10 +1719,21 @@ impl HipRuntime {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(host) };
-        self.check(code, "hipHostFree")
+        let raw = || {
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(host) };
+            self.check(code, "hipHostFree")
+        };
+        if crate::emu_budget::active().is_none() {
+            return raw();
+        }
+        // Release the pinned-host charge only if hipHostFree succeeds.
+        crate::emu_budget::release_keyed::<crate::emu_budget::Process>(
+            &crate::emu_budget::HOST_TOKENS,
+            host as usize,
+            raw,
+        )
     }
 
     /// Own reusable pinned host storage, portable across devices. The library
@@ -1677,7 +1745,17 @@ impl HipRuntime {
         let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         // hipHostMallocPortable: this thread-local stage may outlive a Gpu or
         // be reused with another device after a model swap.
-        let ptr = self.host_malloc(size, 1)?;
+        let (ptr, token) = match crate::emu_budget::active() {
+            None => (self.host_malloc_raw(size, 1)?, None),
+            // The buffer owns its token (not the pointer-keyed table): its
+            // Drop calls the raw free function directly.
+            Some(budget) => crate::emu_budget::charged_alloc(
+                &budget,
+                crate::emu_budget::Class::HostPinned,
+                size,
+                || self.host_malloc_raw(size, 1),
+            )?,
+        };
         // SAFETY: hipHostMalloc succeeded with a non-zero extent. Initialize
         // once so as_bytes_mut can expose ordinary initialized Rust bytes.
         unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
@@ -1685,6 +1763,7 @@ impl HipRuntime {
             ptr,
             size,
             free,
+            token,
             _lib: Arc::clone(&self._lib),
         })
     }
@@ -1767,12 +1846,27 @@ impl HipRuntime {
         prop: &HipMemAllocationProp,
     ) -> HipResult<HipMemGenericAllocationHandle> {
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
-        let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
-        self.check(code, "hipMemCreate")?;
-        Ok(handle)
+        let raw = || {
+            let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
+            self.check(code, "hipMemCreate")?;
+            Ok(handle)
+        };
+        let Some(budget) = crate::emu_budget::active() else {
+            return raw();
+        };
+        // Charged at physical backing creation, by placement.
+        let class = crate::emu_budget::vmm_class(prop.location.type_)?;
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::VMM_TOKENS,
+            class,
+            size,
+            |handle: &HipMemGenericAllocationHandle| *handle as usize,
+            raw,
+        )
     }
 
     /// # Safety
@@ -1826,10 +1920,21 @@ impl HipRuntime {
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
-        // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
-        // # Safety or documented preconditions; out-params are stack locals.
-        let code = unsafe { func(handle) };
-        self.check(code, "hipMemRelease")
+        let raw = || {
+            // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
+            // # Safety or documented preconditions; out-params are stack locals.
+            let code = unsafe { func(handle) };
+            self.check(code, "hipMemRelease")
+        };
+        if crate::emu_budget::active().is_none() {
+            return raw();
+        }
+        // One token per physical handle; released only on a successful release.
+        crate::emu_budget::release_keyed::<crate::emu_budget::Process>(
+            &crate::emu_budget::VMM_TOKENS,
+            handle as usize,
+            raw,
+        )
     }
 
     /// Export a live exportable (POSIX-FD) physical allocation handle as a new
@@ -1839,6 +1944,7 @@ impl HipRuntime {
     /// `handle` with `HipMemAllocationProp::device_pinned_posix_fd`.
     ///
     /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[cfg(unix)]
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn mem_export_posix(
         &self,
@@ -1879,7 +1985,39 @@ impl HipRuntime {
     /// the caller keeps ownership and may close it after import. The returned
     /// handle is owned by the caller and must be released with `mem_release`
     /// after every mapping of it is unmapped.
+    #[cfg(unix)]
     pub fn mem_import_posix(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        // Untyped: no byte/placement metadata to charge, so refuse under emu.
+        crate::emu_budget::untyped_import_gate(crate::emu_budget::active().is_some())?;
+        self.mem_import_posix_raw(fd)
+    }
+
+    /// Import with caller-supplied physical size: under emu the `Device`
+    /// charge is reserved before the raw import, committed on success and kept
+    /// with the handle until a successful `mem_release`. Off state is the
+    /// plain raw import.
+    pub(crate) fn mem_import_posix_charged(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        physical_bytes: usize,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        let Some(budget) = crate::emu_budget::active() else {
+            return self.mem_import_posix_raw(fd);
+        };
+        crate::emu_budget::charged_alloc_keyed(
+            &budget,
+            &crate::emu_budget::VMM_TOKENS,
+            crate::emu_budget::Class::Device,
+            physical_bytes,
+            |handle: &HipMemGenericAllocationHandle| *handle as usize,
+            || self.mem_import_posix_raw(fd),
+        )
+    }
+
+    fn mem_import_posix_raw(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
     ) -> HipResult<HipMemGenericAllocationHandle> {
@@ -3053,6 +3191,10 @@ impl HipRuntime {
     }
 
     /// Get VRAM info: (free_bytes, total_bytes).
+    ///
+    /// RAW hardware query (`hipMemGetInfo`): never capped by an emu profile.
+    /// The application-visible, capped query is `Gpu::device_mem_info` in
+    /// rdna-compute.
     pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
         let mut free: usize = 0;
         let mut total: usize = 0;
@@ -3073,6 +3215,9 @@ pub struct PinnedHostBuffer {
     ptr: *mut c_void,
     size: usize,
     free: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// Emu `HostPinnedGtt` charge; `None` when emu is off. Released only after
+    /// `free` succeeds in `Drop`; a failed free keeps the charge.
+    token: Option<crate::emu_budget::Token>,
     _lib: Arc<Library>,
 }
 
@@ -3091,9 +3236,21 @@ impl PinnedHostBuffer {
 
 impl Drop for PinnedHostBuffer {
     fn drop(&mut self) {
-        // SAFETY: unique hipHostMalloc owner; its library is still live. The
-        // caller must have drained async copies before dropping the owner.
-        let _ = unsafe { (self.free)(self.ptr) };
+        let Some(token) = self.token.take() else {
+            // SAFETY: unique hipHostMalloc owner; its library is still live. The
+            // caller must have drained async copies before dropping the owner.
+            let _ = unsafe { (self.free)(self.ptr) };
+            return;
+        };
+        // SAFETY: as above.
+        let code = unsafe { (self.free)(self.ptr) };
+        let _ = crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
+            if code == HIP_SUCCESS {
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipHostFree"))
+            }
+        });
     }
 }
 

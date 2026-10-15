@@ -3,6 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#ifndef HF_DEVICE_WAIT_DEADLINE_H
+#include "device_wait_deadline.h"
+#endif
 
 // gfx1100 AWQ RMSNorm+MQ-rotate wavegrid (exact-tree variant).
 //
@@ -34,6 +37,12 @@
 //
 // Grid: [K/256]. Block: [32]. Host gates K % 256 == 0 and K/256 <= 32 so all
 // waves stay co-resident (spin-wait is safe).
+//
+// Both waits are bounded (device_wait_deadline.h). If a timeout is recorded
+// in `wait_block`, workgroup 0 still folds and publishes `ready`, so the
+// other workgroups do not each spend a full deadline. Every waiter finishes
+// with a stale value, which the host discards when it fails the step. All
+// workgroups still count `done`, so the last completion restores the scratch.
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void fused_rmsnorm_mq_rotate_awq_wavegrid(
@@ -45,7 +54,8 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_awq_wavegrid(
     float* __restrict__ x_rot,
     float* __restrict__ scratch,
     int K,
-    float eps
+    float eps,
+    hf_device_wait_block* __restrict__ wait_block
 ) {
     volatile float* r = scratch;
     volatile float* rms_slot = scratch + 256;
@@ -94,9 +104,9 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_awq_wavegrid(
     // Workgroup 0 folds the tree once all per-thread partials are visible.
     if (group_id == 0) {
         if (lane_id == 0) {
-            while (atomicAdd(arrivals, 0u) != 8u) {
-                __builtin_amdgcn_s_sleep(1);
-            }
+            hf_bounded_wait(
+                [&] { return atomicAdd(arrivals, 0u) == 8u; },
+                wait_block, HF_WAIT_SITE_RMSNORM_AWQ_WAVEGRID_ARRIVALS, 0u);
             __threadfence();
         }
         // Broadcast the arrival signal to the whole warp.
@@ -130,9 +140,10 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_awq_wavegrid(
     }
 
     if (lane_id == 0) {
-        while (atomicAdd(ready, 0u) == 0u) {
-            __builtin_amdgcn_s_sleep(1);
-        }
+        hf_bounded_wait(
+            [&] { return atomicAdd(ready, 0u) != 0u; },
+            wait_block, HF_WAIT_SITE_RMSNORM_AWQ_WAVEGRID_READY,
+            static_cast<unsigned int>(group_id));
         __threadfence();
     }
     const float rms = __shfl(lane_id == 0 ? *rms_slot : 0.0f, 0);

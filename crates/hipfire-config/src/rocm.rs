@@ -116,7 +116,7 @@ fn normalize_hip_path(p: &Path) -> PathBuf {
 /// sometimes symlinks into `<root>/lib/llvm/bin`, so both layouts are
 /// recognized after canonicalization.
 fn root_from_tool_path(tool: &Path) -> Option<PathBuf> {
-    let resolved = std::fs::canonicalize(tool).unwrap_or_else(|_| tool.to_path_buf());
+    let resolved = canonicalize_plain(tool).unwrap_or_else(|_| tool.to_path_buf());
     let bin = resolved.parent()?;
     let parent = bin.parent()?;
     if parent.file_name().is_some_and(|name| name == "llvm")
@@ -131,6 +131,58 @@ fn root_from_tool_path(tool: &Path) -> Option<PathBuf> {
             .map(Path::to_path_buf);
     }
     Some(parent.to_path_buf())
+}
+
+/// `std::fs::canonicalize` for paths that are reported or exported (e.g. as
+/// `ROCM_PATH`). On Windows, canonicalize yields verbatim `\\?\C:\…` paths,
+/// which some tools (hipcc.bat, cmd) mishandle; those are rewritten to the
+/// plain `C:\…` form when that form names the same file. Elsewhere this is
+/// exactly `std::fs::canonicalize`.
+fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
+    let canon = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(plain) = canon.to_str().and_then(plain_drive_path) {
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(canon)
+}
+
+/// The plain `C:\…` form of a verbatim `\\?\C:\…` path, or `None` when the
+/// path is not a verbatim drive path or the plain form would be reinterpreted
+/// by Win32 path normalization (MAX_PATH overflow, `/` separators, reserved
+/// DOS device names, components with trailing dots/spaces). Pure string logic
+/// so the policy is unit-tested on every host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn plain_drive_path(verbatim: &str) -> Option<&str> {
+    const MAX_PATH: usize = 260;
+    let plain = verbatim.strip_prefix(r"\\?\")?;
+    let bytes = plain.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    if plain.len() >= MAX_PATH || plain.contains('/') {
+        return None;
+    }
+    let rest = &plain[3..];
+    if rest.is_empty() {
+        return Some(plain);
+    }
+    for component in rest.split('\\') {
+        if component.is_empty() || component.ends_with('.') || component.ends_with(' ') {
+            return None;
+        }
+        let stem = component.split('.').next().unwrap_or(component).trim_end();
+        let reserved = ["CON", "PRN", "AUX", "NUL"]
+            .iter()
+            .any(|r| stem.eq_ignore_ascii_case(r))
+            || (stem.len() == 4
+                && stem.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("COM") || p.eq_ignore_ascii_case("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if reserved {
+            return None;
+        }
+    }
+    Some(plain)
 }
 
 /// Locate ROCm-specific tools on `PATH` and derive every distinct install root.
@@ -938,7 +990,7 @@ fn path_tool(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         if let Some(found) = first_tool_in_dir(&dir, name, cfg!(windows)) {
-            return Some(std::fs::canonicalize(&found).unwrap_or(found));
+            return Some(canonicalize_plain(&found).unwrap_or(found));
         }
     }
     None
@@ -1507,7 +1559,12 @@ mod tests {
             joined.contains("rocm.docs.amd.com"),
             "the docs link is the distro-independent answer: {lines:?}"
         );
-        for needle in ["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"] {
+        let needles: &[&str] = if cfg!(windows) {
+            &["amdhip64.dll", "hip_runtime.h", "hipcc.bat"]
+        } else {
+            &["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"]
+        };
+        for needle in needles {
             assert!(
                 joined.contains(needle),
                 "guidance must name required artifact {needle}: {lines:?}"
@@ -1519,6 +1576,28 @@ mod tests {
                 && !joined.contains("rocm-hip-"),
             "guidance must not guess drifting package names: {lines:?}"
         );
+    }
+
+    #[test]
+    fn verbatim_drive_paths_become_plain_only_when_equivalent() {
+        assert_eq!(plain_drive_path(r"\\?\C:\Users\u\rocm"), Some(r"C:\Users\u\rocm"));
+        assert_eq!(plain_drive_path(r"\\?\d:\"), Some(r"d:\"));
+        // Not verbatim-drive forms: leave alone.
+        assert_eq!(plain_drive_path(r"C:\Users\u"), None);
+        assert_eq!(plain_drive_path(r"\\?\UNC\srv\share\x"), None);
+        assert_eq!(plain_drive_path(r"\\?\Volume{0}\x"), None);
+        assert_eq!(plain_drive_path("/opt/rocm"), None);
+        // Plain form would be reinterpreted by Win32 normalization.
+        assert_eq!(plain_drive_path(r"\\?\C:\x\con"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\Lpt3.txt"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\trailing."), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\trailing "), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x/y"), None);
+        assert_eq!(plain_drive_path(r"\\?\C:\x\\y"), None);
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(plain_drive_path(&long), None);
+        // Names merely containing a reserved word are fine.
+        assert_eq!(plain_drive_path(r"\\?\C:\console\com10"), Some(r"C:\console\com10"));
     }
 
     #[test]
@@ -2341,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_and_debian_multiarch_roots_still_resolve() {
+    fn canonical_root_still_resolves() {
         // Canonical layout uses HIP_RUNTIME_DIRS[0] directly.
         let base = std::env::temp_dir().join(format!("hipfire-rocm-canonical-accept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -2350,7 +2429,16 @@ mod tests {
         assert!(is_coherent_sdk_root(&canon));
         let result = resolve_toolchain_pure(Some(&canon), None, false, None, None).unwrap();
         assert_eq!(result.compiler_source, Some(CompilerSource::SelectedRoot));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
+    /// Debian multiarch is a Linux package layout (`lib/<triple>/libamdhip64.so`);
+    /// the Windows HIP SDK keeps the runtime in `bin/`.
+    #[test]
+    #[cfg(not(windows))]
+    fn debian_multiarch_root_still_resolves() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-debian-accept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
         // Debian multiarch: runtime under lib/x86_64-linux-gnu is discovered via
         // root_library_dirs one-level child scan — do not “fix” that.
         let debian = base.join("debian");
@@ -2360,7 +2448,6 @@ mod tests {
         std::fs::write(debian.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
         let runtime = debian.join("lib").join("x86_64-linux-gnu").join("libamdhip64.so");
         std::fs::write(&runtime, b"").unwrap();
-        #[cfg(not(windows))]
         std::fs::write(
             debian.join("lib").join("x86_64-linux-gnu").join("libhsa-runtime64.so.1"),
             b"",
@@ -2404,6 +2491,15 @@ mod tests {
             p.set_mode(0o755);
             std::fs::set_permissions(&comp, p).unwrap();
         }
+        // The returned root is canonical (temp dirs may sit behind symlinks or
+        // Windows 8.3 short names) and must be a plain path, never `\\?\C:\…`:
+        // it is exported as ROCM_PATH to hipcc.
+        let comp_root = canonicalize_plain(&comp_root).unwrap();
+        assert!(
+            !comp_root.to_string_lossy().starts_with(r"\\?\"),
+            "exported root must not be a verbatim path: {}",
+            comp_root.display()
+        );
         let toolchain = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
         assert_eq!(toolchain.compiler_root, Some(comp_root.clone()));
         // compiler_env_root must return the compiler's own root, not the libs root.

@@ -4,6 +4,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#ifndef HF_DEVICE_WAIT_DEADLINE_H
+#include "device_wait_deadline.h"
+#endif
 
 // clang's HIP `float4` is a wrapper type rather than a native vector, so the
 // nontemporal builtin cannot consume `float4*` directly. Match RCCL's gfx11
@@ -45,9 +48,13 @@ __device__ __forceinline__ bool tp_peer_behind(const unsigned int *peer_signal,
 // is the sole writer of its local signal and advances it once per barrier.
 // The peer waits for the same generation. The generation lives on device, so
 // graph replay needs neither host-side signal reset nor a changing kernarg.
+// The wait is bounded (device_wait_deadline.h). A stalled peer leaves this
+// rank's site and generation in `wait_block`, and the wave exits. The host
+// then fails the step and resets both generations.
 extern "C" __global__ void tp_graph_signal_barrier_gfx1100(
     unsigned int *__restrict__ local_signal,
-    const unsigned int *__restrict__ peer_signal) {
+    const unsigned int *__restrict__ peer_signal,
+    hf_device_wait_block *__restrict__ wait_block) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     // This stream is the only writer of local_signal. FIFO graph execution
@@ -59,16 +66,17 @@ extern "C" __global__ void tp_graph_signal_barrier_gfx1100(
     __hip_atomic_exchange(
         local_signal, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
-    while (tp_peer_behind(peer_signal, epoch)) {
-        __builtin_amdgcn_s_sleep(1);
-    }
+    hf_bounded_wait(
+        [&] { return !tp_peer_behind(peer_signal, epoch); },
+        wait_block, HF_WAIT_SITE_TP_SIGNAL_BARRIER_GFX1100, epoch);
 }
 
 // Fused TP2 producer barrier + rank-ordered residual reduction. Keeping the
 // synchronization and the 20 KiB Qwen-27B residual add in one workgroup
 // removes one graph node at every attention/FFN boundary. Every lane performs
 // the peer acquire itself before reading p_first/p_second, avoiding reliance
-// on cross-lane propagation of a single lane's system-scope acquire.
+// on cross-lane propagation of a single lane's system-scope acquire. A lane
+// whose bounded wait stops records the timeout and exits before reducing.
 extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
     unsigned int *__restrict__ local_signal,
     const unsigned int *__restrict__ peer_signal,
@@ -77,7 +85,8 @@ extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
     float *__restrict__ peer_shadow,
     const float *__restrict__ local_shadow,
     int local_is_first,
-    int count) {
+    int count,
+    hf_device_wait_block *__restrict__ wait_block) {
     if (blockIdx.x != 0) return;
 
     const int vec = count >> 2;
@@ -110,8 +119,10 @@ extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
     }
     __syncthreads();
 
-    while (tp_peer_behind(peer_signal, epoch)) {
-        __builtin_amdgcn_s_sleep(1);
+    if (!hf_bounded_wait(
+            [&] { return !tp_peer_behind(peer_signal, epoch); },
+            wait_block, HF_WAIT_SITE_TP_SIGNAL_REDUCE_GFX1100, epoch)) {
+        return;
     }
 
     float4 *__restrict__ xv = reinterpret_cast<float4 *>(x);

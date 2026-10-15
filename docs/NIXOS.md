@@ -124,7 +124,7 @@ services.hipfire = {
   enable = true;
   gpuTargets = [ "gfx1100" ]; # required non-empty
   openFirewall = false;  # does NOT change listen address — only skips opening the port when the host firewall is enabled
-  # openFirewall = true opens cfg.port with NO auth/TLS on the listener — see SERVE.md
+  # openFirewall = true opens cfg.port to the network; the listener has no TLS and auth is optional (serve.api_key_file) — see SERVE.md
 
   defaultModel = "qwen3.5:9b";
   # Module writes these into config.toml as stored globals. run/serve sampling
@@ -263,13 +263,13 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 `LD_LIBRARY_PATH` is set for nixpkgs ROCm. System mode also sets
 `HOME=/var/lib/hipfire` and `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels`.
 
-**Security:** `hipfire serve` has **no authentication and no TLS**
-([SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
+**Security:** `hipfire serve` has **no TLS**, and bearer authentication is
+optional (`serve.api_key_file`; [SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
 `extraSettings.host = "0.0.0.0"` to listen on all interfaces. `openFirewall = false` does
 **not** change the listen address — it only avoids opening `cfg.port` when the
 **host firewall is enabled**. Keep the firewall closed unless the host is on a
-trusted network or an authenticated TLS reverse proxy terminates in front of
-the port. Prefer probing on loopback (`127.0.0.1`).
+trusted network or a TLS reverse proxy terminates in front of the port; a key
+is recommended on any non-loopback listen address. Prefer probing on loopback (`127.0.0.1`).
 
 Device policy allows `/dev/kfd`, DRM char devices, and `/dev/accel/accel0`.
 

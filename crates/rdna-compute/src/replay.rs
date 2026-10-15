@@ -515,7 +515,6 @@ impl Pm4Commands {
         device: &GpuDevice,
         pool: &KernargPool,
         ib_pool: Option<&KernargPool>,
-        cu_mask: Option<&[u32; 2]>,
         dispatch_profile: bool,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
@@ -559,14 +558,8 @@ impl Pm4Commands {
                     SingleQueuePm4Ib::create_profiled(device, pool, commands)
                 }
             }
-        }
-        .map_err(|error| error.to_string())?;
-        if let Some(cu_mask) = cu_mask {
-            graph
-                .set_cu_mask(64, cu_mask)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(graph)
+        };
+        graph.map_err(|error| error.to_string())
     }
 }
 
@@ -1127,6 +1120,13 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
+        // The bounded-wait kernels (these two wavegrids and
+        // `hc_compute_control_vec4_finalize`) end with an `hf_device_wait_block*`
+        // that is deliberately not listed. It points at the Gpu-lifetime,
+        // host-mapped wait-error block (`crate::device_wait`), whose address never
+        // moves, so the snapshot bytes replay unchanged. Its only readers are the
+        // host after the step and the fail-fast check of later waits, so launch
+        // order needs no hazard edge.
         "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1135,7 +1135,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(32),
             write(40),
         ]),
-        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous scratch.
+        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous
+        // scratch, then the unlisted wait-error block at 64 (after K and eps).
         "fused_rmsnorm_mq_rotate_awq_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1214,6 +1215,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "hc_compute_control" | "hc_compute_control_vec4" | "hc_head_compute_pre" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
+        // The trailing wait-error block (null unless rsqrt_once) is unlisted; see
+        // `fused_rmsnorm_mq_rotate_wavegrid`.
         "hc_compute_control_vec4_finalize" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
@@ -1557,8 +1560,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if kernel == "hc_finalize_input_map" {
         return Some(56);
     }
+    // 5 pointers + 6 scalars + the wait-error block pointer = 72, padded to 16 B.
     if kernel == "hc_compute_control_vec4_finalize" {
-        return Some(64);
+        return Some(80);
     }
     if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed" {
         return Some(56);
@@ -1910,8 +1914,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
+        // 6 pointers + K + eps + the wait-error block pointer = 64 explicit bytes.
         | "fused_rmsnorm_mq_rotate_wavegrid"
-        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
         // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
@@ -1930,6 +1934,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
+        // 7 pointers + K + eps + the wait-error block pointer = 72, padded to 16 B.
+        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -3343,50 +3349,26 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
-fn gfx1151_cu_mask(architecture: Pm4Architecture, device_name: &str) -> Option<[u32; 2]> {
+/// `HIPFIRE_GFX1151_REDLINE_CU_COUNT` can no longer produce a CU mask: any value
+/// other than `all`/`inherit`/`40`/empty is refused (CU masks on RDNA hung the
+/// R9700 MES on 2026-10-14).
+fn gfx1151_cu_count_knob_refusal() -> Result<(), String> {
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_REDLINE_CU_COUNT")
         .unwrap_or_else(|| "all".to_owned());
-    let mask = gfx1151_cu_mask_from_value(architecture, device_name, &value).unwrap_or_else(|| {
-        eprintln!("WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs");
-        None
-    });
-    if let Some(mask) = mask {
-        let enabled = mask.into_iter().map(u32::count_ones).sum::<u32>();
-        eprintln!("[redline] gfx1151 queue CU mask enables {enabled}/40 CUs");
-    }
-    mask
+    gfx1151_cu_count_refusal(&value)
 }
 
-fn gfx1151_cu_mask_from_value(
-    architecture: Pm4Architecture,
-    device_name: &str,
-    value: &str,
-) -> Option<Option<[u32; 2]>> {
-    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
-        return Some(None);
-    }
+fn gfx1151_cu_count_refusal(value: &str) -> Result<(), String> {
     if matches!(
         value.to_ascii_lowercase().as_str(),
         "" | "all" | "inherit" | "40"
     ) {
-        return Some(None);
+        return Ok(());
     }
-    let count = value.parse::<u32>().ok()?;
-    if count == 0 || count >= 40 || !count.is_multiple_of(2) {
-        return None;
-    }
-    let low = if count >= 32 {
-        u32::MAX
-    } else {
-        (1_u32 << count) - 1
-    };
-    let high_count = count.saturating_sub(32);
-    let high = if high_count == 0 {
-        0
-    } else {
-        (1_u32 << high_count) - 1
-    };
-    Some(Some([low, high]))
+    Err(format!(
+        "HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?} requests a CU mask and is refused: {}",
+        hipfire_config::devices::RDNA_CU_MASK_BAN
+    ))
 }
 
 fn gfx1151_entry_acquire_policy(
@@ -6052,7 +6034,7 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
-        let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
+        gfx1151_cu_count_knob_refusal()?;
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
@@ -6256,9 +6238,6 @@ impl ReplayController {
         };
         let stream_accounting = pm4_stream_accounting_enabled();
         validate_pm4_stream_accounting_queue_count(stream_accounting, queue_limit)?;
-        if cu_mask.is_some() && queue_limit != 1 {
-            return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
-        }
         let gfx1010_exact = gfx1010_release_wait_required(pm4_architecture, device.name());
         let gfx1010_dependency =
             gfx1010_dependency_policy_from_config(pm4_architecture, device.name())?;
@@ -6615,7 +6594,6 @@ impl ReplayController {
                 &device,
                 &pool,
                 ib_pool.as_ref(),
-                cu_mask.as_ref(),
                 dispatch_profile,
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
@@ -9203,6 +9181,9 @@ mod tests {
         }
         blob.push_i32(2_048);
         blob.push_f32(0.0);
+        // Wait-error block (crate::device_wait): stable, deliberately unlisted.
+        blob.push_ptr(std::ptr::null());
+        assert_eq!(blob.len(), 72);
         blob.pad_to(16);
         assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
         let modes: Vec<_> = pointer_effects(awq)
@@ -9214,6 +9195,27 @@ mod tests {
             modes,
             vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
         );
+
+        // The other bounded-wait kernels' explicit layouts end with the block too.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_f32(0.0);
+        blob.push_ptr(std::ptr::null());
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes("fused_rmsnorm_mq_rotate_wavegrid"), Some(blob.len()));
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..6 {
+            blob.push_i32(0);
+        }
+        blob.push_ptr(std::ptr::null());
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes("hc_compute_control_vec4_finalize"), Some(blob.len()));
     }
 
     #[test]
@@ -10443,35 +10445,20 @@ mod tests {
     }
 
     #[test]
-    fn gfx1151_cu_mask_is_exact_arch_and_wgp_paired() {
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "all"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "32"),
-            Some(Some([u32::MAX, 0]))
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "36"),
-            Some(Some([u32::MAX, 0xf]))
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1100", "32"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx12, "gfx1201", "32"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "35"),
-            None
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "42"),
-            None
-        );
+    fn gfx1151_cu_count_knob_is_refused() {
+        for value in ["all", "", "inherit", "40", "ALL", "Inherit"] {
+            assert_eq!(gfx1151_cu_count_refusal(value), Ok(()), "{value:?}");
+        }
+        for value in ["32", "36", "35", "42"] {
+            let message = gfx1151_cu_count_refusal(value)
+                .expect_err(&format!("{value:?} must be refused"));
+            assert!(
+                message.contains("HIPFIRE_GFX1151_REDLINE_CU_COUNT"),
+                "{message}"
+            );
+            assert!(message.contains("2026-10-14"), "{message}");
+            assert!(message.contains(value), "{message}");
+        }
     }
 
     #[test]

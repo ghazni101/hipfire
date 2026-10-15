@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::Result;
-use hipfire_client::{stream_openai_chat, ClientError, OpenAiSseEvent};
+use hipfire_client::{stream_openai_chat, ClientError, OpenAiSseEvent, ServiceEndpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -33,8 +33,7 @@ pub enum ChatEvent {
 }
 
 pub fn stream_chat(
-    host: &str,
-    port: u16,
+    endpoint: &ServiceEndpoint,
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f64>,
@@ -42,7 +41,7 @@ pub fn stream_chat(
     tx: Sender<ChatEvent>,
     abort: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = stream_chat_inner(host, port, model, messages, temperature, top_p, &tx, &abort);
+    let result = stream_chat_inner(endpoint, model, messages, temperature, top_p, &tx, &abort);
     if let Err(err) = result {
         let _ = tx.send(ChatEvent::Error(err.to_string()));
     }
@@ -51,8 +50,7 @@ pub fn stream_chat(
 
 #[allow(clippy::too_many_arguments)]
 fn stream_chat_inner(
-    host: &str,
-    port: u16,
+    endpoint: &ServiceEndpoint,
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f64>,
@@ -72,8 +70,7 @@ fn stream_chat_inner(
         body["top_p"] = json!(p);
     }
     match stream_openai_chat(
-        host,
-        port,
+        endpoint,
         body,
         Duration::from_secs(600),
         |event| {

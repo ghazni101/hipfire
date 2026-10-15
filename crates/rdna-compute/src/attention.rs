@@ -19860,6 +19860,13 @@ impl Gpu {
         let mut ps = post_scale;
         let mut iters = sinkhorn_iters;
         let mut once = i32::from(rsqrt_once);
+        // Only rsqrt_once waits (rows 1.. on row 0); without it the kernel never
+        // touches the block, so no block is allocated for that route.
+        let wait_block = if rsqrt_once {
+            self.device_wait_block()?
+        } else {
+            std::ptr::null_mut()
+        };
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -19872,6 +19879,7 @@ impl Gpu {
             &mut ps as *mut _ as *mut c_void,
             &mut iters as *mut _ as *mut c_void,
             &mut once as *mut _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             logical_name,
@@ -19892,6 +19900,7 @@ impl Gpu {
                 b.push_f32(ps);
                 b.push_i32(iters);
                 b.push_i32(once);
+                b.push_ptr(wait_block);
                 b
             },
         )
@@ -20459,15 +20468,16 @@ impl Gpu {
         )
     }
 
-    /// Resolve the gfx1100 TP2 graph-signal module before graph capture. JIT
-    /// compilation is not capture-safe, so model load calls this once per rank.
+    /// Resolve the exact gfx1100/gfx1201 TP2 graph-signal module before graph
+    /// capture. JIT compilation is not capture-safe, so model load calls this
+    /// once per rank.
     pub fn ensure_tp_graph_signal_gfx1100_kernels(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100, got {}",
+                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -20484,20 +20494,23 @@ impl Gpu {
         )
     }
 
-    /// Advance this rank's gfx1100 TP2 graph generation and wait until the
-    /// peer reaches the same barrier. The generation is device-resident, so a
-    /// captured graph can replay without host-side signal resets.
+    /// Advance this rank's exact gfx1100/gfx1201 TP2 graph generation and wait
+    /// until the peer reaches the same barrier. The generation is
+    /// device-resident, so a captured graph can replay without host-side
+    /// signal resets. The wait is bounded; a timeout lands in this GPU's
+    /// wait-error block
+    /// ([`Gpu::take_device_wait_error`]).
     pub fn tp_graph_signal_barrier_gfx1100(
         &mut self,
         local_signal: &DeviceBuffer,
         peer_signal: &DeviceBuffer,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp_graph_signal_barrier_gfx1100 requires gfx1100, got {}",
+                    "tp_graph_signal_barrier_gfx1100 requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -20510,9 +20523,11 @@ impl Gpu {
 
         let local_ptr = local_signal.as_ptr();
         let peer_ptr = peer_signal.as_ptr();
-        let mut params: [*mut c_void; 2] = [
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 3] = [
             &local_ptr as *const _ as *mut c_void,
             &peer_ptr as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "tp_graph_signal_barrier_gfx1100",
@@ -20524,6 +20539,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(local_ptr);
                 b.push_ptr(peer_ptr);
+                b.push_ptr(wait_block);
                 b
             },
         )
@@ -20546,11 +20562,11 @@ impl Gpu {
         count: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp_graph_signal_reduce_gfx1100 requires gfx1100, got {}",
+                    "tp_graph_signal_reduce_gfx1100 requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -20568,7 +20584,8 @@ impl Gpu {
         let local_is_first_arg = i32::from(local_is_first);
         let count_arg = i32::try_from(count)
             .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
-        let mut params: [*mut c_void; 8] = [
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 9] = [
             &local_ptr as *const _ as *mut c_void,
             &peer_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
@@ -20577,6 +20594,7 @@ impl Gpu {
             &local_shadow as *const _ as *mut c_void,
             &local_is_first_arg as *const _ as *mut c_void,
             &count_arg as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "tp_graph_signal_reduce_gfx1100",
@@ -20594,6 +20612,7 @@ impl Gpu {
                 b.push_ptr(local_shadow);
                 b.push_i32(local_is_first_arg);
                 b.push_i32(count_arg);
+                b.push_ptr(wait_block);
                 b
             },
         )
@@ -20643,6 +20662,8 @@ impl Gpu {
     }
 
     /// Wait for the other two TP3 ranks with system-scope acquire semantics.
+    /// Bounded: a stalled peer is recorded in this GPU's wait-error block
+    /// ([`Gpu::take_device_wait_error`]) and the wave exits.
     pub fn tp_graph_signal_wait2_gfx1201(
         &mut self,
         signals: [&DeviceBuffer; 2],
@@ -20667,10 +20688,12 @@ impl Gpu {
         let signal0 = signals[0].as_ptr();
         let signal1 = signals[1].as_ptr();
         let mut epoch_arg = epoch;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &signal0 as *const _ as *mut c_void,
             &signal1 as *const _ as *mut c_void,
             &mut epoch_arg as *mut _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "tp_graph_signal_wait2_gfx1201",
@@ -20683,12 +20706,14 @@ impl Gpu {
                 b.push_ptr(signal0);
                 b.push_ptr(signal1);
                 b.push_u32(epoch);
+                b.push_ptr(wait_block);
                 b
             },
         )
     }
 
     /// Wait for the other three TP4 ranks with system-scope acquire semantics.
+    /// Bounded like [`Self::tp_graph_signal_wait2_gfx1201`].
     pub fn tp_graph_signal_wait3_gfx1201(
         &mut self,
         signals: [&DeviceBuffer; 3],
@@ -20714,11 +20739,13 @@ impl Gpu {
         let signal1 = signals[1].as_ptr();
         let signal2 = signals[2].as_ptr();
         let mut epoch_arg = epoch;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &signal0 as *const _ as *mut c_void,
             &signal1 as *const _ as *mut c_void,
             &signal2 as *const _ as *mut c_void,
             &mut epoch_arg as *mut _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             "tp_graph_signal_wait3_gfx1201",
@@ -20732,6 +20759,7 @@ impl Gpu {
                 b.push_ptr(signal1);
                 b.push_ptr(signal2);
                 b.push_u32(epoch);
+                b.push_ptr(wait_block);
                 b
             },
         )

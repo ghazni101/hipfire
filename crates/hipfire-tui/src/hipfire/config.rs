@@ -3,9 +3,12 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use hipfire_client::ServiceEndpoint;
 use hipfire_config::{
-    field, load_catalog, load_global, resolve, ConfigFormat, ConfigPaths, ConfigValue, NamedLayer,
+    field, load_catalog, load_global, resolve, secret::BearerToken, ConfigFormat, ConfigPaths,
+    ConfigValue, NamedLayer,
 };
 
 use super::HipfirePaths;
@@ -48,6 +51,30 @@ impl ConfigState {
                 }
             }
             Err(error) => warning = Some(format!("config parse error: {error}")),
+        }
+
+        // `HIPFIRE_SERVE_API_KEY_FILE` outranks the config file, matching the
+        // CLI's resolution order for this key.
+        if let Some(schema) = field("serve.api_key_file") {
+            if let Some(name) = schema.env_compat {
+                if let Ok(raw) = std::env::var(name) {
+                    match schema.parse_cli(&raw) {
+                        Ok(value) => {
+                            values.insert(schema.legacy_key.to_owned(), value_to_string(&value));
+                        }
+                        Err(error) => {
+                            // Retain the invalid override so HTTP callers fail
+                            // closed instead of using the old or absent key.
+                            values.insert(schema.legacy_key.to_owned(), raw);
+                            let message = format!("{name}: {error}");
+                            warning = Some(match warning.take() {
+                                Some(previous) => format!("{previous}; {message}"),
+                                None => message,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         let per_model_count = load_catalog(&ConfigPaths::under(&paths.root))
@@ -99,6 +126,27 @@ impl ConfigState {
             "::" => "::1".into(),
             other => other.to_string(),
         }
+    }
+
+    /// Authenticated endpoint for the local serve process. Loads the bearer
+    /// from the resolved `serve.api_key_file` (empty = keyless). Errors name
+    /// the key file path and the violated rule, never the token.
+    pub fn service_endpoint(&self) -> Result<ServiceEndpoint, String> {
+        let key_file = self.values.get("api_key_file").map_or("", String::as_str);
+        if !key_file.is_empty()
+            && (key_file.trim() != key_file || !Path::new(key_file).is_absolute())
+        {
+            return Err("serve.api_key_file must be an absolute path".to_owned());
+        }
+        let bearer = if key_file.is_empty() {
+            None
+        } else {
+            Some(
+                BearerToken::load(Path::new(key_file))
+                    .map_err(|error| format!("serve.api_key_file: {error}"))?,
+            )
+        };
+        ServiceEndpoint::local(&self.host, self.port, bearer).map_err(|error| error.to_string())
     }
 
     /// Config keys behind each easy-mode row, in display order. `None` marks a
@@ -417,6 +465,26 @@ mod tests {
             loaded_from_disk: true,
             warning: None,
         }
+    }
+
+    #[test]
+    fn service_endpoint_keeps_keyless_local_behavior_and_rejects_bad_key_paths() {
+        let endpoint = state_with(&[]).service_endpoint().unwrap();
+        assert!(endpoint.bearer().is_none());
+        assert_eq!(
+            hipfire_client::service_url(&endpoint, "/health"),
+            "http://127.0.0.1:11435/health"
+        );
+        assert!(state_with(&[("api_key_file", "relative-key")])
+            .service_endpoint()
+            .unwrap_err()
+            .contains("absolute path"));
+        let missing = std::env::temp_dir().join(format!(
+            "hipfire-tui-key-missing-{}", std::process::id()
+        ));
+        assert!(state_with(&[("api_key_file", missing.to_str().unwrap())])
+            .service_endpoint()
+            .is_err());
     }
 
     #[test]

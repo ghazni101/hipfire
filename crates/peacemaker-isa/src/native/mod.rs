@@ -14,6 +14,12 @@
 //! codec; branch labels resolve to word offsets. The directives the builder
 //! writes (`emit::assembly`, the module combiners, `profile`) are the
 //! accepted set; any other directive is an error.
+//!
+//! gfx942 (CDNA3, wave64) has no text front end here: its kernels are typed
+//! (`crate::cdna`), encoded by `peacemaker_cdna`, and linked through
+//! [`link_encoded`] / [`link_encoded_versioned`] as code object v5 or v6 with
+//! the same descriptor, metadata and ELF writers (the `.amdhsa_*` directive
+//! semantics are those of `llvm-mc -mcpu=gfx942`; see `descriptor`).
 mod descriptor;
 mod elf;
 mod metadata;
@@ -28,14 +34,18 @@ pub const VERSION: &str = concat!("peacemaker-isa ", env!("CARGO_PKG_VERSION"), 
 /// committed `.hxaco` bundles) use the trailing-hyphen form instead.
 pub const DEFAULT_HOST_TARGET: &str = "host-x86_64-unknown-linux-gnu";
 
-fn ir_arch(arch: Arch) -> IrArch {
-    match arch { Arch::Gfx1100 => IrArch::Gfx1100, Arch::Gfx1151 => IrArch::Gfx1151, Arch::Gfx1201 => IrArch::Gfx1201 }
+/// The RDNA codec architecture; CDNA kernels are typed (`crate::cdna`) and never take the text path.
+fn ir_arch(arch: Arch) -> Result<IrArch, String> {
+    match arch {
+        Arch::Gfx1100 => Ok(IrArch::Gfx1100), Arch::Gfx1151 => Ok(IrArch::Gfx1151), Arch::Gfx1201 => Ok(IrArch::Gfx1201),
+        Arch::Gfx942 => Err("gfx942 code is emitted by the typed cdna builder, not the RDNA text assembler".into()),
+    }
 }
 
 /// Encode one instruction line (no label operands) onto `out`; returns its dword count.
 fn encode_into(line: &str, arch: Arch, out: &mut Vec<u32>) -> Result<usize, String> {
-    let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)).map_err(|e| format!("{line}: {e}"))?;
-    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch), &inst) }
+    let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)?).map_err(|e| format!("{line}: {e}"))?;
+    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch)?, &inst) }
         .map_err(|e| format!("{line}: {e}"))?;
     out.extend_from_slice(&words);
     Ok(words.len())
@@ -173,12 +183,13 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
         let descriptor = descriptor::encode(arch, kernel.symbol, directives, end, code_bytes)?;
         linked.push(elf::Kernel { symbol: kernel.symbol.to_owned(), code: kernel.words.iter().flat_map(|w| w.to_le_bytes()).collect(), descriptor });
     }
-    elf::link(arch, &linked, &metadata)
+    elf::link(arch, 6, &linked, &metadata)
 }
 
 /// One kernel whose code is already encoded: the typed encoder's words (not text) plus
-/// the `.amdhsa_*` directive set of its descriptor. `.amdhsa_inst_pref_size` is derived
-/// from the code extent here, exactly as `assemble` derives it, and must not be listed.
+/// the `.amdhsa_*` directive set of its descriptor. On gfx11/gfx12 `.amdhsa_inst_pref_size`
+/// is derived from the code extent here, exactly as `assemble` derives it, and must not be
+/// listed; gfx942 has no such field and rejects it.
 pub struct EncodedKernel<'a> {
     pub symbol: &'a str,
     pub words: &'a [u32],
@@ -189,8 +200,18 @@ pub struct EncodedKernel<'a> {
 /// Link already-encoded kernels and their `.amdgpu_metadata` YAML body (the lines between
 /// `---` and `...`) into the same v6 code object `assemble` lays out. This is the descriptor,
 /// metadata and ELF writer `assemble` uses, minus the text front end: no instruction is
-/// parsed or re-encoded here.
+/// parsed or re-encoded here. Equivalent to [`link_encoded_versioned`] at version 6.
 pub fn link_encoded(kernels: &[EncodedKernel<'_>], metadata_yaml: &str, arch: Arch) -> Result<Vec<u8>, String> {
+    link_encoded_versioned(kernels, metadata_yaml, arch, 6)
+}
+
+/// [`link_encoded`] at `code_object_version` 5 or 6 (`EI_ABIVERSION` 3 or 4; the descriptor,
+/// metadata and layout are identical). Version 5 is gfx942-only: the RDNA kernels are all v6.
+/// The caller's directives and `.amdgpu_metadata` carry the version-specific text of the `.s`
+/// the ROCm oracle assembles (`.amdhsa_code_object_version`, and for a v5 `hipcc` kernel
+/// `.amdhsa_reserve_xnack_mask 1`, which the descriptor accepts and which changes no bit:
+/// gfx942's target ID is `xnack any`); `amdhsa.version` is `[1, 2]` for both.
+pub fn link_encoded_versioned(kernels: &[EncodedKernel<'_>], metadata_yaml: &str, arch: Arch, code_object_version: u32) -> Result<Vec<u8>, String> {
     if kernels.is_empty() { return Err("no kernel to link".into()) }
     let metadata = metadata::msgpack(metadata_yaml)?;
     let mut linked = Vec::with_capacity(kernels.len());
@@ -198,18 +219,21 @@ pub fn link_encoded(kernels: &[EncodedKernel<'_>], metadata_yaml: &str, arch: Ar
         if kernels[..index].iter().any(|k| k.symbol == kernel.symbol) { return Err(format!("duplicate kernel {}", kernel.symbol)) }
         if kernel.words.is_empty() { return Err(format!("{}: empty kernel", kernel.symbol)) }
         let end = format!(".L{}_end", kernel.symbol);
-        let mask = if arch.gfx12() { 4080 } else { 1008 };
-        let inst_pref = format!("((instprefsize({end}-{})<<4)&{mask})>>4", kernel.symbol);
-        if kernel.directives.iter().any(|(name, _)| name == ".amdhsa_inst_pref_size") {
-            return Err(format!("{}: .amdhsa_inst_pref_size is derived from the code extent", kernel.symbol));
-        }
         let mut directives: Vec<(&str, &str)> = kernel.directives.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-        directives.push((".amdhsa_inst_pref_size", inst_pref.as_str()));
+        let inst_pref;
+        if !arch.wave64() {
+            let mask = if arch.gfx12() { 4080 } else { 1008 };
+            inst_pref = format!("((instprefsize({end}-{})<<4)&{mask})>>4", kernel.symbol);
+            if kernel.directives.iter().any(|(name, _)| name == ".amdhsa_inst_pref_size") {
+                return Err(format!("{}: .amdhsa_inst_pref_size is derived from the code extent", kernel.symbol));
+            }
+            directives.push((".amdhsa_inst_pref_size", inst_pref.as_str()));
+        }
         let code_bytes = 4 * kernel.words.len() as u64;
         let descriptor = descriptor::encode(arch, kernel.symbol, &directives, &end, code_bytes)?;
         linked.push(elf::Kernel { symbol: kernel.symbol.to_owned(), code: kernel.words.iter().flat_map(|w| w.to_le_bytes()).collect(), descriptor });
     }
-    elf::link(arch, &linked, &metadata)
+    elf::link(arch, code_object_version, &linked, &metadata)
 }
 
 /// Uncompressed `__CLANG_OFFLOAD_BUNDLE__` of an empty host entry and the

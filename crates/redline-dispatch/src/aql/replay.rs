@@ -398,7 +398,8 @@ impl SingleQueuePm4Ib {
     }
 
     /// Restrict the retained replay queue to an ABI-valid WGP-paired CU mask.
-    /// This must be called before the first submission.
+    /// This must be called before the first submission. Refused on RDNA
+    /// (`RuntimeError::CuMaskRefusedOnRdna`): CU masks hung the R9700 MES on 2026-10-14.
     pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), ReplayError> {
         self.queues.set_cu_mask(mask_bits, mask).map_err(Into::into)
     }

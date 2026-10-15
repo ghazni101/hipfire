@@ -26,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hipfire_client::{service_url, ServiceEndpoint};
 use serde_json::Value;
 
 use super::config::ConfigState;
@@ -139,6 +140,15 @@ impl Dashboard {
             offline_hint: Some("serve offline — start it with `hipfire serve -d`".into()),
             system: None,
         }
+    }
+
+    /// Record why the serve cannot be probed (key-file or endpoint error,
+    /// rejected bearer). Replaces the generic start hint and is mirrored into
+    /// `health_text` so the System tab shows the real cause.
+    fn with_failure(mut self, reason: String) -> Self {
+        self.offline_hint = Some(reason.clone());
+        self.health_text = reason;
+        self
     }
 }
 
@@ -543,10 +553,38 @@ fn field_u64(card: &Value, key: &str) -> Option<u64> {
 
 // ── Fetchers (I/O; thin wrappers around the pure parsers) ───────────────────
 
-fn get_text(agent: &ureq::Agent, url: &str) -> Option<String> {
-    match agent.get(url).call() {
-        Ok(mut resp) if resp.status().as_u16() < 400 => resp.body_mut().read_to_string().ok(),
-        _ => None,
+/// Result of one authenticated text GET against the serve.
+enum TextFetch {
+    Body(String),
+    /// 401/403: serve is reachable but refused (or required) the bearer token.
+    Rejected(u16),
+    /// Transport failure, other non-success status, or unreadable body.
+    Unavailable,
+}
+
+fn get_text(agent: &ureq::Agent, endpoint: &ServiceEndpoint, path: &str) -> TextFetch {
+    match endpoint.authorize(agent.get(&service_url(endpoint, path))).call() {
+        Ok(mut resp) => {
+            let status = resp.status().as_u16();
+            if matches!(status, 401 | 403) {
+                TextFetch::Rejected(status)
+            } else if status >= 400 {
+                TextFetch::Unavailable
+            } else {
+                resp.body_mut()
+                    .read_to_string()
+                    .map_or(TextFetch::Unavailable, TextFetch::Body)
+            }
+        }
+        Err(_) => TextFetch::Unavailable,
+    }
+}
+
+/// Body of a successful GET; `None` for any failure.
+fn get_body(agent: &ureq::Agent, endpoint: &ServiceEndpoint, path: &str) -> Option<String> {
+    match get_text(agent, endpoint, path) {
+        TextFetch::Body(body) => Some(body),
+        TextFetch::Rejected(_) | TextFetch::Unavailable => None,
     }
 }
 
@@ -794,27 +832,41 @@ pub fn fetch_vram() -> VramState {
 /// and of rocm-smi being absent (VramState::Unavailable). All timeouts are
 /// short so the refresh tick never wedges the UI.
 pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
-    let endpoint = format!("{}:{}", config.probe_host(), config.port);
+    let display_endpoint = format!("{}:{}", config.probe_host(), config.port);
     let vram = fetch_vram();
     let gpu_load = fetch_gpu_load();
+
+    // An unloadable key file or malformed endpoint is surfaced as-is — never
+    // downgraded to an unauthenticated probe.
+    let endpoint = match config.service_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            return Dashboard::offline(display_endpoint, vram, gpu_load).with_failure(reason);
+        }
+    };
 
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_millis(450)))
         .http_status_as_error(false)
+        // Never forward the bearer to another origin.
+        .max_redirects(0)
         .build()
         .into();
-    let base = format!("http://{endpoint}");
 
-    let health = get_text(&agent, &format!("{base}/health"));
-    if health.is_none() {
+    let health = match get_text(&agent, &endpoint, "/health") {
+        TextFetch::Body(body) => body,
+        TextFetch::Rejected(status) => {
+            return Dashboard::offline(display_endpoint, vram, gpu_load).with_failure(format!(
+                "serve rejected the bearer token (HTTP {status}); check serve.api_key_file"
+            ));
+        }
         // Serve unreachable — honest offline state (VRAM/load may still read).
-        return Dashboard::offline(endpoint, vram, gpu_load);
-    }
-    let health = health.unwrap();
+        TextFetch::Unavailable => return Dashboard::offline(display_endpoint, vram, gpu_load),
+    };
     let health_model = parse_health_model(&health);
 
-    let stats = get_text(&agent, &format!("{base}/stats")).and_then(|b| parse_stats(&b));
-    let model_ids = get_text(&agent, &format!("{base}/v1/models"))
+    let stats = get_body(&agent, &endpoint, "/stats").and_then(|b| parse_stats(&b));
+    let model_ids = get_body(&agent, &endpoint, "/v1/models")
         .map(|b| parse_model_ids(&b))
         .unwrap_or_default();
 
@@ -826,7 +878,7 @@ pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
 
     Dashboard {
         serve_up: true,
-        endpoint,
+        endpoint: display_endpoint,
         health_text: health,
         model,
         stats,
@@ -1041,22 +1093,31 @@ fn metrics_loop(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_millis(450)))
         .http_status_as_error(false)
+        // Never forward the bearer to another origin.
+        .max_redirects(0)
         .build()
         .into();
     let mut ring = MetricsRing::default();
     while !shutdown.load(Ordering::SeqCst) {
-        let url = {
+        let endpoint = {
             let cfg = config.lock().unwrap_or_else(|e| e.into_inner());
-            format!("http://{}:{}/metrics", cfg.probe_host(), cfg.port)
+            cfg.service_endpoint()
         };
-        let scrape = match agent.get(&url).call() {
-            Ok(resp) if resp.status().as_u16() >= 400 => Err(MetricsView::Unavailable),
-            Ok(mut resp) => resp
-                .body_mut()
-                .read_to_string()
-                .map(|body| metrics::parse(&body))
-                .map_err(|_| MetricsView::Offline),
-            Err(_) => Err(MetricsView::Offline),
+        // An unloadable bearer/endpoint is never retried unauthenticated.
+        let scrape = match endpoint {
+            Err(_) => Err(MetricsView::Unavailable),
+            Ok(endpoint) => match endpoint
+                .authorize(agent.get(&service_url(&endpoint, "/metrics")))
+                .call()
+            {
+                Ok(resp) if resp.status().as_u16() >= 400 => Err(MetricsView::Unavailable),
+                Ok(mut resp) => resp
+                    .body_mut()
+                    .read_to_string()
+                    .map(|body| metrics::parse(&body))
+                    .map_err(|_| MetricsView::Offline),
+                Err(_) => Err(MetricsView::Offline),
+            },
         };
         let next = ring.record(Instant::now(), scrape);
         *view.lock().unwrap_or_else(|e| e.into_inner()) = next;

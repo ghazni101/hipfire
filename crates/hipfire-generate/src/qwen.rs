@@ -542,9 +542,18 @@ pub fn ep_serve_qwen35_dense_tp(
         if let Err(e) = gpus.devices[0].bind_thread() {
             return Err(format!("dense TP first-logits bind_thread: {e:?}"));
         }
-        gpus.devices[0]
+        let logits = gpus.devices[0]
             .download_f32(&scratches[0].logits)
-            .map_err(|e| format!("dense TP first-logits download: {e:?}"))
+            .map_err(|e| format!("dense TP first-logits download: {e:?}"));
+        // Whole-token TP2 graphs use bounded device barriers; rank 0's download
+        // checks only rank 0. Check (and clear) every rank whatever the download
+        // returned, so no rank's timeout leaks into the next request.
+        let waits = gpus
+            .take_device_wait_errors()
+            .map_err(|e| format!("dense TP first-logits: {e}"));
+        let logits = logits?;
+        waits?;
+        Ok(logits)
     })();
     let mut logits = match logits_result {
         Ok(logits) => logits,
@@ -684,9 +693,15 @@ pub fn ep_serve_qwen35_dense_tp(
             if let Err(e) = gpus.devices[0].bind_thread() {
                 return Err(format!("dense TP decode logits bind_thread: {e:?}"));
             }
-            gpus.devices[0]
+            let logits = gpus.devices[0]
                 .download_f32(&scratches[0].logits)
-                .map_err(|e| format!("dense TP decode logits download: {e:?}"))
+                .map_err(|e| format!("dense TP decode logits download: {e:?}"));
+            let waits = gpus
+                .take_device_wait_errors()
+                .map_err(|e| format!("dense TP decode: {e}"));
+            let logits = logits?;
+            waits?;
+            Ok(logits)
         })();
         logits = match logits_result {
             Ok(logits) => logits,

@@ -63,6 +63,19 @@
 //! zeroes the promoted lane's pending hidden right after the promotion (must
 //! fail the comparison).
 //!
+//! `--spec ar --promote P` (P >= 0, AR lanes beside a loaded MTP head: serve
+//! with `serve.batch_spec = false`): after the AR matrix, for every k request
+//! 0 runs on the resident native-MTP singleton (`mtp_prefill`, then P windows
+//! of `mtp_step` at depth `k`), is moved into an AR lane by
+//! `prepare_promotion` + `commit_promotion`, and the other k-1 requests are
+//! admitted and prefilled as AR lanes. The promoted stream (singleton ids,
+//! then every lane pick) must equal the AR singleton reference ids; at P = 0
+//! (promotion right after the prefill pick, as serve promotes a request that
+//! a peer queues behind) every lane step's logits row and the step-1 and
+//! last-step trunk states are compared byte for byte too. `--controls` adds a
+//! 2-lane run that skips `commit_promotion` (the lane keeps its fresh trunk
+//! state; must fail the comparison).
+//!
 //! Exit 0 only when every compared run passes and every control is detected.
 //! Nothing is written outside OUT_DIR.
 
@@ -195,20 +208,15 @@ fn parse_args() -> R<Args> {
     if a.steps == 0 {
         return Err("--steps must be >= 1".into());
     }
-    if a.spec_mtp {
-        if a.k == 0 || a.k > 7 {
-            return Err("--k must be 1..=7".into());
-        }
-        if a.g0 {
-            return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
-        }
+    if (a.spec_mtp || a.promote.is_some()) && (a.k == 0 || a.k > 7) {
+        return Err("--k must be 1..=7".into());
+    }
+    if a.spec_mtp && a.g0 {
+        return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
     }
     if let Some(p) = a.promote {
-        if !a.spec_mtp {
-            return Err("--promote needs --spec mtp".into());
-        }
-        if p == 0 {
-            return Err("--promote must be >= 1".into());
+        if a.spec_mtp && p == 0 {
+            return Err("--spec mtp --promote must be >= 1".into());
         }
         if p >= a.steps {
             return Err(format!("--promote {p} must be below --steps {} (the lane needs a window)", a.steps));
@@ -687,6 +695,9 @@ struct Lane {
     prefilled: usize,
     committed: Vec<u32>,
     ar_steps: usize,
+    /// Compare committed ids only (a lane promoted after native MTP windows:
+    /// its trunk rows came from verify forwards, not the AR reference's).
+    ids_only: bool,
 }
 
 struct Run {
@@ -799,7 +810,10 @@ fn absorb(
                 run.lanes[idx].ar_steps += 1;
                 let s = run.lanes[idx].ar_steps;
                 let got = logits_of(rr.epoch).ok_or("AR row has no logits row")?;
-                run.diff.check(&format!("req {req} step {s} logits"), &ref_logits(rq, s)?, got, true);
+                let ids_only = run.lanes[idx].ids_only;
+                if !ids_only {
+                    run.diff.check(&format!("req {req} step {s} logits"), &ref_logits(rq, s)?, got, true);
+                }
                 run.lane_steps += 1;
                 match adv.committed_ids.as_slice() {
                     [id] => {
@@ -818,7 +832,7 @@ fn absorb(
                         prompt_len + s
                     ));
                 }
-                if ckpt_steps.contains(&s) {
+                if ckpt_steps.contains(&s) && !ids_only {
                     let items = lane_items(w, &run.lanes[idx])?;
                     let rc = rq.ckpts.iter().find(|c| c.step == s).ok_or("missing reference checkpoint")?;
                     compare_ckpt(&mut run.diff, &format!("req {req} step {s}"), rc, &items)?;
@@ -973,6 +987,71 @@ fn drive(
     Ok(())
 }
 
+/// `--spec ar --promote`: request 0 runs `windows` native-MTP windows at
+/// depth `k` on the resident singleton, then moves into an AR lane.
+#[derive(Clone, Copy)]
+struct ArPromote {
+    windows: usize,
+    k: usize,
+    /// Negative control: skip `commit_promotion` (the lane keeps its fresh
+    /// trunk state, the resident is reset), the pre-fix failure.
+    skip_commit: bool,
+}
+
+/// Run `rq`'s request on the resident native-MTP singleton for `p.windows`
+/// windows, then `prepare_promotion` (AR store: no drafter parts) +
+/// `commit_promotion` into lane `epoch`. The returned lane is Decoding with
+/// the singleton's committed ids (the last one is the pending seed) counted
+/// as AR steps, so the lane's next AR row is reference step `ids.len()`.
+fn promote_ar(w: &mut World, rq: &RefReq, epoch: RequestEpoch, p: ArPromote, max_seq: usize, steps: usize) -> R<Lane> {
+    let prompt = rq.prompt.clone();
+    let (drafter, seed, wins) = singleton_phase(w, &prompt, p.k, max_seq, p.windows)?;
+    let mut stream = vec![seed];
+    for win in &wins {
+        stream.extend_from_slice(&win.committed);
+    }
+    let moved = (|| -> R<usize> {
+        if stream.len() > steps {
+            return Err(format!(
+                "promote: the singleton committed {} ids, more than --steps {steps}",
+                stream.len()
+            ));
+        }
+        let pending = *stream.last().ok_or("the promoted request has no pending seed")?;
+        let position = w.bundle.state.position;
+        let expect = prompt.len() + stream.len() - 1;
+        if position != expect {
+            return Err(format!("promote: singleton position {position} expected {expect}"));
+        }
+        let slot = w
+            .bundle
+            .prepare_promotion(&mut w.gpu, epoch, prompt.clone(), stream.clone(), pending, position, None)
+            .map_err(|x| format!("prepare_promotion: {x}"))?;
+        let committed = if p.skip_commit {
+            w.bundle.reset(&mut w.gpu).map_err(|x| format!("control reset: {x}"))
+        } else {
+            w.bundle.commit_promotion(&mut w.gpu, &epoch).map_err(|x| format!("commit_promotion: {x}"))
+        };
+        if let Err(m) = committed {
+            let _ = w.bundle.release_lane(&epoch);
+            return Err(m);
+        }
+        Ok(slot)
+    })();
+    Box::new(drafter).mtp_free(&mut w.gpu);
+    let slot = moved?;
+    Ok(Lane {
+        req: 0,
+        epoch,
+        slot,
+        prompt_len: prompt.len(),
+        prefilled: prompt.len(),
+        ar_steps: stream.len() - 1,
+        committed: stream,
+        ids_only: p.windows > 0,
+    })
+}
+
 struct RunReport {
     k: usize,
     label: String,
@@ -1013,6 +1092,23 @@ impl App {
         control: Control,
         opts: &RunOpts,
     ) -> RunReport {
+        self.run_lanes_with(k, steps, policy, label, control, opts, None)
+    }
+
+    /// [`Self::run_lanes`]; with `promote`, request 0 starts on the resident
+    /// native-MTP singleton and is promoted into an AR lane ([`promote_ar`])
+    /// before requests 1..k are admitted.
+    #[allow(clippy::too_many_arguments)]
+    fn run_lanes_with(
+        &mut self,
+        k: usize,
+        steps: usize,
+        policy: LaneStagePolicy,
+        label: &str,
+        control: Control,
+        opts: &RunOpts,
+        promote: Option<ArPromote>,
+    ) -> RunReport {
         let started = Instant::now();
         let mut run = Run {
             lanes: Vec::new(),
@@ -1034,7 +1130,20 @@ impl App {
                 .lanes_mut()
                 .ok_or("lane store is not staged")?
                 .set_stage_policy(policy);
-            for req in 0..k {
+            let mut first = 0;
+            if let Some(p) = promote {
+                self.tag += 1;
+                let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
+                let lane = promote_ar(&mut self.w, &self.refs[0], epoch, p, self.max_seq, steps)?;
+                run.diff.id_lists(
+                    "req 0 singleton ids before the promotion vs the AR singleton",
+                    &self.refs[0].ids[..lane.committed.len()],
+                    &lane.committed,
+                );
+                run.lanes.push(lane);
+                first = 1;
+            }
+            for req in first..k {
                 self.tag += 1;
                 let epoch = RequestEpoch { request_tag: self.tag, owner_generation: 1 };
                 let prompt = self.refs[req].prompt.clone();
@@ -1044,7 +1153,16 @@ impl App {
                     .bundle
                     .admit_lane(&mut self.w.gpu, epoch, prompt)
                     .map_err(|x| format!("admit request {req}: {x}"))?;
-                run.lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                run.lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
             drive(&mut self.w, &self.refs, &mut run, steps, &self.ckpt_steps, opts)
         })();
@@ -1063,10 +1181,12 @@ impl App {
             .map(|m| format!("executor error: {m}"))
             .or_else(|| run.diff.first.clone())
             .or_else(|| run.release_errors.first().cloned());
-        let prefill_pass = run.pre_bad == 0 && run.pre_checked == k && run.error.is_none();
+        let prefilled_lanes = k - usize::from(promote.is_some());
+        let prefill_pass = run.pre_bad == 0 && run.pre_checked == prefilled_lanes && run.error.is_none();
         let json = json!({
             "k": k,
             "policy": label,
+            "promote": promote.map(|p| json!({"windows": p.windows, "k": p.k, "skip_commit": p.skip_commit})),
             "control": control.name(),
             "pass": clean,
             "steps": steps,
@@ -1134,7 +1254,16 @@ impl App {
                 let prompt = self.prompts[req].clone();
                 let prompt_len = prompt.len();
                 let slot = self.w.bundle.admit_lane(&mut self.w.gpu, epoch, prompt).map_err(e)?;
-                lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
             while let Some(i) = lanes.iter().position(|l| l.prefilled < l.prompt_len) {
                 let l = &lanes[i];
@@ -2069,7 +2198,16 @@ impl App {
                 let prompt = self.prompts[req].clone();
                 let prompt_len = prompt.len();
                 let slot = self.w.bundle.admit_lane(&mut self.w.gpu, epoch, prompt).map_err(e)?;
-                lanes.push(Lane { req, epoch, slot, prompt_len, prefilled: 0, committed: Vec::new(), ar_steps: 0 });
+                lanes.push(Lane {
+                    req,
+                    epoch,
+                    slot,
+                    prompt_len,
+                    prefilled: 0,
+                    committed: Vec::new(),
+                    ar_steps: 0,
+                    ids_only: false,
+                });
             }
             while let Some(i) = lanes.iter().position(|l| l.prefilled < l.prompt_len) {
                 let l = &lanes[i];
@@ -2294,6 +2432,7 @@ fn load(
     max_seq: usize,
     max_k: usize,
     spec: Option<LaneSpecConfig>,
+    attach_mtp: bool,
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
@@ -2350,7 +2489,7 @@ fn load(
     )
     .map_err(e)?;
     bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(e)?;
-    if spec.is_some() {
+    if attach_mtp {
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
     }
     bundle.stage_lanes(&mut gpu, max_k, max_k, spec).map_err(e)?;
@@ -2415,7 +2554,9 @@ fn real_main() -> R<bool> {
 
     let mut log = Log::default();
     let file_size = fs::metadata(&args.model).map_err(e)?.len();
-    let (_source, mut w, tokenizer) = load(&args.model, args.max_seq, max_k, spec_cfg)?;
+    // `--spec ar --promote` keeps the MTP head resident beside AR lanes, as serve does with `serve.batch_spec = false`.
+    let attach_mtp = args.spec_mtp || args.promote.is_some();
+    let (_source, mut w, tokenizer) = load(&args.model, args.max_seq, max_k, spec_cfg, attach_mtp)?;
     log.say(format!("gpu arch: {}", w.gpu.arch));
     log.say(format!("model: {} ({file_size} bytes)", args.model.display()));
     {
@@ -2656,6 +2797,41 @@ fn real_main() -> R<bool> {
         );
     }
 
+    // ── promotion: native-MTP singleton → AR lane ──────────────────
+    let mut promote_json = Vec::new();
+    if let Some(windows) = args.promote {
+        let promote = ArPromote { windows, k: args.k, skip_commit: false };
+        let label = format!("promote:{windows}@k{}", args.k);
+        for &k in &args.ks {
+            let r = app.run_lanes_with(k, args.steps, primary, &label, Control::None, &full, Some(promote));
+            app.say_run(&r);
+            all_pass &= r.pass;
+            promote_json.push(r.json);
+        }
+        if args.controls {
+            // Negative: the lane keeps its fresh trunk state (no commit); the comparison must fail.
+            let control = ArPromote { windows: 0, k: args.k, skip_commit: true };
+            let r = app.run_lanes_with(2, short_steps, primary, "promote:skip_commit", Control::None, &full, Some(control));
+            let detected = r.run.diff.bad > 0 || r.run.error.is_some();
+            all_pass &= detected;
+            let how = if detected {
+                format!("comparison failed: {}", r.first.clone().unwrap_or_default())
+            } else {
+                "comparison still passed".to_string()
+            };
+            app.log.say(format!(
+                "control promote_skip_commit: {} ({how})",
+                if detected { "detected" } else { "MISSED" }
+            ));
+            controls_json.push(json!({
+                "control": "promote_skip_commit",
+                "detected": detected,
+                "how": how,
+                "run": r.json,
+            }));
+        }
+    }
+
     // ── bench ──────────────────────────────────────────────────────
     let mut bench_json = Vec::new();
     if args.bench > 0 {
@@ -2685,11 +2861,13 @@ fn real_main() -> R<bool> {
             "ks": args.ks, "contexts": args.contexts, "steps": args.steps, "max_seq": args.max_seq,
             "policy": args.policy, "policy_described": primary.describe(), "g0": args.g0,
             "controls": args.controls, "bench": args.bench, "spec": "ar",
+            "promote": args.promote, "k": args.promote.map(|_| args.k),
         },
         "policy_evidence": primary.evidence(),
         "requests": app.refs.iter().map(|r| json!({"context": r.prompt.len(), "dir": r.dir.display().to_string()})).collect::<Vec<_>>(),
         "s1_prefill_parity_k2": s1_pass,
         "runs": runs,
+        "promote_runs": promote_json,
         "g0": g0_json,
         "controls": controls_json,
         "bench": bench_json,

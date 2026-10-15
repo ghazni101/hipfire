@@ -15,11 +15,15 @@ thread_local! {
     static TEXTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-fn ir_arch(arch: Arch) -> IrArch {
+const CDNA_UNSUPPORTED: &str = "the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna";
+
+/// The RDNA IR architecture for `arch`; CDNA has no `.rip` lowering, so it is refused.
+fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
-        Arch::Gfx1100 => IrArch::Gfx1100,
-        Arch::Gfx1151 => IrArch::Gfx1151,
-        Arch::Gfx1201 => IrArch::Gfx1201,
+        Arch::Gfx1100 => Ok(IrArch::Gfx1100),
+        Arch::Gfx1151 => Ok(IrArch::Gfx1151),
+        Arch::Gfx1201 => Ok(IrArch::Gfx1201),
+        Arch::Gfx942 => Err(CDNA_UNSUPPORTED.into()),
     }
 }
 
@@ -52,8 +56,8 @@ fn normalized(name: &str) -> String {
         .replace("_co_", "_").replace("_num_", "_")
 }
 
-fn unknown(arch: Arch, name: &str) -> String {
-    let target = isa::table(ir_arch(arch));
+fn unknown(arch: Arch, ir: IrArch, name: &str) -> String {
+    let target = isa::table(ir);
     let normalized_name = normalized(name);
     let suggestion = target.iter().min_by_key(|row| {
         (normalized(row.name) != normalized_name, distance(name, row.name), row.name)
@@ -71,15 +75,14 @@ fn unknown(arch: Arch, name: &str) -> String {
     message
 }
 
-fn parse(arch: Arch, text: &str) -> Result<Inst, String> {
-    parse_line(text, ir_arch(arch)).map_err(|error| match error {
-        ParseError::UnknownMnemonic(name) => unknown(arch, &name),
+fn parse(arch: Arch, ir: IrArch, text: &str) -> Result<Inst, String> {
+    parse_line(text, ir).map_err(|error| match error {
+        ParseError::UnknownMnemonic(name) => unknown(arch, ir, &name),
         other => malformed(arch, text, other),
     })
 }
 
-fn table_effects(arch: Arch, inst: &Inst) -> Result<Effects, peacemaker_ir::inst::ValidateError> {
-    let arch = ir_arch(arch);
+fn table_effects(arch: IrArch, inst: &Inst) -> Result<Effects, peacemaker_ir::inst::ValidateError> {
     if let FormFields::Vopd { y_op, x_operands } = inst.fields {
         let split = usize::from(x_operands);
         let mut effects = Effects::from_table(arch, inst.op, inst.form, &inst.operands[..split], &inst.mods.cpol)?;
@@ -105,8 +108,9 @@ fn builder_reg(reg: &peacemaker_ir::reg::RegRef) -> Option<RegRef> {
 /// Register effects from the target opcode table, excluding special registers
 /// and TTMPs. Returns (definitions, uses), retaining operand order and widths.
 pub fn effects(arch: Arch, text: &str) -> Result<(Vec<RegRef>, Vec<RegRef>), String> {
-    let inst = parse(arch, text)?;
-    let effects = table_effects(arch, &inst).map_err(|e| malformed(arch, text, e))?;
+    let ir = ir_arch(arch)?;
+    let inst = parse(arch, ir, text)?;
+    let effects = table_effects(ir, &inst).map_err(|e| malformed(arch, text, e))?;
     Ok((effects.defs.iter().filter_map(builder_reg).collect(), effects.uses.iter().filter_map(builder_reg).collect()))
 }
 
@@ -133,11 +137,12 @@ fn source_list(declared: &[RegRef], actual: &[RegRef]) -> String {
 /// effects that omit any table effect under the overlap rule above.
 /// Labels and typed branches belong to the driver, not this entry point.
 pub fn instruction(arch: Arch, text: &str, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    let inst = parse(arch, text)?;
+    let ir = ir_arch(arch)?;
+    let inst = parse(arch, ir, text)?;
     let encoded = if arch.gfx12() {
         peacemaker_ir::codec::gfx12::encode(&inst)
     } else {
-        peacemaker_ir::codec::gfx11::encode(ir_arch(arch), &inst)
+        peacemaker_ir::codec::gfx11::encode(ir, &inst)
     };
     encoded.map_err(|e| malformed(arch, text, e))?;
     // parse_line already constructs Effects::from_table (including both VOPD
@@ -254,6 +259,7 @@ fn entry_state(kernel: &peacemaker_ir::inst::Kernel, arch: Arch) -> ([bool; LOCA
 /// counts as defining its dword. Ordering, paths, and half coverage stay with
 /// M7 certification; this inexpensive check does not claim to prove them.
 pub(crate) fn emitted(arch: Arch, text: &str, sites: Vec<(String, String)>) -> Result<(), Vec<String>> {
+    let arch_ir = ir_arch(arch).map_err(|reason| vec![reason])?;
     let bytes = peacemaker_isa::native::assemble(text, arch).map_err(|reason| {
         let at = sites.iter().find(|(text, _)| reason.contains(text)).map(|(_, at)| format!("{at}: ")).unwrap_or_default();
         vec![format!("{at}assemble: {reason}")]
@@ -261,7 +267,6 @@ pub(crate) fn emitted(arch: Arch, text: &str, sites: Vec<(String, String)>) -> R
     let lifted = peacemaker_lift::lift_object(&bytes, peacemaker_lift::Options {
         frontend: peacemaker_ir::inst::Frontend::Builder,
     }).map_err(|reason| vec![format!("certification: lift: {reason}")])?;
-    let arch_ir = ir_arch(arch);
     let mut findings = Vec::new();
     for (index, kernel) in lifted.program.kernels.iter().enumerate() {
         let (mut defined, entry) = entry_state(kernel, arch);

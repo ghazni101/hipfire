@@ -58,10 +58,18 @@
 //! verified against the source before they are renamed into place; the segment
 //! digests of the Q8 table are computed in that re-read.
 
+// Non-Unix builds compile only the platform-independent planning/format logic
+// and explicit "unsupported" entry points; the I/O implementation (positional
+// reads/writes, flock, statvfs, fadvise, sync_file_range) is `cfg(unix)`, so
+// the planning code it alone consumes is intentionally unreferenced there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -169,6 +177,17 @@ impl Default for Tuning {
 }
 
 type Progress<'a> = &'a mut (dyn FnMut(&PleProgress) + Send);
+
+/// Error of every conversion entry point on a non-Unix host, raised before any
+/// file is opened or created.
+#[cfg(not(unix))]
+fn unix_only(ctx: &str, command: &str) -> String {
+    format!(
+        "{ctx}: PLE table conversion requires a Unix (Linux) host: it needs Unix positional \
+         file I/O, flock and statvfs, which this build does not implement. Run \
+         `hipfire ple {command}` on a Unix (Linux) host"
+    )
+}
 
 /// `qwen3.8-flash-next.mq4-xts` → `qwen3.8-flash-next-base.mq4-xts`: "-base"
 /// goes before the extension (appended when there is none).
@@ -290,6 +309,7 @@ impl TableParams<'_> {
 /// digests. This is the content digest of a table and, because the caller
 /// flushed and dropped the page cache first, the verification that the bytes
 /// reached the disk.
+#[cfg(unix)]
 fn segment_digests(
     file: &File,
     path: &Path,
@@ -331,6 +351,7 @@ fn segment_digests(
 /// Rebind an existing Q4 table after proving the embedded Q8 PLE shards are
 /// unchanged. The old base must bind the source table. Publication replaces
 /// the destination directory entry, never its inode (including hard links).
+#[cfg(unix)]
 pub fn rebind_q4(
     old_base: &Path,
     new_base: &Path,
@@ -352,10 +373,14 @@ pub fn rebind_q4(
     {
         return Err("ple rebind: PLE metadata changed".into());
     }
-    let old_shards: Vec<_> = old.tensor_infos().iter()
+    let old_shards: Vec<_> = old
+        .tensor_infos()
+        .iter()
         .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
         .collect();
-    let new_shards: Vec<_> = new.tensor_infos().iter()
+    let new_shards: Vec<_> = new
+        .tensor_infos()
+        .iter()
         .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
         .collect();
     if old_shards.is_empty() || old_shards.len() != new_shards.len() {
@@ -366,17 +391,22 @@ pub fn rebind_q4(
     let mut left = vec![0u8; DEFAULT_CHUNK_BYTES];
     let mut right = vec![0u8; DEFAULT_CHUNK_BYTES];
     for (a, b) in old_shards.iter().zip(&new_shards) {
-        if a.name != b.name || a.shape != b.shape || a.quant_type != b.quant_type
-            || a.group_size != b.group_size || a.data_size != b.data_size
+        if a.name != b.name
+            || a.shape != b.shape
+            || a.quant_type != b.quant_type
+            || a.group_size != b.group_size
+            || a.data_size != b.data_size
         {
             return Err("ple rebind: PLE descriptor changed".into());
         }
         let mut offset = 0;
         while offset < a.data_size {
             let n = left.len().min(a.data_size - offset);
-            old_file.read_exact_at(&mut left[..n], (a.data_offset + offset) as u64)
+            old_file
+                .read_exact_at(&mut left[..n], (a.data_offset + offset) as u64)
                 .map_err(|e| e.to_string())?;
-            new_file.read_exact_at(&mut right[..n], (b.data_offset + offset) as u64)
+            new_file
+                .read_exact_at(&mut right[..n], (b.data_offset + offset) as u64)
                 .map_err(|e| e.to_string())?;
             if left[..n] != right[..n] {
                 return Err(format!("ple rebind: source rows changed in {}", a.name));
@@ -385,12 +415,30 @@ pub fn rebind_q4(
         }
     }
     let input = File::open(source).map_err(|e| e.to_string())?;
-    let tuning = Tuning { threads: 1, segment_bytes: header.table.as_ref()
-        .ok_or("ple rebind: missing table")?.segment_bytes, ..Tuning::default() };
-    let segments = segment_digests(&input, source, header.data_offset,
-        header.data_bytes, &tuning, progress)?;
+    let tuning = Tuning {
+        threads: 1,
+        segment_bytes: header
+            .table
+            .as_ref()
+            .ok_or("ple rebind: missing table")?
+            .segment_bytes,
+        ..Tuning::default()
+    };
+    let segments = segment_digests(
+        &input,
+        source,
+        header.data_offset,
+        header.data_bytes,
+        &tuning,
+        progress,
+    )?;
     if segments.iter().map(|s| hex(s)).collect::<Vec<_>>()
-        != header.table.as_ref().ok_or("ple rebind: missing table")?.segment_sha256 {
+        != header
+            .table
+            .as_ref()
+            .ok_or("ple rebind: missing table")?
+            .segment_sha256
+    {
         return Err("ple rebind: source payload digest mismatch".into());
     }
     let original = header.clone();
@@ -415,9 +463,15 @@ pub fn rebind_q4(
     let mut offset = 0;
     while offset < size {
         let n = left.len().min((size - offset) as usize);
-        input.read_exact_at(&mut left[..n], offset).map_err(|e| e.to_string())?;
-        output.write_all_at(&left[..n], offset).map_err(|e| e.to_string())?;
-        output.read_exact_at(&mut right[..n], offset).map_err(|e| e.to_string())?;
+        input
+            .read_exact_at(&mut left[..n], offset)
+            .map_err(|e| e.to_string())?;
+        output
+            .write_all_at(&left[..n], offset)
+            .map_err(|e| e.to_string())?;
+        output
+            .read_exact_at(&mut right[..n], offset)
+            .map_err(|e| e.to_string())?;
         if left[..n] != right[..n] {
             return Err("ple rebind: copied bytes differ".into());
         }
@@ -436,6 +490,18 @@ pub fn rebind_q4(
     Ok(out)
 }
 
+/// Rebind an existing Q4 table. Unsupported on this platform: the
+/// implementation needs Unix positional file I/O and `flock`.
+#[cfg(not(unix))]
+pub fn rebind_q4(
+    _old_base: &Path,
+    _new_base: &Path,
+    _source: &Path,
+    _progress: Progress<'_>,
+) -> Result<PathBuf, String> {
+    Err(unix_only("ple rebind", "rebind"))
+}
+
 /// Derive `<model>.ple-q4` (a v3 `ple-table`) from the model's Q8F16 PLE rows
 /// (its `.ple-q8` table when present, else the embedded shards).
 ///
@@ -444,6 +510,7 @@ pub fn rebind_q4(
 /// rank-order table (rows in tier order, rank embedded); with none of them the
 /// table is row order. A rank whose fingerprint or padded rows do not match
 /// the model, or whose payload hash is wrong, is refused. See the module docs.
+#[cfg(unix)]
 pub fn derive_q4(
     model_path: &Path,
     rank: Option<&Path>,
@@ -452,6 +519,18 @@ pub fn derive_q4(
     derive_q4_with(model_path, rank, &Tuning::default(), progress)
 }
 
+/// Derive `<model>.ple-q4`. Unsupported on this platform: the implementation
+/// needs Unix positional file I/O, `flock` and `statvfs`.
+#[cfg(not(unix))]
+pub fn derive_q4(
+    _model_path: &Path,
+    _rank: Option<&Path>,
+    _progress: &mut (dyn FnMut(&PleProgress) + Send),
+) -> Result<DeriveReport, String> {
+    Err(unix_only("ple derive", "derive"))
+}
+
+#[cfg(unix)]
 pub(crate) fn derive_q4_with(
     model_path: &Path,
     rank: Option<&Path>,
@@ -729,6 +808,7 @@ pub(crate) fn derive_q4_with(
     })
 }
 
+#[cfg(unix)]
 struct DeriveState {
     input: Vec<u8>,
     /// Encoded rows of one chunk (tier order in rank mode).
@@ -1004,6 +1084,7 @@ fn select_rows_source(
 /// the metadata) and `<out_base>.ple-q8` (the exact Q8F16 rows as a row-order
 /// `ple-table`). `out_base` defaults to [`default_split_base_path`]. The
 /// original is not touched.
+#[cfg(unix)]
 pub fn split(
     model_path: &Path,
     out_base: Option<&Path>,
@@ -1012,6 +1093,18 @@ pub fn split(
     split_with(model_path, out_base, &Tuning::default(), progress)
 }
 
+/// Split a monolithic Qwen4 HFQM. Unsupported on this platform: the
+/// implementation needs Unix positional file I/O, `flock` and `statvfs`.
+#[cfg(not(unix))]
+pub fn split(
+    _model_path: &Path,
+    _out_base: Option<&Path>,
+    _progress: &mut (dyn FnMut(&PleProgress) + Send),
+) -> Result<SplitReport, String> {
+    Err(unix_only("ple split", "split"))
+}
+
+#[cfg(unix)]
 pub(crate) fn split_with(
     model_path: &Path,
     out_base: Option<&Path>,
@@ -1868,12 +1961,14 @@ where
         .collect()
 }
 
+#[cfg(unix)]
 /// Per-worker copy buffer and write-behind state.
 struct CopyState {
     buf: Vec<u8>,
     behind: WriteBehind,
 }
 
+#[cfg(unix)]
 impl CopyState {
     fn new(chunk_bytes: usize) -> Self {
         Self {
@@ -1912,6 +2007,7 @@ impl Drop for TmpCleanup {
 
 /// Create/open `path`, take an exclusive non-blocking `flock` and truncate any
 /// stale content. The lock lives as long as the returned handle.
+#[cfg(unix)]
 fn open_locked_tmp(path: &Path, ctx: &str) -> Result<File, String> {
     let file = OpenOptions::new()
         .read(true)
@@ -1939,7 +2035,8 @@ fn open_locked_tmp(path: &Path, ctx: &str) -> Result<File, String> {
 }
 
 /// Free bytes available to unprivileged writers on the filesystem of `dir`.
-fn available_bytes(dir: &Path) -> Result<u64, String> {
+#[cfg(unix)]
+pub fn available_bytes(dir: &Path) -> Result<u64, String> {
     use std::os::unix::ffi::OsStrExt;
     let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| format!("path {} contains a NUL byte", dir.display()))?;
@@ -1959,6 +2056,7 @@ fn available_bytes(dir: &Path) -> Result<u64, String> {
 }
 
 /// Refuse when `dir` cannot hold `bytes` plus the safety margin.
+#[cfg(unix)]
 fn check_space(dir: &Path, bytes: u64, ctx: &str) -> Result<(), String> {
     let available = available_bytes(dir).map_err(|e| format!("{ctx}: {e}"))?;
     let need = bytes.saturating_add(SPACE_MARGIN);
@@ -2016,6 +2114,7 @@ fn checked_add(a: u64, b: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("size {a} + {b} overflows u64"))
 }
 
+#[cfg(unix)]
 fn advise_sequential(file: &File) {
     // SAFETY: advisory call on a valid fd.
     unsafe {
@@ -2024,6 +2123,7 @@ fn advise_sequential(file: &File) {
 }
 
 /// Drop the clean cached pages of `[off, off + len)` (`len == 0`: to EOF).
+#[cfg(unix)]
 fn drop_cache(file: &File, off: u64, len: u64) {
     // SAFETY: advisory call on a valid fd.
     unsafe {
@@ -2039,11 +2139,13 @@ fn drop_cache(file: &File, off: u64, len: u64) {
 /// Keeps a writer's dirty page-cache footprint to about one chunk: each new
 /// range starts asynchronous writeback; the previous range is then waited on
 /// and dropped from the cache.
+#[cfg(unix)]
 #[derive(Default)]
 struct WriteBehind {
     prev: Option<(u64, u64)>,
 }
 
+#[cfg(unix)]
 impl WriteBehind {
     fn wrote(&mut self, file: &File, off: u64, len: u64) {
         start_writeback(file, off, len);
@@ -2072,7 +2174,7 @@ fn start_writeback(file: &File, off: u64, len: u64) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn start_writeback(_file: &File, _off: u64, _len: u64) {}
 
 #[cfg(target_os = "linux")]
@@ -2091,7 +2193,7 @@ fn settle(file: &File, off: u64, len: u64) {
     drop_cache(file, off, len);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn settle(file: &File, off: u64, len: u64) {
     drop_cache(file, off, len);
 }
@@ -2099,8 +2201,11 @@ fn settle(file: &File, off: u64, len: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::hfq::{write_hfqm_package_mem, HfqMemTensor};
+    #[cfg(unix)]
     use crate::ple_hot_store::write_ple_hot_rank;
+    #[cfg(unix)]
     use crate::ple_q4::decode_q4lm_row_bf16;
 
     const SHARDS: usize = 4;
@@ -2108,10 +2213,13 @@ mod tests {
     const WIDTH: usize = 64;
     const PADDED: usize = SHARDS * ROWS;
     const Q8_ROW: usize = WIDTH / 32 * 34;
+    #[cfg(unix)]
     const Q4_ROW: usize = WIDTH / 32 * 18;
+    #[cfg(unix)]
     /// 16 heads of 2 rows each = 32 valid rows = `padded_rows`.
     const METADATA: &str = r#"{"architecture":"qwen4","note":"ple convert test","qwen4_ple":{"version":1,"multipliers":[-3,5,7],"head_vocab_sizes":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"head_offsets":[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30],"padded_rows":32}}"#;
 
+    #[cfg(unix)]
     /// Small tuning that forces many chunks, several segments and workers.
     fn tuning() -> Tuning {
         Tuning {
@@ -2128,6 +2236,7 @@ mod tests {
         *state >> 33
     }
 
+    #[cfg(unix)]
     /// Q8F16 rows with zero / negative / subnormal / large scales and ±127
     /// extremes mixed in (never NaN/inf, never overflowing an f16 scale).
     fn q8_shard(seed: u64) -> Vec<u8> {
@@ -2153,11 +2262,13 @@ mod tests {
         out
     }
 
+    #[cfg(unix)]
     fn payload(seed: u64, len: usize) -> Vec<u8> {
         let mut state = seed;
         (0..len).map(|_| (lcg(&mut state) >> 5) as u8).collect()
     }
 
+    #[cfg(unix)]
     struct Fixture {
         dir: tempfile::TempDir,
         model: PathBuf,
@@ -2165,6 +2276,7 @@ mod tests {
         kept: Vec<(String, Vec<u8>)>,
     }
 
+    #[cfg(unix)]
     fn mem(name: &str, qt: u8, shape: Vec<u32>, group: u32, data: Vec<u8>) -> HfqMemTensor {
         HfqMemTensor {
             name: name.to_string(),
@@ -2175,6 +2287,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// `shards_first`: shards at index 0..4 (the real layout); otherwise one
     /// kept tensor precedes them so kept payloads form two source runs.
     fn fixture(shards_first: bool) -> Fixture {
@@ -2225,30 +2338,37 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn no_progress() -> impl FnMut(&PleProgress) + Send {
         |_: &PleProgress| {}
     }
 
+    #[cfg(unix)]
     fn read_all(path: &Path) -> Vec<u8> {
         fs::read(path).unwrap()
     }
 
+    #[cfg(unix)]
     fn q4_path(model: &Path) -> PathBuf {
         ple_sidecar_path(model, PleFormat::Q4)
     }
 
+    #[cfg(unix)]
     fn q8_path(model: &Path) -> PathBuf {
         ple_sidecar_path(model, PleFormat::Q8)
     }
 
+    #[cfg(unix)]
     fn fingerprint() -> String {
         ple_fingerprint_from_metadata(METADATA).unwrap()
     }
 
+    #[cfg(unix)]
     fn derive(model: &Path, rank: Option<&Path>, tuning: &Tuning) -> Result<DeriveReport, String> {
         derive_q4_with(model, rank, tuning, &mut no_progress())
     }
 
+    #[cfg(unix)]
     #[test]
     fn rebind_breaks_hardlink_and_preserves_payload() {
         use std::os::unix::fs::MetadataExt;
@@ -2262,17 +2382,28 @@ mod tests {
         let out = q4_path(&base);
         fs::hard_link(&source, &out).unwrap();
         rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap();
-        assert_ne!(fs::metadata(&source).unwrap().ino(), fs::metadata(&out).unwrap().ino());
+        assert_ne!(
+            fs::metadata(&source).unwrap().ino(),
+            fs::metadata(&out).unwrap().ino()
+        );
         assert_eq!(read_all(&source), stock);
         let a = read_ple_hot_pack_header(&source).unwrap();
         let mut b = read_ple_hot_pack_header(&out).unwrap();
-        assert_eq!(&stock[a.data_offset as usize..], &read_all(&out)[b.data_offset as usize..]);
-        assert_eq!(b.table.as_ref().unwrap().base_file_bytes, fs::metadata(&base).unwrap().len());
+        assert_eq!(
+            &stock[a.data_offset as usize..],
+            &read_all(&out)[b.data_offset as usize..]
+        );
+        assert_eq!(
+            b.table.as_ref().unwrap().base_file_bytes,
+            fs::metadata(&base).unwrap().len()
+        );
         b.table.as_mut().unwrap().base_file_bytes = a.table.as_ref().unwrap().base_file_bytes;
-        b.table.as_mut().unwrap().base_index_sha256 = a.table.as_ref().unwrap().base_index_sha256.clone();
+        b.table.as_mut().unwrap().base_index_sha256 =
+            a.table.as_ref().unwrap().base_index_sha256.clone();
         assert_eq!(a, b);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rebind_refuses_changed_source_rows_and_corrupt_q4() {
         let fx = fixture(true);
@@ -2281,20 +2412,31 @@ mod tests {
         let base = fx.dir.path().join("changed.mq4");
         fs::copy(&fx.model, &base).unwrap();
         let hfq = HfqFile::open(&base).unwrap();
-        let shard = hfq.tensor_infos().iter().find(|t| t.name == ple_shard_name(0)).unwrap();
+        let shard = hfq
+            .tensor_infos()
+            .iter()
+            .find(|t| t.name == ple_shard_name(0))
+            .unwrap();
         let file = OpenOptions::new().write(true).open(&base).unwrap();
         file.write_all_at(&[255], shard.data_offset as u64).unwrap();
-        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress())
+            .unwrap_err()
             .contains("source rows changed"));
         fs::copy(&fx.model, &base).unwrap();
         let header = read_ple_hot_pack_header(&source).unwrap();
-        OpenOptions::new().write(true).open(&source).unwrap()
-            .write_all_at(&[255], header.data_offset).unwrap();
-        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+        OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .write_all_at(&[255], header.data_offset)
+            .unwrap();
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress())
+            .unwrap_err()
             .contains("payload digest mismatch"));
         assert!(!q4_path(&base).exists());
     }
 
+    #[cfg(unix)]
     fn do_split(model: &Path, out: Option<&Path>, tuning: &Tuning) -> Result<SplitReport, String> {
         split_with(model, out, tuning, &mut no_progress())
     }
@@ -2304,6 +2446,7 @@ mod tests {
         (0..PADDED).map(|_| (lcg(&mut state) >> 3) as u8).collect()
     }
 
+    #[cfg(unix)]
     fn write_rank(path: &Path, buckets: &[u8]) {
         write_ple_hot_rank(
             path,
@@ -2315,6 +2458,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     /// The Q4 row of global `row` of a derived table, found through the layout
     /// rules (row order: contiguous; rank order: tier base + slot).
     fn table_row(bytes: &[u8], h: &PleHotPackHeader, row: usize, buckets: &[u8]) -> Vec<u8> {
@@ -2334,10 +2478,12 @@ mod tests {
         bytes[off..off + Q4_ROW].to_vec()
     }
 
+    #[cfg(unix)]
     fn read_table(path: &Path) -> PleHotPackHeader {
         read_ple_hot_pack_header(path).unwrap()
     }
 
+    #[cfg(unix)]
     /// Recompute the segment digests / data digest of `bytes` and compare.
     fn assert_digests(bytes: &[u8], h: &PleHotPackHeader) {
         let table = h.table.as_ref().unwrap();
@@ -2364,6 +2510,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_row_order_matches_row_encoding() {
         for shards_first in [true, false] {
@@ -2432,6 +2579,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_rank_order_places_rows_in_tier_order() {
         let fx = fixture(false);
@@ -2476,6 +2624,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_is_deterministic_across_threads_and_chunking() {
         let fx = fixture(true);
@@ -2518,6 +2667,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_refuses_a_mismatched_rank() {
         let fx = fixture(true);
@@ -2553,6 +2703,7 @@ mod tests {
         assert!(!out.exists() && !append_suffix(&out, ".tmp").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_picks_up_the_default_rank_next_to_the_model() {
         let fx = fixture(true);
@@ -2563,6 +2714,7 @@ mod tests {
         assert_eq!(read_table(&report.output).order, PackOrder::Rank);
     }
 
+    #[cfg(unix)]
     #[test]
     fn split_writes_a_verified_base_and_q8_table() {
         for shards_first in [true, false] {
@@ -2667,6 +2819,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn split_defaults_the_base_name_and_is_deterministic() {
         let fx = fixture(true);
@@ -2689,6 +2842,7 @@ mod tests {
         assert_eq!(read_all(&again.ple_q8), q8_a);
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_from_split_base_equals_derive_from_monolithic() {
         let fx = fixture(true);
@@ -2734,6 +2888,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_rejects_a_corrupt_q8_sidecar_and_leaves_no_tmp() {
         let fx = fixture(true);
@@ -2749,6 +2904,7 @@ mod tests {
         assert!(!append_suffix(&q4_path(&base_path), ".tmp").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_rejects_a_q8_sidecar_bound_to_another_base() {
         let fx = fixture(true);
@@ -2759,6 +2915,7 @@ mod tests {
         assert!(err.contains("different base"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_refuses_existing_output_and_split_base_without_q8() {
         let fx = fixture(true);
@@ -2779,6 +2936,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn derive_refuses_when_the_tmp_is_locked_and_restarts_stale_tmp() {
         let fx = fixture(true);
@@ -2812,6 +2970,7 @@ mod tests {
         assert_eq!(read_all(&out).len() as u64, h.data_offset + h.data_bytes);
     }
 
+    #[cfg(unix)]
     #[test]
     fn split_refuses_overlay_trailing_bytes_existing_outputs_and_locks() {
         // Metadata overlay flag in the version word.
@@ -2868,6 +3027,7 @@ mod tests {
         do_split(&fx.model, Some(base_path.as_path()), &tuning()).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn split_refuses_a_split_base_and_models_without_shards() {
         let fx = fixture(true);

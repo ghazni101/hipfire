@@ -676,6 +676,11 @@ pub fn indexed_attention_cache_append_batch_arena(
         arena_copy(gpu,key_tensor,key_pitch,key_col0,p.full_keys,p.rows,width,width,0,p.position_start,true)?;
         return arena_copy(gpu,value.tensor,value.row_pitch_elems,value.col0_elems,p.full_values,p.rows,width,width,0,p.position_start,true);
     }
+    let kernel = match p.format {
+        QsaKvFormat::Fp8 => "indexed_attention_cache_append_fp8_batch_arena",
+        QsaKvFormat::Q8 => "indexed_attention_cache_append_q8_batch_arena",
+        _ => return Err(HipError::new(0, "QSA format has no BF16 projection-arena append kernel")),
+    };
     let mut args = KernargBlob::new();
     for t in [key_tensor,value.tensor,p.full_keys,p.full_values] { args.push_ptr(t.buf.as_ptr()); }
     args.push_i32(checked_i32(p.rows,"arena KV rows")?);
@@ -686,7 +691,7 @@ pub fn indexed_attention_cache_append_batch_arena(
     }
     args.push_i32(i32::from(key_bf16));
     let binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset: position_offset, addend: 0 }];
-    arena_launch(gpu,p.format.kernel(["", "indexed_attention_cache_append_fp8_batch_arena", "indexed_attention_cache_append_q8_batch_arena"]),
+    arena_launch(gpu,kernel,
         [checked_u32(p.kv_heads,"arena KV heads")?,checked_u32(p.rows,"arena KV rows")?,1],256,&mut args,
         crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: &binding })
 }

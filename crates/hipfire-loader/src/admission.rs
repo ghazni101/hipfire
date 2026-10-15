@@ -742,6 +742,17 @@ pub fn resolve_qwen4_ple_rows_hfq(
     if !qwen4_ple_rows_layout_present(hfq) {
         return Ok(None);
     }
+    if qwen4_ple_rows_fp8(hfq) {
+        // Stock-FP8 PLE rows are the artifact's own qt=56 shards (their scale
+        // is per shard): there is no q4/q8 sidecar to resolve or derive.
+        return match hipfire_config::memory::ple_format() {
+            hipfire_config::memory::PleFormatRequest::Auto => Ok(None),
+            format => Err(format!(
+                "qwen4: memory.ple_format = {format:?} requests PLE sidecar rows, but this \
+                 stock-FP8 artifact reads its embedded FP8E4M3PT PLE rows; unset memory.ple_format"
+            )),
+        };
+    }
     let mut progress = ple_progress_printer();
     hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
         hfq,
@@ -757,6 +768,14 @@ pub fn resolve_qwen4_ple_rows_hfq(
     .map_err(|error| format!("qwen4: PLE rows: {error}"))
 }
 
+/// Whether the base's embedded PLE shards are qt=56 FP8E4M3PT rows (the
+/// stock-FP8 recipe).
+fn qwen4_ple_rows_fp8(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    hfq.tensors().iter().any(|tensor| {
+        tensor.quant_type == 56 && hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name)
+    })
+}
+
 /// Validate a reserved arch-16 HFQM source without allocating weights.
 ///
 /// The architecture crate owns the complete source/index contract.  Loader
@@ -768,6 +787,7 @@ pub fn admit_qwen4_source(
     modality: InputModality,
     native_mtp: bool,
     spec_mtp: Option<bool>,
+    gpu_arch: &str,
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
@@ -790,6 +810,19 @@ pub fn admit_qwen4_source(
         receipt.config.mtp.is_some(),
         receipt.config.profile.id(),
     )?;
+    // The recipe's device admission: a stock-FP8 artifact needs FP8 expert
+    // kernels (gfx942 only), one device and every routed expert resident.
+    let host_mapped_experts = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
+        .map_err(|error| format!("qwen4: {error}"))?
+        .is_some();
+    hipfire_arch_qwen4::admission::admit_recipe_on_device(
+        receipt.recipe(),
+        gpu_arch,
+        effective_mesh,
+        native_mtp,
+        host_mapped_experts && receipt.recipe().fp8_experts(),
+    )
+    .map_err(|error| error.to_string())?;
     qwen4_developer_ple_policy(
         receipt.config.profile.is_flash_next(),
         receipt.config.profile.id(),
@@ -1563,6 +1596,7 @@ pub fn admit_source_with_options(
             InputModality::Text,
             native_mtp,
             spec_mtp,
+            gpu_arch,
         )?;
         // Native positions, or the YaRN-extended `factor x original` context.
         let positions = admitted.config.context_limit();

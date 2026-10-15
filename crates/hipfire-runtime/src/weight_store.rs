@@ -841,6 +841,8 @@ fn source_dtype(dtype: &str) -> Result<DType, String> {
         "MFP3G32E8" => DType::MFP3G32E8,
         "MFP2G32E8" => DType::MFP2G32E8,
         "PAROQ4G128" => DType::ParoQ4G128,
+        "FP8E4M3B128" => DType::FP8E4M3B128,
+        "FP8E4M3PT" => DType::FP8E4M3PT,
         "RAW" => DType::Raw,
         _ => {
             return Err(format!("unsupported source dtype '{dtype}'"));
@@ -862,7 +864,20 @@ pub fn external_row_stride(dtype: DType, row_elements: usize) -> Option<usize> {
     match dtype {
         DType::F32 | DType::F16 | DType::BF16 => dtype.row_bytes(row_elements),
         DType::Q8_0 if row_elements % 32 == 0 => dtype.row_bytes(row_elements),
+        // qt=56: one code byte per value; the shard's 16-byte scale header is
+        // not per row ([`external_range_bytes`]).
+        DType::FP8E4M3PT => dtype.row_bytes(row_elements),
         _ => None,
+    }
+}
+
+/// Exact byte extent of one external row range of `physical_rows` rows of
+/// `row_bytes`: the rows plus, for a qt=56 shard, its per-tensor header.
+pub fn external_range_bytes(dtype: DType, physical_rows: usize, row_bytes: usize) -> Option<usize> {
+    let rows = physical_rows.checked_mul(row_bytes)?;
+    match dtype {
+        DType::FP8E4M3PT => rows.checked_add(rdna_compute::fp8_e4m3::PT_HEADER_BYTES),
+        _ => Some(rows),
     }
 }
 
@@ -933,6 +948,23 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
     let k_alignment = match dtype {
         DType::MQ4G256V2 => 256usize,
         DType::MQ4G128V2 => 1,
+        // qt=55 is expert-blocked, not row-strided: `[E, R, K]` (or `[R, K]`)
+        // is E blocks of `b128_block_stride(R, K)` bytes.
+        DType::FP8E4M3B128 => {
+            let (experts, rows, k) = match *shape {
+                [experts, rows, k] => (experts, rows, k),
+                [rows, k] => (1, rows, k),
+                _ => {
+                    return Err(format!(
+                        "{dtype:?} payload shape {shape:?} must be [experts, rows, K] or [rows, K]"
+                    ))
+                }
+            };
+            return rdna_compute::fp8_e4m3::b128_tensor_bytes(experts, rows, k)
+                .filter(|_| experts != 0 && rows != 0 && k != 0)
+                .map(Some)
+                .ok_or_else(|| format!("{dtype:?} payload shape {shape:?} has no exact extent"));
+        }
         _ => return Ok(None),
     };
     if shape.len() < 2 {
@@ -1355,8 +1387,7 @@ fn validate_external_range(
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .ok_or_else(|| "external row shape overflows usize".to_string())?;
     let expected_row_bytes = external_row_stride(dtype, row_elements).unwrap_or(row_bytes);
-    let expected_length = expected_row_bytes
-        .checked_mul(physical_rows)
+    let expected_length = external_range_bytes(dtype, physical_rows, expected_row_bytes)
         .ok_or_else(|| "external range length overflows usize".to_string())?;
     let actual_length = usize::try_from(descriptor.length)
         .map_err(|_| "external range length does not fit usize".to_string())?;

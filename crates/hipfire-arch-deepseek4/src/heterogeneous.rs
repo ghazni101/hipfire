@@ -628,6 +628,11 @@ impl DeepseekV4HeterogeneousModel {
         let (dense_device_id, routed_device_id) = plan.resolve_device_ids()?;
         let dense_gpu = Gpu::init_with_device(dense_device_id)
             .map_err(|error| format!("deepseek4 heterogeneous init dense device: {error}"))?;
+        // Two physical devices cannot share one single-device HIPFIRE_EMU
+        // budget: refuse before touching the routed device (no-op when off).
+        dense_gpu
+            .emu_refuse_multi_device("deepseek4 heterogeneous dense/routed load")
+            .map_err(|error| format!("deepseek4 heterogeneous: {error}"))?;
         let routed_gpu = Gpu::init_with_device(routed_device_id)
             .map_err(|error| format!("deepseek4 heterogeneous init routed device: {error}"))?;
         if dense_gpu.arch != "gfx1100" || routed_gpu.arch != "gfx1151" {
@@ -637,7 +642,11 @@ impl DeepseekV4HeterogeneousModel {
             ));
         }
         let mut staging = DeepseekV4HeterogeneousStaging::new(dense_gpu, routed_gpu);
-        let (dense_free_before, routed_free_before) = {
+        // `*_free_before` / `*_free_after` are PHYSICAL (raw hipMemGetInfo)
+        // figures: the load report and its allocation deltas stay raw. The
+        // `*_budget_free_*` figures are the capped per-device sizing queries
+        // (UMA-safe clamp, then the emu cap) that gate admission.
+        let (dense_free_before, routed_free_before, dense_budget_free_before, routed_budget_free_before) = {
             let (dense_gpu, routed_gpu) = staging.devices_mut();
             dense_gpu
                 .bind_thread()
@@ -646,6 +655,9 @@ impl DeepseekV4HeterogeneousModel {
                 .hip
                 .get_vram_info()
                 .map_err(|error| format!("deepseek4 heterogeneous dense meminfo: {error}"))?;
+            let (dense_budget_free, _) = dense_gpu
+                .device_mem_info_for(dense_gpu.device_id)
+                .map_err(|error| format!("deepseek4 heterogeneous dense budget meminfo: {error}"))?;
             routed_gpu
                 .bind_thread()
                 .map_err(|error| format!("deepseek4 heterogeneous bind routed: {error}"))?;
@@ -653,7 +665,12 @@ impl DeepseekV4HeterogeneousModel {
                 .hip
                 .get_vram_info()
                 .map_err(|error| format!("deepseek4 heterogeneous routed meminfo: {error}"))?;
-            (dense_free, routed_free)
+            let (routed_budget_free, _) = routed_gpu
+                .device_mem_info_for(routed_gpu.device_id)
+                .map_err(|error| {
+                    format!("deepseek4 heterogeneous routed budget meminfo: {error}")
+                })?;
+            (dense_free, routed_free, dense_budget_free, routed_budget_free)
         };
 
         let dense_minimum = projection
@@ -665,9 +682,9 @@ impl DeepseekV4HeterogeneousModel {
             .routed_bytes
             .checked_add(plan.safety_margin_bytes)
             .ok_or_else(|| "deepseek4 heterogeneous routed preflight overflow".to_string())?;
-        if dense_free_before < dense_minimum || routed_free_before < routed_minimum {
+        if dense_budget_free_before < dense_minimum || routed_budget_free_before < routed_minimum {
             return Err(format!(
-                "deepseek4 heterogeneous preflight failed: dense free/weight+margin={dense_free_before}/{dense_minimum}, routed={routed_free_before}/{routed_minimum}"
+                "deepseek4 heterogeneous preflight failed: dense free/weight+margin={dense_budget_free_before}/{dense_minimum}, routed={routed_budget_free_before}/{routed_minimum}"
             ));
         }
 
@@ -704,7 +721,7 @@ impl DeepseekV4HeterogeneousModel {
             return Err("deepseek4: injected heterogeneous failure after scratch".into());
         }
 
-        let (dense_free_after, routed_free_after) = {
+        let (dense_free_after, routed_free_after, dense_budget_free_after, routed_budget_free_after) = {
             let (dense_gpu, routed_gpu) = staging.devices_mut();
             dense_gpu.bind_thread().map_err(|error| {
                 format!("deepseek4 heterogeneous bind dense after load: {error}")
@@ -712,19 +729,29 @@ impl DeepseekV4HeterogeneousModel {
             let (dense_free, _) = dense_gpu.hip.get_vram_info().map_err(|error| {
                 format!("deepseek4 heterogeneous dense post-load meminfo: {error}")
             })?;
+            let (dense_budget_free, _) = dense_gpu
+                .device_mem_info_for(dense_gpu.device_id)
+                .map_err(|error| {
+                    format!("deepseek4 heterogeneous dense post-load budget meminfo: {error}")
+                })?;
             routed_gpu.bind_thread().map_err(|error| {
                 format!("deepseek4 heterogeneous bind routed after load: {error}")
             })?;
             let (routed_free, _) = routed_gpu.hip.get_vram_info().map_err(|error| {
                 format!("deepseek4 heterogeneous routed post-load meminfo: {error}")
             })?;
-            (dense_free, routed_free)
+            let (routed_budget_free, _) = routed_gpu
+                .device_mem_info_for(routed_gpu.device_id)
+                .map_err(|error| {
+                    format!("deepseek4 heterogeneous routed post-load budget meminfo: {error}")
+                })?;
+            (dense_free, routed_free, dense_budget_free, routed_budget_free)
         };
-        if dense_free_after < plan.safety_margin_bytes
-            || routed_free_after < plan.safety_margin_bytes
+        if dense_budget_free_after < plan.safety_margin_bytes
+            || routed_budget_free_after < plan.safety_margin_bytes
         {
             return Err(format!(
-                "deepseek4 heterogeneous post-load safety margin failed: dense={dense_free_after}, routed={routed_free_after}"
+                "deepseek4 heterogeneous post-load safety margin failed: dense={dense_budget_free_after}, routed={routed_budget_free_after}"
             ));
         }
         let dense_actual_bytes = dense_free_before.saturating_sub(dense_free_after);

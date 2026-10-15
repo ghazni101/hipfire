@@ -27,32 +27,47 @@
 //!                  complete() -> bool, failed() -> bool}
 //! ```
 //!
+//! Off Unix `spawn` returns `ErrorKind::Unsupported` without opening the file
+//! (the prewarm needs positional reads and `posix_fadvise`).
+//!
 //! Log lines (stderr, harness scripts key on the prefixes):
 //! `  qwen4 ple prewarm: complete, <MiB> MiB in <secs> s ...`,
 //! `  qwen4 ple prewarm: stopped, ...`, `  qwen4 ple prewarm: failed, ...`.
 
+#[cfg(unix)]
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use crate::external_rows::{FetchActivity, FETCH_QUIET};
 
 /// Bytes per prewarm read.
+#[cfg(unix)]
 const PREWARM_CHUNK: usize = 8 << 20;
 /// `budget` before [`PleRowsPrewarm::set_budget`].
+#[cfg(unix)]
 const BUDGET_UNSET: u64 = u64::MAX;
+#[cfg(unix)]
 const TAG: &str = "  qwen4 ple prewarm:";
 
+#[cfg(unix)]
 fn mib(bytes: u64) -> u64 {
     bytes >> 20
 }
 
+// Off Unix no worker is ever spawned, so the struct is only read by the
+// platform-independent handle methods.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Shared {
     data_offset: u64,
     data_bytes: u64,
@@ -85,6 +100,7 @@ impl PleRowsPrewarm {
     }
 
     /// [`PleRowsPrewarm::spawn`] with an explicit quiet period (tests).
+    #[cfg(unix)]
     pub(crate) fn spawn_with_quiet(
         path: &Path,
         data_offset: u64,
@@ -117,6 +133,23 @@ impl PleRowsPrewarm {
             shared,
             worker: Some(worker),
         })
+    }
+
+    /// Unsupported off Unix: the prewarm needs positional reads and
+    /// `posix_fadvise`.  Fails before the file is touched and starts no worker.
+    #[cfg(not(unix))]
+    pub(crate) fn spawn_with_quiet(
+        _path: &Path,
+        _data_offset: u64,
+        _data_bytes: u64,
+        _activity: Arc<FetchActivity>,
+        _quiet: Duration,
+    ) -> io::Result<PleRowsPrewarm> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PLE sidecar page-cache prewarm is unsupported on Windows (it needs Unix \
+             positional reads and posix_fadvise); use a Unix host",
+        ))
     }
 
     /// Bytes of the data region to read (capped at its size; 0 = none).  The
@@ -158,6 +191,7 @@ impl Drop for PleRowsPrewarm {
     }
 }
 
+#[cfg(unix)]
 impl Shared {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
@@ -221,7 +255,7 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write;

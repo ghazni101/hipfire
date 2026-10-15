@@ -10,6 +10,7 @@
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod error;
+mod emu_budget;
 mod ffi;
 mod kernarg;
 mod launch_grid;
@@ -31,7 +32,8 @@ pub use ffi::{
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
     PinnedHostBuffer, PinnedTransferBuffer, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ,
+    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
     HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
 };
@@ -90,6 +92,11 @@ pub struct DeviceBuffer {
     ptr: *mut std::ffi::c_void,
     size: usize,
     ownership: DeviceBufferOwnership,
+    /// Emu capacity charge for an owning `hipMalloc` allocation (`None` when
+    /// emu is off, and always `None` for borrowed/VMM/host-mapped views). Not
+    /// auto-releasing: dropping the buffer without `HipRuntime::free` keeps
+    /// the charge, like the leaked allocation itself.
+    token: Option<emu_budget::Token>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +136,23 @@ impl DeviceBuffer {
         self.ownership == DeviceBufferOwnership::HostMapped
     }
 
+    /// Attach the emu capacity charge of this owning allocation.
+    pub(crate) fn with_charge(mut self, token: Option<emu_budget::Token>) -> DeviceBuffer {
+        self.token = token;
+        self
+    }
+
+    /// Detach the emu capacity charge so `free` can release it only after the
+    /// raw free succeeds.
+    pub(crate) fn take_charge(&mut self) -> Option<emu_budget::Token> {
+        self.token.take()
+    }
+
+    #[cfg(test)]
+    fn is_charged(&self) -> bool {
+        self.token.is_some()
+    }
+
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
     /// The caller must ensure the pointer is valid GPU memory.
     /// The resulting buffer must NOT be freed (it doesn't own the memory).
@@ -142,6 +166,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 
@@ -156,6 +181,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::Vmm,
+            token: None,
         }
     }
 
@@ -177,6 +203,7 @@ impl DeviceBuffer {
             ptr,
             size,
             ownership: DeviceBufferOwnership::HostMapped,
+            token: None,
         }
     }
 
@@ -190,6 +217,7 @@ impl DeviceBuffer {
             ptr: self.ptr,
             size: self.size,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 
@@ -230,6 +258,7 @@ impl DeviceBuffer {
             ptr,
             size: byte_len,
             ownership: DeviceBufferOwnership::Borrowed,
+            token: None,
         }
     }
 }
@@ -267,5 +296,21 @@ mod device_buffer_tests {
         let view = unsafe { owner.alias() };
         assert!(view.is_borrowed());
         assert!(!view.is_vmm_owner());
+    }
+
+    #[test]
+    fn aliases_views_and_host_mapped_owners_carry_no_charge() {
+        // SAFETY: dangling non-null ptr is never dereferenced; tests only check charge tags.
+        let mapped = unsafe { DeviceBuffer::from_host_mapped(std::ptr::dangling_mut(), 4096) };
+        // SAFETY: alias must not outlive `mapped`; both stay on the stack for this test.
+        let alias = unsafe { mapped.alias() };
+        let view = mapped.byte_view(0, 1024);
+        assert!(!mapped.is_charged() && !alias.is_charged() && !view.is_charged());
+        // SAFETY: dangling non-null ptr is never dereferenced.
+        let vmm = unsafe { DeviceBuffer::from_vmm_owner(std::ptr::dangling_mut(), 4096) };
+        assert!(!vmm.is_charged());
+        // SAFETY: dangling non-null ptr is never dereferenced.
+        let mut raw = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) };
+        assert!(raw.take_charge().is_none());
     }
 }

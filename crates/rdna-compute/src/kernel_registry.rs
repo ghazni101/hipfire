@@ -187,6 +187,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         };
     }
 
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!("qsa_filter_select", kernels::QSA_FILTER_SELECT_SRC,
+            ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"]);
+    }
+
     // Common Qwen3.5 kernels (historical whole-model precompile set).
     add!("rmsnorm", kernels::RMSNORM_SRC, ["rmsnorm_f32"]);
     add!("add_inplace", kernels::ADD_INPLACE_SRC, ["add_inplace_f32"]);
@@ -527,6 +532,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen35_fa_prep_batched_gfx1151", crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1151_SRC, ["qwen35_fa_prep_batched_gfx1151"]);
         // Exact-gfx1151 Qwen4 decode MoE head (HIPFIRE_QWEN4_DECODE_HEAD_FUSE; =0 keeps the x4 + Q8_0 pair launches).
         add!("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, ["gemv_bf16_xf32_x2_q8_0_k2560_staged_pair"]);
+        // Exact-gfx1151 derived BF16 mirror of the F32 pooled index keys (HIPFIRE_QWEN4_QSA_POOLED_BF16, default off).
+        add!("qsa_pooled_bf16_mirror", kernels::QSA_POOLED_BF16_MIRROR_SRC, ["qsa_pooled_f32_to_bf16_mirror", "qsa_pooled_f32_low_nonzero_count"]);
         add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
         add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
     }
@@ -1874,8 +1881,9 @@ mod tests {
         // the O4×R8 pipe gate/up twin `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`
         // (gfx1151-routed, likewise packaged) and the Gemma 4 decode twins
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
+        // and the exact sampled-filter QSA module `qsa_filter_select`
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 151, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 152, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

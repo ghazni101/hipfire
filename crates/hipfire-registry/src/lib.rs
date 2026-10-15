@@ -879,14 +879,16 @@ pub struct RegistryPaths {
 }
 
 impl RegistryPaths {
+    /// Infallible form of [`RegistryPaths::try_discover`]; panics with the
+    /// actionable message when no usable Windows home exists.
     pub fn discover() -> Self {
-        let root = env::var_os("HIPFIRE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
-            .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        Self {
-            cache: root.join("registry.cache.json"),
-        }
+        Self::try_discover().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_discover() -> std::result::Result<Self, hipfire_config::ConfigError> {
+        Ok(Self {
+            cache: hipfire_config::hipfire_home()?.join("registry.cache.json"),
+        })
     }
 }
 

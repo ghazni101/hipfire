@@ -1,0 +1,1180 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Interactive `hipfire pull <model>`: pick a tier of the model's registry
+//! family, the PLE rows of a split base and the registry's draft/MTP sidecars,
+//! then confirm a summary with the total download and a disk check.
+//!
+//! The registry entry and [`ple::plan_pull`] stay the source of truth; this
+//! module only chooses the inputs the pull already takes (the tag, the `--ple`
+//! selection and whether the draft/MTP sidecars are fetched). A flag skips the
+//! matching question. A non-TTY stdin or `--yes` asks nothing and takes
+//! [`PullChoice::defaults`]: the requested tag, `--ple auto` and every declared
+//! sidecar, which is what the pull did before it asked anything.
+
+use crate::ple::{self, PleSelection};
+use crate::Paths;
+use anyhow::{bail, Result};
+use hipfire_config::memory::{PleFormat, PleFormatRequest};
+use hipfire_registry::{ModelEntry, RegistryV1, Sidecar, TrunkOverlayPin};
+use std::fs;
+use std::io::{BufRead, Write};
+use std::path::Path;
+
+const GIB: f64 = (1_u64 << 30) as f64;
+
+/// Longest tier note, in characters, before it is cut with an ellipsis.
+const NOTE_CHARS: usize = 60;
+
+/// Whether a pull asks: only with a terminal on stdin and without `--yes`.
+pub(crate) fn is_interactive(stdin_is_terminal: bool, yes: bool) -> bool {
+    stdin_is_terminal && !yes
+}
+
+/// One optional registry sidecar a pull fetches next to the base.
+pub(crate) struct DeclaredSidecar<'a> {
+    pub label: &'static str,
+    pub sidecar: &'a Sidecar,
+    /// A draft/MTP (speculative-decode) sidecar: the pull asks about these
+    /// and `--no-draft` skips them. Every other sidecar is always fetched.
+    pub spec: bool,
+}
+
+/// The entry's declared optional sidecars, in fetch order.
+pub(crate) fn declared_sidecars(entry: &ModelEntry) -> impl Iterator<Item = DeclaredSidecar<'_>> {
+    [
+        ("TriAttention", entry.triattn.as_ref(), false),
+        ("MTP", entry.mtp.as_ref(), true),
+        ("DSpark", entry.dspark.as_ref(), true),
+        ("DFlash", entry.dflash.as_ref(), true),
+        ("XDNA", entry.xdna.as_ref(), false),
+        ("Vision", entry.vision.as_ref(), false),
+        ("T5", entry.t5.as_ref(), false),
+        ("CLIP", entry.clip.as_ref(), false),
+        ("Qwen3", entry.qwen3.as_ref(), false),
+        ("VAE", entry.vae.as_ref(), false),
+    ]
+    .into_iter()
+    .filter_map(|(label, sidecar, spec)| {
+        sidecar.map(|sidecar| DeclaredSidecar {
+            label,
+            sidecar,
+            spec,
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Registry family
+// ---------------------------------------------------------------------------
+
+/// One pullable variant of a registry model family.
+#[derive(Debug)]
+pub(crate) struct Tier<'a> {
+    pub tag: &'a str,
+    /// Short name: the root's file extension, else the tag suffix after
+    /// `<root>-` (`qwen3.8:flash-next-mq3-xts` -> `mq3-xts`).
+    pub label: String,
+    pub entry: &'a ModelEntry,
+}
+
+/// The tiers `hipfire pull <root>` offers, the root first (the default),
+/// then the rest largest first.
+///
+/// A tier is a tag `<root>-<suffix>` with the root's `arch_id` (which keeps
+/// drafts such as `<root>-draft` out) and a download repo. Tags naming the
+/// same artifact as an earlier tier (same SHA-256, else same file) and the
+/// grandfathered monolithic sibling of a split entry are dropped: they are the
+/// same weights under another name. Aliases resolve to their tag before this
+/// runs, so `qwen3.8:flash` offers the tiers of `qwen3.8:flash-next`.
+pub(crate) fn family_tiers<'a>(registry: &'a RegistryV1, root: &str) -> Vec<Tier<'a>> {
+    let Some((root_tag, root_entry)) = registry.models.get_key_value(root) else {
+        return Vec::new();
+    };
+    let prefix = format!("{root}-");
+    let members: Vec<(&'a str, &'a ModelEntry)> = registry
+        .models
+        .iter()
+        .filter(|(tag, _)| tag.starts_with(&prefix))
+        .map(|(tag, entry)| (tag.as_str(), entry))
+        .collect();
+    let siblings: Vec<&str> = std::iter::once(root_entry)
+        .chain(members.iter().map(|(_, entry)| *entry))
+        .filter_map(|entry| registry.monolithic_sibling(entry).map(|(tag, _)| tag))
+        .collect();
+    let mut others: Vec<(&'a str, &'a ModelEntry)> = members
+        .into_iter()
+        .filter(|(tag, entry)| {
+            !entry.repo.is_empty() && entry.arch_id == root_entry.arch_id && !siblings.contains(tag)
+        })
+        .collect();
+    others.sort_by(|(a_tag, a), (b_tag, b)| {
+        b.size_gb
+            .total_cmp(&a.size_gb)
+            .then_with(|| a_tag.cmp(b_tag))
+    });
+    let mut tiers = vec![Tier {
+        tag: root_tag,
+        label: file_label(&root_entry.file),
+        entry: root_entry,
+    }];
+    for (tag, entry) in others {
+        if tiers.iter().any(|tier| same_artifact(tier.entry, entry)) {
+            continue;
+        }
+        tiers.push(Tier {
+            tag,
+            label: tag[prefix.len()..].to_owned(),
+            entry,
+        });
+    }
+    tiers
+}
+
+fn file_label(file: &str) -> String {
+    Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or(file)
+        .to_owned()
+}
+
+fn same_artifact(a: &ModelEntry, b: &ModelEntry) -> bool {
+    match (a.sha256.as_deref(), b.sha256.as_deref()) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => a.file == b.file,
+    }
+}
+
+/// The first sentence of a registry `desc`, cut to [`NOTE_CHARS`].
+fn tier_note(desc: &str) -> String {
+    let sentence = desc.split(". ").next().unwrap_or(desc).trim();
+    if sentence.chars().count() <= NOTE_CHARS {
+        return sentence.to_owned();
+    }
+    let mut cut: String = sentence.chars().take(NOTE_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+fn entry_bytes(entry: &ModelEntry) -> u64 {
+    entry
+        .size_bytes
+        .unwrap_or_else(|| (entry.size_gb * 1e9).round() as u64)
+}
+
+// ---------------------------------------------------------------------------
+// This machine
+// ---------------------------------------------------------------------------
+
+/// What the questions need to know about this machine.
+#[derive(Clone, Debug)]
+pub(crate) struct HostFacts {
+    /// First detected GPU arch; empty when none is detected.
+    pub gpu_arch: String,
+    /// Largest amdgpu `mem_info_vram_total` (the carve-out on an APU).
+    pub vram_bytes: Option<u64>,
+    /// Installed host memory (`MemTotal`).
+    pub ram_bytes: Option<u64>,
+    /// Free space on the models directory's filesystem.
+    pub free_disk_bytes: Option<u64>,
+    /// `memory.ple_format` from the global config and environment.
+    pub ple_request: PleFormatRequest,
+}
+
+impl HostFacts {
+    pub(crate) fn detect(paths: &Paths) -> Self {
+        Self {
+            gpu_arch: ple::local_gpu_arch(),
+            vram_bytes: largest_vram_bytes(Path::new("/sys/class/drm")),
+            ram_bytes: hipfire_config::host_memory::host_memory()
+                .map(|memory| memory.total_physical_bytes),
+            free_disk_bytes: free_disk_bytes(&paths.models),
+            ple_request: ple::request_from_global(paths),
+        }
+    }
+}
+
+/// Largest `cardN/device/mem_info_vram_total` under a DRM class directory.
+fn largest_vram_bytes(drm: &Path) -> Option<u64> {
+    fs::read_dir(drm)
+        .ok()?
+        .flatten()
+        .filter(|card| {
+            card.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("card")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .filter_map(|card| {
+            rdna_compute::uma_memory::read_sysfs_u64(
+                &card.path().join("device/mem_info_vram_total"),
+            )
+        })
+        .max()
+}
+
+#[cfg(unix)]
+fn free_disk_bytes(dir: &Path) -> Option<u64> {
+    hipfire_runtime::ple_convert::available_bytes(dir).ok()
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_dir: &Path) -> Option<u64> {
+    None
+}
+
+fn host_line(host: &HostFacts) -> String {
+    let gib = |bytes: Option<u64>| {
+        bytes.map_or_else(
+            || "unknown".to_owned(),
+            |bytes| format!("{:.1} GiB", bytes as f64 / GIB),
+        )
+    };
+    let arch = if host.gpu_arch.is_empty() {
+        "GPU unknown"
+    } else {
+        host.gpu_arch.as_str()
+    };
+    format!(
+        "this machine: {arch}, VRAM {}, RAM {}",
+        gib(host.vram_bytes),
+        gib(host.ram_bytes)
+    )
+}
+
+/// Whether a tier's `min_vram_gb` fits this machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fit {
+    /// Fits the detected VRAM.
+    Vram,
+    /// Exceeds VRAM but fits VRAM plus host RAM (unified memory or spill).
+    VramAndRam,
+    /// Exceeds VRAM plus host RAM.
+    TooLarge,
+    /// No VRAM detected, or it exceeds VRAM with RAM unknown.
+    Unknown,
+}
+
+impl Fit {
+    fn text(self) -> &'static str {
+        match self {
+            Fit::Vram => "fits VRAM",
+            Fit::VramAndRam => "fits VRAM+RAM",
+            Fit::TooLarge => "too large",
+            Fit::Unknown => "fit unknown",
+        }
+    }
+}
+
+pub(crate) fn tier_fit(entry: &ModelEntry, host: &HostFacts) -> Fit {
+    let need = entry.min_vram_gb * GIB;
+    let Some(vram) = host.vram_bytes else {
+        return Fit::Unknown;
+    };
+    if need <= vram as f64 {
+        return Fit::Vram;
+    }
+    match host.ram_bytes {
+        Some(ram) if need <= vram.saturating_add(ram) as f64 => Fit::VramAndRam,
+        Some(_) => Fit::TooLarge,
+        None => Fit::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The choice
+// ---------------------------------------------------------------------------
+
+/// Pull flags that answer a question up front.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PullFlags {
+    /// `--ple`.
+    pub ple: Option<PleSelection>,
+    /// `--draft` (`Some(true)`) / `--no-draft` (`Some(false)`).
+    pub draft: Option<bool>,
+    /// `--force`: every file of the plan counts as a download.
+    pub force: bool,
+}
+
+/// The inputs the pull runs with.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PullChoice<'a> {
+    pub tag: &'a str,
+    pub entry: &'a ModelEntry,
+    pub ple: PleSelection,
+    /// Fetch the draft/MTP sidecars.
+    pub draft: bool,
+}
+
+impl<'a> PullChoice<'a> {
+    /// What a pull runs with when nothing is asked: the requested tag,
+    /// `--ple` or `auto`, and the draft/MTP sidecars unless `--no-draft`.
+    pub(crate) fn defaults(tag: &'a str, entry: &'a ModelEntry, flags: &PullFlags) -> Self {
+        Self {
+            tag,
+            entry,
+            ple: flags.ple.unwrap_or(PleSelection::Auto),
+            draft: flags.draft.unwrap_or(true),
+        }
+    }
+}
+
+/// What the questions read besides the flags. The registry outlives the
+/// choice; the host facts only live through the questions.
+pub(crate) struct PullContext<'r, 'c> {
+    pub registry: &'r RegistryV1,
+    pub host: &'c HostFacts,
+    pub overlay_pins: &'c [TrunkOverlayPin],
+    /// Whether `file` (of the given size, when known) is already in the
+    /// models directory. The pull itself still verifies the digest.
+    pub present: &'c dyn Fn(&str, Option<u64>) -> bool,
+}
+
+/// A file counts as present when it exists with the expected size; the
+/// summary does not hash (the pull verifies before it skips a download).
+pub(crate) fn file_present(path: &Path, size: Option<u64>) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && size.is_none_or(|size| metadata.len() == size))
+}
+
+/// Ask the questions flags leave open, then confirm the summary. `Ok(None)`
+/// means the user declined. With nothing to ask (one tier, no split rows, no
+/// draft/MTP sidecars, or every question answered by a flag) it prints
+/// nothing and returns the choice.
+pub(crate) fn select_pull<'a>(
+    ctx: &PullContext<'a, '_>,
+    tag: &'a str,
+    entry: &'a ModelEntry,
+    flags: &PullFlags,
+    prompt: &mut dyn Prompt,
+) -> Result<Option<PullChoice<'a>>> {
+    let mut asked = false;
+    let tiers = family_tiers(ctx.registry, tag);
+    let (tag, entry) = if tiers.len() > 1 {
+        asked = true;
+        let index = ask_tier(prompt, ctx.host, tag, &tiers)?;
+        (tiers[index].tag, tiers[index].entry)
+    } else {
+        (tag, entry)
+    };
+    let ple = match flags.ple {
+        Some(selection) => selection,
+        None if entry.has_ple_sidecars() => {
+            asked = true;
+            ask_ple(prompt, ctx.host, tag, entry)?
+        }
+        None => PleSelection::Auto,
+    };
+    let draft = match flags.draft {
+        Some(draft) => draft,
+        None if declared_sidecars(entry).any(|sidecar| sidecar.spec) => {
+            asked = true;
+            ask_draft(prompt, entry)?
+        }
+        None => true,
+    };
+    let choice = PullChoice {
+        tag,
+        entry,
+        ple,
+        draft,
+    };
+    if !asked {
+        return Ok(Some(choice));
+    }
+    let items = plan_items(ctx, &choice, flags.force);
+    Ok(confirm_summary(prompt, ctx.host, &choice, &items)?.then_some(choice))
+}
+
+fn ask_tier(
+    prompt: &mut dyn Prompt,
+    host: &HostFacts,
+    root: &str,
+    tiers: &[Tier<'_>],
+) -> Result<usize> {
+    prompt.say(&format!(
+        "{root}: {} tiers ({})",
+        tiers.len(),
+        host_line(host)
+    ))?;
+    let label_width = tiers.iter().map(|tier| tier.label.len()).max().unwrap_or(0);
+    let tag_width = tiers.iter().map(|tier| tier.tag.len()).max().unwrap_or(0);
+    for (index, tier) in tiers.iter().enumerate() {
+        let default = if index == 0 { "  (default)" } else { "" };
+        prompt.say(&format!(
+            "  {}. {:<label_width$}  {:<tag_width$}  {:>9}  {:<13}  {}{default}",
+            index + 1,
+            tier.label,
+            tier.tag,
+            format_gb(entry_bytes(tier.entry)),
+            tier_fit(tier.entry, host).text(),
+            tier_note(&tier.entry.desc),
+        ))?;
+    }
+    choose(prompt, "tier", tiers.len(), 0)
+}
+
+/// The PLE format the question preselects, and why.
+///
+/// It is what `--ple auto` fetches ([`ple::plan_pull`] with
+/// `memory.ple_format` and the GPU arch: q4 on gfx1151, q8 elsewhere, or the
+/// published slot when the preferred one is not), except that an `auto`
+/// request picks q4 instead of q8 when host RAM cannot hold the base plus the
+/// q8 rows. The non-interactive default stays plain `auto`.
+pub(crate) fn default_ple(entry: &ModelEntry, host: &HostFacts) -> (PleFormat, &'static str) {
+    let plan = ple::plan_pull(entry, PleSelection::Auto, host.ple_request, &host.gpu_arch);
+    let format = plan
+        .sidecars
+        .first()
+        .map_or(PleFormat::Q8, |(format, _)| *format);
+    if host.ple_request != PleFormatRequest::Auto {
+        return (format, "memory.ple_format");
+    }
+    if format == PleFormat::Q4 {
+        return (format, "gfx1151");
+    }
+    let small_ram = match (host.ram_bytes, entry.ple_q8.as_ref()) {
+        (Some(ram), Some(q8)) => q8
+            .size_bytes
+            .is_some_and(|rows| ram < entry_bytes(entry).saturating_add(rows)),
+        _ => false,
+    };
+    if small_ram && entry.ple_q4.is_some() {
+        return (PleFormat::Q4, "small RAM");
+    }
+    (format, "exact")
+}
+
+fn ask_ple(
+    prompt: &mut dyn Prompt,
+    host: &HostFacts,
+    tag: &str,
+    entry: &ModelEntry,
+) -> Result<PleSelection> {
+    let (default_format, reason) = default_ple(entry, host);
+    let mut options: Vec<(PleSelection, String)> = Vec::new();
+    let mut both = Some(0_u64);
+    let mut default = 0;
+    for (format, selection, what) in [
+        (PleFormat::Q4, PleSelection::Q4, "4-bit Lloyd-Max rows"),
+        (PleFormat::Q8, PleSelection::Q8, "exact Q8F16 rows"),
+    ] {
+        let Some(sidecar) = ple::ple_slot(entry, format) else {
+            both = None;
+            continue;
+        };
+        both = both.zip(sidecar.size_bytes).map(|(sum, size)| sum + size);
+        if format == default_format {
+            default = options.len();
+        }
+        options.push((
+            selection,
+            format!(
+                "{:<4}  {:>9}  {what}",
+                format.name(),
+                format_size(sidecar.size_bytes)
+            ),
+        ));
+    }
+    if options.len() == 2 {
+        options.push((
+            PleSelection::All,
+            format!("both  {:>9}  q4 and q8", format_size(both)),
+        ));
+    }
+    options.push((
+        PleSelection::Skip,
+        format!("none  {:>9}  fetched on first load", ""),
+    ));
+    prompt.say(&format!(
+        "{tag}: PLE rows for the split base ({})",
+        host_line(host)
+    ))?;
+    for (index, (_, line)) in options.iter().enumerate() {
+        let note = if index == default {
+            format!("  (default: {reason})")
+        } else {
+            String::new()
+        };
+        prompt.say(&format!("  {}. {line}{note}", index + 1))?;
+    }
+    let index = choose(prompt, "PLE rows", options.len(), default)?;
+    Ok(options[index].0)
+}
+
+fn ask_draft(prompt: &mut dyn Prompt, entry: &ModelEntry) -> Result<bool> {
+    prompt.say("Draft/MTP sidecars declared by the registry:")?;
+    for sidecar in declared_sidecars(entry).filter(|sidecar| sidecar.spec) {
+        prompt.say(&format!(
+            "  {:<8} {}  ({})",
+            sidecar.label,
+            sidecar.sidecar.file,
+            format_size(sidecar.sidecar.size_bytes)
+        ))?;
+    }
+    match confirm(prompt, "Fetch them", true)? {
+        Some(answer) => Ok(answer),
+        None => bail!("pull cancelled: no answer for the draft/MTP sidecars (end of input)"),
+    }
+}
+
+/// One file of the pull plan.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlanItem {
+    pub label: String,
+    pub file: String,
+    pub size: Option<u64>,
+    pub download: bool,
+}
+
+/// Every file the pull of `choice` touches, in pull order.
+pub(crate) fn plan_items(
+    ctx: &PullContext<'_, '_>,
+    choice: &PullChoice<'_>,
+    force: bool,
+) -> Vec<PlanItem> {
+    let entry = choice.entry;
+    let item = |label: String, file: &str, size: Option<u64>| PlanItem {
+        label,
+        file: file.to_owned(),
+        size,
+        download: force || !(ctx.present)(file, size),
+    };
+    let mut base = item("model".to_owned(), &entry.file, entry.size_bytes);
+    if base.download && !force && entry.is_flash_next_xts() {
+        // The pull migrates a verified legacy spelling instead of downloading.
+        base.download = !(ctx.present)(
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+            entry.size_bytes,
+        );
+    }
+    let mut items = vec![base];
+    let request = if choice.ple == PleSelection::Auto {
+        ctx.host.ple_request
+    } else {
+        PleFormatRequest::Auto
+    };
+    for (format, sidecar) in ple::plan_pull(entry, choice.ple, request, &ctx.host.gpu_arch).sidecars
+    {
+        items.push(item(
+            format!("ple-{}", format.name()),
+            &sidecar.file,
+            sidecar.size_bytes,
+        ));
+    }
+    for sidecar in declared_sidecars(entry).filter(|sidecar| choice.draft || !sidecar.spec) {
+        items.push(item(
+            sidecar.label.to_owned(),
+            &sidecar.sidecar.file,
+            sidecar.sidecar.size_bytes,
+        ));
+    }
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, ctx.overlay_pins) {
+        items.push(item(
+            "overlay".to_owned(),
+            &overlay.sidecar.file,
+            overlay.sidecar.size_bytes,
+        ));
+    }
+    for (name, sidecar) in &entry.heads {
+        items.push(item(
+            format!("head {name}"),
+            &sidecar.file,
+            sidecar.size_bytes,
+        ));
+    }
+    items
+}
+
+/// Total bytes to download and the number of downloads of unknown size.
+pub(crate) fn download_total(items: &[PlanItem]) -> (u64, usize) {
+    items
+        .iter()
+        .filter(|item| item.download)
+        .fold((0, 0), |(bytes, unknown), item| match item.size {
+            Some(size) => (bytes + size, unknown),
+            None => (bytes, unknown + 1),
+        })
+}
+
+/// `Some(true)` when the free space holds the download, `None` when unknown.
+pub(crate) fn disk_fits(total: u64, free: Option<u64>) -> Option<bool> {
+    free.map(|free| total <= free)
+}
+
+fn confirm_summary(
+    prompt: &mut dyn Prompt,
+    host: &HostFacts,
+    choice: &PullChoice<'_>,
+    items: &[PlanItem],
+) -> Result<bool> {
+    prompt.say(&format!("Pull summary: {}", choice.tag))?;
+    for item in items {
+        let state = if item.download { "download" } else { "present" };
+        prompt.say(&ple::plan_line(&item.label, &item.file, item.size, state))?;
+    }
+    let (total, unknown) = download_total(items);
+    let unknown = if unknown > 0 {
+        format!(" + {unknown} file(s) of unknown size")
+    } else {
+        String::new()
+    };
+    let fits = disk_fits(total, host.free_disk_bytes);
+    let disk = match (fits, host.free_disk_bytes) {
+        (Some(true), Some(free)) => format!("free disk {} (ok)", format_gb(free)),
+        (Some(false), Some(free)) => format!(
+            "free disk {} (NOT ENOUGH: {} short)",
+            format_gb(free),
+            format_gb(total - free)
+        ),
+        _ => "free disk unknown".to_owned(),
+    };
+    prompt.say(&format!(
+        "Total download: {}{unknown}; {disk}",
+        format_gb(total)
+    ))?;
+    Ok(confirm(prompt, "Proceed", fits != Some(false))?.unwrap_or(false))
+}
+
+fn format_gb(bytes: u64) -> String {
+    format!("{:.2} GB", bytes as f64 / 1e9)
+}
+
+fn format_size(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "size ?".to_owned(), format_gb)
+}
+
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
+
+/// The line-oriented terminal the questions talk to.
+pub(crate) trait Prompt {
+    fn say(&mut self, line: &str) -> Result<()>;
+    /// Print `question` and read one answer line; `None` at end of input.
+    fn ask(&mut self, question: &str) -> Result<Option<String>>;
+}
+
+/// [`Prompt`] over a reader and a writer (stdin and stderr in the CLI).
+pub(crate) struct LinePrompt<R, W> {
+    input: R,
+    output: W,
+}
+
+impl<R: BufRead, W: Write> LinePrompt<R, W> {
+    pub(crate) fn new(input: R, output: W) -> Self {
+        Self { input, output }
+    }
+}
+
+impl<R: BufRead, W: Write> Prompt for LinePrompt<R, W> {
+    fn say(&mut self, line: &str) -> Result<()> {
+        writeln!(self.output, "{line}")?;
+        Ok(())
+    }
+
+    fn ask(&mut self, question: &str) -> Result<Option<String>> {
+        write!(self.output, "{question}")?;
+        self.output.flush()?;
+        let mut line = String::new();
+        if self.input.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        Ok(Some(line))
+    }
+}
+
+/// Numbered choice; Enter takes `default`. End of input cancels the pull.
+fn choose(prompt: &mut dyn Prompt, label: &str, count: usize, default: usize) -> Result<usize> {
+    loop {
+        let question = format!("Select {label} [1-{count}, Enter = {}]: ", default + 1);
+        let Some(line) = prompt.ask(&question)? else {
+            bail!("pull cancelled: no {label} selected (end of input)");
+        };
+        let answer = line.trim();
+        if answer.is_empty() {
+            return Ok(default);
+        }
+        match answer.parse::<usize>() {
+            Ok(number) if (1..=count).contains(&number) => return Ok(number - 1),
+            _ => prompt.say("  invalid selection")?,
+        }
+    }
+}
+
+/// Yes/no; Enter takes `default`, `None` at end of input.
+fn confirm(prompt: &mut dyn Prompt, question: &str, default: bool) -> Result<Option<bool>> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let Some(line) = prompt.ask(&format!("{question}? {hint} "))? else {
+            return Ok(None);
+        };
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(Some(default)),
+            "y" | "yes" => return Ok(Some(true)),
+            "n" | "no" => return Ok(Some(false)),
+            _ => prompt.say("  answer y or n")?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Cli, Commands};
+    use clap::Parser;
+    use std::io::Cursor;
+
+    const MIB: u64 = 1 << 20;
+    const GB: u64 = 1_000_000_000;
+
+    fn registry() -> RegistryV1 {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "qwen3.8:flash-next": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next-base.mq4-xts",
+                    "size_gb": 70.9, "size_bytes": 70_900_000_000_u64,
+                    "min_vram_gb": 72.0, "arch_id": 16,
+                    "desc": "Best quality. Canonical rung.",
+                    "ple_q4": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q4", "size_bytes": 28_800_000_000_u64},
+                    "ple_q8": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q8", "size_bytes": 54_400_000_000_u64},
+                    "mtp": {"file": "qwen3.8-flash-next.mtp", "size_bytes": 400_000_000_u64}
+                },
+                "qwen3.8:flash-next-mq3-xts": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next-base.mq3-xts",
+                    "size_gb": 55.0, "size_bytes": 55_000_000_000_u64,
+                    "min_vram_gb": 56.0, "arch_id": 16,
+                    "desc": "Balanced",
+                    "ple_q8": {"file": "qwen3.8-flash-next-base.mq3-xts.ple-q8", "size_bytes": 54_400_000_000_u64}
+                },
+                "qwen3.8:flash-next-mq2-xts": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next.mq2-xts",
+                    "size_gb": 40.0, "min_vram_gb": 42.0, "arch_id": 16,
+                    "desc": "Smallest"
+                },
+                // Same artifact as the root under another tag.
+                "qwen3.8:flash-next-canon": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next-base.mq4-xts",
+                    "size_gb": 70.9, "min_vram_gb": 72.0, "arch_id": 16, "desc": "dup"
+                },
+                // The root's grandfathered monolithic sibling.
+                "qwen3.8:flash-next-mq4-xts": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next.mq4-xts",
+                    "size_gb": 125.3, "min_vram_gb": 128.0, "arch_id": 16, "desc": "mono"
+                },
+                "qwen3.8:flash-next-draft": {
+                    "repo": "hipfire-models/qwen3.8-flash-next",
+                    "file": "qwen3.8-flash-next-draft.hfq",
+                    "size_gb": 1.0, "min_vram_gb": 2.0, "arch_id": 20, "desc": "draft"
+                },
+                "qwen3.8:flash-next-local": {
+                    "repo": "", "file": "qwen3.8-flash-next-local.mq4",
+                    "size_gb": 10.0, "min_vram_gb": 12.0, "arch_id": 16, "desc": "local"
+                },
+                "qwen3.8:flash-nextgen": {
+                    "repo": "x/y", "file": "nextgen.mq4",
+                    "size_gb": 9.0, "min_vram_gb": 10.0, "arch_id": 16, "desc": "other family"
+                },
+                "solo": {
+                    "repo": "x/solo", "file": "solo.mq4",
+                    "size_gb": 4.0, "min_vram_gb": 6.0, "desc": "single variant"
+                }
+            },
+            "aliases": {"qwen3.8:flash": "qwen3.8:flash-next"}
+        });
+        RegistryV1::parse(&value.to_string(), "pull select test").unwrap()
+    }
+
+    fn host() -> HostFacts {
+        HostFacts {
+            gpu_arch: "gfx1201".into(),
+            vram_bytes: Some(96 << 30),
+            ram_bytes: Some(256 << 30),
+            free_disk_bytes: Some(500 * GB),
+            ple_request: PleFormatRequest::Auto,
+        }
+    }
+
+    fn absent(_: &str, _: Option<u64>) -> bool {
+        false
+    }
+
+    /// The chosen (tag, ple, draft); `None` when declined.
+    type Picked = Option<(String, PleSelection, bool)>;
+
+    /// Run [`select_pull`] for `input` with scripted answers; returns the
+    /// chosen (tag, ple, draft) or `None` when declined, plus the transcript.
+    fn run(
+        input: &str,
+        flags: PullFlags,
+        host: &HostFacts,
+        answers: &str,
+    ) -> (Result<Picked>, String) {
+        let registry = registry();
+        let (tag, entry) = registry.model(input).unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host,
+            overlay_pins: &[],
+            present: &absent,
+        };
+        let mut output = Vec::new();
+        let result = {
+            let mut prompt = LinePrompt::new(Cursor::new(answers.as_bytes()), &mut output);
+            select_pull(&ctx, tag, entry, &flags, &mut prompt)
+                .map(|choice| choice.map(|c| (c.tag.to_owned(), c.ple, c.draft)))
+        };
+        (result, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn tiers_come_from_the_registry_family() {
+        let registry = registry();
+        let tiers = family_tiers(&registry, "qwen3.8:flash-next");
+        let shape: Vec<(&str, &str)> = tiers
+            .iter()
+            .map(|tier| (tier.label.as_str(), tier.tag))
+            .collect();
+        // Root first; then largest first. Same-artifact tags, the monolithic
+        // sibling, drafts (other arch), local-only entries and the
+        // `flash-nextgen` prefix lookalike are not tiers.
+        assert_eq!(
+            shape,
+            [
+                ("mq4-xts", "qwen3.8:flash-next"),
+                ("mq3-xts", "qwen3.8:flash-next-mq3-xts"),
+                ("mq2-xts", "qwen3.8:flash-next-mq2-xts"),
+            ]
+        );
+        // A specific variant has no sub-tiers; neither does a single model.
+        assert_eq!(
+            family_tiers(&registry, "qwen3.8:flash-next-mq3-xts").len(),
+            1
+        );
+        assert_eq!(family_tiers(&registry, "solo").len(), 1);
+        assert!(family_tiers(&registry, "missing").is_empty());
+    }
+
+    #[test]
+    fn fit_reads_vram_then_vram_plus_ram() {
+        let registry = registry();
+        let entry = |tag: &str| &registry.models[tag];
+        let host = host();
+        assert_eq!(tier_fit(entry("qwen3.8:flash-next"), &host), Fit::Vram);
+        let small = HostFacts {
+            vram_bytes: Some(16 << 30),
+            ram_bytes: Some(48 << 30),
+            ..host.clone()
+        };
+        assert_eq!(
+            tier_fit(entry("qwen3.8:flash-next-mq3-xts"), &small),
+            Fit::VramAndRam
+        );
+        assert_eq!(tier_fit(entry("qwen3.8:flash-next"), &small), Fit::TooLarge);
+        let unknown = HostFacts {
+            vram_bytes: None,
+            ..host
+        };
+        assert_eq!(tier_fit(entry("solo"), &unknown), Fit::Unknown);
+    }
+
+    #[test]
+    fn enter_takes_every_default_and_the_summary_confirms() {
+        let (result, transcript) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host(),
+            "\n\n\n\n",
+        );
+        // gfx1201 with 256 GiB RAM: q8 is the exact default.
+        assert_eq!(
+            result.unwrap(),
+            Some(("qwen3.8:flash-next".into(), PleSelection::Q8, true))
+        );
+        for expected in [
+            "qwen3.8:flash-next: 3 tiers (this machine: gfx1201, VRAM 96.0 GiB, RAM 256.0 GiB)",
+            "1. mq4-xts",
+            "fits VRAM",
+            "Best quality  (default)",
+            "2. q8     54.40 GB  exact Q8F16 rows  (default: exact)",
+            "3. both   83.20 GB  q4 and q8",
+            "4. none",
+            "MTP",
+            "Total download: 125.70 GB; free disk 500.00 GB (ok)",
+            "Proceed? [Y/n]",
+        ] {
+            assert!(
+                transcript.contains(expected),
+                "missing {expected:?} in\n{transcript}"
+            );
+        }
+    }
+
+    #[test]
+    fn answers_choose_the_tier_rows_and_sidecars() {
+        // Tier 2 (mq3-xts publishes only q8), rows "none", no draft question
+        // (no draft/MTP sidecars on that tier), then confirm.
+        let (result, transcript) = run("qwen3.8:flash", PullFlags::default(), &host(), "2\n2\ny\n");
+        assert_eq!(
+            result.unwrap(),
+            Some((
+                "qwen3.8:flash-next-mq3-xts".into(),
+                PleSelection::Skip,
+                true
+            ))
+        );
+        assert!(!transcript.contains("Draft/MTP"));
+        assert!(!transcript.contains("both"));
+
+        // Root, q4, decline the MTP sidecar.
+        let (result, transcript) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host(),
+            "1\n1\nn\n\n",
+        );
+        assert_eq!(
+            result.unwrap(),
+            Some(("qwen3.8:flash-next".into(), PleSelection::Q4, false))
+        );
+        assert!(!transcript.contains("qwen3.8-flash-next.mtp  (0.40 GB)  download"));
+
+        // Invalid input re-asks; the default `n` at the summary declines.
+        let (result, transcript) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host(),
+            "9\nx\n3\nn\n",
+        );
+        assert_eq!(result.unwrap(), None);
+        assert!(transcript.contains("invalid selection"));
+    }
+
+    #[test]
+    fn gfx1151_and_small_ram_preselect_q4() {
+        let halo = HostFacts {
+            gpu_arch: "gfx1151".into(),
+            ..host()
+        };
+        let (result, transcript) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &halo,
+            "\n\n\n\n",
+        );
+        assert_eq!(result.unwrap().unwrap().1, PleSelection::Q4);
+        assert!(transcript.contains("(default: gfx1151)"));
+
+        let small = HostFacts {
+            ram_bytes: Some(64 << 30),
+            ..host()
+        };
+        let registry = registry();
+        let entry = &registry.models["qwen3.8:flash-next"];
+        assert_eq!(default_ple(entry, &small), (PleFormat::Q4, "small RAM"));
+        let configured = HostFacts {
+            ple_request: PleFormatRequest::Q8,
+            ..small
+        };
+        assert_eq!(
+            default_ple(entry, &configured),
+            (PleFormat::Q8, "memory.ple_format")
+        );
+        // A tier without q4 rows falls back to the published slot.
+        let mq3 = &registry.models["qwen3.8:flash-next-mq3-xts"];
+        assert_eq!(default_ple(mq3, &halo).0, PleFormat::Q8);
+    }
+
+    #[test]
+    fn flags_skip_their_questions() {
+        // --ple and --no-draft leave only the tier question (and the summary).
+        let flags = PullFlags {
+            ple: Some(PleSelection::All),
+            draft: Some(false),
+            force: false,
+        };
+        let (result, transcript) = run("qwen3.8:flash-next", flags, &host(), "\n\n");
+        assert_eq!(
+            result.unwrap(),
+            Some(("qwen3.8:flash-next".into(), PleSelection::All, false))
+        );
+        assert!(!transcript.contains("PLE rows for"));
+        assert!(!transcript.contains("Draft/MTP"));
+        assert!(transcript.contains("ple-q4"));
+        assert!(transcript.contains("ple-q8"));
+
+        // A specific tier with every question answered asks nothing at all.
+        let flags = PullFlags {
+            ple: Some(PleSelection::Q8),
+            draft: Some(true),
+            force: false,
+        };
+        let (result, transcript) = run("qwen3.8:flash-next-mq3-xts", flags, &host(), "");
+        assert_eq!(
+            result.unwrap(),
+            Some(("qwen3.8:flash-next-mq3-xts".into(), PleSelection::Q8, true))
+        );
+        assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn a_single_variant_without_sidecars_asks_nothing() {
+        let (result, transcript) = run("solo", PullFlags::default(), &host(), "");
+        assert_eq!(
+            result.unwrap(),
+            Some(("solo".into(), PleSelection::Auto, true))
+        );
+        assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn end_of_input_cancels_instead_of_guessing() {
+        let (result, _) = run("qwen3.8:flash-next", PullFlags::default(), &host(), "");
+        assert!(result.unwrap_err().to_string().contains("no tier selected"));
+        let (result, _) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &host(),
+            "\n\n\n",
+        );
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn non_interactive_pulls_take_the_previous_defaults() {
+        assert!(is_interactive(true, false));
+        assert!(!is_interactive(false, false));
+        assert!(!is_interactive(true, true));
+        let registry = registry();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(
+            PullChoice::defaults(tag, entry, &PullFlags::default()),
+            PullChoice {
+                tag: "qwen3.8:flash-next",
+                entry,
+                ple: PleSelection::Auto,
+                draft: true
+            }
+        );
+        let flags = PullFlags {
+            ple: Some(PleSelection::Skip),
+            draft: Some(false),
+            force: true,
+        };
+        let choice = PullChoice::defaults(tag, entry, &flags);
+        assert_eq!((choice.ple, choice.draft), (PleSelection::Skip, false));
+    }
+
+    #[test]
+    fn plan_items_count_downloads_and_check_the_disk() {
+        let registry = registry();
+        let host = host();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let present = |file: &str, _: Option<u64>| file.ends_with(".ple-q4");
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: &[],
+            present: &present,
+        };
+        let choice = PullChoice {
+            tag,
+            entry,
+            ple: PleSelection::All,
+            draft: false,
+        };
+        let items = plan_items(&ctx, &choice, false);
+        let shape: Vec<(&str, bool)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.download))
+            .collect();
+        assert_eq!(
+            shape,
+            [("model", true), ("ple-q4", false), ("ple-q8", true)]
+        );
+        assert_eq!(download_total(&items), (125_300_000_000, 0));
+        // --force re-downloads what is present.
+        let forced = plan_items(&ctx, &choice, true);
+        assert!(forced.iter().all(|item| item.download));
+        assert_eq!(disk_fits(10 * GB, Some(9 * GB)), Some(false));
+        assert_eq!(disk_fits(10 * GB, Some(10 * GB)), Some(true));
+        assert_eq!(disk_fits(10 * GB, None), None);
+    }
+
+    #[test]
+    fn a_short_disk_defaults_the_summary_to_no() {
+        let tight = HostFacts {
+            free_disk_bytes: Some(MIB),
+            ..host()
+        };
+        let (result, transcript) = run(
+            "qwen3.8:flash-next",
+            PullFlags::default(),
+            &tight,
+            "\n\n\n\n",
+        );
+        assert_eq!(result.unwrap(), None);
+        assert!(transcript.contains("NOT ENOUGH"));
+        assert!(transcript.contains("Proceed? [y/N]"));
+    }
+
+    #[test]
+    fn vram_is_the_largest_card() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-pull-select-drm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (card, vram) in [("card0", "17163091968\n"), ("card1", "34342961152\n")] {
+            let device = root.join(card).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("mem_info_vram_total"), vram).unwrap();
+        }
+        // Connector nodes are not cards.
+        fs::create_dir_all(root.join("card1-DP-1/device")).unwrap();
+        fs::write(
+            root.join("card1-DP-1/device/mem_info_vram_total"),
+            "999999999999\n",
+        )
+        .unwrap();
+        assert_eq!(largest_vram_bytes(&root), Some(34_342_961_152));
+        assert_eq!(largest_vram_bytes(&root.join("missing")), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clap_parses_the_pull_prompt_flags() {
+        let pull = |args: &[&str]| {
+            let mut argv = vec!["hipfire", "pull", "qwen3.8:flash-next"];
+            argv.extend_from_slice(args);
+            match Cli::try_parse_from(argv).unwrap().command.unwrap() {
+                Commands::Pull(pull) => (pull.ple, pull.draft_flag(), pull.yes),
+                other => panic!("expected pull, got {other:?}"),
+            }
+        };
+        assert_eq!(pull(&[]), (None, None, false));
+        assert_eq!(pull(&["-y"]), (None, None, true));
+        assert_eq!(pull(&["--yes"]), (None, None, true));
+        assert_eq!(pull(&["--draft"]), (None, Some(true), false));
+        assert_eq!(pull(&["--no-draft"]), (None, Some(false), false));
+        // The last of --draft / --no-draft wins.
+        assert_eq!(pull(&["--draft", "--no-draft"]), (None, Some(false), false));
+        assert_eq!(pull(&["--no-draft", "--draft"]), (None, Some(true), false));
+        assert_eq!(
+            pull(&["--ple", "q4"]),
+            (Some(PleSelection::Q4), None, false)
+        );
+    }
+}

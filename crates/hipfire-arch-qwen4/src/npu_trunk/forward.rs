@@ -149,14 +149,21 @@ impl PreparedTrunk {
 }
 
 fn match_calibration(gpu: &Gpu, bundle: &Qwen4Bundle, route: &str, mode: NpuTrunkMode, firmware: Option<&str>) -> Result<(trunk::Calibration, trunk::CalKey, &'static str, FamilyMask), String> {
-    let (cal, source) = trunk::Calibration::load_with_builtin(hipfire_config::npu_trunk_calibration_path(), route)
+    let (mut cal, source) = trunk::Calibration::load_with_builtin(hipfire_config::npu_trunk_calibration_path(), route)
         .map_err(|e| format!("calibration unavailable: {e}"))?;
     let index = bundle.npu_model_index.as_ref().ok_or("model index identity unavailable")?.as_ref().map_err(Clone::clone)?;
     let pci = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| e.to_string())?;
-    let key = match firmware {
+    let mut key = match firmware {
         Some(firmware) => trunk::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?,
         None => trunk::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
     };
+    // A user calibration file stays fully strict; the built-in one treats PCI slot, NPU firmware
+    // and kernel as advisory under a raised margin.
+    let host = format!("{}/{}", key.kernel.uname_release, key.device.npu_fw_version);
+    if !cal.adopt_advisory(source, &mut key).is_empty() {
+        eprintln!("npu-trunk: built-in calibration measured on {}/{}, this host {host}; using it with margin {}",
+            cal.key.kernel.uname_release, cal.key.device.npu_fw_version, cal.margin);
+    }
     let families = if mode == NpuTrunkMode::Auto { trunk::auto_admission(&cal, &key)? } else {
         cal.key_matches(&key)?;
         trunk::select_families(&cal).0

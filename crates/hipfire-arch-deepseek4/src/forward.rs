@@ -6997,6 +6997,12 @@ pub(crate) fn mhc_pre(
                 .memset(&hc_c.buf, 0, hc_c.byte_size())
                 .map_err(|e| format!("zero hc_c fusion ticket: {e:?}"))?;
         }
+        if fused_control_finalize && control_rsqrt_once {
+            // Rows 1.. wait (bounded) on row 0's rsqrt. Allocate the wait-error
+            // block with the control state, never inside a graph capture.
+            gpu.ensure_device_wait_block()
+                .map_err(|e| format!("alloc hc_c rsqrt_once wait-error block: {e:?}"))?;
+        }
         state.hc_c = Some(hc_c);
     }
 

@@ -2,12 +2,43 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact QT44/QT53 top-10 grouped-prefill lowering.
+//! Exact QT44/QT53 top-10 grouped-prefill lowering, and the gfx942 qt=55
+//! FP8E4M3B128 grouped lowering.
 //!
 //! This module is deliberately narrow.  It is reached only after the sealed
 //! MoE predicate has admitted the immutable grouped-kernel geometry and replicated route.
 //! Generic MoE prefill continues to own the k=8 path; no QT53 format is
 //! admitted by this module through a representative-dtype fallback.
+//!
+//! # qt=55 FP8E4M3B128 route (`MoeRouteCapability::Fp8B128Grouped`)
+//!
+//! Every stage entrypoint below tests [`is_fp8`] before any legacy branch and
+//! lowers the FP8 route through its own `fp8_*` function, so no QT44/QT53 arm
+//! (rotation, F16 WMMA, symmetric IU4, indexed down, row fold, HC fuse, EP)
+//! can run on qt=55 bytes, and no FP8 stage can run a QT44/QT53 kernel.  The
+//! FP8 route is the grouped protocol at every row count (decode M=1 included):
+//! `input_basis` (no rotation, no pass: the launchers stage BF16) -> router and
+//! shared projections through `project_weight(s)` (gfx942 BF16 MFMA, all M) ->
+//! `scatter` (stable pad16 grouping + one tile descriptor in the `gate_batch`
+//! byte prefix) -> `gate_up` (F32 `[G, 2mi]`) -> `unscatter` (SwiGLU into
+//! `rot_batch`, F32 holding BF16) -> `activation` (nothing owed) -> `down`
+//! (F32 `[G, hidden]`) -> `combine` (canonical ascending expert-ID order).  The
+//! stage's `use_path2` flag is ignored (there is no path 1) and `grouped_rows`
+//! must equal `p.m_total_max`.  Every stage runs [`fp8_validate`], which checks
+//! every buffer and weight the stage or any later FP8 stage touches before the
+//! first launch; no stage allocates device memory.
+//!
+//! ## Activation math (why the QT44 activation kernels are not reused)
+//!
+//! The FP8 teacher computes `bf16(bf16(silu(bf16(gate))) * bf16(up))`: gate and
+//! up are BF16, the SiLU result is rounded to BF16, and the product is rounded
+//! to BF16.  The QT44 kernels (`moe_gate_up_unscatter_silu_top10` and
+//! `shared_expert_activation_bf16_f32`) round gate and up and the final
+//! product but keep `silu(gate)` in F32 (`(v / (1 + expf(-v))) * u`), so they
+//! differ from the teacher.  The FP8 route therefore launches the dedicated
+//! `Gfx942Device::fp8b128_moe_unscatter_silu` / `fp8b128_moe_shared_activation`
+//! kernels, which round all of gate, up, SiLU and product.  The QT44 sources
+//! are untouched.
 
 use super::layer_ops::hip;
 use crate::families::gemv::WeightRef;
@@ -52,6 +83,23 @@ fn require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
             arch: "",
             quant: "declared route",
         })
+    }
+}
+
+/// The declared route is the gfx942 qt=55 FP8E4M3B128 grouped route.  Tested
+/// first by every stage entrypoint, before any legacy branch.
+#[inline]
+fn is_fp8(p: &MoePrefillParams<'_>) -> bool {
+    p.route_policy
+        .is_some_and(|policy| policy.capability.is_fp8_grouped())
+}
+
+/// Geometry gate of whichever grouped route `p` declares.
+fn require_route_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        fp8_require_geometry(p)
+    } else {
+        require_geometry(p)
     }
 }
 
@@ -115,7 +163,7 @@ impl ScratchBytes {
         for ((name, need), (_, have)) in self.fields().into_iter().zip(held.fields()) {
             if have < need {
                 return Err(DispatchError::Hip(format!(
-                    "qt44/qt53 grouped prefill scratch: {name} holds {have} bytes, \
+                    "qt44/qt53/qt55 grouped prefill scratch: {name} holds {have} bytes, \
                      the selected route needs {need}; refusing before launch"
                 )));
             }
@@ -164,6 +212,8 @@ pub(crate) struct ScratchDims {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScratchRoute {
     pub(crate) path2: bool,
+    /// The qt=55 FP8E4M3B128 grouped route (every other flag is then false).
+    pub(crate) fp8: bool,
     pub(crate) sym_iu4: bool,
     pub(crate) gateup_bf16: bool,
     pub(crate) gateup_silu: bool,
@@ -173,13 +223,31 @@ pub(crate) struct ScratchRoute {
 
 impl ScratchRoute {
     pub(crate) fn of(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> Self {
+        // The FP8 route consults none of the legacy arm predicates.
+        if is_fp8(p) {
+            return Self::fp8();
+        }
         Self {
             path2: use_path2,
+            fp8: false,
             sym_iu4: sym_iu4(gpu, p, use_path2),
             gateup_bf16: use_path2 && gateup_bf16(gpu, p),
             gateup_silu: use_path2 && gateup_silu(gpu, p),
             down_wmma: use_path2 && down_wmma(gpu, p),
             indexed_down: indexed_down(gpu, p, use_path2),
+        }
+    }
+
+    /// The qt=55 FP8E4M3B128 route: grouped at every row count, no legacy arm.
+    pub(crate) fn fp8() -> Self {
+        Self {
+            path2: true,
+            fp8: true,
+            sym_iu4: false,
+            gateup_bf16: false,
+            gateup_silu: false,
+            down_wmma: false,
+            indexed_down: false,
         }
     }
 
@@ -193,6 +261,10 @@ impl ScratchRoute {
     ///   batch buffers and the expanded down rows;
     /// - every route that has a shared expert: its F32 `[rows, down_m]` down
     ///   in `down_expanded`, because the BF16 epilogue may decline at run time.
+    /// - qt=55 FP8: a 16-byte tile descriptor per padded 16-row tile in
+    ///   `gate_batch`, F32 `[G, 2 mi]` / `[G, down_m]` grouped rows, the F32
+    ///   `[rows * k_top, mi]` activation (BF16 values) in `rot_batch`, and the
+    ///   unfused shared down's F32 rows; `up_batch` is untouched.
     pub(crate) fn requirement(&self, dims: &ScratchDims) -> Result<ScratchBytes, DispatchError> {
         let slots = scratch_mul(dims.rows, dims.k_top)?;
         let activation = scratch_mul(scratch_mul(slots, dims.mi)?, F32_BYTES)?;
@@ -201,6 +273,14 @@ impl ScratchRoute {
         let mut need = ScratchBytes::default();
         if dims.shared_down {
             need.down_expanded = shared_down_bytes(dims.rows, dims.down_m)?;
+        }
+        if self.fp8 {
+            need.gate_batch = scratch_mul(grouped_tiles(grouped), FP8_TILE_DESC_BYTES)?;
+            need.rot_batch = activation;
+            need.y_gate_up_grouped =
+                scratch_mul(scratch_mul(grouped, scratch_mul(2, dims.mi)?)?, F32_BYTES)?;
+            need.y_down_grouped = scratch_mul(scratch_mul(grouped, dims.down_m)?, F32_BYTES)?;
+            return Ok(need);
         }
         if !self.path2 {
             need.gate_batch = activation;
@@ -250,13 +330,13 @@ pub(crate) fn scratch_requirement(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<ScratchBytes, DispatchError> {
-    require_geometry(p)?;
+    require_route_geometry(p)?;
     ScratchRoute::of(gpu, p, use_path2).requirement(&ScratchDims {
         rows: p.batch_size,
         k_top: p.k_top,
         mi: p.mi,
         down_m: p.down_m,
-        grouped_rows: if use_path2 { grouped_rows } else { 0 },
+        grouped_rows: if use_path2 || is_fp8(p) { grouped_rows } else { 0 },
         shared_down: p.prelude.shared.is_some() && p.shared_down_out.is_none(),
     })
 }
@@ -271,6 +351,10 @@ pub(crate) fn validate_scratch(
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    // qt=55 FP8: the full-route preflight (scratch, weights, experts, router).
+    if is_fp8(p) {
+        return fp8_validate(gpu, p, grouped_rows).map(drop);
+    }
     scratch_requirement(gpu, p, use_path2, grouped_rows)?.require_within(&ScratchBytes::held(p))?;
     if p.shared_down_out.is_some() && p.prelude.shared.is_some() {
         require_shared_rows(p, shared_down_bytes(p.batch_size, p.down_m)?)?;
@@ -300,19 +384,25 @@ fn require_shared_rows(p: &MoePrefillParams<'_>, need: usize) -> Result<(), Disp
 /// read: the decode-kernel down (path 1, or path 2's few-row indexed down) with
 /// no expert-stage table. This is the layout an EP row gather fills.
 pub(crate) fn writes_slot_ordered_rows(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    p.expert_stage_ptrs.is_none()
+    // The FP8 grouped down leaves grouped rows, never slot-ordered rows.
+    !is_fp8(p)
+        && p.expert_stage_ptrs.is_none()
         && !sym_iu4(gpu, p, use_path2)
         && (!use_path2 || indexed_down(gpu, p, use_path2))
 }
 
 /// Prepare the routed expert activation basis.  The route's router/shared
 /// projections are BF16 and consume the natural input, while routed QT44
-/// gate/up consumes the FWHT basis.
+/// gate/up consumes the FWHT basis.  qt=55 FP8: no rotation and no pass; the
+/// BF16 operands are produced by the launchers ([`fp8_input_basis`]).
 pub(crate) fn input_basis(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_input_basis(gpu, p);
+    }
     require_geometry(p)?;
     if gateup_rotates_f16(gpu, p, use_path2) {
         return Ok(());
@@ -366,10 +456,15 @@ fn batch_projection(
 
 /// The grouped route's router is a row-batched projection even though the
 /// generic MoE table intentionally has no BF16 router entry on RDNA3.
+/// qt=55 FP8: `project_weight` of the BF16 router at every row count (gfx942
+/// BF16 MFMA); no fused few-row router/shared launch.
 pub(crate) fn router_projection(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_router_projection(gpu, p);
+    }
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
     if router_with_shared(gpu, p) || router_with_selector(gpu, p) || router_shares_f16(gpu, p) {
@@ -489,11 +584,16 @@ fn shared_down_input(
 /// typed route's BF16 exception to the generic MoE prefill table: the common
 /// family remains fail-closed for QT53 while this exact route uses the native
 /// BF16 XF32 GEMM launcher.
+/// qt=55 FP8: the shared selector/gate/up through `project_weights` (gfx942
+/// BF16 MFMA, all row counts); the router is projected by its own stage.
 pub(crate) fn shared_gate_up(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_shared_gate_up(gpu, p);
+    }
     require_geometry(p)?;
     let shared = p
         .prelude
@@ -653,11 +753,17 @@ pub(crate) fn shared_gate_up(
 }
 
 /// Apply the shared expert activation after the selector and gate/up projections.
+/// qt=55 FP8: `fp8b128_moe_shared_activation` (BF16 gate/up/SiLU/product
+/// rounds, the QT44 kernel's F32 SiLU does not match the teacher); never
+/// fused into the unscatter.
 pub(crate) fn shared_activation(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_shared_activation(gpu, p);
+    }
     require_geometry(p)?;
     // Path 2's fused unscatter launch runs it (see `shared_in_unscatter`).
     if use_path2 && shared_in_unscatter(gpu, p) {
@@ -705,11 +811,16 @@ pub(crate) fn shared_activation(
 
 /// Fold the shared expert into the residual at the recipe's chosen placement,
 /// applying the selector sigmoid exactly once.
+/// qt=55 FP8: unfused `project_weight` of the BF16 shared down into F32 rows,
+/// then `bf16_scaled_add_batched`; no GEMM-epilogue fusion.
 pub(crate) fn shared_down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_shared_down(gpu, p);
+    }
     require_geometry(p)?;
     // The unfused shared down writes F32 rows into `shared_down_out` (an EP
     // row gather owns `down_expanded` until its peers finish reading it), else
@@ -852,12 +963,20 @@ impl HcSharedDown {
 /// routed target is not rewritten (it is dead after the write).  Returns
 /// `false`, having launched nothing, when `hc` does not fit this call; the
 /// caller then runs [`shared_down`] and the write unfused.
+/// Always declines (`Ok(false)`, nothing launched) on the qt=55 FP8 route,
+/// whose shared down has no HC epilogue.
 pub(crate) fn shared_down_hc(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     hc: &HcSharedDown,
     use_path2: bool,
 ) -> Result<bool, DispatchError> {
+    if is_fp8(p) {
+        if hc.row_fold.is_some() {
+            return Err(fp8_refuse("the HC row fold is not available"));
+        }
+        return Ok(false);
+    }
     require_geometry(p)?;
     let Some(shared) = p.prelude.shared.as_ref() else {
         return Ok(false);
@@ -922,12 +1041,16 @@ fn hc_shared_down_admits(gpu: &Gpu, p: &MoePrefillParams<'_>, hc: &HcSharedDown)
 /// (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the zero-initialized BF16-row combine of
 /// path 2 into the routed target (which, nothing reading it, then holds the
 /// BF16 shared-down rows), the HC-write shared down, BF16 streams.
+/// Never applies on the qt=55 FP8 route.
 pub(crate) fn row_fold_applies(
     gpu: &Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
     hc: &HcSharedDown,
 ) -> bool {
+    if is_fp8(p) {
+        return false;
+    }
     let target = p.routed_out.unwrap_or(p.x_batch);
     gpu.flags.qwen4_hc_row_fold_enabled()
         && hc.state_bf16
@@ -1026,11 +1149,16 @@ fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
 }
 
 /// Path-2 grouping (the stage runs on path 2 only).
+/// qt=55 FP8: stable pad16 grouping, then the one tile descriptor both FP8
+/// GEMMs read ([`fp8_scatter`]).
 pub(crate) fn scatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_scatter(gpu, p, grouped_rows);
+    }
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
     if sym_iu4(gpu, p, true) {
@@ -1175,12 +1303,17 @@ fn experts_host_mapped(p: &MoePrefillParams<'_>) -> bool {
     p.expert_stage_ptrs.is_none() && p.routed_experts.host_mapped()
 }
 
+/// Routed gate/up GEMM.  qt=55 FP8: one `gemm_fp8b128_moe_grouped_bf16mfma`
+/// over the tile descriptor, F32 `[G, 2 mi]` grouped rows ([`fp8_gate_up`]).
 pub(crate) fn gate_up(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_gate_up(gpu, p, grouped_rows);
+    }
     require_geometry(p)?;
     validate_scratch(gpu, p, use_path2, grouped_rows)?;
     let gate_up_ptrs = p
@@ -1272,11 +1405,17 @@ pub(crate) fn gate_up(
 /// round trips, bitwise the unfused unscatter -> round trip -> silu_mul ->
 /// round trip sequence, rotated in the same launch when
 /// [`unscatter_rotates`] (else [`activation`] rotates).
+/// qt=55 FP8: `fp8b128_moe_unscatter_silu` (F32 grouped input, BF16 rounds of
+/// gate, up, SiLU and product; not the QT44 unscatter, whose SiLU stays F32),
+/// no rotation ([`fp8_unscatter`]).
 pub(crate) fn unscatter(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_unscatter(gpu, p, grouped_rows);
+    }
     require_geometry(p)?;
     validate_scratch(gpu, p, true, grouped_rows)?;
     // Symmetric IU4: SiLU in the gate/up epilogue, rotation + A4 in `down`.
@@ -1365,11 +1504,16 @@ fn shared_in_unscatter(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
             .is_some_and(|shared| shared.weights.down.dtype != DType::MQ4G128V2)
 }
 
+/// Activation stage.  qt=55 FP8: nothing is owed (the unscatter produced the
+/// BF16-valued activation and the FP8 down consumes it unrotated).
 pub(crate) fn activation(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_validate(gpu, p, p.m_total_max).map(drop);
+    }
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
     // Path 2's unscatter already produced the activation.
@@ -1405,12 +1549,17 @@ fn release_stage(gpu: &Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchErro
     Ok(())
 }
 
+/// Routed down GEMM.  qt=55 FP8: one `gemm_fp8b128_moe_grouped_bf16mfma` over
+/// the same tile descriptor, F32 `[G, hidden]` grouped rows ([`fp8_down`]).
 pub(crate) fn down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_down(gpu, p, grouped_rows);
+    }
     require_geometry(p)?;
     validate_scratch(gpu, p, use_path2, grouped_rows)?;
     down_stage(gpu, p, use_path2, grouped_rows)
@@ -1529,12 +1678,14 @@ fn down_stage(
 /// (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the BF16-row combine of path 2, with
 /// nothing writing the target between its zero fill and the combine (the
 /// shared down, the only other writer, runs after it).
+/// Never applies on the qt=55 FP8 route.
 pub(crate) fn combine_initial_zero_applies(
     gpu: &Gpu,
     p: &MoePrefillParams<'_>,
     use_path2: bool,
 ) -> bool {
-    use_path2
+    !is_fp8(p)
+        && use_path2
         && !indexed_down(gpu, p, use_path2)
         && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2))
         && p.recipe.shared_after_combine()
@@ -1543,6 +1694,8 @@ pub(crate) fn combine_initial_zero_applies(
 /// `initial_zero`: the combine writes the target from +0.0 rather than
 /// accumulating into zeros the caller filled (requires
 /// [`combine_initial_zero_applies`]).
+/// qt=55 FP8: `moe_down_combine_grouped_top10` (F32 grouped rows, canonical
+/// ascending expert-ID order); `initial_zero` is refused ([`fp8_combine`]).
 pub(crate) fn combine(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -1550,6 +1703,9 @@ pub(crate) fn combine(
     grouped_rows: usize,
     initial_zero: bool,
 ) -> Result<(), DispatchError> {
+    if is_fp8(p) {
+        return fp8_combine(gpu, p, grouped_rows, initial_zero);
+    }
     require_geometry(p)?;
     validate_scratch(gpu, p, use_path2, grouped_rows)?;
     combine_stage(gpu, p, use_path2, grouped_rows, initial_zero)
@@ -1620,6 +1776,600 @@ fn combine_stage(
     Ok(())
 }
 
+// ───────────────────────── qt=55 FP8E4M3B128 (gfx942) ─────────────────────────
+
+/// Bytes of one tile descriptor (`{expert, row0, nrows, 0}` as four `i32`).
+const FP8_TILE_DESC_BYTES: usize = 16;
+
+/// Refusal of the qt=55 lowering, raised before the stage's first launch.
+fn fp8_refuse(reason: impl std::fmt::Display) -> DispatchError {
+    DispatchError::Hip(format!(
+        "qt55 fp8 grouped prefill: {reason}; refusing before launch"
+    ))
+}
+
+fn fp8_not_gfx942() -> DispatchError {
+    fp8_refuse("the grouped FP8 kernels need exact gfx942")
+}
+
+/// Whether the declared policy and live dims are exactly the FP8 kernels'
+/// contract (fixed 512/10/2560/640 geometry, qt=55 gate_up + down, BF16
+/// router/shared formats) and the recipe keeps the BF16 boundaries the kernels
+/// implement.
+fn fp8_geometry(p: &MoePrefillParams<'_>) -> bool {
+    let Some(policy) = p.route_policy else {
+        return false;
+    };
+    p.batch_size > 0
+        && p.recipe.bf16_round_trip()
+        && crate::families::moe::fp8_grouped_route_geometry_supported(
+            &policy,
+            p.n_exp,
+            p.k_top,
+            p.gate_up_k,
+            p.mi,
+            p.gate_up_k,
+            p.down_m,
+            p.down_k,
+            p.dtypes.routed_gate_up,
+            p.dtypes.routed_down,
+        )
+}
+
+fn fp8_require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    if fp8_geometry(p) {
+        Ok(())
+    } else {
+        Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "fp8b128-grouped-prefill-shape",
+            arch: "",
+            quant: "FP8E4M3B128",
+        })
+    }
+}
+
+/// Smallest padded grouped-row count that holds `slots` route slots over
+/// `experts` experts in 16-row tiles (`sealed_moe::checked_grouped_m_total_bound`).
+fn fp8_grouped_rows_bound(slots: usize, experts: usize) -> Result<usize, DispatchError> {
+    let block = crate::families::moe::MOE_GROUPED_BLOCK_M;
+    let padding = scratch_mul(slots.min(experts), block - 1)?;
+    slots
+        .checked_add(padding)
+        .and_then(|padded| padded.checked_next_multiple_of(block))
+        .ok_or_else(scratch_overflow)
+}
+
+fn fp8_block_stride(rows: usize, k: usize) -> Result<usize, DispatchError> {
+    rdna_compute::fp8_e4m3::b128_block_stride(rows, k).ok_or_else(scratch_overflow)
+}
+
+/// The checked extents one FP8 stage launches with.
+struct Fp8Plan {
+    rows: usize,
+    slots: usize,
+    grouped_rows: usize,
+    n_tiles: usize,
+    gate_up_base: *mut std::ffi::c_void,
+    down_base: *mut std::ffi::c_void,
+    gate_up_stride: usize,
+    down_stride: usize,
+}
+
+impl Fp8Plan {
+    /// Borrowed whole-table view of one qt=55 table: `experts` blocks of
+    /// `stride` bytes from expert 0's block.  No allocation, never freed.
+    fn table(
+        &self,
+        p: &MoePrefillParams<'_>,
+        base: *mut std::ffi::c_void,
+        stride: usize,
+        rows: usize,
+        k: usize,
+    ) -> GpuTensor {
+        // SAFETY: `fp8_validate` proved, for this table, an immutable expert
+        // set (`immutable_identity`) of `p.n_exp` resident experts whose first
+        // and last block addresses are `base` and `base + (n_exp - 1) * stride`
+        // with every block's buffer at least `stride` bytes (the parent binder
+        // proves every in-between block the same way), so `n_exp * stride`
+        // bytes from `base` are live device memory owned by those experts for
+        // as long as `p` borrows them.  The wrapper is `Borrowed`: drop never
+        // frees it.
+        let buf = unsafe { hip_bridge::DeviceBuffer::from_raw(base, p.n_exp * stride) };
+        GpuTensor {
+            buf,
+            shape: vec![p.n_exp, rows, k],
+            dtype: DType::FP8E4M3B128,
+        }
+    }
+
+    fn gate_up_table(&self, p: &MoePrefillParams<'_>) -> GpuTensor {
+        self.table(p, self.gate_up_base, self.gate_up_stride, 2 * p.mi, p.gate_up_k)
+    }
+
+    fn down_table(&self, p: &MoePrefillParams<'_>) -> GpuTensor {
+        self.table(p, self.down_base, self.down_stride, p.down_m, p.down_k)
+    }
+}
+
+fn fp8_need_bytes(tensor: &GpuTensor, name: &str, need: usize) -> Result<(), DispatchError> {
+    let have = tensor_bytes(tensor);
+    if have < need {
+        return Err(fp8_refuse(format!("{name} holds {have} bytes, the route needs {need}")));
+    }
+    Ok(())
+}
+
+fn fp8_need_f32(tensor: &GpuTensor, name: &str, need: usize) -> Result<(), DispatchError> {
+    if tensor.dtype != DType::F32 {
+        return Err(fp8_refuse(format!("{name} is {:?}, the route needs F32", tensor.dtype)));
+    }
+    fp8_need_bytes(tensor, name, need)
+}
+
+/// A BF16 router/shared weight of exactly `[m, k]`, with no rotation or AWQ
+/// sidecar (its `project_weight` reads the natural activation).
+fn fp8_bf16_weight(w: &WeightRef<'_>, name: &str, m: usize, k: usize) -> Result<(), DispatchError> {
+    if w.dtype != DType::BF16 || w.m != m || w.k != k {
+        return Err(fp8_refuse(format!(
+            "{name} is {:?} [{}, {}], the route needs BF16 [{m}, {k}]",
+            w.dtype, w.m, w.k
+        )));
+    }
+    if w.rotation.is_some() || w.awq_scale.is_some() {
+        return Err(fp8_refuse(format!("{name} carries a rotation or AWQ sidecar")));
+    }
+    let need = scratch_mul(scratch_mul(m, k)?, BF16_BYTES)?;
+    if w.buf.buf.size() < need {
+        return Err(fp8_refuse(format!(
+            "{name} buffer holds {} bytes, [{m}, {k}] BF16 needs {need}",
+            w.buf.buf.size()
+        )));
+    }
+    Ok(())
+}
+
+/// Base address of one qt=55 table from the first and last expert's block:
+/// the layout, residency, alignment and contiguity the whole-table view relies
+/// on.
+fn fp8_expert_base(
+    first: &WeightRef<'_>,
+    last: &WeightRef<'_>,
+    what: &str,
+    rows: usize,
+    k: usize,
+    experts: usize,
+    stride: usize,
+) -> Result<*mut std::ffi::c_void, DispatchError> {
+    for (label, w) in [("first", first), ("last", last)] {
+        if w.dtype != DType::FP8E4M3B128 || w.m != rows || w.k != k {
+            return Err(fp8_refuse(format!(
+                "{what} {label} expert is {:?} [{}, {}], the route needs FP8E4M3B128 [{rows}, {k}]",
+                w.dtype, w.m, w.k
+            )));
+        }
+        if w.rotation.is_some() || w.awq_scale.is_some() {
+            return Err(fp8_refuse(format!("{what} {label} expert carries a rotation or AWQ sidecar")));
+        }
+        if w.buf.buf.is_host_mapped() {
+            return Err(fp8_refuse(format!("{what} {label} expert is host-mapped")));
+        }
+        if w.buf.buf.size() < stride {
+            return Err(fp8_refuse(format!(
+                "{what} {label} expert block holds {} bytes, the stride is {stride}",
+                w.buf.buf.size()
+            )));
+        }
+    }
+    let base = first.buf.buf.as_ptr();
+    if (base as usize) % rdna_compute::fp8_e4m3::B128_ALIGN != 0 {
+        return Err(fp8_refuse(format!("{what} base {:p} is not 256-byte aligned", base)));
+    }
+    let want_last = scratch_mul(experts - 1, stride)?
+        .checked_add(base as usize)
+        .ok_or_else(scratch_overflow)?;
+    if last.buf.buf.as_ptr() as usize != want_last {
+        return Err(fp8_refuse(format!(
+            "{what} experts are not one contiguous table of {stride}-byte blocks"
+        )));
+    }
+    Ok(base)
+}
+
+/// Preflight of the whole FP8 route at `grouped_rows`: the declaration and
+/// device, the operands the legacy arms own (all refused), the grouped extent,
+/// every scratch/router/shared/expert/route buffer any FP8 stage touches, and
+/// the qt=55 tables.  Pure host checks: no launch, no allocation of device
+/// memory.  Run by every FP8 stage before its first launch.
+fn fp8_validate(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<Fp8Plan, DispatchError> {
+    fp8_require_geometry(p)?;
+    let Some(policy) = p.route_policy else {
+        return Err(fp8_refuse("no route policy"));
+    };
+    if !gpu.arch_caps.is_gfx942() {
+        return Err(fp8_not_gfx942());
+    }
+    for (name, present) in [
+        ("expert_stage_ptrs", p.expert_stage_ptrs.is_some()),
+        ("ep_row_gather", p.ep_row_gather.is_some()),
+        ("ep_tile_exchange", p.ep_tile_exchange.is_some()),
+        ("expert_dtype_tags", p.expert_dtype_tags.is_some()),
+        ("expert_down_awq_ptrs", p.expert_down_awq_ptrs.is_some()),
+        ("paro_gate_up", p.paro_gate_up.is_some()),
+        ("paro_down", p.paro_down.is_some()),
+        ("down_awq_scale", p.down_awq_scale.is_some()),
+    ] {
+        if present {
+            return Err(fp8_refuse(format!("{name} belongs to a legacy route")));
+        }
+    }
+
+    let rows = p.batch_size;
+    let slots = scratch_mul(rows, p.k_top)?;
+    let bound = fp8_grouped_rows_bound(slots, p.n_exp)?;
+    if grouped_rows != p.m_total_max
+        || grouped_rows < bound
+        || grouped_rows % crate::families::moe::MOE_GROUPED_BLOCK_M != 0
+        || i32::try_from(grouped_rows).is_err()
+    {
+        return Err(fp8_refuse(format!(
+            "grouped rows {grouped_rows} must equal m_total_max {} and cover {bound}",
+            p.m_total_max
+        )));
+    }
+    let n_tiles = grouped_tiles(grouped_rows);
+
+    // Scratch: the same record the tests compare, against what is physically held.
+    ScratchRoute::fp8()
+        .requirement(&ScratchDims {
+            rows,
+            k_top: p.k_top,
+            mi: p.mi,
+            down_m: p.down_m,
+            grouped_rows,
+            shared_down: p.prelude.shared.is_some() && p.shared_down_out.is_none(),
+        })?
+        .require_within(&ScratchBytes::held(p))?;
+    if p.prelude.shared.is_some() && p.shared_down_out.is_some() {
+        require_shared_rows(p, shared_down_bytes(rows, p.down_m)?)?;
+    }
+    if p.rot_batch.dtype != DType::F32 {
+        return Err(fp8_refuse("rot_batch must be F32 (BF16 values)"));
+    }
+
+    // Route and activation operands.
+    let index_bytes = scratch_mul(slots, F32_BYTES)?;
+    fp8_need_bytes(p.topk_indices, "topk_indices", index_bytes)?;
+    fp8_need_bytes(p.topk_weights, "topk_weights", index_bytes)?;
+    fp8_need_bytes(p.inverse_perm, "inverse_perm", index_bytes)?;
+    fp8_need_bytes(p.sorted_slot_index, "sorted_slot_index", scratch_mul(grouped_rows, F32_BYTES)?)?;
+    fp8_need_bytes(p.expert_tile_ids, "expert_tile_ids", scratch_mul(n_tiles, F32_BYTES)?)?;
+    fp8_need_bytes(p.expert_token_counts, "expert_token_counts", scratch_mul(p.n_exp, F32_BYTES)?)?;
+    fp8_need_bytes(
+        p.expert_offsets,
+        "expert_offsets",
+        scratch_mul(p.n_exp + 1, F32_BYTES)?,
+    )?;
+    let x_elem = match p.x_norm_batch.dtype {
+        DType::F32 => F32_BYTES,
+        DType::BF16 => BF16_BYTES,
+        other => return Err(fp8_refuse(format!("x_norm_batch is {other:?}, the route needs F32 or BF16"))),
+    };
+    fp8_need_bytes(
+        p.x_norm_batch,
+        "x_norm_batch",
+        scratch_mul(scratch_mul(rows, p.gate_up_k)?, x_elem)?,
+    )?;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    fp8_need_f32(target, "combine target", scratch_mul(scratch_mul(rows, p.down_m)?, F32_BYTES)?)?;
+
+    // Router and shared expert: BF16 `project_weight`, F32 outputs.
+    let router = &p.prelude.router;
+    fp8_bf16_weight(router, "router", p.n_exp, p.gate_up_k)?;
+    fp8_need_f32(
+        p.prelude.router_logits,
+        "router_logits",
+        scratch_mul(scratch_mul(rows, p.n_exp)?, F32_BYTES)?,
+    )?;
+    if let Some(shared) = p.prelude.shared.as_ref() {
+        let w = &shared.weights;
+        let inter = shared.intermediate;
+        if inter != policy.geometry.shared_intermediate {
+            return Err(fp8_refuse(format!(
+                "shared intermediate {inter} is not the declared {}",
+                policy.geometry.shared_intermediate
+            )));
+        }
+        fp8_bf16_weight(&w.selector, "shared selector", 1, p.gate_up_k)?;
+        fp8_bf16_weight(&w.gate, "shared gate", inter, p.gate_up_k)?;
+        fp8_bf16_weight(&w.up, "shared up", inter, p.gate_up_k)?;
+        fp8_bf16_weight(&w.down, "shared down", p.down_m, inter)?;
+        let live = scratch_mul(scratch_mul(rows, inter)?, F32_BYTES)?;
+        fp8_need_f32(shared.scalar, "shared scalar", scratch_mul(rows, F32_BYTES)?)?;
+        fp8_need_f32(shared.gate_out, "shared gate_out", live)?;
+        fp8_need_f32(shared.up_out, "shared up_out", live)?;
+        fp8_need_f32(shared.rotated, "shared rotated", live)?;
+    }
+
+    // Routed experts: one immutable, resident, contiguous qt=55 table per projection.
+    let experts = p.routed_experts;
+    if experts.immutable_identity().is_none() {
+        return Err(fp8_refuse("the routed expert set has no immutable identity"));
+    }
+    if experts.host_mapped() || experts.len() != p.n_exp {
+        return Err(fp8_refuse(format!(
+            "the routed expert set must be {} resident experts (len {}, host_mapped {})",
+            p.n_exp,
+            experts.len(),
+            experts.host_mapped()
+        )));
+    }
+    let (Some((first_gu, first_dn)), Some((last_gu, last_dn))) =
+        (experts.get(0), experts.get(p.n_exp - 1))
+    else {
+        return Err(fp8_refuse("the routed expert set does not resolve its first and last expert"));
+    };
+    let gate_up_stride = fp8_block_stride(2 * p.mi, p.gate_up_k)?;
+    let down_stride = fp8_block_stride(p.down_m, p.down_k)?;
+    let gate_up_base = fp8_expert_base(
+        &first_gu, &last_gu, "gate_up", 2 * p.mi, p.gate_up_k, p.n_exp, gate_up_stride,
+    )?;
+    let down_base = fp8_expert_base(
+        &first_dn, &last_dn, "down", p.down_m, p.down_k, p.n_exp, down_stride,
+    )?;
+    Ok(Fp8Plan {
+        rows,
+        slots,
+        grouped_rows,
+        n_tiles,
+        gate_up_base,
+        down_base,
+        gate_up_stride,
+        down_stride,
+    })
+}
+
+fn fp8_shared<'p, 'a>(
+    p: &'p MoePrefillParams<'a>,
+) -> Result<&'p crate::families::moe::MoeSharedPrefill<'a>, DispatchError> {
+    p.prelude
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))
+}
+
+/// No rotation and no pass: validation only.  The expert GEMMs read
+/// `x_norm_batch` directly (the F32 variant RNE-stages each element to BF16 in
+/// its MFMA LDS tile, a BF16 input is the boundary already), and the router /
+/// shared `project_weight`s stage the same BF16, so every BF16 operand is
+/// produced by a launcher and `x_norm_batch` is never modified.  Launches nothing.
+fn fp8_input_basis(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    fp8_validate(gpu, p, p.m_total_max).map(drop)
+}
+
+/// BF16 router through `project_weight` (gfx942 BF16 MFMA at every row count).
+fn fp8_router_projection(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    fp8_validate(gpu, p, p.m_total_max)?;
+    super::project_weight(
+        gpu,
+        &p.prelude.router,
+        p.x_norm_batch,
+        p.prelude.router_logits,
+        p.batch_size,
+        None,
+    )
+}
+
+/// Shared selector/gate/up as one `project_weights` group (gfx942 BF16 MFMA
+/// per member, one BF16 staging of the activation, every row count).
+fn fp8_shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    fp8_validate(gpu, p, p.m_total_max)?;
+    let shared = fp8_shared(p)?;
+    let weights = &shared.weights;
+    super::layer_ops::project_weights(
+        gpu,
+        p.x_norm_batch,
+        p.batch_size,
+        None,
+        &[
+            (&weights.selector, shared.scalar),
+            (&weights.gate, shared.gate_out),
+            (&weights.up, shared.up_out),
+        ],
+    )
+}
+
+/// `fp8b128_moe_shared_activation` over the live rows: BF16 rounds of gate, up,
+/// SiLU and product into `rotated`, the selector as the kernel defines it
+/// (the shared down's scaled add rounds the selector again on read).
+fn fp8_shared_activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    fp8_validate(gpu, p, p.m_total_max)?;
+    let shared = fp8_shared(p)?;
+    let live = p.batch_size * shared.intermediate;
+    let (gate, up, rotated) = (
+        f32_view(shared.gate_out, 0, live),
+        f32_view(shared.up_out, 0, live),
+        f32_view(shared.rotated, 0, live),
+    );
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .fp8b128_moe_shared_activation(
+            &gate,
+            &up,
+            &rotated,
+            shared.scalar,
+            p.batch_size,
+            shared.intermediate,
+        ))
+}
+
+/// Unfused shared down: `project_weight` of the BF16 down into the F32 rows of
+/// `shared_down_out` (else `down_expanded`; the FP8 combine never reads it),
+/// then `bf16_scaled_add_batched` into the combine target (selector rounded
+/// again on read, residual/value/product/sum each BF16).
+fn fp8_shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    fp8_validate(gpu, p, p.m_total_max)?;
+    let shared = fp8_shared(p)?;
+    let down = &shared.weights.down;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    let out = f32_view(
+        p.shared_down_out.unwrap_or(p.down_expanded),
+        0,
+        p.batch_size * p.down_m,
+    );
+    super::project_weight(gpu, down, shared.rotated, &out, p.batch_size, None)?;
+    bf16_scaled_add_batched(
+        gpu,
+        &Bf16ScaledAddBatched {
+            residual: target,
+            value: &out,
+            scalar: shared.scalar,
+            rows: p.batch_size,
+            elements: p.down_m,
+        },
+    )
+    .map_err(|error| DispatchError::Hip(error.to_string()))
+}
+
+/// `moe_scatter_stable_top10` (three launches: ranks, prefix, scatter) then
+/// `fp8b128_moe_tile_desc_pad16` once into the `gate_batch` byte prefix, which
+/// both FP8 GEMMs read.  Nothing else writes `gate_batch` on this route.
+fn fp8_scatter(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    hip(gpu.moe_scatter_stable_top10(
+        p.topk_indices,
+        p.expert_token_counts,
+        p.expert_offsets,
+        p.sorted_slot_index,
+        p.expert_tile_ids,
+        p.inverse_perm,
+        plan.slots,
+        p.n_exp,
+        plan.grouped_rows,
+    ))?;
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .fp8b128_moe_tile_desc_pad16(p.expert_tile_ids, p.gate_batch, plan.n_tiles))
+}
+
+/// gate_up over `x_norm_batch` (X row = slot / k_top): F32 `[G, 2 mi]`.
+fn fp8_gate_up(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    let table = plan.gate_up_table(p);
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .gemm_fp8b128_moe_grouped_bf16mfma(
+            &table,
+            plan.gate_up_stride,
+            p.n_exp,
+            p.gate_batch,
+            plan.n_tiles,
+            p.sorted_slot_index,
+            p.x_norm_batch,
+            p.k_top,
+            plan.rows,
+            p.y_gate_up_grouped,
+            plan.grouped_rows,
+            2 * p.mi,
+            p.gate_up_k,
+        ))
+}
+
+/// `fp8b128_moe_unscatter_silu` into `rot_batch` (flat slot rows, F32 holding
+/// BF16 values): BF16 rounds of gate, up, SiLU and product.
+fn fp8_unscatter(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .fp8b128_moe_unscatter_silu(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.rot_batch,
+            p.mi,
+            plan.grouped_rows,
+            plan.slots,
+        ))
+}
+
+/// down over the unscattered activation (X row = flat slot): F32 `[G, hidden]`.
+fn fp8_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    let table = plan.down_table(p);
+    hip(gpu
+        .try_gfx942()
+        .ok_or_else(fp8_not_gfx942)?
+        .gemm_fp8b128_moe_grouped_bf16mfma(
+            &table,
+            plan.down_stride,
+            p.n_exp,
+            p.gate_batch,
+            plan.n_tiles,
+            p.sorted_slot_index,
+            p.rot_batch,
+            1,
+            plan.slots,
+            p.y_down_grouped,
+            plan.grouped_rows,
+            p.down_m,
+            p.down_k,
+        ))
+}
+
+/// `moe_down_combine_grouped_top10` (F32 grouped rows) into the target, then
+/// the BF16 round trip of the live target rows when no shared down follows.
+/// Per token the ten ranks are folded in ascending expert-ID order through
+/// `inverse_perm`, every weight, product and sum rounded to BF16, no atomics.
+fn fp8_combine(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+    initial_zero: bool,
+) -> Result<(), DispatchError> {
+    if initial_zero {
+        return Err(fp8_refuse("a zero-initialized combine target is not available"));
+    }
+    let plan = fp8_validate(gpu, p, grouped_rows)?;
+    let target = p.routed_out.unwrap_or(p.x_batch);
+    hip(gpu.moe_down_combine_grouped_top10(
+        p.y_down_grouped,
+        p.inverse_perm,
+        p.topk_indices,
+        p.topk_weights,
+        target,
+        p.down_m,
+        plan.grouped_rows,
+        plan.rows,
+    ))?;
+    if !p.recipe.shared_after_combine() {
+        hip(gpu.bf16_round_trip_f32(&f32_view(target, 0, plan.rows * p.down_m)))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod scratch_tests {
     use super::*;
@@ -1651,6 +2401,7 @@ mod scratch_tests {
     fn route(path2: bool) -> ScratchRoute {
         ScratchRoute {
             path2,
+            fp8: false,
             sym_iu4: false,
             gateup_bf16: false,
             gateup_silu: false,
@@ -1673,6 +2424,10 @@ mod scratch_tests {
 
     fn indexed() -> ScratchRoute {
         ScratchRoute { indexed_down: true, ..route(true) }
+    }
+
+    fn fp8() -> ScratchRoute {
+        ScratchRoute::fp8()
     }
 
     /// What the generic validator demands of a Full-width F32 scratch.
@@ -1790,7 +2545,7 @@ mod scratch_tests {
     #[test]
     fn full_width_buffers_always_pass() {
         for rows in [1, 8, 9, 64, 511, 512, 513, 4096, 8192] {
-            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed()] {
+            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed(), fp8()] {
                 let need = r.requirement(&dims(rows)).unwrap();
                 need.require_within(&full_scratch(rows))
                     .unwrap_or_else(|e| panic!("rows={rows} route={r:?}: {e:?}"));
@@ -1801,7 +2556,7 @@ mod scratch_tests {
     #[test]
     fn buffers_short_by_one_word_are_rejected_naming_the_buffer() {
         for rows in [8, 513, 4096] {
-            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed()] {
+            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed(), fp8()] {
                 let need = r.requirement(&dims(rows)).unwrap();
                 // Exactly the requirement passes.
                 need.require_within(&need).unwrap();
@@ -1894,5 +2649,100 @@ mod scratch_tests {
         let mut huge = dims(1);
         huge.rows = usize::MAX / 4;
         assert!(sym().requirement(&huge).is_err());
+    }
+
+    #[test]
+    fn fp8_route_needs_descriptor_f32_grouped_rows_and_the_bf16_activation_at_1536_rows() {
+        let rows = 1536;
+        let slots = rows * K_TOP;
+        let g = grouped_rows(slots);
+        assert_eq!(g, 23_040);
+        assert_eq!(fp8_grouped_rows_bound(slots, N_EXP).unwrap(), g);
+        let need = fp8().requirement(&dims(rows)).unwrap();
+        assert_eq!(
+            need,
+            ScratchBytes {
+                // 16 bytes per 16-row tile.
+                gate_batch: g,
+                up_batch: 0,
+                rot_batch: slots * MI * 4,
+                down_expanded: rows * HIDDEN * 4,
+                y_gate_up_grouped: g * 2 * MI * 4,
+                y_down_grouped: g * HIDDEN * 4,
+            }
+        );
+        need.require_within(&full_scratch(rows)).unwrap();
+    }
+
+    #[test]
+    fn fp8_route_needs_the_same_buffers_at_decode_m1() {
+        let slots = K_TOP;
+        let g = grouped_rows(slots);
+        assert_eq!(g, 160);
+        assert_eq!(fp8_grouped_rows_bound(slots, N_EXP).unwrap(), g);
+        let need = fp8().requirement(&dims(1)).unwrap();
+        assert_eq!(
+            need,
+            ScratchBytes {
+                gate_batch: g,
+                up_batch: 0,
+                rot_batch: slots * MI * 4,
+                down_expanded: HIDDEN * 4,
+                y_gate_up_grouped: g * 2 * MI * 4,
+                y_down_grouped: g * HIDDEN * 4,
+            }
+        );
+        need.require_within(&full_scratch(1)).unwrap();
+    }
+
+    #[test]
+    fn fp8_requirement_ignores_the_legacy_arm_flags_and_charges_shared_down_only_when_owed() {
+        let rows = 700;
+        let base = fp8().requirement(&dims(rows)).unwrap();
+        let flagged = ScratchRoute {
+            path2: false,
+            indexed_down: true,
+            gateup_bf16: true,
+            ..fp8()
+        };
+        assert_eq!(flagged.requirement(&dims(rows)).unwrap(), base);
+        let separate = ScratchDims { shared_down: false, ..dims(rows) };
+        assert_eq!(fp8().requirement(&separate).unwrap().down_expanded, 0);
+        assert_eq!(base.down_expanded, shared_down_bytes(rows, HIDDEN).unwrap());
+    }
+
+    #[test]
+    fn fp8_route_needs_full_f32_grouped_scratch() {
+        // Compact scratch (`c = min(n, 512)`) holds the F32 grouped rows only up to 512 rows.
+        let held = compact_scratch(8192);
+        fp8().requirement(&dims(512)).unwrap().require_within(&held).unwrap();
+        assert!(fp8().requirement(&dims(513)).unwrap().require_within(&held).is_err());
+        assert!(fp8().requirement(&dims(8192)).unwrap().require_within(&held).is_err());
+        // One word short of the F32 gate/up rows is refused naming the buffer.
+        let rows = 1536;
+        let need = fp8().requirement(&dims(rows)).unwrap();
+        let mut short = need;
+        short.y_gate_up_grouped -= WORD;
+        let DispatchError::Hip(message) = need.require_within(&short).unwrap_err() else {
+            panic!("unexpected error kind");
+        };
+        assert!(message.contains("y_gate_up_grouped"), "{message}");
+    }
+
+    #[test]
+    fn fp8_expert_strides_are_the_qt55_block_strides() {
+        assert_eq!(fp8_block_stride(2 * MI, HIDDEN).unwrap(), 3_277_312);
+        assert_eq!(fp8_block_stride(HIDDEN, MI).unwrap(), 1_638_656);
+        for stride in [3_277_312usize, 1_638_656] {
+            assert_eq!(stride % rdna_compute::fp8_e4m3::B128_ALIGN, 0);
+        }
+    }
+
+    #[test]
+    fn fp8_extents_that_overflow_are_errors() {
+        let mut huge = dims(1);
+        huge.rows = usize::MAX / 4;
+        assert!(fp8().requirement(&huge).is_err());
+        assert!(fp8_grouped_rows_bound(usize::MAX, N_EXP).is_err());
     }
 }

@@ -72,6 +72,8 @@ impl QuantType {
             51 => Some(Self::MQ2G256LloydU),
             52 => Some(Self::MQ4G256V2L),
             53 => Some(Self::MQ4G128V2),
+            55 => Some(Self::FP8E4M3B128),
+            56 => Some(Self::FP8E4M3PT),
             _ => None,
         }
     }
@@ -239,6 +241,14 @@ pub(crate) enum QuantType {
     /// (68 B * 8 / 128 weights). It must never be interpreted as qt=44 or
     /// the legacy MQ4G128.
     MQ4G128V2 = 53,
+    /// FP8 E4M3B128 (qt=55): OCP e4m3fn codes verbatim from the checkpoint with
+    /// 128x128 bf16 `s_inv` block scales, expert-blocked payload. Passthrough;
+    /// layout and decode in `docs/quant-formats/fp8-e4m3.md` and
+    /// `rdna_compute::fp8_e4m3`. Never FWHT-rotated.
+    FP8E4M3B128 = 55,
+    /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
+    /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
+    FP8E4M3PT = 56,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.

@@ -120,7 +120,8 @@ fn vision_offload(gpu: &Gpu, cfg: &EmbedConfig) -> bool {
     // busy desktop degrades to PCIe reads instead of failing the load or
     // OOMing on the first image. An unreadable VRAM figure assumes room — the
     // resident path is faster and the failure mode is a clean alloc error.
-    let Some((free, _)) = gpu.hip.get_vram_info().ok() else {
+    // Capped sizing query (UMA-safe clamp, then the HIPFIRE_EMU cap).
+    let Some((free, _)) = gpu.device_mem_info().ok() else {
         return false;
     };
     free < tower_resident_bytes(cfg).saturating_add(RESIDENCY_MARGIN_BYTES)
@@ -365,9 +366,10 @@ pub fn encode_image(
     let grid_h = img_h / vis.patch_size;
     let grid_w = img_w / vis.patch_size;
     if hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
+        // Physical (raw hipMemGetInfo) diagnostic, never the emulated capacity.
         let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
         eprintln!(
-            "  [embed-debug] vision: {}x{} px -> {}x{} grid ({} patches), weights loaded; VRAM {} MB free / {} MB",
+            "  [embed-debug] vision: {}x{} px -> {}x{} grid ({} patches), weights loaded; physical VRAM {} MB free / {} MB",
             img_w, img_h, grid_w, grid_h, grid_h * grid_w, f / (1024*1024), t / (1024*1024)
         );
     }

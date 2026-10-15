@@ -2885,8 +2885,11 @@ impl Qwen4Bundle {
                     lane.host.status
                 ));
             }
-            if lane.spec.is_some() != bundle.mtp.is_some() {
-                return Err("promotion: the lane's MTP state does not match the bundle".to_string());
+            // An MTP lane needs the resident head to move in. An AR lane takes
+            // the trunk state only: a singleton that ran native MTP keeps its
+            // head resident, and the reset below clears it.
+            if lane.spec.is_some() && bundle.mtp.is_none() {
+                return Err("promotion: an MTP lane needs the resident MTP head".to_string());
             }
             if let Some(rows) = ring_rows {
                 if bundle.state.row_capture_rows() < rows {
@@ -3848,8 +3851,9 @@ fn ple_descriptors(
         // seal, file bounds) was already checked when the transaction was
         // fulfilled. Here the declaration only has to name a tier the reader
         // decodes, so a sealed BF16-PLE artifact stays loadable next to a
-        // Q8F16 one.
-        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16]
+        // Q8F16 one; the stock-FP8 recipe's qt=56 rows declare one byte per
+        // value.
+        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16, RowEncoding::Fp8PerTensor]
             .into_iter()
             .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
             .collect::<Vec<_>>();

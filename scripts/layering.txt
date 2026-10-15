@@ -20,6 +20,7 @@
  0 hipfire-config
  0 hipfire-detect
  0 hipfire-xdna
+ 0 peacemaker-cdna
  0 peacemaker-ir
  0 peacemaker-npu
  0 radiowave

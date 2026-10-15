@@ -889,6 +889,8 @@ fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Flux
     } else if args.qwen4_flash_next {
         Route::Qwen4
+    } else if args.recipe.is_some() {
+        Route::Qwen4StockFp8
     } else if args.mq4v2_final_codes.is_some()
         || args.mq3v2_final_codes.is_some()
         || args.mq2v2_final_codes.is_some()
@@ -977,6 +979,55 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Stock FP8 passthrough converter (`--recipe stock-fp8`) ──────────
+    // Selected by the recipe flag alone; a dedicated producer with its own
+    // manifest pin, receipt and writer.  It never reaches the legacy
+    // handlers below, and `reject_unreachable` has already refused every
+    // flag it does not read.
+    if let Some(recipe) = args.recipe.as_deref() {
+        debug_assert_eq!(recipe, "stock-fp8", "clap restricts --recipe to stock-fp8");
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --recipe stock-fp8");
+        let mode = match args.qwen4_component_mode.as_str() {
+            "production" => crate::qwen4::Qwen4Mode::Production,
+            "compact-fixture" => crate::qwen4::Qwen4Mode::CompactFixture,
+            other => {
+                eprintln!(
+                    "error: --qwen4-component-mode unknown mode '{other}' \
+                     (expected production|compact-fixture)"
+                );
+                std::process::exit(2);
+            }
+        };
+        match crate::qwen4::run_stock_fp8_cli(Path::new(input), Path::new(&args.output), mode) {
+            Ok(summary) => {
+                eprintln!(
+                    "stock-fp8: wrote {} ({} entries: {} experts, {} PLE shards; \
+                     fp8 tensors scanned={}, mtp omitted={}, vision omitted={}; \
+                     artifact={} bytes sha256={}; receipt={}; {:.1}s)",
+                    args.output,
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.ple_shards,
+                    summary.fp8_scanned,
+                    summary.mtp_omitted,
+                    summary.vision_omitted,
+                    summary.artifact_bytes,
+                    summary.artifact_sha256,
+                    summary.receipt_path.display(),
+                    summary.elapsed_seconds
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: stock-fp8 conversion: {error}");
                 std::process::exit(2);
             }
         }

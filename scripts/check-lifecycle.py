@@ -50,6 +50,7 @@ DEPRECATED_GATES = {
     "memory.cask.sidecar": 'DefaultValue::String("")',
     "memory.cask.enabled": "DefaultValue::Bool(false)",
     "memory.cask.auto_attach": "DefaultValue::Bool(false)",
+    "diagnostic.replay.gfx1151_cu_count": 'DefaultValue::String("all")',
     "speculation.prefill.mode": 'DefaultValue::String("off")',
     "speculation.prefill.drafter": 'DefaultValue::String("")',
 }

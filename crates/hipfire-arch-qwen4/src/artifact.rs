@@ -14,7 +14,8 @@ use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
-    is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, RECIPE_METADATA_KEY,
+    is_ple_shard_name_within, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, WeightError,
+    RECIPE_METADATA_KEY,
 };
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -43,6 +44,12 @@ const QWEN4_QT_Q8F16: u8 = 3;
 /// MFP4G32E8SOA (qt=35): E8-lattice SoA rows, 4.25 bpw, 32-weight blocks with a
 /// 16-byte-aligned padded scale block.
 const QWEN4_QT_MFP4G32E8SOA: u8 = 35;
+/// FP8E4M3B128 (qt=55): stacked routed-expert blocks of OCP e4m3 codes and
+/// BF16 128x128 `s_inv` (stock-FP8 recipe); group_size 128.
+const QWEN4_QT_FP8E4M3B128: u8 = 55;
+/// FP8E4M3PT (qt=56): 16-byte per-tensor BF16 scale header then one e4m3 code
+/// per value (stock-FP8 PLE rows); group_size 0.
+const QWEN4_QT_FP8E4M3PT: u8 = 56;
 /// One FWHT-256 segment: the unit the encoder rotates and the decode GEMV/GEMM
 /// assert (`assert!(k % 256 == 0)`).  A payload that only satisfied the
 /// 32-weight block size would pass every byte count here and then either panic
@@ -205,6 +212,8 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
         // table is compared against that seal, so the spelling has to match it.
         QWEN4_QT_Q8F16 => Some("Q8_0"),
         QWEN4_QT_MFP4G32E8SOA => Some("MFP4G32E8SOA"),
+        QWEN4_QT_FP8E4M3B128 => Some("FP8E4M3B128"),
+        QWEN4_QT_FP8E4M3PT => Some("FP8E4M3PT"),
         _ => None,
     }
 }
@@ -372,6 +381,62 @@ fn validate_weight_geometry(
                 quantized_extent(&info.shape, &entry.name, DType::MQ4G128V2, 1)?;
             (Some(DType::MQ4G128V2), extent, row_stride)
         }
+        QWEN4_QT_FP8E4M3B128 => {
+            if info.group_size != 128 {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} qt55 group_size={}, expected 128",
+                    entry.name, info.group_size
+                )));
+            }
+            let dims = info
+                .shape
+                .iter()
+                .map(|&dimension| dimension as usize)
+                .collect::<Vec<_>>();
+            let (experts, rows, k) = match dims[..] {
+                [experts, rows, k] => (experts, rows, k),
+                [rows, k] => (1, rows, k),
+                _ => {
+                    return Err(Qwen4ArtifactError::new(format!(
+                        "qwen4: FP8E4M3B128 tensor {} shape {:?} is not [experts, rows, K]",
+                        entry.name, info.shape
+                    )))
+                }
+            };
+            let block = rdna_compute::fp8_e4m3::b128_block_stride(rows, k);
+            let extent = rdna_compute::fp8_e4m3::b128_tensor_bytes(experts, rows, k)
+                .filter(|_| experts != 0 && rows != 0 && k != 0)
+                .zip(block)
+                .ok_or_else(|| {
+                    Qwen4ArtifactError::new(format!(
+                        "qwen4: FP8E4M3B128 tensor {} shape {:?} has no exact extent",
+                        entry.name, info.shape
+                    ))
+                })?;
+            (Some(DType::FP8E4M3B128), extent.0, extent.1)
+        }
+        QWEN4_QT_FP8E4M3PT => {
+            if info.group_size != 0 {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} qt56 group_size={}, expected 0",
+                    entry.name, info.group_size
+                )));
+            }
+            let [rows, k] = info.shape[..] else {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: FP8E4M3PT tensor {} shape {:?} is not [rows, K]",
+                    entry.name, info.shape
+                )));
+            };
+            let extent = rdna_compute::fp8_e4m3::pt_tensor_bytes(rows as usize, k as usize)
+                .ok_or_else(|| {
+                    Qwen4ArtifactError::new(format!(
+                        "qwen4: FP8E4M3PT tensor {} extent overflows usize",
+                        entry.name
+                    ))
+                })?;
+            (Some(DType::FP8E4M3PT), extent, k as usize)
+        }
         other => {
             return Err(Qwen4ArtifactError::new(format!(
                 "qwen4: tensor {} has unsupported HFQM quant_type={other}",
@@ -381,6 +446,17 @@ fn validate_weight_geometry(
     };
 
     match entry.dtype {
+        // The stock-FP8 tiers declare exactly one representation: the tag must
+        // be the declared dtype, never a BF16 or packed stand-in.
+        DType::FP8E4M3B128 | DType::FP8E4M3PT => {
+            if source_dtype != Some(entry.dtype) || !entry.dtype_constraint.accepts(entry.dtype)
+            {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: tensor {} is declared {:?} by the manifest but carries quant_type={}",
+                    entry.name, entry.dtype, info.quant_type
+                )));
+            }
+        }
         DType::MQ4G256V2
         | DType::MQ4G128V2
         | DType::MQ6G256V2
@@ -478,6 +554,7 @@ fn validate_weight_geometry(
         let declared = match info.quant_type {
             QWEN4_QT_BF16 => DType::BF16,
             QWEN4_QT_Q8F16 => DType::Q8_0,
+            QWEN4_QT_FP8E4M3PT => DType::FP8E4M3PT,
             other => {
                 return Err(Qwen4ArtifactError::new(format!(
                     "qwen4: external tensor {} has quant_type={other}, which is not a \
@@ -496,7 +573,7 @@ fn validate_weight_geometry(
         // admit more than one row tier (Qwen4 PLE rows ship as BF16 and Q8F16),
         // so the declaration only has to name a stride that is coherent for this
         // width; the artifact's own tag and extent below pin the real geometry.
-        let declared_stride_is_a_tier = [DType::BF16, DType::Q8_0]
+        let declared_stride_is_a_tier = [DType::BF16, DType::Q8_0, DType::FP8E4M3PT]
             .into_iter()
             .any(|tier| external_row_stride(tier, width) == Some(row_bytes));
         if !declared_stride_is_a_tier {
@@ -980,19 +1057,24 @@ pub struct Qwen4InventoryReceipt {
     pub source_tensor_count: usize,
 }
 
-/// The manifest an artifact's metadata declares.
+/// The config and manifest an artifact's metadata declares.
 ///
-/// A Flash-Next profile has exactly one recipe (its manifest comes from
-/// [`Qwen4Manifest::build`]) and its `qwen4_recipe` object, which predates
-/// recipe ids, must not carry one.  A synthetic developer profile declares its
-/// recipe by `qwen4_recipe.id`: absent means source-exact BF16, the only recipe
-/// before packed synthetic artifacts existed; an unknown or non-string id is
-/// refused rather than guessed.  The declared recipe is explicit and exact: the
-/// manifest then admits only the formats and extents that recipe declares.
+/// A Flash-Next config's `qwen4_recipe` object, which predates recipe ids,
+/// carries no id for the packed recipe (its manifest comes from
+/// [`Qwen4Manifest::build`]); the one Flash-Next id is
+/// [`crate::weights::STOCK_FP8_RECIPE_ID`], which selects
+/// [`Qwen4TierRecipe::StockFp8`] and the AR-only profile
+/// ([`Qwen4Config::into_ar_only`]): the artifact carries no MTP head, so the
+/// admitted config carries none either.  A synthetic developer profile
+/// declares its recipe by `qwen4_recipe.id`: absent means source-exact BF16,
+/// the only recipe before packed synthetic artifacts existed.  An unknown or
+/// non-string id is refused rather than guessed.  The declared recipe is
+/// explicit and exact: the manifest then admits only the formats and extents
+/// that recipe declares.
 fn manifest_for_metadata(
-    config: &Qwen4Config,
+    config: Qwen4Config,
     metadata_json: &str,
-) -> Result<Qwen4Manifest, Qwen4ArtifactError> {
+) -> Result<(Qwen4Config, Qwen4Manifest), Qwen4ArtifactError> {
     let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: recipe metadata admission failed: {error}"))
     })?;
@@ -1008,28 +1090,37 @@ fn manifest_for_metadata(
             })?),
         },
     };
-    let manifest = if config.profile.is_flash_next() {
-        if id.is_some() {
-            return Err(Qwen4ArtifactError::new(format!(
-                "qwen4: {RECIPE_METADATA_KEY}.id is a developer-profile recipe selector; the \
-                 Flash-Next profile has exactly one recipe"
-            )));
-        }
-        Qwen4Manifest::build(config)
-    } else {
-        let recipe = match id {
-            None => Qwen4TierRecipe::SyntheticSourceBf16,
-            Some(id) => Qwen4TierRecipe::from_synthetic_id(id).ok_or_else(|| {
-                Qwen4ArtifactError::new(format!(
-                    "qwen4: {RECIPE_METADATA_KEY}.id {id:?} is not a synthetic-profile recipe"
-                ))
-            })?,
-        };
-        Qwen4Manifest::build_with_recipe(config, recipe)
-    };
-    manifest.map_err(|error| {
+    let manifest_error = |error: WeightError| {
         Qwen4ArtifactError::new(format!("qwen4: manifest admission failed: {error}"))
-    })
+    };
+    if config.profile.is_flash_next() {
+        let Some(id) = id else {
+            let manifest = Qwen4Manifest::build(&config).map_err(manifest_error)?;
+            return Ok((config, manifest));
+        };
+        let recipe = Qwen4TierRecipe::from_flash_next_id(id).ok_or_else(|| {
+            Qwen4ArtifactError::new(format!(
+                "qwen4: {RECIPE_METADATA_KEY}.id {id:?} is not a Flash-Next recipe; the \
+                 Flash-Next profile has exactly one recipe per id (none: packed, \"{}\": stock FP8)",
+                crate::weights::STOCK_FP8_RECIPE_ID
+            ))
+        })?;
+        let config = config.into_ar_only().map_err(|error| {
+            Qwen4ArtifactError::new(format!("qwen4: AR-only config admission failed: {error}"))
+        })?;
+        let manifest = Qwen4Manifest::build_with_recipe(&config, recipe).map_err(manifest_error)?;
+        return Ok((config, manifest));
+    }
+    let recipe = match id {
+        None => Qwen4TierRecipe::SyntheticSourceBf16,
+        Some(id) => Qwen4TierRecipe::from_synthetic_id(id).ok_or_else(|| {
+            Qwen4ArtifactError::new(format!(
+                "qwen4: {RECIPE_METADATA_KEY}.id {id:?} is not a synthetic-profile recipe"
+            ))
+        })?,
+    };
+    let manifest = Qwen4Manifest::build_with_recipe(&config, recipe).map_err(manifest_error)?;
+    Ok((config, manifest))
 }
 
 fn admit_inventory(
@@ -1043,7 +1134,7 @@ fn admit_inventory(
             "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
         )));
     }
-    let manifest = manifest_for_metadata(&config, metadata_json)?;
+    let (config, manifest) = manifest_for_metadata(config, metadata_json)?;
     let source_tensor_count = validate_manifest_inventory(tensors, &manifest, 0, 0)?;
     let ple = admit_ple_metadata(metadata_json, &config)?;
     Ok(Qwen4InventoryReceipt {
@@ -1120,9 +1211,17 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
         ));
     }
     let config = parse_artifact_config(&hfq.metadata_json)?;
-    let mut manifest = manifest_for_metadata(&config, &hfq.metadata_json)?;
+    let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json)?;
     let ple_config = config.ple.as_ref();
     let sidecar = hfq.ple_rows().is_some();
+    if sidecar && manifest.identity.recipe.is_stock_fp8() {
+        // The stock-FP8 PLE rows are the artifact's own qt=56 shards; a Q8/Q4
+        // sidecar would serve different values than the FP8 table it shadows.
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: the stock-FP8 artifact reads its embedded qt=56 FP8E4M3PT PLE rows; a PLE \
+             rows sidecar is not admitted for it (remove the sidecar or unset memory.ple_format)",
+        ));
+    }
     let shadowed_ple_shards = validate_ple_shard_presence(hfq, sidecar, ple_config)?;
     if sidecar {
         manifest = manifest.without_ple_shards();
@@ -1456,6 +1555,16 @@ fn validate_sidecar_geometry(
         )));
     }
     let encoding = geometry.encoding;
+    // FP8E4M3PT rows are a tier of the artifact's own qt=56 shards (admitted
+    // by `validate_weight_geometry`): their scale lives in each shard's
+    // header, which a sidecar table does not carry.
+    if encoding == RowEncoding::Fp8PerTensor {
+        return Err(fail(
+            "FP8E4M3PT rows are read from the artifact's embedded qt=56 shards, not a sidecar \
+             (a table carries no per-shard scale)"
+                .to_string(),
+        ));
+    }
     if !matches!(encoding, RowEncoding::Q8F16 | RowEncoding::Q4Lm) {
         return Err(fail(format!(
             "row encoding {} is not Q8F16 or Q4LM",
@@ -2338,6 +2447,16 @@ mod tests {
                 DType::MQ4G256V2 => (44, 256, rows * (k / 256) * 136),
                 DType::MQ4G128V2 => (53, 128, rows * (k / 128) * 68),
                 DType::MQ6G256V2 => (47, 256, rows * (k / 256) * 200),
+                // qt=55: `E` blocks of round_up(R*K + 2*ceil(R/128)*ceil(K/128), 256).
+                DType::FP8E4M3B128 => {
+                    let [experts, r] = lead[..] else {
+                        panic!("FP8E4M3B128 oracle needs [E, R, K]")
+                    };
+                    let block = r * k + 2 * r.div_ceil(128) * k.div_ceil(128);
+                    (55, 128, experts * block.div_ceil(256) * 256)
+                }
+                // qt=56: 16-byte scale header, then one code per value.
+                DType::FP8E4M3PT => (56, 0, 16 + rows * k),
                 other => panic!("oracle has no byte formula for {other:?}"),
             };
             headers.push(HfqTensorInfo {
@@ -2501,6 +2620,171 @@ mod tests {
             .expect_err("wrong identity")
             .to_string();
         assert!(error.contains("config admission failed"), "{error}");
+    }
+
+    fn stock_fp8_json(id: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&flash_next_json()).unwrap();
+        value[RECIPE_METADATA_KEY] = json!({"version": 3, "id": id});
+        value.to_string()
+    }
+
+    fn stock_fp8_headers() -> Vec<HfqTensorInfo> {
+        let config = crate::config::compact_test_config().into_ar_only().unwrap();
+        oracle_headers(
+            &Qwen4Manifest::build_with_recipe(&config, Qwen4TierRecipe::StockFp8)
+                .expect("stock-FP8 manifest"),
+        )
+    }
+
+    /// A stock-FP8 inventory (`qwen4_recipe.id = "stock-fp8"`) admits under
+    /// the AR-only profile with qt=55 experts, qt=56 PLE rows, a BF16 trunk
+    /// and no MTP records, at the contract's exact extents.
+    #[test]
+    fn stock_fp8_header_inventory_admits_ar_only_with_exact_extents() {
+        let headers = stock_fp8_headers();
+        let receipt = admit_inventory_headers(ARCH_ID, &stock_fp8_json("stock-fp8"), &headers)
+            .expect("the stock-FP8 inventory is admitted");
+        assert_eq!(receipt.manifest.identity.recipe, Qwen4TierRecipe::StockFp8);
+        assert!(receipt.config.profile.is_ar_only() && receipt.config.profile.is_flash_next());
+        assert!(receipt.config.mtp.is_none());
+        assert_eq!(receipt.config.mtp_num_hidden_layers, 0);
+        assert_eq!(receipt.manifest.identity.profile_id, "qwen3.8-flash-next-ar");
+        assert_eq!(receipt.ple, Some(PleHashMetadata::qwen4()));
+        assert_eq!(receipt.source_tensor_count, headers.len());
+        assert!(headers.iter().all(|header| !header.name.starts_with("mtp.")));
+        let flash = flash_next_headers();
+        let mtp = flash.iter().filter(|header| header.name.starts_with("mtp.")).count();
+        assert!(mtp > 0);
+        assert_eq!(headers.len(), flash.len() - mtp);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|header| header.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .clone()
+        };
+        let gate_up = header("model.language_model.layers.0.mlp.experts.gate_up_proj");
+        assert_eq!((gate_up.quant_type, gate_up.group_size), (55, 128));
+        assert_eq!(gate_up.data_size, 512 * 3_277_312);
+        let down = header("model.language_model.layers.0.mlp.experts.down_proj");
+        assert_eq!((down.quant_type, down.data_size), (55, 512 * 1_638_656));
+        let shard =
+            header("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight");
+        assert_eq!((shard.quant_type, shard.group_size), (56, 0));
+        assert_eq!(shard.data_size, 16 + 2_500_012 * 160);
+        for name in [
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.3.self_attn.q_proj.weight",
+            "model.language_model.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+        ] {
+            assert_eq!(header(name).quant_type, 16, "{name}");
+        }
+        for entry in receipt.manifest.external_entries() {
+            assert_eq!(entry.dtype, DType::FP8E4M3PT);
+            assert!(matches!(
+                entry.residency,
+                WeightResidency::ExternalRows { row_bytes: 160, .. }
+            ));
+        }
+    }
+
+    /// The stock-FP8 inventory admits exactly its own representation: a
+    /// packed or BF16 stand-in for an FP8 tensor, a stray MTP record, a wrong
+    /// extent or group, and the inventory under any other recipe id are all
+    /// refused.
+    #[test]
+    fn stock_fp8_header_inventory_refuses_each_deviation() {
+        let json = stock_fp8_json("stock-fp8");
+        let refused = |json: &str, mutate: &dyn Fn(&mut Vec<HfqTensorInfo>), needle: &str| {
+            let mut headers = stock_fp8_headers();
+            mutate(&mut headers);
+            let error = admit_inventory_headers(ARCH_ID, json, &headers)
+                .expect_err(needle)
+                .to_string();
+            assert!(error.contains(needle), "{needle} missing from: {error}");
+        };
+        let position = |headers: &[HfqTensorInfo], name: &str| {
+            headers
+                .iter()
+                .position(|header| header.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let gate_up = "model.language_model.layers.3.mlp.experts.gate_up_proj";
+        let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_5.weight";
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, gate_up);
+                headers[index].quant_type = QWEN4_QT_MQ4G256V2;
+                headers[index].group_size = 256;
+                headers[index].data_size = 512 * 1280 * 10 * 136;
+            },
+            "declared FP8E4M3B128",
+        );
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, gate_up);
+                headers[index].data_size -= 256;
+            },
+            "data_size",
+        );
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, gate_up);
+                headers[index].group_size = 256;
+            },
+            "qt55 group_size",
+        );
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, shard);
+                headers[index].quant_type = QWEN4_QT_Q8F16;
+                headers[index].group_size = 32;
+                headers[index].data_size = 2_500_012 * 170;
+            },
+            "FP8E4M3PT",
+        );
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, shard);
+                headers[index].data_size = 2_500_012 * 160;
+            },
+            "data_size",
+        );
+        refused(
+            &json,
+            &|headers| {
+                let index = position(headers, "lm_head.weight");
+                headers[index].quant_type = QWEN4_QT_MQ6G256V2;
+                headers[index].group_size = 256;
+                headers[index].data_size = 248320 * 10 * 200;
+            },
+            "native BF16 tensor lm_head.weight",
+        );
+        refused(
+            &json,
+            &|headers| {
+                headers.push(HfqTensorInfo {
+                    name: "mtp.fc_hidden.weight".into(),
+                    quant_type: QWEN4_QT_BF16,
+                    shape: vec![2560, 2560],
+                    group_size: 0,
+                    data_offset: 0,
+                    data_size: 2560 * 2560 * 2,
+                });
+            },
+            "manifest declares",
+        );
+        // The same bytes under the packed (no id) or an unknown recipe id.
+        refused(&flash_next_json(), &|_| {}, "manifest declares");
+        refused(&stock_fp8_json("stock-fp9"), &|_| {}, "not a Flash-Next recipe");
     }
 
     #[test]

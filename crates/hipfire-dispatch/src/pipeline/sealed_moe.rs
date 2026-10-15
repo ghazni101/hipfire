@@ -2005,11 +2005,21 @@ impl<'a> SealedMoeCall<'a> {
         if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
             (&self.params, &self.selection)
         {
-            if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+            if selection.route.is_some_and(MoeRouteCapability::is_fp8_grouped)
+                && !gpu.arch_caps.is_gfx942()
+            {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "moe",
+                    variant: "fp8-grouped-gfx942-only",
+                    arch: "",
+                    quant: "FP8E4M3B128",
+                });
+            }
+            if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
                 super::qt44_qt53_prefill::validate_scratch(
                     gpu,
                     params,
-                    selection.resolution.use_path2,
+                    selection.uses_grouped_rows(),
                     selection.path2_m_total,
                 )?;
             }
@@ -2092,7 +2102,7 @@ pub(super) fn produce_prefill_route<'a>(
                     "prefill softmax producer requires a 2-D [batch,n_experts] score view",
                 ));
             }
-            let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+            let grouped = route.is_some_and(MoeRouteCapability::is_sealed_grouped);
             // The grouped top-10 router rounds each logit it reads itself.
             if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
@@ -6973,6 +6983,50 @@ mod tests {
         let selection = prefill_selection(&ctx, &params, route);
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
         moe_program::lowered_stages(&call)
+    }
+
+    #[test]
+    fn fp8_decode_and_prefill_lower_the_same_grouped_stages_without_path2() {
+        for rows in [1, 2, 17, 128, 1536] {
+            let table = table(4, DType::MQ4G256);
+            let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+            let fixture = live_fixture(&table, 0xE8_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+            let ctx = DispatchCtx::for_test("gfx942");
+            let scratch = prefill_scratch(0xE9_0000);
+            // This probe exercises lowering only; route admission and live
+            // block geometry are covered by the independent FP8 selector tests.
+            let params = MoePrefillParams {
+                batch_size: rows,
+                recipe: MoeRecipe::SoftmaxGatedShared {
+                    bf16_round_trip: true,
+                    shared_after_combine: true,
+                },
+                ..ep_prefill_params(
+                    &scratch, &fixture.routed, &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs, None,
+                )
+            };
+            let resolution = crate::families::moe::MoePrefillResolution::sealed_fp8();
+            assert!(!resolution.use_path2 && !resolution.down_path0);
+            let selection = MoeKernelSelection::Prefill(MoePrefillSelection {
+                resolution,
+                path2_m_total: params.m_total_max,
+                force_mq4_grouped_fp16: false,
+                coalesced_verify: false,
+                route: Some(MoeRouteCapability::Fp8B128Grouped),
+                cpu_deferred_experts: false,
+            });
+            let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
+            assert_eq!(moe_program::lowered_stages(&call).unwrap(), [
+                MoeStage::Normalize, MoeStage::InputBasis, MoeStage::RouterProjection,
+                MoeStage::SharedGateUp, MoeStage::SharedActivation, MoeStage::Route,
+                MoeStage::Scatter, MoeStage::GateUp, MoeStage::Unscatter,
+                MoeStage::Activation, MoeStage::Down, MoeStage::MutationFence,
+                MoeStage::Combine, MoeStage::SharedDown,
+            ], "rows={rows}");
+        }
     }
 
     /// `with` is `without` plus exactly one `RowGather`, right after the

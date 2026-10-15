@@ -171,10 +171,8 @@ impl Qwen4ContextCommit {
             return self.virtual_layer_bytes(config, layout);
         }
         let kv_row = format.kv_row_bytes(config.num_key_value_heads, config.head_dim);
-        let index_row = config
-            .indexer_kv_heads
-            .checked_mul(config.indexer_head_dim)?
-            .checked_mul(format.index_dtype().size())?;
+        let raw = config.indexer_kv_heads.checked_mul(config.indexer_head_dim)?;
+        let index_row = raw.checked_mul(format.index_dtype().size())?;
         let compress = config.indexer_compress_ratio;
         let pooled_capacity = self.max_seq.div_ceil(compress);
         let pooled_tokens = self.tokens.div_ceil(compress);
@@ -193,6 +191,12 @@ impl Qwen4ContextCommit {
             .checked_mul(2)?
             .checked_add(mapped(index_row, self.max_seq, self.tokens)?)?
             .checked_add(mapped(index_row, pooled_capacity, pooled_tokens)?)?
+            // The pooled BF16 mirror grows with the pooled keys.
+            .checked_add(if layout.pooled_bf16 {
+                mapped(layout.pooled_bf16_bytes_per_block(raw), pooled_capacity, pooled_tokens)?
+            } else {
+                0
+            })?
             .checked_add(if layout.f16_arena {
                 let row = config.num_key_value_heads.checked_mul(config.head_dim)?.checked_mul(2)?;
                 mapped(row, qsa_f16_arena_rows(self.max_seq), qsa_f16_arena_rows(self.tokens))?
@@ -246,5 +250,28 @@ mod tests {
         // The chunk never charges past the admitted context.
         let short = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 100, 8192, 1 << 21);
         assert_eq!(short.tokens, 100);
+    }
+
+    #[test]
+    fn pooled_bf16_mirror_grows_by_ceil_blocks_at_nonmultiple_depth() {
+        let config = crate::config::compact_test_config();
+        let layout = QsaStateLayout { pooled_bf16: true, ..QsaStateLayout::F32 };
+        // 32_769 tokens: 8193 pooled blocks (ceil), not 8192 (floor). At 256
+        // bytes per block that is 2 MiB + 256 B, one growth page past the
+        // exactly-2-MiB floor mapping.
+        let tokens = 32_769usize;
+        let vmm = Qwen4ContextCommit {
+            backend: Qwen4KvBackend::Vmm,
+            max_seq: 262_144,
+            tokens,
+            granularity: 1 << 21,
+        };
+        let delta = vmm.committed_layer_bytes(&config, layout).unwrap()
+            - vmm.committed_layer_bytes(&config, QsaKvFormat::F32).unwrap();
+        assert_eq!(delta, 2 * (2 << 20));
+        // Legacy and the logical size count the full ceil(max_seq / compress).
+        let logical = config.qsa_context_arena_bytes(tokens, layout).unwrap()
+            - config.qsa_context_arena_bytes(tokens, QsaKvFormat::F32).unwrap();
+        assert_eq!(logical, 8193 * 256);
     }
 }

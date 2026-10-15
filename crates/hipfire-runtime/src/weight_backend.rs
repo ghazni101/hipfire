@@ -697,6 +697,13 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 53,
         dtype: DType::MQ4G128V2,
     },
+    // FP8E4M3B128 (qt=55): OCP e4m3fn codes + 128x128 bf16 s_inv, expert-blocked
+    // (`rdna_compute::fp8_e4m3::b128_block_stride`). Verbatim storage; only the
+    // typed gfx942 Qwen4 FP8 route reads it, generic consumers reject it.
+    RawCodec {
+        quant_type: 55,
+        dtype: DType::FP8E4M3B128,
+    },
     // Neutral-size Magnum V2 family (qt47-50): same neutral header as qt44
     // (LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1, `[6..8)` fp16 z1,
     // `[8..B)` legacy payload). Half 0 covers q[0..128), half 1 q[128..256);
@@ -798,6 +805,26 @@ pub(crate) fn decode_raw_codec(
                 0,
                 &format!(
                     "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::FP8E4M3B128 {
+        // Generic callers describe one 2-D `[m, k]` matrix, i.e. a single expert
+        // block (E=1). Expert-stacked `[E, R, K]` payloads are sized and
+        // validated by the typed Qwen4 loader via `b128_tensor_bytes(E, R, K)`.
+        let expected = rdna_compute::fp8_e4m3::b128_tensor_bytes(1, m, k).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("FP8E4M3B128 blob length overflow: M={m} K={k} (caller: {name})"),
+            )
+        })?;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "FP8E4M3B128 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
                     data.len()
                 ),
             ));
@@ -1321,6 +1348,8 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             out
         }
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
+        55 => panic!("FP8E4M3B128 (qt=55) is typed-Qwen4-gfx942-only; generic dequant_f32 refuses it"),
+        56 => panic!("FP8E4M3PT (qt=56) is read by the Qwen4 PLE row store only; generic dequant_f32 refuses it"),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     }
 }
@@ -1920,6 +1949,8 @@ mod tests {
             // qt=53 is row-local MQ4G128V2 (68 B per ceil(K/128) group), admitted
             // only by typed Qwen4 sealed/dense consumers; generic paths refuse it.
             (53, DType::MQ4G128V2),
+            // qt=55 FP8E4M3B128: expert-blocked FP8 payload, typed gfx942 route only.
+            (55, DType::FP8E4M3B128),
             // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
             // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
             (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw

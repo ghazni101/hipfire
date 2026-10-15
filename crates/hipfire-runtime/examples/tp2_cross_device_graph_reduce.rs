@@ -3,8 +3,9 @@
 // Copyright (c) 2026 HUSRCF
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact replay screen for the gfx1100 TP2 graph-resident fused barrier and
-//! rank-ordered residual reduction.
+//! Exact replay screen for the TP2 graph-resident fused barrier and
+//! rank-ordered residual reduction on an exact homogeneous gfx1100 or gfx1201
+//! pair (`prepare_tp_graph_signals` refuses any other topology).
 
 use hip_bridge::{Graph, GraphExec};
 use hipfire_runtime::multi_gpu::Gpus;
@@ -43,7 +44,7 @@ fn main() {
     assert!(replays > 1);
 
     let mut gpus = Gpus::init_uniform(2, 2).expect("init TP2 GPUs");
-    assert!(gpus.devices.iter().all(|gpu| gpu.arch == "gfx1100"));
+    let arch = gpus.devices[0].arch.clone();
     assert!(
         gpus.enable_peer_all().expect("enable all peer links"),
         "screen requires complete peer access"
@@ -187,5 +188,5 @@ fn main() {
             .expect("destroy graph exec");
         gpu.hip.graph_destroy(capture.graph).expect("destroy graph");
     }
-    println!("PASS gfx1100 TP2 graph fused reduce: {replays} exact replays");
+    println!("PASS {arch} TP2 graph fused reduce: {replays} exact replays");
 }

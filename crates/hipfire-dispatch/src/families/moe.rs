@@ -16,6 +16,25 @@
 //! the model passes only the dtype snapshot + k. One `DispatchCtx` is threaded
 //! end-to-end from the call site through every inner GEMV. Scratch stays model-owned.
 //! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
+//!
+//! # qt=55 FP8E4M3B128 route (gfx942 only)
+//!
+//! qt=55 expert blocks are served by exactly one route: the sealed typed
+//! [`MoeRouteCapability::Fp8B128Grouped`] route (gfx942 only; canonical
+//! 512 experts / top-10 / hidden 2560 / routed + shared intermediate 640 / 640;
+//! routed gate_up and down both qt=55, router and every shared projection
+//! BF16). The architecture declares it through [`MoeRoutePolicy`] and
+//! `pipeline::select_fp8_grouped_route` accepts it or fails closed with a
+//! typed [`DispatchError`]; it never falls through to generic selection.
+//!
+//! Generic resolution ([`MoeResolution`], [`MoePrefillResolution`]) has no
+//! qt=55 implementation. Given any qt=55 operand it returns a *refusal state*
+//! — every route flag disabled, `fp8_b128_refused == true` — and the
+//! `check_generic_route` method on each turns that state into the typed
+//! refusal. Execution MUST call it (or `pipeline::reject_fp8_moe`) before
+//! using a generic route for a layer whose route is not
+//! [`MoeRouteCapability::Fp8B128Grouped`]; the generic prefill Path 0/1/2 and
+//! decode gpu-top-k/CPU fallback therefore can never carry qt=55 bytes.
 
 use rdna_compute::DType;
 use rdna_compute::{Gpu, GpuTensor};
@@ -113,23 +132,61 @@ pub enum MoeRouteCapability {
     /// lowers exactly like [`Self::Qt44Qt53Grouped`] except that the opt-in
     /// symmetric IU4 prefill arm may take the routed experts.
     Qt44Qt53GroupedSymmetric,
+    /// gfx942-only qt=55 FP8E4M3B128 grouped route over the same fixed
+    /// 512/10/2560/640/640 geometry: routed gate_up and down are both qt=55,
+    /// router and all shared projections BF16. Lowered only by the typed
+    /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
+    /// never by generic resolution.
+    Fp8B128Grouped,
 }
 
 impl MoeRouteCapability {
     /// The source-bound QT44/QT53 route is admitted on any GPU when DeltaNet
     /// is enabled; the fixed geometry and format contract is checked separately.
+    /// The FP8 route is arch-gated, so it is never admitted by this
+    /// device-independent predicate (see [`Self::admitted_on_arch`]).
     pub(crate) fn admitted_on(self) -> bool {
         match self {
             Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
+            Self::Fp8B128Grouped => false,
+        }
+    }
+
+    /// Device-aware admission: the QT44/QT53 routes keep their
+    /// device-independent rule, the FP8 route requires gfx942.
+    pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
+        match self {
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
+            Self::Fp8B128Grouped => arch.is_gfx942(),
         }
     }
 
     /// Either QT44/QT53 grouped declaration: both lower through the same
-    /// fixed-shape stages.
+    /// fixed-shape stages. False for the FP8 route.
     pub fn is_qt44_qt53_grouped(self) -> bool {
         matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
     }
+
+    /// The gfx942 qt=55 FP8E4M3B128 grouped declaration.
+    pub fn is_fp8_grouped(self) -> bool {
+        matches!(self, Self::Fp8B128Grouped)
+    }
+
+    /// Any sealed grouped declaration: QT44/QT53 (either) or FP8E4M3B128.
+    pub fn is_sealed_grouped(self) -> bool {
+        self.is_qt44_qt53_grouped() || self.is_fp8_grouped()
+    }
 }
+
+/// The one fixed expert/hidden geometry every grouped specialized route
+/// (QT44/QT53 and FP8E4M3B128) is built for.
+const FIXED_ROUTE_GEOMETRY: MoeRouteGeometry = MoeRouteGeometry {
+    experts: 512,
+    top_k: 10,
+    hidden: 2560,
+    routed_intermediate: 640,
+    shared_intermediate: 640,
+};
 
 /// Exact geometry and wire-format contract of the available grouped kernels.
 /// The route also requires `admitted_on` and live operands matching the policy.
@@ -148,13 +205,7 @@ pub(crate) fn grouped_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let formats = policy.formats;
-    let fixed_geometry = MoeRouteGeometry {
-        experts: 512,
-        top_k: 10,
-        hidden: 2560,
-        routed_intermediate: 640,
-        shared_intermediate: 640,
-    };
+    let fixed_geometry = FIXED_ROUTE_GEOMETRY;
     policy.capability.is_qt44_qt53_grouped()
         && geometry == fixed_geometry
         && experts == geometry.experts
@@ -168,6 +219,60 @@ pub(crate) fn grouped_route_geometry_supported(
         && formats.routed_down == DType::MQ4G128V2
         && gate_up == formats.routed_gate_up
         && down == formats.routed_down
+}
+
+/// Exact geometry and wire-format contract of the gfx942 qt=55 grouped
+/// kernels: the fixed geometry, routed gate_up and down both
+/// [`DType::FP8E4M3B128`], and BF16 router/shared projections. The route also
+/// requires `admitted_on_arch` and live operands matching the policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fp8_grouped_route_geometry_supported(
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    gate_up: DType,
+    down: DType,
+) -> bool {
+    let geometry = policy.geometry;
+    let formats = policy.formats;
+    policy.capability.is_fp8_grouped()
+        && geometry == FIXED_ROUTE_GEOMETRY
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate
+        && [
+            formats.router,
+            formats.shared_selector,
+            formats.shared_gate,
+            formats.shared_up,
+            formats.shared_down,
+        ]
+        .iter()
+        .all(|dtype| *dtype == DType::BF16)
+        && formats.routed_gate_up == DType::FP8E4M3B128
+        && formats.routed_down == DType::FP8E4M3B128
+        && gate_up == formats.routed_gate_up
+        && down == formats.routed_down
+}
+
+/// Typed refusal returned whenever a qt=55 operand would reach a generic
+/// (non-FP8) MoE route.
+pub(crate) fn fp8_b128_generic_refusal() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant: "fp8b128_specialized_route_only",
+        arch: "",
+        quant: "FP8E4M3B128",
+    }
 }
 
 /// Source of the activation consumed by a MoE recipe.
@@ -363,6 +468,25 @@ impl MoeDtypes<'_> {
                 .iter()
                 .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
+
+    /// Any operand (router, shared projection, routed gate_up/down, or any
+    /// per-expert tier) is qt=55 FP8E4M3B128. Generic routes refuse these.
+    pub fn has_fp8_b128_projection(&self) -> bool {
+        let is_fp8 = |dtype: DType| dtype == DType::FP8E4M3B128;
+        self.shared.is_some_and(|shared| {
+            [shared.selector, shared.gate, shared.up, shared.down]
+                .into_iter()
+                .any(is_fp8)
+        }) || [self.router, self.routed_gate_up, self.routed_down]
+            .into_iter()
+            .any(is_fp8)
+            || self
+                .per_expert_gate_up
+                .is_some_and(|values| values.iter().copied().any(is_fp8))
+            || self
+                .per_expert_down
+                .is_some_and(|values| values.iter().copied().any(is_fp8))
+    }
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -446,6 +570,10 @@ pub struct MoeResolution {
     /// the bucketed dispatch path (Task 3). `None` tables or all-equal `Some`
     /// tables leave this `false` ⇒ unchanged uniform fast path.
     pub mixed: bool,
+    /// Refusal state: a qt=55 operand is present, so no generic route flag is
+    /// set. Resolution stays infallible; [`Self::check_generic_route`] raises
+    /// the typed refusal at execution.
+    pub fp8_b128_refused: bool,
 }
 
 impl MoeResolution {
@@ -457,6 +585,9 @@ impl MoeResolution {
     }
 
     pub fn resolve_arch(d: &MoeDtypes<'_>, k: usize, arch_has_e8_wmma: bool) -> Self {
+        if d.has_fp8_b128_projection() {
+            return Self::fp8_b128_refused();
+        }
         use DType::*;
         // The fused four-weight gate kernel is admitted only for the exact
         // MQ4G256 V1 quartet. The exact MQ4G256V2 quartet is admitted on a
@@ -630,7 +761,56 @@ impl MoeResolution {
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
+            fp8_b128_refused: false,
         }
+    }
+
+    /// Resolution for a layer sealed to [`MoeRouteCapability::Fp8B128Grouped`]:
+    /// every generic route flag disabled and no refusal. The typed FP8 route
+    /// lowers its own stages; nothing here selects a generic kernel.
+    pub fn sealed_fp8() -> Self {
+        Self {
+            fp8_b128_refused: false,
+            ..Self::fp8_b128_refused()
+        }
+    }
+
+    /// All-disabled resolution for layers carrying a qt=55 operand.
+    fn fp8_b128_refused() -> Self {
+        Self {
+            gate_side_mq4: false,
+            gate_fusable: false,
+            gate_fusable_mq4v2: false,
+            routed_indexable_mq4: false,
+            routed_indexable_mq4v2: false,
+            routed_indexable_mq5: false,
+            routed_indexable_mq6: false,
+            routed_indexable_mq6v2: false,
+            routed_indexable_mixed_gu4_dn6: false,
+            routed_indexable_mq2lloyd: false,
+            routed_indexable_mq2lloyd_u: false,
+            routed_indexable_mq3lloyd: false,
+            routed_indexable_mixed_lloyd: false,
+            routed_indexable_mixed_per_expert: false,
+            routed_indexable_paro: false,
+            use_gpu_topk: false,
+            needs_x_rot_local: false,
+            mixed: false,
+            fp8_b128_refused: true,
+        }
+    }
+
+    /// Typed execution guard for the generic decode route. `route` is the
+    /// layer's selected specialized route: only
+    /// [`MoeRouteCapability::Fp8B128Grouped`] may carry qt=55 operands.
+    pub fn check_generic_route(
+        &self,
+        route: Option<MoeRouteCapability>,
+    ) -> Result<(), DispatchError> {
+        if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
+            return Err(fp8_b128_generic_refusal());
+        }
+        Ok(())
     }
 
     pub fn routed_indexable(&self) -> bool {
@@ -1627,6 +1807,10 @@ pub struct MoePrefillResolution {
     /// projections. Default mixed layers back to FP16 WMMA; explicit
     /// HIPFIRE_MOE_GROUPED_I8=1 still opts into the research path.
     pub force_mq4_grouped_fp16: bool,
+    /// Refusal state: a qt=55 operand is present, so every path flag above is
+    /// disabled. Resolution stays infallible; [`Self::check_generic_route`]
+    /// raises the typed refusal at execution.
+    pub fp8_b128_refused: bool,
 }
 
 impl MoePrefillResolution {
@@ -1664,6 +1848,17 @@ impl MoePrefillResolution {
         is_verify: bool,
         has_host_projection: bool,
     ) -> Self {
+        if d.has_fp8_b128_projection() {
+            return Self {
+                use_path2: false,
+                down_path0: false,
+                use_paro_i8: false,
+                use_paro_i8_k8: false,
+                paro_mode: false,
+                force_mq4_grouped_fp16: false,
+                fp8_b128_refused: true,
+            };
+        }
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         // Resident routed experts never take the narrow-verify route: only a
         // host-mapped verify window moves to Path 1.
@@ -1750,7 +1945,36 @@ impl MoePrefillResolution {
             use_paro_i8_k8,
             paro_mode,
             force_mq4_grouped_fp16,
+            fp8_b128_refused: false,
         }
+    }
+
+    /// Resolution for a layer sealed to [`MoeRouteCapability::Fp8B128Grouped`]:
+    /// every generic path flag disabled (no Path 0/1/2) and no refusal. The
+    /// typed FP8 route is a separate arm in the sealed selection.
+    pub fn sealed_fp8() -> Self {
+        Self {
+            use_path2: false,
+            down_path0: false,
+            use_paro_i8: false,
+            use_paro_i8_k8: false,
+            paro_mode: false,
+            force_mq4_grouped_fp16: false,
+            fp8_b128_refused: false,
+        }
+    }
+
+    /// Typed execution guard for the generic prefill route (Paths 0/1/2).
+    /// `route` is the layer's selected specialized route: only
+    /// [`MoeRouteCapability::Fp8B128Grouped`] may carry qt=55 operands.
+    pub fn check_generic_route(
+        &self,
+        route: Option<MoeRouteCapability>,
+    ) -> Result<(), DispatchError> {
+        if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
+            return Err(fp8_b128_generic_refusal());
+        }
+        Ok(())
     }
 }
 
@@ -2083,7 +2307,7 @@ mod tests {
         d
     }
 
-    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 6] {
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 7] {
         // Exhaustive destructuring makes a new resolution field require an
         // explicit comparison here, without changing the production API.
         let MoePrefillResolution {
@@ -2093,6 +2317,7 @@ mod tests {
             use_paro_i8_k8,
             paro_mode,
             force_mq4_grouped_fp16,
+            fp8_b128_refused,
         } = r;
         [
             *use_path2,
@@ -2101,6 +2326,7 @@ mod tests {
             *use_paro_i8_k8,
             *paro_mode,
             *force_mq4_grouped_fp16,
+            *fp8_b128_refused,
         ]
     }
 
@@ -2229,7 +2455,7 @@ mod tests {
                     );
                     assert_eq!(
                         prefill_resolution_fields(&host),
-                        [false, false, false, false, dtype == DType::ParoQ4G128, false],
+                        [false, false, false, false, dtype == DType::ParoQ4G128, false, false],
                         "{arch_name}, {dtype:?}, batch={batch}",
                     );
                 }
@@ -2298,5 +2524,119 @@ mod tests {
             assert!((2..=NARROW_VERIFY_MAX_ROWS).contains(&n), "verify range must admit {n}");
         }
         assert!(!(2..=NARROW_VERIFY_MAX_ROWS).contains(&(NARROW_VERIFY_MAX_ROWS + 1)));
+    }
+
+    fn fp8_b128_refusal(err: DispatchError) -> bool {
+        matches!(
+            err,
+            DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "fp8b128_specialized_route_only",
+                quant: "FP8E4M3B128",
+                ..
+            }
+        )
+    }
+
+    /// Every place a qt=55 operand can sit: the generic resolutions refuse
+    /// each one with all path flags disabled.
+    fn fp8_b128_operand_cases() -> Vec<MoeDtypes<'static>> {
+        static FP8_TIERS: [DType; 2] = [DType::FP8E4M3B128, DType::FP8E4M3B128];
+        static MQ4_TIERS: [DType; 2] = [DType::MQ4G256, DType::MQ4G256];
+        let mut cases = Vec::new();
+        let mut routed = uniform_mq4();
+        routed.routed_gate_up = DType::FP8E4M3B128;
+        routed.routed_down = DType::FP8E4M3B128;
+        cases.push(routed);
+        let mut down_only = uniform_mq4();
+        down_only.routed_down = DType::FP8E4M3B128;
+        cases.push(down_only);
+        let mut router = uniform_mq4();
+        router.router = DType::FP8E4M3B128;
+        cases.push(router);
+        let mut shared = uniform_mq4();
+        shared.shared.as_mut().unwrap().down = DType::FP8E4M3B128;
+        cases.push(shared);
+        let mut tiers = uniform_mq4();
+        tiers.per_expert_gate_up = Some(&MQ4_TIERS);
+        tiers.per_expert_down = Some(&FP8_TIERS);
+        cases.push(tiers);
+        cases
+    }
+
+    #[test]
+    fn fp8_capability_predicates_are_disjoint_from_qt44() {
+        assert!(MoeRouteCapability::Fp8B128Grouped.is_fp8_grouped());
+        assert!(!MoeRouteCapability::Fp8B128Grouped.is_qt44_qt53_grouped());
+        for qt44 in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            assert!(qt44.is_qt44_qt53_grouped());
+            assert!(!qt44.is_fp8_grouped());
+        }
+    }
+
+    #[test]
+    fn fp8_b128_decode_resolution_is_a_typed_refusal_state() {
+        for arch_name in ["gfx942", "gfx1151", "gfx1201", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for d in fp8_b128_operand_cases() {
+                assert!(d.has_fp8_b128_projection());
+                let r = MoeResolution::resolve_arch(&d, 8, ctx.arch.has_wmma());
+                assert!(r.fp8_b128_refused, "{arch_name}");
+                assert!(!r.use_gpu_topk && !r.routed_indexable() && !r.mixed);
+                assert!(!r.gate_side_mq4 && !r.gate_fusable && !r.gate_fusable_mq4v2);
+                assert!(!r.needs_x_rot_local && !r.routed_indexable_mq2lloyd_u);
+                assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
+                assert!(fp8_b128_refusal(
+                    r.check_generic_route(Some(MoeRouteCapability::Qt44Qt53Grouped))
+                        .unwrap_err()
+                ));
+                r.check_generic_route(Some(MoeRouteCapability::Fp8B128Grouped))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn fp8_b128_prefill_resolution_disables_every_path() {
+        for arch_name in ["gfx942", "gfx1151", "gfx1201", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for d in fp8_b128_operand_cases() {
+                for (batch, verify, host) in
+                    [(0, false, false), (1, false, false), (2, true, true), (4, true, false)]
+                {
+                    let r = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, verify, host,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&r),
+                        [false, false, false, false, false, false, true],
+                        "{arch_name} batch={batch}",
+                    );
+                    assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
+                    assert!(fp8_b128_refusal(
+                        r.check_generic_route(Some(MoeRouteCapability::Qt44Qt53Grouped))
+                            .unwrap_err()
+                    ));
+                    r.check_generic_route(Some(MoeRouteCapability::Fp8B128Grouped))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_fp8_resolution_has_no_refusal_state() {
+        let ctx = crate::context::DispatchCtx::for_test("gfx942");
+        let d = uniform_mq4();
+        assert!(!d.has_fp8_b128_projection());
+        let decode = MoeResolution::resolve_arch(&d, 8, ctx.arch.has_wmma());
+        assert!(!decode.fp8_b128_refused);
+        decode.check_generic_route(None).unwrap();
+        let prefill = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+        assert!(!prefill.fp8_b128_refused);
+        prefill.check_generic_route(None).unwrap();
     }
 }

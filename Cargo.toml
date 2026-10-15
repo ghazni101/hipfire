@@ -60,6 +60,7 @@ members = [
     "crates/saddle-lab",
     "crates/hipfire-xdna",
     "crates/peacemaker-npu",
+    "crates/peacemaker-cdna",
     "crates/npu-tools",
 ]
 

@@ -30,8 +30,10 @@
 //   stress <reps>             poisoned repeats (rotating 0xFF/0x7F/0x00/0xA5),
 //                             each compared with the reference and the first
 //                             candidate launch (gfx1151: also its live S tiles).
-//                             Run it under ROC_GLOBAL_CU_MASK=0x1 and as 2 and 4
-//                             concurrent processes for the co-resident modes.
+//                             Run it as 2 and 4 concurrent processes for the
+//                             co-resident modes. Never set ROC_GLOBAL_CU_MASK or
+//                             HSA_CU_MASK on RDNA (banned since the 2026-10-14
+//                             MES hang).
 //                             VA_STRESS_SHAPES="b,ctx,capture,cap;..." picks the
 //                             shapes; VA_STRESS_REF=1 loops the reference
 //                             instead (control). Mismatches print STRESS_DIFF.

@@ -14,6 +14,10 @@
 //! No operation owns a tensor or allocates execution-local storage.
 
 use crate::families::gemv::WeightRef;
+use crate::context::DispatchCtx;
+use crate::families::gemm::{GemmFamily, GemmParams};
+use crate::types::KernelKey;
+use std::sync::LazyLock;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
@@ -133,6 +137,12 @@ fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
 /// basis, not the natural input, so the activation is rotated into `rotation`
 /// (`rows * weight.k` elements) first — the same basis the routed experts and the
 /// MTP head consume.  BF16 and Q8F16 payloads read the input as it stands.
+///
+/// gfx942 BF16 weights (every row count, one row included) take the BF16 MFMA
+/// GEMM (`KernelKey::GemmBf16Mfma`, `Gpu::gemm_bf16_mfma_gfx942`) on a BF16
+/// copy of the activation instead of the GEMV / multirow GEMM arms; see
+/// [`g942_trunk_mfma_route`]. `HIPFIRE_G942_TRUNK_GEMV=1` restores the one-row
+/// GEMV arm (rows > 1 stay on MFMA).
 pub fn project_weight(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
@@ -246,6 +256,38 @@ fn project_weights_inner(
                 } else {
                     gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
                 })?;
+                done[j] = true;
+            }
+        }
+    }
+    // gfx942 BF16 weights of one K: the input is staged to BF16 once (or used
+    // as is when it already is BF16) and every member runs the MFMA GEMM, one
+    // output row-tile = 32 batch rows with the kernel masking the tail, so
+    // each output row is independent of `rows` (one row included). Ahead of
+    // the BF16-activation refusal below: a BF16 input is a valid MFMA operand.
+    let g942 = gpu.arch_caps.is_gfx942();
+    if g942 {
+        let gemv_opt_out = g942_trunk_gemv();
+        let route = |j: usize| {
+            g942_trunk_mfma_route(
+                true,
+                gemv_opt_out,
+                rows,
+                input.dtype,
+                projections[j].0.dtype,
+                projections[j].1.dtype,
+            )
+        };
+        for i in 0..projections.len() {
+            if done[i] || !route(i) {
+                continue;
+            }
+            let k = projections[i].0.k;
+            let group: SmallVec<[usize; 4]> = (i..projections.len())
+                .filter(|&j| !done[j] && projections[j].0.k == k && route(j))
+                .collect();
+            project_g942_mfma(gpu, input, rows, rotation, projections, &group, k)?;
+            for j in group {
                 done[j] = true;
             }
         }
@@ -628,6 +670,11 @@ fn rotate_input(
 }
 
 /// Run one projection on an input already in the weight's basis.
+///
+/// gfx942 BF16 weights never reach this on the MFMA route
+/// ([`project_weights_inner`] takes them first); the BF16 arms below are
+/// the non-gfx942 arms and, on gfx942, the `HIPFIRE_G942_TRUNK_GEMV=1` one-row
+/// GEMV.
 fn project_rotated(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
@@ -727,6 +774,123 @@ fn project_rotated(
     hip(result)
 }
 
+/// `HIPFIRE_G942_TRUNK_GEMV=1` (read once): on gfx942, one-row BF16 trunk
+/// projections keep the legacy GEMV arm instead of the MFMA GEMM.
+fn g942_trunk_gemv() -> bool {
+    static OPT_OUT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_G942_TRUNK_GEMV", false)
+    });
+    *OPT_OUT
+}
+
+/// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
+/// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
+///
+/// gfx942 only, at every row count including one: the kernel's 32-row batch
+/// tile masks the tail, each output element is one fixed-order K walk of its
+/// own activation row (128-wide K chunks ascending, MFMA 16-wide steps
+/// ascending, no split-K, no atomics), so a row's bytes do not depend on
+/// `rows`. The activation is F32 (staged to BF16) or already BF16; the output
+/// is F32, or BF16 via an F32 landing in the op's rotation scratch. The one
+/// exception is `gemv_opt_out` (`HIPFIRE_G942_TRUNK_GEMV=1`) at `rows == 1`,
+/// which keeps the legacy GEMV arm.
+fn g942_trunk_mfma_route(
+    gfx942: bool,
+    gemv_opt_out: bool,
+    rows: usize,
+    input: DType,
+    weight: DType,
+    output: DType,
+) -> bool {
+    gfx942
+        && rows > 0
+        && weight == DType::BF16
+        && matches!(input, DType::F32 | DType::BF16)
+        && matches!(output, DType::F32 | DType::BF16)
+        && !(gemv_opt_out && rows == 1)
+}
+
+/// The gfx942 MFMA arm of [`project_weights_inner`] for the `group` (indices
+/// into `projections`) of BF16 weights sharing `input` and `k`: one F32 -> BF16
+/// staging of the activation in the shared 2-byte activation scratch (no
+/// per-call allocation; none when `input` is BF16), then one
+/// `gemm_bf16_mfma_gfx942` per member. The launch extent is the real `rows`;
+/// the kernel pads its batch tile internally, so nothing is padded or copied
+/// here. A BF16 output lands as F32 in `rotation` (`rows * m` elements; BF16
+/// weights need no rotation, so the scratch is free) and is rounded RNE into
+/// the output.
+/// The calibration tap sees the original F32 `input`, never the staged copy.
+fn project_g942_mfma(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    group: &[usize],
+    k: usize,
+) -> Result<(), DispatchError> {
+    let n = checked_mul(rows, k, "gfx942 trunk activation")?;
+    require_tensor(input, n, input.dtype, "gfx942 trunk activation")?;
+    // Calibration tap: the true F32 activation, before the BF16 staging (the
+    // `GemmBf16Mfma` family arm skips BF16 inputs, so it would never see it).
+    if input.dtype == DType::F32 {
+        for &j in group {
+            gpu.maybe_capture_activation(projections[j].0.buf, input, rows, k);
+        }
+    }
+    let staged = if input.dtype == DType::BF16 {
+        view(input, 0, n)
+    } else {
+        let mut staged = hip(gpu.qwen4_f16_x_scratch(n))?;
+        staged.dtype = DType::BF16;
+        hip(gpu.convert_f32_to_bf16(input, &staged, n))?;
+        staged
+    };
+    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
+    // the registry; refuses a non-BF16 activation), not a direct launch.
+    let ctx = DispatchCtx::new(gpu);
+    for &j in group {
+        let (w, out) = projections[j];
+        let elements = checked_mul(rows, w.m, "gfx942 trunk output")?;
+        require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
+        if out.dtype == DType::BF16 {
+            let landing = rotation
+                .filter(|r| r.dtype == DType::F32 && r.numel() >= elements)
+                .ok_or(DispatchError::UnsupportedVariant {
+                    family: "layer-operations",
+                    variant: "bf16-output-f32-landing-absent",
+                    arch: "gfx942",
+                    quant: "BF16",
+                })?;
+            let landing = view(landing, 0, elements);
+            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, &landing, rows)?;
+            hip(gpu.convert_f32_to_bf16(&landing, out, elements))?;
+        } else {
+            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, out, rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// One `KernelKey::GemmBf16Mfma` launch through the GEMM family (`x` BF16,
+/// `y` F32).
+fn g942_gemm_bf16_mfma(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    static GEMM: LazyLock<GemmFamily> = LazyLock::new(GemmFamily::new);
+    GEMM.run_key(
+        KernelKey::GemmBf16Mfma,
+        ctx,
+        gpu,
+        &GemmParams { w, x, y, batch_size: rows },
+    )
+}
+
 /// Hyper-connection read: grouped RMSNorm, low-rank down/up projections,
 /// source BF16 boundaries, sigmoid gating, and branch reduction.
 pub struct HyperReadOp<'a> {
@@ -741,7 +905,6 @@ pub struct HyperReadOp<'a> {
     pub low: &'a GpuTensor,
     pub up: &'a GpuTensor,
     pub mixed: &'a GpuTensor,
-    pub bf16_scratch: &'a GpuTensor,
     pub rows: usize,
     pub branches: usize,
     pub hidden: usize,
@@ -787,12 +950,6 @@ impl HyperReadOp<'_> {
             checked_mul(self.rows, self.hidden, "hyper read mixed")?,
             DType::F32,
             "hyper read mixed",
-        )?;
-        require_tensor(
-            self.bf16_scratch,
-            self.low_rank.max(self.hidden),
-            DType::BF16,
-            "hyper read BF16 scratch",
         )?;
         require_weight(&self.input_mix_down, self.low_rank, wide, "hyper read down")?;
         require_weight(&self.input_mix_up, wide, self.low_rank, "hyper read up")?;
@@ -1036,18 +1193,20 @@ fn execute_hyper_read_inner(
             ))?;
         }
     } else {
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        // The three source BF16 boundaries, each one launch over all rows of
+        // `low`: the round trip is elementwise, so this is bitwise the
+        // per-row launches it replaces. Its BF16 copy is staged in `up`,
+        // which the up projection below overwrites before anything reads it.
+        let elements = op.rows * op.low_rank;
+        let mut staging = view(op.up, 0, elements);
+        staging.dtype = DType::BF16;
+        let roundtrip = Bf16Roundtrip {
+            input: &low,
+            scratch: &staging,
+            output: &low,
+            elements,
+        };
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
         hip(scale_f32(
             gpu,
             &ScaleF32 {
@@ -1055,31 +1214,9 @@ fn execute_hyper_read_inner(
                 scale: 1.0 / op.branches as f32,
             },
         ))?;
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
         hip(gpu.silu_f32(&low, &low))?;
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
     }
     if up_fused {
         // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
@@ -1775,17 +1912,27 @@ impl GatedDeltaNetOp<'_> {
     }
 }
 
+/// Whether the GDN mixer takes the batched persistent k4 route for `rows`.
+/// gfx942 takes it at one row too (decode): its persistent recurrence is
+/// pinned to the sequential kernel's arithmetic and the batched convolution,
+/// gate parameters and gate compute each row as the per-row kernels do, so a
+/// decode row is bitwise the per-row route's, and the step runs as one
+/// launch over all value heads instead of the sequential kernel.
+fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
+    gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
+        && (gpu.route_rows(rows) > 1 || gpu.arch_caps.is_gfx942())
+        && op.key_dim == 128
+        && op.value_dim == 128
+        && op.conv_kernel == 4
+}
+
 /// Whether the native GDN mixer stores `op`'s qkv projection as BF16 (the
 /// chunked batched route with a BF16-storing MQ6/MQ4 GEMM), i.e. the dtype of
 /// `op.projection` that [`execute_gated_delta_net`] writes and its convolution
 /// reads. Exported so producers outside the dispatch (the NPU trunk twin) write
 /// the same layout instead of re-deriving it.
 pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
-    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) > 1
-        && op.key_dim == 128
-        && op.value_dim == 128
-        && op.conv_kernel == 4;
+    let persistent_batch = gdn_persistent_batch(gpu, op, op.rows);
     let dims = GatedDeltaStepBatched {
         projection: op.projection2,
         gate: op.gate,
@@ -1986,6 +2133,7 @@ pub fn execute_indexed_attention_core_rows(
         pooled_keys: op.state.pooled_keys,
         selected_indices: op.state.selected_indices,
         f16_arena: op.state.f16_arena,
+        pooled_bf16: op.state.pooled_bf16,
         full_capacity: op.state.full_capacity,
         raw_capacity: op.state.raw_capacity,
         pooled_capacity: op.state.pooled_capacity,
@@ -2137,11 +2285,7 @@ fn execute_gated_delta_net_hc_impl(
     let mut beta = view(op.beta, 0, rows * op.value_heads);
     let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(rows) > 1
-        && op.key_dim == 128
-        && op.value_dim == 128
-        && op.conv_kernel == 4;
+    let persistent_batch = gdn_persistent_batch(gpu, op, rows);
     if arenas.is_some() && (!persistent_batch || op.row_capture.is_some()) {
         return Err(DispatchError::Hip("GDN trunk arena needs batched k4 without row capture".into()));
     }
@@ -2525,6 +2669,7 @@ pub struct IndexedAttentionState<'a> {
     pub pooled_keys: &'a GpuTensor,
     pub selected_indices: &'a GpuTensor,
     pub f16_arena: Option<QsaF16ArenaRef<'a>>,
+    pub pooled_bf16: Option<rdna_compute::qsa_pooled_mirror::QsaPooledBf16MirrorRef<'a>>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -2863,6 +3008,18 @@ impl IndexedAttentionOp<'_> {
                     "indexed attention F16 arena values",
                 )?;
             }
+            if let Some(mirror) = &self.state.pooled_bf16 {
+                require_tensor(
+                    mirror.mirror,
+                    checked_mul(
+                        self.state.pooled_capacity,
+                        index_kv_width,
+                        "indexed attention pooled BF16 mirror",
+                    )?,
+                    DType::BF16,
+                    "indexed attention pooled BF16 mirror",
+                )?;
+            }
             require_tensor(
                 self.state.selected_indices,
                 checked_mul(
@@ -3193,6 +3350,9 @@ fn execute_indexed_attention_hc_impl(
     if let Some(arena) = &op.state.f16_arena {
         arena.valid_len.clamp(initial_position);
     }
+    if let Some(mirror) = &op.state.pooled_bf16 {
+        mirror.valid_blocks.clamp(initial_position / op.compress);
+    }
     let yarn = op.rope.yarn(op.rotary_dim);
     if let Some(src) = arenas {
         qsa_norm_source(
@@ -3415,6 +3575,16 @@ fn execute_indexed_attention_hc_impl(
             },
         ))?;
     }
+    if let Some(mirror) = &op.state.pooled_bf16 {
+        hip(rdna_compute::qsa_pooled_mirror::qsa_pooled_bf16_sync(
+            gpu,
+            op.state.pooled_keys,
+            mirror.mirror,
+            mirror.valid_blocks,
+            complete,
+            index_kv_width,
+        ))?;
+    }
     let selected_len_out = match op.mode {
         IndexedAttentionMode::Full => None,
         IndexedAttentionMode::AppendOnly => return Ok(()),
@@ -3461,6 +3631,9 @@ fn execute_indexed_attention_hc_impl(
     let select = IndexedAttentionSelectBatch {
         query: &index_batch,
         pooled: op.state.pooled_keys,
+        pooled_bf16: op.state.pooled_bf16.as_ref().and_then(|mirror| {
+            (mirror.valid_blocks.valid(complete) >= complete).then_some(mirror.mirror)
+        }),
         selected: &selected_batch,
         rows: op.rows,
         query_row_stride: index_width,
@@ -4180,6 +4353,11 @@ pub fn execute_lm_head(
     } else if requested_rows == 1 {
         let input = view(hidden_batch, (rows - 1) * weight.k, weight.k);
         match weight.dtype {
+            // gfx942: the one-row MFMA route (or the `HIPFIRE_G942_TRUNK_GEMV=1`
+            // GEMV inside it); elsewhere the final-row GEMV stays.
+            DType::BF16 if gpu.arch_caps.is_gfx942() => {
+                project_weight(gpu, weight, &input, logits, 1, None)
+            }
             DType::BF16 => hip(gpu.gemv_bf16_xf32(weight.buf, &input, logits, weight.m, weight.k)),
             DType::F32 => {
                 hip(gpu.gemm_f32_batched(weight.buf, &input, logits, weight.m, weight.k, 1))
@@ -4413,6 +4591,7 @@ mod tests {
                 pooled_keys: t,
                 selected_indices: t,
                 f16_arena: None,
+                pooled_bf16: None,
                 full_capacity: 64,
                 raw_capacity: 64,
                 pooled_capacity: 16,
@@ -5057,5 +5236,32 @@ mod trunk_arena_dispatch_tests {
             assert_eq!(core_arena::<u8>(phase, None), None);
             assert_eq!(core_arena(phase, Some(1)), (phase == MixerPhase::Core).then_some(1));
         }
+    }
+    #[test]
+    fn g942_trunk_bf16_projection_route_is_every_row_mfma() {
+        use DType::{BF16, F16, F32, MQ4G256V2};
+        // Every row count, one row included, on gfx942.
+        for rows in [1, 2, 7, 8, 9, 31, 32, 33, 8192] {
+            assert!(g942_trunk_mfma_route(true, false, rows, F32, BF16, F32), "rows {rows}");
+            assert!(g942_trunk_mfma_route(true, false, rows, BF16, BF16, F32), "rows {rows}");
+            assert!(g942_trunk_mfma_route(true, false, rows, F32, BF16, BF16), "rows {rows}");
+        }
+        // Never off gfx942, never without rows.
+        assert!(!g942_trunk_mfma_route(false, false, 64, F32, BF16, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 0, F32, BF16, F32));
+        // Only BF16 weights, F32/BF16 activations and outputs.
+        assert!(!g942_trunk_mfma_route(true, false, 64, F32, MQ4G256V2, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 64, F16, BF16, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 64, F32, BF16, F16));
+    }
+    #[test]
+    fn g942_trunk_gemv_opt_out_restores_only_the_one_row_arm() {
+        use DType::{BF16, F32};
+        assert!(!g942_trunk_mfma_route(true, true, 1, F32, BF16, F32));
+        for rows in [2, 8, 9, 32, 33, 8192] {
+            assert!(g942_trunk_mfma_route(true, true, rows, F32, BF16, F32), "rows {rows}");
+        }
+        // The opt-out is a gfx942 lever: elsewhere the route is already off.
+        assert!(!g942_trunk_mfma_route(false, true, 1, F32, BF16, F32));
     }
 }

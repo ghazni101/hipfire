@@ -1014,12 +1014,15 @@ mod tests {
     }
 
     /// A sysfs/procfs tree under a temp dir: a CPU node, a gfx1100 dGPU at
-    /// 66:00.0 (card0) and a gfx1151 APU at bf:00.0 (card1).
+    /// 66:00.0 (card0) and a gfx1151 APU at bf:00.0 (card1). Unix-only: the
+    /// fake DRM card links to its PCI device with a symlink, as sysfs does.
+    #[cfg(unix)]
     struct FakeHost {
         root: PathBuf,
         apu: PathBuf,
     }
 
+    #[cfg(unix)]
     impl FakeHost {
         fn new(label: &str) -> Self {
             let nonce = std::time::SystemTime::now()
@@ -1093,12 +1096,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for FakeHost {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolves_the_daemons_card() {
         let host = FakeHost::new("resolve");
@@ -1122,6 +1127,7 @@ mod tests {
         assert!(resolve_device(&host.root, None, Some("7"), None).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_or_unknown_gpu_metrics_keeps_hwmon_and_sysfs() {
         let host = FakeHost::new("degrade");
@@ -1161,6 +1167,7 @@ mod tests {
         assert_eq!(decoded["gfxclk_mhz"]["max"], 2837.0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unresolvable_device_reports_why() {
         let host = FakeHost::new("nodevice");

@@ -111,8 +111,8 @@ Stable/default-on and safety controls:
 | `fusions.qkv_bias` | `true` | Fold supported QKV bias launches. |
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
-| `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set; any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
-| `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL` (a non-empty path replaces the default). A calibration is `schema_version` 4 JSON that rejects unknown fields. A file at the path wins; only a **missing** file uses the compiled-in measured Halo calibration (stock route, or the overlay route of the load's trunk overlay), so an unreadable or invalid file is an error and never falls back to the built-in. File and built-in calibrations pass the same strict key check (arch, PCI BDF, NPU firmware, build, kernel release, model-index hash, epilogue, trunk route); `auto` treats a mismatch as GPU-only and never recalibrates. Armed logs include `cal_source=file\|builtin`. No calibration/index I/O when effectively off. See [NPU trunk](npu/npu-trunk.md). |
+| `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set (the built-in calibration applies on any Halo kernel/firmware with a 5% safety margin; first-load self-calibration is planned); any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
+| `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL` (a non-empty path replaces the default). A calibration is `schema_version` 4 JSON that rejects unknown fields. A file at the path wins; only a **missing** file uses the compiled-in measured Halo calibration (stock route, or the overlay route of the load's trunk overlay), so an unreadable or invalid file is an error and never falls back to the built-in. A calibration file passes a strict key check (arch, PCI BDF, NPU firmware, build, kernel release, model-index hash, epilogue, trunk route); `auto` treats a mismatch as GPU-only and never recalibrates. The built-in calibration applies on any Halo kernel and NPU firmware (and NPU PCI slot): when those differ from the record it is used with a 5% safety margin (the pipe must be predicted at least 5% faster than GPU-only) and logs `npu-trunk: built-in calibration measured on <kernel>/<fw>, this host <kernel>/<fw>; using it with margin 0.05`. Arch, build, model-index hash, epilogue and trunk route stay strict. First-load self-calibration is planned. Armed logs include `cal_source=file\|builtin`. No calibration/index I/O when effectively off. See [NPU trunk](npu/npu-trunk.md). |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
 | `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host `MemAvailable` headroom check; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
@@ -428,20 +428,35 @@ sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
 recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
 arch, `fp32` through the `state_quant` load parameter.
 
-| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other gfx11/gfx12 | other arches |
-|---|---|---|---|
-| `auto` / unset | `fp8` | `bf16` | `bf16` |
-| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same | same |
-| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | refused |
-| `q8` (opt-in) | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same | refused |
-| anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused |
+| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other gfx11/gfx12 | gfx942 (MI300X) | other arches |
+|---|---|---|---|---|
+| `auto` / unset | `fp8` | `bf16` | `bf16` (never `fp8`) | `bf16` |
+| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same | same | same |
+| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | explicit opt-in: the same row (E4M3 codes plus one f16 scale per head and token) in the gfx942 FNUZ-hardware format; indexer raw/pooled keys stay F32 | refused |
+| `q8` (opt-in) | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same | refused | refused |
+| anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused | refused |
 
 `auto` picks fp8 only on exact gfx1201 and only for a head geometry the
 kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
-otherwise it stays `bf16`. `auto` never picks `q8`; it needs head_dim 256.
+otherwise it stays `bf16`. On exact gfx942 `auto`/unset stays the exact `bf16`
+state; fp8 is served only by an explicit `kv_cache = "fp8"` (same geometry
+requirement, refused rather than rewritten when the model does not meet it).
+`auto` never picks `q8`; it needs head_dim 256.
 The native MTP layer keeps the exact state. On Flash-Next, each trunk QSA
-layer's context state is 4,736 bytes per token at `bf16`, 1,352 at fp8 and
-1,408 at q8 (12 layers at 262,144 tokens: 14,208, 4,056 and 4,224 MiB). The
+layer's context state is 4,736 bytes per token at `bf16`, 1,352 at gfx1201
+fp8, 1,672 at gfx942 fp8 and 1,408 at q8 (12 layers at 262,144 tokens:
+14,208, 4,056, 5,016 and 4,224 MiB). The gfx942 fp8 charge is the K and V
+rows (2 × 516 = 1,032 B; a row is 2 KV heads × (256 E4M3 codes + one f16
+scale)), the F32 raw index key (512 B) and the F32 pooled key (one 512 B row
+per four tokens, 128 B); the index state is the same F32 state as `bf16`.
+gfx942 uses legacy (fully allocated) context storage, so admission charges
+the whole `max_seq`. The gfx942 FNUZ hardware encoder stores code bytes with
+one f16 scale per head and token (the decoder doubles the scale for the FNUZ
+bias). Stored bytes equal gfx1201's except that `0x80` is stored as `0x00`
+(+0) for both input negative zero and negative underflow to zero. FNUZ has no
+negative zero (`0x80` is its NaN), so a stored K/V row never contains `0x80`;
+every other finite code is stored unchanged. Decoded values equal the gfx1201
+fp8 row's up to the sign of zero; full byte identity is not claimed. The
 Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
 native 262,144. Index keys hold the same values in every format, so
 selection is unchanged; only the attention over the selected K/V rows sees
@@ -509,6 +524,14 @@ context then tracks the tokens touched, not `max_seq`: the load logs
 `qwen4 QSA context: … MiB virtual …, … MiB committed at load`, and each
 growth logs `qwen4 QSA context mapped for N tokens`. Mapped pages stay owned
 until unload, and VMM is not eviction.
+
+On gfx1151 two exact QSA selection levers are on by default (kill switches in
+[env-vars](env-vars.md)): each layer keeps a BF16 mirror of its pooled index
+keys (`HIPFIRE_QWEN4_QSA_POOLED_BF16`; 256 bytes per pooled block, i.e.
+16 MiB per QSA layer at 256K, charged in admission and never snapshotted),
+and long-context score/select calls use the sampled filter select
+(`HIPFIRE_QWEN4_QSA_FILTER_SELECT`). Selection, attention and logits are
+byte-identical with either off.
 
 Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
 **automatic** under VMM (legacy storage refuses it and needs an explicit
@@ -833,6 +856,35 @@ Two checks exist; only one is gated:
   deployment target is refused regardless of this box's RAM.
 
 `scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
+
+#### Windows host memory and `hipfire diag`
+
+- **Host memory.** `hipfire diag --json` carries an additive `host_memory`
+  object (`null` when the platform has no host-memory source). On Linux it
+  is parsed from `/proc/meminfo`. On Windows it comes from
+  `GlobalMemoryStatusEx`: `available_physical_bytes` is *physical* RAM
+  (`ullAvailPhys`), whereas the commit figures (`commit_limit_bytes` /
+  `commit_available_bytes`, from `ullTotalPageFile` / `ullAvailPageFile`)
+  count RAM plus pagefile. `swap_total_bytes` on Windows is the **pagefile
+  approximation** `commit limit − total physical`, saturating at 0; it is not a
+  direct pagefile-size query. The bench-sweep headroom check compares the
+  model against available *physical* memory on every platform.
+- **GPU memory budget.** On Windows only, `hipfire diag` adds a
+  `gpu_memory_budget` JSON key and a text section *GPU memory budget (DXGI,
+  this process)*: per hardware adapter, identity (vendor/device id, LUID, AMD
+  vs non-AMD), dedicated/shared sizes, and for the local and non-local
+  segments the `Budget`, `CurrentUsage`, `AvailableForReservation` and
+  `CurrentReservation` from `IDXGIAdapter3::QueryVideoMemoryInfo` (node 0).
+  A failed query is reported as `error`, not as an empty list. Software
+  adapters (`DXGI_ADAPTER_FLAG_SOFTWARE`) are skipped.
+- **Not an admission budget.** These numbers are what the *calling process*
+  (the CLI) sees on node 0, at one instant. They are diagnostics. Admission of
+  a load must query DXGI from inside the engine process itself.
+- **GPU-less `auto` on Windows.** With no GPU arch known, `auto` decides by
+  host swap state. On Windows that state is the pagefile approximation above:
+  approximation `> 0` counts as swap and **disables** the guard; `0` or an
+  unavailable query **enables** it. The arch overrides apply unchanged
+  (unified APU → on, discrete → off).
 
 ### Partial GPU offload (`memory.gpu_layer_budget` / `memory.moe_expert_budget` / `memory.offload_exec`)
 
@@ -1211,7 +1263,7 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.gfx1151_initiator` | `"legacy"` | `legacy` \| `order` \| `radv` |
 | `diagnostic.replay.gfx1151_interleave` | `"inherit"` | `inherit`, `off`, `64`, `128`, `256`, `512` |
 | `diagnostic.replay.gfx1151_resource_limits` | `"legacy"` | `legacy` \| `simd-always` \| `radv` |
-| `diagnostic.replay.gfx1151_cu_count` | `"all"` | `all` or an even CU count below 40 |
+| `diagnostic.replay.gfx1151_cu_count` | `"all"` | deprecated; `all` only (`inherit`/`40` accepted as aliases). Any other value is refused at PM4 replay preparation: CU masks on RDNA hung the R9700 MES on 2026-10-14 |
 | `diagnostic.replay.gfx1151_entry_acquire` | `"system"` | `system` \| `agent` \| `vmem` \| `none` |
 | `diagnostic.compiler.no_device_compiler` | `false` | bool; treat the device compiler as absent so precompiled code objects are used verbatim |
 
@@ -1375,7 +1427,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 299 schema keys, plus the `developer.<name>` namespace.
+**Count:** 300 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1415,7 +1467,7 @@ misspelled key is unknown and fails the load with
 | `diagnostic.prompt_token_heat` | `prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | experimental |
 | `diagnostic.qkv_bias` | `fuse_qkv_bias_debug` | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | experimental |
 | `diagnostic.replay.dispatch_profile` | `replay_dispatch_profile` | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | experimental |
-| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | experimental |
+| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | deprecated |
 | `diagnostic.replay.gfx1151_entry_acquire` | `gfx1151_pm4_entry_acquire` | `HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE` | experimental |
 | `diagnostic.replay.gfx1151_initiator` | `gfx1151_pm4_initiator` | `HIPFIRE_GFX1151_PM4_INITIATOR` | experimental |
 | `diagnostic.replay.gfx1151_interleave` | `gfx1151_pm4_interleave` | `HIPFIRE_GFX1151_PM4_INTERLEAVE` | experimental |
@@ -1616,6 +1668,7 @@ misspelled key is unknown and fails the load with
 | `replay.unsafe_wsl_redline` | `unsafe_wsl_redline` | `HIPFIRE_UNSAFE_WSL_REDLINE` | experimental |
 | `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
 | `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
+| `serve.api_key_file` | `api_key_file` | `HIPFIRE_SERVE_API_KEY_FILE` | stable |
 | `serve.batch_nonexact` | `serve_batch_nonexact` | `HIPFIRE_SERVE_BATCH_NONEXACT` | experimental |
 | `serve.batch_sampled` | `serve_batch_sampled` | `HIPFIRE_SERVE_BATCH_SAMPLED` | experimental |
 | `serve.batch_spec` | `serve_batch_spec` | `HIPFIRE_SERVE_BATCH_SPEC` | experimental |
@@ -1682,6 +1735,19 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:end -->
 
+## Serve bearer credential file
+
+`serve.api_key_file` is an optional process-scoped string, empty/unset by default
+(no authentication). Set an absolute path, never the secret itself.
+`hipfire serve --api-key-file` overrides it for that process;
+`HIPFIRE_SERVE_API_KEY_FILE` is the environment override. CLI/TUI local HTTP
+calls load the same configured credential.
+The file must be UTF-8 with at least 32 bytes after trimming trailing whitespace;
+Unix group/other permissions are refused (`chmod 600`). Windows ACLs are not
+checked yet, and Windows never auto-generates a key. A key is recommended, not
+required, on a non-loopback bind, and remote bearer traffic requires an HTTPS
+proxy for confidentiality. See [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies).
+
 ## Related
 
 | Topic | Owner |
@@ -1692,3 +1758,4 @@ misspelled key is unknown and fails the load with
 | Serve API | [`SERVE.md`](SERVE.md) |
 | CLI | [`CLI.md`](CLI.md) |
 | Multi-GPU | [`multi-gpu.md`](multi-gpu.md) |
+

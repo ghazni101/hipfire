@@ -26,6 +26,11 @@
 //! 5. `.comment` is this writer's own stamp, `hipfire peacemaker native-emit <crate version>`
 //!    (NUL-terminated; the section is mergeable strings). Its length feeds
 //!    `.symtab`'s offset, so every later offset follows the stamp.
+//!
+//! gfx942 objects (checked against `llvm-mc -mcpu=gfx942` + `ld.lld -shared`, AMD LLVM 24.0.0git) use the
+//! same layout: the header differs only in `EI_ABIVERSION` (3 for code object v5, 4 for v6) and `e_flags`
+//! (`EF_AMDGPU_MACH_AMDGCN_GFX942` 0x4c with the xnack-any and sramecc-any feature bits: 0x54c), and
+//! the v5 and v6 objects are otherwise byte-identical.
 use crate::Arch;
 use super::descriptor::{ENTRY_OFFSET, KD_SIZE};
 
@@ -68,9 +73,20 @@ fn sysv_hash(name: &str) -> u32 {
     })
 }
 
+/// `e_flags`: `EF_AMDGPU_MACH_AMDGCN_*`, plus for gfx942 the generic target features ELFABIVERSION >= 3
+/// encodes in the flags (`EF_AMDGPU_FEATURE_XNACK_ANY_V4` 0x100, `EF_AMDGPU_FEATURE_SRAMECC_ANY_V4` 0x400:
+/// the target ID `gfx942` without `:xnack`/`:sramecc` settings is "any" for both, what `llvm-mc` writes
+/// and what `llvm-readelf` prints as `gfx942, xnack, sramecc`). gfx11/gfx12 have neither feature.
 fn e_flags(arch: Arch) -> u32 {
-    // EF_AMDGPU_MACH_AMDGCN_*; gfx11/gfx12 have neither XNACK nor SRAMECC.
-    match arch { Arch::Gfx1100 => 0x41, Arch::Gfx1151 => 0x4a, Arch::Gfx1201 => 0x4e }
+    const MACH_GFX942: u32 = 0x4c;
+    const XNACK_ANY: u32 = 0x100;
+    const SRAMECC_ANY: u32 = 0x400;
+    match arch { Arch::Gfx1100 => 0x41, Arch::Gfx1151 => 0x4a, Arch::Gfx1201 => 0x4e, Arch::Gfx942 => MACH_GFX942 | XNACK_ANY | SRAMECC_ANY }
+}
+
+/// `EI_ABIVERSION` of an `ELFOSABI_AMDGPU_HSA` object: code object version 5 is 3, version 6 is 4.
+fn abi_version(code_object_version: u32) -> Result<u8, String> {
+    match code_object_version { 5 => Ok(3), 6 => Ok(4), v => Err(format!("code object version {v}: the native writer emits version 5 or 6")) }
 }
 
 #[derive(Default)]
@@ -91,8 +107,12 @@ fn shstr(name: &str) -> u32 {
     SHSTRTAB.windows(needle.len()).position(|w| w == needle.as_bytes()).expect("section name") as u32 + 1
 }
 
-/// Link `kernels` and the metadata blob into the code object `ld.lld -shared` writes.
-pub(crate) fn link(arch: Arch, kernels: &[Kernel], metadata: &[u8]) -> Result<Vec<u8>, String> {
+/// Link `kernels` and the metadata blob into the code object `ld.lld -shared` writes, at
+/// `code_object_version` 5 or 6 (the two differ only in `EI_ABIVERSION`; version 5 is gfx942-only,
+/// as the RDNA kernels are all version 6).
+pub(crate) fn link(arch: Arch, code_object_version: u32, kernels: &[Kernel], metadata: &[u8]) -> Result<Vec<u8>, String> {
+    let abi = abi_version(code_object_version)?;
+    if code_object_version == 5 && !arch.wave64() { return Err(format!("code object version 5 is emitted for gfx942 only, not {}", arch.name())) }
     if kernels.is_empty() { return Err("a code object needs at least one kernel".into()) }
     // .text: each kernel at the next 256-byte boundary, padded with `s_nop 0`.
     let mut text = Vec::new();
@@ -164,7 +184,7 @@ pub(crate) fn link(arch: Arch, kernels: &[Kernel], metadata: &[u8]) -> Result<Ve
 
     let mut out = Out::default();
     // ELF header.
-    out.0.extend([0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40, 4, 0, 0, 0, 0, 0, 0, 0]);
+    out.0.extend([0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40, abi, 0, 0, 0, 0, 0, 0, 0]);
     out.u16(3); out.u16(224); out.u32(1); out.u64(0); out.u64(EHDR); out.u64(shoff);
     out.u32(e_flags(arch)); out.u16(EHDR as u16); out.u16(PHDR as u16); out.u16(PHNUM as u16);
     out.u16(SHDR as u16); out.u16(14); out.u16(12);
@@ -283,5 +303,26 @@ mod tests {
         assert_eq!(segment_start(0xc80, 256), 0x1d00);
         assert_eq!(align_skew(0xc80, PAGE, 0x1d00), 0xd00);
         assert_eq!(segment_start(0x6f04, 8), 0x7f08);
+    }
+    fn one_kernel() -> Vec<Kernel> { vec![Kernel { symbol: "k".into(), code: vec![0, 0, 0x81, 0xbf], descriptor: [0; KD_SIZE] }] }
+    #[test]
+    fn gfx942_header_carries_the_abi_version_and_default_target_features() {
+        let v5 = link(Arch::Gfx942, 5, &one_kernel(), &[0x80]).unwrap();
+        let v6 = link(Arch::Gfx942, 6, &one_kernel(), &[0x80]).unwrap();
+        for (elf, abi) in [(&v5, 3), (&v6, 4)] {
+            assert_eq!(&elf[..9], &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40, abi]);
+            assert_eq!(u32::from_le_bytes(elf[48..52].try_into().unwrap()), 0x54c);
+        }
+        let mut flipped = v5.clone();
+        flipped[8] = 4;
+        assert_eq!(flipped, v6);
+    }
+    #[test]
+    fn rdna_header_is_unchanged_and_version_five_is_gfx942_only() {
+        let rdna = link(Arch::Gfx1100, 6, &one_kernel(), &[0x80]).unwrap();
+        assert_eq!(rdna[8], 4);
+        assert_eq!(u32::from_le_bytes(rdna[48..52].try_into().unwrap()), 0x41);
+        assert!(link(Arch::Gfx1100, 5, &one_kernel(), &[0x80]).is_err());
+        assert!(link(Arch::Gfx942, 4, &one_kernel(), &[0x80]).is_err());
     }
 }

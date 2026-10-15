@@ -300,10 +300,10 @@ fn placement_capacity_inputs(
     ctx: &LoadCtx,
     plan: &Qwen35KvPlan,
 ) -> Result<PlacementCapacity, String> {
+    // Capped sizing query (UMA-safe clamp, then the HIPFIRE_EMU cap).
     let free_vram = ctx
         .gpu
-        .hip
-        .get_vram_info()
+        .device_mem_info()
         .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
         .0 as u64;
     let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);

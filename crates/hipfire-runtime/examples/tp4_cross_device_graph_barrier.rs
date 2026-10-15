@@ -4,13 +4,25 @@
 
 //! Admission screen for cross-device signal dependencies captured into three
 //! or four independently instantiated graphs.
-//! independently instantiated graphs.
 //!
-//! Each replay delays and then writes fresh F32 values on every rank. The
-//! captured rank graphs record one event per producer, wait on all peer events,
-//! and rank zero sums three peer-visible tensors with graph-safe kernels.
-//! Repeated exact downloads prove that event nodes bind to the current graph
-//! replay rather than passing on a stale record from the prior replay.
+//! Phase 1 drives the production DS4 path: `Gpus::prepare_tp_graph_signals`
+//! (which allocates every rank's bounded-wait error block, outside capture),
+//! relaxed per-rank capture of `barrier_rank_streams_reuse` →
+//! `capture_tp_graph_barrier` (store + 4-argument wait2/wait3), then replays.
+//! Every replay must advance each rank's signal to the last epoch and leave
+//! every error block at 0. A forced case launches no graph on the last rank
+//! (it never signals): the other ranks' waits must stop at the 500 ms device
+//! deadline and `Gpus::take_device_wait_errors`, the check `ep.rs` runs after
+//! the DS4 TP graph sync, must report it. A recovery replay must pass.
+//!
+//! Phase 2 is the original screen. Each replay delays and then writes fresh
+//! F32 values on every rank. The captured rank graphs record one event per
+//! producer, wait on all peer events, and rank zero sums three peer-visible
+//! tensors with graph-safe kernels. Repeated exact downloads prove that event
+//! nodes bind to the current graph replay rather than passing on a stale
+//! record from the prior replay.
+//!
+//! `HIPFIRE_TP_GRAPH_RANKS` = 3 | 4 (default 4); `HIPFIRE_TP4_GRAPH_REPLAYS`.
 
 use hip_bridge::{DeviceBuffer, Graph, GraphExec};
 use hipfire_runtime::multi_gpu::Gpus;
@@ -25,6 +37,129 @@ struct CapturedRank {
     _blobs: Vec<Vec<u8>>,
 }
 
+/// Epochs captured per rank graph in phase 1.
+const EP_BARRIERS: usize = 4;
+/// Healthy-path replays in phase 1.
+const EP_REPLAYS: usize = 5;
+
+fn rank_stream(gpus: &Gpus, rank: usize) -> &hip_bridge::Stream {
+    gpus.devices[rank].active_stream.as_ref().expect("active stream")
+}
+
+/// Launch the captured graphs of `ranks` and synchronize those ranks.
+fn replay(gpus: &Gpus, ranks: &[usize]) -> f64 {
+    let t = std::time::Instant::now();
+    for &rank in ranks {
+        let gpu = &gpus.devices[rank];
+        gpu.bind_thread().expect("bind replay");
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, rank_stream(gpus, rank))
+            .expect("launch rank graph");
+    }
+    for &rank in ranks {
+        let gpu = &gpus.devices[rank];
+        gpu.bind_thread().expect("bind replay sync");
+        gpu.hip
+            .stream_synchronize(rank_stream(gpus, rank))
+            .expect("sync rank replay");
+    }
+    t.elapsed().as_secs_f64() * 1e3
+}
+
+/// Phase 1: the production capture path with bounded waits.
+fn ep_path_screen(gpus: &mut Gpus) {
+    let n = gpus.devices.len();
+    let all: Vec<usize> = (0..n).collect();
+    gpus.prepare_tp_graph_signals(EP_BARRIERS)
+        .expect("prepare TP graph signals (allocates every rank's wait-error block)");
+    gpus.begin_tp_graph_signal_capture().expect("rewind barrier cursor");
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().expect("bind capture begin");
+        let stream = gpu.active_stream.as_ref().expect("active stream");
+        gpu.graphs
+            .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream)
+            .expect("begin relaxed rank capture");
+    }
+    // No bounded-wait kernel has run yet: a missing block would fail closed here.
+    for _ in 0..EP_BARRIERS {
+        gpus.barrier_rank_streams_reuse()
+            .expect("capture_tp_graph_barrier under capture");
+    }
+    assert_eq!(gpus.tp_graph_captured_signal_count(), EP_BARRIERS);
+    for rank in 0..n {
+        let gpu = &mut gpus.devices[rank];
+        gpu.bind_thread().expect("bind capture end");
+        let stream = gpu.active_stream.as_ref().expect("active stream");
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, stream)
+            .expect("end rank capture");
+    }
+    println!("PASS ep_capture: TP{n} captured {EP_BARRIERS} barriers per rank (wait-error blocks preallocated)");
+
+    let expect_healthy = |gpus: &mut Gpus, what: &str, ms: f64| {
+        for (rank, gpu) in gpus.devices.iter().enumerate() {
+            if let Some(timeout) = gpu.take_device_wait_timeout() {
+                panic!("{what}: rank {rank} error block not 0: {timeout}");
+            }
+        }
+        gpus.take_device_wait_errors().expect("all-rank wait check");
+        let epochs = gpus.tp_graph_signal_epochs().expect("read signal epochs");
+        assert!(
+            epochs.iter().all(|&epoch| epoch == EP_BARRIERS as u32),
+            "{what}: signal epochs {epochs:?}, expected {EP_BARRIERS} on every rank"
+        );
+        println!("PASS {what}: {ms:.2} ms, epochs {epochs:?}, every rank's error block 0");
+    };
+
+    for index in 0..EP_REPLAYS {
+        gpus.reset_tp_graph_signals().expect("reset signals");
+        let ms = replay(gpus, &all);
+        expect_healthy(gpus, &format!("ep_replay_{index}"), ms);
+    }
+
+    // Forced: the last rank launches nothing, so it never signals epoch 1.
+    let skipped = n - 1;
+    let live: Vec<usize> = (0..skipped).collect();
+    gpus.reset_tp_graph_signals().expect("reset signals");
+    let ms = replay(gpus, &live);
+    let skipped_block = gpus.devices[skipped].take_device_wait_timeout();
+    assert!(skipped_block.is_none(), "skipped rank recorded {skipped_block:?}");
+    // Exactly what ep.rs does after the DS4 TP graph sync.
+    let reported = gpus
+        .take_device_wait_errors()
+        .map_err(|error| format!("ds4 TP{n} graph: {error}"));
+    let message = reported.expect_err("a rank that never signals must fail the step");
+    let kernel = if n == 3 {
+        "tp_graph_signal_wait2_gfx1201"
+    } else {
+        "tp_graph_signal_wait3_gfx1201"
+    };
+    assert!(
+        (400.0..1500.0).contains(&ms),
+        "forced skip: live ranks took {ms:.1} ms, expected ~500 ms"
+    );
+    for needle in [kernel, "epoch 1", "device wait timeout on GPU"] {
+        assert!(message.contains(needle), "forced skip report lacks {needle:?}: {message}");
+    }
+    let reports = message.matches("device wait timeout on GPU").count();
+    assert_eq!(reports, live.len(), "every live rank must report: {message}");
+    let epochs = gpus.tp_graph_signal_epochs().expect("read signal epochs");
+    assert!(
+        epochs.iter().all(|&epoch| epoch == 0),
+        "signals not re-zeroed after the timeout: {epochs:?}"
+    );
+    println!("PASS ep_forced_skip: rank {skipped} never signals; live ranks stopped in {ms:.1} ms; reported: {message}");
+
+    gpus.reset_tp_graph_signals().expect("reset signals");
+    let ms = replay(gpus, &all);
+    expect_healthy(gpus, "ep_recovery_replay", ms);
+
+    for gpu in &mut gpus.devices {
+        gpu.bind_thread().expect("bind graph drop");
+        gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
+    }
+}
 fn main() {
     let ranks = std::env::var("HIPFIRE_TP_GRAPH_RANKS")
         .ok()
@@ -58,6 +193,10 @@ fn main() {
         gpu.bind_thread().expect("bind stream owner");
         gpu.active_stream = Some(gpu.hip.stream_create().expect("create stream"));
     }
+
+    // Phase 1 runs before any bounded-wait kernel, so the error blocks can
+    // only exist because prepare_tp_graph_signals allocated them.
+    ep_path_screen(&mut gpus);
 
     let mut sources: Vec<GpuTensor> = Vec::with_capacity(ranks);
     let mut delays = Vec::with_capacity(ranks);

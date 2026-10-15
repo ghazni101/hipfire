@@ -5315,8 +5315,9 @@ pub fn forward_scratch_dense_tp(
         );
     }
 
-    // Opt-in gfx1100 TP2 whole-token graph (`HIPFIRE_TP_FULL_GRAPH=1`); the
-    // runtime owns capture/replay and the cross-rank signal protocol.
+    // TP2 whole-token graph on an exact gfx1201 pair (default) or gfx1100 pair
+    // (`HIPFIRE_TP_FULL_GRAPH=1`; `=0` off); the runtime owns capture/replay
+    // and the cross-rank signal protocol.
     let barriers = n_layers * 2;
     if gpus.tp2_whole_token_graph_ready(barriers) {
         let step = gpus.tp2_whole_token_graph_forward(barriers, |gpus| {

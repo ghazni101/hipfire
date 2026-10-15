@@ -315,7 +315,6 @@ pub struct Qwen4LayerScratch<'a> {
     pub gdn_gate: &'a GpuTensor,
     pub gdn_beta: &'a GpuTensor,
     pub gdn_recurrent_output: &'a GpuTensor,
-    pub gdn_bf16: &'a GpuTensor,
     pub gdn_z: &'a GpuTensor,
     pub gdn_output: &'a GpuTensor,
     pub qsa_index: &'a GpuTensor,
@@ -399,7 +398,6 @@ pub fn execute_final_hyper(
             low: &view(scratch.hc_low, 0, low),
             up: &view(scratch.hc_up, 0, wide),
             mixed: &view(scratch.hc_mixed, 0, hidden),
-            bf16_scratch: scratch.gdn_bf16,
             rows,
             branches: dims.hc_count,
             hidden: dims.hidden,
@@ -841,7 +839,10 @@ fn require_dense_weight(
 /// operation order.  The decode-vs-prefill route is decided on `route_rows`
 /// (`Gpu::route_rows(rows)`: the canonical chunk under the invariant prefill
 /// profile, so a one-row prefill still seals the grouped prefill call);
-/// `rows` sizes the call.
+/// `rows` sizes the call.  The one exception is the gfx942 qt=55 FP8 route
+/// ([`hipfire_dispatch::families::moe::MoeRouteCapability::Fp8B128Grouped`]): it has no indexed decode, so it
+/// always seals the grouped prefill call, one routing row included, over the
+/// same preallocated grouping scratch every other row count uses.
 pub fn seal_moe_for_layer<'a>(
     ctx: &'a hipfire_dispatch::context::DispatchCtx,
     dims: Qwen4ProgramDims,
@@ -852,7 +853,7 @@ pub fn seal_moe_for_layer<'a>(
 ) -> Result<hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>, DispatchError> {
     let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
-    if route_rows == 1 {
+    if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
         let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch)?;
         seal_decode(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 decode MoE: {error:?}")))
@@ -893,10 +894,11 @@ fn moe_dims(dims: Qwen4ProgramDims) -> Result<MoeDims, DispatchError> {
 
 /// Build the indexed decode descriptor for a single-token layer invocation.
 ///
-/// Rows-one execution deliberately keeps the old decode contract: one
-/// normalized activation, GEMV-sized scratch, and `seal_decode`'s exact
-/// indexed route.  Grouped prefill descriptors are built only for a real
-/// multi-row tile.
+/// Rows-one execution of a QT44/QT53 layer deliberately keeps the old decode
+/// contract: one normalized activation, GEMV-sized scratch, and
+/// `seal_decode`'s exact indexed route.  Grouped prefill descriptors are
+/// built for every multi-row tile and, for the qt=55 FP8 layer, for one row
+/// too ([`seal_moe_for_layer`] never calls this for it).
 fn build_moe_decode<'a>(
     dims: Qwen4ProgramDims,
     moe: Qwen4MoeBinding<'a>,

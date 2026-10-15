@@ -33,6 +33,8 @@ pub const TEXT_MODEL_TYPE: &str = "qwen4_exp_text";
 pub const ARCHITECTURE_NAME: &str = "Qwen4ExpForConditionalGeneration";
 /// Stable profile id of the pinned Qwen3.8-Flash-Next checkpoint.
 pub const FLASH_NEXT_PROFILE_ID: &str = "qwen3.8-flash-next";
+/// Stable profile id of the AR-only Flash-Next profile ([`Qwen4Profile::FlashNextArOnly`]).
+pub const FLASH_NEXT_AR_ONLY_PROFILE_ID: &str = "qwen3.8-flash-next-ar";
 /// Top-level JSON key of the explicit developer-profile marker.
 pub const PROFILE_KEY: &str = "hipfire_profile";
 /// Spelling current Transformers normalizes `full_attention` to.  It is an
@@ -242,6 +244,14 @@ pub struct Qwen4SyntheticProfile {
 pub enum Qwen4Profile {
     /// The pinned Qwen3.8-Flash-Next checkpoint (exact production pins).
     FlashNext,
+    /// The pinned Flash-Next geometry without the native MTP head: the
+    /// artifact carries no `mtp.*` tensors (the stock-FP8 recipe ships the
+    /// MTP experts as BF16 source and omits the head).  Never parsed from a
+    /// config: an artifact's recipe selects it through
+    /// [`Qwen4Config::into_ar_only`], so `config.mtp` is `None` and every MTP
+    /// entry point sees a head-free profile instead of a config that claims a
+    /// head the artifact does not carry.
+    FlashNextArOnly,
     /// Developer-only synthetic geometry with pinned HC/GDN/QSA equations.
     Synthetic(Qwen4SyntheticProfile),
 }
@@ -250,12 +260,19 @@ impl Qwen4Profile {
     pub fn id(&self) -> &str {
         match self {
             Self::FlashNext => FLASH_NEXT_PROFILE_ID,
+            Self::FlashNextArOnly => FLASH_NEXT_AR_ONLY_PROFILE_ID,
             Self::Synthetic(profile) => &profile.id,
         }
     }
 
+    /// The pinned Flash-Next geometry, with or without the MTP head.
     pub const fn is_flash_next(&self) -> bool {
-        matches!(self, Self::FlashNext)
+        matches!(self, Self::FlashNext | Self::FlashNextArOnly)
+    }
+
+    /// Flash-Next geometry admitted without the native MTP head.
+    pub const fn is_ar_only(&self) -> bool {
+        matches!(self, Self::FlashNextArOnly)
     }
 
     pub const fn is_synthetic(&self) -> bool {
@@ -269,7 +286,7 @@ impl Qwen4Profile {
 
     pub const fn equation_source(&self) -> Qwen4EquationSource {
         match self {
-            Self::FlashNext => Qwen4EquationSource::PinnedUpstream,
+            Self::FlashNext | Self::FlashNextArOnly => Qwen4EquationSource::PinnedUpstream,
             Self::Synthetic(profile) => profile.equation_source,
         }
     }
@@ -1015,10 +1032,38 @@ impl Qwen4Config {
         expect_str(&self.text_model_type, TEXT_MODEL_TYPE, "text_model_type")?;
         expect_eq(self.dtype, SourceDType::BF16, "dtype")?;
         match &self.profile {
-            Qwen4Profile::FlashNext => self.validate_flash_next()?,
+            Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
+                self.validate_flash_next()?
+            }
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
         }
         self.validate_typed_agreement()
+    }
+
+    /// The AR-only form of a validated Flash-Next config: the
+    /// [`Qwen4Profile::FlashNextArOnly`] profile with no MTP head (`mtp` and
+    /// its scalar mirrors cleared).  Selected by an artifact recipe that omits
+    /// the head (`Qwen4TierRecipe::StockFp8`), never by config contents, so a
+    /// head-free artifact is admitted as head-free instead of under a config
+    /// that names a head nothing loads.  Only Flash-Next converts.
+    pub fn into_ar_only(mut self) -> Result<Self, String> {
+        match self.profile {
+            Qwen4Profile::FlashNext => {}
+            Qwen4Profile::FlashNextArOnly => return Ok(self),
+            Qwen4Profile::Synthetic(_) => {
+                return Err(format!(
+                    "qwen4: profile {} has no AR-only form (only Flash-Next does)",
+                    self.profile.id()
+                ))
+            }
+        }
+        self.validate()?;
+        self.profile = Qwen4Profile::FlashNextArOnly;
+        self.mtp = None;
+        self.mtp_num_hidden_layers = 0;
+        self.mtp_use_dedicated_embeddings = false;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Exact pinned Qwen3.8-Flash-Next geometry.
@@ -1092,7 +1137,10 @@ impl Qwen4Config {
             ));
         }
         expect(self.tie_word_embeddings, false, "tie_word_embeddings")?;
-        expect(self.mtp_num_hidden_layers, 1, "mtp_num_hidden_layers")?;
+        // The AR-only profile carries no head, so its scalar mirror is 0
+        // ("0 when the head is absent"); the checkpoint profile pins one layer.
+        let mtp_layers = if self.profile.is_ar_only() { 0 } else { 1 };
+        expect(self.mtp_num_hidden_layers, mtp_layers, "mtp_num_hidden_layers")?;
         expect(
             self.mtp_use_dedicated_embeddings,
             false,
@@ -1134,6 +1182,12 @@ impl Qwen4Config {
         }
         if self.ple.as_ref() != Some(&Qwen4PleConfig::flash_next()) {
             return Err("qwen4: typed ple is not the pinned Flash-Next PLE".into());
+        }
+        if self.profile.is_ar_only() {
+            return match self.mtp {
+                None => Ok(()),
+                Some(_) => Err("qwen4: the AR-only Flash-Next profile carries no MTP head".into()),
+            };
         }
         self.mtp
             .as_ref()
@@ -1627,8 +1681,10 @@ impl Qwen4Config {
     }
 
     /// Bytes of one QSA layer's context-sized storage, including its
-    /// optional derived F16 arena (four-token-rounded capacity). The MTP
-    /// head passes its plain F32 format and never owns the derived arena.
+    /// optional derived F16 arena (four-token-rounded capacity) and pooled
+    /// BF16 mirror (`ceil(max_seq / compress)` blocks of `index_dim` BF16
+    /// channels). The MTP head passes its plain F32 format and never owns a
+    /// derived arena.
     pub fn qsa_context_arena_bytes(
         &self,
         max_seq: usize,
@@ -1643,6 +1699,7 @@ impl Qwen4Config {
         max_seq
             .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
             .checked_add(pooled_rows.checked_mul(index_row)?)?
+            .checked_add(pooled_rows.checked_mul(layout.pooled_bf16_bytes_per_block(raw))?)?
             .checked_add(if layout.f16_arena {
                 max_seq.div_ceil(4).checked_mul(4)?
                     .checked_mul(self.num_key_value_heads)?
@@ -2202,9 +2259,11 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
             "qwen4: profile id {id:?} must be 1..={MAX_PROFILE_ID_LEN} characters of [A-Za-z0-9._-]"
         ));
     }
-    if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID) {
+    if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID)
+        || id.eq_ignore_ascii_case(FLASH_NEXT_AR_ONLY_PROFILE_ID)
+    {
         return Err(format!(
-            "qwen4: profile id {id:?} is reserved for the pinned Flash-Next profile"
+            "qwen4: profile id {id:?} is reserved for the pinned Flash-Next profiles"
         ));
     }
     Ok(())
@@ -2637,6 +2696,40 @@ fn expect_float(actual: f64, wanted: f64, field: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The AR-only profile is derived, never parsed: Flash-Next converts (the
+    /// MTP head and its scalar mirrors cleared, geometry unchanged), it
+    /// validates only head-free, its id is reserved, and a synthetic profile
+    /// has no AR-only form.
+    #[test]
+    fn ar_only_profile_is_flash_next_without_mtp() {
+        let flash = compact_test_config();
+        let ar = flash.clone().into_ar_only().expect("Flash-Next has an AR-only form");
+        assert_eq!(ar.profile, Qwen4Profile::FlashNextArOnly);
+        assert_eq!(ar.profile.id(), FLASH_NEXT_AR_ONLY_PROFILE_ID);
+        assert!(ar.profile.is_flash_next() && ar.profile.is_ar_only());
+        assert!(!ar.profile.developer_only());
+        assert!(ar.mtp.is_none());
+        assert_eq!(ar.mtp_num_hidden_layers, 0);
+        assert_eq!((ar.hidden_size, ar.num_experts), (flash.hidden_size, flash.num_experts));
+        assert_eq!(ar.ple, flash.ple);
+        ar.validate().expect("AR-only validates");
+        assert_eq!(ar.clone().into_ar_only().unwrap(), ar);
+        // A head bolted back on (or the mirror alone) is refused.
+        let mut headed = ar.clone();
+        headed.mtp = flash.mtp.clone();
+        headed.mtp_num_hidden_layers = 1;
+        assert!(headed.validate().is_err());
+        let mut mirror = ar.clone();
+        mirror.mtp_num_hidden_layers = 1;
+        assert!(mirror.validate().is_err());
+        // The checkpoint profile still requires its head.
+        let mut headless = flash.clone();
+        headless.mtp = None;
+        headless.mtp_num_hidden_layers = 0;
+        assert!(headless.validate().is_err());
+        assert!(validate_profile_id(FLASH_NEXT_AR_ONLY_PROFILE_ID).is_err());
+    }
 
     fn fixture() -> Value {
         let layers: Vec<_> = (0..48)

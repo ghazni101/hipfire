@@ -845,7 +845,12 @@ fn tt_body_ids(tok: &Tokenizer, text: &str, canonical: bool) -> Result<Vec<u32>,
 
 fn tt_filler(prefix: &str, lines: usize) -> String {
     (0..lines)
-        .map(|i| format!("{prefix}_{i}: fn handler_{i}(input: u32) -> u32 {{ input.wrapping_mul({}) }}", i + 3))
+        .map(|i| {
+            format!(
+                "{prefix}_{i}: fn handler_{i}(input: u32) -> u32 {{ input.wrapping_mul({}) }}",
+                i + 3
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -978,7 +983,11 @@ fn simulate_qwen_tool_turns(
         let lcp_wholebody = lcp(&consumed, &whole);
         rows.push(ToolTurnRow {
             thinking: if thinking { "on" } else { "off" },
-            tok: if canonical { "canonical" } else { "noncanonical" },
+            tok: if canonical {
+                "canonical"
+            } else {
+                "noncanonical"
+            },
             request: k + 2,
             prior_len: consumed.len(),
             lcp_plain,
@@ -993,9 +1002,11 @@ fn simulate_qwen_tool_turns(
 }
 
 fn run_qwen_tool_turns(meta_path: &Path) -> Result<Vec<ToolTurnRow>, String> {
-    let json = std::fs::read_to_string(meta_path).map_err(|e| format!("read {meta_path:?}: {e}"))?;
+    let json =
+        std::fs::read_to_string(meta_path).map_err(|e| format!("read {meta_path:?}: {e}"))?;
     let tok = Tokenizer::from_hfq_metadata(&json).map_err(|e| format!("tokenizer: {e:?}"))?;
-    let meta: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("metadata json: {e}"))?;
+    let meta: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("metadata json: {e}"))?;
     let template = meta["tokenizer_config"]["chat_template"]
         .as_str()
         .ok_or("metadata has no tokenizer_config.chat_template string")?;
@@ -1021,7 +1032,9 @@ fn run_qwen_tool_turns(meta_path: &Path) -> Result<Vec<ToolTurnRow>, String> {
     let mut rows = Vec::new();
     for thinking in [false, true] {
         for canonical in [true, false] {
-            rows.extend(simulate_qwen_tool_turns(&tok, template, thinking, canonical, &tools)?);
+            rows.extend(simulate_qwen_tool_turns(
+                &tok, template, thinking, canonical, &tools,
+            )?);
         }
     }
     Ok(rows)
@@ -1060,7 +1073,9 @@ fn main() {
                     println!("oracle_result=PASS");
                     std::process::exit(0);
                 }
-                eprintln!("{failing} WholeBody row(s) are not a strict extension of the consumed stream");
+                eprintln!(
+                    "{failing} WholeBody row(s) are not a strict extension of the consumed stream"
+                );
                 println!("oracle_result=FAIL");
                 std::process::exit(1);
             }

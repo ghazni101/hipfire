@@ -289,20 +289,24 @@ fn qwen4_trunk_target(name: &str, shape: &[usize], requested: DType, trunk_tier:
 }
 
 /// Metadata key naming the recipe a developer artifact was written under.
-/// A Flash-Next artifact's key predates the typed recipe and carries no `id`;
-/// only a synthetic profile reads or requires one.
+/// A Flash-Next artifact's key predates the typed recipe and carries no `id`,
+/// except the stock-FP8 artifact ([`STOCK_FP8_RECIPE_ID`]), which a Flash-Next
+/// config may declare; a synthetic profile reads or requires one.
 pub const RECIPE_METADATA_KEY: &str = "qwen4_recipe";
 /// `id` of [`Qwen4TierRecipe::SyntheticSourceBf16`] in artifact metadata.
 pub const SYNTHETIC_SOURCE_BF16_RECIPE_ID: &str = "synthetic-source-bf16";
 /// `id` of [`Qwen4TierRecipe::SyntheticPacked`] in artifact metadata.
 pub const SYNTHETIC_PACKED_RECIPE_ID: &str = "synthetic-packed";
+/// `id` of [`Qwen4TierRecipe::StockFp8`] in artifact metadata (written by
+/// `hipfire-quantize --recipe stock-fp8`).
+pub const STOCK_FP8_RECIPE_ID: &str = "stock-fp8";
 
 impl Qwen4TierRecipe {
     /// Stable artifact-metadata id of a synthetic recipe; `None` for the
-    /// Flash-Next recipe, which is never selected by metadata.
+    /// Flash-Next recipes.
     pub const fn synthetic_id(&self) -> Option<&'static str> {
         match self {
-            Self::FlashNextPacked { .. } => None,
+            Self::FlashNextPacked { .. } | Self::StockFp8 => None,
             Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
             Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
         }
@@ -315,6 +319,35 @@ impl Qwen4TierRecipe {
             SYNTHETIC_PACKED_RECIPE_ID => Some(Self::SyntheticPacked),
             _ => None,
         }
+    }
+
+    /// The Flash-Next recipe an artifact-metadata `id` names (only
+    /// [`STOCK_FP8_RECIPE_ID`]; the packed recipe carries no id).
+    pub fn from_flash_next_id(id: &str) -> Option<Self> {
+        match id {
+            STOCK_FP8_RECIPE_ID => Some(Self::StockFp8),
+            _ => None,
+        }
+    }
+
+    /// The stock-FP8 recipe ([`Self::StockFp8`]).
+    pub const fn is_stock_fp8(&self) -> bool {
+        matches!(self, Self::StockFp8)
+    }
+
+    /// Whether the Flash-Next trunk (every trunk/head/HC/shared-expert/router/
+    /// embedding matrix) is source BF16 (qt=16) loaded raw — the
+    /// `HIPFIRE_CALIB_BF16` behaviour as a recipe property: the forward keeps
+    /// BF16 reads and builds no Q8 decode copies.  True for [`Self::StockFp8`]
+    /// only (a synthetic profile never takes the Flash-Next decode recipe).
+    pub const fn trunk_raw_bf16(&self) -> bool {
+        self.is_stock_fp8()
+    }
+
+    /// Whether the routed experts are qt=55 `FP8E4M3B128` tables, which only
+    /// a device with `Qwen4Capabilities::fp8_experts` (gfx942) may load.
+    pub const fn fp8_experts(&self) -> bool {
+        self.is_stock_fp8()
     }
 }
 
@@ -571,6 +604,15 @@ pub enum Qwen4TierRecipe {
     /// Q8 embedding, MQ6 head, Q8F16 PLE rows.  `trunk_tier` and `mtp_source`
     /// are the two producer/loader-shared knobs, resolved once.
     FlashNextPacked { trunk_tier: DType, mtp_source: bool },
+    /// The stock FP8 checkpoint (rev `236dfdf2`) converted byte-for-byte:
+    /// routed experts qt=55 `FP8E4M3B128` (OCP e4m3 codes + BF16 `s_inv`
+    /// 128x128 blocks, gate_up `[E, 1280, 2560]`, down `[E, 2560, 640]`),
+    /// every other tensor source BF16 (qt=16) loaded raw, PLE rows qt=56
+    /// `FP8E4M3PT`.  AR-only: the artifact carries no MTP head, so it is
+    /// declared for [`crate::config::Qwen4Profile::FlashNextArOnly`] only.
+    /// Selected by `qwen4_recipe.id = "stock-fp8"`; no environment knob
+    /// moves it.
+    StockFp8,
     /// Developer-only synthetic profiles stay conservative: every tensor is
     /// declared source-exact BF16 (and BF16 external PLE rows) until a role
     /// format has an executable consumer, a producer and a proof.  No
@@ -625,11 +667,14 @@ impl Qwen4Manifest {
     /// The declaration both the producer and the loader read.
     ///
     /// Flash-Next takes its packed tier from `HIPFIRE_QWEN4_TRUNK_TIER`; the
-    /// source-tier experiment affects only rank-2 MTP records.  A synthetic
-    /// developer profile ignores both knobs and declares
-    /// [`Qwen4TierRecipe::SyntheticSourceBf16`].
+    /// source-tier experiment affects only rank-2 MTP records.  The AR-only
+    /// Flash-Next profile has exactly one recipe,
+    /// [`Qwen4TierRecipe::StockFp8`].  A synthetic developer profile ignores
+    /// both knobs and declares [`Qwen4TierRecipe::SyntheticSourceBf16`].
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
-        let tier = if config.profile.is_flash_next() {
+        let tier = if config.profile.is_ar_only() {
+            Qwen4TierRecipe::StockFp8
+        } else if config.profile.is_flash_next() {
             Qwen4TierRecipe::FlashNextPacked {
                 trunk_tier: qwen4_trunk_tier(
                     hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_TIER")
@@ -670,17 +715,37 @@ impl Qwen4Manifest {
                 trunk_tier,
                 mtp_source,
             } => (true, *trunk_tier, *mtp_source),
-            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
-                (false, DType::BF16, false)
-            }
+            Qwen4TierRecipe::StockFp8
+            | Qwen4TierRecipe::SyntheticSourceBf16
+            | Qwen4TierRecipe::SyntheticPacked => (false, DType::BF16, false),
         };
         let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
-        if packed != config.profile.is_flash_next() {
+        let stock_fp8 = recipe.is_stock_fp8();
+        let profile_admits_recipe = match &recipe {
+            Qwen4TierRecipe::FlashNextPacked { .. } => {
+                matches!(config.profile, Qwen4Profile::FlashNext)
+            }
+            Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                config.profile.is_synthetic()
+            }
+        };
+        if !profile_admits_recipe {
             return Err(WeightError::UnsupportedProfile {
                 profile: config.profile.id().to_string(),
                 reason: format!("profile cannot be declared under the {recipe:?} recipe"),
             });
         }
+        // The unpacked recipes declare one exact representation per tensor.
+        let unpacked_dtype = |name: &str, shape: &[usize]| {
+            if stock_fp8 {
+                stock_fp8_dtype(name, shape)
+            } else if synthetic_packed {
+                synthetic_packed_decision(name, shape).dtype
+            } else {
+                DType::BF16
+            }
+        };
         let bf16 = DTypeConstraint::source_exact(DType::BF16);
         // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
         // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
@@ -698,11 +763,7 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
-                let dtype = if synthetic_packed {
-                    synthetic_packed_decision(name, &shape).dtype
-                } else {
-                    DType::BF16
-                };
+                let dtype = unpacked_dtype(name, &shape);
                 return WeightEntry::model_with_dtype_constraint(
                     name,
                     shape,
@@ -732,11 +793,7 @@ impl Qwen4Manifest {
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
             if !packed {
-                let dtype = if synthetic_packed {
-                    synthetic_packed_decision(name, &shape).dtype
-                } else {
-                    DType::BF16
-                };
+                let dtype = unpacked_dtype(name, &shape);
                 return WeightEntry::layer_with_dtype_constraint(
                     name,
                     layer_idx,
@@ -1059,6 +1116,7 @@ impl Qwen4Manifest {
                         ple,
                         packed,
                         synthetic_packed,
+                        stock_fp8,
                         &bf16,
                     );
                 }
@@ -1273,6 +1331,13 @@ impl Qwen4Manifest {
     /// unchanged, and a manifest that is never passed through here (ep = 1)
     /// stays byte-identical to the single-device declaration.
     pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
+        if self.identity.recipe.is_stock_fp8() {
+            return Err(WeightError::EpPlacement(format!(
+                "the stock-FP8 recipe loads every routed expert fully resident on one device \
+                 (P1); expert parallelism (rank {} of {}) is refused",
+                ep.rank, ep.ranks
+            )));
+        }
         if ep.ranks < 2 || ep.rank >= ep.ranks {
             return Err(WeightError::EpPlacement(format!(
                 "rank {} of {} is not an expert-parallel placement",
@@ -1657,8 +1722,9 @@ where
 /// the Flash-Next values are that config's canonical instance, not constants
 /// here.  `packed` is the Flash-Next recipe: it ships Q8F16 rows and still
 /// admits BF16 ones.  `synthetic_packed` ships exactly the one tier the row
-/// width allows ([`synthetic_packed_ple_row_dtype`]); any other synthetic recipe
-/// ships and admits BF16 rows only.
+/// width allows ([`synthetic_packed_ple_row_dtype`]); `stock_fp8` ships and
+/// admits qt=56 `FP8E4M3PT` rows only; any other synthetic recipe ships and
+/// admits BF16 rows only.
 fn push_ple_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
@@ -1669,6 +1735,7 @@ fn push_ple_entries<F>(
     config: &Qwen4PleConfig,
     packed: bool,
     synthetic_packed: bool,
+    stock_fp8: bool,
     bf16: &DTypeConstraint,
 ) where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
@@ -1726,7 +1793,13 @@ fn push_ple_entries<F>(
     // sealed artifact written before the Q8F16 tier carries BF16 rows and must
     // stay loadable, so both tiers are admitted and the reader derives its page
     // and read geometry from whichever one the shard declares.
-    let (ple_rows, row_dtype, encoding) = if packed {
+    let (ple_rows, row_dtype, encoding) = if stock_fp8 {
+        (
+            DTypeConstraint::source_exact(DType::FP8E4M3PT),
+            DType::FP8E4M3PT,
+            RowEncoding::Fp8PerTensor,
+        )
+    } else if packed {
         (
             DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]),
             DType::Q8_0,
@@ -1929,6 +2002,123 @@ impl Qwen4EpPlacement {
     }
 }
 
+/// Device view of one resident stacked qt=55 `FP8E4M3B128` routed-expert
+/// matrix `[experts, rows, k]` (the stock-FP8 recipe's gate_up `[512, 1280,
+/// 2560]` — rows 0..640 gate_proj, 640..1280 up_proj — and down `[512, 2560,
+/// 640]`).  Expert `e`'s block starts at `base + e * stride`
+/// (`stride = S(R, K) = round_up(R*K + 2*ceil(R/128)*ceil(K/128), 256)`,
+/// [`rdna_compute::fp8_e4m3::b128_block_stride`]): its OCP e4m3fn codes
+/// `u8[R*K]` row-major at `+0`, its BF16 `s_inv` grid
+/// `[ceil(R/128) * ceil(K/128)]` row-major at `+R*K`.  Addresses are device
+/// pointers as `usize` (the `MoePointerEntries` convention).  Built only from
+/// a fully resident (not host-mapped), 256-byte-aligned buffer that holds
+/// every block, so every derived pointer is in bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8B128ExpertTable {
+    /// Device address of expert 0's block (its codes).
+    pub base: usize,
+    pub experts: usize,
+    /// Rows `R` of one expert's matrix (output features).
+    pub rows: usize,
+    /// Reduction width `K` of one row.
+    pub k: usize,
+    /// Expert block stride `S(R, K)` in bytes.
+    pub stride: usize,
+}
+
+impl Fp8B128ExpertTable {
+    /// Validate `tensor` (the resident handle of manifest entry `name`) as a
+    /// stacked qt=55 table and describe it.
+    pub fn from_tensor(name: &str, tensor: &GpuTensor) -> Result<Self, WeightError> {
+        let refuse = |reason: String| {
+            WeightError::DescriptorMismatch(format!("{name}: FP8E4M3B128 expert table: {reason}"))
+        };
+        if tensor.dtype != DType::FP8E4M3B128 {
+            return Err(refuse(format!("resident dtype is {:?}", tensor.dtype)));
+        }
+        let [experts, rows, k] = tensor.shape[..] else {
+            return Err(refuse(format!("shape {:?} is not [experts, rows, K]", tensor.shape)));
+        };
+        if experts == 0 || rows == 0 || k == 0 {
+            return Err(refuse(format!("shape {:?} has a zero dimension", tensor.shape)));
+        }
+        let stride = rdna_compute::fp8_e4m3::b128_block_stride(rows, k)
+            .ok_or_else(|| refuse("block stride overflows".to_string()))?;
+        let bytes = rdna_compute::fp8_e4m3::b128_tensor_bytes(experts, rows, k)
+            .ok_or_else(|| refuse("payload size overflows".to_string()))?;
+        if tensor.buf.size() < bytes {
+            return Err(refuse(format!(
+                "buffer holds {} bytes, {experts} blocks of {stride} need {bytes}",
+                tensor.buf.size()
+            )));
+        }
+        if tensor.buf.is_host_mapped() {
+            return Err(refuse(
+                "it is host-mapped; the stock-FP8 recipe requires every routed expert fully \
+                 resident in device memory (P1)"
+                    .to_string(),
+            ));
+        }
+        let base = tensor.buf.as_ptr() as usize;
+        if base % rdna_compute::fp8_e4m3::B128_ALIGN != 0 {
+            return Err(refuse(format!(
+                "base 0x{base:x} is not {}-byte aligned",
+                rdna_compute::fp8_e4m3::B128_ALIGN
+            )));
+        }
+        Ok(Self {
+            base,
+            experts,
+            rows,
+            k,
+            stride,
+        })
+    }
+
+    /// Device address of expert `expert`'s block — its codes (`base + e*S`);
+    /// `None` past the last expert.
+    pub fn block_ptr(&self, expert: usize) -> Option<usize> {
+        (expert < self.experts).then(|| self.base + expert * self.stride)
+    }
+
+    /// Device address of expert `expert`'s codes (same as [`Self::block_ptr`]).
+    pub fn codes_ptr(&self, expert: usize) -> Option<usize> {
+        self.block_ptr(expert)
+    }
+
+    /// Device address of expert `expert`'s BF16 `s_inv` grid (`block + R*K`).
+    pub fn scales_ptr(&self, expert: usize) -> Option<usize> {
+        Some(self.block_ptr(expert)? + self.scales_offset())
+    }
+
+    /// Byte offset of the scale grid inside one block (`R * K`).
+    pub fn scales_offset(&self) -> usize {
+        self.rows * self.k
+    }
+
+    /// `(ceil(R/128), ceil(K/128))`: the row-major `s_inv` grid of one block.
+    pub fn scale_grid(&self) -> (usize, usize) {
+        rdna_compute::fp8_e4m3::b128_scale_dims(self.rows, self.k)
+    }
+
+    /// Every expert's block address in expert order: the per-expert pointer
+    /// table a grouped launch uploads (codes at `+0`, scales at `+R*K`).
+    pub fn block_entries(&self) -> Vec<usize> {
+        (0..self.experts)
+            .map(|expert| self.base + expert * self.stride)
+            .collect()
+    }
+}
+
+/// The two qt=55 routed-expert tables of one MoE layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fp8MoeExpertTables {
+    /// `[E, 2*intermediate, hidden]`: gate rows first, then up rows.
+    pub gate_up: Fp8B128ExpertTable,
+    /// `[E, hidden, intermediate]`.
+    pub down: Fp8B128ExpertTable,
+}
+
 /// Published resident ownership.  External PLE descriptors remain in the
 /// attached transaction census; no fake handle is stored here.
 pub struct Qwen4Weights {
@@ -1979,6 +2169,35 @@ impl Qwen4Weights {
             });
         }
         let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
+        if recipe.is_stock_fp8() {
+            // Checked before anything is taken, so a refusal leaves every
+            // handle with the transaction for its normal rollback.
+            if let Some(ep) = ep {
+                return Err(WeightError::EpPlacement(format!(
+                    "the stock-FP8 recipe loads every routed expert on one device (P1); \
+                     expert-parallel rank {} of {} is refused",
+                    ep.rank, ep.ranks
+                )));
+            }
+            for entry in manifest
+                .weights
+                .iter()
+                .filter(|entry| is_routed_expert_tensor(&entry.name))
+            {
+                match tx.get(&entry.name, entry.layer, 0) {
+                    Some(WeightHandle::Resident(tensor)) => {
+                        Fp8B128ExpertTable::from_tensor(&entry.name, tensor)?;
+                    }
+                    _ => {
+                        return Err(WeightError::MissingResident {
+                            name: entry.name.clone(),
+                            layer: entry.layer,
+                            device: 0,
+                        })
+                    }
+                }
+            }
+        }
         let mut assembly = tx.begin_assembly();
         for placement in placements {
             if assembly
@@ -2066,6 +2285,26 @@ impl Qwen4Weights {
                 self.resident_named(&source, layer, device, depth + 1)
             }
         }
+    }
+
+    /// The resident qt=55 table behind a routed-expert reference
+    /// (`MoeWeights::experts_gate_up` / `experts_down`) of a stock-FP8 load.
+    pub fn fp8_expert_table(
+        &self,
+        reference: &TensorRef,
+    ) -> Result<Fp8B128ExpertTable, WeightError> {
+        Fp8B128ExpertTable::from_tensor(&reference.name, self.resident(reference)?)
+    }
+
+    /// Both qt=55 tables of one MoE layer of a stock-FP8 load.
+    pub fn fp8_moe_expert_tables(
+        &self,
+        moe: &MoeWeights,
+    ) -> Result<Fp8MoeExpertTables, WeightError> {
+        Ok(Fp8MoeExpertTables {
+            gate_up: self.fp8_expert_table(&moe.experts_gate_up)?,
+            down: self.fp8_expert_table(&moe.experts_down)?,
+        })
     }
 
     pub fn external_descriptor<'a>(
@@ -2678,6 +2917,7 @@ fn build_ple_refs(
 /// `artifact` independently of this executor admission.
 ///
 /// * Flash-Next: the pinned shared-expert MoE with PLE and the native MTP head.
+/// * AR-only Flash-Next: the same, with no MTP head (the stock-FP8 recipe).
 /// * Synthetic developer profiles: only under `cfg(test)` or the
 ///   `qwen4-dev-profiles` feature, and only a dense FFN (PLE and MTP optional
 ///   at this layer).  A synthetic MoE has no sealed route (see
@@ -2688,7 +2928,7 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
         reason: reason.to_string(),
     };
     match &config.profile {
-        Qwen4Profile::FlashNext => {
+        Qwen4Profile::FlashNext | Qwen4Profile::FlashNextArOnly => {
             if !matches!(
                 &config.ffn,
                 Qwen4FfnConfig::Moe {
@@ -2703,12 +2943,15 @@ pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), Weigh
             if config.ple.is_none() {
                 return Err(unsupported("the Qwen4 executor requires PLE"));
             }
-            if config.mtp.is_none() {
-                return Err(unsupported(
+            match (config.profile.is_ar_only(), config.mtp.is_some()) {
+                (false, false) => Err(unsupported(
                     "the Qwen4 executor requires the native MTP head",
-                ));
+                )),
+                (true, true) => Err(unsupported(
+                    "the AR-only Flash-Next profile carries no MTP head",
+                )),
+                _ => Ok(()),
             }
-            Ok(())
         }
         Qwen4Profile::Synthetic(_) => admit_synthetic_profile(config),
     }
@@ -2730,6 +2973,19 @@ fn assembly_manifest(
 /// shards.
 fn is_routed_expert_tensor(name: &str) -> bool {
     name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+}
+
+/// What [`Qwen4TierRecipe::StockFp8`] declares for one tensor: qt=55
+/// `FP8E4M3B128` for the stacked routed experts, qt=56 `FP8E4M3PT` for the
+/// PLE n-gram shards, source BF16 for everything else.
+fn stock_fp8_dtype(name: &str, shape: &[usize]) -> DType {
+    if shape.len() == 3 && is_routed_expert_tensor(name) {
+        DType::FP8E4M3B128
+    } else if is_ple_shard_name(name) {
+        DType::FP8E4M3PT
+    } else {
+        DType::BF16
+    }
 }
 
 /// The expert-parallel placement recorded in a transaction's projection
@@ -3040,6 +3296,158 @@ impl std::error::Error for WeightError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock-FP8 declaration: qt=55 routed experts, qt=56 external PLE
+    /// rows (160-byte rows), source BF16 for everything else, no MTP tensor;
+    /// declared for the AR-only profile only, and the AR-only profile builds
+    /// it by default.
+    #[test]
+    fn stock_fp8_manifest_declares_fp8_experts_ple_and_bf16_trunk() {
+        let ar_only = pinned_config().into_ar_only().unwrap();
+        let manifest = Qwen4Manifest::build_with_recipe(&ar_only, Qwen4TierRecipe::StockFp8)
+            .expect("stock-FP8 manifest");
+        assert_eq!(Qwen4Manifest::build(&ar_only).unwrap(), manifest);
+        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::StockFp8);
+        assert!(manifest.identity.recipe.trunk_raw_bf16());
+        assert!(manifest.identity.recipe.fp8_experts());
+        let (mut experts, mut shards) = (0, 0);
+        for entry in &manifest.weights {
+            assert!(!entry.name.starts_with("mtp."), "{}", entry.name);
+            let want = if is_routed_expert_tensor(&entry.name) {
+                experts += 1;
+                DType::FP8E4M3B128
+            } else if is_ple_shard_name(&entry.name) {
+                shards += 1;
+                assert_eq!(
+                    entry.residency,
+                    WeightResidency::external_rows(160, ar_only.ple.as_ref().unwrap().shard_valid_rows(
+                        entry.name
+                            .rsplit("shard_")
+                            .next()
+                            .and_then(|tail| tail.strip_suffix(".weight"))
+                            .and_then(|index| index.parse().ok())
+                            .unwrap()
+                    ))
+                );
+                DType::FP8E4M3PT
+            } else {
+                DType::BF16
+            };
+            assert_eq!(entry.dtype, want, "{}", entry.name);
+            assert_eq!(entry.dtype_constraint, DTypeConstraint::source_exact(want), "{}", entry.name);
+        }
+        assert_eq!(experts, 2 * 48);
+        assert_eq!(shards, PLE_SHARD_COUNT);
+        let gate_up = manifest
+            .entry("model.language_model.layers.0.mlp.experts.gate_up_proj", Some(0))
+            .unwrap();
+        assert_eq!(gate_up.logical_shape, vec![512, 1280, 2560]);
+        let down = manifest
+            .entry("model.language_model.layers.0.mlp.experts.down_proj", Some(0))
+            .unwrap();
+        assert_eq!(down.logical_shape, vec![512, 2560, 640]);
+
+        // Recipe and profile must agree both ways.
+        let flash = pinned_config();
+        assert!(matches!(
+            Qwen4Manifest::build_with_recipe(&flash, Qwen4TierRecipe::StockFp8),
+            Err(WeightError::UnsupportedProfile { .. })
+        ));
+        assert!(matches!(
+            Qwen4Manifest::build_with_recipe(
+                &ar_only,
+                Qwen4TierRecipe::FlashNextPacked {
+                    trunk_tier: DType::Q8_0,
+                    mtp_source: false
+                }
+            ),
+            Err(WeightError::UnsupportedProfile { .. })
+        ));
+        // P1: no expert parallelism for the stock-FP8 recipe.
+        let error = manifest
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .unwrap_err();
+        assert!(error.to_string().contains("stock-FP8"), "{error}");
+        assert_eq!(
+            Qwen4TierRecipe::from_flash_next_id(STOCK_FP8_RECIPE_ID),
+            Some(Qwen4TierRecipe::StockFp8)
+        );
+        assert_eq!(Qwen4TierRecipe::StockFp8.synthetic_id(), None);
+        assert_eq!(Qwen4TierRecipe::from_synthetic_id(STOCK_FP8_RECIPE_ID), None);
+    }
+
+    /// The AR-only profile is head-free everywhere an MTP entry point looks:
+    /// the executor admits it without a head and refuses one bolted on.
+    #[test]
+    fn ar_only_profile_is_executable_without_mtp() {
+        let ar_only = pinned_config().into_ar_only().unwrap();
+        assert!(ar_only.mtp.is_none());
+        admit_executable_profile(&ar_only).expect("AR-only Flash-Next is executable");
+        let mut headed = ar_only.clone();
+        headed.mtp = pinned_config().mtp;
+        assert!(admit_executable_profile(&headed).is_err());
+        assert!(admit_executable_profile(&pinned_config()).is_ok());
+    }
+
+    /// A fake device address (never dereferenced) for table-geometry tests.
+    fn fake_tensor(base: usize, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: a borrowed (non-owning) wrapper the test never reads,
+            // writes or frees; `from_tensor` only does address arithmetic.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes) },
+            shape,
+            dtype,
+        }
+    }
+
+    /// The qt=55 accessor: block/codes/scales addresses follow
+    /// `base + e*S(R,K)` and `+R*K`; a wrong dtype/shape, a short or
+    /// misaligned buffer is refused.
+    #[test]
+    fn fp8_expert_table_addresses_follow_the_contract_stride() {
+        let base = 0x7f00_0000_0000usize;
+        let bytes = 512 * 3_277_312;
+        let gate_up = Fp8B128ExpertTable::from_tensor(
+            "gate_up",
+            &fake_tensor(base, bytes, vec![512, 1280, 2560], DType::FP8E4M3B128),
+        )
+        .unwrap();
+        assert_eq!(
+            gate_up,
+            Fp8B128ExpertTable {
+                base,
+                experts: 512,
+                rows: 1280,
+                k: 2560,
+                stride: 3_277_312
+            }
+        );
+        assert_eq!(gate_up.block_ptr(0), Some(base));
+        assert_eq!(gate_up.codes_ptr(7), Some(base + 7 * 3_277_312));
+        assert_eq!(gate_up.scales_offset(), 1280 * 2560);
+        assert_eq!(gate_up.scales_ptr(511), Some(base + 511 * 3_277_312 + 1280 * 2560));
+        assert_eq!(gate_up.block_ptr(512), None);
+        assert_eq!(gate_up.scale_grid(), (10, 20));
+        let entries = gate_up.block_entries();
+        assert_eq!(entries.len(), 512);
+        assert_eq!(entries[300], base + 300 * 3_277_312);
+        let down = Fp8B128ExpertTable::from_tensor(
+            "down",
+            &fake_tensor(base, 512 * 1_638_656, vec![512, 2560, 640], DType::FP8E4M3B128),
+        )
+        .unwrap();
+        assert_eq!((down.stride, down.scale_grid()), (1_638_656, (20, 5)));
+
+        for (tensor, needle) in [
+            (fake_tensor(base, bytes, vec![512, 1280, 2560], DType::MQ4G256V2), "dtype"),
+            (fake_tensor(base, bytes, vec![655_360, 2560], DType::FP8E4M3B128), "shape"),
+            (fake_tensor(base, bytes - 1, vec![512, 1280, 2560], DType::FP8E4M3B128), "buffer"),
+            (fake_tensor(base + 16, bytes, vec![512, 1280, 2560], DType::FP8E4M3B128), "aligned"),
+        ] {
+            let error = Fp8B128ExpertTable::from_tensor("t", &tensor).unwrap_err();
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
+    }
 
     #[test]
     fn ple_shards_exclude_padding() {

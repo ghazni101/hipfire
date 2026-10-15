@@ -103,6 +103,22 @@ fn a_correct_instruction_is_accepted() {
 }
 
 #[test]
+fn gfx942_is_refused_by_the_rdna_only_validator_and_rdna_targets_are_unaffected() {
+    const REFUSAL: &str = "the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna";
+    let e = validate::instruction(Arch::Gfx942, "s_mov_b32 s0, 0", &[s(0)], &[]).err().expect("gfx942 has no .rip lowering");
+    assert_eq!(e, REFUSAL);
+    let e = validate::effects(Arch::Gfx942, "s_mov_b32 s0, 0").err().expect("gfx942 has no .rip lowering");
+    assert_eq!(e, REFUSAL);
+    // Even text that is not a mnemonic reports the architecture refusal, not an RDNA parse error.
+    let e = validate::instruction(Arch::Gfx942, "not_a_mnemonic", &[], &[]).err().expect("gfx942 has no .rip lowering");
+    assert_eq!(e, REFUSAL);
+    for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+        validate::instruction(arch, "s_mov_b32 s0, 0", &[s(0)], &[]).unwrap();
+        validate::effects(arch, "s_mov_b32 s0, 0").unwrap();
+    }
+}
+
+#[test]
 fn any_same_kind_intersecting_range_covers_an_operand() {
     // Partial overlap is covered by contract: a declared v[8:9] intersects the text's v[8:15],
     // a declared v[2:3] intersects the text's v3, a declared s[0:1] intersects s1.

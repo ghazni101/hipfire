@@ -106,7 +106,11 @@ pub(crate) fn ple_command(paths: &Paths, args: PleArgs) -> Result<()> {
     match args.action {
         PleAction::Derive(args) => derive_command(paths, args),
         PleAction::Split(args) => split_command(paths, args),
-        PleAction::Rebind { old_base, new_base, source } => {
+        PleAction::Rebind {
+            old_base,
+            new_base,
+            source,
+        } => {
             let output = ple_convert::rebind_q4(&old_base, &new_base, &source, &mut |_| {})
                 .map_err(anyhow::Error::msg)?;
             println!("rebound q4 rows: {}", output.display());
@@ -1414,12 +1418,12 @@ mod tests {
                 other => panic!("expected pull, got {other:?}"),
             }
         };
-        assert_eq!(selection(&[]), PleSelection::Auto);
-        assert_eq!(selection(&["--ple", "auto"]), PleSelection::Auto);
-        assert_eq!(selection(&["--ple", "q4"]), PleSelection::Q4);
-        assert_eq!(selection(&["--ple", "q8"]), PleSelection::Q8);
-        assert_eq!(selection(&["--ple", "all"]), PleSelection::All);
-        assert_eq!(selection(&["--ple", "none"]), PleSelection::Skip);
+        assert_eq!(selection(&[]), None);
+        assert_eq!(selection(&["--ple", "auto"]), Some(PleSelection::Auto));
+        assert_eq!(selection(&["--ple", "q4"]), Some(PleSelection::Q4));
+        assert_eq!(selection(&["--ple", "q8"]), Some(PleSelection::Q8));
+        assert_eq!(selection(&["--ple", "all"]), Some(PleSelection::All));
+        assert_eq!(selection(&["--ple", "none"]), Some(PleSelection::Skip));
         assert!(Cli::try_parse_from(["hipfire", "pull", "m", "--ple", "q5"]).is_err());
     }
 }

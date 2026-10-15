@@ -20,6 +20,9 @@ use rdna_compute::tensor_ops::{
     GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen, QsaKvFormat,
     QsaStateLayout,
 };
+use rdna_compute::qsa_pooled_mirror::{
+    qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -278,6 +281,18 @@ pub struct QsaF16Arena {
     pub valid_len: QsaF16ValidLen,
 }
 
+/// A QSA layer's persistent BF16 pooled-index mirror
+/// (`HIPFIRE_QWEN4_QSA_POOLED_BF16`), derived from the F32 `pooled_keys`
+/// (whose values are already BF16-rounded, so the high half of each F32 is
+/// exact). `mirror` is BF16 `[pooled_capacity * index_dim]`. Never
+/// snapshot-copied: `valid_blocks` counts leading pooled blocks whose mirror
+/// equals the canonical pooled keys, and the selector falls back to the F32
+/// keys for any block past it.
+pub struct QsaPooledBf16Arena {
+    pub mirror: GpuTensor,
+    pub valid_blocks: QsaPooledBf16ValidBlocks,
+}
+
 /// A production QSA block.  Full K/V, raw and pooled index buffers have the
 /// max sequence capacity shape; `*_len` fields are active append lengths. The
 /// K/V arenas hold `format`'s rows (`full_row_units` tensor units per token)
@@ -298,6 +313,8 @@ pub struct QsaGpuState {
     pub selected_indices: GpuTensor,
     /// Derived F16 K/V (`None` = the gathered attention converts per launch).
     pub f16_arena: Option<QsaF16Arena>,
+    /// Derived BF16 pooled-index mirror (`None` = score from the F32 keys).
+    pub pooled_bf16: Option<QsaPooledBf16Arena>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -351,24 +368,48 @@ impl QsaGpuState {
             .map_or(0, |arena| arena.valid(self.full_len))
     }
 
-    /// Clamp the arena's valid prefix to the F32 cache's committed rows. Every
-    /// path that rewinds `full_len` calls it: rows past the new mark are
-    /// rewritten later without the arena seeing them.
+    /// The pooled BF16 mirror as the selector reads it, `None` without one.
+    pub fn pooled_bf16_ref(&self) -> Option<QsaPooledBf16MirrorRef<'_>> {
+        self.pooled_bf16.as_ref().map(|arena| QsaPooledBf16MirrorRef {
+            mirror: &arena.mirror,
+            valid_blocks: &arena.valid_blocks,
+        })
+    }
+
+    /// Leading pooled blocks whose BF16 mirror is valid against the F32
+    /// pooled keys (0 without a mirror).
+    pub fn pooled_bf16_valid_blocks(&self) -> usize {
+        self.pooled_bf16_ref()
+            .map_or(0, |mirror| mirror.valid(self.pooled_len))
+    }
+
+    /// Clamp the derived arenas' valid prefixes to the committed rows: the F16
+    /// arena to `full_len` tokens and the pooled BF16 mirror to `pooled_len`
+    /// blocks. Every path that rewinds `full_len`/`pooled_len` calls it: rows
+    /// past the new marks are rewritten later without the arenas seeing them.
     pub(crate) fn clamp_f16_valid(&self) {
         if let Some(arena) = &self.f16_arena {
             arena.valid_len.clamp(self.full_len);
         }
+        if let Some(arena) = &self.pooled_bf16 {
+            arena.valid_blocks.clamp(self.pooled_len);
+        }
     }
 
-    /// Forget every converted row (reset, or the F32 rows were replaced).
+    /// Forget every converted row and mirrored block (reset, or the F32 rows
+    /// and pooled keys were replaced).
     pub(crate) fn invalidate_f16_arena(&self) {
         if let Some(arena) = &self.f16_arena {
             arena.valid_len.invalidate();
         }
+        if let Some(arena) = &self.pooled_bf16 {
+            arena.valid_blocks.invalidate();
+        }
     }
 
     /// The context arenas, in allocation order (full K, full V, raw and
-    /// pooled index keys, then the F16 arena's K and V when present).
+    /// pooled index keys, then the F16 arena's K and V and the pooled BF16
+    /// mirror when present).
     fn context_arenas(&self) -> impl Iterator<Item = &GpuTensor> {
         [
             &self.full_keys,
@@ -382,9 +423,10 @@ impl QsaGpuState {
                 .iter()
                 .flat_map(|arena| [&arena.keys, &arena.values]),
         )
+        .chain(self.pooled_bf16.iter().map(|arena| &arena.mirror))
     }
 
-    fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 6]> {
+    fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 7]> {
         let mut arenas = smallvec::smallvec![
             ContextArena {
                 tensor: &mut self.full_keys,
@@ -421,6 +463,14 @@ impl QsaGpuState {
                     blocks: true,
                 });
             }
+        }
+        if let Some(arena) = &mut self.pooled_bf16 {
+            arenas.push(ContextArena {
+                tensor: &mut arena.mirror,
+                rows: self.pooled_capacity,
+                pooled: true,
+                blocks: false,
+            });
         }
         arenas
     }
@@ -554,23 +604,40 @@ fn grow_context_arena(
 
 /// The QSA state format for a `memory.kv_cache` request on `gpu`
 /// ([`hipfire_runtime::kv_mode::resolve_qwen4`]): `bf16` is the exact
-/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 and a head
-/// geometry its kernels implement (head_dim 256, an even KV-head count);
-/// `q8` ([`QsaKvFormat::Q8`], opt-in) needs gfx11/gfx12 and head_dim 256.
-/// `auto` is fp8 where both hold and the reference state elsewhere; an
-/// explicit request the device or model cannot serve is refused, never
-/// rewritten.
+/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 or gfx942 and
+/// a head geometry its kernels implement (head_dim 256, an even KV-head
+/// count) and is [`QsaKvFormat::Fp8`] (OCP E4M3, BF16 index keys) on gfx1201
+/// and [`QsaKvFormat::Fp8Fnuz`] (E4M3 FNUZ hardware codes, F32 index and
+/// pooled keys) on gfx942; `q8` ([`QsaKvFormat::Q8`], opt-in) needs
+/// gfx11/gfx12 and head_dim 256. `auto` is fp8 on gfx1201 where the geometry
+/// holds and the reference F32 state elsewhere, gfx942 included: gfx942
+/// serves fp8 K/V only when explicitly requested. An explicit request the
+/// device or model cannot serve is refused, never rewritten.
 pub fn resolve_qsa_format(
     request: &str,
     gpu: &Gpu,
     config: &Qwen4Config,
 ) -> Result<QsaKvFormat, String> {
+    resolve_qsa_format_for_arch(request, &gpu.arch, config)
+}
+
+/// [`resolve_qsa_format`] on the architecture name alone.
+fn resolve_qsa_format_for_arch(
+    request: &str,
+    arch: &str,
+    config: &Qwen4Config,
+) -> Result<QsaKvFormat, String> {
     use hipfire_runtime::kv_mode::{resolve_qwen4, KvMode};
     let (kv_heads, head_dim) = (config.num_key_value_heads, config.head_dim);
-    let fp8_geometry = QsaKvFormat::Fp8.supports(kv_heads, head_dim);
+    let fp8 = if arch == "gfx942" {
+        QsaKvFormat::Fp8Fnuz
+    } else {
+        QsaKvFormat::Fp8
+    };
+    let fp8_geometry = fp8.supports(kv_heads, head_dim);
     let auto = matches!(request.trim(), "" | "auto");
-    match resolve_qwen4(request, &gpu.arch)?.mode {
-        KvMode::Fp8 if fp8_geometry => Ok(QsaKvFormat::Fp8),
+    match resolve_qwen4(request, arch)?.mode {
+        KvMode::Fp8 if fp8_geometry => Ok(fp8),
         KvMode::Fp8 if auto => Ok(QsaKvFormat::F32),
         KvMode::Fp8 => Err(format!(
             "qwen4: fp8 QSA K/V needs head_dim 256 and an even KV-head count \
@@ -588,10 +655,28 @@ pub fn resolve_qsa_format(
 /// DeltaNet knob): `auto`/`q8` is Qwen3.5's Q8 state where its kernels apply
 /// (128x128 heads), `fp32` the exact reference state. An explicit request the
 /// model cannot serve is refused, never rewritten.
+///
+/// The AR-only Flash-Next profile is the stock-FP8 recipe's
+/// (`Qwen4TierRecipe::StockFp8` is its only recipe), whose numerical contract
+/// pins the F32 recurrent state: `auto` resolves to F32 there and an explicit
+/// `q8` is refused.
 pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStateFormat, String> {
+    let request = request.trim().to_ascii_lowercase();
+    if config.profile.is_ar_only() {
+        return match request.as_str() {
+            "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
+            "q8" | "int8" => Err(format!(
+                "qwen4: the stock-FP8 artifact pins the F32 GDN recurrent state (its numerical \
+                 contract); state_quant '{request}' is refused, use fp32 or leave it unset"
+            )),
+            other => Err(format!(
+                "qwen4: unsupported GDN state_quant '{other}' (expected auto|fp32)"
+            )),
+        };
+    }
     let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
     let q8 = GdnStateFormat::Q8.supports(key_dim, value_dim);
-    match request.trim().to_ascii_lowercase().as_str() {
+    match request.as_str() {
         "" | "auto" if q8 => Ok(GdnStateFormat::Q8),
         "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
         "q8" | "int8" if q8 => Ok(GdnStateFormat::Q8),
@@ -614,6 +699,10 @@ pub struct Qwen4StateFormat {
     /// Persistent per-layer F16 K/V arenas for the gathered prefill attention
     /// (`HIPFIRE_QWEN4_QSA_F16_ARENA`, gfx1151; [`resolve_state_format`]).
     pub qsa_f16_arena: bool,
+    /// Persistent per-layer BF16 pooled-index mirrors for the PM scorer
+    /// (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, gfx1151 F32 index_dim 128;
+    /// [`resolve_state_format`]).
+    pub qsa_pooled_bf16: bool,
 }
 
 impl Qwen4StateFormat {
@@ -622,6 +711,7 @@ impl Qwen4StateFormat {
         qsa: QsaKvFormat::F32,
         gdn: GdnStateFormat::F32,
         qsa_f16_arena: false,
+        qsa_pooled_bf16: false,
     };
 
     /// The QSA layers' context storage: what admission accounts and the state
@@ -630,6 +720,7 @@ impl Qwen4StateFormat {
         QsaStateLayout {
             kv: self.qsa,
             f16_arena: self.qsa_f16_arena,
+            pooled_bf16: self.qsa_pooled_bf16,
         }
     }
 }
@@ -648,6 +739,13 @@ pub fn resolve_state_format(
         qsa,
         gdn: resolve_gdn_format(state_request, config)?,
         qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
+        qsa_pooled_bf16: qsa_pooled_bf16_mirror_enabled(
+            gpu,
+            qsa,
+            config
+                .indexer_kv_heads
+                .saturating_mul(config.indexer_head_dim),
+        ),
     })
 }
 
@@ -839,6 +937,10 @@ impl Qwen4StateSnapshotArena {
                 .f16_arena
                 .as_ref()
                 .map_or(0, |arena| arena.keys.numel()));
+            mix(layer
+                .pooled_bf16
+                .as_ref()
+                .map_or(0, |arena| arena.mirror.numel()));
         }
         mix(state.ple_conv.as_ref().map_or(0, GpuTensor::numel));
         mix(state.hyper_feedback.numel());
@@ -1109,6 +1211,16 @@ impl Qwen4State {
             .checked_add(config.indexer_compress_ratio - 1)
             .ok_or(StateError::DimensionOverflow)?
             / config.indexer_compress_ratio;
+        if format.qsa_pooled_bf16
+            && (qsa_format != QsaKvFormat::F32 || raw_width != 128 || !gpu.arch_caps.is_gfx1151())
+        {
+            return Err(StateError::Config(format!(
+                "QSA pooled BF16 mirror needs exact F32 K/V on gfx1151 with index_dim 128, got {} on {} with {}",
+                qsa_format.name(),
+                gpu.arch,
+                raw_width
+            )));
+        }
         let selected_capacity = config.qsa_selected_capacity();
         let mut allocated = Vec::new();
         let allocation = (|| -> Result<(), StateError> {
@@ -1156,7 +1268,7 @@ impl Qwen4State {
                             0
                         };
                         // (elements, dtype, context arena: VMM-owned under the VMM backend).
-                        let specs = [
+                        let mut specs = vec![
                             (full_elements, qsa_format.kv_dtype(), true),
                             (full_elements, qsa_format.kv_dtype(), true),
                             (raw_elements, layout.index_dtype(), true),
@@ -1164,12 +1276,17 @@ impl Qwen4State {
                             (partial_key_elements, DType::F32, false),
                             (partial_value_elements, DType::F32, false),
                             (selected_bytes, DType::Raw, false),
-                            (arena_elements, DType::F16, true),
-                            (arena_elements, DType::F16, true),
                         ];
-                        for &(elements, dtype, context_arena) in
-                            &specs[..7 + 2 * usize::from(layout.f16_arena)]
-                        {
+                        if layout.f16_arena {
+                            specs.push((arena_elements, DType::F16, true));
+                            specs.push((arena_elements, DType::F16, true));
+                        }
+                        // The derived BF16 pooled-key mirror (same row count and
+                        // width as `pooled_keys`).
+                        if layout.pooled_bf16 {
+                            specs.push((pooled_elements, DType::BF16, true));
+                        }
+                        for &(elements, dtype, context_arena) in &specs {
                             let tensor = if context_arena && backend == Qwen4KvBackend::Vmm {
                                 // SAFETY: nothing is mapped; every access is
                                 // bounded by `ensure_mapped_capacity`'s prefix
@@ -1222,7 +1339,9 @@ impl Qwen4State {
             .iter()
             .map(|kind| match kind {
                 LayerType::LinearAttention => 2,
-                LayerType::FullAttention => 7 + 2 * usize::from(layout.f16_arena),
+                LayerType::FullAttention => {
+                    7 + 2 * usize::from(layout.f16_arena) + usize::from(layout.pooled_bf16)
+                }
             })
             .sum::<usize>()
             .checked_add(1 + usize::from(config.ple.is_some()))
@@ -1262,6 +1381,10 @@ impl Qwen4State {
                         values: next_tensor(),
                         valid_len: QsaF16ValidLen::default(),
                     });
+                    let pooled_bf16 = layout.pooled_bf16.then(|| QsaPooledBf16Arena {
+                        mirror: next_tensor(),
+                        valid_blocks: QsaPooledBf16ValidBlocks::default(),
+                    });
                     qsa.push(QsaGpuState {
                         format: qsa_format,
                         full_row_units,
@@ -1273,6 +1396,7 @@ impl Qwen4State {
                         partial_values,
                         selected_indices,
                         f16_arena,
+                        pooled_bf16,
                         full_capacity: max_seq_len,
                         raw_capacity: max_seq_len,
                         pooled_capacity,
@@ -1321,6 +1445,7 @@ impl Qwen4State {
                     ]
                     .into_iter()
                     .chain(layer.f16_arena.into_iter().flat_map(|a| [a.keys, a.values]))
+                    .chain(layer.pooled_bf16.into_iter().map(|a| a.mirror))
                     {
                         let _ = gpu.free_tensor(tensor);
                     }
@@ -2139,6 +2264,9 @@ impl Qwen4State {
                 free(arena.keys);
                 free(arena.values);
             }
+            if let Some(arena) = layer.pooled_bf16 {
+                free(arena.mirror);
+            }
         }
         if let Some(ple_conv) = self.ple_conv {
             free(ple_conv);
@@ -2632,6 +2760,29 @@ impl std::error::Error for StateError {}
 mod tests {
     use super::*;
 
+    /// The AR-only (stock-FP8) profile pins the F32 GDN recurrent state:
+    /// `auto`/unset/fp32 resolve to F32 and an explicit q8 is refused; the
+    /// checkpoint profile keeps its Q8 default.
+    #[test]
+    fn stock_fp8_profile_pins_f32_gdn_state() {
+        let flash = crate::config::compact_test_config();
+        assert_eq!(resolve_gdn_format("", &flash).unwrap(), GdnStateFormat::Q8);
+        assert_eq!(resolve_gdn_format("auto", &flash).unwrap(), GdnStateFormat::Q8);
+        let stock = flash.into_ar_only().unwrap();
+        for request in ["", "auto", " AUTO ", "fp32", "f32"] {
+            assert_eq!(
+                resolve_gdn_format(request, &stock).unwrap(),
+                GdnStateFormat::F32,
+                "{request:?}"
+            );
+        }
+        for request in ["q8", "Q8", "int8"] {
+            let error = resolve_gdn_format(request, &stock).unwrap_err();
+            assert!(error.contains("stock-FP8") && error.contains("F32"), "{error}");
+        }
+        assert!(resolve_gdn_format("bf16", &stock).is_err());
+    }
+
     #[test]
     fn f16_arena_bytes_are_counted_for_legacy_and_vmm_states() {
         let config = crate::config::compact_test_config();
@@ -2666,6 +2817,48 @@ mod tests {
             if backend == Qwen4KvBackend::Legacy {
                 assert_eq!(with - plain, logical);
             }
+        }
+    }
+
+    #[test]
+    fn pooled_bf16_mirror_bytes_are_counted_for_legacy_and_vmm_states() {
+        let config = crate::config::compact_test_config();
+        let mirror = Qwen4StateFormat {
+            qsa_pooled_bf16: true,
+            ..Qwen4StateFormat::F32
+        };
+        let layout = mirror.layout();
+        assert_eq!(QsaStateLayout::F32.pooled_bf16_bytes_per_block(128), 0);
+        assert_eq!(layout.pooled_bf16_bytes_per_block(128), 256);
+        for backend in [Qwen4KvBackend::Legacy, Qwen4KvBackend::Vmm] {
+            let context = Qwen4ContextCommit::new(backend, 8193, 1025, 2 << 20);
+            let plain = context
+                .committed_layer_bytes(&config, QsaKvFormat::F32)
+                .unwrap();
+            let with = context.committed_layer_bytes(&config, layout).unwrap();
+            assert!(with > plain);
+            assert_eq!(
+                Qwen4State::device_bytes(&config, mirror, &context).unwrap()
+                    - Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context).unwrap(),
+                (with - plain) * config.n_full_layers(),
+            );
+            // One 256-byte BF16 block per `ceil(tokens / 4)` pooled block.
+            let logical = config.qsa_context_arena_bytes(8193, layout).unwrap()
+                - config.qsa_context_arena_bytes(8193, QsaKvFormat::F32).unwrap();
+            assert_eq!(logical, 2049 * 256);
+            if backend == Qwen4KvBackend::Legacy {
+                assert_eq!(with - plain, logical);
+            }
+        }
+        // Per-layer logical deltas at 32K and 256K (x12 QSA layers: 24 MiB and
+        // 192 MiB); the derived mirror is not snapshot payload.
+        for (tokens, per_layer) in [(32_768usize, 2usize << 20), (262_144, 16 << 20)] {
+            assert_eq!(
+                config.qsa_context_arena_bytes(tokens, layout).unwrap()
+                    - config.qsa_context_arena_bytes(tokens, QsaKvFormat::F32).unwrap(),
+                per_layer
+            );
+            assert_eq!(per_layer * config.n_full_layers(), tokens / 4 * 256 * 12);
         }
     }
 
@@ -2902,6 +3095,140 @@ mod tests {
         assert_eq!(QsaKvFormat::Fp8.kv_row_bytes(2, 256), 516);
         let fp8 = context_arena_plan(516, s, 2 * MIB).unwrap();
         assert_eq!(fp8.token_capacity(2 * MIB), 4064);
+    }
+
+    /// gfx942 serves fp8 K/V only on an explicit request, as the FNUZ format
+    /// (F32 index keys); `auto`/unset/`bf16` stay on the F32 reference state.
+    /// gfx1201 keeps its OCP `Fp8` (BF16 index) default.
+    #[test]
+    fn gfx942_explicit_fp8_is_fnuz_and_auto_stays_f32() {
+        let config = crate::config::compact_test_config();
+        for request in ["", "auto", " auto ", "bf16"] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx942", &config),
+                Ok(QsaKvFormat::F32),
+                "{request:?} on gfx942"
+            );
+        }
+        for request in ["fp8", " fp8 "] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx942", &config),
+                Ok(QsaKvFormat::Fp8Fnuz),
+                "{request:?} on gfx942"
+            );
+        }
+        assert!(resolve_qsa_format_for_arch("q8", "gfx942", &config).is_err());
+        // The RDNA formats are unchanged.
+        for request in ["", "auto", "fp8"] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx1201", &config),
+                Ok(QsaKvFormat::Fp8),
+                "{request:?} on gfx1201"
+            );
+        }
+        assert_eq!(
+            resolve_qsa_format_for_arch("auto", "gfx1151", &config),
+            Ok(QsaKvFormat::F32)
+        );
+        assert!(resolve_qsa_format_for_arch("fp8", "gfx1151", &config).is_err());
+        // An odd KV-head count has no FNUZ kernel: explicit fp8 is refused,
+        // never rewritten, and auto stays F32.
+        let mut odd = config.clone();
+        odd.num_key_value_heads = 3;
+        let error = resolve_qsa_format_for_arch("fp8", "gfx942", &odd).unwrap_err();
+        assert!(error.contains("even KV-head count"), "{error}");
+        assert_eq!(
+            resolve_qsa_format_for_arch("auto", "gfx942", &odd),
+            Ok(QsaKvFormat::F32)
+        );
+    }
+
+    /// Flash-Next (H24 Hkv2 D256, one 128-wide index head, compress 4) charge
+    /// of the gfx942 FP8 state: K and V rows are 2 x (2 x (256 + 2)) = 1032 B,
+    /// the F32 raw index key 512 B and the pooled key 128 B per token, so
+    /// 1672 B per layer-token and 20,064 B over the 12 QSA layers (the F32
+    /// reference state is 4736 B and 56,832 B).
+    #[test]
+    fn gfx942_fp8_state_charge_is_1672_bytes_per_layer_token() {
+        let config = crate::config::compact_test_config();
+        let fnuz = QsaKvFormat::Fp8Fnuz;
+        assert_eq!(fnuz.kv_row_bytes(2, 256), 516);
+        assert_eq!(fnuz.index_dtype(), DType::F32);
+        assert_eq!(config.n_full_layers(), 12);
+        let s = 4096; // a multiple of the compress ratio: pooled rows = s / 4.
+        let layer = config.qsa_context_arena_bytes(s, fnuz).unwrap();
+        assert_eq!(layer, s * 1672);
+        assert_eq!(layer * config.n_full_layers(), s * 20_064);
+        assert_eq!(
+            config.qsa_context_arena_bytes(s, QsaKvFormat::F32).unwrap(),
+            s * 4736
+        );
+        // The RDNA fp8 row keeps its BF16 index keys.
+        assert_eq!(
+            config.qsa_context_arena_bytes(s, QsaKvFormat::Fp8).unwrap(),
+            s * (1032 + 256 + 64)
+        );
+        // Legacy storage (gfx942 is not a VMM arch) commits the whole layer.
+        let context = Qwen4ContextCommit::legacy(s);
+        assert_eq!(context.committed_layer_bytes(&config, fnuz), Some(layer));
+        // The state charge differs from the F32 state by exactly the K/V and
+        // index-row savings of the QSA layers (GDN state untouched).
+        let state = |qsa| Qwen4StateFormat {
+            qsa,
+            ..Qwen4StateFormat::F32
+        };
+        assert_eq!(
+            Qwen4State::device_bytes(&config, state(QsaKvFormat::F32), &context).unwrap()
+                - Qwen4State::device_bytes(&config, state(fnuz), &context).unwrap(),
+            s * (4736 - 1672) * config.n_full_layers()
+        );
+    }
+
+    /// The gfx942 FNUZ encoder feeds `(v / s) * 0.5` to a round-to-nearest-even
+    /// FNUZ convert, which cannot produce `0x80` (its NaN). Modeled on the CPU
+    /// FNUZ table: every finite OCP code except `0x80` is stored as itself, the
+    /// quantized negative zero `0x80` is stored as `0x00`, and `0x80` is never
+    /// stored, including for an input of -0 and for negative nonzero inputs
+    /// that round to zero.
+    #[test]
+    fn gfx942_fp8_kv_codes_canonicalize_negative_zero_and_never_store_0x80() {
+        use rdna_compute::fp8_e4m3::{e4m3fn_to_f32, e4m3fnuz_to_f32};
+        let encode = |x: f32| -> u8 {
+            let mut best: Option<(f64, u8)> = None;
+            for code in 0..=255u8 {
+                let Some(value) = e4m3fnuz_to_f32(code) else {
+                    continue; // 0x80: FNUZ NaN, never produced
+                };
+                let distance = (f64::from(x) - f64::from(value)).abs();
+                best = match best {
+                    Some((d, c)) if d < distance || (d == distance && c & 1 == 0) => Some((d, c)),
+                    _ => Some((distance, code)),
+                };
+            }
+            best.unwrap().1
+        };
+        let mut finite = 0;
+        for code in 0..=255u8 {
+            let Some(value) = e4m3fn_to_f32(code) else {
+                continue; // 0x7F / 0xFF: OCP NaN
+            };
+            finite += 1;
+            let stored = encode(value * 0.5);
+            assert_ne!(stored, 0x80, "code {code:#04x} stored 0x80");
+            assert_eq!(
+                stored,
+                if code == 0x80 { 0x00 } else { code },
+                "code {code:#04x}"
+            );
+        }
+        assert_eq!(finite, 254);
+        // -0, a negative value below the smallest FNUZ subnormal (2^-10), and
+        // the exact tie at half of it (to even: zero) all store +0.
+        for x in [-0.0f32, -1e-9, -2f32.powi(-12), -2f32.powi(-11)] {
+            assert_eq!(encode(x), 0x00, "{x:e}");
+        }
+        // Just past the tie rounds to the smallest negative subnormal 0x81.
+        assert_eq!(encode(-2f32.powi(-11) * 1.0001), 0x81);
     }
 
     #[test]

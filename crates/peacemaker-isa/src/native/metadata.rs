@@ -192,4 +192,61 @@ mod tests {
         assert_eq!(msgpack("a: 200\nb: 70000\n").unwrap(), [0x82, 0xa1, b'a', 0xcc, 200, 0xa1, b'b', 0xce, 0, 1, 0x11, 0x70]);
         for bad in ["a: 1.5\n", "a: yes\n", "a: 0x10\n", "a: \"s\"\n", "a: 012\n"] { assert!(msgpack(bad).is_err(), "{bad}") }
     }
+    /// A gfx942 kernel's metadata (AGPR count, wavefront size 64, global/by-value args) and the blob `llvm-mc -mcpu=gfx942`
+    /// (AMD LLVM 24.0.0git) writes for it into `.note` (`NT_AMDGPU_METADATA`; identical for code object v5 and v6).
+    #[test]
+    fn gfx942_metadata_matches_llvm_mc() {
+        let yaml = concat!(
+            "amdhsa.kernels:\n",
+            "  - .agpr_count: 4\n",
+            "    .args:\n",
+            "      - .address_space: global\n",
+            "        .is_const: true\n",
+            "        .name: x\n",
+            "        .offset: 0\n",
+            "        .size: 8\n",
+            "        .value_kind: global_buffer\n",
+            "        .actual_access: read_only\n",
+            "      - .address_space: global\n",
+            "        .name: y\n",
+            "        .offset: 8\n",
+            "        .size: 8\n",
+            "        .value_kind: global_buffer\n",
+            "      - .name: n\n",
+            "        .offset: 16\n",
+            "        .size: 4\n",
+            "        .value_kind: by_value\n",
+            "    .group_segment_fixed_size: 4096\n",
+            "    .kernarg_segment_align: 8\n",
+            "    .kernarg_segment_size: 24\n",
+            "    .max_flat_workgroup_size: 256\n",
+            "    .name: k\n",
+            "    .private_segment_fixed_size: 0\n",
+            "    .sgpr_count: 22\n",
+            "    .sgpr_spill_count: 0\n",
+            "    .symbol: k.kd\n",
+            "    .uniform_work_group_size: 1\n",
+            "    .uses_dynamic_stack: false\n",
+            "    .vgpr_count: 12\n",
+            "    .vgpr_spill_count: 0\n",
+            "    .wavefront_size: 64\n",
+            "amdhsa.target: amdgcn-amd-amdhsa--gfx942\n",
+            "amdhsa.version: [1, 2]\n",
+        );
+        let golden = concat!(
+            "83ae616d646873612e6b65726e656c7391de0010ab2e616770725f636f756e7404a52e617267739387ae2e61637475616c5f616363657373",
+            "a9726561645f6f6e6c79ae2e616464726573735f7370616365a6676c6f62616ca92e69735f636f6e7374c3a52e6e616d65a178a72e6f6666",
+            "73657400a52e73697a6508ab2e76616c75655f6b696e64ad676c6f62616c5f62756666657285ae2e616464726573735f7370616365a6676c",
+            "6f62616ca52e6e616d65a179a72e6f666673657408a52e73697a6508ab2e76616c75655f6b696e64ad676c6f62616c5f62756666657284a5",
+            "2e6e616d65a16ea72e6f666673657410a52e73697a6504ab2e76616c75655f6b696e64a862795f76616c7565b92e67726f75705f7365676d",
+            "656e745f66697865645f73697a65cd1000b62e6b65726e6172675f7365676d656e745f616c69676e08b52e6b65726e6172675f7365676d65",
+            "6e745f73697a6518b82e6d61785f666c61745f776f726b67726f75705f73697a65cd0100a52e6e616d65a16bbb2e707269766174655f7365",
+            "676d656e745f66697865645f73697a6500ab2e736770725f636f756e7416b12e736770725f7370696c6c5f636f756e7400a72e73796d626f",
+            "6ca46b2e6b64b82e756e69666f726d5f776f726b5f67726f75705f73697a6501b32e757365735f64796e616d69635f737461636bc2ab2e76",
+            "6770725f636f756e740cb12e766770725f7370696c6c5f636f756e7400af2e7761766566726f6e745f73697a6540ad616d646873612e7461",
+            "72676574b9616d6467636e2d616d642d616d646873612d2d676678393432ae616d646873612e76657273696f6e920102",
+        );
+        let expected: Vec<u8> = (0..golden.len() / 2).map(|i| u8::from_str_radix(&golden[2 * i..2 * i + 2], 16).unwrap()).collect();
+        assert_eq!(msgpack(yaml).unwrap(), expected);
+    }
 }

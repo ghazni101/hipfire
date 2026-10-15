@@ -87,3 +87,5 @@
 52  MQ4G256V2L    passthrough  MQ4v2 wire + per-tensor 16-level Lloyd codebook (lloyd_levels sidecar)
 53  MQ4G128V2    passthrough
 54  QwenI64      reserved     Qwen4 raw-I64 metadata record (non-weight; written by the Qwen4 producer, no QuantType variant)
+55  FP8E4M3B128  passthrough  OCP e4m3fn codes verbatim + 128x128 bf16 s_inv block scales, expert-blocked payload (docs/quant-formats/fp8-e4m3.md); Qwen4 stock-FP8 routed experts, gfx942 only
+56  FP8E4M3PT    arch-loaded  OCP e4m3fn codes + one per-tensor bf16 scale in a 16-B header; read by the Qwen4 PLE row store, not the passthrough table

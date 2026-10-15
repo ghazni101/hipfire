@@ -540,21 +540,26 @@ pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201
-/// and bf16 everywhere else; explicit `fp8` is refused off gfx1201 and
-/// explicit `q8` off gfx11/gfx12, and any other unsupported explicit mode
-/// is refused before the generic [`resolve`] fallback can rewrite it. The
-/// model's head geometry is checked where the state is built
-/// (`hipfire_arch_qwen4::resolve_qsa_format`).
+/// and bf16 everywhere else (gfx942 included: auto never selects fp8 there);
+/// explicit `fp8` is accepted on exact gfx1201 and exact gfx942 and refused
+/// elsewhere, explicit `q8` is refused off gfx11/gfx12, and any other
+/// unsupported explicit mode is refused before the generic [`resolve`]
+/// fallback can rewrite it. The model's head geometry is checked where the
+/// state is built (`hipfire_arch_qwen4::resolve_qsa_format`).
+/// Qwen4's `Bf16` mode denotes F32 state, not BF16 KV storage. On gfx942,
+/// unset/`auto`/`bf16` select that F32 state; only an explicit `fp8` selects
+/// the reduced FP8 K/V rows; `q8` is not supported there.
 pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
-    let fp8_arch = arch == "gfx1201";
+    let auto_fp8_arch = arch == "gfx1201";
+    let explicit_fp8_arch = auto_fp8_arch || arch == "gfx942";
     let q8_arch = arch.starts_with("gfx11") || arch.starts_with("gfx12");
     let mode = match raw.trim() {
-        "" | "auto" if fp8_arch => Fp8,
+        "" | "auto" if auto_fp8_arch => Fp8,
         "" | "auto" | "bf16" => Bf16,
-        "fp8" if fp8_arch => Fp8,
+        "fp8" if explicit_fp8_arch => Fp8,
         "fp8" => {
             return Err(format!(
-                "qwen4 kv mode \"fp8\" needs gfx1201 (have {arch}); use bf16 or auto"
+                "qwen4 kv mode \"fp8\" needs gfx1201 or gfx942 (have {arch}); use bf16 or auto"
             ))
         }
         "q8" if q8_arch => Q8,
@@ -1217,6 +1222,40 @@ mod tests {
         assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
         assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
         assert_eq!(resolve("fp8", &QWEN35_SLOTS_POLICY).mode, KvMode::Fp8);
+    }
+
+    #[test]
+    fn qwen4_gfx942_auto_stays_f32_explicit_fp8_accepted_q8_refused() {
+        // Unset/auto/bf16 never select fp8 on gfx942: they resolve to F32 state.
+        for raw in ["", "auto", " auto ", "bf16"] {
+            let resolved = resolve_qwen4(raw, "gfx942").expect("gfx942 F32 state mode");
+            assert_eq!(resolved.mode, KvMode::Bf16, "{raw:?} on gfx942");
+            assert!(resolved.warning.is_none());
+        }
+        // Only an explicit fp8 selects reduced K/V on gfx942.
+        for raw in ["fp8", " fp8 "] {
+            let resolved = resolve_qwen4(raw, "gfx942").expect("explicit gfx942 fp8");
+            assert_eq!(resolved.mode, KvMode::Fp8, "{raw:?} on gfx942");
+            assert!(resolved.warning.is_none());
+        }
+        let Err(error) = resolve_qwen4("q8", "gfx942") else {
+            panic!("q8 reduced KV must be refused on gfx942");
+        };
+        assert!(
+            error.contains("q8") && error.contains("gfx942") && error.contains("use bf16 or auto"),
+            "{error}"
+        );
+        // Only exact gfx942 and gfx1201 accept explicit fp8; sibling CDNA
+        // arches and gfx1200 do not.
+        for arch in ["gfx940", "gfx941", "gfx90a", "gfx9420", "gfx1200"] {
+            let Err(error) = resolve_qwen4("fp8", arch) else {
+                panic!("fp8 must be refused on {arch}");
+            };
+            assert!(
+                error.contains("fp8") && error.contains(arch) && error.contains("gfx942"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

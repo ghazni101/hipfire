@@ -492,6 +492,8 @@ fn select_target(
     let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
     let result = (|| {
         for qsa in &mut state.qsa {
+            // Rewrites pooled keys outside the forward: drop the BF16 mirror.
+            qsa.invalidate_f16_arena();
             indexed_attention_pool_rope(
                 gpu,
                 &IndexedAttentionPoolRope {

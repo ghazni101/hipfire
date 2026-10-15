@@ -126,6 +126,14 @@ pub(super) struct MoePrefillSelection {
     pub(super) cpu_deferred_experts: bool,
 }
 
+impl MoePrefillSelection {
+    /// FP8 owns its grouped arm; it never enables the generic WMMA Path 2.
+    pub(super) fn uses_grouped_rows(&self) -> bool {
+        self.route.is_some_and(MoeRouteCapability::is_fp8_grouped)
+            || self.resolution.use_path2
+    }
+}
+
 /// The call's static kernel selection. Neither variant stores a step list or
 /// a borrow of its enclosing call.
 pub(super) enum MoeKernelSelection {
@@ -284,7 +292,7 @@ impl<'a> MoeStepState<'a> {
             return false;
         };
         let target = params.routed_out.unwrap_or(params.x_batch);
-        selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
             // A CPU-deferred call omits the combine that would consume the
             // absorbed fill, so it must never absorb one.
             && !selection.cpu_deferred_experts
@@ -292,7 +300,7 @@ impl<'a> MoeStepState<'a> {
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             )
             && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
             && Some(clear.elements) == params.batch_size.checked_mul(params.down_m)
@@ -489,11 +497,11 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::input_basis(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             );
         }
         let input_weight = params
@@ -577,7 +585,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
-                if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+                if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
                     return super::qt44_qt53_prefill::router_projection(gpu, params);
                 }
                 let prelude = &params.prelude;
@@ -770,11 +778,11 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::shared_gate_up(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             );
         }
         super::prefill_shared_gate_up_stage(self.state.dispatch_ctx(), gpu, params)
@@ -800,11 +808,11 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::shared_activation(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             );
         }
         super::prefill_shared_activation_stage(gpu, params)
@@ -847,7 +855,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
@@ -856,7 +864,7 @@ impl<'a> SealedMoeOp<'a> {
                     gpu,
                     params,
                     &hc,
-                    selection.resolution.use_path2,
+                    selection.uses_grouped_rows(),
                 )? {
                     self.state.hc_folded.set(true);
                     self.state.hc_row_folded.set(row_fold);
@@ -866,7 +874,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::qt44_qt53_prefill::shared_down(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             );
         }
         super::prefill_shared_down_stage(self.state.dispatch_ctx(), gpu, params)
@@ -875,12 +883,12 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn scatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
         self.state.require_route_ready()?;
-        if !selection.resolution.use_path2 {
+        if !selection.uses_grouped_rows() {
             return Err(DispatchError::Hip(
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
@@ -903,11 +911,11 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::gate_up(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
                 selection.path2_m_total,
             );
         }
@@ -923,12 +931,12 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
-        if !selection.resolution.use_path2 {
+        if !selection.uses_grouped_rows() {
             return Err(DispatchError::Hip(
                 "sealed moe: unscatter is only valid for grouped prefill path 2".into(),
             ));
         }
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
@@ -945,11 +953,11 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::activation(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
             );
         }
         let total_slots = params
@@ -1024,11 +1032,11 @@ impl<'a> SealedMoeOp<'a> {
             return Ok(());
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             return super::qt44_qt53_prefill::down(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
                 selection.path2_m_total,
             );
         }
@@ -1050,7 +1058,7 @@ impl<'a> SealedMoeOp<'a> {
             super::sealed_moe::PrefillRouteMode::ProduceRoot { .. }
                 | super::sealed_moe::PrefillRouteMode::AdoptRoot { .. }
         );
-        if compact_ep && selection.resolution.use_path2 {
+        if compact_ep && selection.uses_grouped_rows() {
             super::prefill_down_unscatter_stage(gpu, params, total_slots)?;
         }
         Ok(())
@@ -1066,7 +1074,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
-        if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
             // The row fold combines inside its own kernel; only the rank order
             // is owed here, and the absorbed target fill is not (the shared
             // down's rows overwrite the target).
@@ -1087,7 +1095,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::qt44_qt53_prefill::combine(
                 gpu,
                 params,
-                selection.resolution.use_path2,
+                selection.uses_grouped_rows(),
                 selection.path2_m_total,
                 self.state.initial_zero.take(),
             );
@@ -1262,11 +1270,11 @@ impl<'a> SealedMoeOp<'a> {
                 MoeProtocol::GroupedPrefill => {
                     let (params, selection) = self.state.prefill_parts()?;
                     let gather = params.ep_row_gather.ok_or_else(missing)?;
-                    if !selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+                    if !selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
                         || !super::qt44_qt53_prefill::writes_slot_ordered_rows(
                             gpu,
                             params,
-                            selection.resolution.use_path2,
+                            selection.uses_grouped_rows(),
                         )
                     {
                         return Err(DispatchError::Hip(
@@ -1431,7 +1439,7 @@ fn lower_decode<'a>(
         let combine_after_down = !selection.cpu_deferred_experts
             && params.ep_mode != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
-            && (selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+            && (selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
                 || !down_self_combines)
             && !params.defer_routed_combine;
         if params.ep_row_gather.is_some() {
@@ -1439,8 +1447,7 @@ fn lower_decode<'a>(
             // indexed down wrote; every other decode lowering either folds
             // inside its down kernel or follows a different EP contract.
             let grouped = selection
-                .route
-                .is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+                .route.is_some_and(MoeRouteCapability::is_sealed_grouped);
             if !grouped
                 || !combine_after_down
                 || params.batch_size != 1
@@ -1487,7 +1494,7 @@ fn lower_prefill<'a>(
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
     if params.ep_row_gather.is_some()
-        && (!selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        && (!selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
             || params.routed_out.is_some())
     {
         // The gather fills the expanded rows the grouped QT44/QT53 down wrote,
@@ -1499,7 +1506,7 @@ fn lower_prefill<'a>(
     }
     if params.ep_tile_exchange.is_some()
         && (selection.route != Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric)
-            || !selection.resolution.use_path2
+            || !selection.uses_grouped_rows()
             || params.routed_out.is_some()
             || params.ep_row_gather.is_some())
     {
@@ -1510,7 +1517,7 @@ fn lower_prefill<'a>(
             "sealed moe: a prefill EP tile exchange requires the grouped symmetric IU4 route combining into the residual".into(),
         ));
     }
-    if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+    if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
         append_step(
             &mut steps,
@@ -1555,14 +1562,14 @@ fn lower_prefill<'a>(
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
             return Ok(steps);
         }
-        if selection.resolution.use_path2 {
+        if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
         if params.ep_tile_exchange.is_some() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::TileMask))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
-        if selection.resolution.use_path2 {
+        if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
@@ -1621,11 +1628,11 @@ fn lower_prefill<'a>(
         }
     }
     if !selection.cpu_deferred_experts {
-        if selection.resolution.use_path2 {
+        if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
-        if selection.resolution.use_path2 {
+        if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
         }
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
@@ -1645,7 +1652,7 @@ fn lower_prefill<'a>(
     // The arch's CPU splice accumulates the routed contribution into `x_batch`.
     if !selection.cpu_deferred_experts
         && !compact_ep
-        && (selection.resolution.use_path2 || !selection.resolution.down_path0)
+        && (selection.uses_grouped_rows() || !selection.resolution.down_path0)
     {
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
     }
@@ -1731,11 +1738,11 @@ pub(super) fn execute_after_clear(
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
-                if selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+                if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
                     && super::qt44_qt53_prefill::row_fold_applies(
                         gpu,
                         params,
-                        selection.resolution.use_path2,
+                        selection.uses_grouped_rows(),
                         offered,
                     )
                 {
@@ -1805,6 +1812,9 @@ pub(super) fn select_decode(
     router: MoeRouterInput,
 ) -> Result<MoeDecodeSelection, DispatchError> {
     super::check_moe_decode_batch_size(params.batch_size)?;
+    // Qt55 decode uses the grouped protocol even for one row. An indexed
+    // descriptor cannot supply its stable permutation and must fail closed.
+    super::reject_fp8_moe(&params.dtypes)?;
     if params.recipe == MoeRecipe::SigmoidRoutedNoShared
         && (params.k != 8
             || params.ep_mode != crate::families::moe::MoeEpMode::None
@@ -2030,6 +2040,7 @@ pub(super) fn select_decode(
         && params.dtypes.routed_gate_up == rdna_compute::DType::MQ6G256V2
         && params.dtypes.routed_down == rdna_compute::DType::MQ6G256V2;
     let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq6v2;
+    resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
         router_shared_fuse,
@@ -2046,6 +2057,54 @@ pub(super) fn select_decode(
     })
 }
 
+/// A grouped FP8 launcher reads one immutable contiguous block table, not the
+/// legacy device pointer indirection. Prove that both tables name those same
+/// live blocks before constructing the launcher's borrowed base view.
+fn validate_fp8_expert_blocks(params: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    let (first_gate, first_down) = params.routed_experts.get(0).ok_or_else(|| {
+        DispatchError::Hip("sealed fp8 moe: empty expert block table".into())
+    })?;
+    let gate_stride = rdna_compute::fp8_e4m3::b128_block_stride(2 * params.mi, params.gate_up_k)
+        .ok_or_else(|| DispatchError::Hip("sealed fp8 moe: gate stride overflows".into()))?;
+    let down_stride = rdna_compute::fp8_e4m3::b128_block_stride(params.down_m, params.down_k)
+        .ok_or_else(|| DispatchError::Hip("sealed fp8 moe: down stride overflows".into()))?;
+    let gate_base = first_gate.buf.buf.as_ptr() as usize;
+    let down_base = first_down.buf.buf.as_ptr() as usize;
+    for expert in 0..params.n_exp {
+        let (gate, down) = params.routed_experts.get(expert).ok_or_else(|| {
+            DispatchError::Hip("sealed fp8 moe: incomplete expert block table".into())
+        })?;
+        let address = |base: usize, stride: usize| {
+            expert.checked_mul(stride).and_then(|offset| base.checked_add(offset))
+        };
+        if Some(gate.buf.buf.as_ptr() as usize) != address(gate_base, gate_stride)
+            || Some(down.buf.buf.as_ptr() as usize) != address(down_base, down_stride)
+            || gate_base % 256 != 0
+            || down_base % 256 != 0
+            || gate.m != 2 * params.mi
+            || gate.k != params.gate_up_k
+            || down.m != params.down_m
+            || down.k != params.down_k
+            || gate.dtype != rdna_compute::DType::FP8E4M3B128
+            || down.dtype != rdna_compute::DType::FP8E4M3B128
+            || gate.buf.buf.size() < gate_stride
+            || down.buf.buf.size() < down_stride
+            || gate.rotation.is_some()
+            || down.rotation.is_some()
+            || gate.awq_scale.is_some()
+            || down.awq_scale.is_some()
+        {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "fp8-immutable-contiguous-expert-blocks",
+                arch: "gfx942",
+                quant: "FP8E4M3B128",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolve all grouped-prefill choices without a GPU or an instruction list.
 ///
 /// The prefill [`MoePrefillResolution`] reads owner-derived residency via
@@ -2058,6 +2117,57 @@ pub(super) fn select_prefill(
     ctx: &DispatchCtx,
     params: &MoePrefillParams<'_>,
 ) -> Result<MoePrefillSelection, DispatchError> {
+    let fp8_route = super::select_fp8_grouped_route(
+        ctx,
+        &params.dtypes,
+        params.route_policy,
+        params.n_exp,
+        params.k_top,
+        params.gate_up_k,
+        params.mi,
+        params.prelude.shared.as_ref().map_or(0, |s| s.intermediate),
+        params.gate_up_k,
+        params.down_m,
+        params.down_k,
+        params.expert_dtype_tags,
+        params.expert_down_awq_ptrs.is_some()
+            || params.down_awq_scale.is_some()
+            || params.paro_gate_up.is_some()
+            || params.paro_down.is_some()
+            || params.prelude.shared.as_ref().is_some_and(|s| {
+                projection_has_sidecars(&params.prelude.router, &s.weights)
+            }),
+    )?;
+    if let Some(route) = fp8_route {
+        if params.recipe != (MoeRecipe::SoftmaxGatedShared {
+            bf16_round_trip: true,
+            shared_after_combine: true,
+        })
+            || params.cpu_deferred_experts
+            || params.routed_out.is_some()
+            || params.expert_stage_ptrs.is_some()
+            || params.ep_row_gather.is_some()
+            || params.ep_tile_exchange.is_some()
+            || !matches!(params.prelude.route, super::sealed_moe::PrefillRouteMode::Replicated)
+            || params.routed_experts.host_mapped()
+        {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "fp8-sealed-replicated-bf16-only",
+                arch: "gfx942",
+                quant: "FP8E4M3B128",
+            });
+        }
+        validate_fp8_expert_blocks(params)?;
+        return Ok(MoePrefillSelection {
+            resolution: MoePrefillResolution::sealed_fp8(),
+            path2_m_total: params.m_total_max,
+            force_mq4_grouped_fp16: false,
+            coalesced_verify: false,
+            route: Some(route),
+            cpu_deferred_experts: false,
+        });
+    }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
         && params.routed_out.is_none()
         && params.paro_gate_up.is_none()
@@ -2104,6 +2214,7 @@ pub(super) fn select_prefill(
     }
     let (host_gate_up, host_down) = params.routed_experts.host_mapped_projections();
     let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify, host_gate_up || host_down);
+    resolution.check_generic_route(route)?;
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
