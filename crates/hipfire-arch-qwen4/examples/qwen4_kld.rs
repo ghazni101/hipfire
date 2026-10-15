@@ -22,7 +22,7 @@
 //!   qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref \
 //!                    --teacher ID_FILE --output REF.kldref [--top-k 256]
 //!   qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq \
-//!                    [--max-chunks N] [--decode] [--ple-hot BYTES]
+//!                    [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]
 //!   qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref \
 //!                    --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]
 //! `s11ref` writes F64 KL(ref || candidate), in the reference score-index order,
@@ -33,6 +33,11 @@
 //! is the same top-k plus exact F64 reference residual as fp8_refs.score_rows.
 //! `--decode` scores the autoregressive route instead: each chunk prefills the
 //! unscored prefix, then runs one `forward_token` per scored position.
+//! `--append-rows R[,R...]` scores the agent-turn append route instead: each
+//! chunk runs from a fresh state as consecutive all-row forwards of at most R
+//! rows on the resident state (the last one shorter), so every scored row comes
+//! from an append of at most R rows. One model load scores every R listed;
+//! each R writes `OUT` with `.a<R>` before its extension.
 //! `--ple-hot BYTES` attaches the PLE hot-row store (`<model>.plehot` sidecar
 //! and `<model>.plehotrows` pack), verified and with BYTES of the pack
 //! prewarmed, before scoring, so the identity gate covers rows read from the
@@ -113,7 +118,7 @@ fn verified_hot_store(
     Ok(hot)
 }
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
 
 /// Reuse the backing allocation, but expose exactly this cold window's rows.
 fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
@@ -307,18 +312,23 @@ impl Model {
         })
     }
 
-    /// All-row logits for one chunk from a fresh state.
-    fn chunk_logits(&mut self, chunk: &[u32]) -> Result<Vec<f32>, String> {
-        let logits = all_logits_view(&self.logits, chunk.len(), self.vocab);
+    /// All-row logits for one chunk from a fresh state: one forward, or with
+    /// `append_rows` consecutive forwards of at most that many rows on the
+    /// resident state (each writes its own logits rows).
+    fn chunk_logits(&mut self, chunk: &[u32], append_rows: Option<usize>) -> Result<Vec<f32>, String> {
         self.bundle
             .reset(&mut self.gpu)
             .map_err(|e| e.to_string())?;
-        self.bundle
-            .forward_chunk(&mut self.gpu, chunk, &logits, None)
-            .map_err(|e| e.to_string())?;
+        let step = append_rows.unwrap_or(chunk.len());
+        for (i, part) in chunk.chunks(step).enumerate() {
+            let logits = self.logits.sub_offset(i * step * self.vocab, part.len() * self.vocab);
+            self.bundle
+                .forward_chunk(&mut self.gpu, part, &logits, None)
+                .map_err(|e| e.to_string())?;
+        }
         let rows = self
             .gpu
-            .download_f32(&logits)
+            .download_f32(&all_logits_view(&self.logits, chunk.len(), self.vocab))
             .map_err(|e| e.to_string())?;
         if rows.iter().any(|v| !v.is_finite()) {
             return Err("non-finite logits".into());
@@ -513,7 +523,7 @@ fn build_ref(
     let mut blocks = Vec::with_capacity(n_chunk * window.scored_per_chunk());
     let mut nll_sum = 0.0f64;
     for (c, chunk) in tokens.chunks_exact(n_ctx).enumerate() {
-        let rows = m.chunk_logits(chunk)?;
+        let rows = m.chunk_logits(chunk, None)?;
         let scored = &rows[window.score_from * m.vocab..window.score_to * m.vocab];
         nll_sum += score_teacher_chunk(scored, chunk, &meta, top_k, &mut blocks)?;
         eprintln!(
@@ -586,12 +596,24 @@ fn import_ref(
     write_ref(output, meta, top_k, tokens, &blocks, nll_sum)
 }
 
+/// `OUT` with `.a<rows>` inserted before its extension (`out.kldseq` ->
+/// `out.a145.kldseq`).
+fn append_output(output: &Path, rows: usize) -> PathBuf {
+    let stem = output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = match output.extension() {
+        Some(ext) => format!("{stem}.a{rows}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.a{rows}"),
+    };
+    output.with_file_name(name)
+}
+
 fn score(
     model: &Path,
     ref_path: &Path,
     output: &Path,
     max_chunks: Option<usize>,
     decode: bool,
+    append_rows: &[usize],
     ple_hot: Option<u64>,
 ) -> Result<(), String> {
     let reference = KldRef::open(ref_path).map_err(|e| e.to_string())?;
@@ -609,79 +631,90 @@ fn score(
             m.vocab, h.n_vocab
         ));
     }
-    eprintln!(
-        "qwen4_kld eval: {n_chunk} chunks x {n_ctx} ({} route); teacher PPL {:.4} ({})",
-        if decode { "decode" } else { "all-row" },
-        h.oracle.ppl,
-        h.teacher.path
-    );
-
-    let started = Instant::now();
-    let mut chunks = Vec::with_capacity(n_chunk);
-    let (mut kld_sum, mut nll_sum, mut top1_hits, mut scored) = (0.0f64, 0.0f64, 0usize, 0usize);
-    // Digest of every scored logits row: equal digests mean bit-identical numerics.
-    let mut digest = Sha256::new();
-    let (from, to) = (window.score_from, window.score_to);
-    for c in 0..n_chunk {
-        let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
-        let rows = if decode {
-            m.decode_rows(chunk, from, to)?
-        } else {
-            let mut rows = m.chunk_logits(chunk)?;
-            rows.truncate(to * m.vocab);
-            rows.drain(..from * m.vocab);
-            rows
+    let passes: Vec<(Option<usize>, PathBuf)> = if append_rows.is_empty() {
+        vec![(None, output.to_path_buf())]
+    } else {
+        append_rows.iter().map(|&r| (Some(r), append_output(output, r))).collect()
+    };
+    for (append, output) in passes {
+        let route = match append {
+            _ if decode => "decode".to_string(),
+            Some(r) => format!("append <= {r} rows"),
+            None => "all-row".to_string(),
         };
-        for v in &rows {
-            digest.update(v.to_le_bytes());
-        }
-        let mut klds = Vec::with_capacity(window.scored_per_chunk());
-        let mut chunk_nll = 0.0f64;
-        for (i, pos) in (from..to).enumerate() {
-            let row = &rows[i * m.vocab..(i + 1) * m.vocab];
-            let block = reference.block(&mmap, c, i).map_err(|e| e.to_string())?;
-            let block = TopKBlock {
-                residual_logprob: block.residual_logprob,
-                top: block.top.to_vec(),
-            };
-            klds.push(kld_from_block(&block, row).map_err(|e| e.to_string())?);
-            chunk_nll += nll_of(row, chunk[pos + 1] as usize).map_err(|e| e.to_string())?;
-            let argmax = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32);
-            top1_hits += usize::from(argmax == Some(block.top[0].0));
-        }
-        let n = klds.len();
-        kld_sum += klds.iter().sum::<f64>();
-        nll_sum += chunk_nll;
-        scored += n;
-        let mean_kld = klds.iter().sum::<f64>() / n as f64;
-        klds.sort_by(f64::total_cmp);
-        let p99_kld = klds[((n as f64 * 0.99).ceil() as usize).clamp(1, n) - 1];
-        chunks.push(ChunkScore {
-            mean_kld,
-            p99_kld,
-            mean_nll: chunk_nll / n as f64,
-        });
         eprintln!(
-            "  chunk {}/{n_chunk}  KLD {mean_kld:.6}  running KLD {:.6}  {:.0}s",
-            c + 1,
+            "qwen4_kld eval: {n_chunk} chunks x {n_ctx} ({route} route); teacher PPL {:.4} ({})",
+            h.oracle.ppl,
+            h.teacher.path
+        );
+
+        let started = Instant::now();
+        let mut chunks = Vec::with_capacity(n_chunk);
+        let (mut kld_sum, mut nll_sum, mut top1_hits, mut scored) = (0.0f64, 0.0f64, 0usize, 0usize);
+        // Digest of every scored logits row: equal digests mean bit-identical numerics.
+        let mut digest = Sha256::new();
+        let (from, to) = (window.score_from, window.score_to);
+        for c in 0..n_chunk {
+            let chunk = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let rows = if decode {
+                m.decode_rows(chunk, from, to)?
+            } else {
+                let mut rows = m.chunk_logits(chunk, append)?;
+                rows.truncate(to * m.vocab);
+                rows.drain(..from * m.vocab);
+                rows
+            };
+            for v in &rows {
+                digest.update(v.to_le_bytes());
+            }
+            let mut klds = Vec::with_capacity(window.scored_per_chunk());
+            let mut chunk_nll = 0.0f64;
+            for (i, pos) in (from..to).enumerate() {
+                let row = &rows[i * m.vocab..(i + 1) * m.vocab];
+                let block = reference.block(&mmap, c, i).map_err(|e| e.to_string())?;
+                let block = TopKBlock {
+                    residual_logprob: block.residual_logprob,
+                    top: block.top.to_vec(),
+                };
+                klds.push(kld_from_block(&block, row).map_err(|e| e.to_string())?);
+                chunk_nll += nll_of(row, chunk[pos + 1] as usize).map_err(|e| e.to_string())?;
+                let argmax = row
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32);
+                top1_hits += usize::from(argmax == Some(block.top[0].0));
+            }
+            let n = klds.len();
+            kld_sum += klds.iter().sum::<f64>();
+            nll_sum += chunk_nll;
+            scored += n;
+            let mean_kld = klds.iter().sum::<f64>() / n as f64;
+            klds.sort_by(f64::total_cmp);
+            let p99_kld = klds[((n as f64 * 0.99).ceil() as usize).clamp(1, n) - 1];
+            chunks.push(ChunkScore {
+                mean_kld,
+                p99_kld,
+                mean_nll: chunk_nll / n as f64,
+            });
+            eprintln!(
+                "  chunk {}/{n_chunk}  KLD {mean_kld:.6}  running KLD {:.6}  {:.0}s",
+                c + 1,
+                kld_sum / scored as f64,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        kldseq::write(&output, &chunks).map_err(|e| e.to_string())?;
+        let mean_nll = nll_sum / scored as f64;
+        eprintln!(
+            "qwen4_kld eval: mean KLD = {:.6}  mean NLL = {mean_nll:.6}  PPL = {:.4}  top1 = {:.4}  ({scored} tokens)  logits sha256 {:x} -> {}",
             kld_sum / scored as f64,
-            started.elapsed().as_secs_f64()
+            mean_nll.exp(),
+            top1_hits as f64 / scored as f64,
+            digest.finalize(),
+            output.display()
         );
     }
-    kldseq::write(output, &chunks).map_err(|e| e.to_string())?;
-    let mean_nll = nll_sum / scored as f64;
-    eprintln!(
-        "qwen4_kld eval: mean KLD = {:.6}  mean NLL = {mean_nll:.6}  PPL = {:.4}  top1 = {:.4}  ({scored} tokens)  logits sha256 {:x} -> {}",
-        kld_sum / scored as f64,
-        mean_nll.exp(),
-        top1_hits as f64 / scored as f64,
-        digest.finalize(),
-        output.display()
-    );
     if let Some(store) = m.bundle.ple_hot_store() {
         eprintln!(
             "qwen4_kld eval: ple hot store served {} rows ({} pages, {} pack reads)",
@@ -879,7 +912,7 @@ fn score_s11ref(
                 }
             }
         } else {
-            let logits = m.chunk_logits(&s.tokens)?;
+            let logits = m.chunk_logits(&s.tokens, None)?;
             for &p in &s.score_positions {
                 reference.block(kls.len(), &mut block)?;
                 kls.push(kld_from_block(&block, &logits[p * m.vocab..(p + 1) * m.vocab])
@@ -922,7 +955,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
     let (mut logits, mut teacher, mut corpus) = (None, None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
-    let mut ple_hot = None;
+    let (mut ple_hot, mut append_rows) = (None, Vec::new());
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -939,18 +972,29 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--max-chunks" => max_chunks = Some(number(value()?)?),
             "--decode" => decode = true,
             "--ple-hot" => ple_hot = Some(number(value()?)? as u64),
+            "--append-rows" => {
+                for rows in value()?.split(',') {
+                    match number(rows.to_string())? {
+                        0 => return Err("--append-rows: rows must be positive".into()),
+                        rows => append_rows.push(rows),
+                    }
+                }
+            }
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
     if mode == "s11ref" && (max_chunks.is_some() || slice.is_some() || logits.is_some() || teacher.is_some()) {
         return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported".into());
     }
+    if !append_rows.is_empty() && (mode != "eval" || decode) {
+        return Err("--append-rows is an eval route and excludes --decode".into());
+    }
     match (mode.as_str(), model, slice, ref_path, output) {
         ("ref", Some(model), Some(slice), None, Some(output)) => {
             build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => {
-            score(&model, &ref_path, &output, max_chunks, decode, ple_hot)
+            score(&model, &ref_path, &output, max_chunks, decode, &append_rows, ple_hot)
         }
         ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
             let corpus = corpus.ok_or("s11ref requires --corpus CORPUS.json (prefix tokens are not stored in S11REF)")?;

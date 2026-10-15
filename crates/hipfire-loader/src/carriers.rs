@@ -233,15 +233,24 @@ const PLE_PREWARM_RESERVE_BYTES: u64 = 8 << 30;
 /// set to zero.
 fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
     let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
-    match hipfire_config::memory::ple_prewarm_bytes() {
-        hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => (bytes, available, bytes == 0),
+    let (budget, explicit_zero) =
+        ple_prewarm_budget_for(hipfire_config::memory::ple_prewarm_bytes(), available);
+    (budget, available, explicit_zero)
+}
+
+/// [`ple_prewarm_budget`] for a given request and `MemAvailable`.
+fn ple_prewarm_budget_for(
+    request: hipfire_config::memory::PleHotStoreBudget,
+    available: Option<u64>,
+) -> (u64, bool) {
+    match request {
+        hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => (bytes, bytes == 0),
         hipfire_config::memory::PleHotStoreBudget::Auto => (
             available.map_or(0, |available| {
                 available
                     .saturating_sub(PLE_PREWARM_RESERVE_BYTES)
                     .min(PLE_PREWARM_AUTO_BYTES)
             }),
-            available,
             false,
         ),
     }
@@ -291,15 +300,26 @@ fn ple_load_fill_bytes(
     requested.min(prewarm).min(host).min(table_bytes)
 }
 
+/// Host RAM the PLE page cache keeps resident at serve time, from one budget
+/// snapshot: the prewarm `budget` or the in-load fill's `load_fill` target,
+/// whichever is larger, capped at the `data_bytes` of the table/pack/sidecar
+/// that holds the rows. On unified memory these pages count in
+/// `MemAvailable` (and so in the device free memory) while reclaimable, so a
+/// device admission must reserve them to keep the rows resident.
+fn ple_resident_bytes(budget: u64, load_fill: u64, data_bytes: u64) -> u64 {
+    budget.max(load_fill).min(data_bytes)
+}
+
 /// Start the worker of a rank-ordered q4 PLE table before the weight sweep,
 /// with an in-load fill of its hottest prefix when
 /// [`ple_load_fill_bytes`] allows one. The worker prewarms on from there
-/// once the model is ready; dropping it stops and joins it.
+/// once the model is ready; dropping it stops and joins it. Also returns the
+/// fill's byte target (the table prefix the load keeps resident).
 #[cfg(unix)]
 fn start_ple_table_worker(
     store: &std::sync::Arc<hipfire_runtime::ple_hot_store::HotRowStore>,
     host_weight_bytes: u64,
-) -> hipfire_arch_qwen4::bundle::PleHotWorker {
+) -> (hipfire_arch_qwen4::bundle::PleHotWorker, u64) {
     const MIB: u64 = 1 << 20;
     let host_available = rdna_compute::uma_memory::host_available_bytes();
     let bytes = ple_load_fill_bytes(
@@ -322,7 +342,13 @@ fn start_ple_table_worker(
         bytes,
         bytes_per_sec: PLE_LOAD_FILL_BYTES_PER_SEC,
     });
-    hipfire_arch_qwen4::bundle::PleHotWorker::new(store.clone(), store.spawn_table_worker(fill))
+    (
+        hipfire_arch_qwen4::bundle::PleHotWorker::new(
+            store.clone(),
+            store.spawn_table_worker(fill),
+        ),
+        bytes,
+    )
 }
 
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
@@ -1894,12 +1920,17 @@ pub fn load_qwen4_rank(
         };
         start_ple_table_worker(store, host_weight_bytes)
     });
+    #[cfg(unix)]
+    let (ple_table_worker, ple_load_fill) = match ple_table_worker {
+        Some((worker, fill)) => (Some(worker), fill),
+        None => (None, 0),
+    };
     #[cfg(not(unix))]
-    let ple_table_worker = {
+    let (ple_table_worker, ple_load_fill) = {
         if rank_table.is_some() {
             return Err("qwen4: rank-ordered PLE table workers are unsupported on Windows; run on Linux".into());
         }
-        None::<hipfire_arch_qwen4::bundle::PleHotWorker>
+        (None::<hipfire_arch_qwen4::bundle::PleHotWorker>, 0u64)
     };
     let ple_hot = match (&metadata, ple_descriptors.as_deref()) {
         (Some(metadata), Some(descriptors)) if config.profile.is_flash_next() => {
@@ -2013,6 +2044,26 @@ pub fn load_qwen4_rank(
             return Err(format!("qwen4: MTP setup failed: {detail}"));
         }
     }
+    // One snapshot of the PLE page-cache budgets, taken before admission:
+    // the prewarm after ready sets exactly these budgets, and the
+    // admission reserves the pages they keep resident. On unified memory
+    // those clean page-cache pages count in `MemAvailable` (and so in the
+    // device free memory) while being reclaimable, so without the charge a
+    // context could consume the host RAM the PLE rows are meant to occupy.
+    // The in-load fill's own target (`ple_load_fill`, fixed when it
+    // started) covers the part already resident; no residency census runs
+    // against the still-reading fill.
+    let ple_prewarm = ple_prewarm_budget();
+    let ple_hot_prewarm = ple_hot_prewarm_budget();
+    let ple_resident = if let Some(worker) = &ple_table_worker {
+        ple_resident_bytes(ple_prewarm.0, ple_load_fill, worker.store().data_bytes())
+    } else if let Some(store) = bundle.ple_hot_store() {
+        ple_resident_bytes(ple_hot_prewarm.0, 0, store.data_bytes())
+    } else if let Some((_, _, data_bytes)) = &q4_prewarm {
+        ple_resident_bytes(ple_prewarm.0, 0, *data_bytes)
+    } else {
+        0
+    };
     // Unified memory (the only place admission resolves a sequence):
     // admit what requests commit after load (VMM context and gather
     // pages, native MTP request buffers) against the device memory the
@@ -2048,6 +2099,7 @@ pub fn load_qwen4_rank(
                 (!automatic).then_some(ctx.max_seq),
                 free as u64,
                 mtp_request,
+                ple_resident,
                 crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
                 |tokens| bundle.context_growth_bytes(gpu, tokens),
             )
@@ -2057,14 +2109,16 @@ pub fn load_qwen4_rank(
         None => ctx.max_seq,
         Some(Ok(admission)) => {
             eprintln!(
-                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context + {} MiB gather workspace + {} MiB MTP request) + {} MiB headroom; card_cap {} tokens",
+                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context incl. any F16 arena + {} MiB gather workspace + {} MiB MTP request) + {} MiB resident PLE + {} MiB headroom; card_cap {} tokens (with the current free host memory the context fits up to {} tokens; this limit moves with free host memory and the PLE prewarm budget)",
                     admission.free / MIB,
                     admission.max_seq,
                     admission.growth() / MIB,
                     admission.context_growth / MIB,
                     admission.gather_growth / MIB,
                     admission.mtp_request / MIB,
+                    admission.resident_ple / MIB,
                     admission.headroom / MIB,
+                    admission.card_cap,
                     admission.card_cap
                 );
             if let Some(sequence) = ctx.sequence.as_mut() {
@@ -2120,7 +2174,7 @@ pub fn load_qwen4_rank(
     // request is served (every PLE fetch pauses it).
     if let Some(worker) = ple_table_worker {
         let store = worker.store().clone();
-        let (budget, available, explicit_zero) = ple_prewarm_budget();
+        let (budget, available, explicit_zero) = ple_prewarm;
         store.set_prewarm_budget(budget);
         // The fill's own `load fill stopped at ready` line reports what it
         // left resident; the prewarm continues from there.
@@ -2143,7 +2197,7 @@ pub fn load_qwen4_rank(
             return Err(format!("qwen4: PLE table worker setup failed: {detail}"));
         }
     } else if let Some(store) = bundle.ple_hot_store() {
-        let (budget, available) = ple_hot_prewarm_budget();
+        let (budget, available) = ple_hot_prewarm;
         store.set_prewarm_budget(budget);
         eprintln!(
             "  qwen4 ple hot store: prewarm budget {} MiB of a {} MiB pack (MemAvailable {} MiB)",
@@ -2155,7 +2209,7 @@ pub fn load_qwen4_rank(
         // No hot store: the rows come from the q4 sidecar, whose pages a
         // request would otherwise fault in cold.  An idle-only sequential
         // read warms the page cache (clean pages, reclaimable).
-        let (budget, available, explicit_zero) = ple_prewarm_budget();
+        let (budget, available, explicit_zero) = ple_prewarm;
         if budget == 0 {
             eprintln!(
                 "  qwen4 ple prewarm: off ({})",
@@ -5458,7 +5512,10 @@ mod qwen4_admission_tests {
 
 #[cfg(test)]
 mod qwen4_ple_load_fill_tests {
-    use super::{ple_load_fill_bytes, PLE_LOAD_FILL_AUTO_BYTES, PLE_PREWARM_RESERVE_BYTES};
+    use super::{
+        ple_load_fill_bytes, ple_prewarm_budget_for, ple_resident_bytes, PLE_LOAD_FILL_AUTO_BYTES,
+        PLE_PREWARM_RESERVE_BYTES,
+    };
     use hipfire_config::memory::PleHotStoreBudget::{Auto, Bytes};
 
     const GIB: u64 = 1 << 30;
@@ -5501,5 +5558,37 @@ mod qwen4_ple_load_fill_tests {
             ple_load_fill_bytes(Bytes(0), Auto, Some(112 * GIB), 66 * GIB, 27 * GIB),
             0
         );
+    }
+
+    #[test]
+    fn halo_prewarm_budget_and_resident_charge() {
+        const MIB: u64 = 1 << 20;
+        // Halo: 23,038 MiB MemAvailable at admission leaves 23,038 - 8,192 =
+        // 14,846 MiB, under the 15 GiB auto cap. The 14 GiB in-load fill is
+        // inside it, so the resident charge is the budget.
+        let (budget, zero) = ple_prewarm_budget_for(Auto, Some(23_038 * MIB));
+        assert_eq!((budget, zero), (14_846 * MIB, false));
+        assert_eq!(
+            ple_resident_bytes(budget, PLE_LOAD_FILL_AUTO_BYTES, 27 * GIB),
+            14_846 * MIB
+        );
+        // The auto cap, an explicit value, zero and unknown MemAvailable.
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(112 * GIB)),
+            (15 * GIB, false)
+        );
+        assert_eq!(ple_prewarm_budget_for(Bytes(2 * GIB), None), (2 * GIB, false));
+        assert_eq!(ple_prewarm_budget_for(Bytes(0), Some(112 * GIB)), (0, true));
+        assert_eq!(ple_prewarm_budget_for(Auto, None), (0, false));
+    }
+
+    #[test]
+    fn resident_charge_covers_the_load_fill_and_is_capped_at_the_table() {
+        // The fill's target counts when it exceeds a later, smaller budget.
+        assert_eq!(ple_resident_bytes(GIB, 14 * GIB, 27 * GIB), 14 * GIB);
+        assert_eq!(ple_resident_bytes(15 * GIB, 14 * GIB, 27 * GIB), 15 * GIB);
+        // Never more than the table/pack/sidecar holds, and 0 when off.
+        assert_eq!(ple_resident_bytes(40 * GIB, 14 * GIB, 27 * GIB), 27 * GIB);
+        assert_eq!(ple_resident_bytes(0, 0, 27 * GIB), 0);
     }
 }

@@ -1317,10 +1317,18 @@ pub struct Gpu {
     /// profile (`HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151): every row-count
     /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
     /// via `Gpu::route_rows` while launches keep the real row count.
+    /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
+    /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
     pub prefill_invariant_scope: bool,
     /// SKU-emulation state (`HIPFIRE_EMU`): profile, host facts and the
     /// installed budget id. `None` when emulation is off (the default).
     pub(crate) emu: Option<crate::emu::EmuGpuState>,
+    /// True while a Qwen4 prefill tile runs on the agent-turn append route
+    /// (`HIPFIRE_QWEN4_APPEND_WMMA`, see
+    /// `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
+    /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
+    /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
+    pub qwen4_append_f16_moe_scope: bool,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -2151,6 +2159,7 @@ impl Gpu {
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             emu,
+            qwen4_append_f16_moe_scope: false,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {

@@ -47347,9 +47347,12 @@ impl Gpu {
     }
 
     /// Whether a `rows`-row prefill takes the route (smaller prefill, decode
-    /// and speculative verify stay on the incumbent).
+    /// and speculative verify stay on the incumbent). Never on the agent-turn
+    /// append route (`Gpu::qwen4_append_f16_moe_scope`).
     pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
-        self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.qwen4_moe_sym_iu4_requested()
+        self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS
+            && !self.qwen4_append_f16_moe_scope
+            && self.qwen4_moe_sym_iu4_requested()
     }
 
     /// Index of this arch in the route's per-arch tables (gfx1151, gfx1201).

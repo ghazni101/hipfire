@@ -2343,6 +2343,63 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
     window.map(|window| (window.committed, window.accepted, window.drafts_generated))
 }
 
+/// The head rows a retired request owes. Once the floor retires a request,
+/// its AR tokens advance the target alone (no head work per token); each
+/// token's target wide hidden is captured into spec hidden row `i` while the
+/// head stays at `start`. [`Qwen4MtpDrafter::catch_up_head`] appends the owed
+/// rows teacher-forced, as a takeover appends its kept rows, when they fill
+/// one batched fill and before every teacher-forced advance (the terminal
+/// pending-seed flush among them). A retired request therefore still ends
+/// with its head at the target, and the conversation's next turn continues
+/// live.
+///
+/// While rows are owed nothing else writes spec hidden: a retired request
+/// runs only head-free AR tokens until it catches up, and every reset or
+/// prefill drops the record (its owners are reset or restored). Host only.
+#[derive(Debug, Default)]
+struct HeadLag {
+    /// The head position: where the first owed row goes.
+    start: usize,
+    /// The owed tokens, at positions `start..start + tokens.len()`; token
+    /// `i`'s target hidden is spec hidden row `i`.
+    tokens: Vec<u32>,
+}
+
+impl HeadLag {
+    /// The spec hidden row the AR token at `position` captures into: the
+    /// next row. Refused unless `position` continues the owed rows and a row
+    /// below `capacity` is free.
+    fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
+        let row = self.tokens.len();
+        if row != 0 && self.start + row != position {
+            return Err(format!(
+                "Qwen4 MTP head lag: AR token at {position} does not continue the owed rows {}..{}",
+                self.start,
+                self.start + row
+            ));
+        }
+        if row >= capacity {
+            return Err(format!(
+                "Qwen4 MTP head lag: {row} owed rows leave no free row of {capacity}"
+            ));
+        }
+        Ok(row)
+    }
+
+    /// Owe the token at `position`, whose hidden went to [`Self::next_row`].
+    fn push(&mut self, position: usize, token: u32) {
+        debug_assert!(self.tokens.is_empty() || self.start + self.tokens.len() == position);
+        if self.tokens.is_empty() {
+            self.start = position;
+        }
+        self.tokens.push(token);
+    }
+
+    fn clear(&mut self) {
+        self.tokens.clear();
+    }
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -2410,6 +2467,9 @@ pub struct Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read once per request by
     /// `configure_request`; false restores the pre-floor chooser.
     floor_enabled: bool,
+    /// The head rows the retired request owes (see [`HeadLag`]); empty
+    /// while the head sits at the target.
+    head_lag: HeadLag,
     /// Request-local wire counters surfaced by `request_stats`; reset only
     /// by `configure_request`.
     stats: MtpRequestStats,
@@ -2453,6 +2513,7 @@ impl Qwen4MtpDrafter {
             takeover_block: Vec::new(),
             floor: MtpFloor::new(),
             floor_enabled: true,
+            head_lag: HeadLag::default(),
             stats: MtpRequestStats::default(),
             device_spare: Vec::new(),
             follower: false,
@@ -2931,7 +2992,8 @@ impl Qwen4MtpDrafter {
     /// a `k = 0` interleaved window does (the ordinary forward's wide hidden,
     /// head append with the same `DraftPairing` conditioning, pending hidden)
     /// before recording the AR price.  Otherwise (retired) it does no head
-    /// work at all and never checks the head position.
+    /// work and never checks the head position: the head owes the token's
+    /// row ([`Self::owe_head_row`]).
     fn mtp_ar_step(
         &mut self,
         gpu: &mut Gpu,
@@ -3028,6 +3090,7 @@ impl Qwen4MtpDrafter {
             self.stats.mtp_windows += 1;
             self.stats.mtp_retired = self.floor.retired;
         } else {
+            self.owe_head_row(gpu, target, position, seed)?;
             self.stats.ar_windows += 1;
         }
         Ok(MtpWindow {
@@ -3035,6 +3098,106 @@ impl Qwen4MtpDrafter {
             accepted: 0,
             drafts_generated: 0,
         })
+    }
+
+    /// Owed head rows a retired request holds before it catches up: one
+    /// batched decode fill (`MtpAppendScratch` rows), inside the spec hidden
+    /// capture both are sized from.
+    fn head_lag_capacity(&self) -> usize {
+        MTP_FILL_ROWS.min(self.prefill_rows).max(1)
+    }
+
+    /// The retired AR token `seed` at `position`, just forwarded by the
+    /// target alone: copy its wide hidden (valid until the next forward) to
+    /// the next spec hidden row and owe its head row. A full record catches
+    /// the head up at once.
+    fn owe_head_row(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+    ) -> Result<(), String> {
+        let capacity = self.head_lag_capacity();
+        let row = self.head_lag.next_row(position, capacity)?;
+        Self::bundle(target)?
+            .copy_ar_hidden_to_spec_row(gpu, row)
+            .map_err(|error| error.to_string())?;
+        self.head_lag.push(position, seed);
+        if self.head_lag.tokens.len() >= capacity {
+            self.catch_up_head(gpu, target)?;
+        }
+        Ok(())
+    }
+
+    /// Append the head rows a retired request owes ([`HeadLag`]),
+    /// teacher-forced (token `p`, target hidden `p`) exactly as a takeover
+    /// appends its kept rows: one batched decode fill from two rows when it
+    /// runs, else one Append per row. Head and target then sit at the same
+    /// position, and the pending hidden is the last row's, as after any
+    /// teacher-forced advance. A no-op when nothing is owed.
+    fn catch_up_head(&mut self, gpu: &mut Gpu, target: &mut dyn SpecTarget) -> Result<(), String> {
+        let owed = self.head_lag.tokens.len();
+        if owed == 0 {
+            return Ok(());
+        }
+        let start = self.head_lag.start;
+        let end = start + owed;
+        let bundle = Self::bundle(target)?;
+        let head = bundle.mtp_position().map_err(|error| error.to_string())?;
+        if head != start || bundle.state.position != end {
+            return Err(format!(
+                "Qwen4 MTP head catch-up position mismatch: target={}, mtp={head}, owed rows {start}..{end}",
+                bundle.state.position
+            ));
+        }
+        let fill = self
+            .append_scratch
+            .as_mut()
+            .filter(|fill| owed >= 2 && owed <= fill.rows() && mtp_batched_fill_enabled());
+        match fill {
+            Some(fill) => bundle
+                .mtp_append_rows(
+                    gpu,
+                    MtpFillContext::DecodeFill,
+                    fill,
+                    &self.head_lag.tokens,
+                    0,
+                    None,
+                    None,
+                    start,
+                )
+                .map_err(|error| error.to_string())?,
+            None => {
+                let row_hidden = self
+                    .row_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+                for (row, &token) in self.head_lag.tokens.iter().enumerate() {
+                    bundle
+                        .copy_spec_hidden_row_to(gpu, row, row_hidden)
+                        .map_err(|error| error.to_string())?;
+                    bundle
+                        .mtp_append_token(gpu, token, Some(row_hidden), start + row)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        let head = bundle.mtp_position().map_err(|error| error.to_string())?;
+        if head != end {
+            return Err(format!(
+                "Qwen4 MTP head catch-up ended at mtp={head}, expected {end}"
+            ));
+        }
+        let pending = self
+            .pending_hidden
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+        bundle
+            .copy_spec_hidden_row_to(gpu, owed - 1, pending)
+            .map_err(|error| error.to_string())?;
+        self.head_lag.clear();
+        Ok(())
     }
 
     /// Count one finished native window; observe it for the floor unless
@@ -4750,8 +4913,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
         }
         // A miss resets target, head and draft policy; a hit restores the
-        // session snapshot at `start_pos` into all three.
+        // session snapshot at `start_pos` into all three. Either way no head
+        // row is owed afterwards (the prefill overwrites spec hidden).
         let reused = if cache_hit { start_pos } else { 0 };
+        self.head_lag.clear();
         Self::bundle(target)?
             .session_begin(gpu, prompt_tokens, reused, SessionRoute::Mtp)
             .map_err(|error| error.to_string())?;
@@ -4919,14 +5084,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if abort() {
             return Ok(true);
         }
-        // Retired: the head lags the target for good, so the caller advances
-        // the target alone (no capture, no head append).
-        if self.floor.retired {
-            return Ok(false);
-        }
-        // Expert parallelism: rank 0 decided above that the head is live and
-        // no abort is pending; every rank advances the rows in one fan-out
-        // (never-abort inside) and the hosts agree.
+        // Expert parallelism: rank 0 decided above that no abort is pending;
+        // every rank advances the rows in one fan-out (never-abort inside)
+        // and the hosts agree.
         if Self::bundle(target)?.ep_mesh().is_some() {
             let never = || false;
             return Self::bundle(target)?.ep_drafter_fanout(
@@ -4942,6 +5102,10 @@ impl MtpDrafter for Qwen4MtpDrafter {
             );
         }
         self.ensure_resources(gpu, target)?;
+        // A retired request's head lags by the rows it owes: append them
+        // first, so these rows follow them and the advance (the terminal
+        // pending-seed flush among them) ends with head and target together.
+        self.catch_up_head(gpu, target)?;
         let pending = self.pending_hidden()?;
         for (index, &token) in tokens.iter().enumerate() {
             if abort() {
@@ -4966,6 +5130,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
 
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.push_replay(ReplayOp::Reset);
+        self.head_lag.clear();
         if let Some(scratch) = self.scratch.as_mut() {
             if let Some(scratch) = scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>() {
                 scratch.target_snapshot = None;
@@ -5031,6 +5196,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
+        self.head_lag.clear();
         self.floor = MtpFloor::with_retire_after(singleton_floor_min_windows())
             .with_decay(self.agreement_decay);
         self.floor_enabled =
@@ -6313,6 +6479,48 @@ mod tests {
         floor.observe_calibration(1000.0, &good);
         assert!(floor.retired);
         assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
+    }
+
+    #[test]
+    fn retired_head_lag_owes_contiguous_rows_from_the_head_position() {
+        let mut lag = HeadLag::default();
+        // The first owed token fixes the head position; later tokens must
+        // continue it row by row (spec hidden row i = position start + i).
+        assert_eq!(lag.next_row(34_120, 4), Ok(0));
+        lag.push(34_120, 11);
+        assert_eq!(lag.next_row(34_121, 4), Ok(1));
+        let gap = lag.next_row(34_122, 4).unwrap_err();
+        assert!(gap.contains("does not continue"), "{gap}");
+        let back = lag.next_row(34_120, 4).unwrap_err();
+        assert!(back.contains("does not continue"), "{back}");
+        lag.push(34_121, 12);
+        lag.push(34_122, 13);
+        lag.push(34_123, 14);
+        assert_eq!(lag.start, 34_120);
+        assert_eq!(lag.tokens, [11, 12, 13, 14]);
+        // A full record has no free row: the drafter catches up first.
+        let full = lag.next_row(34_124, 4).unwrap_err();
+        assert!(full.contains("no free row"), "{full}");
+        // After a catch-up (or a reset) the next owed token starts anew.
+        lag.clear();
+        assert_eq!(lag.next_row(40_000, 4), Ok(0));
+        lag.push(40_000, 21);
+        assert_eq!(lag.start, 40_000);
+        assert_eq!(lag.tokens, [21]);
+    }
+
+    #[test]
+    fn retired_head_lag_capacity_is_one_batched_fill_and_requests_drop_it() {
+        let mut drafter = Qwen4MtpDrafter::new(4, 65_536, None);
+        assert_eq!(drafter.head_lag_capacity(), 1, "no resources yet");
+        drafter.prefill_rows = 8192;
+        assert_eq!(drafter.head_lag_capacity(), MTP_FILL_ROWS);
+        drafter.prefill_rows = 512;
+        assert_eq!(drafter.head_lag_capacity(), 512);
+        // A new request never inherits owed rows of an earlier one.
+        drafter.head_lag.push(7, 3);
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        assert!(drafter.head_lag.tokens.is_empty());
     }
 
     #[test]

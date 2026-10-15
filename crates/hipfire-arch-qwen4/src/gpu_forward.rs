@@ -5268,8 +5268,10 @@ impl Qwen4GpuForward {
     /// capture (BF16 stream bits widen, F32 streams copy). The final hyper
     /// reads `streams` into other scratch, so the row is the trunk's output on
     /// the HIP and the retained-replay route alike. `destination` must be F32
-    /// with exactly `hc_count * hidden_size` elements. Calibration only; the
-    /// row is valid until the next forward writes `streams`.
+    /// with exactly `hc_count * hidden_size` elements. Read by the AR floor's
+    /// calibration token and by every retired AR token (whose row the MTP
+    /// head appends later); the row is valid until the next forward writes
+    /// `streams`.
     pub(crate) fn copy_last_wide_hidden_to(
         &self,
         gpu: &mut Gpu,
@@ -5593,17 +5595,40 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-        // The batch-invariant prefill profile (see `rdna_compute::prefill_invariant`):
-        // every row-count routing decision of this forward sees the canonical
-        // chunk size; launches keep the real row count. Restored below on every
-        // return path.
-        let invariant = trunk_prefill_invariant_scope(
+        // The canonical-routing switch (see `rdna_compute::prefill_invariant`):
+        // set by the batch-invariant prefill profile or by the agent-turn
+        // append route below. Every row-count routing decision of this forward
+        // then sees the canonical chunk size; launches keep the real row
+        // count. Restored below on the single return path.
+        let pm_invariant = trunk_prefill_invariant_scope(
             self.prefill_scope,
             &gpu.arch,
             gpu.arch == "gfx1151"
                 && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
         );
-        let prior_invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
+        // The agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`, gfx1151): a
+        // prefill tile of `min_rows..512` rows takes the same canonical routing
+        // (the >= 512-row kernel family) with the MoE on the F16 WMMA grouped arm.
+        let append = rdna_compute::prefill_invariant::qwen4_append_wmma_route(
+            rdna_compute::prefill_invariant::qwen4_append_wmma_enabled(),
+            self.prefill_scope,
+            &gpu.arch,
+            tokens.len(),
+            rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows(),
+            pm_invariant,
+        );
+        if append {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "qwen4 append route: prefill tiles of {}..511 rows on the canonical (>= 512-row) routes, MoE F16 WMMA (HIPFIRE_QWEN4_APPEND_WMMA)",
+                    rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows()
+                );
+            });
+        }
+        let prior_invariant =
+            std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
+        let prior_f16_moe = std::mem::replace(&mut gpu.qwen4_append_f16_moe_scope, append);
         // The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to max_chunk
         // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
         // contains live tokens. Compact scratch may alias live fields: never
@@ -5626,6 +5651,7 @@ impl Qwen4GpuForward {
         );
         gpu.qwen4_scope = scope;
         gpu.prefill_invariant_scope = prior_invariant;
+        gpu.qwen4_append_f16_moe_scope = prior_f16_moe;
         gpu.qwen4_trunk_iu4_prefill_scope = prior_ragged;
         result
     }

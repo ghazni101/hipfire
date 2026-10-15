@@ -160,6 +160,14 @@ asymmetric artifacts fail that check and stay on the F16 WMMA route.
 lower KLD but the slower prefill; the measured trade for each architecture is
 recorded with the knob in [`env-vars.md`](env-vars.md).
 
+On gfx1151, Flash-Next prefill tiles of 48 to 511 rows (agent-turn appends,
+tool results, short prompt tails) run on the >= 512-row kernel family by
+default. The tile engages `Gpu::prefill_invariant_scope`, so every row-count
+routing predicate sees the canonical chunk while launches keep the real row
+count. `Gpu::qwen4_append_f16_moe_scope` keeps that tile's MoE on the F16 WMMA
+grouped arm, because the IU4 arm below 512 rows exceeds the KLD cap.
+`HIPFIRE_QWEN4_APPEND_WMMA=0` restores the F32 SIMT routes.
+
 ### Qwen4 expert-parallel mesh (Flash-Next, EP2/EP4)
 
 `topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes `1`, `2` or `4`; `HIPFIRE_QWEN4_EP=0`

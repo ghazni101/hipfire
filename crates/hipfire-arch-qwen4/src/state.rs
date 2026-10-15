@@ -426,6 +426,43 @@ impl QsaGpuState {
         .chain(self.pooled_bf16.iter().map(|arena| &arena.mirror))
     }
 
+    /// Bytes of this layer's context arenas still unmapped between `mapped`
+    /// and `through` tokens, row-exact per arena (the pooled BF16 mirror
+    /// grows with the pooled keys, one row per `compress` tokens).
+    fn context_growth_bytes(&self, compress: usize, mapped: usize, through: usize) -> u64 {
+        let plain = [
+            (&self.full_keys, self.full_capacity, 1, false),
+            (&self.full_values, self.full_capacity, 1, false),
+            (&self.raw_index_keys, self.raw_capacity, 1, false),
+            (&self.pooled_keys, self.pooled_capacity, compress, false),
+        ];
+        let f16_rows = qsa_f16_arena_rows(self.full_capacity);
+        let f16 = self
+            .f16_arena
+            .iter()
+            .flat_map(|arena| [&arena.keys, &arena.values])
+            .map(|tensor| (tensor, f16_rows, 1, true));
+        let mirror = self
+            .pooled_bf16
+            .iter()
+            .map(|arena| (&arena.mirror, self.pooled_capacity, compress, false));
+        plain
+            .into_iter()
+            .chain(f16)
+            .chain(mirror)
+            .map(|(tensor, capacity, tokens_per_row, blocks)| {
+                context_arena_bytes_through(tensor, capacity, tokens_per_row, blocks, through)
+                    .saturating_sub(context_arena_bytes_through(
+                        tensor,
+                        capacity,
+                        tokens_per_row,
+                        blocks,
+                        mapped,
+                    ))
+            })
+            .sum()
+    }
+
     fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 7]> {
         let mut arenas = smallvec::smallvec![
             ContextArena {
@@ -527,6 +564,24 @@ fn arena_row_bytes(tensor: &GpuTensor, rows: usize) -> Result<usize, StateError>
         return Err(StateError::DimensionOverflow);
     }
     Ok(bytes / rows)
+}
+
+/// Logical bytes of the first rows of a `capacity`-row context arena that
+/// cover `tokens` tokens (`tokens_per_row` per row; `blocks` rounds the rows
+/// up to whole four-token blocks), the rows `ensure_mapped_capacity` maps.
+pub(crate) fn context_arena_bytes_through(
+    tensor: &GpuTensor,
+    capacity: usize,
+    tokens_per_row: usize,
+    blocks: bool,
+    tokens: usize,
+) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    let rows = tokens.div_ceil(tokens_per_row);
+    let rows = if blocks { qsa_f16_arena_rows(rows) } else { rows };
+    (tensor.byte_size() / capacity) as u64 * rows.min(capacity) as u64
 }
 
 /// All of `tensor` as a fixed session-snapshot part.
@@ -2086,22 +2141,22 @@ impl Qwen4State {
     }
 
     /// Context-arena bytes still unmapped below `through` tokens (at most
-    /// `max_seq_len`; 0 for legacy full-capacity arenas).
+    /// `max_seq_len`; 0 for legacy full-capacity arenas): each arena's rows
+    /// needed for `through` tokens (as [`Self::ensure_mapped_capacity`] maps
+    /// them: pooled keys and the pooled BF16 mirror by `ceil(through /
+    /// compress)`, the F16 arena rounded to four tokens) minus the rows
+    /// already mapped.
     pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
         if self.qsa_backend == Qwen4KvBackend::Legacy || self.max_seq_len == 0 {
             return 0;
         }
-        let capacity: u64 = self
-            .qsa
+        let through = through.min(self.max_seq_len);
+        self.qsa
             .iter()
-            .flat_map(|layer| layer.context_arenas())
-            .map(|tensor| tensor.byte_size() as u64)
-            .sum();
-        capacity
-            * through
-                .min(self.max_seq_len)
-                .saturating_sub(self.qsa_mapped_tokens) as u64
-            / self.max_seq_len as u64
+            .map(|layer| {
+                layer.context_growth_bytes(self.qsa_compress, self.qsa_mapped_tokens, through)
+            })
+            .sum()
     }
 
     /// Capture the fixed-size rollback state into the model-owned arena.

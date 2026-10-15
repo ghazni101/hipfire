@@ -94,8 +94,10 @@ impl AttachedWeightStore {
 
 /// Where every owner of `route` sits when the live state can continue in
 /// place: the target position, for native MTP only when the head sits there
-/// too (a retired head lags, a missing one cannot continue), and never while
-/// a verify row capture is armed. Plain data, so it runs without a GPU.
+/// too (a missing head cannot continue; a retired request's head lags until
+/// it catches up, at the latest in the terminal pending-seed flush), and
+/// never while a verify row capture is armed. Plain data, so it runs without
+/// a GPU.
 fn live_position(
     route: SessionRoute,
     target_position: usize,
@@ -1585,7 +1587,8 @@ impl Qwen4Bundle {
     /// Copy the wide HC stream row the last [`Self::spec_ar_token`] (or any
     /// ordinary one-token forward) left in the forward scratch into
     /// `destination` (F32, exactly `hc_count * hidden_size` elements). Valid
-    /// only until the next forward; for calibration, not the hot path.
+    /// only until the next forward. The AR floor's calibration token and
+    /// every retired AR token take it (one copy or BF16 widen per token).
     pub(crate) fn copy_ar_hidden_to(
         &self,
         gpu: &mut Gpu,
@@ -1598,6 +1601,35 @@ impl Qwen4Bundle {
             })?
             .copy_last_wide_hidden_to(gpu, &self.config, destination)
             .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// [`Self::copy_ar_hidden_to`] into row `row` of the spec hidden capture,
+    /// the row a later batched or per-row head append reads.
+    pub(crate) fn copy_ar_hidden_to_spec_row(
+        &self,
+        gpu: &mut Gpu,
+        row: usize,
+    ) -> Result<(), BundleError> {
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("spec hidden width overflow".to_string()))?;
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        let offset = row
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
+        if offset
+            .checked_add(width)
+            .is_none_or(|end| end > source.numel())
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 spec hidden row is outside capture".to_string(),
+            ));
+        }
+        self.copy_ar_hidden_to(gpu, &source.sub_offset(offset, width))
     }
 
     pub(crate) fn mtp_forward_token(

@@ -14,6 +14,12 @@
 //!
 //! The profile is opt-in (`HIPFIRE_PREFILL_PM_INVARIANT`) and only engaged by
 //! the qwen4 forward on gfx1151 via `Gpu::prefill_invariant_scope`.
+//!
+//! The same canonical-routing switch is also engaged per tile by the agent-turn
+//! append route (`HIPFIRE_QWEN4_APPEND_WMMA`, on by default, exact gfx1151,
+//! prefill tiles of `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS..512` rows), which
+//! additionally suppresses the symmetric IU4 MoE arm for that tile
+//! (`Gpu::qwen4_append_f16_moe_scope`).
 
 use crate::dispatch::Gpu;
 use std::sync::LazyLock;
@@ -61,6 +67,58 @@ pub fn qwen4_gdn_prefill() -> Qwen4GdnPrefill {
     *QWEN4_GDN_PREFILL
 }
 
+/// Default of `HIPFIRE_QWEN4_APPEND_WMMA`: on (KLD, coherence and timing gates
+/// on Strix Halo in the 0.4.3 CHANGELOG).
+pub const QWEN4_APPEND_WMMA_DEFAULT: bool = true;
+/// Default of `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS`: above the measured
+/// F32/append-route crossover (the route loses at 33 rows, wins at 55 and 81).
+pub const QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT: usize = 48;
+
+static QWEN4_APPEND_WMMA: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_APPEND_WMMA", QWEN4_APPEND_WMMA_DEFAULT)
+});
+
+/// `HIPFIRE_QWEN4_APPEND_WMMA` (developer bool, default [`QWEN4_APPEND_WMMA_DEFAULT`]), read once.
+pub fn qwen4_append_wmma_enabled() -> bool {
+    *QWEN4_APPEND_WMMA
+}
+
+static QWEN4_APPEND_WMMA_MIN_ROWS: LazyLock<usize> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT)
+});
+
+/// `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS` (developer var, default
+/// [`QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT`]; values below 2 are ignored), read once.
+pub fn qwen4_append_wmma_min_rows() -> usize {
+    *QWEN4_APPEND_WMMA_MIN_ROWS
+}
+
+/// Whether a qwen4 forward tile takes the agent-turn append route: an
+/// enabled prefill tile of `min_rows..QWEN4_F16_WMMA_MIN_TOKENS` rows on
+/// exact gfx1151 that is not already under the invariant profile. Decode,
+/// MTP verify, other arches, tiles of 512+ rows and the
+/// `HIPFIRE_PREFILL_PM_INVARIANT` profile (whose MoE must route the same at
+/// every row count) keep their route.
+pub fn qwen4_append_wmma_route(
+    enabled: bool,
+    prefill: bool,
+    arch: &str,
+    rows: usize,
+    min_rows: usize,
+    pm_invariant: bool,
+) -> bool {
+    enabled
+        && prefill
+        && !pm_invariant
+        && arch == "gfx1151"
+        && rows >= min_rows
+        && rows < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+}
+
 impl Gpu {
     /// Row count to feed ROUTING predicates (never launch extents): the
     /// canonical prefill chunk under the invariant profile, else `rows`.
@@ -94,5 +152,42 @@ mod tests {
         assert!(QWEN4_PREFILL_CANON_ROWS >= 2048);
         assert!(QWEN4_PREFILL_CANON_ROWS > 8);
         assert_eq!(QWEN4_PREFILL_CANON_ROWS % 128, 0);
+    }
+
+    #[test]
+    fn append_route_disabled_is_never_taken() {
+        for prefill in [false, true] {
+            for pm in [false, true] {
+                for arch in ["gfx1151", "gfx1201", "gfx942"] {
+                    for rows in [0, 1, 64, 511, 512, 8192] {
+                        assert!(!qwen4_append_wmma_route(false, prefill, arch, rows, 64, pm));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn append_route_row_window_and_gates() {
+        let route = |prefill, arch, rows, pm| {
+            qwen4_append_wmma_route(true, prefill, arch, rows, 64, pm)
+        };
+        assert!(!route(true, "gfx1151", 63, false));
+        assert!(route(true, "gfx1151", 64, false));
+        assert!(route(true, "gfx1151", 511, false));
+        assert!(!route(true, "gfx1151", 512, false));
+        assert!(!route(true, "gfx1151", 8192, false));
+        assert!(!route(false, "gfx1151", 256, false));
+        assert!(!route(true, "gfx1151", 256, true));
+        for arch in ["gfx1201", "gfx942", "gfx1100", "gfx1150"] {
+            assert!(!route(true, arch, 256, false));
+        }
+    }
+
+    #[test]
+    fn append_route_defaults() {
+        assert!(QWEN4_APPEND_WMMA_DEFAULT);
+        assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT >= 2);
+        assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT < QWEN4_F16_WMMA_MIN_TOKENS);
     }
 }

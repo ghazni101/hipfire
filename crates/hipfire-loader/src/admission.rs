@@ -571,9 +571,10 @@ pub fn effective_ep(arch_id: u32) -> usize {
 }
 
 /// Device memory a Qwen4 load keeps free beyond the growth it can name
-/// (context pages, gather workspace, native MTP request buffers): the
-/// first long request's other lazy allocations (measured ~1.9 GiB on Strix
-/// Halo with 8192-row chunks), kernel-cache warmup and VMM page rounding.
+/// (context pages, gather workspace, native MTP request buffers, resident
+/// PLE): the first long request's other lazy allocations (measured ~1.9 GiB
+/// on Strix Halo with 8192-row chunks), kernel-cache warmup and VMM page
+/// rounding.
 pub const QWEN4_MEMORY_HEADROOM_BYTES: u64 = 2 << 30;
 
 /// Smallest context an automatic Qwen4 load accepts.
@@ -586,12 +587,17 @@ pub struct Qwen4MemoryAdmission {
     /// Free device memory once the load's own allocations are made.
     pub free: u64,
     /// Target and MTP-head QSA context arenas still unmapped through
-    /// `max_seq` (VMM storage maps them as forwards reach them).
+    /// `max_seq` (VMM storage maps them as forwards reach them), including
+    /// the opt-in F16 arena of the QSA layers.
     pub context_growth: u64,
     /// Gathered QSA prefill workspace still uncommitted through `max_seq`.
     pub gather_growth: u64,
     /// Buffers the first native MTP request allocates and keeps.
     pub mtp_request: u64,
+    /// Host page cache the PLE prewarm / in-load fill keeps resident at
+    /// serve time. On unified memory it is part of the free memory
+    /// measured, so it is reserved here (0 when no PLE rows are cached).
+    pub resident_ple: u64,
     pub headroom: u64,
     /// Largest context whose growth fits (at most the assembled capacity).
     pub card_cap: usize,
@@ -606,26 +612,38 @@ impl Qwen4MemoryAdmission {
             .saturating_add(self.gather_growth)
             .saturating_add(self.mtp_request)
     }
+
+    /// What must be free after load: [`Self::growth`] plus the resident PLE
+    /// and the headroom.
+    pub fn required(&self) -> u64 {
+        self.growth()
+            .saturating_add(self.resident_ple)
+            .saturating_add(self.headroom)
+    }
 }
 
 /// Admit what a Qwen4 load commits after load against the `free` device
 /// memory its own allocations left, keeping `headroom` free: VMM context
 /// pages and the gathered workspace through a context of `t` tokens
 /// (`growth(t)` = `(context, gather)`, monotone, assembled for `capacity`
-/// tokens) and the native MTP request buffers. `card_cap` is the largest
-/// context that fits. An automatic load (`requested` = `None`) admits
-/// `min(capacity, card_cap)`; an explicit `max_seq` must fit whole. The
-/// session cache is not charged: its snapshots yield to context growth.
+/// tokens), the native MTP request buffers and the `resident_ple` bytes of
+/// PLE page cache that stay resident at serve time (unified memory counts
+/// them as free, so the context must leave them room). `card_cap` is the
+/// largest context that fits. An automatic load (`requested` = `None`)
+/// admits `min(capacity, card_cap)`; an explicit `max_seq` must fit whole.
+/// The session cache is not charged: its snapshots yield to context growth.
 pub fn qwen4_memory_admission(
     capacity: usize,
     requested: Option<usize>,
     free: u64,
     mtp_request: u64,
+    resident_ple: u64,
     headroom: u64,
     growth: impl Fn(usize) -> (u64, u64),
 ) -> Result<Qwen4MemoryAdmission, String> {
-    const MIB: u64 = 1 << 20;
-    let fixed = mtp_request.saturating_add(headroom);
+    let fixed = mtp_request
+        .saturating_add(resident_ple)
+        .saturating_add(headroom);
     let fits = |tokens: usize| {
         let (context, gather) = growth(tokens);
         context.saturating_add(gather).saturating_add(fixed) <= free
@@ -652,28 +670,25 @@ pub fn qwen4_memory_admission(
         context_growth,
         gather_growth,
         mtp_request,
+        resident_ple,
         headroom,
         card_cap,
         max_seq,
     };
     let detail = || {
         format!(
-            "a {max_seq}-token context commits {} MiB after load ({} MiB QSA context + {} MiB QSA gather workspace + {} MiB native MTP request buffers) plus {} MiB headroom, and {} MiB is free after load",
-            admission.growth() / MIB,
-            context_growth / MIB,
-            gather_growth / MIB,
-            mtp_request / MIB,
-            headroom / MIB,
-            free / MIB
+            "a {max_seq}-token context needs {} bytes free after load ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {resident_ple} bytes resident PLE + {headroom} bytes headroom), and {free} bytes is free after load",
+            admission.required(),
+            admission.growth(),
         )
     };
     match requested {
         None if max_seq < QWEN4_MIN_AUTO_CONTEXT.min(capacity) => Err(format!(
-            "qwen4: device memory cannot hold an automatic context: {}; free device memory",
+            "qwen4: device memory cannot hold an automatic context: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory and the PLE prewarm budget); free host memory or lower the PLE prewarm budget",
             detail()
         )),
         Some(requested) if requested > card_cap => Err(format!(
-            "qwen4: max_seq {requested} does not fit device memory: {}; lower memory.max_seq to at most {card_cap} or omit it",
+            "qwen4: max_seq {requested} does not fit device memory: {}; with the current free host memory the context fits up to {card_cap} tokens (this limit moves with free host memory and the PLE prewarm budget); lower memory.max_seq to at most {card_cap} or omit it",
             detail()
         )),
         _ => Ok(admission),
@@ -890,6 +905,37 @@ pub struct SequenceResolution {
     pub model_ctx: usize,
     pub card_cap: usize,
     pub kv_mode: &'static str,
+}
+
+/// The context a Qwen4 admission works from: an omitted `max_seq` on a
+/// discrete GPU is the default context (it keeps no automatic sequence);
+/// everything else, including an explicit value on any GPU, is unchanged.
+fn qwen4_requested_context(unified_memory: bool, max_seq: usize) -> usize {
+    if max_seq == 0 && !unified_memory {
+        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    } else {
+        max_seq
+    }
+}
+
+/// The Qwen4 sequence on a unified-memory APU: an omitted `max_seq` is
+/// automatic (the model's context, capped by the measured card capacity at
+/// load), an explicit one is honored and re-checked against the free memory
+/// after load ([`qwen4_memory_admission`]). A discrete GPU resolves no
+/// sequence, so its requested context is never memory-admitted here.
+fn qwen4_context_sequence(
+    unified_memory: bool,
+    max_seq: usize,
+    model_ctx: usize,
+    kv_mode: &'static str,
+) -> Option<SequenceResolution> {
+    unified_memory.then(|| SequenceResolution {
+        max_seq: if max_seq == 0 { model_ctx } else { max_seq },
+        bound: if max_seq == 0 { "pending" } else { "user" },
+        model_ctx,
+        card_cap: 0,
+        kv_mode,
+    })
 }
 
 /// Pure text-vs-VL decision. The vision tower tensor decides; configuration
@@ -1550,8 +1596,8 @@ pub fn admit_source_with_options(
     // explicit values are honored within the limits below. A discrete GPU
     // keeps the default context for an omitted max_seq and no sequence.
     let unified_memory = hipfire_config::is_unified_memory_arch(gpu_arch);
-    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 && !unified_memory {
-        hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+    let max_seq = if arch_id == QWEN4_ARCH_ID {
+        qwen4_requested_context(unified_memory, max_seq)
     } else {
         max_seq
     };
@@ -1607,15 +1653,12 @@ pub fn admit_source_with_options(
             ));
         }
         let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
-        if unified_memory {
-            qwen4_sequence = Some(SequenceResolution {
-                max_seq: if max_seq == 0 { model_ctx } else { max_seq },
-                bound: if max_seq == 0 { "pending" } else { "user" },
-                model_ctx,
-                card_cap: 0,
-                kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
-            });
-        }
+        qwen4_sequence = qwen4_context_sequence(
+            unified_memory,
+            max_seq,
+            model_ctx,
+            hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
+        );
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
@@ -3687,6 +3730,7 @@ mod tests {
                 None,
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3706,6 +3750,7 @@ mod tests {
                 None,
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3728,6 +3773,7 @@ mod tests {
                 Some(CAPACITY),
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3738,6 +3784,7 @@ mod tests {
                 Some(8192),
                 HALO_FREE,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3754,6 +3801,7 @@ mod tests {
                 None,
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3764,6 +3812,7 @@ mod tests {
                 Some(CAPACITY),
                 free,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3774,9 +3823,22 @@ mod tests {
             );
             assert!(error.contains(&format!("at most {cap}")), "{error}");
             assert!(
-                error.contains(
-                    "15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"
-                ),
+                error.contains(&format!(
+                    "with the current free host memory the context fits up to {cap} tokens"
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("moves with free host memory and the PLE prewarm budget"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "{} bytes QSA context incl. any F16 arena + {} bytes QSA gather workspace + {} bytes native MTP request buffers",
+                    15_392 * MIB,
+                    512 * MIB,
+                    740 * MIB
+                )),
                 "{error}"
             );
         }
@@ -3788,6 +3850,7 @@ mod tests {
                 None,
                 fixed() - 1,
                 MTP_REQUEST,
+                0,
                 QWEN4_MEMORY_HEADROOM_BYTES,
                 growth,
             )
@@ -3796,6 +3859,348 @@ mod tests {
                 error.contains("cannot hold an automatic context"),
                 "{error}"
             );
+            assert!(
+                error.contains("moves with free host memory and the PLE prewarm budget"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Strix Halo (gfx1151, 121 GiB shared host/GTT) admission of the
+    /// Flash-Next geometry with the opt-in QSA F16 arena, against the
+    /// measured free memory and the resident PLE budget. Growth comes from
+    /// the real `Qwen4Config` (48 layers, every 4th full attention = 12 QSA
+    /// layers, 2 KV heads x head_dim 256, 1 index head x 128, compress 4),
+    /// row-exact like `Qwen4State::context_growth_bytes`; the gathered
+    /// workspace is the real `qsa_gathered_wmma_scratch_bytes` when the
+    /// arena is off (with it on the route does not need the shared workspace).
+    mod qwen4_halo_arena {
+        use super::super::{
+            qwen4_context_sequence, qwen4_memory_admission, qwen4_requested_context,
+            QWEN4_MEMORY_HEADROOM_BYTES,
+        };
+        use hipfire_arch_qwen4::config::{
+            Qwen4Config, ARCHITECTURE_NAME, MODEL_TYPE, TEXT_MODEL_TYPE,
+        };
+        use rdna_compute::tensor_ops::{qsa_gathered_wmma_scratch_bytes, QsaStateLayout};
+
+        const MIB: u64 = 1 << 20;
+        const CAPACITY: usize = 262_144;
+        /// Free device memory after the load (min of HIP free and
+        /// MemAvailable + TTM pool).
+        const FREE: u64 = 33_605 * MIB;
+        /// Resident PLE budget: `ple_prewarm_budget_for(Auto, 23,038 MiB
+        /// MemAvailable)` = 23,038 - 8,192 MiB (below the 15 GiB cap).
+        const PLE: u64 = 14_846 * MIB;
+
+        fn config() -> Qwen4Config {
+            let layers: Vec<_> = (0..48)
+                .map(|idx| {
+                    if idx % 4 == 3 {
+                        "full_attention"
+                    } else {
+                        "linear_attention"
+                    }
+                })
+                .collect();
+            // Parsed from text: a `json!` literal this size overflows the
+            // macro's recursion limit.
+            let layers = serde_json::to_string(&layers).unwrap();
+            let text = r#"{
+                "architectures": ["@ARCH@"],
+                "model_type": "@MODEL@",
+                "text_config": {
+                    "model_type": "@TEXT@",
+                    "dtype": "bfloat16",
+                    "hidden_size": 2560,
+                    "vocab_size": 248320,
+                    "num_hidden_layers": 48,
+                    "max_position_embeddings": 262144,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "partial_rotary_factor": 0.25,
+                    "rope_parameters": {"rope_theta": 10000000.0},
+                    "attention_bias": false,
+                    "layer_types": @LAYERS@,
+                    "full_attention_interval": 4,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 48,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "mamba_ssm_dtype": "float32",
+                    "indexer_n_heads": 4,
+                    "indexer_kv_heads": 1,
+                    "indexer_head_dim": 128,
+                    "indexer_budget": 2048,
+                    "indexer_compress_ratio": 4,
+                    "num_experts": 512,
+                    "num_experts_per_tok": 10,
+                    "moe_intermediate_size": 640,
+                    "shared_expert_intermediate_size": 640,
+                    "norm_topk_prob": true,
+                    "hc_count": 4,
+                    "hc_lowrank": 320,
+                    "ple_layer_ids": [2],
+                    "ple_conv_kernel_size": 4,
+                    "ple_embed_dim": 2560,
+                    "split_ngram_parts": 128,
+                    "heads_per_ngram": 8,
+                    "ngram_size": 3,
+                    "ngram_vocab_size_base": 20000000,
+                    "make_ngram_vocab_size_divisible_by": 128,
+                    "eos_token_id": 248044,
+                    "tie_word_embeddings": false,
+                    "mtp_num_hidden_layers": 1,
+                    "mtp_use_dedicated_embeddings": false,
+                    "output_gate_type": "sigmoid",
+                    "mtp": {
+                        "hybrid": true,
+                        "layer_types": ["full_attention"],
+                        "num_hidden_layers": 1,
+                        "rope_theta": 10000000.0
+                    }
+                }
+            }"#
+            .replace("@ARCH@", ARCHITECTURE_NAME)
+            .replace("@MODEL@", MODEL_TYPE)
+            .replace("@TEXT@", TEXT_MODEL_TYPE)
+            .replace("@LAYERS@", &layers);
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            Qwen4Config::from_value(&value).expect("Flash-Next geometry")
+        }
+
+        /// `(context, gather)` growth of the target's QSA layers through
+        /// `tokens` (nothing mapped yet, no native MTP head: the receipt's
+        /// 20,352 MiB): per layer the rows `tokens` need, from the real
+        /// `qsa_context_arena_bytes` (pooled keys by `ceil(t / 4)`, the F16
+        /// arena rounded to four tokens), as `Qwen4State::context_growth_bytes`
+        /// counts them.
+        fn growth(arena: bool) -> impl Fn(usize) -> (u64, u64) {
+            growth_with(arena, false)
+        }
+
+        /// [`growth`] with the pooled BF16 mirror (`pooled_bf16`) on or off:
+        /// the mirror adds `ceil(t / 4)` blocks of 128 BF16 channels per layer.
+        fn growth_with(arena: bool, mirror: bool) -> impl Fn(usize) -> (u64, u64) {
+            let config = config();
+            assert_eq!(config.n_full_layers(), 12);
+            let layout = QsaStateLayout {
+                f16_arena: arena,
+                pooled_bf16: mirror,
+                ..QsaStateLayout::F32
+            };
+            let layers = config.n_full_layers() as u64;
+            let kv_heads = config.num_key_value_heads;
+            move |tokens| {
+                let tokens = tokens.min(CAPACITY);
+                let gather = if arena {
+                    0
+                } else {
+                    qsa_gathered_wmma_scratch_bytes(kv_heads, tokens).unwrap() as u64
+                };
+                let context = layers * config.qsa_context_arena_bytes(tokens, layout).unwrap() as u64;
+                (context, gather)
+            }
+        }
+
+        fn admit(
+            requested: Option<usize>,
+            arena: bool,
+            resident_ple: u64,
+        ) -> Result<super::super::Qwen4MemoryAdmission, String> {
+            qwen4_memory_admission(
+                CAPACITY,
+                requested,
+                FREE,
+                0,
+                resident_ple,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth(arena),
+            )
+        }
+
+        #[test]
+        fn config_costs_are_the_expected_halo_figures() {
+            let (with_arena, _) = growth(true)(CAPACITY);
+            let (plain, gather) = growth(false)(CAPACITY);
+            assert_eq!(plain, 14_208 * MIB);
+            assert_eq!(gather, 512 * MIB);
+            assert_eq!(with_arena, 20_352 * MIB);
+            assert_eq!(with_arena - plain, 6_144 * MIB);
+            // Row-exact: 12 x (4608 t + 512 ceil(t/4) + 8192 ceil(t/4)).
+            let cost = |t: u64| 12 * (4608 * t + 512 * t.div_ceil(4) + 8192 * t.div_ceil(4));
+            for t in [215_245u64, 215_246, 215_247, 215_248, CAPACITY as u64] {
+                assert_eq!(growth(true)(t as usize).0, cost(t), "{t}");
+            }
+            assert_eq!(cost(215_245), 17_522_743_296);
+            assert_eq!(cost(215_246), 17_522_798_592);
+        }
+
+        #[test]
+        fn pre_fix_arithmetic_passed_the_oversized_arena_context() {
+            // Without the PLE charge: 20,352 + 2,048 <= 33,605 MiB.
+            let admission = admit(Some(CAPACITY), true, 0).unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.required(), (20_352 + 2_048) * MIB);
+            // The PLE budget the prewarm then sets takes it over the card:
+            // 20,352 + 2,048 + 14,846 = 37,246 MiB > 33,605 MiB (3,641 MiB).
+            assert_eq!((20_352 + 2_048 + 14_846) * MIB - FREE, 3_641 * MIB);
+        }
+
+        #[test]
+        fn halo_arena_context_over_the_card_is_refused_with_exact_cap() {
+            let error = admit(Some(CAPACITY), true, PLE).unwrap_err();
+            assert_eq!(FREE - PLE - QWEN4_MEMORY_HEADROOM_BYTES, 17_522_753_536);
+            assert!(
+                error.contains("max_seq 262144 does not fit device memory"),
+                "{error}"
+            );
+            assert!(error.contains("at most 215245"), "{error}");
+            for part in [
+                format!("needs {} bytes free after load", 37_246 * MIB),
+                format!("{} bytes QSA context incl. any F16 arena", 20_352 * MIB),
+                "0 bytes QSA gather workspace".to_string(),
+                "0 bytes native MTP request buffers".to_string(),
+                format!("= {} bytes growth", 20_352 * MIB),
+                format!("{PLE} bytes resident PLE"),
+                format!("{} bytes headroom", QWEN4_MEMORY_HEADROOM_BYTES),
+                format!("{FREE} bytes is free after load"),
+            ] {
+                assert!(error.contains(&part), "{part}: {error}");
+            }
+            assert!(
+                error.contains("with the current free host memory the context fits up to 215245 tokens"),
+                "{error}"
+            );
+            assert!(
+                error.contains("moves with free host memory and the PLE prewarm budget"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn halo_arena_card_cap_is_the_largest_fit() {
+            let admission = admit(None, true, PLE).unwrap();
+            assert_eq!(admission.card_cap, 215_245);
+            assert_eq!(admission.max_seq, 215_245);
+            assert_eq!(admission.resident_ple, PLE);
+            assert!(admission.required() <= FREE);
+            assert_eq!(FREE - admission.required(), 10_240);
+            let next = growth(true)(215_246).0 + PLE + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert_eq!(next - FREE, 45_056);
+            // An explicit context at the cap is honored, one past it refuses.
+            assert_eq!(admit(Some(215_245), true, PLE).unwrap().max_seq, 215_245);
+            assert!(admit(Some(215_246), true, PLE).is_err());
+        }
+
+        /// The default-on pooled BF16 mirror is charged row-exact
+        /// (`256 * ceil(t / 4)` bytes per QSA layer) in the growth the
+        /// admission sizes the context against.
+        #[test]
+        fn halo_pooled_bf16_mirror_is_counted_in_the_card_cap() {
+            let off = growth_with(true, false);
+            let on = growth_with(true, true);
+            for t in [1usize, 4, 5, 215_245, 215_246, CAPACITY] {
+                let t_u = t as u64;
+                assert_eq!(on(t).0 - off(t).0, 12 * 256 * t_u.div_ceil(4), "{t}");
+            }
+            assert_eq!(on(CAPACITY).0 - off(CAPACITY).0, 192 * MIB);
+            let admission =
+                qwen4_memory_admission(CAPACITY, None, FREE, 0, PLE, QWEN4_MEMORY_HEADROOM_BYTES, &on)
+                    .unwrap();
+            let cap = admission.card_cap;
+            assert!(cap < 215_245, "the mirror lowers the cap: {cap}");
+            let total = |t: usize| on(t).0 + on(t).1 + PLE + QWEN4_MEMORY_HEADROOM_BYTES;
+            assert!(total(cap) <= FREE);
+            assert!(total(cap + 1) > FREE);
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                FREE,
+                0,
+                PLE,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                &on,
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("at most {cap}")), "{error}");
+        }
+
+        #[test]
+        fn halo_without_the_arena_accepts_the_whole_context() {
+            for requested in [None, Some(CAPACITY)] {
+                let admission = admit(requested, false, PLE).unwrap();
+                assert_eq!(admission.max_seq, CAPACITY);
+                assert_eq!(admission.card_cap, CAPACITY);
+                assert_eq!(admission.context_growth, 14_208 * MIB);
+                assert_eq!(admission.gather_growth, 512 * MIB);
+                // 14,208 + 512 + 14,846 + 2,048 = 31,614 MiB <= 33,605 MiB.
+                assert_eq!(admission.required(), 31_614 * MIB);
+            }
+        }
+
+        #[test]
+        fn discrete_arch_resolves_no_sequence_and_keeps_the_explicit_context() {
+            const KV: &str = "bf16";
+            let model_ctx = 262_144;
+            for arch in ["gfx1100", "gfx1201"] {
+                let unified = hipfire_config::is_unified_memory_arch(arch);
+                assert!(!unified, "{arch}");
+                // An omitted max_seq is the default context, an explicit
+                // 262144 is kept; neither resolves a memory-admitted sequence.
+                assert_eq!(
+                    qwen4_requested_context(unified, 0),
+                    hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
+                );
+                assert_eq!(qwen4_requested_context(unified, CAPACITY), CAPACITY);
+                assert!(qwen4_context_sequence(unified, 0, model_ctx, KV).is_none());
+                assert!(qwen4_context_sequence(unified, CAPACITY, model_ctx, KV).is_none());
+            }
+            // Halo resolves a sequence: omitted is pending at the model
+            // context, explicit is the user's bound (checked after load).
+            let halo = hipfire_config::is_unified_memory_arch("gfx1151");
+            assert!(halo);
+            assert_eq!(qwen4_requested_context(halo, 0), 0);
+            let pending = qwen4_context_sequence(halo, 0, model_ctx, KV).unwrap();
+            assert_eq!((pending.max_seq, pending.bound), (model_ctx, "pending"));
+            let user = qwen4_context_sequence(halo, CAPACITY, model_ctx, KV).unwrap();
+            assert_eq!((user.max_seq, user.bound), (CAPACITY, "user"));
+            assert_eq!(user.card_cap, 0);
+        }
+
+        #[test]
+        fn halo_free_is_the_gtt_clamp_of_the_measured_host_memory() {
+            use rdna_compute::uma_memory::{device_free_from, DeviceMemory};
+            // 121 GiB GTT-backed APU (1 GiB carve-out): hipMemGetInfo still
+            // shows 40,000 MiB free, MemAvailable + TTM pool only 33,605 MiB.
+            let halo = DeviceMemory {
+                device_free: 40_000 * MIB,
+                device_total: 121 << 30,
+                uma: true,
+                carveout_total: Some(1 << 30),
+                host_available: Some(FREE),
+            };
+            assert_eq!(device_free_from(halo), Some(FREE));
+            // The host side unreadable: refuse to size blind.
+            let blind = DeviceMemory {
+                host_available: None,
+                ..halo
+            };
+            assert_eq!(device_free_from(blind), None);
+            // A carve-out APU and a discrete card trust hipMemGetInfo.
+            let carve = DeviceMemory {
+                carveout_total: Some(121 << 30),
+                ..halo
+            };
+            assert_eq!(device_free_from(carve), Some(40_000 * MIB));
+            let discrete = DeviceMemory {
+                uma: false,
+                ..halo
+            };
+            assert_eq!(device_free_from(discrete), Some(40_000 * MIB));
         }
     }
 }

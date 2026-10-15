@@ -21,6 +21,10 @@
 //! logits and 16 greedy ids; the MTP leg repeats the chain and branch on the
 //! native MTP route (target plus draft head and its policy) and compares the
 //! seed token.
+//!
+//! `retired_turn_commits_live_on_flash_next` (`--features lab` only) checks
+//! that a native MTP turn the AR floor retired still ends with its head at
+//! the target and commits live for the conversation's next turn.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
@@ -555,5 +559,159 @@ fn message_end_snapshots_restore_on_flash_next() {
     assert_eq!(warm.2, cold.2, "AR message-end ids");
 
     gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// A native MTP turn the AR floor retired still commits live. Retired AR
+/// windows (`lab_ar_window(.., false)`, the floor's head-free route) advance
+/// the target alone and owe their head rows; the terminal flush of the
+/// pending token (`mtp_forced_advance`) appends them teacher-forced first, so
+/// head and target end together, `session_commit_live` keeps the state and
+/// the conversation's next turn prefills only its suffix in place. Before
+/// the fix the flush advanced the target alone and the head stayed behind,
+/// so the commit dropped the live state and the next turn restored a chunk
+/// snapshot instead. One owed row takes the per-row Append, more take the
+/// batched decode fill (where it runs). The caught-up state (target and
+/// head) must equal the same tokens teacher-forced with the head synced
+/// throughout, and both must continue the next turn to the same seed.
+///
+/// Built only with `--features lab` (`lab_ar_window`):
+/// `cargo test -p hipfire-arch-qwen4 --release --features lab --test
+/// session_cache_hw -- --ignored retired_turn_commits_live_on_flash_next`.
+#[cfg(feature = "lab")]
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL; build with --features lab"]
+fn retired_turn_commits_live_on_flash_next() {
+    use hipfire_runtime::spec::SpecRequestConfig;
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    bundle.attach_mtp(&mut gpu, MAX_SEQ).expect("MTP head");
+    let mut drafter = Qwen4MtpDrafter::new(3, MAX_SEQ, None);
+    let never = || false;
+    let a = prompt(0x7e7, 1500);
+    let mut mismatches = Vec::new();
+    for owed in [1usize, 2, 37] {
+        // The retired turn: cold prefill, `owed` head-free AR windows, then
+        // the terminal flush of the pending token.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        let seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .expect("MTP prefill");
+        let mut emitted = vec![seed];
+        for i in 0..owed {
+            let window = drafter
+                .lab_ar_window(&mut gpu, &mut bundle, a.len() + i, emitted[i], false)
+                .expect("retired AR window");
+            emitted.extend(window.committed);
+            assert_eq!(
+                SessionState::live_position(&bundle, SessionRoute::Mtp),
+                None,
+                "owed {owed}: the head lags while it owes rows"
+            );
+        }
+        assert_eq!(
+            emitted.len(),
+            owed + 1,
+            "owed {owed}: one token per AR window"
+        );
+        let flushed = MtpDrafter::mtp_forced_advance(
+            &mut drafter,
+            &mut gpu,
+            &mut bundle,
+            &emitted[owed..],
+            a.len() + owed,
+            &never,
+        )
+        .expect("terminal flush");
+        assert!(
+            flushed,
+            "owed {owed}: the drafter advances the retired flush itself"
+        );
+        let consumed: Vec<u32> = a.iter().chain(&emitted).copied().collect();
+        assert_eq!(
+            SessionState::live_position(&bundle, SessionRoute::Mtp),
+            Some(consumed.len()),
+            "owed {owed}: head and target end at the consumed history"
+        );
+        let retired = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, consumed.len());
+        let next: Vec<u32> = consumed.iter().copied().chain(prompt(0x2e7, 64)).collect();
+        bundle.session_commit_live(&consumed);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            consumed.len(),
+            "owed {owed}: the next turn continues live"
+        );
+        let live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[consumed.len()..],
+                consumed.len(),
+                true,
+                &never,
+            )
+            .expect("live prefill after the retired turn");
+        bundle.session_commit();
+
+        // Reference: the same tokens teacher-forced with the head synced.
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        let reference_seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .expect("reference MTP prefill");
+        assert_eq!(reference_seed, seed, "owed {owed}: cold seed");
+        assert!(
+            MtpDrafter::mtp_forced_advance(
+                &mut drafter,
+                &mut gpu,
+                &mut bundle,
+                &emitted,
+                a.len(),
+                &never
+            )
+            .expect("teacher-forced reference"),
+            "owed {owed}: the reference advance runs on the drafter"
+        );
+        let reference = state_digests(&mut bundle, &mut gpu, SessionRoute::Mtp, consumed.len());
+        bundle.session_commit_live(&consumed);
+        assert_eq!(
+            bundle.session_plan(&next, SessionRoute::Mtp),
+            consumed.len(),
+            "owed {owed}: the reference continues live"
+        );
+        let reference_live_seed = drafter
+            .mtp_prefill(
+                &mut gpu,
+                &mut bundle,
+                &next,
+                &next[consumed.len()..],
+                consumed.len(),
+                true,
+                &never,
+            )
+            .expect("live prefill after the reference turn");
+        bundle.session_commit();
+
+        let parts: Vec<usize> = (0..reference.len().max(retired.len()))
+            .filter(|&i| reference.get(i) != retired.get(i))
+            .collect();
+        println!(
+            "owed {owed}: consumed {} live seeds retired {live_seed} reference {reference_live_seed}; \
+             state parts differing from the reference: {parts:?} of {}",
+            consumed.len(),
+            reference.len()
+        );
+        if !parts.is_empty() || live_seed != reference_live_seed {
+            mismatches.push((owed, parts, live_seed, reference_live_seed));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "caught-up retired turns differ from the teacher-forced reference \
+         (owed, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
+    );
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }

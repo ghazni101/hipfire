@@ -1729,25 +1729,33 @@ impl MtpGpuState {
     }
 
     /// Context-arena bytes still unmapped below `through` tokens (at most
-    /// capacity; 0 for legacy).
+    /// capacity; 0 for legacy), row-exact per arena like the target's
+    /// ([`crate::state::context_arena_bytes_through`]).
     fn context_growth_bytes(&self, through: usize) -> u64 {
         if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
             return 0;
         }
-        let capacity: u64 = [
-            &self.full_keys,
-            &self.full_values,
-            &self.raw_index_keys,
-            &self.pooled_keys,
+        let through = through.min(self.full_capacity);
+        [
+            (&self.full_keys, self.full_capacity, 1),
+            (&self.full_values, self.full_capacity, 1),
+            (&self.raw_index_keys, self.raw_capacity, 1),
+            (&self.pooled_keys, self.pooled_capacity, self.compress),
         ]
-        .iter()
-        .map(|tensor| tensor.byte_size() as u64)
-        .sum();
-        capacity
-            * through
-                .min(self.full_capacity)
-                .saturating_sub(self.mapped_tokens) as u64
-            / self.full_capacity as u64
+        .into_iter()
+        .map(|(tensor, capacity, tokens_per_row)| {
+            let bytes = |tokens| {
+                crate::state::context_arena_bytes_through(
+                    tensor,
+                    capacity,
+                    tokens_per_row,
+                    false,
+                    tokens,
+                )
+            };
+            bytes(through).saturating_sub(bytes(self.mapped_tokens))
+        })
+        .sum()
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
