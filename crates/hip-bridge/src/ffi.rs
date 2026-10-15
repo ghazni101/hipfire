@@ -1999,6 +1999,7 @@ impl HipRuntime {
     /// charge is reserved before the raw import, committed on success and kept
     /// with the handle until a successful `mem_release`. Off state is the
     /// plain raw import.
+    #[cfg(unix)]
     pub(crate) fn mem_import_posix_charged(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
@@ -2017,6 +2018,7 @@ impl HipRuntime {
         )
     }
 
+    #[cfg(unix)]
     fn mem_import_posix_raw(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,
