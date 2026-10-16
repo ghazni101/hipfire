@@ -585,28 +585,41 @@ family `lightonocr3`/`lightonocr` maps to arch 5 in `scripts/registry_gen.py`.
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.53 GiB file); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB) declared in the `vision` slot |
+| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.53 GiB); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB, F16 tower) declared in the `vision` slot |
+| `lightonocr3:0.8b-q8` | `lightonocr3-0.8b.q8` | 0.82 | 2 | Q8 trunk (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) — the high-fidelity tier; same shared `lightonocr3-0.8b.vl` tower pack (byte-identical F16 bytes) |
 
 Build from the HF snapshot (the safetensors sits at the directory root, the
-configs under `source/` — stage them into one directory first):
+configs under `source/` — the trunk quantizer descends into `source/` on its
+own; `--vision-only` needs a flat dir, so stage the configs as symlinks next
+to the safetensors first):
 
 ```bash
-hipfire quantize <lightonocr3-dir> --format mq4 --output ~/.hipfire/models/lightonocr3-0.8b.mq4
-# and the vision tower, as the .vl sibling the loader discovers on its own:
-hipfire-quantize --input <lightonocr3-dir> --vision-only \
-    --output ~/.hipfire/models/lightonocr3-0.8b.vl
+hipfire quantize <lightonocr3-dir> --format mq4 --output <out>/lightonocr3-0.8b.mq4
+hipfire quantize <lightonocr3-dir> --format q8  --output <out>/lightonocr3-0.8b.q8
+# vision tower, once per quant dir — <stem>.vl (the quant suffix is stripped):
+hipfire-quantize --input <flat-lightonocr3-dir> --vision-only \
+    --output <out>/lightonocr3-0.8b.vl          # one pack, both trunks
 ```
 
-The model card's trained default is thinking **off**; the registry's
-`recommended_settings` lower that (`reasoning_effort: none`, temperature
-0.2, top_p 0.9), so `hipfire run` frames the closed think block on its own.
+On this host the artifacts live in the `~/models` store
+(`hipfire/lightonai/LightOnOCR-3-0.8B-{MQ4,Q8}/`, one quant per dir per the
+store convention), catalogued in `~/.hipfire/models.toml` with absolute
+paths — either tag resolves from there; placing the files in
+`~/.hipfire/models/` also works since the registry lookup falls back to the
+models dir.
+
+The model card's trained default is thinking **off**, and the registry's
+`recommended_settings` lower it (`reasoning_effort: none`, temperature 0.2,
+top_p 0.9). Serve requests must carry that field themselves
+(`"reasoning_effort": "none"`): without it the adapter's page text lands in
+the reasoning channel and `content` is empty.
 The card's prompt modes work verbatim: an empty prompt transcribes the page,
 `grounding` returns `![label](x0,y0,x1,y1)` bounding boxes in 0–1000
-coordinates. Image turns need the tower; `vision_mode` stays `off` by
-default, so enable it once:
+coordinates. Image turns need the tower; `vision_mode` defaults to `auto`, so a
+`<stem>.vl` beside the trunk loads with no configuration:
 
 ```bash
-hipfire config lightonocr3:0.8b set vision.mode auto
+hipfire config lightonocr3:0.8b set vision.mode auto        # and/or the q8 tag
 hipfire run lightonocr3:0.8b "" --image page.png
 hipfire run lightonocr3:0.8b grounding --image page.png
 ```
@@ -649,6 +662,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
 | `lightonocr3` / `lightonocr3:0.8b-mq4` | `lightonocr3:0.8b` |
+| `lightonocr3:q8` | `lightonocr3:0.8b-q8` |
 
 ---
 
