@@ -581,6 +581,42 @@ directory, so run it somewhere disposable or delete them afterwards. `--format
 q4k` is refused at load: Q4K (qt=4) is a GGUF/Maple-side container outside the
 dense HFQ decode set, which this encoder's host decoder does not implement.
 
+### LightOnOCR-3 0.8B (arch 5 — local-only row, no Hub artifact)
+
+`lightonai/LightOnOCR-3-0.8B` — Apache-2.0 document-OCR VLM on the
+Qwen3.5-VL architecture (24 hybrid DeltaNet/`full_attention` layers, tied
+248,320 vocab, `model.visual.*` patch-16 ViT tower). Registered local-only
+as `lightonocr3:0.8b` (aliases `lightonocr3`, `lightonocr3:0.8b-mq4`); the
+family `lightonocr3`/`lightonocr` maps to arch 5 in `scripts/registry_gen.py`.
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.53 GiB file); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB) declared in the `vision` slot |
+
+Build from the HF snapshot (the safetensors sits at the directory root, the
+configs under `source/` — stage them into one directory first):
+
+```bash
+hipfire quantize <lightonocr3-dir> --format mq4 --output ~/.hipfire/models/lightonocr3-0.8b.mq4
+# and the vision tower, as the .vl sibling the loader discovers on its own:
+hipfire-quantize --input <lightonocr3-dir> --vision-only \
+    --output ~/.hipfire/models/lightonocr3-0.8b.vl
+```
+
+The model card's trained default is thinking **off**; the registry's
+`recommended_settings` lower that (`reasoning_effort: none`, temperature
+0.2, top_p 0.9), so `hipfire run` frames the closed think block on its own.
+The card's prompt modes work verbatim: an empty prompt transcribes the page,
+`grounding` returns `![label](x0,y0,x1,y1)` bounding boxes in 0–1000
+coordinates. Image turns need the tower; `vision_mode` stays `off` by
+default, so enable it once:
+
+```bash
+hipfire config lightonocr3:0.8b set vision.mode auto
+hipfire run lightonocr3:0.8b "" --image page.png
+hipfire run lightonocr3:0.8b grounding --image page.png
+```
+
 ---
 
 ## Aliases
@@ -618,6 +654,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
+| `lightonocr3` / `lightonocr3:0.8b-mq4` | `lightonocr3:0.8b` |
 
 ---
 
@@ -628,7 +665,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | Family | arch_id | Crate | Registry examples |
 |---|---:|---|---|
 | LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, `qwen3:0.6b` (HF4 dense) |
-| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense |
+| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense, `lightonocr3:0.8b` (VL) |
 | Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b*`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
 | DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash`, `deepseek-v4-flash:mq2lloyd`, `deepseek-v4-flash-preview` |
