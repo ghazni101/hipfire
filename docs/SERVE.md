@@ -171,6 +171,27 @@ Config and env owners for bind, idle, queue, and body limits:
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
 
+   `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
+   storage from fixed per-slot slabs to one VMM reservation per slot, mapped
+   as requests are admitted up to their prompt + generation budget. Prefill
+   runs on the singleton body against the slot's own cache, so each request's
+   prefill/decode arithmetic is the serial route's; decode is batched through
+   the descriptor-addressed `_vmm` kernels. Vision and MTP run on this route:
+   image requests use the sequential per-token VL path against the slot's own
+   cache (`--vision` with `vision_mode=on`), while text requests stay batched;
+   MTP's verify rows ride the batched decode step. DFlash is deferred (an
+   explicit `dflash_mode=on` fails the load; a present draft is ignored with one
+   line). The route refuses `serve.prefix_cache` and ignores the
+   `HIPFIRE_SLOTS_PAGED` dev knob. Every unservable combination is refused
+   before any GPU allocation. On this route decode always runs the
+   row-batched `_vmm` kernels, so a greedy comparison against the sequential
+   route (or against a different batch composition) is expected to differ at
+   some token, as on the arena route: output is deterministic for a fixed batch
+   composition and fully request-isolated, not byte-equal across routes. Design:
+   [`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`](plans/2026-10-22-vmm-kv-multislot-engine.md).
+   A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
+   qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
+
    The **embedding** route (arch 17) uses the same switch with a different
    engine behind it: `POST /v1/embeddings` requests arriving together are
    served as **one batched forward** rather than one at a time, and because the

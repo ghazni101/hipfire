@@ -3248,7 +3248,7 @@ fn run_fullattn_moe_layer_slots(
 /// to every slot count once the WMMA flash-prefill port (root cause #1)
 /// stopped masking the same mismatch at `n_slots >= 2` — see the loop body
 /// below for the empirical confirmation.
-fn final_logits_per_slot(
+pub(crate) fn final_logits_per_slot(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -3852,7 +3852,7 @@ pub fn forward_batch_slots_graphed_opts(
 /// Undo `advance_slot_seq_lens` for this batch: restore each active slot to
 /// the length it had before the step. Used only by the graph path, which runs
 /// the same step body twice (once to warm, once to capture).
-fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
+pub(crate) fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()> {
     for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
         if m == 0 {
             continue;
@@ -4408,7 +4408,7 @@ pub fn forward_batch_slots_opts(
 /// The per-layer body shared by the arena and VMM slots forwards. `kv_addr`
 /// yields the KV storage for FullAttention layer `kv_layer_idx`.
 #[allow(clippy::too_many_arguments)]
-fn run_layers_slots<'a, D, F>(
+pub(crate) fn run_layers_slots<'a, D, F>(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,

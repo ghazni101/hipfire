@@ -35,6 +35,9 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, CheckpointPool};
 use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
 use crate::grammar;
+use crate::serve_vmm::{
+    slot_reserve_end, vmm_format_for_mode, vmm_slot_budget, VmmSlotKv, VMM_SNAPSHOT_TAG_BIT,
+};
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
@@ -110,9 +113,14 @@ pub struct EngineConfig {
     /// explicitly so a bypass of the daemon capability gate still fails
     /// closed inside the engine thread.
     pub kv_mode_raw: String,
-    /// Effective `--kv-backend` for this load (`legacy` default). Slot
-    /// arenas are fixed contiguous `SlotPool` allocations; `vmm` is rejected
-    /// in `Rig::build` before any GPU allocation.
+    /// Effective `--kv-backend` for this load (`legacy` default).
+    ///
+    /// `legacy` keeps the fixed `SlotPool` arenas. `vmm` (q8/fp8 KV only,
+    /// no prefix cache, MTP yes / DFlash deferred) gives every slot its own
+    /// `KvCache` VMM reservation, mapped at admission; vision models run
+    /// image requests on the sequential VL path against their own slot owner.
+    /// See `serve_vmm` and `docs/plans/2026-10-22-vmm-kv-multislot-engine.md`.
+    /// Every combination the route cannot serve is refused in `Rig::build`.
     pub kv_backend: String,
     /// Cross-session prefix cache (radix index + checkpoint pool). Default
     /// false: the existing session-local continuation path (convo hashes)
@@ -392,6 +400,16 @@ struct ModelRig {
     /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
     /// None when `prefix_cache` is off.
     checkpoint_pool: Option<crate::checkpoint::CheckpointPool<DeltaNetSnapshot>>,
+    /// Per-slot VMM KV owners (`kv_backend=vmm`). `None` on the arena route,
+    /// which uses `k_arenas`/`v_arenas` + `desc_staging` instead.
+    vmm: Option<VmmSlotKv>,
+    /// Per-slot row offset of the LAST forward's contribution: the decode
+    /// batch offset for a decoding slot, 0 for a prefilling slot (its hidden
+    /// rows are packed from 0 in `mtp_prefill_hidden`), `usize::MAX` when the
+    /// slot contributed nothing. Spec accept steps and the MTP head prefill
+    /// index `pbs`/the verify tape/hidden staging through this, because the
+    /// VMM route splits prefill and decode rows into separate passes.
+    vmm_row_offsets: Vec<usize>,
 }
 
 impl ModelRig {
@@ -410,7 +428,21 @@ impl ModelRig {
         lm_head_skip: &[bool],
         any_verify: bool,
         any_dflash_rows: bool,
+        prefill_slots: &[bool],
+        mtp_prefill_slots: &[bool],
     ) -> rdna_compute::HipResult<()> {
+        if self.vmm.is_some() {
+            return self.forward_step_vmm(
+                gpu,
+                batch,
+                pool,
+                lm_head_skip,
+                prefill_slots,
+                mtp_prefill_slots,
+                any_verify,
+                any_dflash_rows,
+            );
+        }
         let mut capture = (any_verify || any_dflash_rows).then(|| {
             let tape = self
                 .spec_verify_tape
@@ -445,6 +477,130 @@ impl ModelRig {
             &self.logits_out,
             graph,
             self.spec_rows,
+            lm_head_skip,
+            capture.as_mut(),
+        )
+    }
+
+    /// VMM route: prompt chunks run on the singleton prefill body against the
+    /// slot's own VMM owner, and the remaining decode/verify rows run as one
+    /// `_vmm`-addressed batched step. Speculation is supported here: verify
+    /// rows are part of the decode batch and their tape/hidden rows are
+    /// captured by that pass, so the accept steps index through
+    /// `vmm_row_offsets` (the split renumbers rows relative to the engine's
+    /// `batch`). Pure-decode steps are graph-captured when enabled.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step_vmm(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &SlotBatch,
+        pool: &mut SlotPool,
+        lm_head_skip: &[bool],
+        prefill_slots: &[bool],
+        mtp_prefill_slots: &[bool],
+        any_verify: bool,
+        any_dflash_rows: bool,
+    ) -> rdna_compute::HipResult<()> {
+        let Self {
+            vmm,
+            weights,
+            config,
+            scratch,
+            dn_states,
+            pbs,
+            logits_out,
+            spec_verify_tape,
+            dflash,
+            spec_rows,
+            mtp_prefill_hidden,
+            vmm_row_offsets,
+            ..
+        } = self;
+        let store = vmm
+            .as_mut()
+            .ok_or_else(|| rdna_compute::HipError::new(0, "forward_step_vmm: VMM store missing"))?;
+        // Spec capture is built here (not by the caller) because the VMM path
+        // destructures the model fields it borrows.
+        let mut capture = (any_verify || any_dflash_rows).then(|| {
+            let tape = spec_verify_tape
+                .as_mut()
+                .expect("spec drafts require the verify tape");
+            crate::forward_slots::SpecVerifyCapture {
+                tape,
+                verify_slots: lm_head_skip,
+                stride: *spec_rows,
+                hidden: if any_dflash_rows {
+                    dflash
+                        .as_ref()
+                        .map(|d| d.hidden_capture(config.dim))
+                } else {
+                    None
+                },
+            }
+        });
+        let n = batch.m_per_slot.len();
+        vmm_row_offsets.fill(usize::MAX);
+        // Split rows by slot kind. A prefilling slot's rows go to the
+        // singleton body; everything else (decode/verify) stays batched. Row
+        // order within the decode batch is the original slot order, so
+        // lm_head_skip (indexed by slot) stays valid.
+        let mut decode = SlotBatch::default();
+        decode.m_per_slot = vec![0; n];
+        let mut off = 0usize;
+        for s in 0..n {
+            let m = batch.m_per_slot.get(s).copied().unwrap_or(0);
+            if m == 0 {
+                continue;
+            }
+            let rows = off..off + m;
+            off += m;
+            if prefill_slots.get(s).copied().unwrap_or(false) {
+                let start = batch.positions[rows.start] as usize;
+                // MTP-armed prompt chunks also capture post-output-norm
+                // hidden rows for the head prefill (packed from row 0).
+                let hidden = mtp_prefill_slots
+                    .get(s)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(&*mtp_prefill_hidden);
+                vmm_row_offsets[s] = 0;
+                store.prefill_chunk(
+                    gpu,
+                    weights,
+                    config,
+                    scratch,
+                    s,
+                    &batch.tokens[rows.clone()],
+                    start,
+                    &mut dn_states[s],
+                    logits_out,
+                    hidden,
+                )?;
+                continue;
+            }
+            vmm_row_offsets[s] = decode.tokens.len();
+            decode.m_per_slot[s] = m;
+            decode.tokens.extend_from_slice(&batch.tokens[rows.clone()]);
+            decode
+                .positions
+                .extend_from_slice(&batch.positions[rows.clone()]);
+            decode
+                .row_slot
+                .extend_from_slice(&batch.row_slot[rows.clone()]);
+        }
+        if decode.total_rows() == 0 {
+            return Ok(());
+        }
+        store.forward_step(
+            gpu,
+            weights,
+            config,
+            &decode,
+            pool,
+            dn_states,
+            pbs,
+            scratch,
+            logits_out,
             lm_head_skip,
             capture.as_mut(),
         )
@@ -790,15 +946,33 @@ impl Rig {
             .iter()
             .filter(|t| **t == LayerType::FullAttention)
             .count();
-        // Slot arenas are `SlotPool` allocations under a resolved KV tier.
-        // `kv_backend` other than `legacy` has no slot path at all; reject
-        // before any GPU allocation. The daemon capability gate normally
-        // refuses these first; this is the fail-closed inner check.
-        if cfg.kv_backend != "legacy" {
-            return Err(format!(
-                "experimental multi-slot requires kv_backend=legacy (got {:?})",
-                cfg.kv_backend
-            ));
+        // Slot KV storage: `legacy` = fixed `SlotPool` arenas, `vmm` =
+        // per-slot VMM owners. Every combination the VMM route cannot serve is
+        // refused BEFORE any GPU allocation (the daemon capability gate
+        // normally refuses these first; this is the fail-closed inner check).
+        let kv_backend: hipfire_runtime::kv_backend::KvBackend = cfg
+            .kv_backend
+            .parse()
+            .map_err(|e| format!("kv_backend {:?}: {e}", cfg.kv_backend))?;
+        let use_vmm = kv_backend == hipfire_runtime::kv_backend::KvBackend::Vmm;
+        let vl_env = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        // VMM + vision: image requests run the sequential per-token VL path
+        // against the slot's own VMM owner (`VmmSlotKv::slot_view`). That path
+        // already owns the whole request (M-RoPE + visual embeddings) and the
+        // scheduler keeps VL slots out of the batched body, so no M-RoPE
+        // support is needed in the `_vmm` kernels. Text requests stay batched.
+        let vl_sequential = vl_env || (use_vmm && (cfg.is_vl || cfg.vl_path.is_some()));
+        if use_vmm {
+            if cfg.prefix_cache {
+                return Err("experimental multi-slot kv_backend=vmm does not support serve.prefix_cache yet (the radix index shares PagePool pages; the VMM route has no page pool); disable serve.prefix_cache or use kv_backend=legacy".to_string());
+            }
+            if vl_sequential && (cfg.is_vl || cfg.vl_path.is_some()) {
+                eprintln!(
+                    "[hipfire] kv_backend=vmm + vision: image requests use the sequential VL path on their own slot owner; text requests stay batched"
+                );
+            }
         }
         // Resolve the KV tier through the slots site policy — same config
         // source and alias table as the sequential carrier, but with q8 as
@@ -829,6 +1003,13 @@ impl Rig {
                 hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY.site
             ));
         }
+        // VMM storage is restricted to the tiers with a validated `_vmm`
+        // descriptor kernel (q8, fp8). The arena ladder keeps everything else.
+        let vmm_format = if use_vmm {
+            Some(vmm_format_for_mode(kv_mode).map_err(|e| format!("experimental multi-slot: {e}"))?)
+        } else {
+            None
+        };
         // Native fp8 KV is admitted here only on exact gfx1201, where the
         // descriptor-aware fp8 write/attend kernels exist. The arch gate
         // sits right after `Gpu::init` below — that is the first point the
@@ -857,21 +1038,39 @@ impl Rig {
         // verify tape are sized by — both allocated before the GPU-side
         // draft load below. A parse failure here is non-fatal unless
         // `dflash_required` (the load itself re-parses and reports).
-        let dflash_block = cfg.dflash_draft.as_ref().and_then(|p| {
+        // Speculation on the VMM route: MTP is supported (verify rows ride the
+        // batched decode pass and its tape/hidden capture; the engine indexes
+        // them through `vmm_row_offsets`). DFlash stays deferred on this route
+        // — its draft context ring is seeded from a batched-prefill hidden
+        // capture that the singleton prefill does not produce.
+        let (mtp_k, dflash_draft) = if use_vmm {
+            if cfg.dflash_required {
+                return Err("experimental multi-slot kv_backend=vmm does not support dflash_mode=on yet; run with --spec off or use kv_backend=legacy".to_string());
+            }
+            if cfg.dflash_draft.is_some() {
+                eprintln!(
+                    "[hipfire] kv_backend=vmm: DFlash is deferred on this route — serving without it (MTP is supported)"
+                );
+            }
+            (cfg.mtp_k, None)
+        } else {
+            (cfg.mtp_k, cfg.dflash_draft.clone())
+        };
+        let dflash_block = dflash_draft.as_ref().and_then(|p| {
             hipfire_runtime::hfq::HfqFile::open(p)
                 .ok()
                 .and_then(|h| hipfire_runtime::dflash::DflashConfig::from_hfq(&h))
                 .map(|c| c.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED))
         });
-        if cfg.dflash_required && cfg.dflash_draft.is_some() && dflash_block.is_none() {
+        if cfg.dflash_required && dflash_draft.is_some() && dflash_block.is_none() {
             return Err(format!(
                 "dflash_mode=on: failed to parse DflashConfig from {}",
-                cfg.dflash_draft.as_ref().unwrap().display()
+                dflash_draft.as_ref().unwrap().display()
             ));
         }
         // Verify rows per spec slot: MTP k+1, DFlash2 B — the larger wins so
         // the tape stride and batch sizing cover either mechanism.
-        let spec_rows = (cfg.mtp_k + 1).max(dflash_block.unwrap_or(0));
+        let spec_rows = (mtp_k + 1).max(dflash_block.unwrap_or(0));
         // A step carries at most max(prefill_chunk, spec_rows) rows per
         // slot: prefilling slots contribute up to `prefill_chunk` rows, and
         // a decoding spec slot injects `spec_rows` verify rows. Sizing
@@ -896,7 +1095,19 @@ impl Rig {
         // pages across sessions via PagePool refcounting, which is only
         // available in paged mode. Force it on when prefix_cache is enabled.
         let prefix_cache = cfg.prefix_cache;
-        let paged_pages = if prefix_cache {
+        let paged_pages = if use_vmm {
+            // No page pool on the VMM route: owners are their own
+            // reservations. The developer knob cannot be honored here.
+            if hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+            {
+                eprintln!(
+                    "  [hipfire] HIPFIRE_SLOTS_PAGED ignored: kv_backend=vmm has no page pool (per-slot VMM reservations instead)"
+                );
+            }
+            None
+        } else if prefix_cache {
             let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
             // Cache-retained pages share the same physical pool as active slots.
             // Keep one prefill chunk plus one page per slot available beyond
@@ -989,7 +1200,9 @@ impl Rig {
         let kv_stride = per_pos_bytes.saturating_add(per_pos_v_bytes) as u64;
         let kv = hipfire_runtime::offload::kv_reserve(kv_stride, kv_rows)
             .ok_or("slots KV reservation overflow")?;
-        let kv_bytes = kv.bytes;
+        // The VMM route reserves virtual space per slot lazily and maps on
+        // demand, so nothing is charged against VRAM at load.
+        let kv_bytes = if use_vmm { 0 } else { kv.bytes };
 
         // Partial GPU offload is resolved here, once, before the preflight — the
         // same call the sequential carrier makes, so both routes place
@@ -997,13 +1210,22 @@ impl Rig {
         // placement and skips the capacity check entirely, keeping a no-knob load
         // byte-identical to the pre-offload loader.
         let layer_bytes = qwen35::load::qwen35_layer_bytes(&hfq, &config);
+        // VMM reserves no up-front KV, so the placement search must not budget
+        // an arena it will never allocate (that would spill layers to buy
+        // capacity this route already has).
+        let kv_plan_reserve = if use_vmm {
+            hipfire_runtime::offload::kv_reserve(kv_stride, 0)
+                .ok_or("slots KV reservation overflow")?
+        } else {
+            kv
+        };
         let placement = Self::resolve_slot_offload(
             &layer_bytes,
             &config,
             cfg,
             &gpu,
             vram_free as u64,
-            kv,
+            kv_plan_reserve,
             hfq.arch_id,
         )?;
 
@@ -1120,7 +1342,6 @@ impl Rig {
         // not engage under paged (the graphed entry falls back to the plain
         // step), and `mtp_verify_fits_cap` retires MTP before a verify's
         // k+1-row frontier could fail the paged provision closed.
-        let mtp_k = cfg.mtp_k;
         // MTP over a host spill declines like the sequential route: the
         // verify re-reads host-mapped experts over the link, and a head that
         // is unverified there has garbled windows (`qwen3.6-35b-a3b.mq6` at
@@ -1236,7 +1457,7 @@ impl Rig {
         // slot path runs the DFlash2 selector chain only — legacy DFlash
         // drafts are refused inside `load_dflash_shared`. `dflash_required`
         // (dflash_mode=on) fails the load; auto warns and serves AR.
-        let dflash = match &cfg.dflash_draft {
+        let dflash = match &dflash_draft {
             Some(path) => match crate::dflash_slot::load_dflash_shared(
                 &mut gpu,
                 &path.to_string_lossy(),
@@ -1422,21 +1643,23 @@ impl Rig {
         }
         let k_arena_bytes = pool.k_arena_bytes();
         let v_arena_bytes = pool.v_arena_bytes();
-        for _ in 0..n_fa_layers {
-            let k = g
-                .gpu
-                .as_mut()
-                .unwrap()
-                .zeros(&[k_arena_bytes], DType::Raw)
-                .map_err(|e| format!("k arena: {e}"))?;
-            g.k_arenas.push(k);
-            let v = g
-                .gpu
-                .as_mut()
-                .unwrap()
-                .zeros(&[v_arena_bytes], DType::Raw)
-                .map_err(|e| format!("v arena: {e}"))?;
-            g.v_arenas.push(v);
+        if !use_vmm {
+            for _ in 0..n_fa_layers {
+                let k = g
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .zeros(&[k_arena_bytes], DType::Raw)
+                    .map_err(|e| format!("k arena: {e}"))?;
+                g.k_arenas.push(k);
+                let v = g
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .zeros(&[v_arena_bytes], DType::Raw)
+                    .map_err(|e| format!("v arena: {e}"))?;
+                g.v_arenas.push(v);
+            }
         }
         // Rotation tables for the resolved tier: Givens angles (asym) or
         // FWHT sign vectors (fwht), model-global and shared by every slot
@@ -1558,9 +1781,6 @@ impl Rig {
         let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
         let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
             (0..cfg.n_slots).map(|_| None).collect();
-        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-            .ok()
-            .is_some_and(|v| v == "1" || v == "on" || v == "true");
         if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
             return Err(
                 "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
@@ -1574,7 +1794,8 @@ impl Rig {
             .iter()
             .map(|t| t.buf.size() as u64)
             .sum();
-        let kv_dtype_tag = slot_snapshot_kv_tag(kv_mode);
+        let kv_dtype_tag = slot_snapshot_kv_tag(kv_mode)
+            | if use_vmm { VMM_SNAPSHOT_TAG_BIT } else { 0 };
         let stamp = SnapshotStamp {
             model_hash: weight_bytes,
             kv_dtype_tag,
@@ -1663,6 +1884,32 @@ impl Rig {
         let mtp_prefill_hidden = gpu
             .zeros(&[prefill_chunk.max(1) * config.dim], DType::F32)
             .map_err(|e| format!("mtp prefill hidden staging: {e}"))?;
+        // VMM KV storage is constructed after every non-KV allocation: its
+        // budget is the live free VRAM at this point (the owners themselves
+        // are created per slot on first admission, VA-only).
+        let vmm = match vmm_format {
+            Some(format) => {
+                let budget = vmm_slot_budget(&gpu);
+                let store = VmmSlotKv::new(
+                    &mut gpu,
+                    &config,
+                    format,
+                    cfg.n_slots,
+                    cfg.cap_tokens,
+                    max_batch,
+                    budget,
+                )
+                .map_err(|e| format!("experimental multi-slot kv_backend=vmm: {e}"))?;
+                eprintln!(
+                    "[hipfire] slot KV tier {kv_mode:?} on vmm: {} slots x cap {} tokens, mapped-byte budget {} MiB",
+                    cfg.n_slots,
+                    cfg.cap_tokens,
+                    budget / (1024 * 1024)
+                );
+                Some(store)
+            }
+            None => None,
+        };
         // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
         // Build the CacheDomain ONCE from available identities. When
         // prefix_cache is off, all three are None and the existing path is
@@ -1831,6 +2078,8 @@ impl Rig {
                 vl_ext_devs,
                 vl_tower_jobs,
                 checkpoint_pool,
+                vmm,
+                vmm_row_offsets: vec![usize::MAX; cfg.n_slots],
             },
             out_tokens,
             sample_params,
@@ -1899,6 +2148,7 @@ impl Rig {
                     vl_ext_devs,
                     vl_tower_jobs,
                     checkpoint_pool,
+                    vmm,
                     ..
                 },
             ..
@@ -1939,6 +2189,12 @@ impl Rig {
             }
             if let Some(k) = k_arenas.pop() {
                 note_hip(gpu.free_tensor(k));
+            }
+        }
+        // VMM slot KV owners and their staging (no-op on the arena route).
+        if let Some(store) = vmm {
+            if let Err(e) = store.free_gpu(&mut gpu) {
+                note_hip(Err(rdna_compute::HipError::new(0, &e)));
             }
         }
         weights.free_gpu(&mut gpu);
@@ -1991,6 +2247,17 @@ impl ModelRig {
     /// the same bytes via `legacy_base`. Views are `DeviceBuffer::Borrowed`
     /// — dropping the KvCache does not free the arenas.
     fn slot_kv_view(&self, pool: &SlotPool, slot: SlotId) -> KvCache {
+        // VMM route: the "view" is the slot's own owner (shallow tensor
+        // clones), so the sequential VL writer lands in that slot's
+        // reservation and no arena exists.
+        if let Some(store) = &self.vmm {
+            return store.slot_view(slot.0).unwrap_or_else(|| {
+                panic!(
+                    "slot_kv_view: VMM slot {} has no owner (admission did not reserve it)",
+                    slot.0
+                )
+            });
+        }
         // Paged slots have no contiguous slab: every legacy base is 0, so this
         // view would alias the arena prefix for ALL slots. Sequential writers
         // (VL, MTP prefill/replay) must be gated off under paged KV at
@@ -2340,6 +2607,7 @@ impl ModelRig {
         chunk_positions: &[i32],
         row_off: usize,
         m: usize,
+        hidden_normed: bool,
     ) -> Result<(), String> {
         let head = self
             .mtp_head
@@ -2382,12 +2650,17 @@ impl ModelRig {
             .expect("just ensured it exists");
 
         // The head consumes POST-output-norm trunk hidden (the convention it was
-        // exported with and the one the sequential path feeds it); pbs.x_batch
-        // holds the PRE-norm residual, so norm the chunk's rows into staging.
-        let hidden_rows = self.pbs.x_batch.sub_offset(row_off * dim, m * dim);
+        // exported with and the one the sequential path feeds it). The batched
+        // body leaves the PRE-norm residual in pbs.x_batch, so those rows are
+        // normed into staging here. `hidden_normed` means the caller already
+        // captured post-norm rows into `mtp_prefill_hidden` (the VMM singleton
+        // prefill path); no second norm is applied to them.
         let staged = self.mtp_prefill_hidden.sub_offset(0, m * dim);
-        let norm_outcome = gpu
-            .rmsnorm_batched(
+        let norm_outcome = if hidden_normed {
+            Ok(())
+        } else {
+            let hidden_rows = self.pbs.x_batch.sub_offset(row_off * dim, m * dim);
+            gpu.rmsnorm_batched(
                 &hidden_rows,
                 &self.weights.output_norm,
                 &staged,
@@ -2395,7 +2668,8 @@ impl ModelRig {
                 dim,
                 self.config.norm_eps,
             )
-            .map_err(|e| format!("mtp prefill hidden norm: {e}"));
+            .map_err(|e| format!("mtp prefill hidden norm: {e}"))
+        };
 
         // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
         // `gpu`/`weights`/head separately. No closure — it would capture all of
@@ -3807,6 +4081,23 @@ fn run_loop(
                     .expect("stats")
                     .note_pool_free_pages(pp.free_pages());
             }
+            // Same soak signal for the VMM route: mapped bytes must plateau.
+            if let Some(store) = rig.model.vmm.as_ref() {
+                if let Ok(mapped) = store.mapped_kv_bytes() {
+                    stats.lock().expect("stats").note_mapped_kv_bytes(mapped);
+                }
+                let (captures, replays) = store.graph_stats();
+                stats
+                    .lock()
+                    .expect("stats")
+                    .note_graph_stats(captures, replays);
+            } else {
+                let (captures, replays) = graph.stats();
+                stats
+                    .lock()
+                    .expect("stats")
+                    .note_graph_stats(captures, replays);
+            }
             // Expire timed-out waiters → typed queue timeout rejection. The
             // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
             // enqueue Instant), not a tick count: ticks advance once per serve
@@ -4633,6 +4924,17 @@ fn run_loop(
             // already runs; no new sync, no order change.
             let t_step = std::time::Instant::now();
             let t_forward = std::time::Instant::now();
+            // Prefill rows run on the singleton body under VMM; identify them
+            // from the work state (`decoding` flips only at the first committed
+            // generated token). The arena route ignores this mask.
+            let prefill_slots: Vec<bool> = (0..n)
+                .map(|s| !work[s].decoding && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0)
+                .collect();
+            // MTP-armed prefilling slots capture their chunk's hidden rows so
+            // the head can be prefilled after the trunk chunk.
+            let mtp_prefill_slots: Vec<bool> = (0..n)
+                .map(|s| work[s].spec == SpecKind::Mtp && prefill_slots[s])
+                .collect();
             let fwd = rig.model.forward_step(
                 &mut rig.gpu,
                 &batch,
@@ -4641,6 +4943,8 @@ fn run_loop(
                 &lm_head_skip,
                 any_verify,
                 any_dflash_rows,
+                &prefill_slots,
+                &mtp_prefill_slots,
             );
             let forward_ns = t_forward.elapsed().as_nanos() as u64;
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
@@ -5124,10 +5428,40 @@ fn run_loop(
                     if slots[s].is_none() {
                         continue;
                     }
-                    // Compute hidden row offset for this slot in the batch.
-                    let hidden_row_offset: usize = (0..s)
-                        .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
-                        .sum();
+                    // Hidden row offset for this slot's verify rows. The VMM
+                    // route runs decode/verify rows as their own batch (prefill
+                    // slots are excluded), so the offset is recorded by the
+                    // forward; the arena route's batch is the forward's batch.
+                    let hidden_row_offset: usize = if rig.model.vmm.is_some() {
+                        rig.model
+                            .vmm_row_offsets
+                            .get(s)
+                            .copied()
+                            .unwrap_or(usize::MAX)
+                    } else {
+                        (0..s)
+                            .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
+                            .sum()
+                    };
+                    if hidden_row_offset == usize::MAX {
+                        // Planner invariant: a verify slot contributed rows.
+                        if let Some(mut f) = slots[s].take() {
+                            let _ = send_event(
+                                &f.reply,
+                                Event::Rejected {
+                                    class: RejectClass::Internal,
+                                    reason: "spec verify rows were not forwarded on this step"
+                                        .to_string(),
+                                },
+                            );
+                            release_pin_ticket(&mut rig, &mut f.pin_ticket);
+                            rig.swap.forget(f.session.0);
+                            let _ = rig.fair_queue.remove(f.session.0);
+                            rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                        }
+                        clear_work_slot(&mut work[s]);
+                        continue;
+                    }
                     // Commit context for the burst clamp: the request counters
                     // and the session's current stored length.
                     let (produced, max_tokens, sess_len) = match slots[s].as_ref() {
@@ -5259,13 +5593,21 @@ fn run_loop(
                                 batch.tokens[row_off..row_off + m].to_vec();
                             let chunk_positions: Vec<i32> =
                                 batch.positions[row_off..row_off + m].to_vec();
+                            // VMM: the chunk ran on the singleton prefill, which
+                            // captured post-norm hidden rows from index 0.
+                            let (hidden_off, hidden_normed) = if rig.model.vmm.is_some() {
+                                (0, true)
+                            } else {
+                                (row_off, false)
+                            };
                             rig.model.mtp_head_prefill_chunk(
                                 &mut rig.gpu,
                                 SlotId(s),
                                 &chunk_tokens,
                                 &chunk_positions,
-                                row_off,
+                                hidden_off,
                                 m,
+                                hidden_normed,
                             )
                         }
                         SpecKind::Dflash => rig.model.dflash_prefill_chunk(
@@ -5653,6 +5995,13 @@ fn handle_command(
                 rig.swap.forget(id);
                 rig.sessions
                     .close(&mut rig.pool, &mut rig.adm, SessionId(id));
+            }
+            // VMM slots keep their owners but drop the per-request mapping
+            // guarantee; a new request re-reserves at admission.
+            if let Some(store) = rig.model.vmm.as_mut() {
+                for s in 0..rig.n_slots {
+                    store.release_slot(s);
+                }
             }
             // Drop prefix cache state so subsequent lookups miss (spec §4.6).
             // The radix index owns cache leases taken at publication: it
@@ -6110,6 +6459,24 @@ fn admit(
                     lock_stats(stats).note_rejected();
                     return;
                 }
+                // VMM KV: the extension plus its generation budget must be
+                // mapped before the turn begins (mapping never happens inside
+                // a step). A refusal keeps the session resident — only this
+                // request is rejected, so a smaller retry can still continue.
+                if let Some(store) = rig.model.vmm.as_mut() {
+                    let end = slot_reserve_end(extended.len(), req.max_tokens, rig.cap_tokens);
+                    if let Err(reason) = store.ensure_slot(&mut rig.gpu, slot.0, end) {
+                        let _ = send_event(
+                            &req.reply,
+                            Event::Rejected {
+                                class: RejectClass::Overload,
+                                reason: format!("KV capacity: {reason}"),
+                            },
+                        );
+                        lock_stats(stats).note_rejected();
+                        return;
+                    }
+                }
                 match rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     Ok(plan) => {
                         if let Some(sess) = rig.sessions.get_mut(existing) {
@@ -6463,6 +6830,25 @@ fn admit(
             return;
         }
     };
+
+    // VMM KV: create the slot's owner (first use) and map this request's
+    // prompt + generation budget + speculative slack BEFORE any step runs.
+    // A refusal is capacity (retryable), and it leaves the slot closed below.
+    if let Some(store) = rig.model.vmm.as_mut() {
+        let end = slot_reserve_end(req.prompt_tokens.len(), req.max_tokens, rig.cap_tokens);
+        if let Err(reason) = store.ensure_slot(&mut rig.gpu, slot.0, end) {
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    class: RejectClass::Overload,
+                    reason: format!("KV capacity: {reason}"),
+                },
+            );
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            lock_stats(stats).note_rejected();
+            return;
+        }
+    }
 
     // Reset the slot's recurrent state before reusing it. `seq_len = 0` clears
     // the KV, but DeltaNet state lives OUTSIDE the KV arena, so without this a
@@ -6896,6 +7282,7 @@ fn admit(
                                      // identical output without the overhead.
         let mtp_ok = rig.model.mtp_head.is_some()
             && rig.model.mtp_k > 0
+            && req.visual_data.is_none()
             && !penalized
             && !request_sampled(&req)
             && !grammar_constrained
@@ -6992,16 +7379,28 @@ fn evict(rig: &mut Rig, victim: SessionId) -> bool {
     let tokens = sess.tokens.clone();
 
     let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
-    let snap = capture_slot(
-        &mut rig.gpu,
-        &rig.pool,
-        slot,
-        &rig.model.k_arenas,
-        &rig.model.v_arenas,
-        &dn_refs,
-        &tokens,
-        rig.stamp,
-    );
+    let snap = if let Some(store) = rig.model.vmm.as_ref() {
+        // VMM slots from the owner's flat mapped prefix; the descriptor's
+        // seq_len is the same frontier the arena route reads.
+        let seq_len = rig
+            .pool
+            .descriptors()
+            .get(slot.0)
+            .map(|d| d.seq_len.max(0) as usize)
+            .unwrap_or(0);
+        store.capture_slot(&mut rig.gpu, slot.0, seq_len, &dn_refs, &tokens, rig.stamp)
+    } else {
+        capture_slot(
+            &mut rig.gpu,
+            &rig.pool,
+            slot,
+            &rig.model.k_arenas,
+            &rig.model.v_arenas,
+            &dn_refs,
+            &tokens,
+            rig.stamp,
+        )
+    };
     drop(dn_refs);
 
     match snap {
@@ -7037,16 +7436,27 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
     match rig.swap.unpark(id.0) {
         Ok(snap) => {
             let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
-            let r = restore_slot(
-                &mut rig.gpu,
-                &mut rig.pool,
-                slot,
-                &rig.model.k_arenas,
-                &rig.model.v_arenas,
-                &dn_refs,
-                &snap,
-                rig.stamp,
-            );
+            let r = if let Some(store) = rig.model.vmm.as_mut() {
+                store.restore_slot(
+                    &mut rig.gpu,
+                    slot.0,
+                    &snap,
+                    rig.stamp,
+                    &dn_refs,
+                    snap.seq_len,
+                )
+            } else {
+                restore_slot(
+                    &mut rig.gpu,
+                    &mut rig.pool,
+                    slot,
+                    &rig.model.k_arenas,
+                    &rig.model.v_arenas,
+                    &dn_refs,
+                    &snap,
+                    rig.stamp,
+                )
+            };
             drop(dn_refs);
             // MTP head KV is per-generation, not per-session. Reset it so
             // the restored session starts a fresh MTP prefill.

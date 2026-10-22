@@ -97,6 +97,11 @@ pub mod shared_weights;
 #[cfg(feature = "deltanet")]
 #[cfg(feature = "deltanet")]
 pub mod serve_engine;
+/// VMM KV storage for the multi-slot serve engine (`serve.multi_slot` with
+/// `kv_backend=vmm`): per-slot `KvCache` owners, descriptor staging, and the
+/// `_vmm` batched decode step. See `docs/plans/2026-10-22-vmm-kv-multislot-engine.md`.
+#[cfg(feature = "deltanet")]
+pub mod serve_vmm;
 /// Qwen3.5 impls of the arch-generic `hipfire_runtime::spec` seam
 /// (`impl SpecTarget for ModelSlot`). Deltanet-gated — it touches `ModelSlot`.
 #[cfg(feature = "deltanet")]

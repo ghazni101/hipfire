@@ -222,6 +222,15 @@ pub struct EngineStats {
     /// telemetry). A monotonic decline across identical request cycles is
     /// the page-level leak signature the oracle asserts against.
     pub pool_free_pages: usize,
+    /// Mapped VMM KV bytes at the last completed step (`kv_backend=vmm`
+    /// only; 0 on the arena route). The VMM analogue of `pool_free_pages`:
+    /// it must plateau across identical request cycles, not climb.
+    pub mapped_kv_bytes: usize,
+    /// Decode-graph captures and replays performed by the active KV storage
+    /// route. Replays only happen when `HIPFIRE_SLOTS_DECODE_GRAPH=1`; a run
+    /// with the flag on and `graph_replays == 0` means capture never engaged.
+    pub graph_captures: usize,
+    pub graph_replays: usize,
 }
 
 impl EngineStats {
@@ -246,6 +255,15 @@ impl EngineStats {
     }
     pub fn note_pool_free_pages(&mut self, n: usize) {
         self.pool_free_pages = n;
+    }
+
+    pub fn note_mapped_kv_bytes(&mut self, n: usize) {
+        self.mapped_kv_bytes = n;
+    }
+
+    pub fn note_graph_stats(&mut self, captures: usize, replays: usize) {
+        self.graph_captures = captures;
+        self.graph_replays = replays;
     }
 }
 
@@ -297,7 +315,10 @@ pub struct SlotEngineConfig {
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,
-    /// Effective KV backend (`legacy`/`vmm`); slot engines may refuse `vmm`.
+    /// Effective KV backend (`legacy`/`vmm`). `legacy` is the arena route;
+    /// `vmm` is per-slot VMM reservations (q8/fp8 KV, no prefix cache, MTP
+    /// yes / DFlash deferred, vision via the sequential VL path). The engine
+    /// re-checks every gate at load.
     pub kv_backend: String,
     /// Cross-session prefix cache enabled (spec §4.5–4.6).
     pub prefix_cache: bool,

@@ -2064,12 +2064,30 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         .filter(|v| !v.is_empty())
     {
         match v.parse::<KvBackend>() {
+            // Arena route: the fixed `SlotPool` slabs.
             Ok(KvBackend::Legacy) => {}
-            Ok(_) => {
-                return Some(
-                    "experimental multi-slot uses fixed slot arenas and requires kv_backend=legacy"
-                        .to_string(),
+            // VMM route: per-slot owners, q8/fp8 KV only (the `_vmm`
+            // descriptor kernels). The engine re-checks every gate
+            // (vision/prefix-cache/speculation, arch) before allocating.
+            Ok(KvBackend::Vmm) => {
+                let raw = params
+                    .and_then(|p| p.get("kv_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tier_ok = matches!(
+                    hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch),
+                    Ok(r) if r.warning.is_none()
+                        && matches!(
+                            r.mode,
+                            hipfire_runtime::kv_mode::KvMode::Q8
+                                | hipfire_runtime::kv_mode::KvMode::Fp8
+                        )
                 );
+                if !tier_ok {
+                    return Some(format!(
+                        "experimental multi-slot kv_backend=vmm supports kv_mode=q8 (and fp8 on gfx1201) only; got kv_mode={raw:?}"
+                    ));
+                }
             }
             Err(e) => return Some(e.to_string()),
         }

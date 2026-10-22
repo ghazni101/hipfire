@@ -598,21 +598,24 @@ impl ResidentKvDiag {
         }
     }
 
-    /// Fixed Q8 slot arena always admits legacy storage.
-    fn for_slot(explicit: bool) -> Self {
+    /// The slot engine's own KV backend. `None` = the load request did not
+    /// name one, and the route's documented default (legacy arenas) applies;
+    /// `Some` is the operator's choice (`legacy` or per-slot `vmm`).
+    fn for_slot(requested: Option<hipfire_runtime::kv_backend::KvBackend>) -> Self {
         use hipfire_loader::admission::KvBackendRequest;
         use hipfire_runtime::kv_backend::KvBackend;
-        let request = if explicit {
-            KvBackendRequest::Explicit(KvBackend::Legacy)
-        } else {
-            KvBackendRequest::Automatic
-        };
-        let automatic_reason = if explicit {
-            None
-        } else {
-            Some("fixed Q8 slot arena has no VMM owner")
-        };
-        Self::from_admission(request, KvBackend::Legacy, automatic_reason)
+        match requested {
+            Some(backend) => {
+                Self::from_admission(KvBackendRequest::Explicit(backend), backend, None)
+            }
+            None => Self::from_admission(
+                KvBackendRequest::Automatic,
+                KvBackend::Legacy,
+                Some(
+                    "kv_backend not requested; the slot route defaults to legacy arenas                      (pass --kv-backend vmm for per-slot VMM KV)",
+                ),
+            ),
+        }
     }
 }
 
@@ -1280,12 +1283,14 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    let slot_kv_explicit = msg
+                    // The slot engine's backend is its own selector, not the
+                    // sequential route's: report exactly what was requested.
+                    let slot_kv_requested: Option<hipfire_runtime::kv_backend::KvBackend> = msg
                         .get("params")
                         .and_then(|p| p.get("kv_backend"))
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
-                        .is_some();
+                        .and_then(|s| s.parse().ok());
                     // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
                     if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                         emit_uncorrelated_error(
@@ -1334,9 +1339,9 @@ fn main() {
                             }
                         }
                     }
-                    // Fixed Q8 slot arena has no VMM owner — always legacy.
-                    // Emit once here; prior model/slot is about to be torn down.
-                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
+                    // Emit the effective slot backend once here; prior
+                    // model/slot is about to be torn down.
+                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_requested);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -5224,6 +5229,35 @@ mod tests {
         assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
         // Deferred tp>1: prior model survives a failed load.
         assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
+    #[test]
+    fn slot_kv_diag_reports_the_backend_the_load_requested() {
+        use hipfire_runtime::kv_backend::KvBackend;
+        let vmm = super::ResidentKvDiag::for_slot(Some(KvBackend::Vmm));
+        assert_eq!(vmm.backend, "vmm");
+        assert!(!vmm.legacy);
+        assert_eq!(vmm.request, "explicit");
+        assert!(
+            vmm.warning.is_none(),
+            "a VMM slot load must not emit the legacy-backend disclosure: {:?}",
+            vmm.warning
+        );
+        let explicit_legacy = super::ResidentKvDiag::for_slot(Some(KvBackend::Legacy));
+        assert_eq!(explicit_legacy.backend, "legacy");
+        assert!(explicit_legacy.legacy);
+        assert!(explicit_legacy.warning.is_some());
+        let default = super::ResidentKvDiag::for_slot(None);
+        assert_eq!(default.backend, "legacy");
+        assert_eq!(default.request, "automatic");
+        assert!(
+            default
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("kv_backend not requested")),
+            "the automatic legacy warning must name the slot-route default: {:?}",
+            default.warning
+        );
     }
 
     use super::{
