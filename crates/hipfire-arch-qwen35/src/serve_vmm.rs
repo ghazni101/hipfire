@@ -48,7 +48,8 @@ use crate::forward_slots::{
 };
 use crate::qwen35::prefill::q8_prefill_wmma_enabled;
 use crate::qwen35::{
-    DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Config, Qwen35Scratch, Qwen35Weights,
+    DeltaNetState, ExtractHiddenCapture, LayerType, PrefillBatchScratch, Qwen35Config,
+    Qwen35Scratch, Qwen35Weights,
 };
 
 /// Device budget of the row-batched flash-decode partials (same fixed policy
@@ -917,6 +918,7 @@ impl VmmSlotKv {
         dn: &mut DeltaNetState,
         logits_out: &GpuTensor,
         hidden_out: Option<&GpuTensor>,
+        extract_hidden: Option<ExtractHiddenCapture<'_>>,
     ) -> HipResult<()> {
         if tokens.is_empty() {
             return Ok(());
@@ -942,11 +944,18 @@ impl VmmSlotKv {
         // The MTP head prefill consumes post-output-norm trunk hidden rows;
         // the capture variant writes exactly those (`tokens.len() * dim`) and
         // keeps KV, DeltaNet state and logits identical to the plain prefill.
-        let result = match hidden_out {
-            Some(hidden) => crate::qwen35::forward_prefill_batch_capture_hidden(
+        let result = match (hidden_out, extract_hidden) {
+            (Some(_), Some(_)) => Err(HipError::new(
+                0,
+                "VMM slot prefill: MTP and DFlash hidden captures are mutually exclusive",
+            )),
+            (Some(hidden), None) => crate::qwen35::forward_prefill_batch_capture_hidden(
                 gpu, weights, config, tokens, start_pos, owner, dn, scratch, hidden,
             ),
-            None => crate::qwen35::forward_prefill_batch(
+            (None, Some(extract)) => crate::qwen35::forward_prefill_batch_capture_extract_hidden(
+                gpu, weights, config, tokens, start_pos, owner, dn, scratch, extract,
+            ),
+            (None, None) => crate::qwen35::forward_prefill_batch(
                 gpu, weights, config, tokens, start_pos, owner, dn, scratch, None, None, None, None,
             ),
         };

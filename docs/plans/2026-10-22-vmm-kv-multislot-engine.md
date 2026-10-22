@@ -232,17 +232,20 @@ flowchart LR
   D --> F[final_logits_per_slot + sampler]
 ```
 
-- **Prefill runs on the singleton body** against the request's own `KvCache`:
-  `forward_prefill_batch(gpu, weights, config, tokens, pos, &mut kv, &mut dn, s, ..)`
-  exactly as the exact VMM route does (`forward_slots/vmm/exact.rs:780-820`).
-  Why: it is the already-validated VMM prefill path, it runs the serial
-  route's own prefill arithmetic (so the arithmetic is not the variable in a
-  batch-composition A/B), and it needs zero new kernels. Cost: prefill is
-  *not* batched across slots. Equality with a serial `hipfire run` additionally
-  needs matching chunk boundaries — the slots scheduler chunks by
-  `serve.multi_slot_prefill_chunk`, not by the singleton's own chunk plan — so
-  the gate is request isolation plus batch determinism (I9), with VMM-vs-arena
-  concurrent text compared byte for byte at the same batch composition.
+- **Plain prompt rows run batched** through the same `run_layers_slots` /
+  `LayerKvAddr::Vmm` body as decode. `positions[]` is the causal authority and
+  `final_logits_per_slot` produces each slot's final-row logits. MTP/DFlash
+  prompt chunks stay on the singleton `forward_prefill_batch` body because
+  their private hidden capture is not ported to the batched pass yet; MoE/A3B
+  prompt chunks stay singleton because the `_vmm` batched prefill path is not
+  validated for those branches (a 35B-A3B run hung before sampling). Those are
+  the serialized prefill cases. The batched path needs zero new
+  kernels (the `_vmm` kernels already serve prefill rows). Equality with a
+  serial `hipfire run` is still not a gate: chunk boundaries are the slots
+  scheduler's, and row-count-dependent kernels make byte equality across
+  compositions false on both storage routes. The gate remains request
+  isolation plus batch determinism (I9), with VMM-vs-arena concurrent text
+  compared byte for byte at the same batch composition.
 - **Decode and speculative verify run batched** through `run_layers_slots`
   with `LayerKvAddr::Vmm` — the same closure `Qwen35VmmStore::run_pass` builds
   (`vmm.rs:1698-1706`), using row-batched flash decode
@@ -311,29 +314,40 @@ each layer/side is one `memcpy_dtoh` of `seq_len × stride` from the tensor base
 - MTP head-KV is not in the snapshot today ("swap-restore loses the head KV",
   `serve_engine.rs:5874-5884`) — unchanged; the restore path already resets MTP.
 
-### 4.8 Prefix cache (deferred design)
+### 4.8 Prefix cache (implemented: host snapshot LRU)
 
 The arena route shares 128-token physical pages through `PagePool` and a radix
-index (`serve_engine.rs:3186-3210`, `:6571-6590`). VMM has no page table, but it
-has the *granule* equivalent: `capture_vmm_prefixes` seals the shared granule
-prefix of a set of owners and spills the partial granule to a slab;
-`fork_vmm_prefixes` maps that prefix into fresh owners and copies the frontier
-(`dispatch.rs:5525-5740`); `share_prefix`/`map_shared_prefix` do the
-granule lease/mapping (`hip-bridge/src/vmm.rs:987`, `:1124`).
+index (`serve_engine.rs`). VMM has no page table. The selected v1 design is a
+bounded **host-snapshot LRU** (`serve_vmm_prefix.rs`), not a `PagePool` shim:
 
-Design sketch (not v1):
+- an entry is `(token prefix, SlotSnapshot)` where the snapshot is exactly
+  `VmmSlotKv::capture_slot`'s payload — per-FA-layer KV prefix plus the
+  DeltaNet state at the same boundary;
+- capture happens after a successful prefill chunk, only while a suffix
+  remains (a full-prompt snapshot has no logits to continue from), via the
+  per-slot `vmm_prefix_mark` watermark so an idle step does not recopy;
+- a cold request looks up the longest cached token prefix that validates
+  against the current `SnapshotStamp`, restores KV **and** recurrent state
+  into its own owner, publishes `pool.set_seq_len(n)`, and prefills only the
+  suffix. A failed restore resets the state and discards the entry; it never
+  leaves a half-restored prefix paired with a cold prefill;
+- retention is bounded by `serve.prefix_cache_max_bytes`; eviction is LRU.
+  Nothing is shared physically and no VA is retired: no owner churn, no graph
+  invalidation beyond the normal request boundary;
+- `reused > 0` retires MTP/DFlash for the turn (their private KV was not
+  prefilled), matching the arena radix rule.
 
-- a shared-prefix cache keyed by token span, holding one `VmmPrefixSet` per
-  entry (2 K/V owners per FA layer);
-- on a hit, the slot's owner must be **re-created** from the fork, because
-  `map_shared_prefix` requires a never-mapped arena (`vmm.rs:1124-1134`);
-  that means per-request owner churn for hits, a new `owner_generation`, and
-  a graph invalidation;
-- eviction/refcount follows `VmmSharedPrefix` leases; the slab is one
-  `GpuTensor` allocated by the capture.
+Measured on a 981-token prompt with a 256 MiB ceiling: entries at 512 and 896
+tokens (48/103 MiB), a warm request reused 896 tokens, greedy text was
+byte-identical to a cache-disabled cold control, and a different-prefix
+request missed. See §12.5.
 
-This is a real feature with a real cost (VA churn, §4.2). It should be decided
-on measured hit-rate value, not assumed.
+**Future (not v1):** physical sharing via `capture_vmm_prefixes` /
+`fork_vmm_prefixes` and `map_shared_prefix`. It is a different trade — shared
+physical bytes for VA churn and per-hit owner recreation — and should be
+decided on measured host pressure, not assumed. The host-snapshot cache is
+the correct baseline: it cannot alias, cannot cross a stamp, and does not
+retire VA.
 
 ### 4.9 MTP and DFlash
 
@@ -357,10 +371,18 @@ it and the MTP head prefill uses the chunk's captured post-norm hidden rows
 norm). The verify tape is captured by the batched decode pass exactly as on
 the arena route.
 
-**DFlash remains deferred**: `dflash_prefill_chunk` needs the *pre-norm*
-trunk hidden of the prompt chunk from `pbs.x_batch` (the batched body's
-output), which the singleton prefill does not write; a `dflash_mode=on` load
-is refused and a present draft is ignored with one line.
+**DFlash is implemented on this route.** `dflash_prefill_chunk` needs the
+*pre-norm* trunk hidden of the prompt chunk (the batched body's `x_batch`),
+which the singleton prefill previously did not write. The singleton prefill
+now accepts an extract-layer capture
+(`forward_prefill_batch_capture_extract_hidden`): each internal chunk copies
+the extract layers' post-layer residual rows to the shared staging buffer at
+the chunk's absolute row, so a prompt split by the arch chunk ceiling still
+lands contiguously. `VmmSlotKv::prefill_chunk` selects that capture for a
+DFlash-armed slot (MTP keeps the post-output-norm capture), and
+`dflash_prefill_chunk` scatters from staging row 0. Verify rows use the same
+`SpecVerifyCapture` as the arena route. A legacy DFlash draft (no candidate
+selector) is still refused by `load_dflash_shared`, as on the arena route.
 
 ### 4.10 Vision (sequential VL on the slot owner)
 
@@ -376,6 +398,13 @@ encode runs inline on the engine thread (4.5 s for a 34×34 grid) instead of
 being interleaved one layer at a time, and a VL request never speculates
 (`mtp_ok` requires `visual_data.is_none()`, both admit arms).
 
+A **text continuation of an image conversation** also needs M-RoPE phases
+(`pos + rope_delta`), and the `_vmm` kernels have no M-RoPE writer. The engine
+routes exactly that turn through the same sequential body: a `VlPrefill` with
+an empty patch list (nothing to encode) and the session's `rope_delta`; the
+scheduler's per-row `pos3_delta` is zeroed so other slots keep 1D steps. Plain
+text turns (delta 0) stay batched.
+
 q8 only: the sequential writer's kernels are the q8 flat path, so
 `fp8 + vision` fails the existing `vl_sequential && !Q8` gate.
 
@@ -386,7 +415,7 @@ q8 only: the sequential writer's kernels are the q8 flat path, so
   `bench --backend slots` → `experimental_multi_slot`
   (`cli/main.rs:6581-6585`).
 - Daemon gate (`slots.rs:2060-2073`) becomes: `vmm` is admitted iff
-  `kv_mode ∈ {q8, fp8}`, `fp8 ⇒ gfx1201`, `!prefix_cache`, `!is_vl`, and the
+  `kv_mode ∈ {q8, fp8}`, `fp8 ⇒ gfx1201`, `!is_vl`, and the
   engine's own `Rig::build` re-checks all of it fail-closed (house style, cf.
   `serve_engine.rs:793-802`).
 - Loaded ack gains `slot_kv_backend: "vmm"`, `slot_kv_format`,
@@ -441,17 +470,19 @@ frees whatever was created (pattern at `serve_engine.rs:1300-1374`).
 
 | # | Slice | Files | Acceptance |
 |---|---|---|---|
-| 0 | Contract + gates + ack fields; no behavior change | `serve_engine.rs` (`Rig::build`, `EngineConfig`), `daemon/slots.rs` (`validate_load_caps`, `SlotLoadParams`), `runtime/src/serve/mod.rs`, `CONFIG.md`, `SERVE.md`, `env-vars.md` | `legacy` loads byte-identically; `vmm` with rotated tier / VL / prefix cache / fp8-off-gfx1201 gets the named refusal; unmodified `test_serve_concurrent` passes |
+| 0 | Contract + gates + ack fields; no behavior change | `serve_engine.rs` (`Rig::build`, `EngineConfig`), `daemon/slots.rs` (`validate_load_caps`, `SlotLoadParams`), `runtime/src/serve/mod.rs`, `CONFIG.md`, `SERVE.md`, `env-vars.md` | `legacy` loads byte-identically; `vmm` with rotated tier / VL / fp8-off-gfx1201 gets the named refusal; unmodified `test_serve_concurrent` passes |
 | 1 | `SlotKvStorage` enum + `VmmKv` (owners, tables, budget, admission mapping, release) | new `slot_kv_vmm.rs`, `serve_engine.rs` | unit: reservation math, desc packing/MASKED idle slots, budget refusal; load-time `Guard` cleanup test |
 | 2 | VMM forward: decode rows batched + singleton prefill + host epilogue | `serve_vmm.rs` (`prepare_step`/`step_body`), `serve_engine.rs::forward_step_vmm` | isolation + composition determinism oracle (`test_slots_vmm_oracle`), coherent output — **branch-implemented, measured (§11)** |
 | 3 | Lifecycle: swap capture/restore, eviction, continuation, reset/close, MTP/DFlash | `serve_engine.rs`, `swap/snapshot.rs` (VMM capture helper), `checkpoint.rs` untouched | swap-out/in continuation identical; eviction admits a new request; MTP and DFlash oracles; soak I2/I6/I7 |
 | 4 | Graph capture for VMM decode | `serve_vmm.rs` (own cache/key), `serve_engine.rs` (stats) | `HIPFIRE_SLOTS_DECODE_GRAPH=1`: capture/replay counts > 0, ids identical to graph-off; I1/I3 hold — **branch-implemented, measured (§11)** |
-| 5 | Prefill throughput closure | new `_vmm` WMMA prefill tile kernel (or measured decision to keep singleton prefill) | `bench --backend slots` A/B vmm vs legacy with prefill/decode split; no prefill regression > noise |
-| 6 | (optional) VMM prefix cache | `slot_kv_vmm.rs`, `dispatch.rs` reuse | hit-rate + correctness oracle; decision record |
+| 5 | Prefill throughput closure | `serve_engine.rs` (`forward_step_vmm`) | **implemented**: dense prompt rows batched through `_vmm`; MTP/DFlash and MoE prefill stay singleton. 4-lane 953-token prompt TTFT within run spread of legacy (see §12.5); no new kernel |
+| 6 | VMM prefix cache | `serve_vmm_prefix.rs`, `serve_engine.rs` | **implemented**: host-snapshot LRU; `check_slots_vmm_prefix.py` hit + negative + warm==cold; no VA churn (§12.5) |
 
 Slices 1–4 are the shippable v1. Slice 5 is a perf gate: if the singleton
 prefill costs more than the arena route on the target workload, v1 either ships
-with that documented or waits for the kernel. Slice 6 is not v1.
+with that documented or waits for the kernel. Slice 6 (host-snapshot cache) is
+implemented and measured; physical granule sharing remains a future optimization
+(§4.8).
 
 ---
 
@@ -522,8 +553,9 @@ Slice 0 alone is a behavior-preserving change and can ship independently.
    churn against the 64 TiB cap, or add an owner freelist with explicit
    generation bumps. Only worth doing if a workload shows sticky-high-water
    fragmentation.
-3. **Prefix cache** — granule fork design (§4.8) vs no cross-session reuse on
-   the VMM route. Needs hit-rate evidence.
+3. **Prefix cache** — **decided for v1:** bounded host-snapshot LRU (§4.8),
+   measured by `check_slots_vmm_prefix.py`. Physical granule sharing remains a
+   future optimization, gated on measured host-memory pressure and hit rate.
 4. **Consolidation** — once VMM slots ships, the VMM batch store and the slots
    engine share nearly everything except the control loop. A follow-up record
    should decide whether they converge.
@@ -546,6 +578,9 @@ batched decode), and the lifecycle hooks (admission, continuation, eviction,
 restore, reset, teardown, `EngineStats::mapped_kv_bytes`). Speculation is
 deferred on the route (`auto` declines with one line, explicit `on` fails the
 load); slices 4–6 (graph capture, prefill kernel, prefix cache) are not started.
+*Historical note:* §12 supersedes this paragraph — graph capture, MTP/DFlash,
+post-image continuation and the host-snapshot prefix cache are implemented and
+measured; slice 5 (batched prefill) remains the open performance decision.
 
 ### Measured
 
@@ -666,3 +701,172 @@ the sequential VL path on the slot's own cache.
 - The `docs/VALIDATION.md` serve battery/chain routes. The state-oracle
   *property* is now encoded in `test_slots_vmm_oracle` (see the new row), but
   that example is manual evidence, not an automated hw-gate route.
+
+---
+
+## 12. Gap closure — 2026-10-22 (second pass)
+
+Four gaps found by reading the route were closed and measured on gfx1100
+(HIP 7.16), with the binaries named at the end of this section. These are
+branch measurements, not a product admission.
+
+### 12.1 Post-image text continuation (correctness)
+
+**Gap:** VMM sets `vl_sequential` for a vision model, so image turns run the
+sequential M-RoPE body. A **text** turn that continues that conversation also
+needs M-RoPE phases (`pos + rope_delta`), but `VmmSlotKv::prepare_step` rejected
+every `pos3`/`ext_emb` row. The follow-up failed the step before any launch.
+The earlier "vision + MTP" evidence exercised two sequential images, not this
+path; re-encoding the image in history hid it.
+
+**Fix:** a continuation whose session `rope_delta` is non-zero on the VMM route
+is built as a `VlPrefill` with an empty patch list and that delta
+(`serve_engine.rs`, continuation admit). `vl_forward_remaining` skips the
+vision tower when there are no patches, so the turn runs the same per-token
+M-RoPE body image turns use. The scheduler's `pos3_delta` is zeroed for that
+turn so other slots' batched steps stay 1D. No new kernel; the `_vmm` kernels
+still have no M-RoPE writer.
+
+**Measured** (`scripts/check_slots_vmm_vision.py`, Qwen3.5-4B MQ4 + `.vl`,
+2 slots × 4096, q8, VMM): image turn → correct doge description; text
+follow-up on the same conversation → `continuation HIT -- session 0 reused 360
+of 388 tokens`, answer `Dog`; plain text turn `pong`; 848-token prompt
+(2 prefill chunks of 512) recalls `ZEBRA-42`; same script under `--spec mtp`
+also passes. The same run passes inside the `hipfire:dev` container with the
+host-built binaries mounted (see §12.4).
+
+### 12.2 DFlash2 on the VMM route (feature)
+
+**Gap:** `Rig::build` ignored a DFlash draft on VMM because
+`dflash_prefill_chunk` needs the prompt chunk's pre-norm extract-layer hidden
+rows, and the singleton prefill did not write them.
+
+**Fix:** `forward_prefill_batch_capture_extract_hidden` threads an
+`ExtractHiddenCapture` through the prefill chunk loop; each internal chunk
+copies the extract layers' post-layer residual rows to the shared staging
+buffer at `row_base + chunk_start`, so a prompt split by the arch chunk
+ceiling is contiguous. `VmmSlotKv::prefill_chunk` selects it for a DFlash-armed
+slot (MTP keeps the post-output-norm capture; the two are mutually exclusive),
+and the engine passes staging row 0 for the scatter. `Rig::build` no longer
+refuses DFlash on VMM. A legacy DFlash draft (no candidate selector) is still
+refused by `load_dflash_shared`.
+
+**Measured with the paired fixture** — target
+`qwen3.8-27b.mq4`, draft `qwen38-27b-dflash-mq4.hfq` (the registry sidecar for
+`qwen3.8:27b`; draft metadata: `base_model Qwen/Qwen3.8-27B`,
+`DFlash2DraftModel`, `target_layer_ids [5,19,33,47,61]`,
+`num_target_layers 64`, hidden 5120). `test_slots_vmm_oracle` with
+`HIPFIRE_SLOTS_ORACLE_DRAFT=...`, `HIPFIRE_SLOT_TRACE=1`, 2 slots × 1024, q8:
+arena and VMM each ran **52** `DFlash draft` + **52** `DFlash accept` windows,
+and the oracle reported `PASS: vmm first-token isolation + composition
+determinism on both routes`. Serve-level: a 2-slot, 1024-context VMM serve on
+the registry tag `qwen3.8:27b` with `--spec dflash` answered the Python
+one-liner prompt with ```` ```python\nlambda a, b: a + b\n``` ````,
+`finish_reason=stop`, and accepted bursts of 4 and 9 tokens in the trace (the
+prompt is 36 tokens); the same text came back with
+`HIPFIRE_SLOTS_DECODE_GRAPH=1`. This is the correct Qwen3.8-27B + DFlash2
+pairing, not a cross-target run.
+
+### 12.3 Swap-in prefix reuse (correctness)
+
+**Gap:** a VMM restore wrote the owner's KV/DeltaNet bytes back but did not
+publish `snap.seq_len` into the slot pool's descriptor. `begin_turn` reads
+that descriptor as the held prefix, so after every swap-in it saw `held = 0`
+and re-prefilled the whole conversation. Output was correct; the eviction and
+restore cost bought nothing, and the trace still said `continuation HIT`.
+
+**Fix:** `restore` sets the pool length from the snapshot after a successful
+restore. The arena route already did this inside its own `restore_slot`, so the
+call is idempotent there. `scripts/check_slots_vmm_swap.py` now asserts
+`swap-out`, `swap-in`, and reused > 0 across a 2-slot / 3-conversation
+eviction.
+
+**Measured** (before the fix: `continuation HIT -- reused 0 of 61` after a
+`Swapped` match; after: `reused 31 of 61`, answer `ALPHA`; same result inside
+the runtime container).
+
+### 12.4 User stop sequences on slots (API correctness)
+
+**Gap:** the slot emitter already had a streaming `StopMatcher`, but both the
+gateway (`complete.rs::multi_slot_request_supported`) and daemon
+(`slots.rs::validate_generate_caps`) refused every non-empty `stop`; the
+emitter was constructed with `stop: Vec::new()`. The capability vector also
+advertised `stop` as refused.
+
+**Fix:** both layers validate the field with `parse_stop_field` (string or
+array, ≤4 sequences, ≤64 chars; malformed → 400), the daemon passes it to
+`Qwen35Emit`, and a `StopReason::StopSequence` ends the turn as
+`finish_reason: "stop"`. The stop bytes never enter client content. The
+session is closed on a stop because the KV holds unrendered text past the stop
+that no client history reproduces; the next turn cold-reprefills. Empty stops
+remain neutral, and the refusal list no longer advertises `stop`.
+
+**Measured** (`scripts/check_slots_vmm_vision.py`): non-streaming
+`stop: ["ZEBRA-42"]` → `finish=stop`, content empty; the same request with
+`stream: true` → terminal frame `finish=stop`, no stop bytes; the next request
+is served (`pong`); a malformed `stop: [1]` → HTTP 400. Container run passes.
+
+### 12.5 Evidence and remaining gaps
+
+Commands (fresh processes; binaries below):
+
+```text
+HIPFIRE_DAEMON_BIN=<release>/daemon \
+HIPFIRE_SLOTS_ORACLE_DUMP=/tmp/oracle-fix-off.json \
+  <release>/examples/test_slots_vmm_oracle <qwen3.5-4b.mq4>
+# PASS, ids equal to the pre-change baseline on arena and VMM;
+# graph-on arm: 5 captures / 132 replays each, ids identical.
+
+HIPFIRE_SLOTS_ORACLE_DRAFT=<qwen38-27b-dflash-mq4.hfq> \
+HIPFIRE_SLOT_TRACE=1 <release>/examples/test_slots_vmm_oracle <qwen3.8-27b.mq4>
+# PASS; 52 arena / 52 VMM draft+accept windows (paired fixture).
+
+python3 scripts/check_slots_vmm_vision.py --model <4b.mq4> --vision <4b.vl>
+# PASS; host and container.
+
+python3 scripts/check_slots_vmm_swap.py --model <4b.mq4>
+# PASS; swap-out + swap-in + continuation reused 31/61 (was 0/61
+# before the pool-length fix); host and container.
+
+python3 scripts/check_slots_vmm_prefix.py --model <4b.mq4>
+# PASS; shared 981-token prompt: STORE at 512/896, HIT 896, warm text
+# equals the cache-disabled cold control, different-prefix request misses;
+# 206 MiB retained under a 256 MiB ceiling.
+
+# serve-level DFlash: 2 slots x 1024, q8, --kv-backend vmm --spec dflash,
+# registry-paired DFlash2 sidecar (host symlink for this fixture).
+# ANSWER: ```python
+# lambda a, b: a + b
+# ```
+# finish=stop; accepted bursts of 4 and 9 tokens; same text with
+# HIPFIRE_SLOTS_DECODE_GRAPH=1. Target qwen3.8:27b, draft sidecar as above.
+```
+
+Binaries: `hipfire` md5 `658b40b77265da2246b4880a426524dc`, `daemon` md5
+`98a1e7fc5e2c765bba24794219d74b1a`, built from `2a3bc44b8` + the working-tree
+changes above (`hipfire --version` reports `0.4.2+patch.1 (2a3bc44b8dfe;
+feat/vmm-kv-multislot; dirty)`).
+`cargo test -p hipfire-arch-qwen35 --lib serve_vmm` 4/4; the daemon/gateway
+stop validation tests pass.
+
+**Still open (not closed by this pass):**
+
+| Gap | State / blocker |
+|---|---|
+| VMM cross-session prefix cache (§4.8, slice 6) | **implemented** as a bounded host-snapshot LRU; `check_slots_vmm_prefix.py` hit + negative + warm==cold, 896/981 reused, 206 MiB retained under a 256 MiB cap. Physical granule sharing remains future. |
+| Batched prefill on VMM (slice 5) | **implemented** for dense AR prompt rows (MTP/DFlash and MoE prefill remain singleton). 4-lane 953-token prompt: VMM 1239/2072 ms vs legacy 1351/2042 ms TTFT across two interleaved pairs — no consistent regression beyond spread; oracle ids unchanged. |
+| fp8 KV on VMM / second arch | gfx1201-only kernels; this host is gfx1100, so untested here. |
+| 9B / second arch | 9B dense AR is exercised (2 slots, concurrent turns). Its published DFlash sidecar is a legacy (no selector) draft, refused by the slots route by design. A second arch is not available on this host. |
+| Eviction under **budget-driven reclaim** | ordinary slot eviction has `check_slots_vmm_swap.py` (reused 31/61 after swap-in). Budget refusal is now exercised: 27B, budget 5.7 GB, a 200k-position request needs 6.9 GB → typed retryable 503; the engine then served `pong`. |
+| MTP sampled / DFlash sampled | **implemented**; temp>0 takes the singleton rejection sampler on both drafters (`speculation.mtp_sampled` is the opt-out). GPU runs: 4B MTP and 27B DFlash2 coherent sampled windows. |
+| `logprobs`, `n`, `json_object` | **implemented** (`logprobs` AR D2H; `n` 1..=8 fanout, non-stream + sequential-choice SSE; `json_object` permissive mask). `best_of`/`logit_bias` and the legacy-Completions-only `echo`/`suffix` remain refused on the chat route. |
+| Multi-image requests | **implemented**: ordered `VisualImage` list, one pad block/M-RoPE span per image, per-image tower encode, 2-image 4B run answers both images. |
+| Vision + prefix cache | still off (`should_lookup_prefix` excludes images). |
+| PM4/Redline parity | standard VMM route passes `--pm4 --skip-prefill` (`pass=True`, PM4 exact, GDN frame exact). The multi-slot executor does not use the singleton PM4 replay path. |
+| `docs/VALIDATION.md` serve battery/chain | **run on the VMM route** (4B, 2 slots): 5/5 coherent turns in battery and chain, no empty/attractor/retrieval miss. Terminal-semantics pass is not claimed: every turn was `finish=length` at 64, which the harness labels `!RUNAWAY`. |
+
+No current-product claim follows from this section: the route is still
+experimental and `legacy` remains the default KV backend. Remaining work is
+validation hardware (fp8 / gfx1201) and the follow-up API fields
+(`best_of`/`logit_bias`, legacy-Completions `echo`/`suffix`), recorded in
+[`2026-10-22-multislot-remaining-gaps.md`](2026-10-22-multislot-remaining-gaps.md).

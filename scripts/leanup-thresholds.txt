@@ -89,7 +89,11 @@ required_features_daemon    == 0
 # Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
 # stays 0. Paid down when the message loop's per-verb refusal boilerplate is
 # factored out.
-daemon_lines                <= 5515
+# RATCHET-RAISE 5515 -> 5544: `0090e4fe1` made the slot load ack report the
+# requested KV backend (`ResidentKvDiag::for_slot`) instead of assuming the
+# legacy arena. This is load-ack plumbing, not a new verb; paid down when slot
+# load params move into the loader.
+daemon_lines                <= 5544
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

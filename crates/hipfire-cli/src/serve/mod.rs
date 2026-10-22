@@ -434,15 +434,10 @@ pub(crate) fn route_capabilities(
         // spelled out separately.
         "refused_request_fields": if multi_slot {
             serde_json::json!([
-                "stop",
-                "logprobs",
-                "top_logprobs",
-                "n",
                 "best_of",
                 "logit_bias",
                 "echo",
                 "suffix",
-                "response_format:json_object",
                 "tools+image",
             ])
         } else {
@@ -1251,12 +1246,7 @@ pub(crate) fn parse_bind(
 
 /// Builds the detached child's argv. `--open` stays a parent-only action; the
 /// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
-fn detached_serve_command(
-    executable: &Path,
-    args: &ServeArgs,
-    host: &str,
-    port: u16,
-) -> Command {
+fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port: u16) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("serve")
@@ -4076,18 +4066,19 @@ mod capabilities_tests {
         assert_eq!(caps["openai_compatible"], true);
         let refused = caps["refused_request_fields"].as_array().unwrap();
         assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
-        for field in [
-            "stop",
-            "logprobs",
-            "top_logprobs",
-            "n",
-            "best_of",
-            "logit_bias",
-            "echo",
-            "suffix",
-            "response_format:json_object",
-            "tools+image",
-        ] {
+        assert!(
+            !refused.iter().any(|v| v == "stop"),
+            "stop sequences are supported"
+        );
+        assert!(
+            !refused.iter().any(|v| v == "response_format:json_object"),
+            "json_object is enforced as a permissive object schema"
+        );
+        assert!(
+            !refused.iter().any(|v| v == "logprobs"),
+            "logprobs are supported (AR fallback)"
+        );
+        for field in ["best_of", "logit_bias", "echo", "suffix", "tools+image"] {
             assert!(
                 refused.iter().any(|v| v == field),
                 "refusal list must contain {field}"

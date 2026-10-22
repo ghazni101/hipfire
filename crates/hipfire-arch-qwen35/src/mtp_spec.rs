@@ -33,10 +33,10 @@
 use crate::mtp_head::{
     self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
-use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
-use hipfire_dispatch::families::moe::{NARROW_VERIFY_MAX_ROWS, RoutedExpertWeights};
+use hipfire_dispatch::families::moe::{RoutedExpertWeights, NARROW_VERIFY_MAX_ROWS};
 /// Debug tracing for the slot-engine MTP cycle (`HIPFIRE_MTP_TRACE=1`).
 /// Prints seed/candidates/argmax/advance per cycle to stderr.
 pub(crate) fn mtp_trace_enabled() -> bool {
@@ -1572,8 +1572,16 @@ fn mtp_verify_graph_eligible(
                     .experts
                     .iter()
                     .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)),
-                routed_gate_up: ffn.experts.first().map(|e| e.gate_up.gpu_dtype).unwrap_or(DType::F32),
-                routed_down: ffn.experts.first().map(|e| e.down.gpu_dtype).unwrap_or(DType::F32),
+                routed_gate_up: ffn
+                    .experts
+                    .first()
+                    .map(|e| e.gate_up.gpu_dtype)
+                    .unwrap_or(DType::F32),
+                routed_down: ffn
+                    .experts
+                    .first()
+                    .map(|e| e.down.gpu_dtype)
+                    .unwrap_or(DType::F32),
                 routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
                 has_paro_shared: ffn.paro_shared.is_some(),
                 per_expert_gate_up,
@@ -1657,9 +1665,18 @@ fn mtp_verify_graph_key(
         model: weights.output_norm.buf.as_ptr() as usize,
         kv_capacity: kv_cache.physical_cap,
         kv_max_seq: kv_cache.max_seq,
-        kv_k: kv_cache.k_gpu.first().map_or(0, |t| t.buf.as_ptr() as usize),
-        kv_v: kv_cache.v_gpu.first().map_or(0, |t| t.buf.as_ptr() as usize),
-        recurrent: dn_state.s_matrices.first().map_or(0, |t| t.buf.as_ptr() as usize),
+        kv_k: kv_cache
+            .k_gpu
+            .first()
+            .map_or(0, |t| t.buf.as_ptr() as usize),
+        kv_v: kv_cache
+            .v_gpu
+            .first()
+            .map_or(0, |t| t.buf.as_ptr() as usize),
+        recurrent: dn_state
+            .s_matrices
+            .first()
+            .map_or(0, |t| t.buf.as_ptr() as usize),
         scratch: [0usize; 32],
     };
 
@@ -1722,7 +1739,6 @@ impl MtpSpecState {
         self.mtp_verify_graph_mode
     }
 }
-
 
 fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
     if let Some(exec) = state.mtp_proposal_graph_exec.take() {
@@ -2233,8 +2249,23 @@ pub(crate) fn mtp_verify_accept(
     eos_token_id: u32,
 ) -> HipResult<MtpVerifyAccepted> {
     mtp_verify_accept_impl(
-        gpu, w_out, dim, vocab, state, n_verify, candidates, drafts_generated, use_sampling, sampling,
-        draft_probs, draft_softmaxes, is_external, use_device_token_chain, cur_pos, eos_token_id, false,
+        gpu,
+        w_out,
+        dim,
+        vocab,
+        state,
+        n_verify,
+        candidates,
+        drafts_generated,
+        use_sampling,
+        sampling,
+        draft_probs,
+        draft_softmaxes,
+        is_external,
+        use_device_token_chain,
+        cur_pos,
+        eos_token_id,
+        false,
     )
 }
 
@@ -2544,7 +2575,10 @@ fn mtp_verify_forward_graphed(
     // If this window needs more mapped capacity than reserved, tear down any
     // cached entry FIRST: ensure_mapped_capacity below may grow/remap memory a
     // live graph references — destruction orders its frees ahead of that growth.
-    if cur_pos.checked_add(n_verify).is_none_or(|end| end > kv_cache.physical_cap) {
+    if cur_pos
+        .checked_add(n_verify)
+        .is_none_or(|end| end > kv_cache.physical_cap)
+    {
         destroy_mtp_verify_graph(gpu, state);
     }
     kv_cache.ensure_mapped_capacity(gpu, cur_pos + n_verify)?;
@@ -2570,10 +2604,29 @@ fn mtp_verify_forward_graphed(
     // Shared eager Path-2 body (identical math to the non-graph path). Takes
     // only the live mutable handles and captures weights/config/inputs so the
     // argument list is written once and reused by warmup + capture fallback.
-    let run_eager = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<()> {
+    let run_eager = |gpu: &mut Gpu,
+                     kv_cache: &mut KvCache,
+                     dn_state: &mut DeltaNetState,
+                     scratch: &Qwen35Scratch,
+                     state: &mut MtpSpecState|
+     -> HipResult<()> {
         qwen35::forward_prefill_batch_with_pbs_opts(
-            gpu, weights, config, verify_tokens, cur_pos, kv_cache, dn_state, scratch,
-            None, Some(&state.verify_hidden), Some(&mut state.trunk_gdn_tape), None, Some(&state.trunk_pbs), None, None, false,
+            gpu,
+            weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            None,
+            Some(&state.verify_hidden),
+            Some(&mut state.trunk_gdn_tape),
+            None,
+            Some(&state.trunk_pbs),
+            None,
+            None,
+            false,
             qwen35::DflashFusionCtx::Off,
         )
     };
@@ -2605,19 +2658,38 @@ fn mtp_verify_forward_graphed(
         state.mtp_verify_graph_warm_n = n_verify;
         // Recompute identity AFTER warmup: the execution may have moved scratch
         // (lazy growth) or DN pointers that the next capture bakes into nodes.
-        state.mtp_verify_graph_key = Some(mtp_verify_graph_key(gpu, weights, kv_cache, dn_state, n_verify));
+        state.mtp_verify_graph_key = Some(mtp_verify_graph_key(
+            gpu, weights, kv_cache, dn_state, n_verify,
+        ));
         state.mtp_verify_graph_mode = "warmup";
         return Ok(());
     }
 
     // 4. Capture the forward: begin -> exact single-chunk captured body -> end
     //    in one IIFE so a single match handles every failure path.
-    let run_capture = |gpu: &mut Gpu, kv_cache: &mut KvCache, dn_state: &mut DeltaNetState, scratch: &Qwen35Scratch, state: &mut MtpSpecState| -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
+    let run_capture = |gpu: &mut Gpu,
+                       kv_cache: &mut KvCache,
+                       dn_state: &mut DeltaNetState,
+                       scratch: &Qwen35Scratch,
+                       state: &mut MtpSpecState|
+     -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
         mtp_graph_begin_capture(gpu)?;
         qwen35::forward_prefill_batch_single_chunk_captured_opts(
-            gpu, weights, config, verify_tokens, cur_pos, kv_cache, dn_state, scratch,
-            &state.trunk_pbs, None, Some(&state.verify_hidden), Some(&mut state.trunk_gdn_tape),
-            None, false, qwen35::DflashFusionCtx::Off,
+            gpu,
+            weights,
+            config,
+            verify_tokens,
+            cur_pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            &state.trunk_pbs,
+            None,
+            Some(&state.verify_hidden),
+            Some(&mut state.trunk_gdn_tape),
+            None,
+            false,
+            qwen35::DflashFusionCtx::Off,
         )?;
         mtp_graph_end_capture(gpu)
     };
@@ -2643,7 +2715,10 @@ fn mtp_verify_forward_graphed(
             match launch {
                 Ok(()) => {
                     state.mtp_verify_graph_replays += 1;
-                    eprintln!("[mtp-verify-graph] captured for n={n_verify} with {} blobs", n_blobs);
+                    eprintln!(
+                        "[mtp-verify-graph] captured for n={n_verify} with {} blobs",
+                        n_blobs
+                    );
                     Ok(())
                 }
                 Err(e) => {
@@ -3056,43 +3131,70 @@ pub fn mtp_batched_verify_accept_from_batch(
         &draft.sampling,
     )?;
 
-    // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
-    // prefix rule. (The slot-engine MTP path is greedy-only, matching the
-    // retired `is_external = true` behaviour.)
-    let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
-    gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
-    let mut argmax_host: Vec<i32> = vec![0; n_verify];
+    // Sampled requests use the same rejection rule the singleton MTP path
+    // (and DFlash) use: accept each draft with `u * p_draft <= p_target`,
+    // draw a residual bonus on rejection, and sample the target nucleus on a
+    // full accept. Greedy requests keep the argmax prefix rule and its A10
+    // fault seam.
+    let (mut committed, mut hit_eos, accept_count): (Vec<u32>, bool, usize) = if draft.use_sampling
     {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
-        };
-        gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
-    }
-    let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
-    if mtp_trace_enabled() {
-        eprintln!(
-            "[mtp-trace] accept cur_pos={} n_verify={} drafts={} candidates={:?} argmax={:?}",
-            draft.cur_pos,
-            n_verify,
+        let mut committed = Vec::with_capacity(drafts_generated + 1);
+        let mut accept_count = 0;
+        let hit_eos = mtp_sampled_accept(
+            gpu,
+            state,
+            &logits_view,
+            &draft.draft_softmaxes,
+            &draft.draft_probs,
+            &draft.candidates,
             drafts_generated,
-            &draft.candidates[..drafts_generated.min(draft.candidates.len())],
-            argmax_per_pos
-        );
-    }
-    // A10 fault seam (oracle only, see `arm_mtp_full_reject`): the committed
-    // token is the trunk's own argmax, so greedy output must equal the
-    // accepting MTP / AR sequence; the cell proves rejected draft rows never
-    // become cache-visible (spec §4.6.2) and the repair path handles a
-    // zero-length accepted prefix.
-    let fault_full_reject = MTP_FULL_REJECT.load(std::sync::atomic::Ordering::Acquire);
-    let accepted = if fault_full_reject {
-        greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
+            vocab,
+            false,
+            draft.sampling.temp,
+            draft.sampling.top_p,
+            draft.sampling.top_k,
+            draft.sampling.min_p,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
+        )?;
+        (committed, hit_eos, accept_count)
     } else {
-        greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id)
+        // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
+        // prefix rule.
+        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+        let mut argmax_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+            };
+            gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+        }
+        let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+        if mtp_trace_enabled() {
+            eprintln!(
+                "[mtp-trace] accept cur_pos={} n_verify={} drafts={} candidates={:?} argmax={:?}",
+                draft.cur_pos,
+                n_verify,
+                drafts_generated,
+                &draft.candidates[..drafts_generated.min(draft.candidates.len())],
+                argmax_per_pos
+            );
+        }
+        // A10 fault seam (oracle only, see `arm_mtp_full_reject`): the committed
+        // token is the trunk's own argmax, so greedy output must equal the
+        // accepting MTP / AR sequence; the cell proves rejected draft rows never
+        // become cache-visible (spec §4.6.2) and the repair path handles a
+        // zero-length accepted prefix.
+        let fault_full_reject = MTP_FULL_REJECT.load(std::sync::atomic::Ordering::Acquire);
+        let accepted = if fault_full_reject {
+            greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
+        } else {
+            greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id)
+        };
+        (accepted.committed, accepted.hit_eos, accepted.accept_count)
     };
-
-    let mut committed = accepted.committed;
-    let mut hit_eos = accepted.hit_eos;
 
     // Clamp the burst to what the engine can actually KEEP. The accept rule
     // above only early-stops on `eos_token_id`, but the commit path also
@@ -3117,7 +3219,6 @@ pub fn mtp_batched_verify_accept_from_batch(
     }
     committed.truncate(keep);
 
-    let accept_count = accepted.accept_count;
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
     if mtp_trace_enabled() {
@@ -3353,7 +3454,16 @@ where
         dn_state: &mut target.dn_state,
         scratch: &target.scratch,
     };
-    prefill_trunk_and_mtp_cache_parts(gpu, &mut parts, head, state, prompt_tokens, start_pos, route, on_committed_boundary)
+    prefill_trunk_and_mtp_cache_parts(
+        gpu,
+        &mut parts,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        route,
+        on_committed_boundary,
+    )
 }
 
 /// The trunk owners a prompt prefill writes: a [`ModelSlot`]'s, or a
@@ -3428,13 +3538,9 @@ where
         && mtp_head::mtp_fill_fast_enabled()
         && route == MtpPromptRoute::ArRoute
         && gpu.arch == "gfx1201"
-        && [
-            &head.weights.eh_proj,
-            &head.weights.wk,
-            &head.weights.wv,
-        ]
-        .iter()
-        .all(|w| w.gpu_dtype == DType::MQ4G256 && w.awq_scale.is_none());
+        && [&head.weights.eh_proj, &head.weights.wk, &head.weights.wv]
+            .iter()
+            .all(|w| w.gpu_dtype == DType::MQ4G256 && w.awq_scale.is_none());
     let legacy_rotation_k = (2 * dim)
         .max(head.config.n_ff)
         .max(dim)
@@ -3515,14 +3621,11 @@ where
         } else if mtp_head::mtp_fill_fast_enabled() {
             gpu.bind_thread()?;
             // D32 counts f32 words: zero only the first partner-hidden row.
-            gpu.hip.memset_d32_async(
-                &prompt_hidden.buf,
-                0,
-                dim,
-                gpu.active_stream.as_ref(),
-            )?;
+            gpu.hip
+                .memset_d32_async(&prompt_hidden.buf, 0, dim, gpu.active_stream.as_ref())?;
         } else {
-            gpu.hip.memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])?;
+            gpu.hip
+                .memcpy_htod(&prompt_hidden.buf, &vec![0u8; dim_bytes])?;
         }
         while off < prompt_tokens.len() {
             let remaining = prompt_tokens.len() - off;

@@ -11,9 +11,9 @@ use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_batch;
-use super::prefill::HiddenCapture;
 use super::prefill::moe_grouped_m_total_max;
 use super::prefill::run_plain_gemm_key;
+use super::prefill::HiddenCapture;
 use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
@@ -1950,6 +1950,7 @@ pub fn forward_decode_batch_prepared(
         },
         DflashFusionCtx::Off,
         None, // commit_stride: independent lanes keep legacy cadence
+        None, // extract_hidden: independent lanes do not seed a draft context
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);

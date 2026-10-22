@@ -11,9 +11,10 @@ fn main() {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    let model_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| { eprintln!("usage: test_e4_engine_repro <model.hfq>"); std::process::exit(2) });
+    let model_path = std::env::args().nth(1).unwrap_or_else(|| {
+        eprintln!("usage: test_e4_engine_repro <model.hfq>");
+        std::process::exit(2)
+    });
     println!("=== E4 engine repro === model={model_path}");
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
@@ -94,6 +95,7 @@ fn main() {
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         min_p: 0.0,
+        logprobs_top_k: None,
         visual_data: None,
         json_schema: Some(schema),
         started_in_think: think,
@@ -117,7 +119,7 @@ fn main() {
             }) => {
                 println!("Accepted reused={reused} prefill={prefill}");
             }
-            Ok(Event::Token { id }) => text.push_str(&tok.decode(&[id])),
+            Ok(Event::Token { id, .. }) => text.push_str(&tok.decode(&[id])),
             Ok(Event::Done { reason, generated }) => {
                 println!("Done reason={reason:?} generated={generated}");
                 println!("OUTPUT: {:?}", text);

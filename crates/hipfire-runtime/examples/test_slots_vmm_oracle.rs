@@ -67,7 +67,12 @@ fn main() {
 
     /// One engine: serial runs, then two identical bursts (one submission per
     /// slot, all at once), then a consuming shutdown so the next route can load.
-    fn run_engine(model_path: &str, backend: &str, prompts: &[Vec<u32>]) -> Run {
+    fn run_engine(
+        model_path: &str,
+        backend: &str,
+        prompts: &[Vec<u32>],
+        draft: Option<&Path>,
+    ) -> Run {
         let engine = SlotEngine::spawn(EngineConfig {
             model_path: PathBuf::from(model_path),
             n_slots: prompts.len().max(N_SLOTS),
@@ -89,8 +94,8 @@ fn main() {
             wait_max_bytes: 256 * 1024 * 1024,
             queue_timeout_ms: 30_000,
             structured_jump_forward: false,
-            dflash_draft: None,
-            dflash_required: false,
+            dflash_draft: draft.map(Path::to_path_buf),
+            dflash_required: draft.is_some(),
         })
         .unwrap_or_else(|e| panic!("SlotEngine::spawn({backend}): {e}"));
 
@@ -131,6 +136,7 @@ fn main() {
                     presence_penalty: 0.0,
                     frequency_penalty: 0.0,
                     min_p: 0.0,
+                    logprobs_top_k: None,
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
@@ -165,6 +171,7 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 min_p: 0.0,
+                logprobs_top_k: None,
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
@@ -181,7 +188,7 @@ fn main() {
         let mut ids = Vec::new();
         while let Ok(ev) = rx.recv() {
             match ev {
-                Event::Token { id } => ids.push(id),
+                Event::Token { id, .. } => ids.push(id),
                 Event::Rejected { reason, .. } => panic!("request rejected: {reason}"),
                 Event::Done { .. } => break,
                 _ => {}
@@ -201,6 +208,10 @@ fn main() {
         );
         return;
     };
+    let draft = std::env::var_os("HIPFIRE_SLOTS_ORACLE_DRAFT").map(PathBuf::from);
+    if let Some(d) = &draft {
+        println!("draft: {}", d.display());
+    }
     println!("=== test_slots_vmm_oracle ===\nmodel: {model_path}");
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
@@ -211,8 +222,8 @@ fn main() {
     // One engine at a time: each spawn loads its own weights, and the
     // consuming shutdown releases VRAM (and invalidates caches) before the
     // next route loads.
-    let arena = run_engine(&model_path, "legacy", &prompts);
-    let vmm = run_engine(&model_path, "vmm", &prompts);
+    let arena = run_engine(&model_path, "legacy", &prompts, draft.as_deref());
+    let vmm = run_engine(&model_path, "vmm", &prompts, draft.as_deref());
 
     // Composition determinism: the same serial run and the same burst
     // reproduce every id on both storage routes.

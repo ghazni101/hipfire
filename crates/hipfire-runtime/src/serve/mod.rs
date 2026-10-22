@@ -33,6 +33,17 @@ use std::sync::mpsc::Sender;
 /// The engine splices the resulting embeddings at `<|image_pad|>` positions
 /// during a per-token prefill that uses `forward_scratch_embed_mrope`.
 ///
+/// One image in a multi-image VL request.
+#[derive(Clone, Debug)]
+pub struct VisualImage {
+    /// Vision-tower patch tensor from `extract_patches` (CPU).
+    pub patches: Vec<f32>,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// Post-merge visual token count for this image.
+    pub n_visual_tokens: usize,
+}
+
 /// `mrope_positions` carries the 3D (t, h, w) position for every prompt token,
 /// already offset by `base` so values are absolute rope phases. `rope_delta`
 /// is added to the running sequence length for decode-step positions.
@@ -43,6 +54,10 @@ pub struct VisualData {
     pub grid_w: usize,
     /// Number of post-merge visual tokens to splice at image_pad positions.
     pub n_visual_tokens: usize,
+    /// Multi-image payload, in request order. Non-empty supersedes the
+    /// single-image `patches`/`grid_*` fields; each image runs through its own
+    /// grid so mixed aspect ratios are preserved.
+    pub images: Vec<VisualImage>,
     /// 3D M-RoPE positions for every prompt token, offset by base.
     pub mrope_positions: Vec<[i32; 3]>,
     /// rope_delta for decode positions past the prompt.
@@ -80,6 +95,12 @@ pub struct SubmitRequest {
     pub frequency_penalty: f32,
     /// min-p cutoff; 0.0 = off.
     pub min_p: f32,
+    /// OpenAI `top_logprobs` count when `logprobs: true`; `None` = no
+    /// logprobs. `Some(0)` asks for the chosen token's log-prob only. The slot
+    /// engine forces AR for these requests and downloads the sampled row once
+    /// per token (opt-in cost), then emits `Event::Token` with the chosen
+    /// log-prob and its top-K candidates.
+    pub logprobs_top_k: Option<usize>,
     /// Visual embeddings + M-RoPE for VL requests. None for text-only.
     pub visual_data: Option<VisualData>,
     /// JSON Schema for structured output (spec §7 G1/G2). When present, the
@@ -168,7 +189,7 @@ pub enum RejectClass {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// `reused` — prompt tokens served from the session's existing KV;
     /// `prefill` — tokens actually prefilled this turn. Together they are the
@@ -181,6 +202,13 @@ pub enum Event {
     },
     Token {
         id: u32,
+        /// Log-probability of `id` under the row used for sampling, when the
+        /// request asked for logprobs.
+        logprob: Option<f32>,
+        /// Top-K candidates `(token_id, logprob)` for the same row, descending.
+        /// `None` when logprobs were not requested; `Some([])` is a valid
+        /// `top_logprobs: 0` response.
+        top_logprobs: Option<Vec<(u32, f32)>>,
     },
     /// `generated` — tokens delivered to the client (terminators excluded).
     Done {
@@ -282,7 +310,6 @@ impl EngineStats {
 // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
 // them in lock-step (the qwen35 carrier maps them 1:1).
 
-
 /// Family-neutral multi-slot engine spawn parameters. Constructed once by
 /// the daemon from serve.* config keys + the load request, then handed to
 /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
@@ -367,7 +394,6 @@ pub struct SlotModelPreflight {
     pub vl_path: Option<PathBuf>,
 }
 
-
 /// Which prompt the encoder wraps the input in. Queries and documents carry
 /// different markers and different truncation limits, and the document side
 /// additionally drops the multi-vector mask's punctuated positions — so the
@@ -405,7 +431,6 @@ pub struct EmbedResponse {
     /// Tokens the input tokenized to, before the mask.
     pub n_input_tokens: usize,
 }
-
 
 /// Arch-erased multi-slot engine. The concrete engine runs its own thread
 /// and is driven through this narrow surface: submit a request, cancel a
@@ -467,7 +492,15 @@ mod tests {
         let (tx, rx) = channel::<Event>();
         drop(rx);
         assert!(
-            send_event(&tx, Event::Token { id: 1 }).is_err(),
+            send_event(
+                &tx,
+                Event::Token {
+                    id: 1,
+                    logprob: None,
+                    top_logprobs: None
+                }
+            )
+            .is_err(),
             "a dropped receiver must be visible so the engine can free the slot"
         );
     }
@@ -484,7 +517,15 @@ mod tests {
             },
         )
         .unwrap();
-        send_event(&tx, Event::Token { id: 7 }).unwrap();
+        send_event(
+            &tx,
+            Event::Token {
+                id: 7,
+                logprob: None,
+                top_logprobs: None,
+            },
+        )
+        .unwrap();
         send_event(
             &tx,
             Event::Done {
@@ -501,7 +542,14 @@ mod tests {
                 prefill: 2
             }
         );
-        assert_eq!(rx.recv().unwrap(), Event::Token { id: 7 });
+        assert_eq!(
+            rx.recv().unwrap(),
+            Event::Token {
+                id: 7,
+                logprob: None,
+                top_logprobs: None
+            }
+        );
         assert_eq!(
             rx.recv().unwrap(),
             Event::Done {

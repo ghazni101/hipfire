@@ -173,17 +173,26 @@ Config and env owners for bind, idle, queue, and body limits:
 
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped
-   as requests are admitted up to their prompt + generation budget. Prefill
-   runs on the singleton body against the slot's own cache, so each request's
-   prefill/decode arithmetic is the serial route's; decode is batched through
-   the descriptor-addressed `_vmm` kernels. Vision and MTP run on this route:
-   image requests use the sequential per-token VL path against the slot's own
-   cache (`--vision` with `vision_mode=on`), while text requests stay batched;
-   MTP's verify rows ride the batched decode step. DFlash is deferred (an
-   explicit `dflash_mode=on` fails the load; a present draft is ignored with one
-   line). The route refuses `serve.prefix_cache` and ignores the
-   `HIPFIRE_SLOTS_PAGED` dev knob. Every unservable combination is refused
-   before any GPU allocation. On this route decode always runs the
+   as requests are admitted up to their prompt + generation budget. Plain
+   prompt rows, decode and verify rows run batched through the
+   descriptor-addressed `_vmm` kernels; only MTP/DFlash prompt chunks stay on
+   the singleton body, because their private hidden capture is not ported to
+   the batched pass. Sampled (temperature>0) MTP/DFlash requests use the
+   same rejection-sampling acceptors as the singleton route; set
+   `speculation.mtp_sampled=0`/`HIPFIRE_MTP_SAMPLED=0` to restore the AR
+   fallback. Vision, MTP and DFlash2 run on this
+   route: image requests (up to 8, encoded per-image) use the sequential
+   per-token VL path against the slot's own cache (`--vision` with
+   `vision_mode=on`); a text turn that
+   continues an image conversation uses that same sequential M-RoPE path for
+   the turn (the `_vmm` kernels have no M-RoPE writer), while ordinary text
+   stays batched. MTP verify rows ride the batched decode step, and DFlash's
+   draft context is seeded from the singleton prefill's extract-layer hidden
+   capture (legacy DFlash drafts, which have no candidate selector, are still
+   refused). `serve.prefix_cache` runs on this route as a bounded
+   host-snapshot LRU (KV + DeltaNet at a committed prefill boundary; no page
+   table, no VA churn), and the `HIPFIRE_SLOTS_PAGED` dev knob is ignored.
+   Every unservable combination is refused before any GPU allocation. On this route decode always runs the
    row-batched `_vmm` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at
    some token, as on the arena route: output is deterministic for a fixed batch
@@ -373,7 +382,8 @@ through to per-model / registry / daemon defaults when omitted):
 | `model` | Tag or path of an installed model; reloads if different from the resident model. A registry model that is not installed is 404 ("run `hipfire pull`") unless `serve.allow_request_pull = true`; a file outside the models directory, the catalog and the pre-warm model is 404 unless `serve.allow_request_paths = true`. |
 | `max_tokens` / `max_completion_tokens` | Omitted: the configured default (Qwen tags 81920, DeepSeek V4 Flash 393216, else `generation.max_tokens`) is fitted to the context left after the prompt, minus 64. Explicit and at or above the loaded context: 400. Never triggers a reload. |
 | `messages` | OpenAI chat messages (required for useful chat) |
-| `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
+| `messages[].content[].image_url` | Base64 PNG/JPEG data URIs for VL models; up to 8 per request on the multi-slot engine (`serve.multi_slot=true`), in request order (the standard route accepts one; remote URLs remain rejected). Images are placed before the question text; M-RoPE gets one span per image, each with its own grid |
+| `n` | 1..=8 on `/v1/chat/completions`; the gateway fans choices into separate daemon attempts (sequential, one admission at a time), sets `choice.index`, and returns all choices (non-stream) or sequential choice streams on one SSE body (one final `[DONE]`). `n>1` is a typed 400 on the Anthropic/Responses adapters. `echo`/`suffix` are legacy Completions fields and stay refused here |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied. On the Qwen AR samplers (GPU kernel and the CPU sampler used by Flash-Next AR, grammar-constrained Qwen turns and the multi-slot VL first token) `top_k` keeps at most k candidates from a 64-wide gather (absent = 20; `0` or > 64 = 64) and `min_p` drops candidates below `min_p` × the top candidate's probability, both before `top_p`. At `temperature: 0` all three are no-ops. Other routes do not apply every field yet: Gemma4 eager, LFM2, Cohere2, MiniMax, DeepSeek V4 AR, LLaMA AR and single-slot Qwen3.5-VL image turns ignore the request `top_k`; those plus Muse Glimmer, DeepSeek V4 speculative and n-gram speculative decoding ignore `min_p`; Qwen2, Maple and dots.ocr text decode greedily. |
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
@@ -381,7 +391,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `max_tokens` | Generation cap, shared by the `<think>` span and the answer (see the note under the example above) |
 | `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP) and Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP); every other route answers 400 instead of ignoring it |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on). Flash-Next accepts them with native MTP attached: greedy tool turns run on MTP and match AR byte for byte |
-| `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (pre-sampling grammar mask) and refuses `json_object` / unknown types with 400 |
+| `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (strict subset, pre-sampling grammar mask) and `json_object` (permissive `{"type":"object"}` mask); unknown types are 400 |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
 | `thinking` / `thinking.type` | Mode axis (`on`/`off`, or DeepSeek-style `enabled`/`disabled`). Thinking disabled wins and drops effort/cap with a warning. |
@@ -720,13 +730,25 @@ start cost on that first switched request).
 ## Experimental prefix cache (multi-slot)
 
 `serve.prefix_cache` is **off by default**. On the multi-slot engine
-(`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
-128-token KV pages plus Qwen hybrid checkpoints. `.mtp` sidecars are
-probed as both `foo.mq4v2.mtp` and `foo.mtp` on the slot engine and the
-single-slot loader (`hipfire run --spec mtp`). Verified on gfx1101 /
-ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
-and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
-Vision+prefix reuse stays off. Non-empty stop sequences, logprobs, and the images+tools combination stay refused on slots; tools alone are supported.
+(`serve.multi_slot=true`) the arena route (`kv_backend=legacy`) enables
+cross-session radix reuse of sealed 128-token KV pages plus Qwen hybrid
+checkpoints. The VMM route has no page table, so it keeps a bounded
+**host-snapshot LRU** instead: each entry is the exact KV prefix plus the
+DeltaNet state at a committed prefill boundary, restored into the request's
+own owner (no page sharing, no owner churn, no retired VA). Both routes skip
+vision requests. `.mtp` sidecars are probed as both `foo.mq4v2.mtp` and
+`foo.mtp` on the slot engine and the single-slot loader
+(`hipfire run --spec mtp`). Verified on gfx1101 / ROCm 10
+(`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR, and
+JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss. VMM
+host-snapshot reuse is checked by `scripts/check_slots_vmm_prefix.py`
+(shared 981-token prompt, 896 reused, warm text equals the cold control,
+different-prefix miss). Vision+prefix reuse stays off. Stop sequences are
+supported on slots (the emitter withholds the stop bytes and ends the turn as
+`stop`; malformed shapes are 400s); `response_format: json_object` is
+enforced as a permissive object schema. `logprobs`/`top_logprobs` are supported
+(AR fallback; the sampled row is downloaded once per token); the images+tools
+combination stays refused, and tools alone are supported.
 This is not a registry admission.
 
 ### Capability advertisement
@@ -747,7 +769,7 @@ extra field; hipfire clients (and deployment tooling) use it for discovery:
     "prefix_cache": true,
     "structured_output": true,
     "structured_output_subset": "json-schema-strict-v1",
-    "refused_request_fields": ["stop", "logprobs", "response_format:json_object"]
+    "refused_request_fields": ["best_of", "logit_bias", "echo", "suffix", "tools+image"]
   }
 }
 ```
