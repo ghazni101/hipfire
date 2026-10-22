@@ -10,17 +10,18 @@
 #   scripts/container-gate.sh python3 scripts/serve_harness.py battery --model <model>
 #   scripts/container-gate.sh python3 scripts/redline_daemon_harness.py
 #
-# Environment:
-#   HIPFIRE_CONTAINER=podman|docker   container runtime (default: podman)
+#   HIPFIRE_CONTAINER=docker|podman   container runtime (default: docker)
 #   HIPFIRE_MODELS_DIR=<path>         host models dir (default: ~/.hipfire/models)
-#   HIPFIRE_IMAGE=<name>              image tag (default: hipfire-gate)
+#   HIPFIRE_IMAGE=<name>              image tag (default: hipfire-gate:dev)
 #   HIPFIRE_SKIP_BUILD=1              skip the image build, run the existing tag
+#   HIPFIRE_ROCM=<path>               host ROCm root mounted into the container
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUNTIME="${HIPFIRE_CONTAINER:-podman}"
-IMAGE="${HIPFIRE_IMAGE:-hipfire-gate}"
+RUNTIME="${HIPFIRE_CONTAINER:-docker}"
+IMAGE="${HIPFIRE_IMAGE:-hipfire-gate:dev}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
+ROCM_ROOT="$(readlink -f "${HIPFIRE_ROCM:-/opt/rocm}")"
 
 GATE_CMD=("$@")
 if [ ${#GATE_CMD[@]} -eq 0 ]; then
@@ -42,8 +43,8 @@ fi
 
 if [ "${HIPFIRE_SKIP_BUILD:-0}" != "1" ]; then
     echo "[container-gate] building $IMAGE (gate-runner target)..."
-    "$RUNTIME" build -f "$ROOT/Containerfile" --target gate-runner \
-        -t "$IMAGE" "$ROOT" || exit 1
+    HIPFIRE_CONTAINER="$RUNTIME" HIPFIRE_ROCM="$ROCM_ROOT" \
+        "$ROOT/scripts/container-build.sh" gate-runner "$IMAGE" || exit 1
 fi
 
 # Rootless podman needs --group-add keep-groups to keep the host render/video
@@ -56,6 +57,7 @@ GPU_ARGS=(
     --device /dev/kfd
     --device /dev/dri
     --security-opt seccomp=unconfined
+    -v "$ROCM_ROOT:/opt/rocm:ro"
     -v "$MODELS_DIR:/root/.hipfire/models"
     -v hipfire-kcache:/var/cache/hipfire
 )

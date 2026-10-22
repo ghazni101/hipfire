@@ -1,0 +1,62 @@
+# hipfire compose — host-ROCm, single-volume dedup layout.
+#
+# Every service mounts the same host ROCm (read-only), the same models
+# volume, and the same kernel-cache volume. One image tag family; no
+# per-arch or per-model images.
+#
+# Serve:
+#   docker compose -f docker/compose.yaml up hipfire
+# Pull a model (one-shot):
+#   docker compose -f docker/compose.yaml --profile tools run --rm pull qwen3.5:4b
+# Quantize (one-shot):
+#   docker compose -f docker/compose.yaml --profile tools run --rm quantize <args>
+#
+# GID env: docker has no `keep-groups`; pass the host groups that own
+# /dev/kfd (render) and /dev/dri (video/render). Defaults below are typical;
+# override:  RENDER_GID=$(stat -c %g /dev/kfd) docker compose ... up
+services:
+  hipfire:
+    image: ${HIPFIRE_IMAGE:-hipfire:dev}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:-109}"
+      - "${VIDEO_GID:-44}"
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ${HIPFIRE_ROCM:-/opt/rocm}:/opt/rocm:ro
+      - hipfire-models:/root/.hipfire/models
+      - hipfire-kcache:/var/cache/hipfire
+    ports:
+      - "127.0.0.1:11435:11435"   # no auth/TLS — loopback publish only
+    # Bind 0.0.0.0 inside the container so the published port reaches it.
+    command: ["serve", "qwen3.5:4b", "0.0.0.0:11435"]
+
+  pull:
+    image: ${HIPFIRE_IMAGE:-hipfire:dev}
+    volumes:
+      - hipfire-models:/root/.hipfire/models
+    command: ["pull"]
+    profiles: ["tools"]
+
+  quantize:
+    image: ${HIPFIRE_QUANTIZER_IMAGE:-hipfire-quantize:dev}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:-109}"
+      - "${VIDEO_GID:-44}"
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ${HIPFIRE_ROCM:-/opt/rocm}:/opt/rocm:ro
+      - hipfire-models:/root/.hipfire/models
+      - hipfire-kcache:/var/cache/hipfire
+    profiles: ["tools"]
+
+volumes:
+  hipfire-models:
+  hipfire-kcache:

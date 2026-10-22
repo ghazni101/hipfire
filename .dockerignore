@@ -60,5 +60,12 @@ kernels/compiled/
 /dev/
 /dist/
 
-# The existing narrow gfx12-precompile helper is out of scope
+# Container service definitions are runtime config, not build inputs
 docker/
+
+# Build inputs that never land in the image — editing them must not bust the
+# builder-stage cache on COPY . . (a Containerfile tweak would otherwise force a
+# full Rust + kernel recompile).
+Containerfile
+scripts/container-build.sh
+scripts/container-gate.sh

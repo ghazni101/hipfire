@@ -1,181 +1,179 @@
 # Containerized hipfire
 
-Repo-root multi-stage `Containerfile` (podman-native, Docker-compatible).
-Two final targets share a ROCm base:
+Repo-root multi-stage `Containerfile`. **No image carries ROCm**: the host's
+`/opt/rocm` is mounted into the builder at image-build time (BuildKit named
+context / `podman build --volume`) and into every container read-only at run
+time. This works because hipfire `dlopen`s `libamdhip64.so`/
+`libhsa-runtime64.so` — nothing links HIP at build time, and containers share
+the host's KMD, so user-space/KMD versions always match.
 
 | Target | Purpose | Image contents |
 |---|---|---|
-| `runtime` | Deliverable inference image | Daemon + native CLI + five-arch indexed registry kernel packages |
-| `gate-runner` | Local GPU harness / historical gate runner | Full builder tree + source + in-image entry scripts |
+| `runtime` | Deliverable inference image | daemon + `hipfire` CLI + five-arch indexed kernel packs + python3 (mounted hipcc JIT works) |
+| `runtime-slim` | Deliverable for pinned registered models | same minus python3; unregistered routes fail fast |
+| `quantizer` | Model-build image | `runtime` + `hipfire-quantize` |
+| `gate-runner` | Local GPU harness / dev-build validation | full builder tree + source + gate scripts |
 
 | Field | Value |
 |---|---|
-| Base image | `docker.io/rocm/dev-ubuntu-24.04:7.2.4` |
-| Control plane | Native `hipfire-cli` Rust binary |
+| Base image | `docker.io/library/ubuntu:26.10` (must match the host Ubuntu the mounted `/opt/rocm` was built for) |
+| ROCm | host `/opt/rocm`, mounted `ro` — never an image layer |
+| Control plane | native `hipfire-cli` Rust binary |
 | Published port | `11435` (`EXPOSE`) |
 | JIT kernel cache env | `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire` |
 | Daemon path in runtime | `HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon` |
 
-Truth state: **shipped / ref-pinned** for build/run paths below. There is
-**no** GitHub Actions workflow that builds or publishes these images today
-(`.github/workflows/` has no container publish job). No-GPU CI does **not**
-exercise the image or the GPU.
+## Design constraints
 
-## Design constraints (from `Containerfile`)
-
-- **ROCm is dlopen'd at runtime** — the image build needs no GPU.
-- **gfx1151 needs ROCm 7.2+** — do not downgrade the base; if `hipcc`/HIP
-  headers are missing, switch the tag to `7.2.4-complete`.
-- **Exact-source registry kernels are packaged at build time.** Each installed
-  object carries a verified `.index.json` beside the daemon. For an unregistered
-  route or rejected package, the ROCm base still supplies hipcc for JIT.
-- **CLI is native Rust.** `hipfire-registry` embeds `registry/v1.json`; neither
-  the builder nor runtime image installs Bun, Node, or a TypeScript payload.
-- **Models are never baked in** — mount a volume.
-- **No `HSA_OVERRIDE_GFX_VERSION`** is set in the image; arch comes from HIP
+- **ROCm is dlopen'd at runtime** — `cargo build` needs no GPU and no ROCm.
+  Only `scripts/compile-kernels.sh` needs `hipcc`, and it gets the host's.
+- **Base tag MUST match the host OS** that produced `/opt/rocm`. The mounted
+  amdclang/hipcc run inside the container against its glibc; a base older
+  than the host breaks on glibc symbols. Host Ubuntu 26.10 → `ubuntu:26.10`.
+- **Exact-source registry kernels are packaged at build time** for
+  `gfx1201/1100/1151/906/942` by the host's hipcc. One image serves all
+  arches — never build per-arch images.
+- **Models are never baked in** — the named volume `hipfire-models` is
+  shared by the pull, quantize, and serve containers so weights exist on
+  disk exactly once.
+- **No `HSA_OVERRIDE_GFX_VERSION`** is set; arch comes from HIP
   `gcnArchName` at runtime.
+- **Host-ROCm caveat:** images are host-bound — they run only where an
+  equivalent `/opt/rocm` exists. A host ROCm upgrade propagates to all
+  containers instantly; kernel-cache entries are content-keyed so a new
+  ROCm just writes new entries.
 
 `.dockerignore` keeps the build context small (excludes `target/`, models,
-worktrees, etc.).
+worktrees, `kernels/compiled/`).
 
 ## Build
 
+`scripts/container-build.sh` supplies the host-ROCm mount for the build:
+
 ```bash
-podman build -f Containerfile --target runtime     -t hipfire .
-podman build -f Containerfile --target gate-runner -t hipfire-gate .
+scripts/container-build.sh runtime      hipfire:dev
+scripts/container-build.sh runtime-slim hipfire:dev-slim
+scripts/container-build.sh quantizer    hipfire-quantize:dev
+scripts/container-build.sh gate-runner  hipfire-gate:dev
 ```
 
-Docker works the same with `docker build …`. Rootful Docker does **not**
-implement Podman's `--group-add keep-groups` token — omit that flag under
-Docker (see run section).
+Environment: `HIPFIRE_CONTAINER=docker|podman` (default `docker`),
+`HIPFIRE_ROCM=<path>` (default `readlink -f /opt/rocm`). Under docker the
+wrapper passes `--build-context rocm=<path>`; the builder stage mounts it
+inside the kernel-pack `RUN` step. Under podman it passes
+`--volume <path>:/opt/rocm:ro` to `podman build`.
 
-Daemon and CLI builds inside the image (Containerfile builder stage):
+Equivalent manual docker command:
 
-```text
-cargo build --release --locked -p hipfire-daemon
-cargo build --release --locked -p hipfire-cli
+```bash
+docker build --build-context rocm=/opt/rocm \
+  -f Containerfile --target runtime -t hipfire:dev .
 ```
 
-The builder also runs `scripts/compile-kernels.sh`, failing the image build
-if any registry module cannot produce an indexed object. Runtime copies
-`kernels/compiled/` to `/opt/hipfire/bin/kernels/compiled/`.
+## Run (GPU required)
 
-## Run the runtime image (GPU required)
-
-GPU device nodes are required for inference. Rootless podman needs
-`--group-add keep-groups` so host `render`/`video` gids reach `/dev/kfd` and
-`/dev/dri`.
+GPU device nodes plus the host ROCm mount are required. Docker does not
+implement podman's `--group-add keep-groups`; if the daemon user can't open
+`/dev/kfd`, pass host GIDs with `--group-add $(stat -c %g /dev/kfd)` (or run
+rootless podman, which honors `keep-groups`).
 
 **Unauthenticated HTTP.** Serve has no auth and no TLS ([SERVE.md](SERVE.md)).
-Publish the port only on loopback unless a trusted network or authenticated
-TLS reverse proxy protects it. Prefer `-p 127.0.0.1:11435:11435` over bare
-`-p 11435:11435` (the latter binds all host interfaces).
+Publish only on loopback (`-p 127.0.0.1:11435:11435`) unless a trusted
+network or authenticated TLS reverse proxy protects it.
 
 ```bash
-podman run --rm -it \
+docker run --rm -it \
   --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
+  --group-add "$(stat -c %g /dev/kfd)" \
+  --security-opt seccomp=unconfined \
+  -v /opt/rocm:/opt/rocm:ro \
   -v hipfire-models:/root/.hipfire/models \
   -v hipfire-kcache:/var/cache/hipfire \
   -p 127.0.0.1:11435:11435 \
-  hipfire run qwen3.5:4b "2+2="
+  hipfire:dev serve qwen3.5:4b 0.0.0.0:11435
 ```
 
-Serve in the **foreground** (ENTRYPOINT is `hipfire`). Keep **host** publication
-on loopback (`-p 127.0.0.1:11435:11435`) but bind Hipfire to **`0.0.0.0:11435`
-inside the container** so published-port DNAT can reach the listener
-(a container-local `127.0.0.1` bind is unreachable through Podman/Docker port publish):
+Bind `0.0.0.0:11435` inside the container so published-port DNAT reaches the
+listener; keep the host publication on loopback.
+
+Do **not** pass `-d`/`--detach` as the container command — that forks a
+background child and lets PID 1 exit. Detach with the container runtime
+(`docker run -d …`) for a long-lived container.
+
+`docker/compose.yaml` wires the same layout (`hipfire` service + `tools`
+profile with one-shot `pull` and `quantize` services):
 
 ```bash
-podman run --rm -it \
-  --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
-  -v hipfire-models:/root/.hipfire/models \
-  -v hipfire-kcache:/var/cache/hipfire \
-  -p 127.0.0.1:11435:11435 \
-  hipfire serve qwen3.5:4b 0.0.0.0:11435
+docker compose -f docker/compose.yaml up hipfire          # serve
+docker compose -f docker/compose.yaml --profile tools \
+    run --rm pull qwen3.8:27b-mq4-xts                     # fetch model + draft sidecar
 ```
-
-To publish on all host interfaces (no auth, no TLS — trusted network or
-authenticated TLS reverse proxy only): `-p 11435:11435` and keep the in-container
-bind at `0.0.0.0:11435`.
-
-Do **not** pass `-d` / `--detach` as the container command: that forks a
-background child and lets PID 1 exit, which stops the container. Detach with
-the container runtime (`podman run -d … hipfire serve …`) if you need a
-long-lived container.
 
 Volumes:
 
 | Volume / path | Role |
 |---|---|
-| `hipfire-models` → `/root/.hipfire/models` | Pulled / mounted model files |
+| `hipfire-models` → `/root/.hipfire/models` | Pulled / quantized model files |
 | `hipfire-kcache` → `/var/cache/hipfire` | Persistent JIT kernel cache |
+| `/opt/rocm` → `/opt/rocm` (ro) | Host ROCm — mount the real dir, not a broken symlink |
 
-OpenAI HTTP surface after serve is up: [SERVE.md](SERVE.md).
+
+### Profiling (`rocprofv3`)
+
+`hipfire:dev` (the `runtime` target) bakes the ROCm profiler toolchain into
+the image at `/opt/rocprofiler` — `rocprofv3`, `rocprofv3-avail` and
+`rocprof-attach` are on `PATH`. This is a deliberate exception to the
+"no ROCm in the image" rule: packaged host installs keep `/opt/rocm/{bin,lib}`
+as `/etc/alternatives` symlinks that dangle inside containers, so the bind
+mount alone cannot provide working tools. The profiler's own closure (SDK,
+comgr/LLVM, rocm_sysdeps, rocpd schemas) is self-contained under
+`/opt/rocprofiler`; the app under test still uses the mounted ROCm for HIP.
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri \
+    --security-opt seccomp=unconfined --entrypoint bash \
+    -v /opt/rocm:/opt/rocm:ro -v "$PWD/traces:/out" hipfire:dev -c \
+    'rocprofv3 --hip-trace --kernel-trace -d /out -o run -- hipfire bench <model> ...'
+```
+
+Output is `rocpd` (SQLite) by default; convert on the host with
+`rocpd convert` or pass `--output-format csv`/`json`/`pftrace`.
 
 ## Local containerized GPU runs (`scripts/container-gate.sh`)
 
-Helper builds `gate-runner` and runs a command inside it with GPU
-passthrough and the host models directory bind-mounted.
+Builds `gate-runner` and runs a command inside it with GPU passthrough, the
+host ROCm mount, and the host models directory bind-mounted. Defaults to
+docker (`HIPFIRE_CONTAINER=podman` for podman).
 
-The `gate-runner` image has no default gate. Its `CMD` and the wrapper's
-no-argument path both print guidance and exit `2`: there is no universal
-correctness battery, so select a route from [VALIDATION.md](VALIDATION.md)
-and pass it explicitly. The image ENTRYPOINT is `/bin/bash`, so invoke Python
-scripts through `python3`; a bare `.py` path would be run by bash.
+The `gate-runner` image has no default gate — select a route from
+[VALIDATION.md](VALIDATION.md) and pass it explicitly:
 
 ```bash
-# Serve semantics smoke (finish reasons, empty/runaway output, prompt-cache
-# reuse across a chain of turns). The harness starts its own serve inside the
-# container; the host models dir is mounted at /root/.hipfire/models:
-scripts/container-gate.sh -lc 'exec python3 scripts/serve_harness.py --mode chain --model /root/.hipfire/models/<file> --tag qwen3.5:9b'
-
-# Kernel / dispatch / Redline changes:
-scripts/container-gate.sh -lc 'exec python3 scripts/redline_daemon_harness.py'
+scripts/container-gate.sh python3 scripts/serve_harness.py --mode chain \
+    --model /root/.hipfire/models/<file> --tag qwen3.5:9b
+scripts/container-gate.sh python3 scripts/redline_daemon_harness.py
 ```
 
-Prefix-cache behavior: `--mode chain` reports `cached_tokens` on related
-turns, and `--mode prefix-fanout` drives the opt-in shared-header workload.
-The cross-session prefix cache itself is opt-in multi-slot config
-(`serve.multi_slot`, `serve.prefix_cache`; see [SERVE.md](SERVE.md)).
-
-Environment:
-
-| Variable | Default | Role |
-|---|---|---|
-| `HIPFIRE_CONTAINER` | `podman` | `podman` or `docker` |
-| `HIPFIRE_MODELS_DIR` | `~/.hipfire/models` | Host models path |
-| `HIPFIRE_IMAGE` | `hipfire-gate` | Image tag |
-| `HIPFIRE_SKIP_BUILD` | unset | `1` reuses existing tag |
-| `HIPFIRE_GPU_LOCKFILE` | `/tmp/hipfire-gpu.lock` | Mounted when present |
-
-**Scope limits (fail closed):**
-
-- The retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance
-  evidence and are not recommended here ([VALIDATION.md](VALIDATION.md)).
-- A successful **image build** proves the multi-stage compile path only. It
-  does **not** certify GPU runtime correctness, serve semantics, or perf.
-- Bare `scripts/container-gate.sh` with no arguments fails closed with exit
-  `2` and a usage message until you pass a real command.
-- No-GPU CI (`.github/workflows/no-gpu-ci.yml`) does **not** build this
-  Containerfile and does **not** replace a manual GPU route.
-
-Current user-facing serve smoke is `scripts/serve_harness.py` per
-[VALIDATION.md](VALIDATION.md) and [SERVE.md](SERVE.md).
+**Scope limits (fail closed):** a successful image build proves the
+multi-stage compile path only — not GPU runtime correctness, serve
+semantics, or perf. Retired `coherence-gate-*.sh` batteries are not
+acceptance evidence. Current user-facing serve smoke is
+`scripts/serve_harness.py` per [VALIDATION.md](VALIDATION.md).
 
 ## Publishing
 
-Not wired. When added, the natural path is building the `runtime` target
-(no GPU required at build time) and pushing tags from CI; GPU validation
-remains a local/manual concern.
+Not applicable under the host-ROCm design — images only run where an
+equivalent `/opt/rocm` exists. Distributing a self-contained image would
+mean returning to a `FROM rocm/…` base stage; that is the deliberate
+tradeoff this layout avoids.
 
 ## Related paths
 
 | Path | Role |
 |---|---|
-| `Containerfile` | Multi-stage definition |
+| `Containerfile` | Multi-stage definition (base → builder → 4 targets) |
+| `scripts/container-build.sh` | Build wrapper — supplies the host-ROCm build mount |
 | `scripts/container-gate.sh` | Local GPU container runner |
-| `docker/rocm7-builder.Dockerfile` | Separate helper for pre-compiling gfx12 kernels via `compile-kernels.sh` — **not** part of the runtime/gate-runner deliverable |
+| `docker/compose.yaml` | Serve/pull/quantize service layout |
 | [SERVE.md](SERVE.md) | HTTP API |
 | [NIXOS.md](NIXOS.md) | NixOS alternative install |
