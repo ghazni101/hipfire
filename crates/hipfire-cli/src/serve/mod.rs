@@ -418,6 +418,9 @@ pub(crate) struct ServeRuntime {
     pub(crate) multi_slot_slots: u64,
     pub(crate) multi_slot_ctx: u64,
     pub(crate) multi_slot_prefill_chunk: u64,
+    /// Shared `PagePool` for the multi-slot engine; pages=0 auto-sizes.
+    pub(crate) multi_slot_paged: bool,
+    pub(crate) multi_slot_paged_pages: u64,
     pub(crate) spawner: EngineSpawner,
     /// The `model` string the resident model was loaded under; reloaded after
     /// a daemon restart.
@@ -511,6 +514,8 @@ pub(crate) fn route_capabilities(
     multi_slot_slots: u64,
     multi_slot_ctx: u64,
     multi_slot_prefill_chunk: u64,
+    multi_slot_paged: bool,
+    multi_slot_paged_pages: u64,
     prefix_cache: bool,
     prefix_cache_max_bytes: u64,
     structured_jump_forward: bool,
@@ -535,6 +540,8 @@ pub(crate) fn route_capabilities(
         "multi_slot_slots": multi_slot_slots,
         "multi_slot_ctx": multi_slot_ctx,
         "multi_slot_prefill_chunk": multi_slot_prefill_chunk,
+        "multi_slot_paged": multi_slot_paged,
+        "multi_slot_paged_pages": multi_slot_paged_pages,
         "prefix_cache": prefix_cache,
         "prefix_cache_max_bytes": prefix_cache_max_bytes,
         "structured_output": structured_output,
@@ -1768,6 +1775,18 @@ pub(crate) fn serve_foreground(
         .unwrap_or(config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192));
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Shared paged KV pool for the multi-slot engine. `--multi-slot-paged`
+    // or an explicit page count selects it; otherwise the process config
+    // decides. pages=0 auto-sizes from post-weight free VRAM.
+    let multi_slot_paged = args.multi_slot_paged
+        || args.multi_slot_paged_pages.is_some()
+        || config_bool(&global, "serve.multi_slot_paged")?;
+    let multi_slot_paged_pages = args
+        .multi_slot_paged_pages
+        .unwrap_or(config_u64(&global, "serve.multi_slot_paged_pages")?);
+    if multi_slot_paged && !multi_slot_enabled {
+        bail!("--multi-slot-paged requires serve.multi_slot / HIPFIRE_SERVE_MULTI_SLOT=1");
+    }
     // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
     // consumes both (row budget and prefill quantum); other standard routes
     // read them for startup validation only.
@@ -1894,6 +1913,8 @@ pub(crate) fn serve_foreground(
         multi_slot_slots,
         multi_slot_ctx,
         multi_slot_prefill_chunk,
+        multi_slot_paged,
+        multi_slot_paged_pages,
         prefix_cache,
         prefix_cache_max_bytes,
         structured_jump_forward,
@@ -1936,6 +1957,8 @@ pub(crate) fn serve_foreground(
             multi_slot_slots,
             multi_slot_ctx,
             multi_slot_prefill_chunk,
+            multi_slot_paged,
+            multi_slot_paged_pages,
             spawner,
             resident_model: None,
             request_policy,
@@ -2357,6 +2380,8 @@ impl ServeRuntime {
                 params["experimental_multi_slot_ctx"] = serde_json::json!(self.multi_slot_ctx);
                 params["experimental_multi_slot_prefill_chunk"] =
                     serde_json::json!(self.multi_slot_prefill_chunk);
+                params["multi_slot_paged"] = serde_json::json!(self.multi_slot_paged);
+                params["multi_slot_paged_pages"] = serde_json::json!(self.multi_slot_paged_pages);
                 // Forward the resolved (possibly clamped-to-scratch) trunk-row
                 // budget so the daemon's slot engine does not re-read the
                 // unclamped OnceLock `serve.max_batch_tokens` default and
@@ -4089,6 +4114,8 @@ mod tests {
             multi_slot_slots: 4,
             multi_slot_ctx: 8192,
             multi_slot_prefill_chunk: 1024,
+            multi_slot_paged: false,
+            multi_slot_paged_pages: 0,
             spawner: EngineSpawner {
                 daemon: daemon.clone(),
                 process_config,
@@ -4582,6 +4609,8 @@ mod capabilities_tests {
             2,
             50000,
             1024,
+            /*multi_slot_paged*/ false,
+            0,
             /*prefix_cache*/ true,
             536870912,
             /*jump_forward*/ true,
@@ -4652,6 +4681,8 @@ mod capabilities_tests {
             4,
             8192,
             1024,
+            false,
+            0,
             false,
             0,
             false,

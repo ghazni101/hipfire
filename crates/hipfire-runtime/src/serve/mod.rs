@@ -392,6 +392,10 @@ pub struct SlotEngineConfig {
     /// yes / DFlash deferred, vision via the sequential VL path). The engine
     /// re-checks every gate at load.
     pub kv_backend: String,
+    /// Multi-slot shared paged KV pool (`PagePool`) instead of fixed slabs.
+    pub multi_slot_paged: bool,
+    /// Physical pages in the shared paged pool; 0 = auto-size from free VRAM.
+    pub multi_slot_paged_pages: usize,
     /// Cross-session prefix cache enabled (spec §4.5–4.6).
     pub prefix_cache: bool,
     /// Checkpoint pool max bytes; `prefix_cache` with `0` must refuse at

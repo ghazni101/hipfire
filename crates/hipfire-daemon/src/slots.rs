@@ -132,6 +132,9 @@ pub struct SlotLoadParams {
     /// Display name of the tier the engine will run, for the loaded ACK and
     /// kv_mode diag.
     pub kv_mode_resolved: &'static str,
+    /// Shared `PagePool` for the multi-slot engine (auto-sized when pages=0).
+    pub multi_slot_paged: bool,
+    pub multi_slot_paged_pages: usize,
     pub dflash_draft: Option<PathBuf>,
     pub dflash_required: bool,
     /// Optional `params.max_batch_tokens` override. When present it wins over
@@ -214,6 +217,13 @@ impl SlotLoadParams {
             kv_mode_raw,
             kv_backend,
             kv_mode_resolved,
+            multi_slot_paged: param("multi_slot_paged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            multi_slot_paged_pages: param("multi_slot_paged_pages")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0),
             dflash_draft,
             dflash_required: dflash_mode == "on",
             max_batch_tokens: param("max_batch_tokens")
@@ -538,6 +548,8 @@ impl SlotBackend {
         mtp_mode: hipfire_config::MtpMode,
         kv_mode_raw: &str,
         kv_backend: &str,
+        multi_slot_paged: bool,
+        multi_slot_paged_pages: usize,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
         vision_mode: &str,
@@ -694,6 +706,8 @@ impl SlotBackend {
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
                 kv_backend: kv_backend.to_string(),
+                multi_slot_paged,
+                multi_slot_paged_pages,
                 prefix_cache,
                 prefix_cache_max_bytes,
                 max_batch_tokens,

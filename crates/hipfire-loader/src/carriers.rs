@@ -8016,6 +8016,8 @@ impl Carrier for Qwen35Carrier {
             mtp_mode: cfg.mtp_mode,
             kv_mode_raw: cfg.kv_mode_raw,
             kv_backend: cfg.kv_backend,
+            multi_slot_paged: cfg.multi_slot_paged,
+            multi_slot_paged_pages: cfg.multi_slot_paged_pages,
             prefix_cache: cfg.prefix_cache,
             prefix_cache_max_bytes: cfg.prefix_cache_max_bytes,
             max_batch_tokens: cfg.max_batch_tokens,

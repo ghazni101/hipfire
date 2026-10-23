@@ -1542,6 +1542,8 @@ fn main() {
                         slot_params.mtp_mode,
                         &slot_params.kv_mode_raw,
                         &slot_params.kv_backend,
+                        slot_params.multi_slot_paged,
+                        slot_params.multi_slot_paged_pages,
                         slot_params.dflash_draft,
                         slot_params.dflash_required,
                         &slot_vision_mode,
