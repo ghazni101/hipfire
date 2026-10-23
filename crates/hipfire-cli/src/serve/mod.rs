@@ -1795,21 +1795,26 @@ pub(crate) fn serve_foreground(
     let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
     let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
     let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
-    // Multi-slot scratch capacity is `prefill_chunk * n_slots` trunk rows. The
-    // built-in `serve.max_batch_tokens` default (4096) exceeds that for the
-    // documented slot counts (1..3 slots x 1024) and would refuse every such
-    // start. When the key is still the built-in default, clamp it to the
-    // scratch capacity rather than failing; a user-set value keeps the strict
-    // refuse (an explicit oversized budget is a real misconfiguration).
+    // Multi-slot uses one shared prefill scratch with a **total** row budget:
+    // a single slot may use the full `prefill_chunk`, and every slot's verify
+    // rows must fit. This mirrors `serve_engine::multi_slot_prefill_rows`; 64
+    // is the VMM reserve-slack upper bound per speculative slot. The built-in
+    // `serve.max_batch_tokens` default (4096) exceeds that for the documented
+    // slot counts (1..3 slots x 1024) and would refuse every such start. When
+    // the key is still the built-in default, clamp it rather than failing; a
+    // user-set value keeps the strict refuse (an explicit oversized budget is
+    // a real misconfiguration).
+    const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
     let max_batch_tokens = if multi_slot_enabled {
-        let scratch_rows = multi_slot_prefill_chunk.saturating_mul(multi_slot_slots);
+        let scratch_rows =
+            multi_slot_prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(multi_slot_slots));
         let is_builtin = global
             .get("serve.max_batch_tokens")
             .map(|v| matches!(v.source, ConfigSource::BuiltIn))
             .unwrap_or(true);
         if is_builtin && max_batch_tokens > scratch_rows {
             eprintln!(
-                "serve: built-in max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} ({multi_slot_slots} x {multi_slot_prefill_chunk}); clamping to {scratch_rows}"
+                "serve: built-in max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} (max(prefill_chunk {multi_slot_prefill_chunk}, 64 verify rows x {multi_slot_slots} slots)); clamping to {scratch_rows}"
             );
             scratch_rows
         } else {
@@ -2705,12 +2710,18 @@ pub(crate) fn validate_multi_slot_startup(
         return Err("serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned());
     }
     if multi_slot_enabled {
-        let scratch_rows = prefill_chunk
-            .checked_mul(n_slots)
-            .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?;
+        // Same total-row budget as `serve_engine::multi_slot_prefill_rows`:
+        // one chunk for a single prefilling slot, or every slot's verify
+        // rows, whichever is larger. 64 is the per-slot verify upper bound.
+        const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
+        let scratch_rows = prefill_chunk.max(
+            MAX_VERIFY_ROWS_PER_SLOT
+                .checked_mul(n_slots)
+                .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?,
+        );
         if max_batch_tokens > scratch_rows {
             return Err(format!(
-                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = {n_slots} slots x {prefill_chunk} rows)"
+                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = max(prefill_chunk {prefill_chunk}, 64 verify rows x {n_slots} slots))"
             ));
         }
     }
@@ -4253,19 +4264,19 @@ mod tests {
         // Args: (multi_slot, continuous_batch_size, max_queue, max_batch_tokens, prefill_min_tokens)
         assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1, 1024, 4, false, 0).is_ok());
         assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1, 1024, 4, false, 0).is_ok());
-        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1, 1024, 4, false, 0).is_ok());
-        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        assert!(validate_multi_slot_startup(true, 1, 64, 1024, 1, 1024, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 2, 64, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
         let err =
-            validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+            validate_multi_slot_startup(true, 16, 64, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
     #[test]
     fn multi_slot_startup_rejects_uncapped_queue() {
         // serve.max_queue=0 is uncapped historically; robust multi-slot rejects it.
-        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        let err = validate_multi_slot_startup(true, 1, 0, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.max_queue"), "{err}");
         assert!(err.contains("non-zero"), "{err}");
         // Off multi-slot, an uncapped queue is still accepted (old behavior preserved).
@@ -4296,8 +4307,22 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_budget_above_scratch_rows() {
-        let err = validate_multi_slot_startup(true, 1, 64, 2049, 1, 1024, 2, false, 0).unwrap_err();
-        assert!(err.contains("scratch capacity (2048"), "{err}");
+        let err = validate_multi_slot_startup(true, 1, 64, 1025, 1, 1024, 2, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (1024"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_scratch_is_a_total_budget_not_slots_times_chunk() {
+        // 4 slots x 1024 rows would have allowed 4096; the shared PBS holds
+        // one full chunk (1024), not one per slot.
+        assert!(validate_multi_slot_startup(true, 1, 64, 1024, 1, 1024, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 1, 64, 1025, 1, 1024, 4, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (1024"), "{err}");
+
+        // A small chunk still admits every slot's verify rows (64 x 4).
+        assert!(validate_multi_slot_startup(true, 1, 64, 256, 1, 32, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 1, 64, 257, 1, 32, 4, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (256"), "{err}");
     }
 
     #[test]

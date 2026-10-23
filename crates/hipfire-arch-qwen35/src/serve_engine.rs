@@ -694,6 +694,20 @@ impl ModelRig {
     }
 }
 
+/// Verify rows one speculative slot may inject in a step: the last DFlash
+/// window / MTP draft plus the finish drain. Mirrors the VMM reserve slack.
+const MAX_VERIFY_ROWS_PER_SLOT: usize = crate::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
+
+/// Rows the shared multi-slot prefill scratch must hold.
+///
+/// This is a **total** row budget: a single prefilling slot may use the full
+/// `prefill_chunk`, while verify rows for every slot must still fit. It is not
+/// `prefill_chunk × n_slots` — that sized the scratch for every slot prefilling
+/// at once and cost several GiB of KV headroom on large models.
+fn multi_slot_prefill_rows(prefill_chunk: usize, n_slots: usize) -> usize {
+    prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(n_slots))
+}
+
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -1154,13 +1168,16 @@ impl Rig {
         // Verify rows per spec slot: MTP k+1, DFlash2 B — the larger wins so
         // the tape stride and batch sizing cover either mechanism.
         let spec_rows = (mtp_k + 1).max(dflash_block.unwrap_or(0));
-        // A step carries at most max(prefill_chunk, spec_rows) rows per
-        // slot: prefilling slots contribute up to `prefill_chunk` rows, and
-        // a decoding spec slot injects `spec_rows` verify rows. Sizing
-        // without the spec term let a small `prefill_chunk` (operator knob)
-        // overflow `pbs.max_batch` on the first verify step — an
-        // engine-thread panic, the serve-hang failure class.
-        let max_batch = prefill_chunk.max(spec_rows) * cfg.n_slots;
+        // One shared prefetch scratch, not one per slot. A step may carry the
+        // full `prefill_chunk` for a single prefilling slot, and every spec
+        // slot may inject up to `VMM_RESERVE_SLACK_ROWS` verify rows, but the
+        // total row budget is shared by the whole batch. Multiplying the
+        // chunk by `n_slots` here sized the PBS for N simultaneous full-size
+        // prefills (4 x 1024 = 4096 rows on a 4-slot engine), which on a 27B
+        // model costs ~2.7 GiB and starves the VMM KV budget. Sizing without
+        // the verify term let a small `prefill_chunk` overflow the PBS on
+        // the first verify step; keep that bound.
+        let max_batch = multi_slot_prefill_rows(prefill_chunk, cfg.n_slots);
 
         // ── Paged KV opt-in ────────────────────────────────────────────────
         // Default OFF: the pool stays legacy (fixed per-slot slabs). With
@@ -8287,6 +8304,19 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_slot_prefill_rows_share_one_total_budget() {
+        // One full chunk for a single prefilling slot; not one per slot.
+        assert_eq!(multi_slot_prefill_rows(1024, 4), 1024);
+        assert_eq!(multi_slot_prefill_rows(512, 4), 512);
+        assert_eq!(multi_slot_prefill_rows(1024, 1), 1024);
+        // Every slot's verify rows still fit when the chunk is smaller.
+        assert_eq!(multi_slot_prefill_rows(32, 4), 256);
+        assert_eq!(multi_slot_prefill_rows(64, 8), 512);
+        // Saturating: an absurd slot count must not wrap or panic.
+        assert!(multi_slot_prefill_rows(1024, usize::MAX) >= 1024);
+    }
 
     #[test]
     fn slot_snapshot_kv_tags_are_stable_and_unique() {

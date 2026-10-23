@@ -259,7 +259,14 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
 
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped
-   as requests are admitted up to their prompt + generation budget. Plain
+   as requests are admitted up to their prompt + generation budget. The
+   shared prefill scratch is one **total** row budget, not one per slot:
+   `serve.max_batch_tokens` clamps to `max(serve.multi_slot_prefill_chunk,
+   64 verify rows × slots)`. A lone prefilling slot may use the full chunk;
+   concurrent prefills share those rows. This is the difference between a
+   4096-row (2.7 GiB on 27B) and a 1024-row scratch, and it is what leaves
+   KV headroom for concurrent long generations (4-slot 27B q8 VMM: 5766 MiB
+   mapped-byte budget at `multi_slot_prefill_chunk=1024`). Plain
    prompt rows, decode and verify rows run batched through the
    descriptor-addressed `_vmm` kernels; only MTP/DFlash prompt chunks stay on
    the singleton body, because their private hidden capture is not ported to
