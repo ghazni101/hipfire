@@ -76,6 +76,7 @@ fn main() {
                     presence_penalty: 0.0,
                     frequency_penalty: 0.0,
                     min_p: 0.0,
+                    logprobs_top_k: None,
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
@@ -101,7 +102,7 @@ fn main() {
                         Ok(Event::Accepted { reused, .. }) => {
                             log.push(format!("Accepted(reused={reused})"))
                         }
-                        Ok(Event::Token { id }) => log.push(format!("Tok({id})")),
+                        Ok(Event::Token { id, .. }) => log.push(format!("Tok({id})")),
                         Ok(Event::Rejected { reason, .. }) => {
                             log.push(format!("Rejected({reason})"));
                             break;

@@ -870,7 +870,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1742
+**Count:** 1745
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -937,7 +937,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BENCH_WORKLOAD` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BF16_H_A4` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_BF16_H_FP8` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_BIN` | scripts/calibrate_multigpu.sh, scripts/install.sh | harness |
+| `HIPFIRE_BIN` | scripts/calibrate_multigpu.sh, scripts/check_slots_vmm_prefix.py | harness |
 | `HIPFIRE_BLOB_FORCE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/dispatch.rs | experimental |
 | `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE` | crates/rdna-compute/examples/qwen4_moe_sym.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE` | crates/rdna-compute/src/gemm_mq6_i8.rs, crates/rdna-compute/src/gemv.rs | developer |
@@ -1962,7 +1962,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
-| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | stable |
+| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | stable |
 | `HIPFIRE_MTP_SAMPLED_MODE` | crates/hipfire-arch-qwen4/src/lab_window.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs | harness |
@@ -2444,15 +2444,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_MAX_BATCH_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_MAX_QUEUE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | stable |
 | `HIPFIRE_SERVE_MAX_QUEUE_BYTES` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
-| `HIPFIRE_SERVE_MULTI_SLOT` | crates/hipfire-config/src/lib.rs, scripts/serve_concurrency_gate.sh | stable |
-| `HIPFIRE_SERVE_MULTI_SLOT_CTX` | crates/hipfire-config/src/lib.rs, scripts/scs_suite.py | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_CTX` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_MAX_SESSIONS` | crates/hipfire-config/src/lib.rs | experimental |
-| `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS` | crates/hipfire-config/src/lib.rs | experimental |
-| `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
 | `HIPFIRE_SERVE_PREFILL_MIN_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_PREFIX_CACHE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
-| `HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | experimental |
 | `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | stable |
 | `HIPFIRE_SERVE_RETRY_BACKOFF_MS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_RETRY_ENABLED` | crates/hipfire-config/src/lib.rs | experimental |
@@ -2477,10 +2477,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SKIP_BUILD` | scripts/container-gate.sh, scripts/test_container_gate.py | harness |
 | `HIPFIRE_SKIP_LLAMA_COMMIT_CHECK` | crates/hipfire-runtime/src/eval_common.rs | developer |
 | `HIPFIRE_SLOTS_ATTN_CROSSOVER` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs, crates/hipfire-runtime/src/serve/mod.rs | developer |
+| `HIPFIRE_SLOTS_ORACLE_DRAFT` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
+| `HIPFIRE_SLOTS_ORACLE_DUMP` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
-| `HIPFIRE_SLOT_TRACE` | crates/rdna-compute/src/feature_flags.rs, scripts/serve_concurrency_gate.sh | developer |
+| `HIPFIRE_SLOTS_VMM_MODEL` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
+| `HIPFIRE_SLOT_TRACE` | crates/rdna-compute/src/feature_flags.rs, scripts/check_slots_vmm_prefix.py | developer |
 | `HIPFIRE_SLOWLINK_HW_MODEL` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
 | `HIPFIRE_SLOWLINK_HW_ROWS` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
 | `HIPFIRE_SLOW_TOKEN_LOG` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |

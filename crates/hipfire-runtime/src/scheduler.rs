@@ -136,6 +136,9 @@ pub struct VlPrefill {
     pub patches: Vec<f32>,
     pub grid_h: usize,
     pub grid_w: usize,
+    /// Multi-image payload, in request order. Non-empty supersedes the
+    /// single-image `patches`/`grid_*` fields.
+    pub images: Vec<crate::serve::VisualImage>,
     /// Post-merge visual token count.
     pub n_visual_tokens: usize,
     /// Filled by `vision_forward` (`n_visual_tokens * dim` floats).
@@ -658,6 +661,7 @@ mod tests {
             patches: vec![],
             grid_h: 1,
             grid_w: 1,
+            images: Vec::new(),
             n_visual_tokens: n_visual,
             embeddings: vec![0.0; n_visual * 4],
             dim: 4,
