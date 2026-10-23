@@ -257,9 +257,28 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
 
+   `--multi-slot-paged` (`serve.multi_slot_paged`) selects the **shared
+   paged KV pool**: one `PagePool` of 128-token physical pages serves every
+   slot, each slot has a block table, and pages are allocated as a request
+   grows (not per slot at admission). Pages are refcounted and copy-on-write
+   shared for the prefix cache, and page exhaustion is a per-request overload
+   refusal with demand reclaim, not an engine failure. With
+   `serve.multi_slot_paged_pages=0` the pool auto-sizes from post-weight free
+   VRAM after the prefill scratch is resident, less the 512 MiB map reserve;
+   an explicit count is the operator's physical ceiling. `prefix_cache`
+   requires and selects this route. `--multi-slot-paged` is mutually
+   exclusive with `--kv-backend vmm`; VMM wins if both are requested.
+
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped
-   as requests are admitted up to their prompt + generation budget. Plain
+   as requests are admitted up to their prompt + generation budget. The
+   shared prefill scratch is one **total** row budget, not one per slot:
+   `serve.max_batch_tokens` clamps to `max(serve.multi_slot_prefill_chunk,
+   64 verify rows × slots)`. A lone prefilling slot may use the full chunk;
+   concurrent prefills share those rows. This is the difference between a
+   4096-row (2.7 GiB on 27B) and a 1024-row scratch, and it is what leaves
+   KV headroom for concurrent long generations (4-slot 27B q8 VMM: 5766 MiB
+   mapped-byte budget at `multi_slot_prefill_chunk=1024`). Plain
    prompt rows, decode and verify rows run batched through the
    descriptor-addressed `_vmm` kernels; only MTP/DFlash prompt chunks stay on
    the singleton body, because their private hidden capture is not ported to
@@ -277,7 +296,8 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    capture (legacy DFlash drafts, which have no candidate selector, are still
    refused). `serve.prefix_cache` runs on this route as a bounded
    host-snapshot LRU (KV + DeltaNet at a committed prefill boundary; no page
-   table, no VA churn), and the `HIPFIRE_SLOTS_PAGED` dev knob is ignored.
+   table, no VA churn), and paged-pool selection is ignored on this route
+   (use the legacy backend with `--multi-slot-paged` for the shared pool).
    Every unservable combination is refused before any GPU allocation. On this route decode always runs the
    row-batched `_vmm` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at

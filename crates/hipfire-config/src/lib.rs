@@ -1001,6 +1001,34 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK"),
         "Prefill tokens taken from one slot per multi-slot step; batch scratch is sized n_slots x this."
     ),
+    process_bool_field!(
+        "serve.multi_slot_paged",
+        "multi_slot_paged",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_MULTI_SLOT_PAGED",
+        "Multi-slot KV: use the shared PagePool (128-token physical pages, per-slot block tables, \
+         refcounted prefix sharing and COW) instead of fixed per-slot slabs. The pool is shared by \
+         every slot; pages are allocated as a request grows. Pair with \
+         serve.multi_slot_paged_pages=0 for automatic sizing from post-weight free VRAM."
+    ),
+    field!(
+        "serve.multi_slot_paged_pages",
+        "multi_slot_paged_pages",
+        Serve,
+        Process,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_PAGES"),
+        "Physical pages in the shared multi-slot paged KV pool (128 tokens per page). 0 = auto-size \
+         from free VRAM after weights and prefill scratch; ignored when the paged pool is off."
+    ),
     field!(
         "generation.temperature",
         "temperature",

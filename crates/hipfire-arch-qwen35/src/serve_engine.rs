@@ -129,6 +129,14 @@ pub struct EngineConfig {
     /// See `serve_vmm` and `docs/plans/2026-10-22-vmm-kv-multislot-engine.md`.
     /// Every combination the route cannot serve is refused in `Rig::build`.
     pub kv_backend: String,
+    /// Multi-slot KV: use the shared `PagePool` instead of fixed per-slot
+    /// slabs. Every slot draws 128-token physical pages from one pool; block
+    /// tables resolve logical rows, and pages are refcounted/COW-shared for
+    /// the prefix cache. Implied by `prefix_cache`.
+    pub multi_slot_paged: bool,
+    /// Physical pages in the shared paged pool. 0 = auto-size from free VRAM
+    /// after weights and prefill scratch (leaving the VMM map reserve).
+    pub multi_slot_paged_pages: usize,
     /// Cross-session prefix cache (radix index + checkpoint pool). Default
     /// false: the existing session-local continuation path (convo hashes)
     /// is unchanged. When true, cold admits consult a PrefixIndex for
@@ -694,6 +702,42 @@ impl ModelRig {
     }
 }
 
+/// Verify rows one speculative slot may inject in a step: the last DFlash
+/// window / MTP draft plus the finish drain. Mirrors the VMM reserve slack.
+const MAX_VERIFY_ROWS_PER_SLOT: usize = crate::forward_slots::vmm::VMM_RESERVE_SLACK_ROWS;
+
+/// Rows the shared multi-slot prefill scratch must hold.
+///
+/// This is a **total** row budget: a single prefilling slot may use the full
+/// `prefill_chunk`, while verify rows for every slot must still fit. It is not
+/// `prefill_chunk × n_slots` — that sized the scratch for every slot prefilling
+/// at once and cost several GiB of KV headroom on large models.
+fn multi_slot_prefill_rows(prefill_chunk: usize, n_slots: usize) -> usize {
+    prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(n_slots))
+}
+
+/// Headroom the auto-sized paged pool leaves free for the map reserve, graph
+/// capture, JIT and driver allocations. Mirrors the VMM map reserve.
+const PAGED_MAP_RESERVE_BYTES: usize = 512 << 20;
+
+/// Physical pages the shared paged pool may own from `free` device bytes.
+///
+/// `page_bytes` is the cost of one 128-token page across every full-attention
+/// layer's K and V arenas. Auto-sizing never exceeds `cap_pages` (the pool
+/// cannot usefully hold more than `n_slots × cap` tokens) and always returns
+/// at least one page so a zero/overflowing free figure fails later with a
+/// real allocation error instead of panicking here.
+fn paged_pool_pages_from_free(free: usize, page_bytes: usize, cap_pages: usize) -> usize {
+    if page_bytes == 0 {
+        return 1;
+    }
+    free.saturating_sub(PAGED_MAP_RESERVE_BYTES)
+        .checked_div(page_bytes)
+        .unwrap_or(0)
+        .min(cap_pages)
+        .max(1)
+}
+
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -1154,96 +1198,96 @@ impl Rig {
         // Verify rows per spec slot: MTP k+1, DFlash2 B — the larger wins so
         // the tape stride and batch sizing cover either mechanism.
         let spec_rows = (mtp_k + 1).max(dflash_block.unwrap_or(0));
-        // A step carries at most max(prefill_chunk, spec_rows) rows per
-        // slot: prefilling slots contribute up to `prefill_chunk` rows, and
-        // a decoding spec slot injects `spec_rows` verify rows. Sizing
-        // without the spec term let a small `prefill_chunk` (operator knob)
-        // overflow `pbs.max_batch` on the first verify step — an
-        // engine-thread panic, the serve-hang failure class.
-        let max_batch = prefill_chunk.max(spec_rows) * cfg.n_slots;
+        // One shared prefetch scratch, not one per slot. A step may carry the
+        // full `prefill_chunk` for a single prefilling slot, and every spec
+        // slot may inject up to `VMM_RESERVE_SLACK_ROWS` verify rows, but the
+        // total row budget is shared by the whole batch. Multiplying the
+        // chunk by `n_slots` here sized the PBS for N simultaneous full-size
+        // prefills (4 x 1024 = 4096 rows on a 4-slot engine), which on a 27B
+        // model costs ~2.7 GiB and starves the VMM KV budget. Sizing without
+        // the verify term let a small `prefill_chunk` overflow the PBS on
+        // the first verify step; keep that bound.
+        let max_batch = multi_slot_prefill_rows(prefill_chunk, cfg.n_slots);
 
-        // ── Paged KV opt-in ────────────────────────────────────────────────
-        // Default OFF: the pool stays legacy (fixed per-slot slabs). With
-        // HIPFIRE_SLOTS_PAGED=1 the pool becomes a PagePool: slots draw
-        // physical pages on demand, so short sessions don't pre-reserve
-        // their full cap. HIPFIRE_SLOTS_PAGED_PAGES overrides the physical
-        // page count; the default matches legacy total capacity
-        // (n_slots × ceil(cap/128) pages), so admission behaviour is
-        // unchanged and only the allocation pattern is paged. A smaller
-        // count under-subscribes (pool exhaustion fails the step CLOSED —
-        // set_seq_len errors before any kernel writes through the missing
-        // page); a larger count over-subscribes physical VRAM and is the
-        // operator's call.
-        // Prefix cache requires paged KV: the radix index shares physical
-        // pages across sessions via PagePool refcounting, which is only
-        // available in paged mode. Force it on when prefix_cache is enabled.
+        // ── Shared paged KV pool ───────────────────────────────────────────
+        // `serve.multi_slot_paged` (or `--multi-slot-paged`) selects the
+        // shared `PagePool`: every slot draws 128-token physical pages from
+        // one pool, block tables resolve logical rows, and pages are
+        // refcounted/COW-shared for the prefix cache. Pages are provisioned
+        // as a request grows, not per slot at admission. Pages=0 auto-sizes
+        // the pool after every non-KV owner is resident (see Rig::build);
+        // an explicit count is the operator's physical ceiling.
+        //
+        // `prefix_cache` requires paged KV (the radix index shares physical
+        // pages through PagePool refcounting). The `HIPFIRE_SLOTS_PAGED` /
+        // `HIPFIRE_SLOTS_PAGED_PAGES` developer knobs remain aliases for the
+        // schema keys and were the only way to select this route before it
+        // became first-class.
         let prefix_cache = cfg.prefix_cache;
+        let env_paged = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+            .ok()
+            .and_then(|v| match v.as_str() {
+                "1" | "on" | "true" => Some(true),
+                "0" | "off" | "false" => Some(false),
+                _ => None,
+            });
+        let env_pages = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let paged_requested = !use_vmm
+            && (cfg.multi_slot_paged
+                || cfg.multi_slot_paged_pages > 0
+                || env_paged == Some(true)
+                || env_pages.is_some_and(|p| p > 0)
+                || prefix_cache);
+        let paged_explicit = if cfg.multi_slot_paged_pages > 0 {
+            Some(cfg.multi_slot_paged_pages)
+        } else {
+            env_pages
+        };
         let paged_pages = if use_vmm {
-            // No page pool on the VMM route: owners are their own
-            // reservations. The developer knob cannot be honored here.
-            if hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
-                .ok()
-                .is_some_and(|v| v == "1" || v == "on" || v == "true")
-            {
+            if paged_requested || env_paged == Some(true) {
                 eprintln!(
-                    "  [hipfire] HIPFIRE_SLOTS_PAGED ignored: kv_backend=vmm has no page pool (per-slot VMM reservations instead)"
+                    "  [hipfire] multi-slot paged pool ignored: kv_backend=vmm uses \
+                     per-slot VMM owners"
                 );
             }
             None
-        } else if prefix_cache {
-            let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
-            // Cache-retained pages share the same physical pool as active slots.
-            // Keep one prefill chunk plus one page per slot available beyond
-            // the legacy active-session capacity so publication cannot consume
-            // the last page needed by an admitted request.
-            let cache_headroom = cfg.prefill_chunk.div_ceil(PAGE_TOKENS) + cfg.n_slots;
-            Some(
-                hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-                    // Clamp to >= 1: a literal "0" reaches PagePool's
-                    // `assert!(n_pages > 0)` inside Rig::build, which runs on
-                    // the engine thread before ready_tx — the spawn then
-                    // reports the opaque "engine thread died during startup".
-                    .map(|p| p.max(1))
-                    .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
-            )
-        } else {
-            match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+        } else if paged_requested {
+            // The legacy sequential VL path writes through a flat contiguous
+            // slab view that aliases every slot onto the arena prefix in
+            // paged mode; batched VL is paged-capable.
+            let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
                 .ok()
-                .as_deref()
-            {
-                Some("1") | Some("on") | Some("true") => {
-                    // Batched VL is paged-capable (block-table indirection all
-                    // the way down), so paged is refused only when the operator
-                    // forced the legacy sequential VL path — that path writes
-                    // through a flat contiguous slab view which aliases every
-                    // slot onto the arena prefix in paged mode.
-                    let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-                        .ok()
-                        .is_some_and(|v| v == "1" || v == "on" || v == "true");
-                    if cfg.is_vl && sequential_vl {
-                        eprintln!(
-                            "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
-                             requires contiguous KV slots"
-                        );
-                        None
-                    } else {
-                        let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
-                        Some(
-                            hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
-                                .ok()
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                // Same >= 1 clamp as the prefix-cache arm: a
-                                // literal "0" would panic PagePool's build.
-                                .map(|p| p.max(1))
-                                .unwrap_or(legacy_equivalent),
-                        )
-                    }
-                }
-                _ => None,
+                .is_some_and(|v| v == "1" || v == "on" || v == "true");
+            if cfg.is_vl && sequential_vl {
+                eprintln!(
+                    "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
+                     requires contiguous KV slots"
+                );
+                None
+            } else {
+                Some(paged_explicit.unwrap_or(0))
             }
+        } else {
+            None
         };
+        // Auto page sizing needs the post-weight free-VRAM figure. Partial
+        // offload's placement pass needs the KV reserve up front, so require
+        // an explicit page count there rather than over- or under-placing the
+        // trunk.
+        if paged_pages == Some(0) {
+            use hipfire_config::memory::OffloadBudget;
+            let (host, experts) = hipfire_config::memory::effective_offload_budgets();
+            if !matches!(host, OffloadBudget::Full) || !matches!(experts, OffloadBudget::Full) {
+                return Err(
+                    "serve.multi_slot_paged_pages=0 (auto) requires fully resident \
+                     weights; set an explicit page count when \
+                     memory.gpu_layer_budget/memory.moe_expert_budget request a spill"
+                        .to_string(),
+                );
+            }
+        }
 
         // Model-file size doubles as the load identity (`model_hash` below).
         let weight_bytes = std::fs::metadata(&cfg.model_path)
@@ -1274,7 +1318,15 @@ impl Rig {
             .map_err(|e| format!("vram info: {e}"))?;
 
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
-        let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
+        // An auto-sized paged pool has no page count until the post-weight
+        // free-VRAM query; charge zero here (like VMM) so placement does not
+        // budget an arena that will be sized later. Explicit pages and the
+        // legacy slab route stay fully charged.
+        let kv_pages = match paged_pages {
+            Some(0) => 0,
+            Some(p) => p,
+            None => cfg.n_slots * cap_rounded / 128,
+        };
         let kv_rows = n_fa_layers
             .saturating_mul(kv_pages)
             .saturating_mul(PAGE_TOKENS);
@@ -1282,8 +1334,13 @@ impl Rig {
         let kv = hipfire_runtime::offload::kv_reserve(kv_stride, kv_rows)
             .ok_or("slots KV reservation overflow")?;
         // The VMM route reserves virtual space per slot lazily and maps on
-        // demand, so nothing is charged against VRAM at load.
-        let kv_bytes = if use_vmm { 0 } else { kv.bytes };
+        // demand; an auto-sized paged pool is sized after non-KV allocations.
+        // Neither is charged against VRAM at this point.
+        let kv_bytes = if use_vmm || paged_pages == Some(0) {
+            0
+        } else {
+            kv.bytes
+        };
 
         // Partial GPU offload is resolved here, once, before the preflight — the
         // same call the sequential carrier makes, so both routes place
@@ -1294,7 +1351,7 @@ impl Rig {
         // VMM reserves no up-front KV, so the placement search must not budget
         // an arena it will never allocate (that would spill layers to buy
         // capacity this route already has).
-        let kv_plan_reserve = if use_vmm {
+        let kv_plan_reserve = if use_vmm || paged_pages == Some(0) {
             hipfire_runtime::offload::kv_reserve(kv_stride, 0)
                 .ok_or("slots KV reservation overflow")?
         } else {
@@ -1691,57 +1748,6 @@ impl Rig {
             out_tokens: None,
             committed: false,
         };
-        let pool = if let Some(pages) = paged_pages {
-            SlotPool::new_paged_with_strides(
-                cfg.n_slots,
-                cfg.cap_tokens,
-                per_pos_bytes,
-                per_pos_v_bytes,
-                pages,
-            )
-        } else {
-            SlotPool::new_with_strides(cfg.n_slots, cfg.cap_tokens, per_pos_bytes, per_pos_v_bytes)
-        }
-        .map_err(|e| format!("SlotPool: {e}"))?;
-        if !kv_plan.kv_strides_differ() {
-            // q8/bf16: nothing else to log; the tier banner below covers it.
-        } else {
-            eprintln!(
-                "[hipfire] slot KV tier {kv_mode:?}: K {per_pos_bytes} B/pos, \
-                 V {per_pos_v_bytes} B/pos (strides differ; descriptors carry \
-                 separate K/V slab bases)"
-            );
-        }
-        if pool.is_paged() {
-            eprintln!(
-                "[hipfire] paged KV pool: {} slots x cap {} tokens over {} physical pages \
-                 ({} tokens/page)",
-                cfg.n_slots,
-                pool.cap_tokens(),
-                pool.free_pages(),
-                PAGE_TOKENS
-            );
-        }
-        let k_arena_bytes = pool.k_arena_bytes();
-        let v_arena_bytes = pool.v_arena_bytes();
-        if !use_vmm {
-            for _ in 0..n_fa_layers {
-                let k = g
-                    .gpu
-                    .as_mut()
-                    .unwrap()
-                    .zeros(&[k_arena_bytes], DType::Raw)
-                    .map_err(|e| format!("k arena: {e}"))?;
-                g.k_arenas.push(k);
-                let v = g
-                    .gpu
-                    .as_mut()
-                    .unwrap()
-                    .zeros(&[v_arena_bytes], DType::Raw)
-                    .map_err(|e| format!("v arena: {e}"))?;
-                g.v_arenas.push(v);
-            }
-        }
         // Rotation tables for the resolved tier: Givens angles (asym) or
         // FWHT sign vectors (fwht), model-global and shared by every slot
         // and layer. Seeds match the sequential path's cache constructors
@@ -1792,21 +1798,6 @@ impl Rig {
                 .map_err(|e| format!("dn: {e}"))?;
             g.dn_states.push(dn);
         }
-        // Paged mode needs per-slot block-table staging sized to the slot
-        // cap; legacy mode passes 0 and the staging stays empty.
-        let max_pages_per_slot = if pool.is_paged() {
-            pool.cap_tokens().div_ceil(PAGE_TOKENS)
-        } else {
-            0
-        };
-        let desc_staging = SlotDescStaging::new(
-            g.gpu.as_mut().unwrap(),
-            cfg.n_slots,
-            max_batch,
-            max_pages_per_slot,
-        )
-        .map_err(|e| format!("staging: {e}"))?;
-        g.desc_staging = Some(desc_staging);
         // Slots do plain prefill only — never tree-verify — so skip the GDN
         // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).
         let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
@@ -1830,6 +1821,104 @@ impl Rig {
             .zeros(&[cfg.n_slots], DType::F32)
             .map_err(|e| format!("out_tokens: {e}"))?;
         g.out_tokens = Some(out_tokens);
+        // The shared KV pool is the last large allocation: every non-KV owner
+        // (weights, prefill scratch, sampler state) is already resident, so
+        // post-allocation free VRAM is exactly the budget the pool can own.
+        // Auto-sizing leaves the VMM route's 512 MiB map reserve.
+        let pool = if let Some(requested_pages) = paged_pages {
+            let pages = if requested_pages == 0 {
+                let free = g
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .device_mem_info()
+                    .map_err(|e| format!("paged pool VRAM query: {e}"))?
+                    .0;
+                let page_bytes = n_fa_layers
+                    .checked_mul(PAGE_TOKENS)
+                    .and_then(|v| v.checked_mul(per_pos_bytes.saturating_add(per_pos_v_bytes)))
+                    .ok_or_else(|| "multi-slot paged page size overflow".to_string())?;
+                let cap_pages = cfg
+                    .n_slots
+                    .saturating_mul(cfg.cap_tokens.div_ceil(PAGE_TOKENS));
+                let pages = paged_pool_pages_from_free(free, page_bytes, cap_pages);
+                eprintln!(
+                    "[hipfire] paged KV auto pool: free={free} B page={page_bytes} B -> \
+                     {pages} pages (cap {cap_pages}, {} tokens/page)",
+                    PAGE_TOKENS
+                );
+                pages
+            } else {
+                requested_pages
+            };
+            SlotPool::new_paged_with_strides(
+                cfg.n_slots,
+                cfg.cap_tokens,
+                per_pos_bytes,
+                per_pos_v_bytes,
+                pages,
+            )
+        } else {
+            SlotPool::new_with_strides(cfg.n_slots, cfg.cap_tokens, per_pos_bytes, per_pos_v_bytes)
+        }
+        .map_err(|e| format!("SlotPool: {e}"))?;
+        if kv_plan.kv_strides_differ() {
+            eprintln!(
+                "[hipfire] slot KV tier {kv_mode:?}: K {per_pos_bytes} B/pos, \
+                 V {per_pos_v_bytes} B/pos (strides differ; descriptors carry \
+                 separate K/V slab bases)"
+            );
+        }
+        if let Some(pp) = pool.page_pool() {
+            eprintln!(
+                "[hipfire] paged KV pool: {} slots x cap {} tokens over {} physical pages \
+                 ({} tokens/page){}",
+                cfg.n_slots,
+                pool.cap_tokens(),
+                pp.n_pages(),
+                PAGE_TOKENS,
+                if cfg.multi_slot_paged_pages == 0 {
+                    " [auto]"
+                } else {
+                    ""
+                }
+            );
+        }
+        let k_arena_bytes = pool.k_arena_bytes();
+        let v_arena_bytes = pool.v_arena_bytes();
+        if !use_vmm {
+            for _ in 0..n_fa_layers {
+                let k = g
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .zeros(&[k_arena_bytes], DType::Raw)
+                    .map_err(|e| format!("k arena: {e}"))?;
+                g.k_arenas.push(k);
+                let v = g
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .zeros(&[v_arena_bytes], DType::Raw)
+                    .map_err(|e| format!("v arena: {e}"))?;
+                g.v_arenas.push(v);
+            }
+        }
+        // Paged mode needs per-slot block-table staging sized to the slot
+        // cap; legacy mode passes 0 and the staging stays empty.
+        let max_pages_per_slot = if pool.is_paged() {
+            pool.cap_tokens().div_ceil(PAGE_TOKENS)
+        } else {
+            0
+        };
+        let desc_staging = SlotDescStaging::new(
+            g.gpu.as_mut().unwrap(),
+            cfg.n_slots,
+            max_batch,
+            max_pages_per_slot,
+        )
+        .map_err(|e| format!("staging: {e}"))?;
+        g.desc_staging = Some(desc_staging);
         let sample_params = (0..cfg.n_slots)
             .map(|_| SlotSampleParams {
                 temperature: 0.0,
@@ -8287,6 +8376,33 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_slot_prefill_rows_share_one_total_budget() {
+        // One full chunk for a single prefilling slot; not one per slot.
+        assert_eq!(multi_slot_prefill_rows(1024, 4), 1024);
+        assert_eq!(multi_slot_prefill_rows(512, 4), 512);
+        assert_eq!(multi_slot_prefill_rows(1024, 1), 1024);
+        // Every slot's verify rows still fit when the chunk is smaller.
+        assert_eq!(multi_slot_prefill_rows(32, 4), 256);
+        assert_eq!(multi_slot_prefill_rows(64, 8), 512);
+        // Saturating: an absurd slot count must not wrap or panic.
+        assert!(multi_slot_prefill_rows(1024, usize::MAX) >= 1024);
+    }
+
+    #[test]
+    fn paged_pool_pages_from_free_reserves_headroom_and_caps_at_slot_capacity() {
+        // 10 GiB free, ~4.25 MiB/page, cap 8192: (10 GiB - 512 MiB)/4.25 MiB.
+        let pages = paged_pool_pages_from_free(10 << 30, 4_456_448, 8192);
+        assert!(pages > 2000 && pages < 8192, "{pages}");
+        // More free than the slots can ever use: the cap wins.
+        assert_eq!(paged_pool_pages_from_free(1 << 40, 4_456_448, 2048), 2048);
+        // Below the reserve: one page, never zero or a panic.
+        assert_eq!(paged_pool_pages_from_free(0, 4_456_448, 8192), 1);
+        assert_eq!(paged_pool_pages_from_free(1024, 4_456_448, 8192), 1);
+        // Defensive: a zero page size must not divide by zero.
+        assert_eq!(paged_pool_pages_from_free(1 << 30, 0, 8192), 1);
+    }
 
     #[test]
     fn slot_snapshot_kv_tags_are_stable_and_unique() {
