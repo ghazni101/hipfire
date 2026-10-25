@@ -124,7 +124,7 @@ use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
 };
-use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
+use rdna_compute::kv_slots::{build_tiles, KvSlotDesc, VmmPagedKvSlotDesc, VMM_PAGED_DESC_BYTES};
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -153,6 +153,42 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
         out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
     out
+}
+
+/// Pack a 48-byte VMM-paged descriptor table (the `_vmm_paged` ABI).
+fn pack_vmm_descs(descs: &[VmmPagedKvSlotDesc]) -> Vec<u8> {
+    debug_assert_eq!(
+        std::mem::size_of::<VmmPagedKvSlotDesc>(),
+        VMM_PAGED_DESC_BYTES,
+        "VmmPagedKvSlotDesc ABI drifted from the 48-byte layout"
+    );
+    descs
+        .iter()
+        .flat_map(|d| {
+            let mut row = Vec::with_capacity(VMM_PAGED_DESC_BYTES);
+            row.extend_from_slice(&d.block_table.to_ne_bytes());
+            row.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+            row.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
+            row.extend_from_slice(&d.seq_len.to_ne_bytes());
+            row.extend_from_slice(&d.page_tokens.to_ne_bytes());
+            row.extend_from_slice(&d.granule_bytes.to_ne_bytes());
+            row.extend_from_slice(&d.pages_per_granule.to_ne_bytes());
+            row.extend_from_slice(&d._pad.to_ne_bytes());
+            row
+        })
+        .collect()
+}
+
+/// Pack whichever descriptor table the pool selected. Both upload paths must
+/// use this: the 32-byte arena packer written into a 48-byte staging buffer
+/// leaves the VMM granule fields stale and can hand the kernel a garbage
+/// block-table pointer for slot 1.
+fn pack_active_descs(pool: &SlotPool) -> Vec<u8> {
+    if pool.is_vmm_paged() {
+        pack_vmm_descs(pool.vmm_descriptors())
+    } else {
+        pack_descs(pool.descriptors())
+    }
 }
 
 /// The resolved KV-cache tier a slots forward runs against, plus the
@@ -265,17 +301,46 @@ pub struct SlotDescStaging {
     max_pages_per_slot: usize,
     n_slots: usize,
     max_rows: usize,
+    /// Packed descriptor width: 32 (arena/legacy) or 48 (VMM-paged).
+    desc_bytes: usize,
+    vmm_paged: bool,
 }
 
 impl SlotDescStaging {
-    /// `max_pages_per_slot` is the maximum number of pages a slot's block
-    /// table can hold. 0 = legacy mode (no block table buffers allocated).
+    /// Arena/legacy descriptor staging (32-byte `KvSlotDesc`).
     pub fn new(
         gpu: &mut Gpu,
         n_slots: usize,
         max_rows: usize,
         max_pages_per_slot: usize,
     ) -> HipResult<Self> {
+        Self::new_impl(gpu, n_slots, max_rows, max_pages_per_slot, false)
+    }
+
+    /// VMM-paged descriptor staging (48-byte `VmmPagedKvSlotDesc`).
+    pub fn new_vmm(
+        gpu: &mut Gpu,
+        n_slots: usize,
+        max_rows: usize,
+        max_pages_per_slot: usize,
+    ) -> HipResult<Self> {
+        Self::new_impl(gpu, n_slots, max_rows, max_pages_per_slot, true)
+    }
+
+    /// `max_pages_per_slot` is the maximum number of pages a slot's block
+    /// table can hold. 0 = legacy mode (no block table buffers allocated).
+    fn new_impl(
+        gpu: &mut Gpu,
+        n_slots: usize,
+        max_rows: usize,
+        max_pages_per_slot: usize,
+        vmm_paged: bool,
+    ) -> HipResult<Self> {
+        let desc_bytes = if vmm_paged {
+            VMM_PAGED_DESC_BYTES
+        } else {
+            DESC_BYTES
+        };
         // Allocate all five staging buffers, freeing whatever already
         // succeeded if a later allocation fails partway through.
         let mut allocated: Vec<GpuTensor> = Vec::new();
@@ -288,7 +353,7 @@ impl SlotDescStaging {
             // pool rounds sub-256-byte allocations up to 256 B: the
             // overflow was silently absorbed up to 8 slots and would trip
             // the memcpy_htod bound assert at 9+.
-            &[n_slots * DESC_BYTES], // descs_dev
+            &[n_slots * desc_bytes], // descs_dev
             &[max_rows * 4],         // row_slot_dev
             &[max_rows * 4],         // tile_slot_dev
             &[max_rows * 4],         // tile_row0_dev
@@ -342,6 +407,8 @@ impl SlotDescStaging {
             max_pages_per_slot,
             n_slots,
             max_rows,
+            desc_bytes,
+            vmm_paged,
         })
     }
 
@@ -372,6 +439,8 @@ pub(crate) enum LayerKvAddr<'a> {
         desc_staging: &'a SlotDescStaging,
         single_slot: Option<(u64, usize)>,
         n_tiles: Option<usize>,
+        /// True for the shared paged pool's `_vmm_paged` descriptor ABI.
+        vmm_paged: bool,
     },
     Vmm(vmm::VmmLayerKv<'a>),
 }
@@ -396,6 +465,7 @@ fn layer_kv_write_attend(
             desc_staging,
             single_slot,
             n_tiles,
+            vmm_paged,
         } => {
             // Batched KV write — slot-aware, ONE launch per arena across every
             // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
@@ -415,6 +485,7 @@ fn layer_kv_write_attend(
                 n,
                 &desc_staging.descs_dev,
                 &desc_staging.row_slot_dev,
+                *vmm_paged,
             )?;
             // Batched attend — slot-aware, one launch across every slot.
             // `positions[]` (not any `desc.seq_len`) is authoritative for the
@@ -449,6 +520,7 @@ fn layer_kv_write_attend(
                         nt,
                     )
                 }),
+                *vmm_paged,
             )
         }
         LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
@@ -2074,31 +2146,63 @@ fn kv_write_slots(
     n_rows: usize,
     descs: &GpuTensor,
     row_slot: &GpuTensor,
+    vmm_paged: bool,
 ) -> HipResult<()> {
+    if vmm_paged && !kv.is_q8() {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "VMM-paged KV supports q8 only in phase 1",
+        ));
+    }
     match kv.mode {
         KvMode::Q8 => {
-            gpu.kv_cache_write_q8_0_batched_slots(
-                k_cache,
-                k_batch,
-                positions,
-                n_kv_heads,
-                head_dim,
-                n_rows,
-                Some(descs),
-                Some(row_slot),
-                /*use_v_base=*/ false,
-            )?;
-            gpu.kv_cache_write_q8_0_batched_slots(
-                v_cache,
-                v_batch,
-                positions,
-                n_kv_heads,
-                head_dim,
-                n_rows,
-                Some(descs),
-                Some(row_slot),
-                /*use_v_base=*/ false,
-            )
+            if vmm_paged {
+                gpu.kv_cache_write_q8_0_batched_slots_vmm_paged(
+                    k_cache,
+                    k_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )?;
+                gpu.kv_cache_write_q8_0_batched_slots_vmm_paged(
+                    v_cache,
+                    v_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )
+            } else {
+                gpu.kv_cache_write_q8_0_batched_slots(
+                    k_cache,
+                    k_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )?;
+                gpu.kv_cache_write_q8_0_batched_slots(
+                    v_cache,
+                    v_batch,
+                    positions,
+                    n_kv_heads,
+                    head_dim,
+                    n_rows,
+                    Some(descs),
+                    Some(row_slot),
+                    /*use_v_base=*/ false,
+                )
+            }
         }
         KvMode::Asym2 => gpu.kv_cache_write_asym2_batched_slots(
             k_cache,
@@ -2307,7 +2411,14 @@ fn tier_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    vmm_paged: bool,
 ) -> HipResult<()> {
+    if vmm_paged && !kv.is_q8() {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "VMM-paged attention supports q8 only in phase 1",
+        ));
+    }
     if kv.is_q8() {
         return q8_attend_slots(
             gpu,
@@ -2327,6 +2438,7 @@ fn tier_attend_slots(
             row_slot_dev,
             single_slot,
             multi_slot_tiles,
+            vmm_paged,
         );
     }
     let d = Some(descs_dev);
@@ -2565,6 +2677,7 @@ fn q8_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    vmm_paged: bool,
 ) -> HipResult<()> {
     if let Some((k_base, slab_bytes)) = single_slot {
         if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
@@ -2597,22 +2710,41 @@ fn q8_attend_slots(
             let tile_slot_view = tile_slot_dev.sub_offset(0, n_tiles);
             let tile_row0_view = tile_row0_dev.sub_offset(0, n_tiles);
             let tile_qbase_view = tile_qbase_dev.sub_offset(0, n_tiles);
-            return gpu.attention_q8_0_flash_prefill_wmma_slots(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                positions,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                max_ctx_len,
-                batch_size,
-                Some(descs_dev),
-                Some(&tile_slot_view),
-                Some(&tile_row0_view),
-                Some(&tile_qbase_view),
-            );
+            return if vmm_paged {
+                gpu.attention_q8_0_flash_prefill_wmma_slots_vmm_paged(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    positions,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx_len,
+                    batch_size,
+                    Some(descs_dev),
+                    Some(&tile_slot_view),
+                    Some(&tile_row0_view),
+                    Some(&tile_qbase_view),
+                )
+            } else {
+                gpu.attention_q8_0_flash_prefill_wmma_slots(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    positions,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx_len,
+                    batch_size,
+                    Some(descs_dev),
+                    Some(&tile_slot_view),
+                    Some(&tile_row0_view),
+                    Some(&tile_qbase_view),
+                )
+            };
         }
     }
     // Context length above which the flash (context-split) kernel beats the
@@ -2646,7 +2778,47 @@ fn q8_attend_slots(
         }
     });
     if max_ctx_len <= crossover {
-        gpu.attention_q8_0_kv_batched_masked_slots(
+        if vmm_paged {
+            gpu.attention_q8_0_kv_batched_masked_slots_vmm_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                None,
+                0,
+                0,
+                Some(descs_dev),
+                Some(row_slot_dev),
+            )
+        } else {
+            gpu.attention_q8_0_kv_batched_masked_slots(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                None,
+                0,
+                0,
+                Some(descs_dev),
+                Some(row_slot_dev),
+            )
+        }
+    } else if vmm_paged {
+        gpu.attention_flash_q8_0_batched_masked_slots_vmm_paged(
             q,
             k_cache,
             v_cache,
@@ -2658,6 +2830,7 @@ fn q8_attend_slots(
             physical_cap,
             max_ctx_len,
             batch_size,
+            flash_partials,
             None,
             0,
             0,
@@ -3954,7 +4127,17 @@ pub fn upload_step_inputs(
     // mappings, i.e. silent cross-session corruption.
     upload_block_tables(gpu, pool, desc_staging)?;
     if pool.descriptors_dirty() {
-        let desc_bytes = pack_descs(pool.descriptors());
+        debug_assert_eq!(
+            desc_staging.vmm_paged,
+            pool.is_vmm_paged(),
+            "SlotDescStaging width must match the pool's descriptor kind"
+        );
+        let desc_bytes = pack_active_descs(pool);
+        debug_assert_eq!(
+            desc_bytes.len(),
+            pool.descriptors().len() * desc_staging.desc_bytes,
+            "descriptor packing width drifted from the staging allocation"
+        );
         gpu.hip
             .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
         pool.mark_uploaded();
@@ -4205,7 +4388,17 @@ pub fn forward_batch_slots_opts(
             .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
         upload_block_tables(gpu, pool, desc_staging)?;
         if pool.descriptors_dirty() {
-            let desc_bytes = pack_descs(pool.descriptors());
+            debug_assert_eq!(
+                desc_staging.vmm_paged,
+                pool.is_vmm_paged(),
+                "SlotDescStaging width must match the pool's descriptor kind"
+            );
+            let desc_bytes = pack_active_descs(pool);
+            debug_assert_eq!(
+                desc_bytes.len(),
+                pool.descriptors().len() * desc_staging.desc_bytes,
+                "descriptor packing width drifted from the staging allocation"
+            );
             gpu.hip
                 .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
             pool.mark_uploaded();
@@ -4325,6 +4518,7 @@ pub fn forward_batch_slots_opts(
             desc_staging,
             single_slot,
             n_tiles,
+            vmm_paged: pool.is_vmm_paged(),
         },
         kv,
         pbs,

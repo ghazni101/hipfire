@@ -859,3 +859,7 @@ required-features = ["lab"]
 [[example]]
 name = "moe_nan_guard_regress"
 required-features = ["lab"]
+
+[[example]]
+name = "vmm_paged_swap_smoke"
+required-features = ["lab"]

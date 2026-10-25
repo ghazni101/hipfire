@@ -524,6 +524,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_PP_PFLASH` / `HIPFIRE_PP_DFLASH` | **Experimental, generic Qwen3.5/3.6 PP only** (`pp>1`; `HIPFIRE_PP_PFLASH` is deprecated with PFlash). `=1` makes the daemon accept a PFlash compose or a DFlash `draft` that it otherwise refuses with `pp>1` (DFlash: cross-card speculative generate is not fully implemented). Neither is an admission, and neither changes Flash-Next PP, which still refuses PFlash and DFlash. |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
 | `HIPFIRE_SLOTS_PAGED` / `HIPFIRE_SLOTS_PAGED_PAGES` | Multi-slot engine: `1`/`on`/`true` selects the paged KV pool instead of fixed per-slot slabs (implied by `serve.prefix_cache`); `_PAGES` overrides the physical page count (clamped to ≥ 1). |
+| `HIPFIRE_SLOTS_PAGED_BACKEND` | **Developer-only.** Physical backend for the shared paged pool: `arena` (default; zeroed full-size K/V arenas) or `vmm` (VA-only reservations, 2 MiB granule groups mapped as PagePool pages become resident). `vmm` currently admits q8/fp8 equal-stride pools; prefix cache, multi-slot COW and page-offset swap/restore are implemented. Batched vision, MTP (with a present head), and DFlash2 drafts are admitted; the 4B VL/MTP fixture is exercised end-to-end. Experimental, not a production default. |
 | `HIPFIRE_VL_SEQUENTIAL` | Multi-slot engine: `1`/`on`/`true` forces the legacy one-image-at-a-time VL prefill. Refused together with the paged pool. |
 | `HIPFIRE_PAGE_EVICTION` | `0` keeps model pages in the host page cache after upload (default: evict only on UMA). Shared by the sequential loader and the multi-slot engine. |
 | `HIPFIRE_BENCH_MULTI_SLOT` / `HIPFIRE_BENCH_MULTI_SLOT_SLOTS` / `HIPFIRE_BENCH_MULTI_SLOT_CTX` | `hipfire bench`: load the model on the multi-slot engine with the given slot count and per-slot context. |
@@ -870,7 +871,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1747
+**Count:** 1749
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2447,7 +2448,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_MULTI_SLOT` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_CTX` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_MAX_SESSIONS` | crates/hipfire-config/src/lib.rs | experimental |
-| `HIPFIRE_SERVE_MULTI_SLOT_PAGED` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_PAGED` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_swap.py | stable |
+| `HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_PAGED_PAGES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs, scripts/check_slots_vmm_prefix.py | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS` | crates/hipfire-config/src/lib.rs | experimental |
@@ -2483,6 +2485,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SLOTS_ORACLE_DRAFT` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOTS_ORACLE_DUMP` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+| `HIPFIRE_SLOTS_PAGED_BACKEND` | crates/hipfire-arch-qwen35/src/serve_engine.rs, scripts/check_slots_vmm_swap.py | developer |
 | `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_SLOTS_VMM_MODEL` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOT_TRACE` | crates/rdna-compute/src/feature_flags.rs, scripts/check_slots_vmm_prefix.py | developer |

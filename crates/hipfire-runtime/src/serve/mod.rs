@@ -396,6 +396,8 @@ pub struct SlotEngineConfig {
     pub multi_slot_paged: bool,
     /// Physical pages in the shared paged pool; 0 = auto-size from free VRAM.
     pub multi_slot_paged_pages: usize,
+    /// `arena` (default) or experimental `vmm` physical backend.
+    pub multi_slot_paged_backend: String,
     /// Cross-session prefix cache enabled (spec §4.5–4.6).
     pub prefix_cache: bool,
     /// Checkpoint pool max bytes; `prefix_cache` with `0` must refuse at

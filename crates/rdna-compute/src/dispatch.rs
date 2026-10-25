@@ -6231,6 +6231,49 @@ impl Gpu {
         self.f16_shadow_arena.root_capacities(DeviceBuffer::size)
     }
 
+    /// Reserve VA for a VMM-backed tensor without mapping any physical
+    /// memory. The caller maps granules with [`Self::vmm_map_at`] and must
+    /// refresh the owner's safe size with [`Self::refresh_vmm_owner_size`]
+    /// before any whole-tensor copy/read checks.
+    pub unsafe fn reserve_vmm_tensor(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        let arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // `access_devices` is applied by the first `vmm_map_at`; reserve has
+        // no mapped range to set access on yet.
+        let _ = access_devices;
+        self.register_vmm_arena(arena, byte_size, shape, dtype)
+    }
+
+    /// Rebuild the owning descriptor after the arena's mapped prefix
+    /// changed. The base address is stable; only the safe byte length moves.
+    pub fn refresh_vmm_owner_size(&mut self, tensor: &mut GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let logical_bytes = tensor.byte_size();
+        let arena = self.vmm_arenas.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        // SAFETY: exactly one owner descriptor replaces the previous owner
+        // for the same registered arena; the old descriptor never freed it.
+        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
+        Ok(())
+    }
+
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
     /// The returned tensor follows the normal kernel ABI, but its ownership is
     /// registered separately so `free_tensor` releases VMM handles instead of
@@ -6807,6 +6850,49 @@ impl Gpu {
         access_devices: &[i32],
     ) -> HipResult<usize> {
         self.grow_vmm_tensor_impl(tensor, additional_bytes, access_devices, true)
+    }
+
+    /// Map `size` fresh bytes at a granularity-aligned `offset` in a VMM
+    /// owner's reservation. Used by the multi-slot KV page pool; unlike
+    /// [`Self::grow_vmm_tensor`], it may leave holes and does not change the
+    /// tensor's logical size.
+    pub fn vmm_map_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        if !self.vmm_arenas.contains_key(&key) {
+            return Err(HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            ));
+        }
+        self.vmm_pool_headroom(size);
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
+        arena.map_at(&self.hip, offset, size, access_devices)
+    }
+
+    /// Unmap and release one pool page previously mapped with
+    /// [`Self::vmm_map_at`]. Synchronizes every access device first.
+    pub fn vmm_unmap_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.unmap_at(&self.hip, offset, size)
     }
 
     fn grow_vmm_tensor_impl(

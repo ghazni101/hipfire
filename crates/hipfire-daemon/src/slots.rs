@@ -135,6 +135,7 @@ pub struct SlotLoadParams {
     /// Shared `PagePool` for the multi-slot engine (auto-sized when pages=0).
     pub multi_slot_paged: bool,
     pub multi_slot_paged_pages: usize,
+    pub multi_slot_paged_backend: String,
     pub dflash_draft: Option<PathBuf>,
     pub dflash_required: bool,
     /// Optional `params.max_batch_tokens` override. When present it wins over
@@ -224,6 +225,10 @@ impl SlotLoadParams {
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(0),
+            multi_slot_paged_backend: param("multi_slot_paged_backend")
+                .and_then(|v| v.as_str())
+                .unwrap_or("arena")
+                .to_string(),
             dflash_draft,
             dflash_required: dflash_mode == "on",
             max_batch_tokens: param("max_batch_tokens")
@@ -550,6 +555,7 @@ impl SlotBackend {
         kv_backend: &str,
         multi_slot_paged: bool,
         multi_slot_paged_pages: usize,
+        multi_slot_paged_backend: &str,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
         vision_mode: &str,
@@ -708,6 +714,7 @@ impl SlotBackend {
                 kv_backend: kv_backend.to_string(),
                 multi_slot_paged,
                 multi_slot_paged_pages,
+                multi_slot_paged_backend: multi_slot_paged_backend.to_string(),
                 prefix_cache,
                 prefix_cache_max_bytes,
                 max_batch_tokens,

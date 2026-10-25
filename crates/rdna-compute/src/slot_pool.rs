@@ -13,8 +13,9 @@
 //   points to the GPU-uploaded page index array, `page_tokens = PAGE_TOKENS`.
 //   Enables dynamic allocation, prefix sharing, and over-subscription.
 
-use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
+use crate::kv_slots::{preflight_alloc, KvSlotDesc, VmmPagedKvSlotDesc, R9700_VRAM_BYTES};
 use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
+use crate::vmm_page_pool::VmmPageLayout;
 
 /// Slab capacities round up to this, so a future page size divides them.
 /// Matches the tile size the flash path walks KV in.
@@ -69,6 +70,11 @@ pub struct SlotPool {
     /// fails `validate_generation` after a release/reacquire cycle.
     /// Initialized to 0 — legacy `acquire` callers never check it.
     slot_generations: Vec<u32>,
+    /// VMM-paged descriptor layout. `None` = arena-paged (32-byte
+    /// `KvSlotDesc`); `Some` = VMM-paged (48-byte descriptors).
+    vmm_layout: Option<VmmPageLayout>,
+    /// Parallel 48-byte descriptor table, empty until `set_vmm_layout`.
+    vmm_descs: Vec<VmmPagedKvSlotDesc>,
 }
 
 // Compile-time check that the pool and page-pool page sizes agree.
@@ -141,6 +147,8 @@ impl SlotPool {
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
             slot_generations: vec![0; n_slots],
+            vmm_layout: None,
+            vmm_descs: Vec::new(),
         })
     }
 
@@ -202,7 +210,56 @@ impl SlotPool {
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
             slot_generations: vec![0; n_slots],
+            vmm_layout: None,
+            vmm_descs: Vec::new(),
         })
+    }
+
+    /// Select VMM-paged descriptors for this paged pool. Reserved for q8/fp8
+    /// equal-stride pools; the caller builds the matching `VmmPageMapper`.
+    pub fn set_vmm_layout(&mut self, layout: VmmPageLayout) -> Result<(), String> {
+        if self.page_pool.is_none() {
+            return Err("SlotPool: VMM layout requires a paged pool".into());
+        }
+        if layout.page_tokens != PAGE_TOKENS {
+            return Err(format!(
+                "SlotPool: VMM page_tokens {} does not match paged PAGE_TOKENS {PAGE_TOKENS}",
+                layout.page_tokens
+            ));
+        }
+        self.vmm_descs = self
+            .descs
+            .iter()
+            .map(|desc| VmmPagedKvSlotDesc {
+                block_table: desc.block_table,
+                legacy_k_base: 0,
+                legacy_v_base: 0,
+                seq_len: desc.seq_len,
+                page_tokens: if desc.block_table != 0 {
+                    PAGE_TOKENS as i32
+                } else {
+                    0
+                },
+                granule_bytes: layout.granule_bytes as u64,
+                pages_per_granule: layout.pages_per_granule,
+                _pad: 0,
+            })
+            .collect();
+        self.vmm_layout = Some(layout);
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn is_vmm_paged(&self) -> bool {
+        self.vmm_layout.is_some()
+    }
+
+    pub fn vmm_layout(&self) -> Option<VmmPageLayout> {
+        self.vmm_layout
+    }
+
+    pub fn vmm_descriptors(&self) -> &[VmmPagedKvSlotDesc] {
+        &self.vmm_descs
     }
 
     /// Take a free slot, or `None` when the pool is full. Admission control
@@ -268,6 +325,17 @@ impl SlotPool {
             self.descs[id.0].legacy_k_base = 0;
             self.descs[id.0].legacy_v_base = 0;
         }
+        if let Some(layout) = self.vmm_layout {
+            let desc = &mut self.vmm_descs[id.0];
+            desc.block_table = 0;
+            desc.legacy_k_base = 0;
+            desc.legacy_v_base = 0;
+            desc.seq_len = 0;
+            desc.page_tokens = 0;
+            desc.granule_bytes = layout.granule_bytes as u64;
+            desc.pages_per_granule = layout.pages_per_granule;
+            self.dirty = true;
+        }
     }
 
     /// Set a slot's logical KV length. Enforces `seq_len <= cap` host-side,
@@ -306,6 +374,9 @@ impl SlotPool {
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
             self.descs[id.0].seq_len = seq_len as i32;
+            if !self.vmm_descs.is_empty() {
+                self.vmm_descs[id.0].seq_len = seq_len as i32;
+            }
             self.dirty = true;
         }
         Ok(())
@@ -360,6 +431,9 @@ impl SlotPool {
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
             self.descs[id.0].seq_len = seq_len as i32;
+            if !self.vmm_descs.is_empty() {
+                self.vmm_descs[id.0].seq_len = seq_len as i32;
+            }
             self.dirty = true;
         }
         Ok(())
@@ -470,6 +544,16 @@ impl SlotPool {
         self.descs[slot.0].legacy_k_base = 0;
         self.descs[slot.0].legacy_v_base = 0;
         self.descs[slot.0].seq_len = bt.live_tokens() as i32;
+        if let Some(layout) = self.vmm_layout {
+            let desc = &mut self.vmm_descs[slot.0];
+            desc.block_table = block_table_dev_addr;
+            desc.legacy_k_base = 0;
+            desc.legacy_v_base = 0;
+            desc.seq_len = bt.live_tokens() as i32;
+            desc.page_tokens = PAGE_TOKENS as i32;
+            desc.granule_bytes = layout.granule_bytes as u64;
+            desc.pages_per_granule = layout.pages_per_granule;
+        }
         self.dirty = true;
     }
 

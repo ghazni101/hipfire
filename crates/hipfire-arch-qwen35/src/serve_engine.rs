@@ -26,11 +26,14 @@ use hipfire_runtime::serve::{
     send_event, Continuation, DoneReason, EngineStats, Event, RejectClass, SubmitRequest,
 };
 use hipfire_runtime::session_table::{SessionId, SessionTable};
-use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
+use hipfire_runtime::swap::snapshot::{
+    capture_slot, capture_slot_mapped, restore_slot, restore_slot_mapped, SnapshotStamp,
+};
 use hipfire_runtime::swap::{SwapError, SwapManager};
 use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
+use rdna_compute::vmm_page_pool::{VmmPageLayout, VmmPageMapper};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, CheckpointPool};
@@ -137,6 +140,8 @@ pub struct EngineConfig {
     /// Physical pages in the shared paged pool. 0 = auto-size from free VRAM
     /// after weights and prefill scratch (leaving the VMM map reserve).
     pub multi_slot_paged_pages: usize,
+    /// `arena` (default) or experimental `vmm` physical backend.
+    pub multi_slot_paged_backend: String,
     /// Cross-session prefix cache (radix index + checkpoint pool). Default
     /// false: the existing session-local continuation path (convo hashes)
     /// is unchanged. When true, cold admits consult a PrefixIndex for
@@ -457,6 +462,10 @@ struct ModelRig {
     /// Per-slot VMM KV owners (`kv_backend=vmm`). `None` on the arena route,
     /// which uses `k_arenas`/`v_arenas` + `desc_staging` instead.
     vmm: Option<VmmSlotKv>,
+    /// VMM-paged shared pool mapper (`serve.multi_slot_paged_backend=vmm`).
+    /// The owners live in `k_arenas`/`v_arenas`; this maps granules on page
+    /// allocation and unmaps them on release.
+    paged_vmm: Option<VmmPageMapper>,
     /// Cross-session host-snapshot prefix cache for the VMM route.
     /// `None` on the arena route (which uses the radix `prefix_index`) or when
     /// `serve.prefix_cache` is off.
@@ -480,6 +489,33 @@ impl ModelRig {
     /// `any_verify`/`any_dflash_rows` so the engine loop never names model
     /// buffers. `gpu`/`pool`/`graph`/`batch`/`lm_head_skip` are the
     /// family-neutral engine pieces passed in by the caller.
+    /// Reconcile VMM-page mappings with the logical page pool immediately
+    /// before a forward. Mapping and unmapping are admission/provisioning
+    /// boundaries, never inside a kernel step.
+    fn sync_paged_vmm(&mut self, gpu: &mut Gpu, pool: &SlotPool) -> rdna_compute::HipResult<()> {
+        let Some(mapper) = self.paged_vmm.as_mut() else {
+            return Ok(());
+        };
+        let states = pool
+            .page_pool()
+            .ok_or_else(|| rdna_compute::HipError::new(0, "VMM-paged mapper without a page pool"))?
+            .page_states();
+        mapper
+            .sync(gpu, &states)
+            .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+        for slot in 0..pool.descriptors().len() {
+            if let Some(bt) = pool.block_table(SlotId(slot)) {
+                mapper
+                    .check_table(bt.page_indices(), bt.num_pages())
+                    .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+            }
+        }
+        for tensor in self.k_arenas.iter_mut().chain(self.v_arenas.iter_mut()) {
+            gpu.refresh_vmm_owner_size(tensor)?;
+        }
+        Ok(())
+    }
+
     fn forward_step(
         &mut self,
         gpu: &mut Gpu,
@@ -493,6 +529,25 @@ impl ModelRig {
         mtp_prefill_slots: &[bool],
         dflash_prefill_slots: &[bool],
     ) -> rdna_compute::HipResult<()> {
+        if self.paged_vmm.is_some() {
+            // `forward_batch_slots` provisions each slot's write frontier
+            // inside the step; VMM must map any new pages before the forward
+            // starts. Do the same `max_pos + 1` provisioning here first so the
+            // in-forward call is a no-op.
+            for slot in 0..pool.descriptors().len() {
+                let mut frontier = 0usize;
+                for (row, &slot_id) in batch.row_slot.iter().enumerate() {
+                    if slot_id as usize == slot && slot_id >= 0 {
+                        frontier = frontier.max(batch.positions[row] as usize + 1);
+                    }
+                }
+                if frontier > 0 {
+                    pool.set_seq_len(SlotId(slot), frontier)
+                        .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+                }
+            }
+        }
+        self.sync_paged_vmm(gpu, pool)?;
         if self.vmm.is_some() {
             return self.forward_step_vmm(
                 gpu,
@@ -1234,12 +1289,23 @@ impl Rig {
         let env_pages = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok());
+        // Physical backend for the shared paged pool. `arena` (default) keeps
+        // the existing zeroed full-size arenas; `vmm` reserves VA and maps
+        // granule groups as pages become resident.
+        let paged_vmm = match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+            .ok()
+            .as_deref()
+        {
+            Some(value) => value.eq_ignore_ascii_case("vmm"),
+            None => cfg.multi_slot_paged_backend.eq_ignore_ascii_case("vmm"),
+        };
         let paged_requested = !use_vmm
             && (cfg.multi_slot_paged
                 || cfg.multi_slot_paged_pages > 0
                 || env_paged == Some(true)
                 || env_pages.is_some_and(|p| p > 0)
-                || prefix_cache);
+                || prefix_cache
+                || paged_vmm);
         let paged_explicit = if cfg.multi_slot_paged_pages > 0 {
             Some(cfg.multi_slot_paged_pages)
         } else {
@@ -1272,6 +1338,32 @@ impl Rig {
         } else {
             None
         };
+        if paged_vmm {
+            if use_vmm {
+                return Err(
+                    "HIPFIRE_SLOTS_PAGED_BACKEND=vmm cannot combine with kv_backend=vmm"
+                        .to_string(),
+                );
+            }
+
+            if paged_pages.is_none() {
+                return Err("VMM-paged backend requires the shared paged pool".to_string());
+            }
+
+            if per_pos_bytes != per_pos_v_bytes {
+                return Err(format!(
+                    "VMM-paged backend requires equal K/V strides (K {per_pos_bytes}, V {per_pos_v_bytes})"
+                ));
+            }
+            if !matches!(
+                kv_mode,
+                hipfire_runtime::kv_mode::KvMode::Q8 | hipfire_runtime::kv_mode::KvMode::Fp8
+            ) {
+                return Err(format!(
+                    "VMM-paged backend admits q8/fp8 only (selected {kv_mode:?})"
+                ));
+            }
+        }
         // Auto page sizing needs the post-weight free-VRAM figure. Partial
         // offload's placement pass needs the KV reserve up front, so require
         // an explicit page count there rather than over- or under-placing the
@@ -1825,7 +1917,7 @@ impl Rig {
         // (weights, prefill scratch, sampler state) is already resident, so
         // post-allocation free VRAM is exactly the budget the pool can own.
         // Auto-sizing leaves the VMM route's 512 MiB map reserve.
-        let pool = if let Some(requested_pages) = paged_pages {
+        let mut pool = if let Some(requested_pages) = paged_pages {
             let pages = if requested_pages == 0 {
                 let free = g
                     .gpu
@@ -1886,7 +1978,7 @@ impl Rig {
         }
         let k_arena_bytes = pool.k_arena_bytes();
         let v_arena_bytes = pool.v_arena_bytes();
-        if !use_vmm {
+        if !use_vmm && !paged_vmm {
             for _ in 0..n_fa_layers {
                 let k = g
                     .gpu
@@ -1911,12 +2003,21 @@ impl Rig {
         } else {
             0
         };
-        let desc_staging = SlotDescStaging::new(
-            g.gpu.as_mut().unwrap(),
-            cfg.n_slots,
-            max_batch,
-            max_pages_per_slot,
-        )
+        let desc_staging = if paged_vmm {
+            SlotDescStaging::new_vmm(
+                g.gpu.as_mut().unwrap(),
+                cfg.n_slots,
+                max_batch,
+                max_pages_per_slot,
+            )
+        } else {
+            SlotDescStaging::new(
+                g.gpu.as_mut().unwrap(),
+                cfg.n_slots,
+                max_batch,
+                max_pages_per_slot,
+            )
+        }
         .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
         let sample_params = (0..cfg.n_slots)
@@ -2024,8 +2125,35 @@ impl Rig {
         let vision_weights = g.vision_weights.take();
         let mtp_head = g.mtp_head.take();
         let dflash = g.dflash.take();
-        let k_arenas = std::mem::take(&mut g.k_arenas);
-        let v_arenas = std::mem::take(&mut g.v_arenas);
+        let mut k_arenas = std::mem::take(&mut g.k_arenas);
+        let mut v_arenas = std::mem::take(&mut g.v_arenas);
+        let mut paged_vmm_mapper = None;
+        if paged_vmm {
+            let n_pages = pool
+                .page_pool()
+                .ok_or_else(|| "VMM-paged backend requires a page pool".to_string())?
+                .n_pages();
+            let (mapper, arenas) = VmmPageMapper::new(
+                &mut gpu,
+                n_fa_layers,
+                n_pages,
+                PAGE_TOKENS,
+                per_pos_bytes,
+                0,
+                0,
+            )
+            .map_err(|e| format!("VMM-paged KV: {e}"))?;
+            let layout = mapper.page_layout();
+            pool.set_vmm_layout(layout)
+                .map_err(|e| format!("VMM-paged descriptors: {e}"))?;
+            k_arenas = arenas.k;
+            v_arenas = arenas.v;
+            paged_vmm_mapper = Some(mapper);
+            eprintln!(
+                "[hipfire] paged KV backend=vmm: {} pages, granule {} B, {} pages/granule, VA-only at load",
+                layout.n_pages, layout.granule_bytes, layout.pages_per_granule
+            );
+        }
         let kv_tier = g.kv_tier.take().expect("kv tier built");
         let dn_states = std::mem::take(&mut g.dn_states);
         let desc_staging = g.desc_staging.take().unwrap();
@@ -2286,6 +2414,7 @@ impl Rig {
                 vl_tower_jobs,
                 checkpoint_pool,
                 vmm,
+                paged_vmm: paged_vmm_mapper,
                 vmm_prefix,
                 vmm_prefix_mark: vec![0; cfg.n_slots],
                 vmm_row_offsets: vec![usize::MAX; cfg.n_slots],
@@ -2361,6 +2490,7 @@ impl Rig {
                     vl_tower_jobs,
                     checkpoint_pool,
                     vmm,
+                    mut paged_vmm,
                     ..
                 },
             ..
@@ -2390,6 +2520,12 @@ impl Rig {
         kv_tier.free_gpu(&mut gpu);
         for dn in dn_states.into_iter().rev() {
             dn.free_gpu(&mut gpu);
+        }
+        // The mapper borrows the arena base addresses only; clear its
+        // bookkeeping before the owner tensors are freed. `free_tensor` runs
+        // the actual unmap/release for every segment.
+        if let Some(mapper) = paged_vmm.as_mut() {
+            mapper.release();
         }
         // Arenas were allocated per FA layer as k then v; free reverse layers
         // as v then k.
@@ -3547,12 +3683,23 @@ fn rebuild_batch_excluding_failed(batch: &mut SlotBatch, failed: &[usize]) {
 /// (releasing the reserved destinations) and fails the slot — a partial
 /// copy never leaves a half-initialized destination referenced, because
 /// the table still maps the logical page to the source until commit.
+fn cow_offset(phys: u32, page_bytes: usize, layout: Option<VmmPageLayout>) -> usize {
+    match layout {
+        Some(layout) => {
+            let p = layout.pages_per_granule as usize;
+            (phys as usize / p) * layout.granule_bytes + (phys as usize % p) * page_bytes
+        }
+        None => phys as usize * page_bytes,
+    }
+}
+
 fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> bool {
     let Some(pp) = rig.pool.page_pool() else {
         return false;
     };
     let k_page = pp.k_page_bytes();
     let v_page = pp.v_page_bytes();
+    let layout = rig.model.paged_vmm.as_ref().map(|m| m.page_layout());
     for copy in plan.copies() {
         for (layer, k_arena) in rig.model.k_arenas.iter().enumerate() {
             let Some(v_arena) = rig.model.v_arenas.get(layer) else {
@@ -3561,9 +3708,9 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
             if copy.k_copy_bytes > 0 {
                 let res = rig.gpu.hip.memcpy_dtod_at(
                     &k_arena.buf,
-                    copy.dst_phys as usize * k_page,
+                    cow_offset(copy.dst_phys, k_page, layout),
                     &k_arena.buf,
-                    copy.src_phys as usize * k_page,
+                    cow_offset(copy.src_phys, k_page, layout),
                     copy.k_copy_bytes,
                 );
                 if let Err(e) = res {
@@ -3574,9 +3721,9 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
             if copy.v_copy_bytes > 0 {
                 let res = rig.gpu.hip.memcpy_dtod_at(
                     &v_arena.buf,
-                    copy.dst_phys as usize * v_page,
+                    cow_offset(copy.dst_phys, v_page, layout),
                     &v_arena.buf,
-                    copy.src_phys as usize * v_page,
+                    cow_offset(copy.src_phys, v_page, layout),
                     copy.v_copy_bytes,
                 );
                 if let Err(e) = res {
@@ -5212,6 +5359,9 @@ fn run_loop(
                         // source in place.
                         let copy_ok = if plan.is_empty() {
                             true
+                        } else if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                            eprintln!("[cow] VMM map of COW destination failed for slot {s}: {e}");
+                            false
                         } else {
                             execute_cow_copies(&rig, &plan)
                         };
@@ -8202,7 +8352,8 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
             .unwrap_or(0);
         store.capture_slot(&mut rig.gpu, slot.0, seq_len, &dn_refs, &tokens, rig.stamp)
     } else {
-        capture_slot(
+        let layout = rig.model.paged_vmm.as_ref().map(|m| m.page_layout());
+        capture_slot_mapped(
             &mut rig.gpu,
             &rig.pool,
             slot,
@@ -8211,6 +8362,7 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
             &dn_refs,
             &tokens,
             rig.stamp,
+            layout,
         )
     };
     drop(dn_refs);
@@ -8282,18 +8434,45 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
     }
     match rig.swap.unpark(id.0) {
         Ok(snap) => {
-            let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
             let r = if let Some(store) = rig.model.vmm.as_mut() {
-                store.restore_slot(
+                let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
+                let r = store.restore_slot(
                     &mut rig.gpu,
                     slot.0,
                     &snap,
                     rig.stamp,
                     &dn_refs,
                     snap.seq_len,
-                )
+                );
+                drop(dn_refs);
+                r
+            } else if rig.model.paged_vmm.is_some() {
+                let layout = rig.model.paged_vmm.as_ref().map(|m| m.page_layout());
+                match rig.pool.provision_pages_for(slot, snap.seq_len) {
+                    Err(e) => Err(SwapError::Gpu(e)),
+                    Ok(()) => match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                        Err(e) => Err(SwapError::Gpu(e.to_string())),
+                        Ok(()) => {
+                            let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
+                            let r = restore_slot_mapped(
+                                &mut rig.gpu,
+                                &mut rig.pool,
+                                slot,
+                                &rig.model.k_arenas,
+                                &rig.model.v_arenas,
+                                &dn_refs,
+                                &snap,
+                                rig.stamp,
+                                layout,
+                            );
+                            drop(dn_refs);
+                            r
+                        }
+                    },
+                }
             } else {
-                restore_slot(
+                let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
+                let r = restore_slot(
                     &mut rig.gpu,
                     &mut rig.pool,
                     slot,
@@ -8302,9 +8481,10 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                     &dn_refs,
                     &snap,
                     rig.stamp,
-                )
+                );
+                drop(dn_refs);
+                r
             };
-            drop(dn_refs);
             // Publish the restored frontier in the pool's descriptor. The
             // arena restore does this itself; the VMM restore writes the
             // owner but has no pool. Without it `begin_turn` reads `held = 0`

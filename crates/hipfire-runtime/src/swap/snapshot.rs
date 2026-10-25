@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::swap::SwapError;
+use rdna_compute::vmm_page_pool::VmmPageLayout;
 
 /// Magic for the serialised form: "HIPF_SW1" as big-endian ASCII.
 const MAGIC: u64 = 0x484950465F535731;
@@ -297,6 +298,16 @@ impl SlotSnapshot {
 /// the two call sites must derive it the same way. Keeping it opaque here is
 /// what lets this module stay model-agnostic — `hipfire-runtime` cannot depend
 /// on an arch crate without a dependency cycle.
+fn page_arena_offset(phys: usize, page_bytes: usize, layout: Option<VmmPageLayout>) -> usize {
+    match layout {
+        Some(layout) => {
+            let p = layout.pages_per_granule as usize;
+            (phys / p) * layout.granule_bytes + (phys % p) * page_bytes
+        }
+        None => phys * page_bytes,
+    }
+}
+
 pub fn capture_slot(
     gpu: &mut rdna_compute::Gpu,
     pool: &rdna_compute::slot_pool::SlotPool,
@@ -306,6 +317,24 @@ pub fn capture_slot(
     extra: &[&rdna_compute::GpuTensor],
     tokens: &[u32],
     stamp: SnapshotStamp,
+) -> Result<SlotSnapshot, SwapError> {
+    capture_slot_mapped(
+        gpu, pool, slot, k_arenas, v_arenas, extra, tokens, stamp, None,
+    )
+}
+
+/// [`capture_slot`] for a VMM-paged pool. `layout` translates a physical page
+/// id to its granule-grouped byte offset; `None` keeps `phys * page_bytes`.
+pub fn capture_slot_mapped(
+    gpu: &mut rdna_compute::Gpu,
+    pool: &rdna_compute::slot_pool::SlotPool,
+    slot: rdna_compute::slot_pool::SlotId,
+    k_arenas: &[rdna_compute::GpuTensor],
+    v_arenas: &[rdna_compute::GpuTensor],
+    extra: &[&rdna_compute::GpuTensor],
+    tokens: &[u32],
+    stamp: SnapshotStamp,
+    layout: Option<VmmPageLayout>,
 ) -> Result<SlotSnapshot, SwapError> {
     let desc = pool.descriptors()[slot.0];
     let mut seq_len = desc.seq_len as usize;
@@ -354,7 +383,7 @@ pub fn capture_slot(
                 // Copy full pages.
                 for lp in 0..n_full_pages {
                     let phys = bt.physical(lp).expect("page count pre-validated") as usize;
-                    let arena_off = phys * page_bytes;
+                    let arena_off = page_arena_offset(phys, page_bytes, layout);
                     let view = arena.sub_offset(arena_off, page_bytes);
                     gpu.hip
                         .memcpy_dtoh(&mut payload[off..off + page_bytes], &view.buf)
@@ -365,7 +394,7 @@ pub fn capture_slot(
                 if last_page_tokens > 0 {
                     let phys =
                         bt.physical(n_full_pages).expect("page count pre-validated") as usize;
-                    let arena_off = phys * page_bytes;
+                    let arena_off = page_arena_offset(phys, page_bytes, layout);
                     let last_bytes = last_page_tokens * per_pos;
                     let view = arena.sub_offset(arena_off, last_bytes);
                     gpu.hip
@@ -428,6 +457,25 @@ pub fn restore_slot(
     snap: &SlotSnapshot,
     expect: SnapshotStamp,
 ) -> Result<(), SwapError> {
+    restore_slot_mapped(
+        gpu, pool, slot, k_arenas, v_arenas, extra, snap, expect, None,
+    )
+}
+
+/// [`restore_slot`] for a VMM-paged pool. The caller must provision and map
+/// the destination pages before calling (the engine does this while the
+/// mapper still owns the GPU mapping boundary).
+pub fn restore_slot_mapped(
+    gpu: &mut rdna_compute::Gpu,
+    pool: &mut rdna_compute::slot_pool::SlotPool,
+    slot: rdna_compute::slot_pool::SlotId,
+    k_arenas: &[rdna_compute::GpuTensor],
+    v_arenas: &[rdna_compute::GpuTensor],
+    extra: &[&rdna_compute::GpuTensor],
+    snap: &SlotSnapshot,
+    expect: SnapshotStamp,
+    layout: Option<VmmPageLayout>,
+) -> Result<(), SwapError> {
     snap.validate(expect)?;
 
     let desc = pool.descriptors()[slot.0];
@@ -476,7 +524,7 @@ pub fn restore_slot(
                 // Copy full pages.
                 for lp in 0..n_full_pages {
                     let phys = bt.physical(lp).expect("page count pre-validated") as usize;
-                    let arena_off = phys * page_bytes;
+                    let arena_off = page_arena_offset(phys, page_bytes, layout);
                     let view = arena.sub_offset(arena_off, page_bytes);
                     gpu.hip
                         .memcpy_htod(&view.buf, &snap.payload[off..off + page_bytes])
@@ -487,7 +535,7 @@ pub fn restore_slot(
                 if last_page_tokens > 0 {
                     let phys =
                         bt.physical(n_full_pages).expect("page count pre-validated") as usize;
-                    let arena_off = phys * page_bytes;
+                    let arena_off = page_arena_offset(phys, page_bytes, layout);
                     let last_bytes = last_page_tokens * per_pos;
                     let view = arena.sub_offset(arena_off, last_bytes);
                     gpu.hip

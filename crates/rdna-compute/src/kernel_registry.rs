@@ -613,6 +613,35 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ),
         ["attention_flash_q8_0_tile_batched_paged"]
     );
+    // VMM-backed shared paged route: same bodies, 48-byte header and the
+    // `_vmm_paged` symbol. The arena `_paged` modules above stay byte-identical.
+    add!(
+        "kv_cache_write_q8_0_batched_vmm_paged",
+        kernels::kv_slot_desc_vmm_paged_source(
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
+            "kv_cache_write_q8_0_batched",
+            "kv_cache_write_q8_0_batched_vmm_paged"
+        ),
+        ["kv_cache_write_q8_0_batched_vmm_paged"]
+    );
+    add!(
+        "attention_q8_0_kv_batched_vmm_paged",
+        kernels::kv_slot_desc_vmm_paged_source(
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            "attention_q8_0_kv_batched",
+            "attention_q8_0_kv_batched_vmm_paged"
+        ),
+        ["attention_q8_0_kv_batched_vmm_paged"]
+    );
+    add!(
+        "attention_flash_q8_0_tile_batched_vmm_paged",
+        kernels::kv_slot_givens4_vmm_paged_source(
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            "attention_flash_q8_0_tile_batched_vmm_paged"
+        ),
+        ["attention_flash_q8_0_tile_batched_vmm_paged"]
+    );
     add!(
         "kv_cache_write_asym_k_givens3_batched_paged",
         kernels::kv_slot_givens4_paged_source(
@@ -646,6 +675,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 )
             ),
             ["attention_q8_0_flash_prefill_wmma_paged"]
+        );
+        add!(
+            "attention_q8_0_flash_prefill_wmma_gfx11_hd256_vmm_paged",
+            format!(
+                "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM 256\n#define PREFETCH_V 1\n{}",
+                kernels::kv_slot_desc_vmm_paged_source(
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC,
+                    "attention_q8_0_flash_prefill_wmma",
+                    "attention_q8_0_flash_prefill_wmma_vmm_paged"
+                )
+            ),
+            ["attention_q8_0_flash_prefill_wmma_vmm_paged"]
         );
     }
     add!(

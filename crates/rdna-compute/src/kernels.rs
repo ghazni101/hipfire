@@ -8169,6 +8169,12 @@ pub const KV_SLOT_DESC_H: &str = include_str!("../../../kernels/src/kv_slot_desc
 /// module keeps the legacy header and its exact source bytes.
 pub const KV_SLOT_DESC_PAGED_H: &str = include_str!("../../../kernels/src/kv_slot_desc_paged.h");
 
+/// VMM-backed shared paged (48-byte) KV descriptor — see
+/// `kernels/src/kv_slot_desc_vmm_paged.h`. Only `_vmm_paged` module variants
+/// compile against it; the arena-paged header and code objects are untouched.
+pub const KV_SLOT_DESC_VMM_PAGED_H: &str =
+    include_str!("../../../kernels/src/kv_slot_desc_vmm_paged.h");
+
 /// Assemble a descriptor-consuming kernel translation unit for the runtime
 /// compile (which has no `-I` to `kernels/src`): strip `body`'s
 /// `#include "kv_slot_desc.h"` and prepend the header. `paged == false`
@@ -8199,6 +8205,17 @@ pub fn kv_slot_desc_paged_source(body: &str, symbol: &str, paged_symbol: &str) -
     )
 }
 
+/// Source of the `_vmm_paged` variant of descriptor kernel `symbol` in
+/// `body`: the 48-byte VMM-paged header, with the body's symbol renamed by
+/// macro so the arena `_paged` module and its code object stay untouched.
+pub fn kv_slot_desc_vmm_paged_source(body: &str, symbol: &str, vmm_paged_symbol: &str) -> String {
+    let stripped = body
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm_paged.h\"", "");
+    format!("#define {symbol} {vmm_paged_symbol}\n{KV_SLOT_DESC_VMM_PAGED_H}\n{stripped}")
+}
+
 /// Source of the paged (slot-engine) variant of a descriptor kernel launched
 /// through the givens4/turbo assembler: `func` renamed to `paged_func` by
 /// macro, then the turbo/givens headers and the paged descriptor header in
@@ -8212,6 +8229,19 @@ pub fn kv_slot_givens4_paged_source(body: &str, func: &str, paged_func: &str) ->
         .replace("#include \"kv_slot_desc_paged.h\"", "");
     format!(
         "#define {func} {paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_PAGED_H}\n{stripped}"
+    )
+}
+
+/// Givens/turbo assembler variant of [`kv_slot_desc_vmm_paged_source`].
+pub fn kv_slot_givens4_vmm_paged_source(body: &str, func: &str, vmm_paged_func: &str) -> String {
+    let stripped = body
+        .replace("#include \"turbo_common.h\"", "")
+        .replace("#include \"givens_common.h\"", "")
+        .replace("#include \"kv_slot_desc.h\"", "")
+        .replace("#include \"kv_slot_desc_paged.h\"", "")
+        .replace("#include \"kv_slot_desc_vmm_paged.h\"", "");
+    format!(
+        "#define {func} {vmm_paged_func}\n{TURBO_COMMON_H}\n{GIVENS_COMMON_SRC}\n{KV_SLOT_DESC_VMM_PAGED_H}\n{stripped}"
     )
 }
 

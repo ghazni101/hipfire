@@ -1030,6 +1030,21 @@ pub static FIELDS: &[ConfigField] = &[
          from free VRAM after weights and prefill scratch; ignored when the paged pool is off."
     ),
     field!(
+        "serve.multi_slot_paged_backend",
+        "multi_slot_paged_backend",
+        Serve,
+        Process,
+        DefaultValue::String("arena"),
+        ValueRule::Enum(&["arena", "vmm"]),
+        false,
+        true,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND"),
+        "Physical backend for the shared paged KV pool: `arena` (default; zeroed full-size K/V \
+         arenas) or `vmm` (VA-only reservations, 2 MiB granule groups mapped as pages become \
+         resident). `vmm` is experimental; it currently admits q8/fp8 equal-stride pools and is \
+         not a production default."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,

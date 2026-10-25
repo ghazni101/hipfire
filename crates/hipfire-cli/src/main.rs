@@ -16079,6 +16079,7 @@ effort = "high"
                     1024,
                     false,
                     0,
+                    "arena",
                     false,
                     0,
                     false,
@@ -16121,6 +16122,7 @@ effort = "high"
                     multi_slot_prefill_chunk: 1024,
                     multi_slot_paged: false,
                     multi_slot_paged_pages: 0,
+                    multi_slot_paged_backend: "arena".into(),
                     spawner: crate::serve::EngineSpawner {
                         daemon: daemon.clone(),
                         process_config: process_config.clone(),

@@ -421,6 +421,7 @@ pub(crate) struct ServeRuntime {
     /// Shared `PagePool` for the multi-slot engine; pages=0 auto-sizes.
     pub(crate) multi_slot_paged: bool,
     pub(crate) multi_slot_paged_pages: u64,
+    pub(crate) multi_slot_paged_backend: String,
     pub(crate) spawner: EngineSpawner,
     /// The `model` string the resident model was loaded under; reloaded after
     /// a daemon restart.
@@ -516,6 +517,7 @@ pub(crate) fn route_capabilities(
     multi_slot_prefill_chunk: u64,
     multi_slot_paged: bool,
     multi_slot_paged_pages: u64,
+    multi_slot_paged_backend: &str,
     prefix_cache: bool,
     prefix_cache_max_bytes: u64,
     structured_jump_forward: bool,
@@ -542,6 +544,7 @@ pub(crate) fn route_capabilities(
         "multi_slot_prefill_chunk": multi_slot_prefill_chunk,
         "multi_slot_paged": multi_slot_paged,
         "multi_slot_paged_pages": multi_slot_paged_pages,
+        "multi_slot_paged_backend": multi_slot_paged_backend,
         "prefix_cache": prefix_cache,
         "prefix_cache_max_bytes": prefix_cache_max_bytes,
         "structured_output": structured_output,
@@ -1784,6 +1787,16 @@ pub(crate) fn serve_foreground(
     let multi_slot_paged_pages = args
         .multi_slot_paged_pages
         .unwrap_or(config_u64(&global, "serve.multi_slot_paged_pages")?);
+    let multi_slot_paged_backend = config_string(&global, "serve.multi_slot_paged_backend")?;
+    if !matches!(multi_slot_paged_backend.as_str(), "arena" | "vmm") {
+        bail!(
+            "serve.multi_slot_paged_backend must be `arena` or `vmm`, got {:?}",
+            multi_slot_paged_backend
+        );
+    }
+    if multi_slot_paged_backend == "vmm" && !multi_slot_paged {
+        bail!("serve.multi_slot_paged_backend=vmm requires serve.multi_slot_paged=true");
+    }
     if multi_slot_paged && !multi_slot_enabled {
         bail!("--multi-slot-paged requires serve.multi_slot / HIPFIRE_SERVE_MULTI_SLOT=1");
     }
@@ -1915,6 +1928,7 @@ pub(crate) fn serve_foreground(
         multi_slot_prefill_chunk,
         multi_slot_paged,
         multi_slot_paged_pages,
+        &multi_slot_paged_backend,
         prefix_cache,
         prefix_cache_max_bytes,
         structured_jump_forward,
@@ -1959,6 +1973,7 @@ pub(crate) fn serve_foreground(
             multi_slot_prefill_chunk,
             multi_slot_paged,
             multi_slot_paged_pages,
+            multi_slot_paged_backend,
             spawner,
             resident_model: None,
             request_policy,
@@ -2382,6 +2397,8 @@ impl ServeRuntime {
                     serde_json::json!(self.multi_slot_prefill_chunk);
                 params["multi_slot_paged"] = serde_json::json!(self.multi_slot_paged);
                 params["multi_slot_paged_pages"] = serde_json::json!(self.multi_slot_paged_pages);
+                params["multi_slot_paged_backend"] =
+                    serde_json::json!(self.multi_slot_paged_backend);
                 // Forward the resolved (possibly clamped-to-scratch) trunk-row
                 // budget so the daemon's slot engine does not re-read the
                 // unclamped OnceLock `serve.max_batch_tokens` default and
@@ -4116,6 +4133,7 @@ mod tests {
             multi_slot_prefill_chunk: 1024,
             multi_slot_paged: false,
             multi_slot_paged_pages: 0,
+            multi_slot_paged_backend: "arena".into(),
             spawner: EngineSpawner {
                 daemon: daemon.clone(),
                 process_config,
@@ -4611,6 +4629,7 @@ mod capabilities_tests {
             1024,
             /*multi_slot_paged*/ false,
             0,
+            /*multi_slot_paged_backend*/ "arena",
             /*prefix_cache*/ true,
             536870912,
             /*jump_forward*/ true,
@@ -4683,6 +4702,7 @@ mod capabilities_tests {
             1024,
             false,
             0,
+            "arena",
             false,
             0,
             false,

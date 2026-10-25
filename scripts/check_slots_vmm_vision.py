@@ -98,6 +98,11 @@ def main() -> int:
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--spec", default="off", choices=["off", "mtp", "dflash"])
+    ap.add_argument(
+        "--paged-vmm",
+        action="store_true",
+        help="test batched vision on the shared paged pool over VMM",
+    )
     ap.add_argument("--timeout", type=float, default=300.0)
     args = ap.parse_args()
 
@@ -139,16 +144,19 @@ def main() -> int:
         args.model,
         "--vision",
         args.vision,
-        "--kv-backend",
-        "vmm",
         "--kv-mode",
         "q8",
         "--spec",
         args.spec,
         "--idle-timeout",
         "0",
-        f"127.0.0.1:{args.port}",
     ]
+    if args.paged_vmm:
+        env["HIPFIRE_SERVE_MULTI_SLOT_PAGED"] = "1"
+        env["HIPFIRE_SLOTS_PAGED_BACKEND"] = "vmm"
+    else:
+        cmd.extend(["--kv-backend", "vmm"])
+    cmd.append(f"127.0.0.1:{args.port}")
     proc = subprocess.Popen(
         cmd,
         env=env,

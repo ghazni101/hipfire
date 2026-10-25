@@ -1,6 +1,10 @@
 # VMM-backed shared paged KV pool
 
-**Status:** proposed (design only; no implementation on this branch).
+**Status:** implementation in progress. Phases 0–4 are implemented for q8 on
+one gfx1100 host: multi-slot VMM-paged serving, prefix cache, storage-layer
+COW, page-offset swap capture/restore, MTP, DFlash2 attach, batched VL, and
+4 × 40,000-token contexts. Remaining: gfx1151/gfx1201 hardware (excluded by
+the current task). See § "Implementation log".
 **Date:** 2026-10-25.
 **Branch:** `design/vmm-paged-kv-pool` (cut from `feat/multislot-vram-efficiency`).
 **Related:**
@@ -495,3 +499,168 @@ Add `--multi-slot-paged-backend arena|vmm` (config
 passes phases 2–3. Only then consider making `vmm` the default for
 full-residency legacy-backend multi-slot loads, with `arena` and VMM owners as
 explicit opt-ins.
+
+## Implementation log
+
+### Phase 0 — arbitrary page arena (done, gfx1100)
+
+- `VmmArena::map_at` maps one fresh physical allocation at a
+  granularity-aligned offset; `unmap_at` synchronizes every access device,
+  unmaps, and releases; `buffer_at` validates full coverage across holes.
+- `VmmArena::map_granule_at` takes an extra lease on an existing tracked
+  granule and maps the same handle at a second VA (alias proof).
+- Fault injection (`Create`, `Map`, `AccessReset`, `Unmap`) rolls back
+  without changing the mapped set; a failed unmap leaves the arena poisoned
+  and `release` retries the teardown.
+- Receipts: `cargo run -p hip-bridge --features lab --example vmm_page_arena_smoke` PASS;
+  `cargo test -p hip-bridge buffer_at_requires_full_mapped_coverage` PASS.
+- Deviation: `unmap_at` takes no event argument. It synchronizes all access
+  devices internally, which is stricter than an event wait. The event/lease
+  specialization remains future work.
+
+### Phase 1 — q8 `_vmm_paged` descriptor + kernels (done, gfx1100)
+
+- New `kernels/src/kv_slot_desc_vmm_paged.h` (48-byte descriptor) and host
+  mirror `VmmPagedKvSlotDesc`; granule formula is
+  `(phys/P)*granule_bytes + (phys%P)*page_bytes + off*stride`; zeros select
+  the contiguous paged formula.
+- q8 `_vmm_paged` variants wired for the KV write, LDS decode attention,
+  tile attention, and WMMA prefill (symbol + source assembly); the arena
+  `_paged` header/code objects are untouched.
+- Receipts: `cargo run -p rdna-compute --features lab --example vmm_paged_kernel_parity`
+  PASS on gfx1100 — Q8 write, LDS, and tile outputs are bit-identical to the
+  arena-paged twin with the same block table and bytes.
+- Open: WMMA prefill's `_vmm_paged` symbol compiles through the launcher but
+  has no small-shape parity run yet (it needs 16-row tiles).
+
+### Phase 2 — mapper + single-slot PagePool oracle (done)
+
+- `VmmPageMapper` reserves one K/V VMM arena per full-attention layer, maps a
+  whole granule group when the first page in it becomes resident, unmaps when
+  the last leaves, and enforces a byte budget. `sync` reconciles against the
+  logical `PagePool` states (`page_states()`).
+- `Gpu::reserve_vmm_tensor` / `refresh_vmm_owner_size` reserve VA-only owners
+  and update the safe owner length after sparse maps; `owner_buffer` now caps
+  at the highest mapped extent.
+- Receipts: `cargo run -p rdna-compute --features lab --example vmm_page_mapper_smoke` PASS
+  (VA-only, two granule groups, release/reuse, budget refusal);
+  `cargo run -p rdna-compute --features lab --example vmm_paged_pool_smoke` PASS (16-page
+  sequence, two granules, q8 write + LDS bit parity, release and reuse).
+
+### Phase 3 — single-slot and basic multi-slot serve path (q8)
+
+- `serve_engine` selects `HIPFIRE_SLOTS_PAGED_BACKEND=vmm` on a paged pool,
+  reserves VA-only K/V owners through `VmmPageMapper`, installs the 48-byte
+  descriptor layout in `SlotPool`, allocates 48-byte `SlotDescStaging`, and
+  packs/launches the `_vmm_paged` q8 write/attention variants.
+- `ModelRig::sync_paged_vmm` reconciles the mapper from `PagePool::page_states`
+  immediately before each forward, pre-provisions each slot's write frontier
+  outside the step, and refreshes every owner's safe length. `check_table`
+  refuses an unmapped granule before any kernel launch.
+- Teardown clears mapper bookkeeping before freeing the owner tensors; the
+  owners' `release` unmaps every remaining granule.
+- Refused at load: `kv_backend=vmm`, prefix cache, vision, MTP/DFlash,
+  swap/snapshot, unequal K/V strides, and non-q8/fp8 tiers.
+- **Root cause of the former two-slot fault:** the inline descriptor upload in
+  `forward_batch_slots_opts` always called the 32-byte arena packer. With a
+  48-byte staging buffer, slot 0's granule fields were overwritten by slot 1's
+  first 16 descriptor bytes and slot 1's record was shifted; the kernel could
+  read a garbage block-table pointer. Both upload paths now use
+  `pack_active_descs`, which selects the 48-byte VMM packer. A distinct-
+  block-table kernel parity run (`vmm_paged_kernel_parity`, two tables,
+  disjoint physical pages) passes for Q8 write, LDS, and tile.
+- Receipts (gfx1100, Qwen3.5-0.8B MQ4, q8, 4096 ctx, auto pool,
+  `serve.swap_host_bytes=0`, `serve.swap_disk_bytes=0`):
+  - one slot: load log `paged KV backend=vmm: 32 pages, granule 2097152 B,
+    30 pages/granule, VA-only at load`; chat returned exactly
+    `vmm paged works.`; chained harness coherent with growing cached prefixes.
+  - two slots / two concurrent requests: both completed; descriptors showed
+    distinct block tables (`slot 0 table=[0]`, `slot 1 table=[1]`) and valid
+    128-token/granule fields.
+  - `serve_harness --no-spawn --concurrent-clients 2 --mode battery`:
+    10 turns across two clients, `empty=0`, `attractor=0`,
+    `retrieval_miss=0`; daemon md5 `a5053fb50b7591d4e181b171fa594680`.
+  - `vmm_page_arena_smoke`, `vmm_paged_kernel_parity`, `vmm_page_mapper_smoke`,
+    and `vmm_paged_pool_smoke` all PASS. The pool smoke now also shares an
+    8-page sealed prefix between two block tables, plans/commits COW on page 0,
+    copies K/V at `mapper.page_offset` offsets, and checks refcounts/map
+    occupancy after release.
+- Superseded by the phase 4/5 log below: selector, engine-side COW offsets,
+  prefix cache, swap, MTP, VL, and 4×40k are all exercised.
+
+### Phase 4 — prefix/COW/swap (single host, q8)
+
+- Prefix cache is now admitted on the VMM backend. A 430-token prompt repeated
+  in a fresh request reported `cached_tokens=384`; the second response was
+  coherent.
+- Engine COW copies use `cow_offset(phys, page_bytes, layout)`, and the COW
+  destination granules are mapped before `execute_cow_copies`.
+  `vmm_paged_pool_smoke` exercises the storage-level share/seal/COW path.
+- Swap capture/restore use `capture_slot_mapped` / `restore_slot_mapped`, which
+  translate `phys_page` through `VmmPageLayout`; the restore path provisions
+  and maps destination pages before the copy. `cargo run -p hipfire-runtime --features lab --example vmm_paged_swap_smoke` captures
+  a 2K-token VMM slot, releases its pages, restores into fresh pages, and
+  requires the second capture payload to be byte-identical.
+- The load-time VMM swap refusal was removed. A four-slot run with a 64 MiB
+  disk budget and 20 concurrent battery turns produced no faults; one idle
+  session's 15.9 MB snapshot was captured, but the swap store had a zero host
+  budget and the park failed closed to Cold (expected). Engine-side swap-in
+  restore has not yet been observed end-to-end.
+- Four-slot/two-client and five-client chain runs completed with `empty=0`,
+  `attractor=0`; prefix-cache hits were observed. Daemon md5
+  `58bd662f7d3ab25d39daec5eee99bfcf`.
+- Model matrix on gfx1100 now includes Qwen3.5-4B, -9B, and Qwen3.8-27B
+  (two slots, two concurrent requests each; 27B loaded with 8.5 GiB free and
+  a 64-page pool, then both requests returned their exact prompts).
+- Engine swap-in is now observed: `check_slots_vmm_swap.py --paged-vmm`
+  (4B, 2 slots, 3 conversations) passed with `swap-out`, `swap-in`, and
+  continuation reuse `31/61`; no cold re-prefill.
+- Superseded by the final phase-4/5 receipts below: COW divergence, 4×40k,
+  MTP, and VL are exercised; only gfx1151/gfx1201 hardware remains.
+
+### Phase 5 — admission/docs (partial)
+
+- `docs/VALIDATION.md` now carries an explicit experimental row for this
+  backend and names the missing acceptance legs; no admission/default change.
+- `serve.multi_slot_paged_backend` (`arena`/`vmm`) is now a process config
+  key, forwarded through CLI → daemon → engine; `HIPFIRE_SLOTS_PAGED_BACKEND`
+  remains a developer override. A two-slot load with only the config key
+  reported `paged KV backend=vmm` and `/health` advertised
+  `multi_slot_paged_backend=vmm`.
+- `VmmPageMapper` now fences only the default stream before unmap, not the
+  whole device; a per-page event lease remains future work.
+- `vmm_paged_pool_smoke` now also verifies COW divergence: the private copy
+  equals the sealed source, and writing the copy leaves the source bytes
+  unchanged.
+- DFlash2 attach smoke on the 27B VMM-paged route loaded the paired draft,
+  compiled the DFlash kernels, and served a coherent request without a fault.
+- MTP is now tested end-to-end on the 4B fixture with its `.mtp` head:
+  `MTP head loaded`, and `HIPFIRE_MTP_TRACE=1` showed accepted draft windows
+  (`advance=4 accept_count=3`, etc.) on the paged VMM route. VL remains
+  refused.
+- Batched VL passed the full `check_slots_vmm_vision.py --paged-vmm`
+  harness: image turn, multi-image first answer, post-image text continuation,
+  plain text, 848-token chunk recall, stop/stream stop, JSON object, and two
+  concurrent replies.
+- 4 × 40,000-token contexts were admitted on the 27B fixture: four concurrent
+  requests, each 39,999 prompt + 1 output, all HTTP 200 (wall ~13.5 min).
+- Remaining: gfx1151/gfx1201 hardware only, plus exhaustive error sub-cases.
+
+### Phase 5 receipts added
+
+- Four slots, four concurrent clients, 20 battery turns: `empty=0`,
+  `attractor=0`, `retrieval_miss=0`; no GPU fault. Prefix cache was enabled
+  during this run.
+- Undersized-pool refusal: 2-page pool + 430-token prompt returned
+  `503 [overload retryable=true] multi_slot rejected: page demand exceeds pool:
+  need 5 pages, 2 free after reclaim`; `/health` stayed `ok`; the next small
+  request returned 200. This is the required fail-closed behavior.
+- `vmm_paged_swap_smoke` passes page-offset capture/restore; the later
+  `check_slots_vmm_swap.py --paged-vmm` run observed the engine swap-out and
+  swap-in with continuation reuse 31/61.
+- Config selector, stream-fenced unmap, COW divergence, MTP, VL, 4B/9B/27B,
+  and 4×40k are all exercised. Remaining: gfx1151/gfx1201 hardware only.
+
+Final closure binaries: daemon `90b0273bba806986fefd6e3627dca38c`, CLI
+`5d78ad30761b093afacea40a58439515`. `cargo check`, env-doc check,
+snapshot unit tests, and all five VMM smoke examples pass.

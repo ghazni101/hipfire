@@ -578,6 +578,7 @@ mod tests {
             kv_backend: "legacy".into(),
             multi_slot_paged: false,
             multi_slot_paged_pages: 0,
+            multi_slot_paged_backend: "arena".into(),
             prefix_cache: false,
             prefix_cache_max_bytes: 0,
             max_batch_tokens: 3072,

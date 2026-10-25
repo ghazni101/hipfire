@@ -1141,3 +1141,15 @@ required-features = ["lab"]
 [[example]]
 name = "lane_rows_pm_gfx1201_h0"
 required-features = ["lab"]
+
+[[example]]
+name = "vmm_page_mapper_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "vmm_paged_kernel_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "vmm_paged_pool_smoke"
+required-features = ["lab"]
