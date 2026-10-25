@@ -691,6 +691,24 @@ impl ResidentKvDiag {
     /// The slot engine's own KV backend. `None` = the load request did not
     /// name one, and the route's documented default (legacy arenas) applies;
     /// `Some` is the operator's choice (`legacy` or per-slot `vmm`).
+    /// The shared paged pool is backed by VMM. This is a different storage
+    /// route from the per-slot KV backend; reporting it as the per-slot
+    /// automatic-legacy default emitted a warning that contradicted the
+    /// active `paged KV backend=vmm`.
+    fn for_paged_vmm() -> Self {
+        Self {
+            request: "automatic".to_string(),
+            backend: "vmm".to_string(),
+            reason: Some(
+                "shared paged pool physical backend (serve.multi_slot_paged_backend=vmm)"
+                    .to_string(),
+            ),
+            legacy: false,
+            warning: None,
+            mode: None,
+        }
+    }
+
     fn for_slot(requested: Option<hipfire_runtime::kv_backend::KvBackend>) -> Self {
         use hipfire_loader::admission::KvBackendRequest;
         use hipfire_runtime::kv_backend::KvBackend;
@@ -1454,9 +1472,6 @@ fn main() {
                             }
                         }
                     }
-                    // Emit the effective slot backend once here; prior
-                    // model/slot is about to be torn down.
-                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_requested);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1527,6 +1542,23 @@ fn main() {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
                     let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Emit the effective slot backend once here; prior
+                    // model/slot is about to be torn down. A paged VMM pool
+                    // is its own storage route, so it must not inherit the
+                    // per-slot route's automatic-legacy disclosure.
+                    let paged_backend =
+                        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| slot_params.multi_slot_paged_backend.clone());
+                    let paged_vmm = (slot_params.multi_slot_paged
+                        || slot_params.multi_slot_paged_pages > 0)
+                        && paged_backend.eq_ignore_ascii_case("vmm");
+                    let slot_kv_diag = if paged_vmm {
+                        ResidentKvDiag::for_paged_vmm()
+                    } else {
+                        ResidentKvDiag::for_slot(slot_kv_requested)
+                    };
                     // Vision tower: the SAME ladder the ordinary arm applies
                     // (`vision_mode=off` is a hard override). The slot engine
                     // discovers the `.vl` sibling itself, so it has to be told
@@ -5018,6 +5050,22 @@ mod tests {
         assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
         // Deferred tp>1: prior model survives a failed load.
         assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
+    #[test]
+    fn paged_vmm_diag_does_not_report_legacy() {
+        let diag = super::ResidentKvDiag::for_paged_vmm();
+        assert_eq!(diag.backend, "vmm");
+        assert!(!diag.legacy);
+        assert!(diag.warning.is_none());
+        assert_eq!(diag.request, "automatic");
+        assert!(
+            diag.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("paged pool")),
+            "the paged route must name its storage: {:?}",
+            diag.reason
+        );
     }
 
     #[test]
