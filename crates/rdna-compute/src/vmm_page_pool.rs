@@ -19,7 +19,7 @@
 // provisioning, COW, release), never inside a forward.
 
 use crate::kv_slots::VmmPagedKvSlotDesc;
-use crate::page_pool::{PageState, PAGE_TOKENS};
+use crate::page_pool::{PAGE_TOKENS, PageState};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::DeviceBuffer;
 
@@ -101,7 +101,8 @@ fn alias(base: usize, size: usize) -> GpuTensor {
 impl VmmPageMapper {
     /// Reserve VA for `n_fa_layers` K and V arenas covering `n_pages`
     /// logical pages. `granule_bytes` must be a multiple of the device's VMM
-    /// granularity; `0` selects the recommended granularity.
+    /// granularity; `0` selects the recommended granularity. A page larger
+    /// than the requested granule gets its own rounded-up granule.
     ///
     /// `budget_bytes` is a hard cap on committed physical bytes across every
     /// K/V arena; `0` means no cap. No physical memory is committed here.
@@ -133,16 +134,28 @@ impl VmmPageMapper {
         let granularity = gpu
             .vmm_recommended_granularity()
             .map_err(|e| format!("VmmPageMapper: VMM granularity unavailable: {e}"))?;
-        let granule_bytes = if granule_bytes == 0 {
+        let requested_granule = if granule_bytes == 0 {
             granularity
         } else {
             granule_bytes
         };
-        if granule_bytes == 0 || !granule_bytes.is_multiple_of(granularity) {
+        if requested_granule == 0 || !requested_granule.is_multiple_of(granularity) {
             return Err(format!(
-                "VmmPageMapper: granule {granule_bytes} is not a multiple of VMM granularity {granularity}"
+                "VmmPageMapper: granule {requested_granule} is not a multiple of VMM granularity {granularity}"
             ));
         }
+        // A logical page is the unit of ownership, not a VMM granule: on this
+        // engine a q8 page is ~136 KiB while the device's recommended granule
+        // is 4 KiB. Reserve whole granules per page and never split a page
+        // across mappings. When the requested granule is large enough and
+        // divides evenly, pack several pages into it; otherwise one page per
+        // granule (the tail of a non-dividing granule is unused, as documented
+        // by the descriptor).
+        let page_granule = page_bytes.div_ceil(granularity) * granularity;
+        let granule_bytes = requested_granule.max(page_granule);
+        // `page_granule` is divisible by `page_bytes` only when the rounded
+        // value happens to divide; use floor packing otherwise. The unused
+        // tail is already part of the descriptor contract.
         let pages_per_granule = granule_bytes / page_bytes;
         if pages_per_granule == 0 {
             return Err(format!(
