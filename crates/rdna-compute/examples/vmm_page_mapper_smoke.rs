@@ -15,9 +15,9 @@
 //! Run:
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_page_mapper_smoke
 
-use rdna_compute::Gpu;
-use rdna_compute::page_pool::{PAGE_TOKENS, PageState};
+use rdna_compute::page_pool::{PageState, PAGE_TOKENS};
 use rdna_compute::vmm_page_pool::{VmmPageArenas, VmmPageMapper};
+use rdna_compute::Gpu;
 
 const PER_POS: usize = 1088;
 const N_PAGES: usize = 4096;

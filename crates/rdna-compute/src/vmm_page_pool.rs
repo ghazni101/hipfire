@@ -19,7 +19,7 @@
 // provisioning, COW, release), never inside a forward.
 
 use crate::kv_slots::VmmPagedKvSlotDesc;
-use crate::page_pool::{PAGE_TOKENS, PageState};
+use crate::page_pool::{PageState, PAGE_TOKENS};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::DeviceBuffer;
 
