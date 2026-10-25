@@ -135,7 +135,12 @@ impl VmmPageMapper {
             .vmm_recommended_granularity()
             .map_err(|e| format!("VmmPageMapper: VMM granularity unavailable: {e}"))?;
         let requested_granule = if granule_bytes == 0 {
-            granularity
+            // One page is ~136 KiB on q8; a 4 KiB mapping granule would cost
+            // one VMM map/unmap per page and, with current GpuPool behavior,
+            // one pool drain per map. Use at least 2 MiB so a granule packs
+            // multiple pages without wasting physical bytes (the descriptor
+            // carries the packing and its unused tail).
+            granularity.max(2 * 1024 * 1024)
         } else {
             granule_bytes
         };
