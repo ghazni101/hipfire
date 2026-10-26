@@ -275,10 +275,17 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
     multi-slot COW, and page-offset swap/restore are implemented. Batched vision, MTP (with a present head), and a DFlash2 draft are admitted.
     MoE/A3B prompt chunks run as isolated single-slot `_vmm_paged` steps
     (the mixed batched prefill hung on 35B-A3B); decode stays batched.
-    Lockstep single-position decode can record/replay retained PM4 when the
-    slots `Gpu` is armed (`HIPFIRE_REPLAY_BACKEND=pm4` or the same automatic
-    `.mq4r` / gfx1201-dense predicate as sequential). It is still experimental
-    and not a production default.
+    Single-token decode can record/replay retained PM4 when the slots `Gpu` is
+    armed (the automatic `.mq4r` / gfx1201-dense predicate as sequential, or
+    an explicit `HIPFIRE_REPLAY_BACKEND`). Live slots need not share a
+    position: every row's position rides the uploaded `positions[]` buffer and
+    the slots body synthesizes no position kernarg binding, so one prepared
+    tape covers any composition of single-token rows inside its context
+    bucket. A prefill row stays eager, including a one-token chunk. The tape
+    rearms when the 256-token bucket changes or the live-slot pattern changes,
+    because `max_ctx_len`, conv state and per-slot logit rows are recorded.
+    Multi-row MoE decode is admitted up to `FEW_ROW_ROUTE_ROWS` live rows.
+    Still experimental, and not a production default.
 
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped

@@ -4347,6 +4347,15 @@ impl ReplayController {
         &self.synthesized_position_bindings
     }
 
+    /// Whether this tape carries a position *kernarg* binding, i.e. a scalar
+    /// position baked into a launch. A body that keeps every row's position in
+    /// a device buffer (and so has none) replays one tape for any set of rows
+    /// inside its bucket; a body with a binding needs every live row to share
+    /// that one value.
+    pub fn has_position_bindings(&self) -> bool {
+        !self.synthesized_position_bindings.is_empty()
+    }
+
     /// The complete retained binding set for the first `prefix` recorded
     /// launches; see [`retained_kernarg_bindings`].
     pub(crate) fn retained_kernarg_bindings(

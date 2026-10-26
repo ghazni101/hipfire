@@ -3546,15 +3546,17 @@ pub(crate) fn final_logits_per_slot(
                 continue;
             }
             let last_row = row_off + m - 1;
-            let dim_row_bytes = dim * 4;
-            gpu.memcpy_dtod_at_auto(
-                &s.x.buf,
-                0,
-                &pbs.x_batch.buf,
-                last_row * dim_row_bytes,
-                dim_row_bytes,
+            // Read the row as a view. A device copy here is a `hipMemcpyDtoD`
+            // inside the forward body, which a retained PM4 tape cannot replay
+            // (the capture's effect audit refuses it). The view is the same
+            // bytes, so the norm/GEMV below are unchanged.
+            let last_row_view = pbs.x_batch.sub_offset(last_row * dim, dim);
+            gpu.rmsnorm_f32(
+                &last_row_view,
+                &weights.output_norm,
+                &s.tmp,
+                config.norm_eps,
             )?;
-            gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
             let ctx = DispatchCtx::new(gpu);
             let wr = weights.output.dispatch_ref();
             let logits_view = logits_out.sub_offset(slot * config.vocab_size, config.vocab_size);
@@ -3722,10 +3724,11 @@ pub struct SlotDecodeGraph {
     key: Option<DecodeGraphKey>,
     captures: usize,
     replays: usize,
-    /// Context bucket baked into a prepared slots-PM4 tape. Crossing it
-    /// rearms: `max_ctx_len` lives in kernargs and `positions[]` only masks
-    /// within the captured bound.
-    redline_ctx_bucket: Option<usize>,
+    /// Prepared slots-PM4 tape. The bucket is baked `max_ctx_len`. The body
+    /// hash covers which slots are live, the lm_head skip mask, and the VL
+    /// flags: conv state and per-slot logit rows are recorded pointers, so
+    /// a different live slot is a different tape.
+    redline_tape: Option<PagedPm4TapeKey>,
 }
 
 impl SlotDecodeGraph {
@@ -3749,25 +3752,68 @@ impl SlotDecodeGraph {
             let _ = gpu.hip.graph_destroy(graph);
         }
         self.key = None;
+        self.redline_tape = None;
     }
 }
 
-/// Position a paged PM4 tape may bind. All live rows must be single-token
-/// decode at the same absolute position — Redline patches one `pos` into
-/// every launch, so mixed slot positions cannot share a tape.
-fn lockstep_decode_pos(batch: &SlotBatch) -> Option<usize> {
+/// Identity of a prepared paged-PM4 tape. Any change rearms.
+///
+/// `body` is [`decode_graph_m_hash`]: per-slot row counts, the lm_head skip
+/// mask, and the VL flags. Row count alone is not enough. The decode body
+/// records each live slot's conv-state pointer and logit row, so slot 0's
+/// width-1 tape must not replay for slot 1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PagedPm4TapeKey {
+    ctx_bucket: usize,
+    body: u64,
+}
+
+fn paged_pm4_tape_key(
+    batch: &SlotBatch,
+    lm_head_skip: &[bool],
+    physical_cap: usize,
+) -> PagedPm4TapeKey {
+    PagedPm4TapeKey {
+        ctx_bucket: decode_ctx_bucket(batch, physical_cap),
+        body: decode_graph_m_hash(
+            &batch.m_per_slot,
+            lm_head_skip,
+            !batch.pos3.is_empty(),
+            !batch.ext_emb.is_empty(),
+        ),
+    }
+}
+
+/// Position a paged PM4 tape may bind.
+///
+/// Every live row must be a single-token decode row. Position equality is
+/// required only when the prepared tape actually binds a position *kernarg*
+/// (`position_bound`): this body carries each row's absolute position in the
+/// uploaded `positions[]` buffer and synthesizes no position bindings, so one
+/// prepared tape serves any set of single-token rows inside its context
+/// bucket — mixed slot positions included, which is what makes retained PM4
+/// usable for independent parallel generations. A route that ever binds a
+/// position scalar keeps the lockstep rule.
+///
+/// Shape is not admission. A one-token prefill matches this predicate; the
+/// caller passes `redline_ok` only for a real continuation.
+fn paged_decode_pos(batch: &SlotBatch, position_bound: bool) -> Option<usize> {
     if batch.is_empty() || !batch.m_per_slot.iter().all(|&m| m <= 1) {
         return None;
     }
     if !batch.m_per_slot.iter().any(|&m| m == 1) {
         return None;
     }
-    let pos = *batch.positions.first()? as usize;
-    batch
-        .positions
-        .iter()
-        .all(|&p| p as usize == pos)
-        .then_some(pos)
+    let max_pos = *batch.positions.iter().max()? as usize;
+    if position_bound {
+        batch
+            .positions
+            .iter()
+            .all(|&p| p as usize == max_pos)
+            .then_some(max_pos)
+    } else {
+        Some(max_pos)
+    }
 }
 
 fn decode_ctx_bucket(batch: &SlotBatch, physical_cap: usize) -> usize {
@@ -3781,12 +3827,15 @@ fn decode_ctx_bucket(batch: &SlotBatch, physical_cap: usize) -> usize {
         .max(1)
 }
 
-/// Retained-PM4 body for a lockstep paged decode step.
+/// Retained-PM4 body for a paged decode step.
 ///
 /// Uploads (tokens, positions, descriptors, block tables) stay outside the
-/// tape, same contract as the hipGraph path. The recorded kernels read those
-/// device buffers, so a later token can refresh `seq_len` / `positions[]`
-/// and replay. Crossing a context bucket rearms: `max_ctx_len` is baked.
+/// tape, same contract as the hipGraph path, and the recorded kernels read
+/// those device buffers. That is what makes one tape serve a whole bucket of
+/// tokens and any composition of single-token rows: every row's position is
+/// in `positions[]`, not in a kernarg. A new context bucket or a new
+/// live-slot pattern rearms — `max_ctx_len` and the per-slot state pointers
+/// are baked.
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_slots_redline(
     gpu: &mut Gpu,
@@ -3806,10 +3855,10 @@ fn forward_batch_slots_redline(
     lm_head_skip: &[bool],
     pos: usize,
 ) -> HipResult<()> {
-    let ctx_bucket = decode_ctx_bucket(batch, pool.cap_tokens());
-    if cache.redline_ctx_bucket != Some(ctx_bucket) && gpu.replay.should_route_pm4() {
+    let tape_key = paged_pm4_tape_key(batch, lm_head_skip, pool.cap_tokens());
+    if cache.redline_tape != Some(tape_key) && gpu.replay.should_route_pm4() {
         gpu.replay.rearm_after_layout_growth();
-        cache.redline_ctx_bucket = None;
+        cache.redline_tape = None;
     }
     upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
     gpu.replay.set_forward_eligible(true);
@@ -3840,7 +3889,7 @@ fn forward_batch_slots_redline(
         None,
         SlotStepOpts {
             skip_uploads: true,
-            ctx_override: Some(ctx_bucket),
+            ctx_override: Some(tape_key.ctx_bucket),
         },
         lm_head_skip,
         None,
@@ -3860,15 +3909,25 @@ fn forward_batch_slots_redline(
             {
                 gpu.replay
                     .poison(format!("slots paged PM4 prepare failed: {reason}"));
-                cache.redline_ctx_bucket = None;
+                cache.redline_tape = None;
                 eprintln!("[redline] slots paged falling back to HIP: {reason}");
             } else {
-                cache.redline_ctx_bucket = Some(ctx_bucket);
+                cache.redline_tape = Some(tape_key);
+                // One receipt per prepared tape (never per token): the route
+                // proof a timed arm needs to show the PM4 body is installed.
+                eprintln!(
+                    "[redline] slots paged PM4 prepared: {} launches, ctx_bucket={}, \
+                     live_slots={}, tape_hash={:016x}",
+                    launches,
+                    tape_key.ctx_bucket,
+                    batch.m_per_slot.iter().filter(|&&m| m == 1).count(),
+                    tape_key.body
+                );
             }
         } else {
             gpu.replay
                 .poison("slots VMM-paged Redline is PM4-only".to_string());
-            cache.redline_ctx_bucket = None;
+            cache.redline_tape = None;
         }
     }
     result
@@ -3914,6 +3973,7 @@ pub fn forward_batch_slots_graphed(
         /* mtp_k */ 0,
         /* lm_head_skip */ &[],
         /* spec_capture */ None,
+        /* redline_ok */ true,
     )
 }
 
@@ -3932,6 +3992,12 @@ pub fn forward_batch_slots_graphed(
 /// rows via a batched GEMM instead; the single-row GEMV would be discarded
 /// work that re-reads the whole lm_head weight). The mask is part of the
 /// graph key: a captured graph bakes which GEMVs exist.
+///
+/// `redline_ok` is the engine's decode-versus-prefill decision. Lockstep
+/// shape is not enough: a one-token prefill tail matches decode and must
+/// stay on eager HIP so it cannot record or replay the continuation tape.
+/// Callers that have no prefill mask (the plain graphed wrapper) pass
+/// `true`.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_slots_graphed_opts(
     gpu: &mut Gpu,
@@ -3951,6 +4017,7 @@ pub fn forward_batch_slots_graphed_opts(
     verify_rows: usize,
     lm_head_skip: &[bool],
     mut spec_capture: Option<&mut SpecVerifyCapture>,
+    redline_ok: bool,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
     // An MTP verify step is graphable when every slot's row count is a decode
@@ -3959,12 +4026,13 @@ pub fn forward_batch_slots_graphed_opts(
     // vary step to step and would thrash the capture cache.
     let mtp_verify_shape =
         !batch.is_empty() && spec_verify_graph_shape(&batch.m_per_slot, verify_rows);
-    if pool.is_paged()
+    if redline_ok
+        && pool.is_paged()
         && spec_capture.is_none()
         && gpu.replay.is_enabled()
         && gpu.replay.uses_pm4_transport()
     {
-        if let Some(pos) = lockstep_decode_pos(batch) {
+        if let Some(pos) = paged_decode_pos(batch, gpu.replay.has_position_bindings()) {
             return forward_batch_slots_redline(
                 gpu,
                 weights,
@@ -3987,6 +4055,23 @@ pub fn forward_batch_slots_graphed_opts(
     }
     if !gpu.slots_decode_graph() || !(pure_decode || mtp_verify_shape) || pool.is_paged() {
         gpu.replay.set_forward_eligible(false);
+        // A paged step runs the SAME uploads and the SAME `max_ctx_len` bound as
+        // the retained-PM4 path. Those were two implementations before — this
+        // branch let the body upload inline with `max_ctx_len = physical cap`,
+        // while `forward_batch_slots_redline` uploaded through
+        // `upload_step_inputs` with the bucketed bound — so an eager step and a
+        // replayed step of the same batch were not the same computation. One
+        // routine, one bound: eager output is then the retained tape's reference
+        // by construction, not by luck.
+        let opts = if pool.is_paged() {
+            upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+            SlotStepOpts {
+                skip_uploads: true,
+                ctx_override: Some(decode_ctx_bucket(batch, pool.cap_tokens())),
+            }
+        } else {
+            SlotStepOpts::default()
+        };
         return forward_batch_slots_opts(
             gpu,
             weights,
@@ -4002,7 +4087,7 @@ pub fn forward_batch_slots_graphed_opts(
             s,
             logits_out,
             None,
-            SlotStepOpts::default(),
+            opts,
             lm_head_skip,
             spec_capture,
         );
@@ -4277,6 +4362,24 @@ pub fn upload_step_inputs(
         .collect();
     gpu.hip
         .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+    // Per-step state trace: the one place both the eager body and the
+    // retained-PM4 path pass through, so a parity diff can compare the exact
+    // inputs (rows, positions, descriptor length) a step was given.
+    if gpu.slot_trace() {
+        let descs: Vec<(usize, Option<usize>)> = (0..batch.m_per_slot.len())
+            .map(|slot| {
+                (
+                    slot,
+                    pool.block_table(rdna_compute::slot_pool::SlotId(slot))
+                        .map(|table| table.live_tokens()),
+                )
+            })
+            .collect();
+        eprintln!(
+            "[slot-trace] step: m={:?} positions={:?} descs={:?}",
+            batch.m_per_slot, batch.positions, descs
+        );
+    }
     // Block tables BEFORE descs: activating a paged descriptor mutates the
     // descriptor table, so it must be uploaded after this. Skipping this in
     // paged mode would let `mark_uploaded` below clear the block-table dirty
@@ -4851,7 +4954,7 @@ mod tests {
     use rdna_compute::DType;
 
     #[test]
-    fn lockstep_decode_pos_requires_uniform_single_row() {
+    fn paged_decode_pos_allows_ragged_positions_without_a_position_binding() {
         let mut batch = SlotBatch {
             m_per_slot: vec![1, 0, 1],
             tokens: vec![1, 2],
@@ -4859,15 +4962,65 @@ mod tests {
             row_slot: vec![0, 2],
             ..SlotBatch::default()
         };
-        assert_eq!(lockstep_decode_pos(&batch), Some(9));
+        // No position binding: one tape serves ragged positions (the max is
+        // what the bucket and the replay observation take).
+        assert_eq!(paged_decode_pos(&batch, false), Some(9));
         batch.positions[1] = 10;
-        assert_eq!(lockstep_decode_pos(&batch), None);
+        assert_eq!(paged_decode_pos(&batch, false), Some(10));
+        // A tape that binds a position scalar keeps the lockstep rule.
+        assert_eq!(paged_decode_pos(&batch, true), None);
+        batch.positions[1] = 9;
+        assert_eq!(paged_decode_pos(&batch, true), Some(9));
+        // Multi-row and empty batches never route.
         batch.m_per_slot = vec![2, 0, 0];
         batch.tokens = vec![1, 2];
         batch.positions = vec![9, 10];
         batch.row_slot = vec![0, 0];
-        assert_eq!(lockstep_decode_pos(&batch), None);
-        assert_eq!(lockstep_decode_pos(&SlotBatch::default()), None);
+        assert_eq!(paged_decode_pos(&batch, false), None);
+        assert_eq!(paged_decode_pos(&SlotBatch::default(), false), None);
+    }
+
+    #[test]
+    fn paged_pm4_tape_key_rearms_on_bucket_slot_and_skip() {
+        let slot0 = SlotBatch {
+            m_per_slot: vec![1, 0],
+            tokens: vec![1],
+            positions: vec![9],
+            row_slot: vec![0],
+            ..SlotBatch::default()
+        };
+        let slot1 = SlotBatch {
+            m_per_slot: vec![0, 1],
+            tokens: vec![1],
+            positions: vec![9],
+            row_slot: vec![1],
+            ..SlotBatch::default()
+        };
+        let both = SlotBatch {
+            m_per_slot: vec![1, 1],
+            tokens: vec![1, 2],
+            positions: vec![9, 9],
+            row_slot: vec![0, 1],
+            ..SlotBatch::default()
+        };
+        let skip = [false, false];
+        let key0 = paged_pm4_tape_key(&slot0, &skip, 8192);
+        assert_eq!(key0, paged_pm4_tape_key(&slot0, &skip, 8192));
+        assert_eq!(key0.ctx_bucket, 256);
+        // Conv state and the logit row are recorded per slot index.
+        assert_ne!(key0, paged_pm4_tape_key(&slot1, &skip, 8192));
+        assert_ne!(key0, paged_pm4_tape_key(&both, &skip, 8192));
+        assert_ne!(key0, paged_pm4_tape_key(&slot0, &[true, false], 8192));
+
+        let mut crossed = slot0.clone();
+        crossed.positions = vec![256];
+        let crossed_key = paged_pm4_tape_key(&crossed, &skip, 8192);
+        assert_eq!(crossed_key.ctx_bucket, 512);
+        assert_ne!(key0, crossed_key);
+
+        let mut vision = slot0.clone();
+        vision.pos3 = vec![[9, 0, 0]];
+        assert_ne!(key0, paged_pm4_tape_key(&vision, &skip, 8192));
     }
 
     #[test]

@@ -578,7 +578,16 @@ impl ModelRig {
                     );
                 }
                 for pref in &moe_prefills {
-                    self.forward_paged_batch(gpu, pref, pool, graph, lm_head_skip, false, false)?;
+                    self.forward_paged_batch(
+                        gpu,
+                        pref,
+                        pool,
+                        graph,
+                        lm_head_skip,
+                        false,
+                        false,
+                        prefill_slots,
+                    )?;
                 }
                 if rest.is_empty() {
                     return Ok(());
@@ -591,6 +600,7 @@ impl ModelRig {
                     lm_head_skip,
                     any_verify,
                     any_dflash_rows,
+                    prefill_slots,
                 );
             }
         }
@@ -602,6 +612,7 @@ impl ModelRig {
             lm_head_skip,
             any_verify,
             any_dflash_rows,
+            prefill_slots,
         )
     }
 
@@ -614,6 +625,7 @@ impl ModelRig {
         lm_head_skip: &[bool],
         any_verify: bool,
         any_dflash_rows: bool,
+        prefill_slots: &[bool],
     ) -> rdna_compute::HipResult<()> {
         let mut capture = (any_verify || any_dflash_rows).then(|| {
             let tape = self
@@ -651,6 +663,7 @@ impl ModelRig {
             self.spec_rows,
             lm_head_skip,
             capture.as_mut(),
+            paged_decode_redline_ok(batch, prefill_slots),
         )
     }
 
@@ -3776,6 +3789,19 @@ fn slots_model_arch(arch_id: u32) -> &'static str {
 /// or an automatic `.mq4r` / gfx1201 dense default left the controller on
 /// HIP. MoE is not an automatic gfx1201 default (`qwen3_5` only); a
 /// `.mq4r` A3B still follows the extension predicate, matching sequential.
+///
+/// **MoE (arch 6) is admitted.** The slots body is the per-slot descriptor
+/// path, not the sequential dense tape, so it needed its own receipt: on
+/// gfx1100 `nex-n2.5-mini.mq4r` (qwen3_5_moe, 40 layers, 256 experts top-8,
+/// q8 paged VMM) a 320-token greedy decode is byte-identical to eager HIP
+/// (`329482bef799`, `prepared=2`, no fallback, no fault) at 125.5 vs 94.4
+/// tok/s. Three fixes got there, each one making the retained body compute
+/// what the eager body computes instead of a near-equivalent: the per-step
+/// upload path and `max_ctx_len` bound are shared, the one-row MQ4V2 MoE
+/// projections take the GEMV rather than zero+GEMM (the
+/// `effect-incomplete capture` refusals were 120 host memsets per step), and
+/// the gfx1100 `ldsstage` residual/gate_up kernels are admitted under
+/// recording (their `replay.rs` kernarg contracts already existed).
 fn configure_slots_redline(
     gpu: &mut Gpu,
     arch_id: u32,
@@ -3802,6 +3828,22 @@ fn configure_slots_redline(
             gpu.replay.transport_name()
         );
     }
+}
+
+/// Retained PM4 is a continuation tape. Any live prefill row, including a
+/// one-token prompt tail, stays on eager HIP.
+fn paged_decode_redline_ok(batch: &SlotBatch, prefill_slots: &[bool]) -> bool {
+    let mut live = false;
+    for (slot, &rows) in batch.m_per_slot.iter().enumerate() {
+        if rows == 0 {
+            continue;
+        }
+        live = true;
+        if prefill_slots.get(slot).copied().unwrap_or(false) {
+            return false;
+        }
+    }
+    live
 }
 
 /// Pull isolated prefilling slots out of a mixed batch so each runs as its
@@ -9010,6 +9052,47 @@ mod tests {
     }
 
     #[test]
+    fn slots_redline_default_admits_moe_like_sequential() {
+        // The slots body takes the same automatic default as the sequential
+        // loader, MoE included: the parity receipt is a 320-token
+        // byte-identical gfx1100 qwen3_5_moe decode (see
+        // `configure_slots_redline`).
+        assert_eq!(slots_model_arch(6), "qwen3_5_moe");
+        let path = std::path::Path::new("model.mq4r");
+        for arch in ["qwen3_5", slots_model_arch(6)] {
+            assert!(hipfire_runtime::config::retained_redline_default(
+                "gfx1100",
+                arch,
+                path.to_str().unwrap(),
+                1,
+                1,
+                1,
+                false
+            ));
+        }
+        // Still fail-closed where the shared predicate withholds it: a
+        // non-`.mq4r` file, or expert parallelism.
+        assert!(!hipfire_runtime::config::retained_redline_default(
+            "gfx1100",
+            "qwen3_5_moe",
+            "model.hfq",
+            1,
+            1,
+            1,
+            false
+        ));
+        assert!(!hipfire_runtime::config::retained_redline_default(
+            "gfx1100",
+            "qwen3_5_moe",
+            "model.mq4r",
+            1,
+            1,
+            2,
+            false
+        ));
+    }
+
+    #[test]
     fn split_isolated_prefill_keeps_other_slots_and_side_arrays() {
         let batch = SlotBatch {
             m_per_slot: vec![2, 1, 3],
@@ -9033,6 +9116,41 @@ mod tests {
         assert_eq!(rest.positions, vec![7]);
         assert_eq!(rest.pos3, vec![[7; 3]]);
         assert_eq!(rest.ext_emb, vec![0]);
+    }
+
+    #[test]
+    fn paged_decode_redline_ok_rejects_a_live_prefill_row() {
+        let mixed = SlotBatch {
+            m_per_slot: vec![1, 1],
+            tokens: vec![1, 2],
+            positions: vec![4, 4],
+            row_slot: vec![0, 1],
+            ..SlotBatch::default()
+        };
+        assert!(paged_decode_redline_ok(&mixed, &[false, false]));
+        assert!(!paged_decode_redline_ok(&mixed, &[true, false]));
+        assert!(!paged_decode_redline_ok(&mixed, &[false, true]));
+
+        // A prefill flag on an idle slot does not block the live decode slot.
+        let decode = SlotBatch {
+            m_per_slot: vec![0, 1],
+            tokens: vec![2],
+            positions: vec![4],
+            row_slot: vec![1],
+            ..SlotBatch::default()
+        };
+        assert!(paged_decode_redline_ok(&decode, &[true, false]));
+
+        // One-token prompt tail: shape matches decode, admission does not.
+        let tail = SlotBatch {
+            m_per_slot: vec![1],
+            tokens: vec![9],
+            positions: vec![1024],
+            row_slot: vec![0],
+            ..SlotBatch::default()
+        };
+        assert!(!paged_decode_redline_ok(&tail, &[true]));
+        assert!(!paged_decode_redline_ok(&SlotBatch::default(), &[false]));
     }
 
     #[test]

@@ -681,4 +681,100 @@ snapshot unit tests, and all five VMM smoke examples pass.
 - Unit coverage: `split_isolated_prefill`, `lockstep_decode_pos`,
   `slots_model_arch`, and the `_vmm_paged` recorder contracts
   (`expected_kernarg_bytes` / `pointer_effects` for write, LDS attend, and
-  tile). Hardware PM4/MoE serve receipts are still pending.
+  tile). A one-token prefill stays eager (`paged_decode_redline_ok`).
+  The PM4 tape key is the context bucket plus the live-slot pattern,
+  because conv state and per-slot logit rows are recorded pointers.
+  Hardware PM4/MoE serve receipts landed on 2026-10-26 — see the section
+  below, which also lifts the lockstep-position restriction.
+
+### Phase 6 — first MoE hardware attempt (gfx1100, nex-n2.5-mini)
+
+Probe: `nex-n2.5-mini.mq4r` (arch 6 `qwen3_5_moe`, 40 layers = 30 linear +
+10 full attention, 256 experts top-8, GQA 16/2, head_dim 256, 262144 ctx),
+paged VMM backend, q8, one slot, `serve.multi_slot_ctx=8192`, spec off.
+
+- **Load and pool are healthy.** `paged KV auto pool (vmm): free=5970591744 B
+  usable=5433720832 B granule=2097152 B pages/granule=30 physical=125829120 B
+  -> 64 pages`, `VA-only at load`. One 128-token page is 1,392,640 B across the
+  ten K/V arenas, so 30 pages pack a 2 MiB granule and a granule group is
+  40 MiB / 1,920 tokens. The five VMM smokes pass, including the WMMA prefill
+  `_vmm_paged` parity leg.
+- **The tape audit was the first blocker, and it is now understood.** The
+  decode window carried 1 `hipMemcpyDtoD` (the per-slot last-row copy in
+  `final_logits_per_slot`, since replaced by a zero-copy view) and 120
+  `hipMemset`s (three `gemm_mq4g256v2` Y-zeroing sites per layer x 40 layers).
+  Capture refuses that with `effect-incomplete capture`, which is correct: a
+  memset inside the body is state the tape cannot replay.
+- **Issuing the zero as a recorded kernel is the wrong fix.** With the zero
+  routed through `zero_f32` the body lowers cleanly (`1474 launches,
+  typed=1474 untyped=0`, 883 resources, stable `tape_hash`) and decode
+  measured 96.5 vs 86.0 tok/s eager. But it changes the body a recording runs
+  against the body an eager step runs, so the two stop being the same
+  computation: completing runs diverged from eager greedy text at a near-tie
+  (163-char prefix, then a different token), and one run stalled the PM4 queue
+  (`HIPFIRE_REDLINE_QUEUE_TIMEOUT read_index=184 write_index=185
+  last_packet_id=184`) and died with HIP 700. Reverted. Note the wait audit's
+  `resource_only` bucket is *not* the problem: `RecordedResourceAccess::
+  conflicts` keys on the HIP allocation base and already covers write-after-
+  write. Context bound (`8192` vs `1024`) and capture tile grid
+  (`HIPFIRE_REPLAY_STABLE_TILING=1`) both measured numerically inert.
+- **The fix that removes the zero instead of moving it: one row takes the
+  GEMV.** `gemm_mq4g256v2` is "plain GEMM" implemented as zero-then-residual,
+  and the decode body reached it at one row for the three MoE shared/router
+  projections (`m`=2048/256/1), three times per layer, 120 memsets per step.
+  `layer_ops::project_rotated` already keeps the MQ4V2 GEMV at one row for
+  exactly this reason; the slots MoE body bypassed it through the arch crate's
+  own `KernelKey::GemmMq4G256V2` mapping. Applying the same rule inside
+  `gemm_mq4g256v2` (so no key-routed caller can bypass it) removes the memset
+  from *both* bodies at once — no recording-only selection, so eager and
+  replayed steps agree by construction.
+  Measured on gfx1100/nex-n2.5-mini: capture now prepares
+  (`prepared=2`, no refusal, no fallback), decode **111.3 tok/s retained vs
+  92.8 eager** (eager itself 85.8 -> 92.8 from the GEMV). The tape is the
+  same computation as the eager step now, but the 320-token greedy text still
+  parted at a 146-char prefix in the one clean pair measured, so parity is not
+  yet established and the MoE default stays withheld.
+- **Parity closed (gfx1100, nex-n2.5-mini, q8, paged VMM).** Three defects
+  each made the retained body a *different computation* than the eager body
+  rather than a fault in the tape. All three are fixed:
+  1. **Two upload paths, two bounds.** The eager branch let the body upload
+     inline with `max_ctx_len = physical cap` while the retained path used
+     `upload_step_inputs` with the bucketed bound. A paged step now takes the
+     same uploads and the same bound on both paths.
+  2. **120 host memsets per step.** The MoE shared/router projections
+     (`m`=2048/256/1) ran `gemm_mq4g256v2`, which is zero-then-residual, at one
+     row. One row takes the MQ4V2 GEMV and 2..`FEW_ROW_ROUTE_ROWS` rows take
+     the bitwise-identical few-row GEMV, both of which write Y outright, so the
+     zeroing is gone at every decode width. (The fixed constant is used, not
+     `few_row_limit()`, which widens for eager routes and would re-open the
+     divergence.)
+  3. **gfx1100 `ldsstage` excluded from recording.** The residual and gate_up
+     tiers were gated on `!replay.is_recording()` even though both symbols
+     already carried `replay.rs` kernarg contracts. Located with
+     `HIPFIRE_LAUNCH_DUMP`: launch 2229 was `..._ldsstage` block 256 eagerly
+     and base block 32 under recording. `ksplit_lds`, which has no contract,
+     still keeps the base kernel.
+  Receipt: 320-token greedy decode, one 1-slot lane, bucket 256 -> 512 rearm,
+  byte-identical to `HIPFIRE_REPLAY_BACKEND=hip` (`329482bef799`), 125.5 vs
+  94.4 tok/s. The automatic `.mq4r` default now arms MoE (no env knobs) and
+  renders the same bytes.
+- **Lockstep lifted.** The slots body keeps every row's absolute position in
+  the uploaded `positions[]` buffer and synthesizes no position kernarg
+  binding, so one prepared tape serves any composition of single-token rows
+  inside its bucket. `paged_decode_pos` therefore requires single-token rows
+  and, only when `ReplayController::has_position_bindings()` is true, equal
+  positions. Two concurrent lanes at deliberately different prompt lengths are
+  byte-identical to HP on both lanes with `prepared=3` (a 1-live-slot tape and
+  a 2-live-slot tape, 1417 launches, `live_slots=2`), 182.5 vs 157.1
+  aggregate tok/s.
+- **Superseded:** the MoE default is armed again (above). `configure_slots_redline` had withheld the automatic default for
+  arch 6, so unset/`auto` render byte-identical to `HIPFIRE_REPLAY_BACKEND=hip`
+  (measured). The route needs `HIPFIRE_REPLAY_BACKEND=redline` **and**
+  `HIPFIRE_REPLAY_TRANSPORT=pm4`; with the memsets gone that now prepares and
+  restores rather than refusing, so the remaining gate is the parity
+  measurement, not admission.
+- **Measurement hygiene on this host:** the model is 17.4 GB and the host has
+  26 GB RAM with no swap, so back-to-back arms can get the loader SIGKILLed
+  (`daemon closed its output (status unknown)`, no daemon output at all).
+  Space arms out and confirm `free -g` before attributing a load death to the
+  route.

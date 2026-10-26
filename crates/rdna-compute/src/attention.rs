@@ -638,6 +638,21 @@ const Q8_DECODE_GQA_REDUCE_MAX_TILES: usize = 7680;
 /// [`DecodeGqaPair`] routes): its workgroups loop over tiles y, y + cap, ...
 const Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP: usize = 512;
 
+/// `HIPFIRE_REPLAY_STABLE_TILING=1` forces the eager route onto the same
+/// `max_tiles` superset grid a retained recording (or hipGraph capture) uses.
+/// Diagnostic A/B only: it exists to answer "does the capture grid change the
+/// result?" without a tape, and to give a tester an eager control that runs
+/// the retained geometry. Default off.
+fn replay_stable_tiling_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_REPLAY_STABLE_TILING")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| matches!(v, "1" | "on" | "true"))
+    })
+}
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
@@ -645,7 +660,7 @@ fn replay_stable_tile_count(
     graph_capture: bool,
     redline_recording: bool,
 ) -> usize {
-    if graph_capture || redline_recording {
+    if graph_capture || redline_recording || replay_stable_tiling_forced() {
         max_tiles
     } else {
         actual_tiles

@@ -3997,6 +3997,34 @@ impl Gpu {
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.
+    /// `HIPFIRE_LAUNCH_DUMP=N` prints the first `N` launch names, in order,
+    /// from this funnel. Developer diagnostic only: the eager body and the
+    /// retained recorder both pass here, so two dumps of the same step diff
+    /// into the exact launch where a retained route diverges from eager.
+    /// Unset prints nothing.
+    fn launch_dump_budget() -> usize {
+        static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_LAUNCH_DUMP")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    fn launch_dump_note(func_name: &str, grid: [u32; 3], block: [u32; 3]) {
+        let budget = Self::launch_dump_budget();
+        if budget == 0 {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        let index = SEEN.fetch_add(1, Ordering::Relaxed);
+        if index < budget {
+            eprintln!("[launch-dump] {index} {func_name} grid={grid:?} block={block:?}");
+        }
+    }
+
     pub(crate) fn launch_maybe_blob(
         &mut self,
         func_name: &str,
@@ -4094,6 +4122,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        Self::launch_dump_note(func_name, grid, block);
         self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
