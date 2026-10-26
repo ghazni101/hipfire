@@ -83,6 +83,10 @@ __device__ __forceinline__ float hipfire_gdn_read_lane0(float value) {
 }
 #endif
 
+#if defined(HIPFIRE_GDN_SLOTS_BYVAL) && !defined(HIPFIRE_GDN_LAYER_TABLE)
+#define HIPFIRE_GDN_LAYER_TABLE 1
+#define HIPFIRE_GDN_SLOTS_BYVAL_ENTRY 1
+#endif
 #if defined(HIPFIRE_GDN_LAYER_TABLE)
 // Railgun E0 / L6c multi-layer replay: one launch advances the recurrence of
 // every LinearAttention layer. grid.z selects a layer row of this pointer
@@ -90,6 +94,13 @@ __device__ __forceinline__ float hipfire_gdn_read_lane0(float value) {
 // crates/rdna-compute/src/dflash_gdn_replay.rs); the per-block body below is
 // the single-lane (lane = 0) body unchanged. Layer z gets the frame the
 // per-layer launch sequence would have reserved for it: frame + z * n_tokens.
+//
+// HIPFIRE_GDN_SLOTS_BYVAL_ENTRY: lane 0 reuses the scalar
+// gated_delta_net_q8_fast prefix (nt @64, frame @76); lanes 1..3 are nine
+// explicit pointer args each after that prefix so gfx11 PM4 Resource wait
+// sees every live slot. Four slots are 312 B: the compiler s_loads the
+// 56 B past the 256 B gfx11 preload. A by-value GdnLayerTable blob hid
+// later lanes from alias analysis and raced gated_norm on gfx1100.
 struct GdnLayerTable {
     const float* q;
     const float* k;
@@ -110,6 +121,65 @@ struct GdnLayerTable {
 #endif
 };
 
+#if defined(HIPFIRE_GDN_SLOTS_BYVAL_ENTRY)
+// gfx11 preloads the first 256 B of kernarg. Keep the scalar
+// gated_delta_net_q8_fast prefix (nt @64, frame @76, 96 B with pointer
+// alignment) so retained PM4 can patch the requant frame. Lane 0 is those
+// prefix pointers — HIP Resource wait sees them. Lanes 1..3 are nine
+// explicit pointer args each (72 B): 96 + 3*72 = 312 B. The compiler
+// s_loads the 56 B past the 256 B preload. A by-value GdnLayerTable blob
+// hid later lanes from alias analysis and raced gated_norm on gfx1100.
+extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
+__global__ void HIPFIRE_GDN_KERNEL(
+    const float* __restrict__ slot0_q,
+    const float* __restrict__ slot0_k,
+    const float* __restrict__ slot0_v,
+    const float* __restrict__ slot0_gate,
+    const float* __restrict__ slot0_beta,
+    signed char* __restrict__ slot0_s,
+    float* __restrict__ slot0_sc,
+    float* __restrict__ slot0_out,
+    int n_tokens,
+    int n_heads,
+    int head_dim,
+    unsigned int frame_base,
+    __half* __restrict__ slot0_ef,
+    int qk_ratio_unused,
+    const float* __restrict__ slot1_q,
+    const float* __restrict__ slot1_k,
+    const float* __restrict__ slot1_v,
+    const float* __restrict__ slot1_gate,
+    const float* __restrict__ slot1_beta,
+    signed char* __restrict__ slot1_s,
+    float* __restrict__ slot1_sc,
+    float* __restrict__ slot1_out,
+    __half* __restrict__ slot1_ef,
+    const float* __restrict__ slot2_q,
+    const float* __restrict__ slot2_k,
+    const float* __restrict__ slot2_v,
+    const float* __restrict__ slot2_gate,
+    const float* __restrict__ slot2_beta,
+    signed char* __restrict__ slot2_s,
+    float* __restrict__ slot2_sc,
+    float* __restrict__ slot2_out,
+    __half* __restrict__ slot2_ef,
+    const float* __restrict__ slot3_q,
+    const float* __restrict__ slot3_k,
+    const float* __restrict__ slot3_v,
+    const float* __restrict__ slot3_gate,
+    const float* __restrict__ slot3_beta,
+    signed char* __restrict__ slot3_s,
+    float* __restrict__ slot3_sc,
+    float* __restrict__ slot3_out,
+    __half* __restrict__ slot3_ef
+) {
+    (void)qk_ratio_unused;
+    const GdnLayerTable gdn_layer =
+        blockIdx.z == 3 ? GdnLayerTable{slot3_q, slot3_k, slot3_v, slot3_gate, slot3_beta, slot3_s, slot3_sc, slot3_out, slot3_ef} :
+        blockIdx.z == 2 ? GdnLayerTable{slot2_q, slot2_k, slot2_v, slot2_gate, slot2_beta, slot2_s, slot2_sc, slot2_out, slot2_ef} :
+        blockIdx.z != 0 ? GdnLayerTable{slot1_q, slot1_k, slot1_v, slot1_gate, slot1_beta, slot1_s, slot1_sc, slot1_out, slot1_ef} :
+                          GdnLayerTable{slot0_q, slot0_k, slot0_v, slot0_gate, slot0_beta, slot0_s, slot0_sc, slot0_out, slot0_ef};
+#else
 extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
 __global__ void HIPFIRE_GDN_KERNEL(
     const GdnLayerTable* __restrict__ gdn_layers,
@@ -119,6 +189,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
     unsigned int frame_base
 ) {
     const GdnLayerTable gdn_layer = gdn_layers[blockIdx.z];
+#endif
     const float* __restrict__ q = gdn_layer.q;
     const float* __restrict__ k = gdn_layer.k;
     const float* __restrict__ v = gdn_layer.v;

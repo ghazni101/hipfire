@@ -40299,6 +40299,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Decode-width rows: the WMMA tile is 16 and `ensure_fp16_x` launches
+        // `convert_f32_to_f16`. A 4-slot retained tape was paying that convert
+        // plus an empty 12-row tile every MoE layer. The x-batch GEMV reads
+        // each weight row once for up to four activations and writes Y
+        // outright, matching the slots QKV path.
+        if (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+            && k.is_multiple_of(256)
+        {
+            if batch_size == 1 {
+                let x1 = x.sub_offset(0, k);
+                let g1 = y_gate.sub_offset(0, gate_m);
+                let u1 = y_up.sub_offset(0, up_m);
+                self.gemv_mq4g256v2(a_gate, &x1, &g1, gate_m, k)?;
+                return self.gemv_mq4g256v2(a_up, &x1, &u1, up_m, k);
+            }
+            self.gemv_mq4g256v2_xbatch(a_gate, x, y_gate, gate_m, k, batch_size)?;
+            return self.gemv_mq4g256v2_xbatch(a_up, x, y_up, up_m, k, batch_size);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -40324,6 +40342,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if batch_size == 1 && k.is_multiple_of(256) {
+            // One row stays on the arch residual GEMV, including the gfx1100
+            // M=2048 K=4096 noscratch kernel. The 4-wide x-batch body keeps
+            // four accumulator sets at B=1 and misses that specialization.
+            let x1 = x.sub_offset(0, k);
+            let y1 = y.sub_offset(0, m);
+            return self.gemv_hfq4g256_residual_mq4v2(a_raw, &x1, &y1, m, k);
+        }
+        if (2..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+            && k.is_multiple_of(256)
+        {
+            // Several decode rows: one weight pass per four activations.
+            // Both write Y in place, so a retained tape has no host memset.
+            return self.gemv_mq4g256v2_xbatch_residual(a_raw, x, y, m, k, batch_size);
+        }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
         }
@@ -40365,18 +40398,14 @@ impl Gpu {
             return self.gemv_mq4g256v2(a_raw, x, y, m, k);
         }
         if batch_size <= crate::prefill_invariant::FEW_ROW_ROUTE_ROWS {
-            // Few-row rows are per-row GEMV arithmetic too (the rows_x4 kernel
-            // is bitwise the singleton `gemv_mq4g256v2` on each row), and it
-            // writes Y outright. Same reason as the one-row arm: the plain
-            // GEMM below zeroes Y with a host memset, which a retained tape
-            // cannot replay — a 2-slot MoE decode step refused to capture on
-            // exactly this. The bound is the fixed constant, not
-            // `few_row_limit()`, because that one widens for eager routes and
-            // a shape between the two limits would take different kernels
-            // recording vs eager.
-            let part = (a_raw, y, m);
-            let none = (a_raw, y, 0usize);
-            return self.gemv_mq4g256v2_rows_x4([part, none, none, none], x, k, batch_size);
+            // Few-row rows are per-row GEMV arithmetic too, and they write Y
+            // outright. Same reason as the one-row arm: the plain GEMM below
+            // zeroes Y with a host memset, which a retained tape cannot replay.
+            // gfx1100 has no rows_x4 PM image, so that helper fell through to
+            // one singleton GEMV per row (four weight passes). The x-batch
+            // GEMV is the same accumulator with each weight row decoded once
+            // for up to four activations — the slots QKV path already uses it.
+            return self.gemv_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size);
         }
         if self.arch_caps.has_wmma() {
             // Plain GEMM semantics: Y = W·X . The V2 WMMA kernels are
@@ -40677,6 +40706,100 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
+    }
+
+    /// Residual `Y += W·X` sibling of [`Self::gemv_mq4g256v2_xbatch`].
+    /// Same per-row accumulation as the singleton GEMV, weights read once
+    /// per chunk of four rows, and Y is updated in place so a retained tape
+    /// does not need a host memset.
+    pub fn gemv_mq4g256v2_xbatch_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
+    }
+
+    /// Shared-expert down fuse: `y[b] += sigmoid(c[b]) * (W · x[b])`.
+    /// Weights are decoded once per chunk of four rows. `c` is `[batch]`
+    /// pre-sigmoid logits. A single decode row on gfx1100/gfx1201 with the
+    /// K=512 shared-down shape keeps the specialized k512 singleton.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq4g256v2_xbatch_residual_sigmoid(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        c: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "gemv_mq4g256v2_xbatch_residual_sigmoid";
+        const XBATCH_MAX: usize = 4;
+        if batch_size == 0 {
+            return Ok(());
+        }
+        if !k.is_multiple_of(256) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4g256v2_xbatch_residual_sigmoid: requires K%256==0",
+            ));
+        }
+        if batch_size == 1
+            && m == 2_048
+            && k == 512
+            && (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201())
+        {
+            let x1 = x.sub_offset(0, k);
+            let y1 = y.sub_offset(0, m);
+            let c1 = c.sub_offset(0, 1);
+            return self.gemv_mq4g256v2_residual_sigmoid_scaled_k512(a_raw, &x1, &y1, &c1, m, k);
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC,
+            FUNC,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        for start in (0..batch_size).step_by(XBATCH_MAX) {
+            let rows = XBATCH_MAX.min(batch_size - start);
+            let x_rows = x.sub_offset(start * k, rows * k);
+            let y_rows = y.sub_offset(start * m, rows * m);
+            let c_rows = c.sub_offset(start, rows);
+            let x_ptr = x_rows.buf.as_ptr();
+            let y_ptr = y_rows.buf.as_ptr();
+            let c_ptr = c_rows.buf.as_ptr();
+            let b_val = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &c_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &b_val as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_ptr(c_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            })?;
+        }
+        Ok(())
     }
 
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight

@@ -2714,6 +2714,14 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
 );
+/// Shared-expert down fuse: `y[b] += sigmoid(c[b]) * (A . x[b])`. Same
+/// weight-once x-batch body as [`GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC`].
+pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_SIGMOID_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch_residual_sigmoid\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2_xbatch.hip")
+);
 
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
@@ -3620,6 +3628,18 @@ pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_MQ4V2_NINEPATH_RPB 8\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip")
 );
+
+/// Multi-slot gfx1100 gate/up: one wave per (token, row, krank). The token
+/// is folded into grid.x. Same FMA order as
+/// [`GEMV_MQ4G256V2_MOE_GATE_UP_K8_INDEXED_K2048_NOLDS_GFX1100_SRC`].
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_K8_SLOTS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100.hip");
+
+/// Multi-slot gfx1100 ninepath (RPB=8). One tile per token, token folded
+/// into grid.x. Same pairwise slots and krank-ordered fold as
+/// [`GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC`].
+pub const GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_SLOTS_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100.hip");
 
 /// MQ6G256V2 (qt=47) sister of [`GEMV_MQ4G256V2_MOE_NINEPATH_D4_SRC`].
 /// Identical staging / warp-per-krank / LDS fold; only the 200 B dual-half
@@ -9291,6 +9311,18 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 /// ds_bpermute form.
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
+/// Multi-slot decode sibling of [`GATED_DELTA_NET_Q8_FAST_SRC`]: one launch
+/// advances up to four live slots. The scalar prefix (nt @64, frame @76) is
+/// kept so retained PM4 can patch the requant frame; lanes 1..3 are nine
+/// explicit pointer args each after that prefix so Resource wait sees every
+/// slot (312 B total; gfx11 s_loads the 56 B past the 256 B preload).
+pub const GATED_DELTA_NET_Q8_FAST_SLOTS_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    "#define HIPFIRE_GDN_SLOTS_BYVAL 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_slots\n",
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 

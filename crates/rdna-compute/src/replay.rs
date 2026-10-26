@@ -931,6 +931,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             // only changes the recorded kernarg length (64 B padded).
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -945,6 +946,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         // expert_ptrs, topk_indices, topk_weights, act (read); out is RMW.
@@ -1003,6 +1005,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
+            | "gemv_mq4g256v2_xbatch"
+            | "gemv_mq4g256v2_xbatch_residual"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
             | "gemv_mq4g256v2_multirow_r2"
@@ -1079,7 +1083,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
+        || kernel == "moe_router_softmax_topk_k8_wave"
     {
+        // wave: logits read, topk idx/weights write. 3 pointers + 2 i32 = 32 B.
+        // Logits are not stored (the fused softmax stays in registers).
         return Some(vec![read(0), write(8), write(16)]);
     }
     if kernel.starts_with("gated_delta_net_q8_compact") {
@@ -1095,6 +1102,35 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]);
     }
+    if kernel == "gated_delta_net_q8_fast_slots" {
+        // Scalar prefix (same as gated_delta_net_q8_fast, lane 0) plus nine
+        // explicit pointers per extra lane at 96 / 168 / 240. Null pointers
+        // are skipped later.
+        let mut effects = vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+            write(56),
+            write(80),
+        ];
+        for lane in 1..4 {
+            let base = 96 + (lane - 1) * 72;
+            effects.push(read(base));
+            effects.push(read(base + 8));
+            effects.push(read(base + 16));
+            effects.push(read(base + 24));
+            effects.push(read(base + 32));
+            effects.push(write(base + 40));
+            effects.push(write(base + 48));
+            effects.push(write(base + 56));
+            effects.push(write(base + 64));
+        }
+        return Some(effects);
+    }
     if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
         return Some(vec![
             read(0),
@@ -1109,6 +1145,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(72),
             read(80),
         ]);
+    }
+    if kernel == "conv1d_silu_split_f32_lanes" {
+        // q/k/v writes, input and weight reads, then 16 conv-ring pointers
+        // inlined at offset 40. Unused lanes are null and skipped. Without
+        // a per-lane effect the by-value table hides those rings from
+        // Resource wait and the next GDN launch races them on gfx1100.
+        let mut effects = vec![write(0), write(8), write(16), read(24), read(32)];
+        for lane in 0..16 {
+            effects.push(write(40 + lane * 8));
+        }
+        return Some(effects);
     }
     if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
         return Some(vec![
@@ -1409,7 +1456,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
-        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512" => {
+        | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_xbatch_residual_sigmoid" => {
             Some(vec![read(0), read(8), write(16), read(24)])
         }
         "gemv_hfq4g256_moe_gate_up_k8_indexed"
@@ -1774,6 +1822,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
             | "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
+            | "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
     ) {
         return Some(64);
@@ -1789,6 +1838,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed_batched"
+            | "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"
             | "gemm_mq4g256v2_moe_grouped_wmma_k2"
             | "gemm_mq4g256v2_moe_grouped_wmma_gfx12"
             | "gemm_mq6g256v2_moe_grouped_wmma_k2"
@@ -1887,6 +1937,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel == "moe_router_softmax_topk_k8_wave64"
         || kernel == "moe_router_softmax_topk_k8_wave64_exact"
+        || kernel == "moe_router_softmax_topk_k8_wave"
     {
         return Some(32);
     }
@@ -1942,6 +1993,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
+        | "gemv_mq4g256v2_xbatch_residual_sigmoid"
         | "hc_mix_4stream"
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
@@ -1950,6 +2002,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_partial_halfsplit_f32"
         | "rope_partial_halfsplit_f32_headgrid"
         | "conv1d_gated_decode_f32" => Some(48),
+        "conv1d_silu_split_f32_lanes" => Some(304),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
         | "gated_norm_mq_rotate_k6144_gfx1100"
@@ -2013,6 +2066,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_mq4g256v2"
         | "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gated_delta_net_q8_fast_slots" => Some(96 + 3 * 9 * 8),
         "gated_delta_net_f32" => Some(80),
         _ => None,
     }
@@ -4214,7 +4268,9 @@ struct SnapshotEntry {
 }
 
 pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
-    kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
+    kernel == "gated_delta_net_q8_fast"
+        || kernel == "gated_delta_net_q8_fast_slots"
+        || kernel.starts_with("gated_delta_net_q8_compact")
 }
 
 /// Fail-closed gate for the PM4/AQL lowering, which turns a recorded HIP
@@ -5958,6 +6014,7 @@ impl ReplayController {
                 .with_dynamic_group_bytes(launch.shared_mem)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel == "gated_delta_net_q8_fast_slots"
                 || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
@@ -10003,6 +10060,7 @@ mod tests {
             "gemv_mq4g256v2_moe_gate_up_k8_indexed",
             "gemv_mq6g256v2_moe_gate_up_k8_indexed",
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
+            "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(64));
             let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");
@@ -10069,6 +10127,7 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
+            "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
             assert_eq!(expected_kernarg_bytes(symbol), Some(64));
@@ -10408,6 +10467,45 @@ mod tests {
         assert_ne!(symbol, "gemv_mq4g256v2_residual");
         assert!(pointer_effects("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
         assert!(expected_kernarg_bytes("gemv_mq4g256v2_residual_sigmoid_scaled").is_none());
+    }
+
+    #[test]
+    fn mq4g256v2_xbatch_residual_sigmoid_keeps_4ptr_abi() {
+        let symbol = "gemv_mq4g256v2_xbatch_residual_sigmoid";
+        let want = [read(0), read(8), write(16), read(24)];
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 44, "{symbol} explicit args occupy 44 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
+        assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
+        let got = pointer_effects(symbol).expect("xbatch sigmoid residual pointer contract");
+        assert_eq!(got.len(), want.len());
+        for (got_effect, want_effect) in got.iter().zip(want.iter()) {
+            assert_eq!(got_effect.offset, want_effect.offset);
+            assert_eq!(got_effect.mode, want_effect.mode);
+        }
+    }
+
+    #[test]
+    fn gated_delta_net_q8_fast_slots_tracks_four_lanes() {
+        let symbol = "gated_delta_net_q8_fast_slots";
+        assert_eq!(expected_kernarg_bytes(symbol), Some(96 + 3 * 9 * 8));
+        let got = pointer_effects(symbol).expect("gdn slots pointer contract");
+        // Lane 0 prefix (9 effects, ef @80) plus 3 extra lanes * 9 pointers.
+        assert_eq!(got.len(), 9 + 3 * 9);
+        assert_eq!(got[8].offset, 80);
+        assert_eq!(got[9].offset, 96);
+        assert_eq!(got[17].offset, 160);
+        assert_eq!(got[18].offset, 168);
+        assert_eq!(got[26].offset, 232);
+        assert_eq!(got[27].offset, 240);
+        assert_eq!(got[35].offset, 304);
     }
 
     #[test]
@@ -12194,7 +12292,9 @@ mod tests {
         assert!(metadata_kernarg_size >= 80);
         let bindings: Vec<(usize, ReplayKernargBinding)> = vec![];
         let is_gdn =
-            kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact");
+            kernel == "gated_delta_net_q8_fast"
+        || kernel == "gated_delta_net_q8_fast_slots"
+        || kernel.starts_with("gated_delta_net_q8_compact");
         assert!(is_gdn);
         let has_binding = bindings.iter().any(|(_, b)| {
             matches!(

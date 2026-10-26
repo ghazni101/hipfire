@@ -282,7 +282,8 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
     the slots body synthesizes no position kernarg binding, so one prepared
     tape covers any composition of single-token rows inside its context
     bucket. A prefill row stays eager, including a one-token chunk. The tape
-    rearms when the 256-token bucket changes or the live-slot pattern changes,
+    rearms when the context bucket changes (8192 tokens, capped by the slot
+    context) or the live-slot pattern changes,
     because `max_ctx_len`, conv state and per-slot logit rows are recorded.
     Multi-row MoE decode is admitted up to `FEW_ROW_ROUTE_ROWS` live rows.
     Still experimental, and not a production default.

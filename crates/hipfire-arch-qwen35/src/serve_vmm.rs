@@ -152,7 +152,7 @@ pub struct VmmSlotKv {
 /// Context-length bucket for the VMM decode graph: a capture bakes the
 /// attention context bound into kernargs, so it is reused until the real
 /// context crosses the next bucket (one capture per this many tokens).
-const VMM_DECODE_GRAPH_CTX_BUCKET: usize = 256;
+const VMM_DECODE_GRAPH_CTX_BUCKET: usize = 8192;
 
 /// Identity of a captured VMM decode graph. Any change invalidates it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
