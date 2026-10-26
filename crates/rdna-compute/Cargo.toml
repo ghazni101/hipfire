@@ -1153,3 +1153,7 @@ required-features = ["lab"]
 [[example]]
 name = "vmm_paged_pool_smoke"
 required-features = ["lab"]
+
+[[example]]
+name = "vmm_paged_reclaim_smoke"
+required-features = ["lab"]

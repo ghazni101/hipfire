@@ -34,6 +34,126 @@ pub struct VmmPageLayout {
     pub n_granules: usize,
 }
 
+/// Granule packing that does not depend on how many logical pages the pool
+/// owns. Auto-sizing uses this so the page count is bounded by committed
+/// physical bytes (one whole granule in every K and V arena), not by the
+/// slightly smaller logical page size. vLLM and SGLang size the block pool
+/// the same way: the allocator's byte cost is the physical block, padding
+/// included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmGranuleGeometry {
+    pub page_bytes: usize,
+    pub granule_bytes: usize,
+    pub pages_per_granule: u32,
+}
+
+impl VmmGranuleGeometry {
+    /// `requested_granule == 0` selects at least 2 MiB, aligned up to
+    /// `granularity`. A page larger than that granule gets its own
+    /// rounded-up granule. Several pages pack into one granule when they
+    /// fit; the unused tail is part of the descriptor contract.
+    pub fn plan(
+        granularity: usize,
+        page_tokens: usize,
+        per_pos_bytes: usize,
+        requested_granule: usize,
+    ) -> Result<Self, String> {
+        if granularity == 0 {
+            return Err("VmmPageMapper: VMM granularity is zero".into());
+        }
+        if page_tokens == 0 || per_pos_bytes == 0 {
+            return Err("VmmPageMapper: page geometry must be positive".into());
+        }
+        let page_bytes = page_tokens
+            .checked_mul(per_pos_bytes)
+            .ok_or_else(|| "VmmPageMapper: page bytes overflowed".to_string())?;
+        let requested = if requested_granule == 0 {
+            // One q8 page is ~136 KiB. A 4 KiB granule would map once per
+            // page; 2 MiB packs several pages and stays a multiple of the
+            // device granularity on gfx1100.
+            granularity.max(2 * 1024 * 1024)
+        } else {
+            requested_granule
+        };
+        if requested == 0 || !requested.is_multiple_of(granularity) {
+            return Err(format!(
+                "VmmPageMapper: granule {requested} is not a multiple of VMM granularity {granularity}"
+            ));
+        }
+        let page_granule = page_bytes.div_ceil(granularity) * granularity;
+        let granule_bytes = requested.max(page_granule);
+        let pages_per_granule = granule_bytes / page_bytes;
+        if pages_per_granule == 0 {
+            return Err(format!(
+                "VmmPageMapper: page {page_bytes} B does not fit granule {granule_bytes} B"
+            ));
+        }
+        if pages_per_granule > u32::MAX as usize {
+            return Err("VmmPageMapper: pages_per_granule exceeds u32".into());
+        }
+        Ok(Self {
+            page_bytes,
+            granule_bytes,
+            pages_per_granule: pages_per_granule as u32,
+        })
+    }
+
+    /// Physical bytes of one granule group: `granule_bytes` in every K arena
+    /// and every V arena.
+    pub fn group_bytes(&self, n_fa_layers: usize) -> Result<usize, String> {
+        if n_fa_layers == 0 {
+            return Err("VmmPageMapper: n_fa_layers must be positive".into());
+        }
+        let arenas = n_fa_layers
+            .checked_mul(2)
+            .ok_or_else(|| "VmmPageMapper: arena count overflowed".to_string())?;
+        self.granule_bytes
+            .checked_mul(arenas)
+            .ok_or_else(|| "VmmPageMapper: physical granule cost overflowed".to_string())
+    }
+
+    /// Logical pages whose granule groups fit in `usable_bytes`.
+    ///
+    /// A partially filled last granule still commits a whole group, so the
+    /// count is `groups * pages_per_granule` unless `cap_pages` cuts it.
+    /// Returns an error when even one group does not fit: handing back a
+    /// single page would OOM on the first map.
+    pub fn pages_fitting(
+        &self,
+        n_fa_layers: usize,
+        usable_bytes: usize,
+        cap_pages: usize,
+    ) -> Result<usize, String> {
+        if cap_pages == 0 {
+            return Err("VmmPageMapper: page cap is zero".into());
+        }
+        let group = self.group_bytes(n_fa_layers)?;
+        if group == 0 {
+            return Err("VmmPageMapper: granule group costs nothing".into());
+        }
+        let groups = usable_bytes / group;
+        if groups == 0 {
+            return Err(format!(
+                "VmmPageMapper: one granule group costs {group} B but only {usable_bytes} B are available"
+            ));
+        }
+        let packed = groups.saturating_mul(self.pages_per_granule as usize);
+        Ok(packed.min(cap_pages))
+    }
+
+    /// Physical bytes committed when all `n_pages` are resident. The last
+    /// partial granule rounds up to a full group.
+    pub fn physical_bytes(&self, n_fa_layers: usize, n_pages: usize) -> Result<usize, String> {
+        if n_pages == 0 {
+            return Err("VmmPageMapper: n_pages is zero".into());
+        }
+        let groups = n_pages.div_ceil(self.pages_per_granule as usize);
+        self.group_bytes(n_fa_layers)?
+            .checked_mul(groups)
+            .ok_or_else(|| "VmmPageMapper: physical pool size overflowed".to_string())
+    }
+}
+
 /// Kernel-visible owner tensors. The caller owns and frees these exactly
 /// once; the mapper holds only their base addresses and sizes.
 pub struct VmmPageArenas {
@@ -122,64 +242,22 @@ impl VmmPageMapper {
         if n_pages == 0 {
             return Err("VmmPageMapper: n_pages must be positive".into());
         }
-        if page_tokens == 0 || per_pos_bytes == 0 {
-            return Err("VmmPageMapper: page geometry must be positive".into());
-        }
         if n_pages > u32::MAX as usize {
             return Err("VmmPageMapper: n_pages exceeds the u32 page-id space".into());
         }
-        let page_bytes = page_tokens
-            .checked_mul(per_pos_bytes)
-            .ok_or_else(|| "VmmPageMapper: page bytes overflowed".to_string())?;
         let granularity = gpu
             .vmm_recommended_granularity()
             .map_err(|e| format!("VmmPageMapper: VMM granularity unavailable: {e}"))?;
-        let requested_granule = if granule_bytes == 0 {
-            // One page is ~136 KiB on q8; a 4 KiB mapping granule would cost
-            // one VMM map/unmap per page and, with current GpuPool behavior,
-            // one pool drain per map. Use at least 2 MiB so a granule packs
-            // multiple pages without wasting physical bytes (the descriptor
-            // carries the packing and its unused tail).
-            granularity.max(2 * 1024 * 1024)
-        } else {
-            granule_bytes
-        };
-        if requested_granule == 0 || !requested_granule.is_multiple_of(granularity) {
-            return Err(format!(
-                "VmmPageMapper: granule {requested_granule} is not a multiple of VMM granularity {granularity}"
-            ));
-        }
-        // A logical page is the unit of ownership, not a VMM granule: on this
-        // engine a q8 page is ~136 KiB while the device's recommended granule
-        // is 4 KiB. Reserve whole granules per page and never split a page
-        // across mappings. When the requested granule is large enough and
-        // divides evenly, pack several pages into it; otherwise one page per
-        // granule (the tail of a non-dividing granule is unused, as documented
-        // by the descriptor).
-        let page_granule = page_bytes.div_ceil(granularity) * granularity;
-        let granule_bytes = requested_granule.max(page_granule);
-        // `page_granule` is divisible by `page_bytes` only when the rounded
-        // value happens to divide; use floor packing otherwise. The unused
-        // tail is already part of the descriptor contract.
-        let pages_per_granule = granule_bytes / page_bytes;
-        if pages_per_granule == 0 {
-            return Err(format!(
-                "VmmPageMapper: page {page_bytes} B does not fit granule {granule_bytes} B"
-            ));
-        }
-        if pages_per_granule > u32::MAX as usize {
-            return Err("VmmPageMapper: pages_per_granule exceeds u32".into());
-        }
+        let geom =
+            VmmGranuleGeometry::plan(granularity, page_tokens, per_pos_bytes, granule_bytes)?;
+        let page_bytes = geom.page_bytes;
+        let granule_bytes = geom.granule_bytes;
+        let pages_per_granule = geom.pages_per_granule as usize;
         let n_granules = n_pages.div_ceil(pages_per_granule);
         let va_bytes = n_granules
             .checked_mul(granule_bytes)
             .ok_or_else(|| "VmmPageMapper: VA size overflowed".to_string())?;
-        let arena_count = n_fa_layers
-            .checked_mul(2)
-            .ok_or_else(|| "VmmPageMapper: arena count overflowed".to_string())?;
-        let granule_cost = granule_bytes
-            .checked_mul(arena_count)
-            .ok_or_else(|| "VmmPageMapper: physical granule cost overflowed".to_string())?;
+        let granule_cost = geom.group_bytes(n_fa_layers)?;
         if budget_bytes != 0 && granule_cost > budget_bytes {
             return Err(format!(
                 "VmmPageMapper: one granule group costs {granule_cost} B over the {budget_bytes} B budget"
@@ -329,9 +407,15 @@ impl VmmPageMapper {
     /// `states[phys]` is authoritative: every state except `Free` keeps the
     /// page's granule mapped (`ReclaimPending` may still have device reads).
     ///
-    /// Mapping/unmapping happens here, at a caller-controlled boundary, and
-    /// never inside a forward. On any mapping failure the previously mapped
-    /// granules from this call are rolled back.
+    /// Free granules are unmapped before any new granule is mapped. Doing it
+    /// the other way charges soon-to-be-freed physical memory against the
+    /// budget and can refuse a map that would have fit, the same failure
+    /// mode as freeing a block only after the next allocation in a paged
+    /// pool. On a mapping failure the granules mapped by this call are
+    /// rolled back. An unmap that cannot be undone poisons the mapper: the
+    /// bitmap must not claim a VA range is free while a segment is still
+    /// mapped, or the next `map_at` fails closed with "overlaps" and the
+    /// range is stuck.
     pub fn sync(&mut self, gpu: &mut Gpu, states: &[PageState]) -> Result<(), String> {
         if self.released {
             return Err("VmmPageMapper: sync after release".into());
@@ -360,96 +444,148 @@ impl VmmPageMapper {
             .checked_mul(arena_count)
             .ok_or_else(|| "VmmPageMapper: granule cost overflowed".to_string())?;
 
+        let needs_unmap = (0..self.layout.n_granules)
+            .any(|granule| self.mapped_granules[granule] && !used[granule]);
+        if needs_unmap {
+            // Paged kernels run on the default stream. Wait for that stream
+            // once, then unmap. `vmm_unmap_at` also device-synchronizes, so
+            // a kernel that was not on the default stream still cannot race
+            // the unmap.
+            gpu.hip
+                .stream_synchronize_default()
+                .map_err(|e| format!("VmmPageMapper: stream sync before unmap: {e}"))?;
+            for granule in 0..self.layout.n_granules {
+                if self.mapped_granules[granule] && !used[granule] {
+                    self.unmap_granule(gpu, granule, granule_cost)?;
+                }
+            }
+        }
+
         let mut newly_mapped = Vec::new();
         for granule in 0..self.layout.n_granules {
-            if used[granule] == self.mapped_granules[granule] {
+            if !used[granule] || self.mapped_granules[granule] {
                 continue;
             }
-            if used[granule] {
-                if self.budget_bytes != 0
-                    && self.mapped_bytes.saturating_add(granule_cost) > self.budget_bytes
-                {
-                    self.rollback_mapped(gpu, &newly_mapped);
-                    return Err(format!(
-                        "VmmPageMapper: mapping granule {granule} would exceed {} B budget ({} mapped)",
-                        self.budget_bytes, self.mapped_bytes
-                    ));
-                }
-                let offset = granule * self.layout.granule_bytes;
-                let bases: Vec<(usize, usize)> = self
-                    .k_bases
-                    .iter()
-                    .chain(self.v_bases.iter())
-                    .copied()
-                    .collect();
-                let mut staged = 0usize;
-                let mut error = None;
-                for (arena_idx, &(base, size)) in bases.iter().enumerate() {
-                    let arena = alias(base, size);
-                    match gpu.vmm_map_at(&arena, offset, self.layout.granule_bytes, &[]) {
-                        Ok(()) => staged += 1,
-                        Err(e) => {
-                            error = Some(format!(
-                                "VmmPageMapper: map granule {granule} arena {arena_idx}: {e}"
-                            ));
-                            break;
-                        }
-                    }
-                }
-                if let Some(e) = error {
-                    // Undo this granule's partial mapping in reverse order.
-                    for &(base, size) in bases.iter().take(staged).rev() {
-                        let arena = alias(base, size);
-                        let _ = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes);
-                    }
-                    self.rollback_mapped(gpu, &newly_mapped);
-                    return Err(e);
-                }
-                self.mapped_granules[granule] = true;
-                self.mapped_bytes = self
-                    .mapped_bytes
-                    .checked_add(granule_cost)
-                    .ok_or_else(|| "VmmPageMapper: mapped bytes overflowed".to_string())?;
-                newly_mapped.push(granule);
-            } else {
-                // No page in this granule is resident. Complete prior stream
-                // work before releasing the mappings. Every paged kernel runs
-                // on the Gpu's default stream; wait
-                // on that stream instead of fencing the whole device. This is
-                // still a completion fence, not a per-page event lease: unmap
-                // happens only at a caller-controlled boundary after the
-                // step's writes/reads have been submitted.
-                gpu.hip
-                    .stream_synchronize_default()
-                    .map_err(|e| format!("VmmPageMapper: stream sync before unmap: {e}"))?;
-                let offset = granule * self.layout.granule_bytes;
-                for &(base, size) in self.k_bases.iter().chain(self.v_bases.iter()) {
-                    let arena = alias(base, size);
-                    if let Err(e) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
-                        self.poisoned = true;
-                        return Err(format!(
-                            "VmmPageMapper: unmap granule {granule} failed after partial teardown: {e}"
-                        ));
-                    }
-                }
-                self.mapped_granules[granule] = false;
-                self.mapped_bytes = self.mapped_bytes.saturating_sub(granule_cost);
+            if self.budget_bytes != 0
+                && self.mapped_bytes.saturating_add(granule_cost) > self.budget_bytes
+            {
+                self.rollback_mapped(gpu, &newly_mapped)?;
+                return Err(format!(
+                    "VmmPageMapper: mapping granule {granule} would exceed {} B budget ({} mapped)",
+                    self.budget_bytes, self.mapped_bytes
+                ));
             }
+            if let Err(e) = self.map_granule(gpu, granule, granule_cost) {
+                self.rollback_mapped(gpu, &newly_mapped)?;
+                return Err(e);
+            }
+            newly_mapped.push(granule);
         }
         Ok(())
     }
 
-    fn rollback_mapped(&mut self, gpu: &mut Gpu, granules: &[usize]) {
+    fn map_granule(
+        &mut self,
+        gpu: &mut Gpu,
+        granule: usize,
+        granule_cost: usize,
+    ) -> Result<(), String> {
+        let offset = granule * self.layout.granule_bytes;
+        let bases: Vec<(usize, usize)> = self
+            .k_bases
+            .iter()
+            .chain(self.v_bases.iter())
+            .copied()
+            .collect();
+        let mut staged = 0usize;
+        for (arena_idx, &(base, size)) in bases.iter().enumerate() {
+            let arena = alias(base, size);
+            if let Err(e) = gpu.vmm_map_at(&arena, offset, self.layout.granule_bytes, &[]) {
+                let mut staged_err = None;
+                for &(base, size) in bases.iter().take(staged).rev() {
+                    let arena = alias(base, size);
+                    if let Err(ue) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
+                        self.poisoned = true;
+                        staged_err = Some(format!(
+                            "VmmPageMapper: map granule {granule} arena {arena_idx}: {e}; \
+                             staged unmap failed and the mapper is poisoned: {ue}"
+                        ));
+                        break;
+                    }
+                }
+                if let Some(err) = staged_err {
+                    return Err(err);
+                }
+                return Err(format!(
+                    "VmmPageMapper: map granule {granule} arena {arena_idx}: {e}"
+                ));
+            }
+            staged += 1;
+        }
+        let Some(next) = self.mapped_bytes.checked_add(granule_cost) else {
+            // The maps landed. Drop them before returning so the unset bit
+            // still matches the VA. An unmap failure poisons instead of
+            // pretending the range is free.
+            for &(base, size) in bases.iter().rev() {
+                let arena = alias(base, size);
+                if let Err(e) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
+                    self.poisoned = true;
+                    return Err(format!(
+                        "VmmPageMapper: mapped bytes overflowed; unmap of granule {granule} failed and the mapper is poisoned: {e}"
+                    ));
+                }
+            }
+            return Err("VmmPageMapper: mapped bytes overflowed".into());
+        };
+        self.mapped_bytes = next;
+        self.mapped_granules[granule] = true;
+        Ok(())
+    }
+
+    fn unmap_granule(
+        &mut self,
+        gpu: &mut Gpu,
+        granule: usize,
+        granule_cost: usize,
+    ) -> Result<(), String> {
+        let offset = granule * self.layout.granule_bytes;
+        for &(base, size) in self.k_bases.iter().chain(self.v_bases.iter()) {
+            let arena = alias(base, size);
+            if let Err(e) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
+                // Leave the bit set. Some arenas in this granule may already
+                // be unmapped; a cleared bit would let the next map overlap
+                // the ones that survived.
+                self.poisoned = true;
+                return Err(format!(
+                    "VmmPageMapper: unmap granule {granule} failed after partial teardown: {e}"
+                ));
+            }
+        }
+        self.mapped_granules[granule] = false;
+        self.mapped_bytes = self.mapped_bytes.saturating_sub(granule_cost);
+        Ok(())
+    }
+
+    fn rollback_mapped(&mut self, gpu: &mut Gpu, granules: &[usize]) -> Result<(), String> {
+        let cost = self.layout.granule_bytes * (self.k_bases.len() + self.v_bases.len());
         for &granule in granules.iter().rev() {
+            if !self.mapped_granules[granule] {
+                continue;
+            }
             let offset = granule * self.layout.granule_bytes;
             for &(base, size) in self.k_bases.iter().chain(self.v_bases.iter()) {
                 let arena = alias(base, size);
-                let _ = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes);
+                if let Err(e) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
+                    self.poisoned = true;
+                    return Err(format!(
+                        "VmmPageMapper: rollback unmap of granule {granule} failed; mapper poisoned: {e}"
+                    ));
+                }
             }
             self.mapped_granules[granule] = false;
-            let cost = self.layout.granule_bytes * (self.k_bases.len() + self.v_bases.len());
             self.mapped_bytes = self.mapped_bytes.saturating_sub(cost);
         }
+        Ok(())
     }
 
     /// Clear the mapper's bookkeeping. The caller must free the
@@ -476,3 +612,50 @@ impl Drop for VmmPageMapper {
 /// mapper from `PagePool` should pass it so descriptor and copy arithmetic
 /// cannot drift.
 pub const VMM_PAGE_TOKENS: usize = PAGE_TOKENS;
+
+#[cfg(test)]
+mod tests {
+    use super::VmmGranuleGeometry;
+
+    /// Qwen3.5-27B q8: 16 full-attention layers, 4 KV heads, D=256, 1088 B/token.
+    /// A 2 MiB granule holds 15 pages and wastes 8 KiB. Sizing by the logical
+    /// page (K+V across layers) asks for one more granule group than fits in
+    /// `free - 512 MiB`.
+    #[test]
+    fn q8_27b_auto_pool_fits_the_granule_budget_logical_sizing_does_not() {
+        let geom = VmmGranuleGeometry::plan(4096, 128, 1088, 0).unwrap();
+        assert_eq!(geom.page_bytes, 139_264);
+        assert_eq!(geom.granule_bytes, 2 * 1024 * 1024);
+        assert_eq!(geom.pages_per_granule, 15);
+
+        let layers = 16;
+        let logical_page = layers * 128 * (1088 + 1088);
+        assert_eq!(logical_page, 4_456_448);
+        let free = 10usize << 30;
+        let reserve = 512usize << 20;
+        let usable = free - reserve;
+        let logical_pages = usable / logical_page;
+        let logical_cost = geom.physical_bytes(layers, logical_pages).unwrap();
+        assert!(
+            logical_cost > usable,
+            "logical sizing must overshoot: cost {logical_cost} usable {usable} pages {logical_pages}"
+        );
+
+        let pages = geom.pages_fitting(layers, usable, usize::MAX).unwrap();
+        let physical = geom.physical_bytes(layers, pages).unwrap();
+        assert!(physical <= usable, "physical {physical} usable {usable}");
+        assert!(pages < logical_pages);
+        assert_eq!(pages % 15, 0);
+    }
+
+    #[test]
+    fn pages_fitting_refuses_a_budget_smaller_than_one_group_and_honors_the_cap() {
+        let geom = VmmGranuleGeometry::plan(4096, 128, 1088, 0).unwrap();
+        let group = geom.group_bytes(16).unwrap();
+        let err = geom.pages_fitting(16, group - 1, 100).unwrap_err();
+        assert!(err.contains("granule group"), "{err}");
+        assert_eq!(geom.pages_fitting(16, group, 10).unwrap(), 10);
+        assert_eq!(geom.physical_bytes(16, 10).unwrap(), group);
+        assert_eq!(geom.pages_fitting(16, group * 2, 1000).unwrap(), 30);
+    }
+}

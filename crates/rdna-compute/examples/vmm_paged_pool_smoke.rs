@@ -304,6 +304,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(a.to_bits(), b.to_bits(), "LDS bit mismatch at {i}");
     }
 
+    // WMMA over the same real VMM mapping. The query is the last token of
+    // page 15, which is the first page of the second granule (P=15).
+    let tile_slot = gpu
+        .upload_raw(&i32_bytes(&[0]), &[1])
+        .expect("wmma tile slot");
+    let tile_row0 = gpu
+        .upload_raw(&i32_bytes(&[0]), &[1])
+        .expect("wmma tile row0");
+    let tile_qbase = gpu
+        .upload_raw(&i32_bytes(&[0]), &[1])
+        .expect("wmma tile qbase");
+    let run_wmma = |gpu: &mut Gpu,
+                    k: &rdna_compute::GpuTensor,
+                    v: &rdna_compute::GpuTensor,
+                    descs: &rdna_compute::GpuTensor,
+                    vmm: bool| {
+        let out = gpu
+            .zeros(&[N_HEADS * HEAD_DIM], DType::F32)
+            .expect("wmma out");
+        let launch = if vmm {
+            gpu.attention_q8_0_flash_prefill_wmma_slots_vmm_paged(
+                &q,
+                k,
+                v,
+                &out,
+                &positions,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                SEQ_TOKENS,
+                1,
+                Some(descs),
+                Some(&tile_slot),
+                Some(&tile_row0),
+                Some(&tile_qbase),
+            )
+        } else {
+            gpu.attention_q8_0_flash_prefill_wmma_slots(
+                &q,
+                k,
+                v,
+                &out,
+                &positions,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                SEQ_TOKENS,
+                1,
+                Some(descs),
+                Some(&tile_slot),
+                Some(&tile_row0),
+                Some(&tile_qbase),
+            )
+        };
+        launch.expect("wmma");
+        gpu.hip.device_synchronize().expect("wmma sync");
+        let values = gpu.download_f32(&out).expect("wmma read");
+        gpu.free_tensor(out).unwrap();
+        values
+    };
+    let ref_wmma = run_wmma(&mut gpu, &ref_k, &ref_v, &ref_descs, false);
+    let vmm_wmma = run_wmma(&mut gpu, &vmm_k, &vmm_v, &vmm_descs, true);
+    assert!(
+        ref_wmma.iter().any(|v| v.to_bits() != 0),
+        "WMMA reference output is all zeros"
+    );
+    for (i, (a, b)) in ref_wmma.iter().zip(&vmm_wmma).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "WMMA bit mismatch at {i}");
+    }
+
     // Prefix sharing + COW: a second table shares a full 8-page prefix, then
     // copies away one shared page. The mapper must keep the shared granules
     // mapped, map the COW destination, and the copy must use page offsets.
@@ -407,6 +477,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         positions,
         row_slot,
         q,
+        tile_slot,
+        tile_row0,
+        tile_qbase,
     ] {
         gpu.free_tensor(t).unwrap();
     }

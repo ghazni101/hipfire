@@ -548,27 +548,43 @@ impl GpuTensor {
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
+    ///
+    /// Panics when the view does not fit. Serve paths that must fail closed
+    /// (swap capture/restore) use [`Self::try_sub_offset`] instead.
     pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
+        self.try_sub_offset(offset_elems, len_elems)
+            .expect("tensor sub-view exceeds accessible buffer prefix")
+    }
+
+    /// [`Self::sub_offset`] that returns the overflow or bounds failure
+    /// instead of panicking the caller.
+    pub fn try_sub_offset(
+        &self,
+        offset_elems: usize,
+        len_elems: usize,
+    ) -> Result<GpuTensor, String> {
         let element_size = self.dtype.size();
         let byte_off = offset_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view offset overflow");
+            .ok_or_else(|| "tensor sub-view offset overflow".to_string())?;
         let byte_len = len_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view length overflow");
+            .ok_or_else(|| "tensor sub-view length overflow".to_string())?;
         let byte_end = byte_off
             .checked_add(byte_len)
-            .expect("tensor sub-view range overflow");
-        assert!(
-            byte_end <= self.buf.size(),
-            "tensor sub-view exceeds accessible buffer prefix"
-        );
+            .ok_or_else(|| "tensor sub-view range overflow".to_string())?;
+        if byte_end > self.buf.size() {
+            return Err(format!(
+                "tensor sub-view exceeds accessible buffer prefix ({byte_end} > {})",
+                self.buf.size()
+            ));
+        }
         let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
-        GpuTensor {
+        Ok(GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
-        }
+        })
     }
 
     /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).

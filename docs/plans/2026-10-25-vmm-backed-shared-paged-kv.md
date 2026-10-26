@@ -664,3 +664,21 @@ explicit opt-ins.
 Final closure binaries: daemon `90b0273bba806986fefd6e3627dca38c`, CLI
 `5d78ad30761b093afacea40a58439515`. `cargo check`, env-doc check,
 snapshot unit tests, and all five VMM smoke examples pass.
+
+### Phase 6 — PM4 Redline + MoE on the shared pool (this branch)
+
+- Slots `Gpu::init` now calls `configure_model_default` with the same
+  `retained_redline_default` predicate as sequential (pp=tp=ep=1). An
+  explicit `HIPFIRE_REPLAY_BACKEND=pm4` arms MoE as well; gfx1201 auto
+  still names dense `qwen3_5` only, while `.mq4r` follows the extension rule.
+- Lockstep paged decode (`m<=1` and every live row at the same position,
+  no spec capture) uploads tokens/positions/descriptors outside the tape
+  and records/replays the compute body. Crossing a 256-token context bucket
+  rearms. Mixed-position or prefill steps stay HIP.
+- MoE prompt chunks on the shared pool are peeled into per-slot
+  `_vmm_paged` batches so they cannot share a step or a tape with decode.
+  Decode remains the batched descriptor path, including MoE FFN.
+- Unit coverage: `split_isolated_prefill`, `lockstep_decode_pos`,
+  `slots_model_arch`, and the `_vmm_paged` recorder contracts
+  (`expected_kernarg_bytes` / `pointer_effects` for write, LDS attend, and
+  tile). Hardware PM4/MoE serve receipts are still pending.

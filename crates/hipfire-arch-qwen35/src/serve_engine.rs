@@ -33,7 +33,7 @@ use hipfire_runtime::swap::{SwapError, SwapManager};
 use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
-use rdna_compute::vmm_page_pool::{VmmPageLayout, VmmPageMapper};
+use rdna_compute::vmm_page_pool::{VmmGranuleGeometry, VmmPageLayout, VmmPageMapper};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, CheckpointPool};
@@ -561,6 +561,60 @@ impl ModelRig {
                 any_dflash_rows,
             );
         }
+        // Shared paged has no per-slot KvCache owner. Isolate MoE prompt
+        // chunks so they never share a step (or a Redline tape) with decode:
+        // the mixed `_vmm` batched prefill hung on 35B-A3B before sampling.
+        if self.config.num_experts > 0 {
+            let isolate: Vec<bool> = (0..batch.m_per_slot.len())
+                .map(|s| prefill_slots.get(s).copied().unwrap_or(false))
+                .collect();
+            if isolate.iter().any(|&b| b) {
+                let (moe_prefills, rest) = split_isolated_prefill(batch, &isolate);
+                gpu.replay.set_forward_eligible(false);
+                if gpu.slot_trace() && !moe_prefills.is_empty() {
+                    eprintln!(
+                        "[slot-trace] VMM-paged MoE prefill: {} isolated slot(s)",
+                        moe_prefills.len()
+                    );
+                }
+                for pref in &moe_prefills {
+                    self.forward_paged_batch(gpu, pref, pool, graph, lm_head_skip, false, false)?;
+                }
+                if rest.is_empty() {
+                    return Ok(());
+                }
+                return self.forward_paged_batch(
+                    gpu,
+                    &rest,
+                    pool,
+                    graph,
+                    lm_head_skip,
+                    any_verify,
+                    any_dflash_rows,
+                );
+            }
+        }
+        self.forward_paged_batch(
+            gpu,
+            batch,
+            pool,
+            graph,
+            lm_head_skip,
+            any_verify,
+            any_dflash_rows,
+        )
+    }
+
+    fn forward_paged_batch(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &SlotBatch,
+        pool: &mut SlotPool,
+        graph: &mut SlotDecodeGraph,
+        lm_head_skip: &[bool],
+        any_verify: bool,
+        any_dflash_rows: bool,
+    ) -> rdna_compute::HipResult<()> {
         let mut capture = (any_verify || any_dflash_rows).then(|| {
             let tape = self
                 .spec_verify_tape
@@ -1292,13 +1346,16 @@ impl Rig {
         // Physical backend for the shared paged pool. `arena` (default) keeps
         // the existing zeroed full-size arenas; `vmm` reserves VA and maps
         // granule groups as pages become resident.
-        let paged_vmm = match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
-            .ok()
-            .as_deref()
-        {
-            Some(value) => value.eq_ignore_ascii_case("vmm"),
-            None => cfg.multi_slot_paged_backend.eq_ignore_ascii_case("vmm"),
-        };
+        // `HIPFIRE_SLOTS_PAGED_BACKEND` is the developer alias and wins when
+        // it is set. An unknown spelling is a refusal, not a silent fall
+        // through to the arena pool: that pool has a different descriptor
+        // ABI and would hide a misconfigured VMM run.
+        let paged_vmm = select_paged_vmm_backend(
+            hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+                .ok()
+                .as_deref(),
+            &cfg.multi_slot_paged_backend,
+        )?;
         let paged_requested = !use_vmm
             && (cfg.multi_slot_paged
                 || cfg.multi_slot_paged_pages > 0
@@ -1355,12 +1412,14 @@ impl Rig {
                     "VMM-paged backend requires equal K/V strides (K {per_pos_bytes}, V {per_pos_v_bytes})"
                 ));
             }
-            if !matches!(
-                kv_mode,
-                hipfire_runtime::kv_mode::KvMode::Q8 | hipfire_runtime::kv_mode::KvMode::Fp8
-            ) {
+            // fp8 descriptor kernels exist for the arena-paged and per-slot
+            // VMM routes. The shared VMM-paged route only compiles q8
+            // `_vmm_paged` bodies; admitting fp8 loads the model and then
+            // fails the first forward (and every in-flight request with it).
+            if !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
                 return Err(format!(
-                    "VMM-paged backend admits q8/fp8 only (selected {kv_mode:?})"
+                    "VMM-paged backend supports q8 only (selected {kv_mode:?}); \
+                     fp8 _vmm_paged kernels are not implemented"
                 ));
             }
         }
@@ -1389,6 +1448,12 @@ impl Rig {
         // total come from the live device so gfx1100 is not over-admitted
         // against a hardcoded R9700 budget.
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
+        configure_slots_redline(
+            &mut gpu,
+            hfq.arch_id,
+            &cfg.model_path,
+            cfg.mtp_k > 0 || cfg.dflash_draft.is_some(),
+        );
         // Native fp8 KV admission gate (gfx1201-only): the descriptor-aware
         // fp8 writer/reader kernels compile `#error` off gfx1201 (OCP E4M3FN
         // cvt), so admitting the tier anywhere else fails at first kernel
@@ -1917,29 +1982,52 @@ impl Rig {
         // (weights, prefill scratch, sampler state) is already resident, so
         // post-allocation free VRAM is exactly the budget the pool can own.
         // Auto-sizing leaves the VMM route's 512 MiB map reserve.
+        // VMM auto-sizing charges a whole granule group per packed page run.
+        // The arena route still charges the logical K+V page.
+        let mut paged_vmm_budget = 0usize;
         let mut pool = if let Some(requested_pages) = paged_pages {
             let pages = if requested_pages == 0 {
-                let free = g
-                    .gpu
-                    .as_mut()
-                    .unwrap()
+                let gpu = g.gpu.as_mut().unwrap();
+                let free = gpu
                     .device_mem_info()
                     .map_err(|e| format!("paged pool VRAM query: {e}"))?
                     .0;
-                let page_bytes = n_fa_layers
-                    .checked_mul(PAGE_TOKENS)
-                    .and_then(|v| v.checked_mul(per_pos_bytes.saturating_add(per_pos_v_bytes)))
-                    .ok_or_else(|| "multi-slot paged page size overflow".to_string())?;
                 let cap_pages = cfg
                     .n_slots
                     .saturating_mul(cfg.cap_tokens.div_ceil(PAGE_TOKENS));
-                let pages = paged_pool_pages_from_free(free, page_bytes, cap_pages);
-                eprintln!(
-                    "[hipfire] paged KV auto pool: free={free} B page={page_bytes} B -> \
-                     {pages} pages (cap {cap_pages}, {} tokens/page)",
-                    PAGE_TOKENS
-                );
-                pages
+                if paged_vmm {
+                    let granularity = gpu.vmm_recommended_granularity().map_err(|e| {
+                        format!("VMM-paged auto pool: granularity unavailable: {e}")
+                    })?;
+                    let geom = VmmGranuleGeometry::plan(granularity, PAGE_TOKENS, per_pos_bytes, 0)
+                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
+                    let usable = free.saturating_sub(PAGED_MAP_RESERVE_BYTES);
+                    let pages = geom
+                        .pages_fitting(n_fa_layers, usable, cap_pages)
+                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
+                    paged_vmm_budget = geom
+                        .physical_bytes(n_fa_layers, pages)
+                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
+                    eprintln!(
+                        "[hipfire] paged KV auto pool (vmm): free={free} B usable={usable} B \
+                         granule={} B pages/granule={} physical={paged_vmm_budget} B -> \
+                         {pages} pages (cap {cap_pages})",
+                        geom.granule_bytes, geom.pages_per_granule
+                    );
+                    pages
+                } else {
+                    let page_bytes = n_fa_layers
+                        .checked_mul(PAGE_TOKENS)
+                        .and_then(|v| v.checked_mul(per_pos_bytes.saturating_add(per_pos_v_bytes)))
+                        .ok_or_else(|| "multi-slot paged page size overflow".to_string())?;
+                    let pages = paged_pool_pages_from_free(free, page_bytes, cap_pages);
+                    eprintln!(
+                        "[hipfire] paged KV auto pool: free={free} B page={page_bytes} B -> \
+                         {pages} pages (cap {cap_pages}, {} tokens/page)",
+                        PAGE_TOKENS
+                    );
+                    pages
+                }
             } else {
                 requested_pages
             };
@@ -2140,7 +2228,7 @@ impl Rig {
                 PAGE_TOKENS,
                 per_pos_bytes,
                 0,
-                0,
+                paged_vmm_budget,
             )
             .map_err(|e| format!("VMM-paged KV: {e}"))?;
             let layout = mapper.page_layout();
@@ -3668,6 +3756,144 @@ fn rebuild_batch_excluding_failed(batch: &mut SlotBatch, failed: &[usize]) {
     batch.ext_emb = new_ext_emb;
 }
 
+/// Resolve the shared paged pool's physical backend.
+///
+/// `env_backend` is `HIPFIRE_SLOTS_PAGED_BACKEND` when the process snapshot
+/// has it. It overrides `configured` (`serve.multi_slot_paged_backend`).
+/// Only `arena` and `vmm` are accepted; anything else, including a padded
+/// or empty override, is an error so a typo cannot silently select arena.
+fn slots_model_arch(arch_id: u32) -> &'static str {
+    match arch_id {
+        6 => "qwen3_5_moe",
+        _ => "qwen3_5",
+    }
+}
+
+/// Arm the slots `Gpu` the same way the sequential load does.
+///
+/// Without this the multi-slot executor never called
+/// `configure_model_default`, so an explicit `HIPFIRE_REPLAY_BACKEND=pm4`
+/// or an automatic `.mq4r` / gfx1201 dense default left the controller on
+/// HIP. MoE is not an automatic gfx1201 default (`qwen3_5` only); a
+/// `.mq4r` A3B still follows the extension predicate, matching sequential.
+fn configure_slots_redline(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    model_path: &std::path::Path,
+    has_drafter: bool,
+) {
+    let path = model_path.to_string_lossy();
+    let arch = slots_model_arch(arch_id);
+    let redline_default = hipfire_runtime::config::retained_redline_default(
+        &gpu.arch,
+        arch,
+        &path,
+        1,
+        1,
+        1,
+        has_drafter,
+    ) && hipfire_config::devices::redline_platform_refusal().is_none();
+    if gpu.replay.configure_model_default(redline_default) && redline_default {
+        eprintln!(
+            "[redline] slots: enabling fail-closed retained default on {} \
+             (model_arch={arch}, drafter={}, transport={})",
+            gpu.arch,
+            if has_drafter { "on" } else { "off" },
+            gpu.replay.transport_name()
+        );
+    }
+}
+
+/// Pull isolated prefilling slots out of a mixed batch so each runs as its
+/// own `_vmm_paged` step. `isolate[s]` is true for a slot whose rows must
+/// not share a forward with anyone else.
+fn split_isolated_prefill(batch: &SlotBatch, isolate: &[bool]) -> (Vec<SlotBatch>, SlotBatch) {
+    let n = batch.m_per_slot.len();
+    let mut isolated = Vec::new();
+    let mut rest = SlotBatch {
+        m_per_slot: vec![0; n],
+        ..SlotBatch::default()
+    };
+    let has_pos3 = !batch.pos3.is_empty();
+    let has_ext = !batch.ext_emb.is_empty();
+    let mut off = 0usize;
+    for s in 0..n {
+        let m = batch.m_per_slot.get(s).copied().unwrap_or(0);
+        if m == 0 {
+            continue;
+        }
+        let rows = off..off + m;
+        off += m;
+        if isolate.get(s).copied().unwrap_or(false) {
+            let mut one = SlotBatch {
+                m_per_slot: vec![0; n],
+                ..SlotBatch::default()
+            };
+            one.m_per_slot[s] = m;
+            one.tokens.extend_from_slice(&batch.tokens[rows.clone()]);
+            one.positions
+                .extend_from_slice(&batch.positions[rows.clone()]);
+            one.row_slot
+                .extend_from_slice(&batch.row_slot[rows.clone()]);
+            if has_pos3 {
+                one.pos3.extend_from_slice(&batch.pos3[rows.clone()]);
+            }
+            if has_ext {
+                one.ext_emb.extend_from_slice(&batch.ext_emb[rows.clone()]);
+            }
+            isolated.push(one);
+        } else {
+            rest.m_per_slot[s] = m;
+            rest.tokens.extend_from_slice(&batch.tokens[rows.clone()]);
+            rest.positions
+                .extend_from_slice(&batch.positions[rows.clone()]);
+            rest.row_slot
+                .extend_from_slice(&batch.row_slot[rows.clone()]);
+            if has_pos3 {
+                rest.pos3.extend_from_slice(&batch.pos3[rows.clone()]);
+            }
+            if has_ext {
+                rest.ext_emb.extend_from_slice(&batch.ext_emb[rows.clone()]);
+            }
+        }
+    }
+    (isolated, rest)
+}
+
+fn select_paged_vmm_backend(env_backend: Option<&str>, configured: &str) -> Result<bool, String> {
+    let override_backend = env_backend.map(str::trim).filter(|value| !value.is_empty());
+    let value = override_backend.unwrap_or(configured.trim());
+    match value.to_ascii_lowercase().as_str() {
+        "vmm" => Ok(true),
+        "arena" => Ok(false),
+        other => Err(format!(
+            "paged KV backend must be `arena` or `vmm`, got {other:?}"
+        )),
+    }
+}
+
+fn cow_offset(phys: u32, page_bytes: usize, layout: Option<VmmPageLayout>) -> Option<usize> {
+    match layout {
+        Some(layout) => {
+            let p = layout.pages_per_granule as usize;
+            if p == 0 || page_bytes != layout.page_bytes {
+                // The device offset is `within * page_tokens * per_pos_bytes`,
+                // which is `layout.page_bytes`. A mismatched K or V page
+                // would copy onto the wrong granule slot.
+                return None;
+            }
+            let base = (phys as usize / p).checked_mul(layout.granule_bytes)?;
+            let within = (phys as usize % p).checked_mul(layout.page_bytes)?;
+            base.checked_add(within)
+        }
+        None => (phys as usize).checked_mul(page_bytes),
+    }
+}
+
+fn cow_copy_fits(buf_size: usize, offset: usize, len: usize) -> bool {
+    len == 0 || offset.checked_add(len).is_some_and(|end| end <= buf_size)
+}
+
 /// Execute the raw device-to-device copies of a [`CowPlan`] (spec §4.3):
 /// for every copy, `valid_prefix_tokens` positions' worth of K and V bytes
 /// are copied from the sealed source page to the reserved private
@@ -3683,16 +3909,6 @@ fn rebuild_batch_excluding_failed(batch: &mut SlotBatch, failed: &[usize]) {
 /// (releasing the reserved destinations) and fails the slot — a partial
 /// copy never leaves a half-initialized destination referenced, because
 /// the table still maps the logical page to the source until commit.
-fn cow_offset(phys: u32, page_bytes: usize, layout: Option<VmmPageLayout>) -> usize {
-    match layout {
-        Some(layout) => {
-            let p = layout.pages_per_granule as usize;
-            (phys as usize / p) * layout.granule_bytes + (phys as usize % p) * page_bytes
-        }
-        None => phys as usize * page_bytes,
-    }
-}
-
 fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> bool {
     let Some(pp) = rig.pool.page_pool() else {
         return false;
@@ -3706,11 +3922,32 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
                 return false;
             };
             if copy.k_copy_bytes > 0 {
+                let (Some(dst_off), Some(src_off)) = (
+                    cow_offset(copy.dst_phys, k_page, layout),
+                    cow_offset(copy.src_phys, k_page, layout),
+                ) else {
+                    eprintln!(
+                        "[cow] K offset refused (layer {layer}): page {k_page} B \
+                         does not match the VMM layout"
+                    );
+                    return false;
+                };
+                if !cow_copy_fits(k_arena.buf.size(), dst_off, copy.k_copy_bytes)
+                    || !cow_copy_fits(k_arena.buf.size(), src_off, copy.k_copy_bytes)
+                {
+                    eprintln!(
+                        "[cow] K copy out of mapped prefix (layer {layer}): \
+                         src {src_off} dst {dst_off} len {} prefix {}",
+                        copy.k_copy_bytes,
+                        k_arena.buf.size()
+                    );
+                    return false;
+                }
                 let res = rig.gpu.hip.memcpy_dtod_at(
                     &k_arena.buf,
-                    cow_offset(copy.dst_phys, k_page, layout),
+                    dst_off,
                     &k_arena.buf,
-                    cow_offset(copy.src_phys, k_page, layout),
+                    src_off,
                     copy.k_copy_bytes,
                 );
                 if let Err(e) = res {
@@ -3719,11 +3956,32 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
                 }
             }
             if copy.v_copy_bytes > 0 {
+                let (Some(dst_off), Some(src_off)) = (
+                    cow_offset(copy.dst_phys, v_page, layout),
+                    cow_offset(copy.src_phys, v_page, layout),
+                ) else {
+                    eprintln!(
+                        "[cow] V offset refused (layer {layer}): page {v_page} B \
+                         does not match the VMM layout"
+                    );
+                    return false;
+                };
+                if !cow_copy_fits(v_arena.buf.size(), dst_off, copy.v_copy_bytes)
+                    || !cow_copy_fits(v_arena.buf.size(), src_off, copy.v_copy_bytes)
+                {
+                    eprintln!(
+                        "[cow] V copy out of mapped prefix (layer {layer}): \
+                         src {src_off} dst {dst_off} len {} prefix {}",
+                        copy.v_copy_bytes,
+                        v_arena.buf.size()
+                    );
+                    return false;
+                }
                 let res = rig.gpu.hip.memcpy_dtod_at(
                     &v_arena.buf,
-                    cow_offset(copy.dst_phys, v_page, layout),
+                    dst_off,
                     &v_arena.buf,
-                    cow_offset(copy.src_phys, v_page, layout),
+                    src_off,
                     copy.v_copy_bytes,
                 );
                 if let Err(e) = res {
@@ -4651,6 +4909,16 @@ fn run_loop(
         'serve: loop {
             let idle = slots.iter().all(|s| s.is_none());
             if idle && rig.wait_queue.queued_count() == 0 {
+                // Nothing in flight. Return physical granules whose pages
+                // were freed by the step that just finished. Prefix-cache
+                // pages stay non-Free, so their granules stay mapped. A
+                // failed unmap poisons the mapper; keep serving only if the
+                // mapping state is still trustworthy.
+                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                    let reason = format!("VMM-paged reclaim failed: {e}");
+                    poison = Some(reason);
+                    break 'serve;
+                }
                 // Nothing in flight and nothing queued: block rather than spin.
                 // With an idle TTL configured, wake periodically to close
                 // abandoned parked sessions instead of waiting for the next
@@ -4713,6 +4981,12 @@ fn run_loop(
                     .expect("stats")
                     .note_graph_stats(captures, replays);
             } else {
+                if let Some(mapper) = rig.model.paged_vmm.as_ref() {
+                    stats
+                        .lock()
+                        .expect("stats")
+                        .note_mapped_kv_bytes(mapper.mapped_bytes());
+                }
                 let (captures, replays) = graph.stats();
                 stats
                     .lock()
@@ -5268,26 +5542,89 @@ fn run_loop(
             // refusal instead of an engine-thread failure.
             let mut provision_failed = Vec::new();
             let mut row = 0usize;
+            let mut vmm_map_poison: Option<String> = None;
             for s in 0..n {
                 let m = batch.m_per_slot[s];
                 if m == 0 {
                     continue;
                 }
-                let frontier = batch.positions[row + m - 1] as usize + 1;
+                // Max position, not the last row. `forward_step` provisions
+                // the same way; a short frontier here lets that later call
+                // allocate a page whose granule map then fails the whole step.
+                let frontier = batch.positions[row..row + m]
+                    .iter()
+                    .map(|pos| *pos as usize + 1)
+                    .max()
+                    .unwrap_or(0);
                 row += m;
-                let first = rig.pool.set_seq_len(SlotId(s), frontier);
-                if first.is_ok() {
+                let mut reserved = rig.pool.set_seq_len(SlotId(s), frontier).is_ok();
+                if !reserved {
+                    if let (Some(idx), Some(pp)) =
+                        (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+                    {
+                        idx.evict_unpinned_leaves(pp, usize::MAX);
+                        pp.drain_completed();
+                    }
+                    match rig.pool.set_seq_len(SlotId(s), frontier) {
+                        Ok(()) => reserved = true,
+                        Err(error) => {
+                            eprintln!("[serve] page provisioning refused slot {s}: {error}");
+                            provision_failed.push(s);
+                        }
+                    }
+                }
+                if !reserved || rig.model.paged_vmm.is_none() {
                     continue;
                 }
-                if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
-                {
-                    idx.evict_unpinned_leaves(pp, usize::MAX);
-                    pp.drain_completed();
-                }
-                if let Err(error) = rig.pool.set_seq_len(SlotId(s), frontier) {
-                    eprintln!("[serve] page provisioning refused slot {s}: {error}");
+                // Logical pages are not physical memory. Map this slot's
+                // granule before the next slot allocates, and drop only this
+                // request when the budget or `hipMemCreate` refuses. A
+                // poisoned mapper has a VA range that no longer matches the
+                // bitmap; keep serving and the next map faults or overlaps.
+                if let Err(error) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                    let poisoned = rig
+                        .model
+                        .paged_vmm
+                        .as_ref()
+                        .is_some_and(|mapper| mapper.is_poisoned());
+                    if poisoned {
+                        vmm_map_poison = Some(format!(
+                            "VMM-paged map failed and the mapper is poisoned: {error}"
+                        ));
+                        break;
+                    }
+                    eprintln!(
+                        "[serve] VMM page map refused slot {s}: {error}; \
+                         rejecting that request"
+                    );
                     provision_failed.push(s);
+                    if let Some(mut flight) = slots[s].take() {
+                        let _ = send_event(
+                            &flight.reply,
+                            Event::Rejected {
+                                class: RejectClass::Overload,
+                                reason: "server capacity exhausted while mapping KV pages; \
+                                          retry later"
+                                    .to_owned(),
+                            },
+                        );
+                        release_pin_ticket(&mut rig, &mut flight.pin_ticket);
+                        rig.swap.forget(flight.session.0);
+                        let _ = rig.fair_queue.remove(flight.session.0);
+                        rig.sessions
+                            .close(&mut rig.pool, &mut rig.adm, flight.session);
+                        clear_work_slot(&mut work[s]);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
+                        if let Some(draft) = spec_drafts[s].take() {
+                            draft.free_gpu(&mut rig.gpu);
+                        }
+                    }
                 }
+            }
+            if let Some(reason) = vmm_map_poison {
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
             }
             if !provision_failed.is_empty() {
                 for &s in &provision_failed {
@@ -5333,6 +5670,7 @@ fn run_loop(
             // its reserved pages until the failed-slot handler aborts it, so no
             // half-installed COW mappings survive (spec §4.3).
             let mut failed_slots: Vec<usize> = Vec::new();
+            let mut cow_overload: Vec<usize> = Vec::new();
             for s in 0..n {
                 let m = batch.m_per_slot[s];
                 if m == 0 || !rig.pool.is_paged() {
@@ -5340,8 +5678,12 @@ fn run_loop(
                     row_offset += m;
                     continue;
                 }
-                let write_start = batch.positions[row_offset] as usize;
-                let write_end = batch.positions[row_offset + m - 1] as usize + 1;
+                let rows = &batch.positions[row_offset..row_offset + m];
+                // Span every position this slot will write, not only the
+                // first and last row. An unsorted row range would otherwise
+                // copy-on-write the wrong pages and mutate a shared one.
+                let write_start = rows.iter().map(|pos| *pos as usize).min().unwrap_or(0);
+                let write_end = rows.iter().map(|pos| *pos as usize + 1).max().unwrap_or(0);
                 match rig
                     .pool
                     .plan_cow_for_slot(SlotId(s), write_start, write_end)
@@ -5357,15 +5699,31 @@ fn run_loop(
                         // write rows into uninitialized pages, and writing
                         // before the rebind would mutate the sealed shared
                         // source in place.
-                        let copy_ok = if plan.is_empty() {
-                            true
+                        if plan.is_empty() {
+                            cow_plans.push(Some((s, plan)));
                         } else if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
-                            eprintln!("[cow] VMM map of COW destination failed for slot {s}: {e}");
-                            false
-                        } else {
-                            execute_cow_copies(&rig, &plan)
-                        };
-                        if copy_ok {
+                            let poisoned = rig
+                                .model
+                                .paged_vmm
+                                .as_ref()
+                                .is_some_and(|mapper| mapper.is_poisoned());
+                            // Release the reserved destination before the next
+                            // slot maps. Leaving it Private makes the refused
+                            // granule look live, so every later sync retries
+                            // the same allocation and fails the whole batch.
+                            rig.pool.abort_cow_for_slot(plan);
+                            if poisoned {
+                                let reason = format!(
+                                    "VMM-paged COW map failed and the mapper is poisoned: {e}"
+                                );
+                                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                                poison = Some(reason);
+                                break 'serve;
+                            }
+                            eprintln!("[cow] VMM map of COW destination refused slot {s}: {e}");
+                            cow_plans.push(None);
+                            cow_overload.push(s);
+                        } else if execute_cow_copies(&rig, &plan) {
                             cow_plans.push(Some((s, plan)));
                         } else {
                             eprintln!(
@@ -5389,6 +5747,38 @@ fn run_loop(
                     }
                 }
                 row_offset += m;
+            }
+            // A refused COW destination map is capacity, not a broken table:
+            // the plan was already aborted and the source page is unchanged.
+            // Reject only that request so the client can retry. Copy failures
+            // below stay Internal — the bytes did not land.
+            if !cow_overload.is_empty() {
+                for &s in &cow_overload {
+                    if let Some(mut f) = slots[s].take() {
+                        let _ = send_event(
+                            &f.reply,
+                            Event::Rejected {
+                                class: RejectClass::Overload,
+                                reason: "server capacity exhausted while mapping a copy-on-write \
+                                          KV page; retry later"
+                                    .to_owned(),
+                            },
+                        );
+                        release_pin_ticket(&mut rig, &mut f.pin_ticket);
+                        rig.swap.forget(f.session.0);
+                        let _ = rig.fair_queue.remove(f.session.0);
+                        rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                        clear_work_slot(&mut work[s]);
+                        rig.model.clear_slot_vl_state(&mut rig.gpu, s);
+                    }
+                    if let Some(d) = spec_drafts[s].take() {
+                        d.free_gpu(&mut rig.gpu);
+                    }
+                }
+                rebuild_batch_excluding_failed(&mut batch, &cow_overload);
+                if batch.is_empty() {
+                    continue;
+                }
             }
             // Fail the isolated slots: reject their requests, clear their work,
             // and zero their batch rows so the forward skips them. COW plans
@@ -8568,6 +8958,81 @@ mod tests {
         assert_eq!(multi_slot_prefill_rows(64, 8), 512);
         // Saturating: an absurd slot count must not wrap or panic.
         assert!(multi_slot_prefill_rows(1024, usize::MAX) >= 1024);
+    }
+
+    #[test]
+    fn vmm_cow_offset_matches_the_kernel_and_refuses_a_mismatched_page() {
+        let layout = VmmPageLayout {
+            page_tokens: 128,
+            page_bytes: 139_264,
+            granule_bytes: 2 * 1024 * 1024,
+            pages_per_granule: 15,
+            n_pages: 30,
+            n_granules: 2,
+        };
+        // Page 15 is the first page of the next granule, not 15 * page_bytes.
+        assert_eq!(
+            cow_offset(15, layout.page_bytes, Some(layout)),
+            Some(layout.granule_bytes)
+        );
+        assert_eq!(
+            cow_offset(14, layout.page_bytes, Some(layout)),
+            Some(14 * layout.page_bytes)
+        );
+        assert_eq!(cow_offset(15, layout.page_bytes - 1, Some(layout)), None);
+        assert_eq!(cow_offset(3, 64, None), Some(192));
+    }
+
+    #[test]
+    fn paged_vmm_backend_refuses_unknown_spellings() {
+        assert_eq!(select_paged_vmm_backend(None, "vmm").unwrap(), true);
+        assert_eq!(select_paged_vmm_backend(None, "arena").unwrap(), false);
+        assert_eq!(
+            select_paged_vmm_backend(Some("VMM"), "arena").unwrap(),
+            true
+        );
+        assert_eq!(
+            select_paged_vmm_backend(Some(" arena "), "vmm").unwrap(),
+            false
+        );
+        // An empty override does not hide the configured backend.
+        assert_eq!(select_paged_vmm_backend(Some("  "), "vmm").unwrap(), true);
+        let err = select_paged_vmm_backend(Some("vm"), "vmm").unwrap_err();
+        assert!(err.contains("vm"), "{err}");
+        assert!(select_paged_vmm_backend(None, "paged").is_err());
+    }
+
+    #[test]
+    fn slots_model_arch_names_dense_and_moe() {
+        assert_eq!(slots_model_arch(5), "qwen3_5");
+        assert_eq!(slots_model_arch(6), "qwen3_5_moe");
+        assert_eq!(slots_model_arch(0), "qwen3_5");
+    }
+
+    #[test]
+    fn split_isolated_prefill_keeps_other_slots_and_side_arrays() {
+        let batch = SlotBatch {
+            m_per_slot: vec![2, 1, 3],
+            tokens: vec![10, 11, 20, 30, 31, 32],
+            positions: vec![0, 1, 7, 2, 3, 4],
+            row_slot: vec![0, 0, 1, 2, 2, 2],
+            pos3: vec![[0; 3], [1; 3], [7; 3], [2; 3], [3; 3], [4; 3]],
+            ext_emb: vec![-1, -1, 0, -1, -1, -1],
+        };
+        let (iso, rest) = split_isolated_prefill(&batch, &[true, false, true]);
+        assert_eq!(iso.len(), 2);
+        assert_eq!(iso[0].m_per_slot, vec![2, 0, 0]);
+        assert_eq!(iso[0].tokens, vec![10, 11]);
+        assert_eq!(iso[0].positions, vec![0, 1]);
+        assert_eq!(iso[0].row_slot, vec![0, 0]);
+        assert_eq!(iso[0].ext_emb, vec![-1, -1]);
+        assert_eq!(iso[1].m_per_slot, vec![0, 0, 3]);
+        assert_eq!(iso[1].tokens, vec![30, 31, 32]);
+        assert_eq!(rest.m_per_slot, vec![0, 1, 0]);
+        assert_eq!(rest.tokens, vec![20]);
+        assert_eq!(rest.positions, vec![7]);
+        assert_eq!(rest.pos3, vec![[7; 3]]);
+        assert_eq!(rest.ext_emb, vec![0]);
     }
 
     #[test]

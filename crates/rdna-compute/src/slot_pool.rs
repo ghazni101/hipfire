@@ -374,12 +374,41 @@ impl SlotPool {
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
             self.descs[id.0].seq_len = seq_len as i32;
-            if !self.vmm_descs.is_empty() {
-                self.vmm_descs[id.0].seq_len = seq_len as i32;
-            }
             self.dirty = true;
         }
+        self.note_vmm_live_len(id.0, seq_len);
         Ok(())
+    }
+
+    /// Keep the 48-byte VMM descriptor's `seq_len` equal to the 32-byte one.
+    ///
+    /// `set_seq_len` used to update the VMM row only when the arena row
+    /// changed. `share_prefix` / `share_published_pages` write the arena row
+    /// themselves, so a following `set_seq_len` of that same length skipped
+    /// the VMM row and left `seq_len == 0` until `activate_paged_desc`. A
+    /// pack that ran before activation would hand the kernel a zero length.
+    /// A positive length also installs `page_tokens` when the VMM layout is
+    /// selected; it does not clear `page_tokens` on a zero length, because
+    /// the block-table pointer may still be installed and a zero
+    /// `page_tokens` divides in the device offset.
+    fn note_vmm_live_len(&mut self, slot: usize, live: usize) {
+        if self.vmm_descs.is_empty() {
+            return;
+        }
+        let seq_len = live as i32;
+        let desc = &mut self.vmm_descs[slot];
+        let mut changed = false;
+        if desc.seq_len != seq_len {
+            desc.seq_len = seq_len;
+            changed = true;
+        }
+        if live > 0 && self.vmm_layout.is_some() && desc.page_tokens == 0 {
+            desc.page_tokens = PAGE_TOKENS as i32;
+            changed = true;
+        }
+        if changed {
+            self.dirty = true;
+        }
     }
 
     /// Grow `id`'s block table so it can hold `seq_len` tokens WITHOUT
@@ -431,11 +460,9 @@ impl SlotPool {
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
             self.descs[id.0].seq_len = seq_len as i32;
-            if !self.vmm_descs.is_empty() {
-                self.vmm_descs[id.0].seq_len = seq_len as i32;
-            }
             self.dirty = true;
         }
+        self.note_vmm_live_len(id.0, seq_len);
         Ok(())
     }
 
@@ -603,6 +630,7 @@ impl SlotPool {
         // provision happened to fix it.
         dst_bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
+        self.note_vmm_live_len(dst.0, live);
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())
@@ -662,6 +690,7 @@ impl SlotPool {
         }
         bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
+        self.note_vmm_live_len(dst.0, live);
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())
@@ -849,6 +878,36 @@ mod tests {
         assert_eq!(c.0, a.0, "released slot must be reused");
         p.release(b);
         p.release(c);
+    }
+
+    #[test]
+    fn share_prefix_publishes_the_vmm_descriptor_length() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 32).unwrap();
+        p.set_vmm_layout(crate::vmm_page_pool::VmmPageLayout {
+            page_tokens: PAGE_TOKENS,
+            page_bytes: PAGE_TOKENS * PPB,
+            granule_bytes: 2 * 1024 * 1024,
+            pages_per_granule: 15,
+            n_pages: 32,
+            n_granules: 3,
+        })
+        .unwrap();
+        let src = p.acquire().unwrap();
+        let dst = p.acquire().unwrap();
+        p.set_seq_len(src, PAGE_TOKENS * 2).unwrap();
+        assert_eq!(p.vmm_descriptors()[src.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[src.0].page_tokens, PAGE_TOKENS as i32);
+        // The fork itself must publish the destination length. Waiting for
+        // a later set_seq_len of the same value used to leave the VMM row
+        // at seq_len 0, because that path updates VMM only when the arena
+        // row changes and share already wrote the arena row.
+        p.share_prefix(src, dst, 2).unwrap();
+        assert_eq!(p.descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].page_tokens, PAGE_TOKENS as i32);
+        assert_eq!(p.vmm_descriptors()[dst.0].pages_per_granule, 15);
+        p.set_seq_len(dst, PAGE_TOKENS * 2).unwrap();
+        assert_eq!(p.vmm_descriptors()[dst.0].seq_len, (PAGE_TOKENS * 2) as i32);
     }
 
     #[test]

@@ -271,10 +271,14 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    `serve.multi_slot_paged_backend` selects the physical backing: `arena`
    (default, zeroed full-size K/V arenas) or experimental `vmm` (VA-only
    reservations; 2 MiB granule groups are mapped as pages become resident).
-   The VMM backend currently admits q8/fp8 equal-stride pools; prefix cache,
-   multi-slot COW, and page-offset swap/restore are implemented. Batched vision, MTP (with a present head), and a DFlash2 draft are admitted;
-   the paged VMM route is exercised end-to-end on the 4B VL/MTP fixture. It is
-   still experimental and not a production default.
+    The VMM backend currently admits q8 equal-stride pools; prefix cache,
+    multi-slot COW, and page-offset swap/restore are implemented. Batched vision, MTP (with a present head), and a DFlash2 draft are admitted.
+    MoE/A3B prompt chunks run as isolated single-slot `_vmm_paged` steps
+    (the mixed batched prefill hung on 35B-A3B); decode stays batched.
+    Lockstep single-position decode can record/replay retained PM4 when the
+    slots `Gpu` is armed (`HIPFIRE_REPLAY_BACKEND=pm4` or the same automatic
+    `.mq4r` / gfx1201-dense predicate as sequential). It is still experimental
+    and not a production default.
 
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped

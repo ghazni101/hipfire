@@ -463,10 +463,161 @@ fn attention_parity(gpu: &mut Gpu) {
     println!("vmm_paged_kernel_parity: LDS PASS, TILE PASS");
 }
 
+fn wmma_parity(gpu: &mut Gpu) {
+    // 16 query rows per slot, two slots. Positions 2..=17 cross every granule
+    // the slot owns (page = 4 tokens, granule = 2 pages). Arena and VMM run
+    // the same WMMA body; only the descriptor header differs, so the outputs
+    // are bit-identical when granule translation is right.
+    const ROWS: usize = 16;
+    const BATCH: usize = ROWS * 2;
+    let table0: Vec<i32> = (0..PAGES_PER_SLOT as i32).collect();
+    let table1: Vec<i32> = (PAGES_PER_SLOT as i32..N_PAGES as i32).collect();
+    let block_table0 = gpu
+        .upload_raw(&i32_bytes(&table0), &[PAGES_PER_SLOT])
+        .expect("wmma block table 0");
+    let block_table1 = gpu
+        .upload_raw(&i32_bytes(&table1), &[PAGES_PER_SLOT])
+        .expect("wmma block table 1");
+    let seq_lens = [SEQ_LEN, SEQ_LEN];
+    let ref_descs = upload_desc_tables(gpu, &[&block_table0, &block_table1], false, &seq_lens);
+    let vmm_descs = upload_desc_tables(gpu, &[&block_table0, &block_table1], true, &seq_lens);
+    let ref_k = gpu
+        .upload_raw(
+            &build_two_slot_arena(0x31, 0x51, false, SEQ_LEN),
+            &[REF_ARENA_BYTES],
+        )
+        .expect("wmma ref k");
+    let ref_v = gpu
+        .upload_raw(
+            &build_two_slot_arena(0x91, 0xb1, false, SEQ_LEN),
+            &[REF_ARENA_BYTES],
+        )
+        .expect("wmma ref v");
+    let vmm_k = gpu
+        .upload_raw(
+            &build_two_slot_arena(0x31, 0x51, true, SEQ_LEN),
+            &[VMM_ARENA_BYTES],
+        )
+        .expect("wmma vmm k");
+    let vmm_v = gpu
+        .upload_raw(
+            &build_two_slot_arena(0x91, 0xb1, true, SEQ_LEN),
+            &[VMM_ARENA_BYTES],
+        )
+        .expect("wmma vmm v");
+    let pos_values: Vec<i32> = (0..ROWS)
+        .map(|row| 2 + row as i32)
+        .chain((0..ROWS).map(|row| 2 + row as i32))
+        .collect();
+    let positions = gpu
+        .upload_raw(&i32_bytes(&pos_values), &[BATCH])
+        .expect("wmma positions");
+    let tile_slot = gpu
+        .upload_raw(&i32_bytes(&[0, 1]), &[2])
+        .expect("tile_slot");
+    let tile_row0 = gpu
+        .upload_raw(&i32_bytes(&[0, 0]), &[2])
+        .expect("tile_row0");
+    let tile_qbase = gpu
+        .upload_raw(&i32_bytes(&[0, ROWS as i32]), &[2])
+        .expect("tile_qbase");
+    let q_data: Vec<f32> = (0..BATCH * N_HEADS * HEAD_DIM)
+        .map(|i| ((i as f32) * 0.019) - 0.5)
+        .collect();
+    let q = gpu
+        .upload_f32(&q_data, &[BATCH * N_HEADS * HEAD_DIM])
+        .expect("wmma q");
+    let run = |gpu: &mut Gpu, k: &GpuTensor, v: &GpuTensor, descs: &GpuTensor, vmm: bool| {
+        let out = gpu
+            .zeros(&[BATCH * N_HEADS * HEAD_DIM], DType::F32)
+            .expect("wmma out");
+        let launch = if vmm {
+            gpu.attention_q8_0_flash_prefill_wmma_slots_vmm_paged(
+                &q,
+                k,
+                v,
+                &out,
+                &positions,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                SEQ_LEN,
+                BATCH,
+                Some(descs),
+                Some(&tile_slot),
+                Some(&tile_row0),
+                Some(&tile_qbase),
+            )
+        } else {
+            gpu.attention_q8_0_flash_prefill_wmma_slots(
+                &q,
+                k,
+                v,
+                &out,
+                &positions,
+                N_HEADS,
+                N_KV_HEADS,
+                HEAD_DIM,
+                SEQ_LEN,
+                BATCH,
+                Some(descs),
+                Some(&tile_slot),
+                Some(&tile_row0),
+                Some(&tile_qbase),
+            )
+        };
+        launch.expect("wmma launch");
+        gpu.hip.device_synchronize().expect("wmma sync");
+        let values = gpu.download_f32(&out).expect("wmma read");
+        gpu.free_tensor(out).unwrap();
+        values
+    };
+    let ref_out = run(gpu, &ref_k, &ref_v, &ref_descs, false);
+    let vmm_out = run(gpu, &vmm_k, &vmm_v, &vmm_descs, true);
+    assert!(
+        ref_out.iter().any(|v| v.to_bits() != 0),
+        "WMMA reference output is all zeros"
+    );
+    // Slot 1 must not be a copy of slot 0: the salts differ, so a kernel that
+    // pins every tile to slot 0 matches on the first 16 rows and diverges after.
+    let row = N_HEADS * HEAD_DIM;
+    assert_ne!(
+        &ref_out[..row],
+        &ref_out[ROWS * row..(ROWS + 1) * row],
+        "slot 1 WMMA output matches slot 0; the block table was ignored"
+    );
+    for (i, (a, b)) in ref_out.iter().zip(&vmm_out).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "WMMA bit mismatch at {i}: {a} vs {b}"
+        );
+    }
+    for t in [
+        block_table0,
+        block_table1,
+        ref_descs,
+        vmm_descs,
+        ref_k,
+        ref_v,
+        vmm_k,
+        vmm_v,
+        positions,
+        tile_slot,
+        tile_row0,
+        tile_qbase,
+        q,
+    ] {
+        gpu.free_tensor(t).unwrap();
+    }
+    println!("vmm_paged_kernel_parity: WMMA PASS");
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init_with_device(dev())?;
     q8_write_parity(&mut gpu);
     attention_parity(&mut gpu);
+    wmma_parity(&mut gpu);
     println!("vmm_paged_kernel_parity: PASS");
     Ok(())
 }

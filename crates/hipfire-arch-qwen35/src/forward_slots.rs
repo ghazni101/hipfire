@@ -2680,7 +2680,11 @@ fn q8_attend_slots(
     vmm_paged: bool,
 ) -> HipResult<()> {
     if let Some((k_base, slab_bytes)) = single_slot {
-        if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
+        // The pointer-shifted WMMA view assumes one contiguous slab. A
+        // VMM-paged slot's pages are packed into granules and may have
+        // holes, so this reduction is never valid there even if a caller
+        // forgets the `!pool.is_paged()` gate.
+        if !vmm_paged && q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
@@ -3718,6 +3722,10 @@ pub struct SlotDecodeGraph {
     key: Option<DecodeGraphKey>,
     captures: usize,
     replays: usize,
+    /// Context bucket baked into a prepared slots-PM4 tape. Crossing it
+    /// rearms: `max_ctx_len` lives in kernargs and `positions[]` only masks
+    /// within the captured bound.
+    redline_ctx_bucket: Option<usize>,
 }
 
 impl SlotDecodeGraph {
@@ -3742,6 +3750,128 @@ impl SlotDecodeGraph {
         }
         self.key = None;
     }
+}
+
+/// Position a paged PM4 tape may bind. All live rows must be single-token
+/// decode at the same absolute position — Redline patches one `pos` into
+/// every launch, so mixed slot positions cannot share a tape.
+fn lockstep_decode_pos(batch: &SlotBatch) -> Option<usize> {
+    if batch.is_empty() || !batch.m_per_slot.iter().all(|&m| m <= 1) {
+        return None;
+    }
+    if !batch.m_per_slot.iter().any(|&m| m == 1) {
+        return None;
+    }
+    let pos = *batch.positions.first()? as usize;
+    batch
+        .positions
+        .iter()
+        .all(|&p| p as usize == pos)
+        .then_some(pos)
+}
+
+fn decode_ctx_bucket(batch: &SlotBatch, physical_cap: usize) -> usize {
+    let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
+        .min(physical_cap)
+        .max(1);
+    true_ctx
+        .div_ceil(DECODE_GRAPH_CTX_BUCKET)
+        .saturating_mul(DECODE_GRAPH_CTX_BUCKET)
+        .min(physical_cap)
+        .max(1)
+}
+
+/// Retained-PM4 body for a lockstep paged decode step.
+///
+/// Uploads (tokens, positions, descriptors, block tables) stay outside the
+/// tape, same contract as the hipGraph path. The recorded kernels read those
+/// device buffers, so a later token can refresh `seq_len` / `positions[]`
+/// and replay. Crossing a context bucket rearms: `max_ctx_len` is baked.
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_slots_redline(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    kv: &SlotKvTier,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    cache: &mut SlotDecodeGraph,
+    lm_head_skip: &[bool],
+    pos: usize,
+) -> HipResult<()> {
+    let ctx_bucket = decode_ctx_bucket(batch, pool.cap_tokens());
+    if cache.redline_ctx_bucket != Some(ctx_bucket) && gpu.replay.should_route_pm4() {
+        gpu.replay.rearm_after_layout_growth();
+        cache.redline_ctx_bucket = None;
+    }
+    upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+    gpu.replay.set_forward_eligible(true);
+    gpu.replay
+        .begin_auto_capture_if_armed()
+        .map_err(|reason| HipError::new(0, reason))?;
+    if gpu.replay.should_route_pm4() {
+        return unsafe { gpu.replay_pm4_routed(pos) }.map_err(|reason| {
+            gpu.replay
+                .poison(format!("slots paged PM4 replay failed: {reason}"));
+            HipError::new(0, &reason)
+        });
+    }
+    let result = forward_batch_slots_opts(
+        gpu,
+        weights,
+        config,
+        batch,
+        pool,
+        dn_states,
+        k_arenas,
+        v_arenas,
+        desc_staging,
+        kv,
+        pbs,
+        s,
+        logits_out,
+        None,
+        SlotStepOpts {
+            skip_uploads: true,
+            ctx_override: Some(ctx_bucket),
+        },
+        lm_head_skip,
+        None,
+    );
+    if gpu.replay.should_auto_finalize_capture() {
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| HipError::new(0, &format!("slots paged PM4 capture sync: {e}")))?;
+        gpu.replay
+            .finish_capture()
+            .map_err(|reason| HipError::new(0, reason))?;
+        if gpu.replay.uses_pm4_transport() {
+            let launches = gpu.replay.recorded_launches().len();
+            if let Err(reason) = gpu
+                .replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            {
+                gpu.replay
+                    .poison(format!("slots paged PM4 prepare failed: {reason}"));
+                cache.redline_ctx_bucket = None;
+                eprintln!("[redline] slots paged falling back to HIP: {reason}");
+            } else {
+                cache.redline_ctx_bucket = Some(ctx_bucket);
+            }
+        } else {
+            gpu.replay
+                .poison("slots VMM-paged Redline is PM4-only".to_string());
+            cache.redline_ctx_bucket = None;
+        }
+    }
+    result
 }
 
 /// `forward_batch_slots` with hipGraph capture/replay for decode-shaped steps.
@@ -3829,7 +3959,34 @@ pub fn forward_batch_slots_graphed_opts(
     // vary step to step and would thrash the capture cache.
     let mtp_verify_shape =
         !batch.is_empty() && spec_verify_graph_shape(&batch.m_per_slot, verify_rows);
+    if pool.is_paged()
+        && spec_capture.is_none()
+        && gpu.replay.is_enabled()
+        && gpu.replay.uses_pm4_transport()
+    {
+        if let Some(pos) = lockstep_decode_pos(batch) {
+            return forward_batch_slots_redline(
+                gpu,
+                weights,
+                config,
+                batch,
+                pool,
+                dn_states,
+                k_arenas,
+                v_arenas,
+                desc_staging,
+                kv,
+                pbs,
+                s,
+                logits_out,
+                cache,
+                lm_head_skip,
+                pos,
+            );
+        }
+    }
     if !gpu.slots_decode_graph() || !(pure_decode || mtp_verify_shape) || pool.is_paged() {
+        gpu.replay.set_forward_eligible(false);
         return forward_batch_slots_opts(
             gpu,
             weights,
@@ -4692,6 +4849,26 @@ mod tests {
     use super::*;
     use hipfire_dispatch::types::KernelKey;
     use rdna_compute::DType;
+
+    #[test]
+    fn lockstep_decode_pos_requires_uniform_single_row() {
+        let mut batch = SlotBatch {
+            m_per_slot: vec![1, 0, 1],
+            tokens: vec![1, 2],
+            positions: vec![9, 9],
+            row_slot: vec![0, 2],
+            ..SlotBatch::default()
+        };
+        assert_eq!(lockstep_decode_pos(&batch), Some(9));
+        batch.positions[1] = 10;
+        assert_eq!(lockstep_decode_pos(&batch), None);
+        batch.m_per_slot = vec![2, 0, 0];
+        batch.tokens = vec![1, 2];
+        batch.positions = vec![9, 10];
+        batch.row_slot = vec![0, 0];
+        assert_eq!(lockstep_decode_pos(&batch), None);
+        assert_eq!(lockstep_decode_pos(&SlotBatch::default()), None);
+    }
 
     #[test]
     fn v2_one_to_one_keys_no_hfq4_fallback() {

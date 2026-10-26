@@ -298,13 +298,40 @@ impl SlotSnapshot {
 /// the two call sites must derive it the same way. Keeping it opaque here is
 /// what lets this module stay model-agnostic — `hipfire-runtime` cannot depend
 /// on an arch crate without a dependency cycle.
-fn page_arena_offset(phys: usize, page_bytes: usize, layout: Option<VmmPageLayout>) -> usize {
+fn page_arena_offset(
+    phys: usize,
+    page_bytes: usize,
+    layout: Option<VmmPageLayout>,
+) -> Result<usize, SwapError> {
     match layout {
         Some(layout) => {
             let p = layout.pages_per_granule as usize;
-            (phys / p) * layout.granule_bytes + (phys % p) * page_bytes
+            if p == 0 || layout.granule_bytes == 0 {
+                return Err(SwapError::Gpu(
+                    "VMM page offset: granule geometry is zero".into(),
+                ));
+            }
+            // The kernel's within-granule stride is layout.page_bytes
+            // (`page_tokens * per_pos_bytes`). A K/V page size that does not
+            // match would copy the right logical page to the wrong offset.
+            if page_bytes != layout.page_bytes {
+                return Err(SwapError::Gpu(format!(
+                    "VMM page offset: page is {page_bytes} B but the mapper page is {} B",
+                    layout.page_bytes
+                )));
+            }
+            let base = (phys / p)
+                .checked_mul(layout.granule_bytes)
+                .ok_or_else(|| SwapError::Gpu("VMM page offset overflowed".into()))?;
+            let within = (phys % p)
+                .checked_mul(page_bytes)
+                .ok_or_else(|| SwapError::Gpu("VMM page offset overflowed".into()))?;
+            base.checked_add(within)
+                .ok_or_else(|| SwapError::Gpu("VMM page offset overflowed".into()))
         }
-        None => phys * page_bytes,
+        None => phys
+            .checked_mul(page_bytes)
+            .ok_or_else(|| SwapError::Gpu("page offset overflowed".into())),
     }
 }
 
@@ -383,8 +410,10 @@ pub fn capture_slot_mapped(
                 // Copy full pages.
                 for lp in 0..n_full_pages {
                     let phys = bt.physical(lp).expect("page count pre-validated") as usize;
-                    let arena_off = page_arena_offset(phys, page_bytes, layout);
-                    let view = arena.sub_offset(arena_off, page_bytes);
+                    let arena_off = page_arena_offset(phys, page_bytes, layout)?;
+                    let view = arena
+                        .try_sub_offset(arena_off, page_bytes)
+                        .map_err(SwapError::Gpu)?;
                     gpu.hip
                         .memcpy_dtoh(&mut payload[off..off + page_bytes], &view.buf)
                         .map_err(|e| SwapError::Gpu(e.to_string()))?;
@@ -394,9 +423,11 @@ pub fn capture_slot_mapped(
                 if last_page_tokens > 0 {
                     let phys =
                         bt.physical(n_full_pages).expect("page count pre-validated") as usize;
-                    let arena_off = page_arena_offset(phys, page_bytes, layout);
+                    let arena_off = page_arena_offset(phys, page_bytes, layout)?;
                     let last_bytes = last_page_tokens * per_pos;
-                    let view = arena.sub_offset(arena_off, last_bytes);
+                    let view = arena
+                        .try_sub_offset(arena_off, last_bytes)
+                        .map_err(SwapError::Gpu)?;
                     gpu.hip
                         .memcpy_dtoh(&mut payload[off..off + last_bytes], &view.buf)
                         .map_err(|e| SwapError::Gpu(e.to_string()))?;
@@ -524,8 +555,10 @@ pub fn restore_slot_mapped(
                 // Copy full pages.
                 for lp in 0..n_full_pages {
                     let phys = bt.physical(lp).expect("page count pre-validated") as usize;
-                    let arena_off = page_arena_offset(phys, page_bytes, layout);
-                    let view = arena.sub_offset(arena_off, page_bytes);
+                    let arena_off = page_arena_offset(phys, page_bytes, layout)?;
+                    let view = arena
+                        .try_sub_offset(arena_off, page_bytes)
+                        .map_err(SwapError::Gpu)?;
                     gpu.hip
                         .memcpy_htod(&view.buf, &snap.payload[off..off + page_bytes])
                         .map_err(|e| SwapError::Gpu(e.to_string()))?;
@@ -535,9 +568,11 @@ pub fn restore_slot_mapped(
                 if last_page_tokens > 0 {
                     let phys =
                         bt.physical(n_full_pages).expect("page count pre-validated") as usize;
-                    let arena_off = page_arena_offset(phys, page_bytes, layout);
+                    let arena_off = page_arena_offset(phys, page_bytes, layout)?;
                     let last_bytes = last_page_tokens * per_pos;
-                    let view = arena.sub_offset(arena_off, last_bytes);
+                    let view = arena
+                        .try_sub_offset(arena_off, last_bytes)
+                        .map_err(SwapError::Gpu)?;
                     gpu.hip
                         .memcpy_htod(&view.buf, &snap.payload[off..off + last_bytes])
                         .map_err(|e| SwapError::Gpu(e.to_string()))?;

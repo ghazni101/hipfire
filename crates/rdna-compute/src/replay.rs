@@ -722,6 +722,38 @@ const fn write(offset: usize) -> PointerEffect {
 /// their compute-idle boundaries. Offsets are the naturally aligned HIP
 /// kernarg ABI offsets verified by the captured-blob/loader parity gate.
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
+    // Shared-pool `_vmm_paged` decode. Descriptor bytes live in `descs_dev`
+    // (kernarg holds the pointer); positions/row_slot are the same. Offsets
+    // match `attention.rs` blob builders after natural alignment + pad_to(16).
+    if kernel == "kv_cache_write_q8_0_batched_vmm_paged" {
+        return Some(vec![write(0), read(8), read(16), read(40), read(48)]);
+    }
+    if kernel == "attention_q8_0_kv_batched_vmm_paged" {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(80),
+            read(88),
+        ]);
+    }
+    if kernel == "attention_flash_q8_0_tile_batched_vmm_paged" {
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            write(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+            read(112),
+            read(120),
+        ]);
+    }
     // The repacker completely overwrites all three planes on each launch.
     // ADD is a read-modify-write of Y0, represented conservatively as Write.
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
@@ -1495,6 +1527,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "kv_cache_write_q8_0_batched_vmm_paged" {
+        return Some(64);
+    }
+    if kernel == "attention_q8_0_kv_batched_vmm_paged" {
+        return Some(96);
+    }
+    if kernel == "attention_flash_q8_0_tile_batched_vmm_paged" {
+        return Some(128);
+    }
     if kernel == "fused_rmsnorm_mq_rotate_f16" {
         return Some(48);
     }
@@ -9181,6 +9222,97 @@ mod tests {
 
         assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
         assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
+    fn vmm_paged_slots_effect_contracts_match_launch_blobs() {
+        use std::ffi::c_void;
+
+        let null = std::ptr::null::<c_void>();
+        let mut write = hip_bridge::KernargBlob::new();
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_i32(0);
+        write.push_i32(0);
+        write.push_i32(0);
+        write.push_ptr(null);
+        write.push_ptr(null);
+        write.push_i32(0);
+        write.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("kv_cache_write_q8_0_batched_vmm_paged"),
+            Some(write.len())
+        );
+        let write_fx = pointer_effects("kv_cache_write_q8_0_batched_vmm_paged")
+            .expect("vmm-paged write contract");
+        assert_eq!(
+            write_fx
+                .iter()
+                .map(|e| (e.offset, e.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, RecordedAccessMode::Write),
+                (8, RecordedAccessMode::Read),
+                (16, RecordedAccessMode::Read),
+                (40, RecordedAccessMode::Read),
+                (48, RecordedAccessMode::Read),
+            ]
+        );
+
+        let mut lds = hip_bridge::KernargBlob::new();
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_f32(0.0);
+        lds.push_i32(0);
+        lds.push_i32(0);
+        lds.push_ptr(null);
+        lds.push_ptr(null);
+        lds.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("attention_q8_0_kv_batched_vmm_paged"),
+            Some(lds.len())
+        );
+        assert_eq!(
+            pointer_effects("attention_q8_0_kv_batched_vmm_paged").map(|e| e.len()),
+            Some(8)
+        );
+
+        let mut tile = hip_bridge::KernargBlob::new();
+        for _ in 0..8 {
+            tile.push_ptr(null);
+        }
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_f32(0.0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_i32(0);
+        tile.push_ptr(null);
+        tile.push_ptr(null);
+        tile.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("attention_flash_q8_0_tile_batched_vmm_paged"),
+            Some(tile.len())
+        );
+        assert_eq!(
+            pointer_effects("attention_flash_q8_0_tile_batched_vmm_paged").map(|e| e.len()),
+            Some(10)
+        );
     }
 
     #[test]
