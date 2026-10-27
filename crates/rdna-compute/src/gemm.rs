@@ -40303,8 +40303,12 @@ impl Gpu {
         // `convert_f32_to_f16`. A 4-slot retained tape was paying that convert
         // plus an empty 12-row tile every MoE layer. The x-batch GEMV reads
         // each weight row once for up to four activations and writes Y
-        // outright, matching the slots QKV path.
-        if (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+        // outright, matching the slots QKV path. gfx1100 only: the retained
+        // slots tape this route exists for is gfx1100, and the GEMV's f32-x
+        // arithmetic differs from the WMMA arms below, so gfx1151/gfx1201
+        // keep the incumbent kernels and their byte identity.
+        if self.arch_caps.is_gfx1100()
+            && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
             && k.is_multiple_of(256)
         {
             if batch_size == 1 {

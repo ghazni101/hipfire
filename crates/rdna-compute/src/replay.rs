@@ -1584,6 +1584,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if kernel == "attention_flash_q8_0_tile_batched_vmm_paged" {
         return Some(128);
     }
+    // X-batched MQ4V2 GEMV: `a, x, y` pointers then three i32 (`m`, `k`, `b`),
+    // no trailing pad, so the recorded blob is 36 bytes. Their pointer
+    // effects below are inert without this arm.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_xbatch" | "gemv_mq4g256v2_xbatch_residual"
+    ) {
+        return Some(36);
+    }
     if kernel == "fused_rmsnorm_mq_rotate_f16" {
         return Some(48);
     }
@@ -12305,10 +12314,9 @@ mod tests {
         let metadata_kernarg_size = 80usize;
         assert!(metadata_kernarg_size >= 80);
         let bindings: Vec<(usize, ReplayKernargBinding)> = vec![];
-        let is_gdn =
-            kernel == "gated_delta_net_q8_fast"
-        || kernel == "gated_delta_net_q8_fast_slots"
-        || kernel.starts_with("gated_delta_net_q8_compact");
+        let is_gdn = kernel == "gated_delta_net_q8_fast"
+            || kernel == "gated_delta_net_q8_fast_slots"
+            || kernel.starts_with("gated_delta_net_q8_compact");
         assert!(is_gdn);
         let has_binding = bindings.iter().any(|(_, b)| {
             matches!(

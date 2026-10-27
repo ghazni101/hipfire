@@ -4814,11 +4814,13 @@ fn prefill_shared_down_stage(
         DType::MQ4G256V2 | DType::MQ6G256V2 | DType::Q8_0 | DType::F32 => {
             // Decode-width MQ4V2: fold sigmoid(gate)*down into the residual
             // GEMV. The incumbent writes a temp then launches
-            // `sigmoid_scaled_residual_add_batched_f32`.
+            // `sigmoid_scaled_residual_add_batched_f32`. gfx1100 only: the
+            // retained slots tape this replaces launches there, and the fold
+            // is a different accumulation than the incumbent.
             if down.dtype == DType::MQ4G256V2
+                && gpu.arch_caps.is_gfx1100()
                 && prepared.is_none()
-                && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
-                    .contains(&p.batch_size)
+                && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&p.batch_size)
                 && down.k.is_multiple_of(256)
                 && down.m == dim
             {

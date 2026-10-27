@@ -1127,7 +1127,11 @@ fn scalar_dots(b: &mut Builder, x: u8, tail: bool) -> R {
 
 fn scalar_operands(x: u8, tail: bool, row: usize, n: u8) -> (u8, u8) {
     let w = W[row] + n;
-    if tail { (x + n, w) } else { (w, x + n) }
+    if tail {
+        (x + n, w)
+    } else {
+        (w, x + n)
+    }
 }
 
 fn scalar_one(b: &mut Builder, x: u8, tail: bool, row: usize, index: u8, order: [u8; 8]) -> R {

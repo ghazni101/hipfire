@@ -795,6 +795,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            ["gated_delta_net_q8_fast_slots"]
+        );
+        add!(
             "gdn_pre_batched_gfx1201",
             include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip"),
             ["gdn_pre_batched_gfx1201"]
@@ -1182,6 +1187,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_net_q8_fast",
                 "gated_delta_net_q8_fast_independent_masked"
             ]
+        );
+        add!(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            ["gated_delta_net_q8_fast_slots"]
         );
         add!(
             "gdn_chunk_prep_gfx11",
@@ -3891,6 +3901,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
             kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_GFX1100_SRC,
             ["gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"]
+        );
+        // Multi-slot MoE decode: the same bodies with the token folded into
+        // grid.x so one launch serves up to four live lanes
+        // (gemv.rs `gemv_moe_gate_up_k8_slots`, `gemv_moe_ninepath_rpb8_slots`).
+        add!(
+            "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100",
+            kernels::GEMV_MQ4G256V2_MOE_GATE_UP_K8_SLOTS_GFX1100_SRC,
+            ["gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100"]
+        );
+        add!(
+            "gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100",
+            kernels::GEMV_MQ4G256V2_MOE_NINEPATH_RPB8_SLOTS_GFX1100_SRC,
+            ["gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100"]
+        );
+        // Decode-width shared-expert down fold (`sigmoid(c) * (A . x)` added to
+        // the residual), gfx1100 only (hipfire-dispatch `qt44_qt53_prefill`
+        // and `pipeline/mod.rs`).
+        add!(
+            "gemv_mq4g256v2_xbatch_residual_sigmoid",
+            kernels::GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC,
+            ["gemv_mq4g256v2_xbatch_residual_sigmoid"]
         );
         add!(
             "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch",

@@ -25643,10 +25643,16 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
 
 /// `*_vmm_paged` symbol of a q8/fp8 descriptor-aware kernel. Only the tiers
 /// the VMM-paged backend admits in phase 1 are listed.
+///
+/// `attention_q8_0_flash_prefill_wmma` is deliberately absent: its VMM-paged
+/// load goes through `attention_q8_0_flash_prefill_wmma_slots_impl` (module
+/// `..._gfx11_hd<d>[_splitq]_vmm_paged`), and the only caller of this helper
+/// asserts that a descriptor grid never takes the WMMA tile
+/// (`launch_asym_flash_batched_variant`), so a variant here could not be
+/// requested by either side.
 fn kv_slot_vmm_paged_symbol(func: &str) -> Option<&'static str> {
     Some(match func {
         "attention_flash_q8_0_tile_batched" => "attention_flash_q8_0_tile_batched_vmm_paged",
-        "attention_q8_0_flash_prefill_wmma" => "attention_q8_0_flash_prefill_wmma_vmm_paged",
         _ => return None,
     })
 }

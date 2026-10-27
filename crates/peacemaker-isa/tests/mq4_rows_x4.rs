@@ -1383,7 +1383,10 @@ fn scalar_dot_text(line: &str) -> Option<(usize, String)> {
     if dst != 24 && dst != 25 {
         return None;
     }
-    Some((dst, format!("{op} {}, {}, {}", parts[0], parts[1], parts[2])))
+    Some((
+        dst,
+        format!("{op} {}, {}, {}", parts[0], parts[1], parts[2]),
+    ))
 }
 
 #[test]
