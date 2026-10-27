@@ -720,7 +720,7 @@ impl ResidentKvDiag {
                 KvBackendRequest::Automatic,
                 KvBackend::Legacy,
                 Some(
-                    "kv_backend not requested; the slot route defaults to legacy arenas                      (pass --kv-backend vmm for per-slot VMM KV)",
+                    "kv_backend not requested; the slot route defaults to legacy arenas (pass --kv-backend vmm for per-slot VMM KV)",
                 ),
             ),
         }
@@ -1545,7 +1545,11 @@ fn main() {
                     // Emit the effective slot backend once here; prior
                     // model/slot is about to be torn down. A paged VMM pool
                     // is its own storage route, so it must not inherit the
-                    // per-slot route's automatic-legacy disclosure.
+                    // per-slot route's automatic-legacy disclosure. Resolve
+                    // it with the engine's own predicate: `slot_params`
+                    // carries the CLI's fully derived pool flag (config, page
+                    // count, prefix cache and the developer aliases), and the
+                    // backend spelling must trim like the engine's.
                     let paged_backend =
                         hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
                             .ok()
@@ -1553,7 +1557,11 @@ fn main() {
                             .unwrap_or_else(|| slot_params.multi_slot_paged_backend.clone());
                     let paged_vmm = (slot_params.multi_slot_paged
                         || slot_params.multi_slot_paged_pages > 0)
-                        && paged_backend.eq_ignore_ascii_case("vmm");
+                        && hipfire_config::select_paged_vmm_backend(
+                            Some(paged_backend.as_str()),
+                            &slot_params.multi_slot_paged_backend,
+                        )
+                        .unwrap_or(false);
                     let slot_kv_diag = if paged_vmm {
                         ResidentKvDiag::for_paged_vmm()
                     } else {

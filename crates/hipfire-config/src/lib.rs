@@ -4703,6 +4703,34 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
 }
+
+/// Resolve the shared paged pool's physical backend.
+///
+/// `env_backend` is `HIPFIRE_SLOTS_PAGED_BACKEND` when the process snapshot
+/// has it; it overrides `configured` (`serve.multi_slot_paged_backend`).
+/// Only `arena` and `vmm` are accepted, trimmed and case-insensitively;
+/// anything else, including a padded or empty override, is an error so a typo
+/// cannot silently select arena.
+///
+/// One implementation for the engine, the CLI's startup gate and the daemon's
+/// KV diagnostic: those three used to disagree on trimming and on which flags
+/// select the pool, which let a running VMM-paged server be reported as
+/// legacy KV.
+pub fn select_paged_vmm_backend(
+    env_backend: Option<&str>,
+    configured: &str,
+) -> std::result::Result<bool, String> {
+    let override_backend = env_backend.map(str::trim).filter(|value| !value.is_empty());
+    let value = override_backend.unwrap_or(configured.trim());
+    match value.to_ascii_lowercase().as_str() {
+        "vmm" => Ok(true),
+        "arena" => Ok(false),
+        other => Err(format!(
+            "paged KV backend must be `arena` or `vmm`, got {other:?}"
+        )),
+    }
+}
+
 /// Strict process-snapshot boolean for the `HIPFIRE_*` long tail.
 /// Reads exactly one snapshot value: `"1"` is true, `"0"` is false, and
 /// anything else (absent, empty, or any other spelling) falls back to

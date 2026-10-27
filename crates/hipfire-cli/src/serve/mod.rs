@@ -1778,28 +1778,59 @@ pub(crate) fn serve_foreground(
         .unwrap_or(config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192));
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
-    // Shared paged KV pool for the multi-slot engine. `--multi-slot-paged`
-    // or an explicit page count selects it; otherwise the process config
-    // decides. pages=0 auto-sizes from post-weight free VRAM.
-    let multi_slot_paged = args.multi_slot_paged
-        || args.multi_slot_paged_pages.is_some()
-        || config_bool(&global, "serve.multi_slot_paged")?;
+    // Shared paged KV pool for the multi-slot engine. `--multi-slot-paged`,
+    // an explicit page count, the process config or the developer aliases
+    // select it; pages=0 auto-sizes from post-weight free VRAM. On the
+    // multi-slot route the prefix cache shares physical pages through the
+    // pool, so the engine selects it there as well — the flag on the wire
+    // must say so, because the daemon's KV diagnostic trusts it.
+    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    let env_paged_alias = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+        .ok()
+        .and_then(|v| match v.as_str() {
+            "1" | "on" | "true" => Some(true),
+            "0" | "off" | "false" => Some(false),
+            _ => None,
+        });
+    let env_pages_alias = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
     let multi_slot_paged_pages = args
         .multi_slot_paged_pages
         .unwrap_or(config_u64(&global, "serve.multi_slot_paged_pages")?);
-    let multi_slot_paged_backend = config_string(&global, "serve.multi_slot_paged_backend")?;
-    if !matches!(multi_slot_paged_backend.as_str(), "arena" | "vmm") {
-        bail!(
-            "serve.multi_slot_paged_backend must be `arena` or `vmm`, got {:?}",
-            multi_slot_paged_backend
-        );
+    let mut multi_slot_paged = args.multi_slot_paged
+        || args.multi_slot_paged_pages.is_some()
+        || config_bool(&global, "serve.multi_slot_paged")?
+        || multi_slot_paged_pages > 0
+        || env_paged_alias == Some(true)
+        || env_pages_alias.is_some_and(|pages| pages > 0);
+    if prefix_cache && multi_slot_enabled {
+        // A prefix cache outside the multi-slot route belongs to that route,
+        // not to this pool, so never let it flip the flag on its own.
+        multi_slot_paged = true;
     }
-    if multi_slot_paged_backend == "vmm" && !multi_slot_paged {
+    let multi_slot_paged_backend = config_string(&global, "serve.multi_slot_paged_backend")?;
+    // One resolver for the physical backend: `HIPFIRE_SLOTS_PAGED_BACKEND`
+    // wins, a padded/unknown spelling is an error, and `arena` is the default
+    // (`hipfire_config::select_paged_vmm_backend`, shared with the engine).
+    let paged_vmm = hipfire_config::select_paged_vmm_backend(
+        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+            .ok()
+            .as_deref(),
+        &multi_slot_paged_backend,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    if paged_vmm && !multi_slot_paged {
         bail!("serve.multi_slot_paged_backend=vmm requires serve.multi_slot_paged=true");
     }
     if multi_slot_paged && !multi_slot_enabled {
         bail!("--multi-slot-paged requires serve.multi_slot / HIPFIRE_SERVE_MULTI_SLOT=1");
     }
+    // Downstream (capabilities, slot load params) advertises what the engine
+    // will actually run: the resolver's canonical `vmm`/`arena`, not the raw
+    // config spelling. Otherwise `/health` said `arena` while
+    // `HIPFIRE_SLOTS_PAGED_BACKEND=vmm` had selected the VMM pool.
+    let multi_slot_paged_backend = if paged_vmm { "vmm" } else { "arena" }.to_string();
     // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
     // consumes both (row budget and prefill quantum); other standard routes
     // read them for startup validation only.
@@ -1823,8 +1854,8 @@ pub(crate) fn serve_foreground(
     };
     // Cache/scheduler route flags (spec §9.1). Read with the SAME config
     // resolution the daemon applies so /health advertises the engine's
-    // actual build options.
-    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    // actual build options. `prefix_cache` is resolved above (it selects the
+    // shared paged pool on this route).
     let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
     let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
     // Multi-slot uses one shared prefill scratch with a **total** row budget:

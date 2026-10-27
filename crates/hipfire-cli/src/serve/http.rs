@@ -2259,6 +2259,10 @@ async fn handle_nonstreaming(
                 .get("model")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
+            let base_seed = body_for_worker
+                .get("seed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let mut first_guard = Some(guard);
             let mut completions = Vec::with_capacity(choices as usize);
             for choice in 0..choices {
@@ -2273,9 +2277,18 @@ async fn handle_nonstreaming(
                         .acquire_for(is_eligible, model.as_deref())
                         .map_err(|error| anyhow!("{}", error.message))?,
                 };
+                // Mirror the streaming fan-out: with an explicit `seed` the
+                // daemon derives the sampler stream from it alone, so passing
+                // the request body unchanged made every non-streaming choice
+                // byte-identical.
+                let mut choice_body = body_for_worker.clone();
+                if choices > 1 {
+                    choice_body["n"] = serde_json::json!(1);
+                    choice_body["seed"] = serde_json::json!(base_seed + choice as u64);
+                }
                 let completion = complete_request_cancellable(
                     &shared_clone,
-                    &body_for_worker,
+                    &choice_body,
                     guard,
                     None,
                     &cancelled,
@@ -2283,7 +2296,6 @@ async fn handle_nonstreaming(
                     |_completion| Ok(()),
                 )?;
                 completions.push(completion);
-                let _ = choice;
             }
             Ok::<_, anyhow::Error>(completions)
         }));

@@ -3769,12 +3769,7 @@ fn rebuild_batch_excluding_failed(batch: &mut SlotBatch, failed: &[usize]) {
     batch.ext_emb = new_ext_emb;
 }
 
-/// Resolve the shared paged pool's physical backend.
-///
-/// `env_backend` is `HIPFIRE_SLOTS_PAGED_BACKEND` when the process snapshot
-/// has it. It overrides `configured` (`serve.multi_slot_paged_backend`).
-/// Only `arena` and `vmm` are accepted; anything else, including a padded
-/// or empty override, is an error so a typo cannot silently select arena.
+/// Model-arch label for the retained-PM4 default predicate and log lines.
 fn slots_model_arch(arch_id: u32) -> &'static str {
     match arch_id {
         6 => "qwen3_5_moe",
@@ -3902,16 +3897,14 @@ fn split_isolated_prefill(batch: &SlotBatch, isolate: &[bool]) -> (Vec<SlotBatch
     (isolated, rest)
 }
 
-fn select_paged_vmm_backend(env_backend: Option<&str>, configured: &str) -> Result<bool, String> {
-    let override_backend = env_backend.map(str::trim).filter(|value| !value.is_empty());
-    let value = override_backend.unwrap_or(configured.trim());
-    match value.to_ascii_lowercase().as_str() {
-        "vmm" => Ok(true),
-        "arena" => Ok(false),
-        other => Err(format!(
-            "paged KV backend must be `arena` or `vmm`, got {other:?}"
-        )),
-    }
+/// The engine's view of the shared paged pool's physical backend. The
+/// resolver itself lives in `hipfire_config` so the CLI's startup gate and
+/// the daemon's KV diagnostic cannot drift from the engine.
+pub fn select_paged_vmm_backend(
+    env_backend: Option<&str>,
+    configured: &str,
+) -> Result<bool, String> {
+    hipfire_config::select_paged_vmm_backend(env_backend, configured)
 }
 
 fn cow_offset(phys: u32, page_bytes: usize, layout: Option<VmmPageLayout>) -> Option<usize> {
