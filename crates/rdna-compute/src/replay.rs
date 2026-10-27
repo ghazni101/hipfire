@@ -6924,7 +6924,17 @@ impl ReplayController {
                         }
                     }
                     for commands in &mut lanes {
-                        commands.trailing_release()?;
+                        // Native semaphores publish with WRITE_DATA only when
+                        // the lane already ends in CS_PARTIAL_FLUSH. A system
+                        // acquire here hides that idle and the gfx11 native
+                        // builder refuses the tape. The next phase's entry
+                        // acquire, plus the terminal acquire on the stitched
+                        // stream, still covers GL2.
+                        if native_phase_sync {
+                            commands.wait_compute_idle()?;
+                        } else {
+                            commands.trailing_release()?;
+                        }
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -6993,7 +7003,11 @@ impl ReplayController {
                         )
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
-                commands.trailing_release()?;
+                if native_phase_sync {
+                    commands.wait_compute_idle()?;
+                } else {
+                    commands.trailing_release()?;
+                }
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
