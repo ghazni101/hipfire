@@ -194,7 +194,7 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
         Err(HipError::new(
             0,
             &format!(
-                "this model uses the {} weight format (qt 57/58): MQ4V2 codes stored for the IU4 or IU8 matrix unit, and no GPU kernel reads it yet",
+                "this model uses the {} weight format (qt 57/58/59): an integer-matrix operand layout, and no GPU kernel reads it yet",
                 dtype.iu_quant_name().unwrap_or("IU")
             ),
         ))

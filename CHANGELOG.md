@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **IU4/IU8 quant family (qt 57/58): MQ4V2 codes stored as integer-matrix operands.** `--format iu4` and `--format iu8` on `hipfire-quantize` follow the MQ4V2 tensor map and write each 4-bit row as a contiguous code plane plus the per-128 fp16 scale/zero pairs: unsigned nibbles for IU4 (4.25 bpw), or one byte `0..=15` per weight for IU8 (8.25 bpw, not a new 8-bit grid). Generic GEMV/GEMM refuse the dtypes; no kernel reads them yet. Layout: [docs/quant-formats/iu.md](docs/quant-formats/iu.md).
+- **IU4/IU8 quant family (qt 57/58/59): integer-matrix operands.** The products are `iu4-xt`, `iu4`, `iu4 pro` and the same three rungs of `iu8`. `--format iu4` / `--format iu8` on `hipfire-quantize` follow the MQ4V2 tensor map for the body and write each such row as a contiguous code plane plus the per-128 fp16 scale/zero pairs: unsigned nibbles for IU4 (qt 57, 4.25 bpw), or one byte `0..=15` per weight for IU8 (qt 58, 8.25 bpw, not a new 8-bit grid). An omitted `--tier` is the bare name (`base`; `--tier normal` is the same rung): embeddings and `lm_head` are qt 59 `IU8G32` (signed int8, one fp16 scale per 32, 8.5 bpw). `xt` leaves `lm_head` on the body. `pro` also lifts `ssm_out`. conv1d stays on the Q8 grid at every rung; norms stay F16. Generic GEMV/GEMM refuse the dtypes; no kernel reads them yet. Layout: [docs/quant-formats/iu.md](docs/quant-formats/iu.md).
 
 ## v0.4.4 — 2026-10-27
 

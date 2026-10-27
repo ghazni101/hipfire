@@ -740,6 +740,12 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 58,
         dtype: DType::IU8G256,
     },
+    // qt=59: Q8F16 codes as a contiguous signed int8 plane, scales at the
+    // tail. Verbatim upload. `iu_quant::validate_q8` checks the length.
+    RawCodec {
+        quant_type: 59,
+        dtype: DType::IU8G32,
+    },
 ];
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
@@ -790,6 +796,14 @@ pub(crate) fn decode_raw_codec(
         _ => None,
     } {
         if let Err(error) = crate::iu_quant::validate(data, m, k, layout) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{error} (caller: {name}){BLOB_FIX}"),
+            ));
+        }
+    }
+    if codec.dtype == DType::IU8G32 {
+        if let Err(error) = crate::iu_quant::validate_q8(data, m, k) {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!("{error} (caller: {name}){BLOB_FIX}"),
@@ -1992,6 +2006,8 @@ mod tests {
             // hipfire-quantize `QuantType::IU4G256 = 57` / `IU8G256 = 58`.
             (57, DType::IU4G256),
             (58, DType::IU8G256),
+            // qt=59: planar Q8 operand. rhs pinned against QuantType::IU8G32 = 59.
+            (59, DType::IU8G32),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

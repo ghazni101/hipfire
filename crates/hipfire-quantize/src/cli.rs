@@ -330,8 +330,9 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub vision_only: bool,
 
-    /// Product tier for Qwen3.8 ladder: xt keeps lm_head at base codec, base lifts lm_head, pro also lifts ssm_out (linear_attn.out_proj).
-    /// embed_tokens and linear_attn.conv1d.weight remain Q8 at every rung; structural tensors remain F16.
+    /// Product tier: `xt` keeps lm_head at the body codec, `base` (alias `normal`) lifts lm_head, `pro` also lifts ssm_out.
+    /// embed_tokens and linear_attn.conv1d.weight stay above the body at every rung; structural tensors stay F16.
+    /// On `iu4` / `iu8` the lifted roles are IU8G32 and an omitted flag selects `base`.
     #[arg(long, value_name = "TIER")]
     pub tier: Option<String>,
 

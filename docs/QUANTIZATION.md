@@ -36,6 +36,7 @@ Production defaults for day-to-day use:
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
 | `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. No GPU kernel yet |
 | `iu8` | `IU8G256` (qt 58) | 4 | 8.25 | 264 (K bytes of codes 0..=15, then the same scales) | Same codes, pre-expanded for the IU8 unit. Not an 8-bit grid |
+| `iu4` / `iu8` lifted roles | `IU8G32` (qt 59) | 8 | 8.5 | 272 (K signed codes, then 2 B scale per 32) | Q8 grid, scales at the row tail. Embeddings every rung; lm_head on `iu4`/`iu8` and `pro`; ssm_out on `pro` |
 
 **Nominal bitwidth is not bpw.** The “bits” column is the payload width only.
 Stored bpw is the exact group arithmetic and includes the per-group header:
@@ -46,7 +47,12 @@ role lifts sit above the base width; see [ladder.md](quant-formats/ladder.md)), 
 none of these figures is a performance or quality claim.
 
 Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
-(Q4-grade embedding error compounds). 1D norms / scales stay F16. Direct
+(Q4-grade embedding error compounds). On `iu4` / `iu8` that same grid is
+stored as `IU8G32` (qt 59) for the roles the rung lifts: the signed codes
+are contiguous and the scales sit at the end of the row, which is the
+operand `v_wmma_i32_16x16x16_iu8` loads. The bare product lifts embeddings
+and `lm_head`. `iu4-xt` leaves `lm_head` on the body. `iu4 pro` also lifts
+`ssm_out`. It is not qt 58. 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
 ### Magnum V2 family (qt 44 / 47–50 / 52), MQ4C (qt 45) and MQ4G128V2 (qt 53)

@@ -814,6 +814,13 @@ pub enum DType {
     /// (`K` code bytes, then the same scale plane). 8.25 bpw. The byte is the
     /// IU8 WMMA operand, not a new 8-bit grid. No GPU kernel yet.
     IU8G256,
+    /// IU8-G32 (qt=59): the Q8F16 grid (signed int8, one f16 scale per 32,
+    /// zero point 0, no FWHT) stored as a contiguous code plane. `K` code
+    /// bytes, then `(K/32)` little-endian f16 scales. `K % 32 == 0`, 8.5 bpw.
+    /// This is the signed operand of `v_wmma_i32_16x16x16_iu8`. Not qt=58:
+    /// those bytes are MQ4 nibbles. No GPU kernel yet. See
+    /// `hipfire_runtime::iu_quant::repack_q8f16`.
+    IU8G32,
     /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
     /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
     /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
@@ -1023,7 +1030,8 @@ impl DType {
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128
             | DType::IU4G256
-            | DType::IU8G256 => 1, // byte-level
+            | DType::IU8G256
+            | DType::IU8G32 => 1, // byte-level
         }
     }
 
@@ -1086,6 +1094,14 @@ impl DType {
                     Some(codes + (k / 128) * 4)
                 }
             }
+            // qt=59. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
+            DType::IU8G32 => {
+                if k % 32 != 0 {
+                    None
+                } else {
+                    Some(k + (k / 32) * 2)
+                }
+            }
             _ => None,
         }
     }
@@ -1127,6 +1143,7 @@ impl DType {
         match self {
             DType::IU4G256 => Some("IU4G256"),
             DType::IU8G256 => Some("IU8G256"),
+            DType::IU8G32 => Some("IU8G32"),
             _ => None,
         }
     }
@@ -10371,6 +10388,14 @@ mod tests {
         assert!(DType::IU4G256.is_iu_quant());
         assert!(!DType::MQ4G256V2.is_iu_quant());
         assert!(!DType::IU4G256.is_mq_i4());
+        // qt=59 is the Q8 grid, group 32, not the K%256 MQ4 repack.
+        assert_eq!(DType::IU8G32.row_bytes(32), Some(34));
+        assert_eq!(DType::IU8G32.row_bytes(256), Some(272));
+        assert_eq!(DType::IU8G32.row_bytes(31), None);
+        assert!(!DType::IU8G32.requires_k_mod_256());
+        assert!(!DType::IU8G32.supports_awq_sidecar());
+        assert_eq!(DType::IU8G32.iu_quant_name(), Some("IU8G32"));
+        assert!(DType::IU8G32.is_iu_quant());
     }
 
     #[test]

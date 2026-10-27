@@ -86,6 +86,12 @@ pub fn run_mtp_fill_mq4(
 
 /// Select the residual GEMM key for a packed weight container.
 pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
+    if dtype.is_iu_quant() {
+        panic!(
+            "residual_gemm_key_for: {} has no residual key — no GPU kernel reads the IU operand layouts",
+            dtype.iu_quant_name().unwrap_or("IU")
+        );
+    }
     match dtype {
         // qt=15/qt=8 share the 200 B/group 6-bit container; the HFQ4 default
         // below would read them at the 136 B stride and return noise.
@@ -251,7 +257,7 @@ impl GemmFamily {
             | DType::E8PI4G128R128 => {
                 return Err(reject_mq_i4(dtype, "gemm"));
             }
-            DType::IU4G256 | DType::IU8G256 => {
+            DType::IU4G256 | DType::IU8G256 | DType::IU8G32 => {
                 return Err(crate::types::reject_iu(dtype, "gemm"));
             }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,

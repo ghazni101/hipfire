@@ -2224,6 +2224,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         56 => "FP8E4M3PT",
         57 => "IU4G256",
         58 => "IU8G256",
+        59 => "IU8G32",
         131 => "MQ3I4G128R256",
         132 => "MQ3I4G128R128",
         133 => "MQ2I4G128R256",

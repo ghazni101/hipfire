@@ -772,6 +772,7 @@ mod residual_coverage_tests {
             E8PI4G128R128,
             IU4G256,
             IU8G256,
+            IU8G32,
         );
         let mut missing = Vec::new();
         for dtype in all {

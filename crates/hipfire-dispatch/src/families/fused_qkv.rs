@@ -9,6 +9,14 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Select the fused gate/up kernel key for a packed weight container.
 pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
+    // The `_` arm below is the HFQ4 container. An IU operand is a different
+    // layout; aliasing it would run that kernel and return noise.
+    if dtype.is_iu_quant() {
+        panic!(
+            "fused_gate_up_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            dtype.iu_quant_name().unwrap_or("IU")
+        );
+    }
     match dtype {
         DType::Q8_0 => KernelKey::FusedGateUpQ8_0,
         // qt=15/qt=8 share the 200 B/group 6-bit container. The MoE shared
@@ -53,6 +61,12 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
 // found. Select on the container; never hardcode.
 
 pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
+    if dt.is_iu_quant() {
+        panic!(
+            "fused_qkvza_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            dt.iu_quant_name().unwrap_or("IU")
+        );
+    }
     match dt {
         DType::Q8_0 => KernelKey::FusedQkvzaQ8_0,
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
@@ -75,6 +89,12 @@ pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 }
 
 pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
+    if dt.is_iu_quant() {
+        panic!(
+            "fused_qkv_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            dt.iu_quant_name().unwrap_or("IU")
+        );
+    }
     match dt {
         DType::Q8_0 => KernelKey::FusedQkvQ8_0,
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,

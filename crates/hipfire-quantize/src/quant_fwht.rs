@@ -1078,6 +1078,35 @@ mod tests {
     }
 
     #[test]
+    fn iu8g32_repack_of_q8f16_dequants_to_the_same_grid() {
+        use super::f16_to_f32;
+        use hipfire_runtime::iu_quant::{dequant_q8, q8_row_bytes, repack_q8f16};
+        let m = 2usize;
+        let k = 64usize;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.07).sin() * 3.0 - 1.2)
+            .collect();
+        let q8 = crate::quant_q4::quantize_q8f16(&w);
+        let packed = repack_q8f16(&q8, m, k).unwrap();
+        assert_eq!(packed.len(), m * q8_row_bytes(k).unwrap());
+        let got = dequant_q8(&packed, m, k).unwrap();
+        // Same reconstruction as the interleaved blocks: scale * i8(code).
+        for row in 0..m {
+            for g in 0..(k / 32) {
+                let base = (row * (k / 32) + g) * 34;
+                let scale = f16_to_f32(u16::from_le_bytes([q8[base], q8[base + 1]]));
+                for i in 0..32 {
+                    let code = q8[base + 2 + i] as i8;
+                    let expect = scale * f32::from(code);
+                    let actual = got[row * k + g * 32 + i];
+                    assert!((actual - expect).abs() < 1e-6, "{actual} vs {expect}");
+                    assert_eq!(packed[row * q8_row_bytes(k).unwrap() + g * 32 + i], code as u8);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mq4g256v2_learned_code_export_is_byte_exact() {
         let m = 2usize;
         let k = 512usize;

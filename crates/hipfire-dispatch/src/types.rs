@@ -124,6 +124,9 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | IU4G256 | IU8G256 => RotationPlan::FwhtG256,
+        // qt=59 is the Q8 grid in the natural basis. Mapping it to FwhtG256
+        // would rotate activations against weights that were not rotated.
+        IU8G32 => RotationPlan::None,
         // MQ-I4 (qt=131..=136) are typed-qwen4-only; their activation basis
         // is fixed by the profile's rotation width (R256 / R128).
         MQ3I4G128R256 | MQ2I4G128R256 | E8PI4G128R256 => RotationPlan::FwhtG256,
@@ -865,7 +868,7 @@ impl KernelKey {
                 | E8PI4G128R128,
                 _,
             ) => Err(reject_mq_i4(dtype, "gemv")),
-            (IU4G256 | IU8G256, _) => Err(reject_iu(dtype, "gemv")),
+            (IU4G256 | IU8G256 | IU8G32, _) => Err(reject_iu(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -926,7 +929,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 => Err(reject_iu(dtype, "gemv")),
+            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -971,7 +974,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 => Err(reject_iu(dtype, "gemv")),
+            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -1007,7 +1010,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 => Err(reject_iu(dtype, "gemv")),
+            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
             // qt=52 shares the qt=44 key: the SwiGLU-residual variant is a
             // residual GEMV over caller-supplied silu(gate)*up (already
             // FWHT-rotated), and the family arm branches on the WEIGHT dtype to
@@ -1084,9 +1087,9 @@ impl KernelKey {
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => ArchPredicate::Always,
-            // qt=57/58 have no kernel. Explicit so they cannot inherit a
-            // neighbouring MQ4 route.
-            IU4G256 | IU8G256 => ArchPredicate::Always,
+            // qt=57/58/59 have no kernel. Explicit so they cannot inherit a
+            // neighbouring MQ4 or Q8 route.
+            IU4G256 | IU8G256 | IU8G32 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

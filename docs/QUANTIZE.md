@@ -21,6 +21,7 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 | **`mq4`** *(alias)* / `mq4v2` | **qt 44 `MQ4G256V2`** | 4 | FWHT | Qwen 3.5+ default body. **`--format mq4` means V2, not qt 13.** |
 | `iu4` / `iu4g256` | qt 57 `IU4G256` | 4 | FWHT | Same MQ4V2 codes, stored as an unsigned-nibble row for the IU4 matrix unit. **`hipfire-quantize` direct. No GPU kernel yet.** |
 | `iu8` / `iu8g256` | qt 58 `IU8G256` | 4 (byte operand) | FWHT | Same codes, one byte `0..=15` each, for the IU8 matrix unit. **Not an 8-bit grid. No GPU kernel yet.** |
+| `iu4` / `iu8` lifted roles | qt 59 `IU8G32` | 8 | none | Embeddings on every rung, `lm_head` on the bare name and `pro`, `ssm_out` on `pro`: the Q8 grid with scales at the row tail, a signed IU8 operand. **Not qt 58. No GPU kernel yet.** |
 | `mq4v1` / `mq4g256` / `magnum` | qt 13 `MQ4G256` | 4 | FWHT | Legacy Magnum v1 only (explicit opt-in) |
 | `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |
 | `mq6` | qt 15 `MQ6G256` | 6 | FWHT | Qwen 3.5+ v1 when you can spare size for quality |
@@ -44,7 +45,7 @@ grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
 CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
 further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
 `mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, `iu4`, `iu8`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
-`hipfire-quantize` directly. `iu4` / `iu8` follow the MQ4V2 tensor map and store those codes for the integer matrix units; no kernel reads them yet ([quant-formats/iu.md](quant-formats/iu.md)).
+`hipfire-quantize` directly. `iu4` / `iu8` follow the MQ4V2 tensor map for the body. The bare name is the normal rung (embeddings and `lm_head` as qt 59 `IU8G32`); `--tier xt` leaves `lm_head` on the body and `--tier pro` also lifts `ssm_out`. No kernel reads either layout yet ([quant-formats/iu.md](quant-formats/iu.md)).
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
 (`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays), product-tier
@@ -183,7 +184,7 @@ Full alias set and product-ladder controls. Common extras:
 |---|---|
 | `--input` / `--output` | Paths |
 | `--format` | Full set: `mq4`/`mq4v2` → qt44; `mq4v1`/`mq4g256`/`magnum` → qt13; `mq4c`; `mq{6,5,3,2}v2`; `mq3`; `hf4`/`hf6`; `hfp4`/`mfp4`/`mfp4e8`; Lloyd; `tq2`/`bq1`; … |
-| `--tier <xt\|base\|pro>` | Product rung (Qwen3.8 ladder): `xt` keeps lm_head at base codec; `base` lifts embed+lm_head; `pro` also lifts `ssm_out`. embed/conv1d stay Q8; structural tensors stay F16. See [ladder.md](quant-formats/ladder.md). |
+| `--tier <xt\|base\|normal\|pro>` | Product rung: `xt` keeps lm_head at the body codec; `base` (alias `normal`) lifts embed+lm_head; `pro` also lifts `ssm_out`. embed/conv1d stay above the body; structural tensors stay F16. On `iu4`/`iu8` an omitted flag selects the bare name. See [ladder.md](quant-formats/ladder.md). |
 | `--fixed-tier <spec>` | Per-class codec overrides, e.g. `lm_head:mq6v2,ssm_out:mq6v2`. Classes: `lm_head,embed,router,attn,ssm_out` (plus `attn_full` where applicable). Dtypes: `q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2` (+ limited legacy). Env: `HIPFIRE_FIXED_TIER`. |
 | `--imatrix <gguf>` | GGUF-format imatrix for activation-aware recipes |
 | `--hessian-dir <dir>` | GPTQ-E8 Hessians |

@@ -320,7 +320,9 @@ impl ProductTier {
     pub(crate) fn from_flag(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "xt" => Some(Self::Xt),
-            "base" => Some(Self::Base),
+            // `normal` is the bare product (`iu4`, `mq4`). The metadata
+            // token stays `base`, which is the name this flag already used.
+            "base" | "normal" => Some(Self::Base),
             "pro" => Some(Self::Pro),
             _ => None,
         }
@@ -794,6 +796,7 @@ mod product_tier_tests {
         assert_eq!(ProductTier::from_flag("xt"), Some(ProductTier::Xt));
         assert_eq!(ProductTier::from_flag("XT"), Some(ProductTier::Xt));
         assert_eq!(ProductTier::from_flag("base"), Some(ProductTier::Base));
+        assert_eq!(ProductTier::from_flag("normal"), Some(ProductTier::Base));
         assert_eq!(ProductTier::from_flag("pro"), Some(ProductTier::Pro));
         assert_eq!(ProductTier::from_flag("unknown"), None);
     }

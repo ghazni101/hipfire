@@ -162,6 +162,87 @@ fn stamp_mq4v2_body(
         }
     }
 }
+
+/// Retag a finished Q8F16 blob when `--format iu4` / `iu8` is latched.
+///
+/// The grid is unchanged: signed int8, one f16 scale per 32, zero point 0,
+/// no FWHT. The scale moves from in front of each block to the tail of the
+/// row, so the code plane is a contiguous signed operand for
+/// `v_wmma_i32_16x16x16_iu8` (qt 59 `IU8G32`). This is not qt 58, which
+/// stores MQ4 nibbles `0..=15` in a byte. A row whose K is not a multiple
+/// of 32, or a tensor that is not a single row or a 2-D matrix, stays
+/// interleaved Q8F16.
+/// Product name for an iu file. The bare name is the normal rung.
+/// `xt` and `pro` use the suffixes the quant ladder already uses.
+fn iu_product_name(format: &str, tier: crate::model_filter::ProductTier) -> Option<String> {
+    let body = match hipfire_runtime::iu_quant::Layout::from_format(format) {
+        Some(hipfire_runtime::iu_quant::Layout::Iu4) => "iu4",
+        Some(hipfire_runtime::iu_quant::Layout::Iu8) => "iu8",
+        None => return None,
+    };
+    Some(match tier {
+        crate::model_filter::ProductTier::Xt => format!("{body}-xt"),
+        crate::model_filter::ProductTier::Base => body.to_string(),
+        crate::model_filter::ProductTier::Pro => format!("{body} pro"),
+    })
+}
+
+/// Embed, lm_head, and ssm_out are the only roles a rung moves. Attention
+/// and the router are not rungs.
+fn iu_unlifted_role(class: Option<&str>, tier: crate::model_filter::ProductTier) -> bool {
+    let Some(class) = class else {
+        return false;
+    };
+    matches!(class, "embed" | "lm_head" | "ssm_out") && !tier.lifts(class)
+}
+
+/// True when an iu product rung, not the K-map, decides this tensor.
+fn iu_ladder_owns(name: &str) -> bool {
+    if IU_STORAGE.get().copied().flatten().is_none() {
+        return false;
+    }
+    if crate::model_filter::product_tier_cli().is_none()
+        && !crate::model_filter::fixed_tier_override_applies(name)
+    {
+        return false;
+    }
+    matches!(
+        crate::model_filter::q8_class_of(name),
+        Some("embed" | "lm_head" | "ssm_out")
+    )
+}
+
+/// True when the active iu rung leaves this role on the body codec.
+/// An explicit `--fixed-tier` override still wins.
+fn iu_role_stays_on_body(name: &str) -> bool {
+    if IU_STORAGE.get().copied().flatten().is_none()
+        || crate::model_filter::fixed_tier_override_applies(name)
+    {
+        return false;
+    }
+    let Some(tier) = crate::model_filter::product_tier_cli() else {
+        return false;
+    };
+    iu_unlifted_role(crate::model_filter::q8_class_of(name), tier)
+}
+
+fn emit_q8_or_iu8(bytes: Vec<u8>, shape: &[usize]) -> (Vec<u8>, QuantType, u32, &'static str) {
+    if IU_STORAGE.get().copied().flatten().is_none() {
+        return (bytes, QuantType::Q8F16, 32, "Q8_F16");
+    }
+    let (m, k) = match shape {
+        [m, k] if *m > 0 && *k > 0 && *k % 32 == 0 => (*m, *k),
+        [k] if *k > 0 && *k % 32 == 0 => (1, *k),
+        _ => return (bytes, QuantType::Q8F16, 32, "Q8_F16"),
+    };
+    match hipfire_runtime::iu_quant::repack_q8f16(&bytes, m, k) {
+        Ok(packed) => (packed, QuantType::IU8G32, 32, "IU8G32"),
+        Err(error) => {
+            eprintln!("error: IU8G32 repack failed: {error}");
+            std::process::exit(2);
+        }
+    }
+}
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 /// `--moe-expert-down mq4g128v2-symmetric`: routed-expert down_proj goes to
@@ -1277,22 +1358,32 @@ pub(crate) fn run() {
     // Unknown class/dtype tokens must fail before rayon spawn, and CLI/env
     // parsers must share the same strict set.
     crate::model_filter::validate_env_fixed_tier_or_exit();
-    let product_tier: Option<crate::model_filter::ProductTier> = match args.tier.as_deref() {
+    let mut product_tier: Option<crate::model_filter::ProductTier> = match args.tier.as_deref() {
         Some(s) => match crate::model_filter::ProductTier::from_flag(s) {
             Some(t) => Some(t),
             None => {
-                eprintln!("error: --tier unknown tier '{s}' (expected xt|base|pro)");
+                eprintln!("error: --tier unknown tier '{s}' (expected xt|base|normal|pro)");
                 std::process::exit(2);
             }
         },
         None => None,
     };
+    // A bare iu4 / iu8 file is the normal rung. xt and pro are opt-in.
+    // `normal` already parsed as `base` above, so an explicit flag still wins.
+    if product_tier.is_none()
+        && hipfire_runtime::iu_quant::Layout::from_format(args.format.as_str()).is_some()
+    {
+        product_tier = Some(crate::model_filter::ProductTier::Base);
+    }
     // CLI --fixed-tier overrides env; parsed and validated via the same strict parser.
     crate::model_filter::set_fixed_tier_cli(args.fixed_tier.clone());
     crate::model_filter::set_product_tier_cli(product_tier);
     if let Some(t) = product_tier {
+        let product = iu_product_name(args.format.as_str(), t)
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
         eprintln!(
-            "product tier: {} (lifted classes: {})",
+            "product tier: {}{product} (lifted classes: {})",
             t.label(),
             t.lifted_classes().join(",")
         );
@@ -1416,8 +1507,9 @@ pub(crate) fn run() {
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
-    // iu4/iu8 keep the MQ4V2 tensor map (which rows are 4-bit, which stay Q8
-    // or F16) and only change the bytes those 4-bit rows are stored as.
+    // iu4/iu8 keep the MQ4V2 tensor map for the 4-bit body. The product
+    // rung (bare name = normal) lifts embed, and on base/pro lm_head, and
+    // on pro ssm_out, onto IU8G32. An omitted --tier selects the bare name.
     let iu_layout = hipfire_runtime::iu_quant::Layout::from_format(format);
     let use_mq4v2 =
         format == "mq4v2" || format == "mq4" || format == "mq4g256v2" || iu_layout.is_some();
@@ -3739,12 +3831,13 @@ pub(crate) fn run() {
                 &st_files,
             );
             let q = quantize_q8f16(&f32_data);
-            eprintln!("  {:>8}: {} {:?} (router Q8)", "Q8-MM", name, meta.shape);
+            let (q, qt, group, label) = emit_q8_or_iu8(q, &meta.shape);
+            eprintln!("  {:>8}: {} {:?} (router {label})", "Q8-MM", name, meta.shape);
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
-                quant_type: QuantType::Q8F16,
+                quant_type: qt,
                 shape,
-                group_size: 32,
+                group_size: group,
                 data: q,
                 spilled_len: 0,
             });
@@ -4460,6 +4553,9 @@ pub(crate) fn run() {
             );
             if let Some(tier) = product_tier {
                 obj.insert("hipfire_product_tier".to_string(), tier.label().into());
+                if let Some(product) = iu_product_name(format, tier) {
+                    obj.insert("hipfire_product".to_string(), product.into());
+                }
             }
             if let Some(map) = crate::model_filter::fixed_tier_map_cli() {
                 let mut sorted: BTreeMap<String, String> = BTreeMap::new();
@@ -5068,7 +5164,21 @@ fn load_vl_processor_budget(
 /// and mq4c keep the historical Q8 embed so the tensor stays loadable.
 fn lfm2_dense_mq_name_matches(name: &str, use_mq4v2: bool) -> bool {
     if name.ends_with("embed_tokens.weight") {
+        // Every iu rung lifts the embedding table to IU8G32.
+        if IU_STORAGE.get().copied().flatten().is_some() {
+            return false;
+        }
         return use_mq4v2;
+    }
+    if IU_STORAGE.get().copied().flatten().is_some() {
+        // A lifted role belongs on the Q8 tail. xt's lm_head is not a
+        // `*_proj` name, so claim it here to keep it on the body.
+        if iu_ladder_owns(name) && !iu_role_stays_on_body(name) {
+            return false;
+        }
+        if iu_role_stays_on_body(name) && name.contains("lm_head") {
+            return true;
+        }
     }
     name.ends_with("_proj.weight")
         || name.ends_with(".w1.weight")
@@ -5255,12 +5365,24 @@ fn try_handle_lfm2moe(
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, &fp8_scale_for, &st_files);
         let q = quantize_q8f16(&f32_data);
-        eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+        // Norms and the depthwise conv filter stay interleaved Q8. A role
+        // the iu rung lifts becomes the contiguous int8 plane; a role the
+        // rung left on the body must not be retagged here.
+        let plane = !iu_role_stays_on_body(name)
+            && (name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || crate::model_filter::is_q8_tensor(name));
+        let (q, qt, group, label) = if plane {
+            emit_q8_or_iu8(q, &meta.shape)
+        } else {
+            (q, QuantType::Q8F16, 32, "Q8-LFM")
+        };
+        eprintln!("  {:>8}: {} {:?} ({label})", "Q8-LFM", name, meta.shape);
         hfq_tensors.push(HfqTensor {
             name: name.to_string(),
-            quant_type: QuantType::Q8F16,
+            quant_type: qt,
             shape,
-            group_size: 32,
+            group_size: group,
             data: q,
             spilled_len: 0,
         });
@@ -5593,15 +5715,16 @@ fn handle_cohere2moe(
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, fp8_scale_for, st_files);
         let q = quantize_q8f16(&f32_data);
+        let (q, qt, group, label) = emit_q8_or_iu8(q, &meta.shape);
         eprintln!(
-            "  {:>8}: {} {:?} (tied embed Q8)",
+            "  {:>8}: {} {:?} (tied embed {label})",
             "Q8-COH", name, meta.shape
         );
         hfq_tensors.push(HfqTensor {
             name: name.to_string(),
-            quant_type: QuantType::Q8F16,
+            quant_type: qt,
             shape,
-            group_size: 32,
+            group_size: group,
             data: q,
             spilled_len: 0,
         });
@@ -5651,26 +5774,37 @@ fn handle_cohere2moe(
         };
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, fp8_scale_for, st_files);
-        let (data, gs, tag): (Vec<u8>, u32, &str) = match dt {
+        let (data, qt, gs, tag): (Vec<u8>, QuantType, u32, &str) = match dt {
             QuantType::F16 => (
                 f32_data
                     .iter()
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect(),
+                QuantType::F16,
                 0,
                 "F16-COH",
             ),
             QuantType::MQ6G256 => {
                 let s1 = gen_fwht_signs(42, 256);
                 let s2 = gen_fwht_signs(1042, 256);
-                (quantize_mq6g256(&f32_data, &s1, &s2), 256, "MQ6-COH")
+                (
+                    quantize_mq6g256(&f32_data, &s1, &s2),
+                    QuantType::MQ6G256,
+                    256,
+                    "MQ6-COH",
+                )
             }
             QuantType::MQ4G256 => {
                 let s1 = gen_fwht_signs(42, 256);
                 let s2 = gen_fwht_signs(1042, 256);
-                (quantize_mq4g256(&f32_data, &s1, &s2), 256, "MQ4-COH")
+                (
+                    quantize_mq4g256(&f32_data, &s1, &s2),
+                    QuantType::MQ4G256,
+                    256,
+                    "MQ4-COH",
+                )
             }
-            _ => (quantize_q8f16(&f32_data), 32, "Q8-COH"),
+            _ => emit_q8_or_iu8(quantize_q8f16(&f32_data), &meta.shape),
         };
         eprintln!(
             "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
@@ -5682,7 +5816,7 @@ fn handle_cohere2moe(
         );
         hfq_tensors.push(HfqTensor {
             name: name.to_string(),
-            quant_type: dt,
+            quant_type: qt,
             shape,
             group_size: gs,
             data,
@@ -5699,12 +5833,13 @@ fn handle_cohere2moe(
     let f32_data =
         tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, fp8_scale_for, st_files);
     let q = quantize_q8f16(&f32_data);
-    eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-COH", name, meta.shape);
+    let (q, qt, group, label) = emit_q8_or_iu8(q, &meta.shape);
+    eprintln!("  {:>8}: {} {:?} ({label})", "Q8-COH", name, meta.shape);
     hfq_tensors.push(HfqTensor {
         name: name.to_string(),
-        quant_type: QuantType::Q8F16,
+        quant_type: qt,
         shape,
-        group_size: 32,
+        group_size: group,
         data: q,
         spilled_len: 0,
     });
@@ -6766,12 +6901,15 @@ fn handle_main_quant(
                 (q, QuantType::MQ4G128V2, 128u32, "MQ4G128V2-sym")
             } else if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
+                // A 3-D filter stays interleaved; a 2-D row becomes IU8G32.
                 let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if kmap_level == QuantLevel::Q8 {
-                // K-map says Q8 (embed, lm_head, router)
+                emit_q8_or_iu8(q, &meta.shape)
+            } else if kmap_level == QuantLevel::Q8 && !iu_ladder_owns(name) {
+                // K-map says Q8 (embed, lm_head, router). On an iu file the
+                // product rung owns embed / lm_head / ssm_out, so xt can
+                // leave lm_head on the body.
                 let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                emit_q8_or_iu8(q, &meta.shape)
             } else if kmap_level == QuantLevel::F16 {
                 // K-map says F16 (should not normally reach here — should_quantize filters first)
                 let f16_bytes: Vec<u8> = f32_data
@@ -6779,7 +6917,7 @@ fn handle_main_quant(
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if kmap_level == QuantLevel::Promote6 {
+            } else if kmap_level == QuantLevel::Promote6 && !iu_ladder_owns(name) {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 {
                     meta.shape[1]
@@ -7266,7 +7404,7 @@ fn handle_main_quant(
                             }
                             "q8" => {
                                 let q = quantize_q8f16(&f32_data);
-                                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                                emit_q8_or_iu8(q, &meta.shape)
                             }
                             _ => {
                                 let q = quantize_mq4g256(&f32_data, &s1, &s2);
@@ -7275,7 +7413,7 @@ fn handle_main_quant(
                         }
                     } else {
                         let q = quantize_q8f16(&f32_data);
-                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        emit_q8_or_iu8(q, &meta.shape)
                     }
                 } else if flags.use_hfq_mixed {
                     // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
@@ -7357,7 +7495,7 @@ fn handle_main_quant(
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     }
-                } else if flags.q8_router && is_q8_tensor(name) {
+                } else if flags.q8_router && is_q8_tensor(name) && !iu_role_stays_on_body(name) {
                     // Fixed tier (attention / lm_head / embed / router) held above
                     // --format. Default Q8F16; `HIPFIRE_FIXED_TIER=<class>:<dtype>`
                     // overrides per class — the bit-allocation lever.
@@ -7435,7 +7573,7 @@ fn handle_main_quant(
                                 }
                                 "q8" => {
                                     let q = quantize_q8f16(&f32_data);
-                                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                                    emit_q8_or_iu8(q, &meta.shape)
                                 }
                                 _ => {
                                     let q = quantize_mq4g256(&f32_data, &s1, &s2);
@@ -7445,7 +7583,7 @@ fn handle_main_quant(
                         }
                         None => {
                             let q = quantize_q8f16(&f32_data);
-                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                            emit_q8_or_iu8(q, &meta.shape)
                         }
                     }
                 } else if (flags.use_mq4g256
@@ -7466,7 +7604,7 @@ fn handle_main_quant(
                     && is_embed
                 {
                     let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    emit_q8_or_iu8(q, &meta.shape)
                 } else if flags.use_mq4g256
                     || flags.use_mq4_mq6exp
                     || flags.use_mq4_mq2lloydexp
@@ -9803,9 +9941,35 @@ fn provenance(
 #[cfg(test)]
 mod pipeline_tests {
     use super::{
-        collect_vl_processor_fields, lfm2_dense_mq_name_matches, load_vl_processor_budget,
-        moe_expert_3d_applies,
+        collect_vl_processor_fields, iu_product_name, iu_unlifted_role, lfm2_dense_mq_name_matches,
+        load_vl_processor_budget, moe_expert_3d_applies,
     };
+    use crate::model_filter::ProductTier;
+
+    #[test]
+    fn iu_products_are_the_three_ladder_rungs() {
+        assert_eq!(iu_product_name("iu4", ProductTier::Xt).as_deref(), Some("iu4-xt"));
+        assert_eq!(iu_product_name("iu4g256", ProductTier::Base).as_deref(), Some("iu4"));
+        assert_eq!(iu_product_name("iu4", ProductTier::Pro).as_deref(), Some("iu4 pro"));
+        assert_eq!(iu_product_name("iu8", ProductTier::Xt).as_deref(), Some("iu8-xt"));
+        assert_eq!(iu_product_name("iu8", ProductTier::Base).as_deref(), Some("iu8"));
+        assert_eq!(
+            iu_product_name("iu8g256", ProductTier::Pro).as_deref(),
+            Some("iu8 pro")
+        );
+        assert_eq!(iu_product_name("mq4", ProductTier::Base), None);
+        // The bare name is the normal rung. xt drops the head, pro lifts ssm_out.
+        assert!(iu_unlifted_role(Some("lm_head"), ProductTier::Xt));
+        assert!(!iu_unlifted_role(Some("embed"), ProductTier::Xt));
+        assert!(!iu_unlifted_role(Some("lm_head"), ProductTier::Base));
+        assert!(iu_unlifted_role(Some("ssm_out"), ProductTier::Base));
+        assert!(!iu_unlifted_role(Some("ssm_out"), ProductTier::Pro));
+        assert!(!iu_unlifted_role(Some("attn"), ProductTier::Xt));
+        assert!(!iu_unlifted_role(Some("router"), ProductTier::Pro));
+        assert_eq!(ProductTier::from_flag("normal"), Some(ProductTier::Base));
+        assert_eq!(ProductTier::from_flag("normal").unwrap().label(), "base");
+    }
+
 
     /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
     /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D
