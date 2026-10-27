@@ -1367,7 +1367,7 @@ fn plan_runtime(
             host_layer[layer] = true;
             sources.push(
                 runtime
-                    .s1_host_sources(&mut *gpu, bundle, layer)
+                    .s1_host_sources(&mut *gpu, bundle, layer, forward.cpu_split_explicit())
                     .map_err(|error| error.to_string())?,
             );
         } else {
@@ -1609,7 +1609,7 @@ fn load_decline(
     for layer in forward.band_layers() {
         if let Some(runtime) = forward.moe.get(layer).and_then(Option::as_ref) {
             if runtime.s1_host_mapped() {
-                if let Err(why) = runtime.s1_layer_check() {
+                if let Err(why) = runtime.s1_layer_check(forward.cpu_split_explicit()) {
                     return Some(format!("host layer {layer}: {why}"));
                 }
             }
@@ -2352,7 +2352,7 @@ fn select(
         if let Some(runtime) = forward.moe.get(layer).and_then(Option::as_ref) {
             if runtime.s1_host_mapped() {
                 runtime
-                    .s1_layer_check()
+                    .s1_layer_check(forward.cpu_split_explicit())
                     .map_err(|why| format!("host layer {layer}: {why}"))?;
             }
         }
@@ -3927,7 +3927,7 @@ fn resident_check_layer(forward: &Qwen4GpuForward, geo: &RunGeo, what: &str) -> 
                 .moe
                 .get(layer)
                 .and_then(Option::as_ref)
-                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check().is_ok())
+                .is_some_and(|runtime| !runtime.s1_host_mapped() && runtime.s1_layer_check(forward.cpu_split_explicit()).is_ok())
         })
         .ok_or_else(|| {
             invalid(format!(

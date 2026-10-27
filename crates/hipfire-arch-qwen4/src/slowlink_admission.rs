@@ -83,14 +83,10 @@ pub const S1_WINDOW_ROWS: usize = 16384;
 
 /// Fewest request rows S1 runs when forced: one row past a tile, the first
 /// genuinely multi-chunk request (a request of at most one tile is a named
-/// bypass). The automatic selector starts at [`S1_MIN_AUTO_REQUEST_ROWS`].
+/// bypass). The automatic selector starts one row past the ADMITTED tile
+/// ([`qualify_request`]): on a 768-row-tile load a 769..=1536-row request is
+/// already two incumbent chunks, each re-streaming every host layer's experts.
 pub const S1_MIN_FORCED_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
-
-/// Fewest request rows the automatic selector sends to S1: one row past the
-/// tile, the first genuinely multi-chunk request. Requests of at most one
-/// tile are a named bypass; the 1,400 tok/s target is not generalised to
-/// shorter prompts.
-pub const S1_MIN_AUTO_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
 
 /// Preferred resident trunk layers of an S1 load beside its own charges.
 /// INFORMATION ONLY: placement keeps the largest count that fits
@@ -2720,7 +2716,7 @@ pub fn qualify_request(
 ) -> Result<RequestVerdict, RequestBypass> {
     let minimum = match mode {
         SlowlinkMode::Off => return Err(RequestBypass::KillSwitch),
-        SlowlinkMode::Auto => S1_MIN_AUTO_REQUEST_ROWS,
+        SlowlinkMode::Auto => profile.tile_rows.saturating_add(1),
         SlowlinkMode::Force => S1_MIN_FORCED_REQUEST_ROWS,
     };
     if request.rows == 0 {
@@ -5043,13 +5039,16 @@ mod tests {
                 maximum: 4
             })
         );
-        // Automatic and forced share the 1537-row floor (one row past the
-        // tile): at most one tile is a named bypass on either selector.
-        assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 1537);
+        // At a 1536-row admitted tile automatic and forced share the 1537-row
+        // floor (one row past the tile): at most one tile is a named bypass.
         assert_eq!(S1_MIN_FORCED_REQUEST_ROWS, 1537);
+        let wide = SlowlinkProfile {
+            tile_rows: 1536,
+            ..profile
+        };
         for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
             assert_eq!(
-                qualify_request(mode, &profile, &req(1536)),
+                qualify_request(mode, &wide, &req(1536)),
                 Err(RequestBypass::TooShort {
                     rows: 1536,
                     minimum: 1537
@@ -5057,7 +5056,7 @@ mod tests {
                 "{mode:?}"
             );
             assert_eq!(
-                qualify_request(mode, &profile, &req(1537)),
+                qualify_request(mode, &wide, &req(1537)),
                 Ok(RequestVerdict {
                     rows: 1537,
                     windows: 1
@@ -5065,6 +5064,32 @@ mod tests {
                 "{mode:?}"
             );
         }
+        // A 768-row admitted tile (this profile, and the slow-link XTX
+        // Flash-Next load): the automatic floor follows the tile, so
+        // 769..=1536 rows (two incumbent chunks) run layer-major; the forced
+        // floor stays the legal-maximum one.
+        assert_eq!(profile.tile_rows, 768);
+        assert_eq!(
+            qualify_request(SlowlinkMode::Auto, &profile, &req(768)),
+            Err(RequestBypass::TooShort {
+                rows: 768,
+                minimum: 769
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Auto, &profile, &req(769)),
+            Ok(RequestVerdict {
+                rows: 769,
+                windows: 1
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Force, &profile, &req(1536)),
+            Err(RequestBypass::TooShort {
+                rows: 1536,
+                minimum: 1537
+            })
+        );
         assert_eq!(profile.windows_for(1), 1);
         assert_eq!(profile.windows_for(32768), 2);
     }

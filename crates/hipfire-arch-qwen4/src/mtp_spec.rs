@@ -9101,10 +9101,20 @@ impl Qwen4MtpDrafter {
         // session cut is published once its tile is appended, and the head and
         // `pending` are part of the transaction. The selector declining
         // (before any mutation) leaves the incumbent loop below untouched.
-        if !ops.is_mesh()
-            && start_pos < prompt_tokens.len()
-            && Self::bundle(target)?.slowlink_capture_eligible().is_ok()
-        {
+        let capture_eligible = if !ops.is_mesh() && start_pos < prompt_tokens.len() {
+            let eligible = Self::bundle(target)?.slowlink_capture_eligible();
+            if let Err(why) = eligible {
+                tracing::debug!(
+                    bypass_reason = why,
+                    prompt_rows = prompt_tokens.len() - start_pos,
+                    "qwen4 MTP prompt fill: slow-link capture bypassed",
+                );
+            }
+            eligible.is_ok()
+        } else {
+            false
+        };
+        if capture_eligible {
             let aborted = std::cell::Cell::new(false);
             let mut sink = |gpu: &mut Gpu,
                             bundle: &mut Qwen4Bundle,

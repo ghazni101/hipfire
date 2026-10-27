@@ -1187,7 +1187,15 @@ impl Qwen4Bundle {
                 .hc_count
                 .saturating_mul(self.config.hidden_size)
                 .max(1);
-            if hidden.numel() / width < PROMPT_TILE_ROWS_MAX {
+            // The S1 forward fills the capture buffer one admitted tile at a
+            // time (`slowlink_prefill` checks `n * wide` per tile), so the
+            // buffer must hold the profile's tile, not the legal maximum.
+            let tile_rows = self
+                .slowlink
+                .profile
+                .as_ref()
+                .map_or(PROMPT_TILE_ROWS_MAX, |profile| profile.tile_rows);
+            if hidden.numel() / width < tile_rows {
                 return Err("the wide-hidden capture buffer is narrower than a mixer tile");
             }
         }

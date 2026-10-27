@@ -1560,18 +1560,25 @@ impl Qwen4MoeLayerRuntime {
     }
 
     /// Whether this layer is the qualified S1 shape: uniform MQ4 experts with
-    /// no CPU splice or tier split, no stock FP8, no expert-keep pruning mask
-    /// and no non-MQ4 slab codec. `Err` names the first reason; the S1
-    /// selector turns it into a pre-mutation incumbent verdict.
-    pub(crate) fn s1_layer_check(&self) -> Result<(), &'static str> {
+    /// no every-call CPU splice or tier split, no stock FP8, no expert-keep
+    /// pruning mask and no non-MQ4 slab codec. `Err` names the first reason;
+    /// the S1 selector turns it into a pre-mutation incumbent verdict.
+    ///
+    /// The CPU refusal is [`host_arith_every_call`]: a D1 splice layer, or a D2
+    /// split of an explicit `memory.offload_exec=cpu` load
+    /// (`split_explicit`, the forward's `cpu_split_explicit`). A split armed
+    /// only by the per-load D2 default never runs host arithmetic on prefill
+    /// rows ([`host_arith_call`]), so S1 streams that layer's experts like any
+    /// other host-mapped layer and decode keeps the split.
+    pub(crate) fn s1_layer_check(&self, split_explicit: bool) -> Result<(), &'static str> {
         if self.fp8 {
             return Err("stock FP8 experts");
         }
-        if self.cpu_deferred_experts
-            || self.cpu_expert_owners.is_some()
-            || self.cpu_cold_owners.is_some()
-            || self.cpu_split.is_some()
-        {
+        if host_arith_every_call(
+            self.cpu_deferred_experts || self.cpu_expert_owners.is_some(),
+            self.cpu_split.is_some() || self.cpu_cold_owners.is_some(),
+            split_explicit,
+        ) {
             return Err("CPU expert splice");
         }
         if self.tier.is_some() {
@@ -1633,9 +1640,10 @@ impl Qwen4MoeLayerRuntime {
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         layer: usize,
+        split_explicit: bool,
     ) -> Result<panel_stage::LayerExpertSources, Qwen4GpuForwardError> {
         use panel_stage::{AliasExpert, LayerExpertSources, PanelCodec};
-        self.s1_layer_check().map_err(|why| {
+        self.s1_layer_check(split_explicit).map_err(|why| {
             invalid(format!(
                 "slow-link layer {layer} is not S1 qualified: {why}"
             ))
@@ -9294,6 +9302,12 @@ impl Qwen4GpuForward {
             self.cpu_split_explicit,
         )
     }
+    /// Whether this load's D2 split was requested explicitly
+    /// (`memory.offload_exec=cpu`, not passback) rather than armed by the
+    /// per-load default: the `split_explicit` input of the S1 layer check.
+    pub(crate) fn cpu_split_explicit(&self) -> bool {
+        self.cpu_split_explicit
+    }
     /// Whether a call of `rows` rows over `route_rows` routing rows in the
     /// given phase executes host arithmetic ([`host_arith_call`]). `gpu`
     /// supplies this call's frozen row-exact width; capacity is the minimum
@@ -11649,7 +11663,7 @@ impl Qwen4GpuForward {
     pub(crate) fn slowlink_forward_blocker(&self, config: &Qwen4Config) -> Option<&'static str> {
         if self.ep.is_some() {
             Some("expert parallelism")
-        } else if self.has_cpu_deferred_experts() || self.cpu_split_layers > 0 {
+        } else if self.has_cpu_deferred_experts() {
             Some("CPU expert splice")
         } else if self.qsa_tap.is_some() {
             Some("the QSA parity tap")
@@ -15681,6 +15695,43 @@ mod tests {
     /// on a whole narrow non-prefill window — so wide verify and every prefill
     /// call (tails, short prompts) keep their old graph and replay behaviour.
     /// The load-wide part is composed exactly as the forward composes it.
+    /// The S1 CPU-splice guard (`slowlink_forward_blocker`,
+    /// `Qwen4MoeLayerRuntime::s1_layer_check`) refuses exactly the loads that
+    /// can run host arithmetic on a prefill row: D1 or an explicit D2 split.
+    /// An automatic-default D2 split (`split_explicit = false`) never executes
+    /// on prefill rows, so S1 must admit it (the XTX Flash-Next default,
+    /// where the refusal sent every long prompt to the chunk-major route).
+    #[test]
+    fn s1_cpu_guard_refuses_only_when_prefill_rows_run_host_arithmetic() {
+        use super::{host_arith_call, host_arith_every_call};
+        for d1 in [false, true] {
+            for has_split in [false, true] {
+                for explicit in [false, true] {
+                    let refused = host_arith_every_call(d1, has_split, explicit);
+                    let prefill_host = [false, true].into_iter().any(|lab| {
+                        [1usize, 4, 64, 768, 1536, 16384].into_iter().any(|rows| {
+                            host_arith_call(refused, has_split, true, rows, rows, lab, 64, 64)
+                        })
+                    });
+                    assert_eq!(
+                        refused, prefill_host,
+                        "d1={d1} split={has_split} explicit={explicit}"
+                    );
+                }
+            }
+        }
+        // The two named cases.
+        assert!(
+            !host_arith_every_call(false, true, false),
+            "automatic D2 admits S1"
+        );
+        assert!(
+            host_arith_every_call(false, true, true),
+            "explicit cpu refuses S1"
+        );
+        assert!(host_arith_every_call(true, false, false), "D1 refuses S1");
+    }
+
     #[test]
     fn automatic_d2_asks_for_eager_only_on_the_calls_that_execute_it() {
         use super::{host_arith_call, host_arith_every_call};
