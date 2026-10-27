@@ -122,6 +122,14 @@ struct GdnLayerTable {
 };
 
 #if defined(HIPFIRE_GDN_SLOTS_BYVAL_ENTRY)
+// Separate entry name on purpose: the rows-twin assembler
+// (`rdna_compute::rows_batched::rows_twin_source`) counts textual
+// entry-signature occurrences of HIPFIRE_GDN_KERNEL to rewrite the twin's
+// entry points, and this block is inactive in every twin build. Sharing the
+// name made that count 3 where 2 are expected.
+#ifndef HIPFIRE_GDN_SLOTS_ENTRY
+#define HIPFIRE_GDN_SLOTS_ENTRY HIPFIRE_GDN_KERNEL
+#endif
 // gfx11 preloads the first 256 B of kernarg. Keep the scalar
 // gated_delta_net_q8_fast prefix (nt @64, frame @76, 96 B with pointer
 // alignment) so retained PM4 can patch the requant frame. Lane 0 is those
@@ -130,7 +138,7 @@ struct GdnLayerTable {
 // s_loads the 56 B past the 256 B preload. A by-value GdnLayerTable blob
 // hid later lanes from alias analysis and raced gated_norm on gfx1100.
 extern "C" __launch_bounds__(HIPFIRE_GDN_BLOCK_SIZE, HIPFIRE_GDN_MIN_BLOCKS)
-__global__ void HIPFIRE_GDN_KERNEL(
+__global__ void HIPFIRE_GDN_SLOTS_ENTRY(
     const float* __restrict__ slot0_q,
     const float* __restrict__ slot0_k,
     const float* __restrict__ slot0_v,
