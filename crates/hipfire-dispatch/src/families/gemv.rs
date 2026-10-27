@@ -275,6 +275,9 @@ impl GemvFamily {
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
         }
+        if w.dtype.is_iu_quant() {
+            return Err(crate::types::reject_iu(w.dtype, "gemv"));
+        }
         let x_buf = match input {
             RotInput::Raw(x) => {
                 let plan = crate::types::dtype_rotation_plan(w.dtype);
@@ -343,6 +346,9 @@ impl GemvFamily {
         if params.w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(params.w.dtype, "gemv"));
         }
+        if params.w.dtype.is_iu_quant() {
+            return Err(crate::types::reject_iu(params.w.dtype, "gemv"));
+        }
         let shape = ShapeInfo {
             batch_size: 1,
             head_dim: 0,
@@ -397,6 +403,9 @@ impl GemvFamily {
         }
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
+        }
+        if w.dtype.is_iu_quant() {
+            return Err(crate::types::reject_iu(w.dtype, "gemv"));
         }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
         if plan == RotationPlan::None {
@@ -761,6 +770,8 @@ mod residual_coverage_tests {
             MQ2I4G128R128,
             E8PI4G128R256,
             E8PI4G128R128,
+            IU4G256,
+            IU8G256,
         );
         let mut missing = Vec::new();
         for dtype in all {

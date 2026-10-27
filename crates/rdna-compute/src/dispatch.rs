@@ -805,6 +805,15 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
+    /// IU4-G256 (qt=57): MQ4V2 codes in an unsigned-nibble row. Codes occupy
+    /// the first `K/2` bytes (low nibble = even K); `(f16 scale, f16 zero)`
+    /// pairs for each 128 weights follow. `K % 256 == 0`, 4.25 bpw. No GPU
+    /// kernel: generic GEMV/GEMM must refuse it. See `hipfire_runtime::iu_quant`.
+    IU4G256,
+    /// IU8-G256 (qt=58): the same codes, one byte `0..=15` per weight
+    /// (`K` code bytes, then the same scale plane). 8.25 bpw. The byte is the
+    /// IU8 WMMA operand, not a new 8-bit grid. No GPU kernel yet.
+    IU8G256,
     /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
     /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
     /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
@@ -1012,7 +1021,9 @@ impl DType {
             | DType::MQ2I4G128R256
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
-            | DType::E8PI4G128R128 => 1, // byte-level
+            | DType::E8PI4G128R128
+            | DType::IU4G256
+            | DType::IU8G256 => 1, // byte-level
         }
     }
 
@@ -1064,6 +1075,17 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128 => None,
+            // IU rows are codes then scales. K must be a multiple of 256;
+            // a partial group is not a legal row, so it is not rounded up.
+            // Keep this arithmetic identical to `hipfire_runtime::iu_quant::row_bytes`.
+            DType::IU4G256 | DType::IU8G256 => {
+                if k % 256 != 0 {
+                    None
+                } else {
+                    let codes = if self == DType::IU4G256 { k / 2 } else { k };
+                    Some(codes + (k / 128) * 4)
+                }
+            }
             _ => None,
         }
     }
@@ -1097,6 +1119,21 @@ impl DType {
     /// Whether this is one of the typed-qwen4-only planar MQ-I4 formats.
     pub fn is_mq_i4(self) -> bool {
         self.mq_i4_name().is_some()
+    }
+
+    /// Canonical name of the IU4/IU8 operand layouts (qt=57/58); `None` for
+    /// every other dtype. Generic consumers refuse these: no kernel reads them yet.
+    pub fn iu_quant_name(self) -> Option<&'static str> {
+        match self {
+            DType::IU4G256 => Some("IU4G256"),
+            DType::IU8G256 => Some("IU8G256"),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the IU4 or IU8 operand layout of an MQ4V2 code tensor.
+    pub fn is_iu_quant(self) -> bool {
+        self.iu_quant_name().is_some()
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
@@ -1181,6 +1218,10 @@ impl DType {
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
+                // IU4/IU8 are repacked MQ4V2 bodies, so they carry the same
+                // AWQ sidecar. Dropping it here would silently compute (W·s)·x.
+                | DType::IU4G256
+                | DType::IU8G256
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -1217,6 +1258,8 @@ impl DType {
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
+                | DType::IU4G256
+                | DType::IU8G256
         )
     }
 }
@@ -10308,6 +10351,26 @@ mod tests {
         }
         assert!(!DType::MQ4G128V2.is_mq_i4());
         assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
+    }
+
+    /// qt=57/58 are row-addressed MQ4V2 code layouts. K must be a multiple of
+    /// 256; the row is codes then the per-128 scale pairs.
+    #[test]
+    fn iu_dtypes_are_row_addressed_and_named() {
+        assert_eq!(DType::IU4G256.row_bytes(256), Some(136));
+        assert_eq!(DType::IU8G256.row_bytes(256), Some(264));
+        assert_eq!(DType::IU4G256.row_bytes(512), Some(272));
+        assert_eq!(DType::IU4G256.row_bytes(128), None);
+        assert_eq!(DType::IU8G256.row_bytes(0), None);
+        assert!(DType::IU4G256.requires_k_mod_256());
+        assert!(DType::IU8G256.requires_k_mod_256());
+        assert!(DType::IU4G256.supports_awq_sidecar());
+        assert!(DType::IU8G256.supports_awq_sidecar());
+        assert_eq!(DType::IU4G256.iu_quant_name(), Some("IU4G256"));
+        assert_eq!(DType::IU8G256.iu_quant_name(), Some("IU8G256"));
+        assert!(DType::IU4G256.is_iu_quant());
+        assert!(!DType::MQ4G256V2.is_iu_quant());
+        assert!(!DType::IU4G256.is_mq_i4());
     }
 
     #[test]

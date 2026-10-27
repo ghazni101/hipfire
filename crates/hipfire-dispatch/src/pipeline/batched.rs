@@ -190,6 +190,14 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
             0,
             "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
         ))
+    } else if dtype.is_iu_quant() {
+        Err(HipError::new(
+            0,
+            &format!(
+                "this model uses the {} weight format (qt 57/58): MQ4V2 codes stored for the IU4 or IU8 matrix unit, and no GPU kernel reads it yet",
+                dtype.iu_quant_name().unwrap_or("IU")
+            ),
+        ))
     } else if let Some(name) = dtype.mq_i4_name() {
         Err(HipError::new(
             0,

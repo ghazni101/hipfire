@@ -58,6 +58,8 @@ pub mod gguf;
 pub mod hfq;
 pub mod hfq_parallel;
 pub mod imagedec;
+/// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
+pub mod iu_quant;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
@@ -70,7 +72,6 @@ pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
-/// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
 pub mod mq_i4;
 /// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.
 pub mod mq_i4_reference;

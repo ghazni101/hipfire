@@ -251,6 +251,9 @@ impl GemmFamily {
             | DType::E8PI4G128R128 => {
                 return Err(reject_mq_i4(dtype, "gemm"));
             }
+            DType::IU4G256 | DType::IU8G256 => {
+                return Err(crate::types::reject_iu(dtype, "gemm"));
+            }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
             DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
             DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
@@ -321,6 +324,9 @@ impl GemmFamily {
         }
         if params.w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(params.w.dtype, "gemm"));
+        }
+        if params.w.dtype.is_iu_quant() {
+            return Err(crate::types::reject_iu(params.w.dtype, "gemm"));
         }
         // Validate the explicit key is registered and arch-admissible. The
         // dispatcher-entry keys used at migrated prefill sites are registered

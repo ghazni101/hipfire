@@ -189,6 +189,7 @@ dtype_table! {
     FP8E4M3PT = 52,
     MQ3I4G128R256 = 53, MQ3I4G128R128 = 54, MQ2I4G128R256 = 55, MQ2I4G128R128 = 56,
     E8PI4G128R256 = 57, E8PI4G128R128 = 58, ParoQ4G64 = 59,
+    IU4G256 = 60, IU8G256 = 61,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> u8 {

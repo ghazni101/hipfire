@@ -125,6 +125,43 @@ struct MainQuantState<'a> {
 }
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
+/// Set for `--format iu4` / `iu8`. `None` means the body stays qt=44.
+/// Unset (tests that encode MQ4V2 without going through the CLI) also stays qt=44.
+static IU_STORAGE: OnceLock<Option<hipfire_runtime::iu_quant::Layout>> = OnceLock::new();
+
+/// Retag a finished MQ4V2 blob. With no IU layout latched, the bytes and qt=44
+/// are unchanged. Otherwise the codes and scale bits are copied into the IU
+/// row layout and the quant type changes. `k` is the reduction width.
+fn stamp_mq4v2_body(
+    bytes: Vec<u8>,
+    k: usize,
+    mq_label: &'static str,
+) -> (Vec<u8>, QuantType, &'static str) {
+    let Some(layout) = IU_STORAGE.get().copied().flatten() else {
+        return (bytes, QuantType::MQ4G256V2, mq_label);
+    };
+    let gpr = k / 256;
+    let groups = if gpr == 0 { 0 } else { bytes.len() / 136 };
+    if gpr == 0 || bytes.len() != groups * 136 || groups % gpr != 0 {
+        eprintln!(
+            "error: IU repack expected MQ4V2 groups of K={k}, got {} bytes",
+            bytes.len()
+        );
+        std::process::exit(2);
+    }
+    let m = groups / gpr;
+    let quant_type = match layout {
+        hipfire_runtime::iu_quant::Layout::Iu4 => QuantType::IU4G256,
+        hipfire_runtime::iu_quant::Layout::Iu8 => QuantType::IU8G256,
+    };
+    match hipfire_runtime::iu_quant::repack_mq4v2(&bytes, m, k, layout) {
+        Ok(packed) => (packed, quant_type, layout.name()),
+        Err(error) => {
+            eprintln!("error: IU repack failed: {error}");
+            std::process::exit(2);
+        }
+    }
+}
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 /// `--moe-expert-down mq4g128v2-symmetric`: routed-expert down_proj goes to
@@ -180,6 +217,11 @@ fn check_moe_expert_down(
         return Ok(());
     }
     const FLAG: &str = "--moe-expert-down mq4g128v2-symmetric";
+    if hipfire_runtime::iu_quant::Layout::from_format(&args.format).is_some() {
+        return Err(format!(
+            "{FLAG} does not apply to --format iu4/iu8; those formats have no G128 operand layout"
+        ));
+    }
     if route != crate::cli::Route::Main {
         return Err(format!(
             "{FLAG} only applies to the safetensors quantize path"
@@ -1374,7 +1416,11 @@ pub(crate) fn run() {
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
-    let use_mq4v2 = format == "mq4v2" || format == "mq4" || format == "mq4g256v2";
+    // iu4/iu8 keep the MQ4V2 tensor map (which rows are 4-bit, which stay Q8
+    // or F16) and only change the bytes those 4-bit rows are stored as.
+    let iu_layout = hipfire_runtime::iu_quant::Layout::from_format(format);
+    let use_mq4v2 =
+        format == "mq4v2" || format == "mq4" || format == "mq4g256v2" || iu_layout.is_some();
     let use_mq4v2_lloyd = format == "mq4v2-lloyd"
         || format == "mq4v2l"
         || format == "mq4l"
@@ -2076,6 +2122,17 @@ pub(crate) fn run() {
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
         .expect("MQ4V2_SYMMETRIC set twice — should not happen");
+    let iu_layout = hipfire_runtime::iu_quant::Layout::from_format(&args.format);
+    IU_STORAGE
+        .set(iu_layout)
+        .expect("IU_STORAGE set twice — should not happen");
+    if let Some(layout) = iu_layout {
+        eprintln!(
+            "IU storage: {} — MQ4V2 codes, {} operand rows, no GPU kernel yet",
+            layout.name(),
+            layout.name()
+        );
+    }
     if args.mq4v2_symmetric {
         eprintln!("MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)");
     }
@@ -5164,7 +5221,7 @@ fn try_handle_lfm2moe(
                 let m = meta.shape[0];
                 let k = meta.shape[1];
                 let qq = quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2);
-                (qq, QuantType::MQ4G256V2, "MQ4V2-LFM")
+                stamp_mq4v2_body(qq, k, "MQ4V2-LFM")
             } else {
                 let qq = quantize_mq4g256(&f32_data, &signs1, &signs2);
                 (qq, QuantType::MQ4G256, "MQ4-LFM")
@@ -6421,7 +6478,8 @@ fn handle_moe_expert_3d(
                 // and on an A3B MoE that is ~99% of the model by tensor count.
                 let q =
                     quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
-                (q, QuantType::MQ4G256V2, 256u32)
+                let (q, qt, _) = stamp_mq4v2_body(q, inner_k_e, "MQ4G256V2");
+                (q, qt, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ4G256, 256u32)
@@ -7526,7 +7584,8 @@ fn handle_main_quant(
                             let k = k_dim;
                             quantize_mq4g256v2_selected(&f32_data, m_dim, k, &signs1, &signs2)
                         };
-                        (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                        let (q, qt, label) = stamp_mq4v2_body(q, k_dim, "MQ4G256V2");
+                        (q, qt, 256u32, label)
                     } else {
                         let q = if meta.shape.len() == 2 {
                             let m = meta.shape[0];
@@ -9612,6 +9671,23 @@ mod moe_expert_down_override_tests {
                 .find(|(name, _)| *name == var)
                 .map(|(_, value)| value.to_string())
         })
+    }
+
+    #[test]
+    fn iu_format_refuses_the_qt53_down_override() {
+        let err = check(
+            &[
+                "--format",
+                "iu4",
+                "--uniform",
+                "--mq4v2-symmetric",
+                "--moe-expert-down",
+                "mq4g128v2-symmetric",
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("iu4"), "{err}");
     }
 
     #[test]

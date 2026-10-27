@@ -2498,6 +2498,10 @@ fn gemm_dispatch(
             0,
             "dflash GEMM cannot consume MQ-I4 / E8P-I4 (qt=131..=136): typed-Qwen4 expert-slab format with no generic GPU kernel",
         )),
+        DType::IU4G256 | DType::IU8G256 => Err(hip_bridge::HipError::new(
+            0,
+            "dflash GEMM cannot consume IU4/IU8 (qt=57/58): MQ4V2 codes in an integer-operand layout, and no GPU kernel reads it yet",
+        )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
             // S7 draft collapse: rotate straight to the persistent F16 twin

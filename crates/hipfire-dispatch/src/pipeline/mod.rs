@@ -113,6 +113,9 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
     if dtype.is_mq_i4() {
         return Err(reject_mq_i4(dtype, family));
     }
+    if dtype.is_iu_quant() {
+        return Err(crate::types::reject_iu(dtype, family));
+    }
     Ok(())
 }
 
@@ -197,7 +200,7 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
                 .flat_map(|shared| [shared.selector, shared.gate, shared.up, shared.down]),
         )
         .chain([dtypes.router, dtypes.routed_gate_up, dtypes.routed_down])
-        .find(|dtype| dtype.is_mq_i4());
+        .find(|dtype| dtype.is_mq_i4() || dtype.is_iu_quant());
     if let Some(dtype) = first_mq_i4 {
         return reject_mq4g128v2(dtype, "moe");
     }

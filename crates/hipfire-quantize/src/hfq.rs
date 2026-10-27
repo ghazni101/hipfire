@@ -74,6 +74,8 @@ impl QuantType {
             53 => Some(Self::MQ4G128V2),
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
+            57 => Some(Self::IU4G256),
+            58 => Some(Self::IU8G256),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -253,6 +255,12 @@ pub(crate) enum QuantType {
     /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
     /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
     FP8E4M3PT = 56,
+    /// IU4G256 (qt=57): MQ4G256V2 codes stored as an unsigned-nibble operand
+    /// plane. See `hipfire_runtime::iu_quant`. No GPU kernel yet.
+    IU4G256 = 57,
+    /// IU8G256 (qt=58): the same codes stored one byte each (`0..=15`) for
+    /// `v_wmma_i32_16x16x16_iu8`. Not an 8-bit grid. See `iu_quant`.
+    IU8G256 = 58,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert

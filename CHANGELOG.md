@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **IU4/IU8 quant family (qt 57/58): MQ4V2 codes stored as integer-matrix operands.** `--format iu4` and `--format iu8` on `hipfire-quantize` follow the MQ4V2 tensor map and write each 4-bit row as a contiguous code plane plus the per-128 fp16 scale/zero pairs: unsigned nibbles for IU4 (4.25 bpw), or one byte `0..=15` per weight for IU8 (8.25 bpw, not a new 8-bit grid). Generic GEMV/GEMM refuse the dtypes; no kernel reads them yet. Layout: [docs/quant-formats/iu.md](docs/quant-formats/iu.md).
+
 ## v0.4.4 — 2026-10-27
 
 - **Developer: Qwen3.5 AR hipGraph / Redline replay refuses int8, int8c and hfq4 KV caches (HIPF-192).** `attention_int8c_f16_kv` / `attention_int8_kv` / `attention_hfq4_kv` size their block and LDS (`scores[seq_len]`) from the host `seq_len`, which a replay freezes at the capture position, so per-token decode past ~256-511 positions went degenerate (one argmax every position). `ar_graph_eligible_for_kv` now refuses those tiers, which then decode eagerly. No `KvMode` builds these tiers, so production routes are unaffected; contributor-measured on gfx1151 qwen3.5-9b.mq4 int8c/int8 at 600 rows: logits bitwise equal to `HIPFIRE_GRAPH=0 HIPFIRE_AR_GRAPH=0`. (#1004, @fivetide)

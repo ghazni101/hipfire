@@ -728,6 +728,18 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 50,
         dtype: DType::MQ2G256V2,
     },
+    // qt=57/58: MQ4V2 codes repacked into an IU4 or IU8 operand row
+    // (codes, then per-128 f16 scale/zero). Verbatim upload; generic GEMV/GEMM
+    // refuse them until a kernel exists. Length and IU8 code-range checks are
+    // `iu_quant::validate`.
+    RawCodec {
+        quant_type: 57,
+        dtype: DType::IU4G256,
+    },
+    RawCodec {
+        quant_type: 58,
+        dtype: DType::IU8G256,
+    },
 ];
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
@@ -771,6 +783,18 @@ pub(crate) fn decode_raw_codec(
                 codec.dtype
             ),
         ));
+    }
+    if let Some(layout) = match codec.dtype {
+        DType::IU4G256 => Some(crate::iu_quant::Layout::Iu4),
+        DType::IU8G256 => Some(crate::iu_quant::Layout::Iu8),
+        _ => None,
+    } {
+        if let Err(error) = crate::iu_quant::validate(data, m, k, layout) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{error} (caller: {name}){BLOB_FIX}"),
+            ));
+        }
     }
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;
@@ -1964,6 +1988,10 @@ mod tests {
             (48, DType::MQ5G256V2), // 168 B/G256 5.25bpw
             (49, DType::MQ3G256V2), // 104 B/G256 3.25bpw
             (50, DType::MQ2G256V2), // 72 B/G256 2.25bpw
+            // qt=57/58: IU operand layouts of MQ4V2 codes. rhs pinned against
+            // hipfire-quantize `QuantType::IU4G256 = 57` / `IU8G256 = 58`.
+            (57, DType::IU4G256),
+            (58, DType::IU8G256),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

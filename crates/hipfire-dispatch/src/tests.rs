@@ -779,6 +779,8 @@ const ALL_DTYPES: &[DType] = &[
     DType::MQ2I4G128R128,
     DType::E8PI4G128R256,
     DType::E8PI4G128R128,
+    DType::IU4G256,
+    DType::IU8G256,
 ];
 
 /// Registered keys that are KNOWN to have no dispatch arm today. Each entry is
