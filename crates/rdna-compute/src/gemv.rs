@@ -17777,8 +17777,7 @@ impl Gpu {
         k: usize,
         n_tokens: usize,
     ) -> HipResult<()> {
-        if !(self.arch_caps.is_gfx1100() && m == 1024 && k == 2048 && (1..=4).contains(&n_tokens))
-        {
+        if !(self.arch_caps.is_gfx1100() && m == 1024 && k == 2048 && (1..=4).contains(&n_tokens)) {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemv_mq4g256v2_moe_gate_up_k8_slots_gfx1100: requires gfx1100 M=1024 K=2048 N=1..=4",
@@ -18922,7 +18921,9 @@ impl Gpu {
             &n_val as *const _ as *mut c_void,
         ];
         let bytes = n_tokens
-            * (8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4);
+            * (8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k)
+                + 8 * down_k * 4
+                + down_m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,

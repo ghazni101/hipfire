@@ -4083,8 +4083,8 @@ impl Gpu {
         let mut sc3 = lane3.s_scales as *mut c_void;
         let mut o3 = lane3.output as *mut c_void;
         let mut ef3 = lane3.ef as *mut c_void;
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim)
-            * lanes.len();
+        let bytes =
+            crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim) * lanes.len();
         let timer = crate::profile::begin_timer(
             &self.hip,
             "deltanet",

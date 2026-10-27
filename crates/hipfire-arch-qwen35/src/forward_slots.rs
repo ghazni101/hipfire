@@ -1004,7 +1004,6 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     }
 }
 
-
 /// Decode-width MQ4V2 (1..=[`FEW_ROW_ROUTE_ROWS`]). The prefill WMMA tile is
 /// 16 rows and a PM4 recording is pinned to its base kernel, so a 1..4 row
 /// slot step was paying for an empty tile. The x-batch GEMV is the sequential
@@ -1081,7 +1080,6 @@ fn slots_mq4v2_apply(
         gpu.gemv_mq4g256v2_xbatch(w, x, y, m, k, n)
     }
 }
-
 
 /// One conv1d launch across every live slot. The lane kernel's ring pointers
 /// are by-value kernargs, so a retained PM4 tape records them the same way
@@ -1171,7 +1169,6 @@ where
     Ok(())
 }
 
-
 /// GDN recurrence across live slots. Same-width groups of up to four
 /// share one launch (`gated_delta_net_q8_fast_slots`; extra-lane pointers
 /// are explicit HIP args so Resource wait sees every slot). A leftover
@@ -1205,8 +1202,7 @@ where
     // GDN→gated_norm is visible to alias analysis on every slot. Up to
     // four same-width live slots share one launch; a leftover slot keeps
     // `gated_delta_net_q8_batch_seq`.
-    let can_pair = live.len() >= 2
-        && same_m.is_some_and(|m| live.iter().all(|&(_, _, w)| w == m));
+    let can_pair = live.len() >= 2 && same_m.is_some_and(|m| live.iter().all(|&(_, _, w)| w == m));
     let mut paired = 0usize;
     if can_pair {
         let m = same_m.unwrap();
@@ -1267,9 +1263,7 @@ where
         let gate_view = pbs
             .dn_alpha_batch
             .sub_offset(row * n_v_heads, m * n_v_heads);
-        let beta_view = pbs
-            .dn_beta_batch
-            .sub_offset(row * n_v_heads, m * n_v_heads);
+        let beta_view = pbs.dn_beta_batch.sub_offset(row * n_v_heads, m * n_v_heads);
         let out_view = pbs.dn_attn_out_batch.sub_offset(row * v_dim, m * v_dim);
         gpu.gated_delta_net_q8_batch_seq(
             &q_view,
@@ -1340,9 +1334,10 @@ fn slots_moe_cohort(
             .all(|(gate_up, down)| *gate_up == DType::MQ4G256V2 && *down == DType::MQ4G256V2),
         _ => {
             !ffn.experts.is_empty()
-                && ffn.experts.iter().all(|expert| {
-                    v2(&expert.gate_up, 1024, 2048) && v2(&expert.down, 2048, 512)
-                })
+                && ffn
+                    .experts
+                    .iter()
+                    .all(|expert| v2(&expert.gate_up, 1024, 2048) && v2(&expert.down, 2048, 512))
         }
     };
     if !routed_v2 {
@@ -1488,9 +1483,7 @@ fn slots_moe_ffn(
         let dim = config.dim;
         for row in 0..n {
             let x = pbs.x_batch.sub_offset(row * dim, dim);
-            crate::qwen35::forward::moe_ffn_dispatch(
-                gpu, ffn, &x, ffn_norm, config, s, false,
-            )?;
+            crate::qwen35::forward::moe_ffn_dispatch(gpu, ffn, &x, ffn_norm, config, s, false)?;
         }
         return Ok(());
     }
@@ -2129,7 +2122,6 @@ where
         n,
     )?;
 
-
     // 7. Batched gated output norm — stateless, batched over N.
     gpu.gated_norm_f32_batched(
         &pbs.dn_attn_out_batch,
@@ -2416,7 +2408,6 @@ where
         config.linear_value_head_dim,
         n,
     )?;
-
 
     // 7. Batched gated output norm — stateless, batched over N.
     gpu.gated_norm_f32_batched(
