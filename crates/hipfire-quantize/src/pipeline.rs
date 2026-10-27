@@ -212,6 +212,43 @@ fn iu_ladder_owns(name: &str) -> bool {
     )
 }
 
+/// `--format mq4` turns a K-map Promote6 row into MQ6. An IU file must not:
+/// `v_wmma_i32_16x16x16_iu4` and `v_dot4_i32_iu8` read the IU body operand.
+/// Q8 and F16 decisions are a different arm and stay.
+fn kmap_promote_emits_mq6(iu_latched: bool, kmap_promote: bool, use_mq4v2: bool) -> bool {
+    kmap_promote && use_mq4v2 && !iu_latched
+}
+
+fn iu_integer_body_latched() -> bool {
+    IU_STORAGE.get().copied().flatten().is_some()
+}
+
+/// Developer levers that would write a non-IU expert grid into an IU file.
+/// The integer units cannot mix those bytes with the body operand.
+fn check_iu_integer_body(
+    format: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    if hipfire_runtime::iu_quant::Layout::from_format(format).is_none() {
+        return Ok(());
+    }
+    const FOREIGN: &[&str] = &[
+        "HIPFIRE_MOE_EXPERTS_MQ6",
+        "HIPFIRE_MOE_DOWN_MQ6",
+        "HIPFIRE_MOE_EXPERTS_MQ5",
+        "HIPFIRE_MOE_DOWN_MQ5",
+        "HIPFIRE_MOE_GRADED",
+    ];
+    for var in FOREIGN {
+        if env(var).as_deref() == Some("1") {
+            return Err(format!(
+                "{var}=1 does not apply to --format {format}; an IU file keeps body rows on the integer operand"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// True when the active iu rung leaves this role on the body codec.
 /// An explicit `--fixed-tier` override still wins.
 fn iu_role_stays_on_body(name: &str) -> bool {
@@ -2167,6 +2204,12 @@ pub(crate) fn run() {
         std::process::exit(1);
     }
     if let Err(message) = check_moe_expert_down(&args, route_for(&args), use_mq4v2, &|var| {
+        hipfire_config::developer_var(var).ok()
+    }) {
+        eprintln!("error: {message}");
+        std::process::exit(2);
+    }
+    if let Err(message) = check_iu_integer_body(&args.format, &|var| {
         hipfire_config::developer_var(var).ok()
     }) {
         eprintln!("error: {message}");
@@ -6030,7 +6073,9 @@ fn handle_moe_expert_3d(
         // #599's description states "K-map Promote6 now emits MQ6 for qt44/qt45
         // when K%256==0". That holds on the non-expert path; this arm is where
         // routed experts are decided, and it was never updated.
-        || (kmap_promote && use_mq4v2)
+        // `--format iu4` / `iu8` also sets use_mq4v2, but those rows must stay
+        // on the integer operand. `kmap_promote_emits_mq6` drops that term.
+        || kmap_promote_emits_mq6(iu_integer_body_latched(), kmap_promote, use_mq4v2)
         || (kmap_promote && use_mq4v2_lloyd && mq6v2_promote_supported(arch_id))
         || (kmap_promote && use_mq4c)
         || (kmap_promote && use_mq4_mq2lloyd_kmap)
@@ -6917,7 +6962,10 @@ fn handle_main_quant(
                     .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                     .collect();
                 (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if kmap_level == QuantLevel::Promote6 && !iu_ladder_owns(name) {
+            } else if kmap_level == QuantLevel::Promote6
+                && !iu_ladder_owns(name)
+                && !iu_integer_body_latched()
+            {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 {
                     meta.shape[1]
@@ -9941,8 +9989,9 @@ fn provenance(
 #[cfg(test)]
 mod pipeline_tests {
     use super::{
-        collect_vl_processor_fields, iu_product_name, iu_unlifted_role, lfm2_dense_mq_name_matches,
-        load_vl_processor_budget, moe_expert_3d_applies,
+        check_iu_integer_body, collect_vl_processor_fields, iu_product_name, iu_unlifted_role,
+        kmap_promote_emits_mq6, lfm2_dense_mq_name_matches, load_vl_processor_budget,
+        moe_expert_3d_applies,
     };
     use crate::model_filter::ProductTier;
 
@@ -9968,6 +10017,26 @@ mod pipeline_tests {
         assert!(!iu_unlifted_role(Some("router"), ProductTier::Pro));
         assert_eq!(ProductTier::from_flag("normal"), Some(ProductTier::Base));
         assert_eq!(ProductTier::from_flag("normal").unwrap().label(), "base");
+    }
+
+    #[test]
+    fn iu_body_does_not_take_the_mq6_promotion() {
+        // mq4 still promotes. IU is the same use_mq4v2 flag and must not.
+        assert!(kmap_promote_emits_mq6(false, true, true));
+        assert!(!kmap_promote_emits_mq6(true, true, true));
+        assert!(!kmap_promote_emits_mq6(false, false, true));
+        assert!(!kmap_promote_emits_mq6(false, true, false));
+        let err = check_iu_integer_body("iu4", &|var| {
+            (var == "HIPFIRE_MOE_EXPERTS_MQ6").then(|| "1".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("HIPFIRE_MOE_EXPERTS_MQ6"), "{err}");
+        assert!(err.contains("integer operand"), "{err}");
+        check_iu_integer_body("iu8", &|var| {
+            (var == "HIPFIRE_MOE_DOWN_MQ5").then(|| "0".to_string())
+        })
+        .unwrap();
+        check_iu_integer_body("mq4", &|_| Some("1".to_string())).unwrap();
     }
 
 

@@ -35,9 +35,11 @@
 //! `sum((q - 8) * x)` can use it when that identity holds after the fp16
 //! round trip.
 //!
-//! No GPU kernel reads these tensors yet. Generic GEMV and GEMM refuse them.
-//! A kernel should load `row_bytes(k)` with the code plane at offset 0
-//! (`code_bytes(k)` long) and the scales immediately after.
+//! Decode GEMV for [`Layout::Iu4`] is `v_dot8_i32_iu4` on this plane
+//! ([`gemv_iu4_dot8`] is the CPU contract). Generic GEMM still refuses every
+//! IU dtype, and qt 58 / qt 59 still have no kernel. A kernel loads
+//! `row_bytes(k)` with the code plane at offset 0 (`code_bytes(k)` long)
+//! and the scales immediately after.
 //!
 //! ## IU8G32 (qt 59), the Q8 tier
 //!
@@ -348,6 +350,75 @@ fn code_at(codes: &[u8], index: usize, layout: Layout) -> u8 {
     }
 }
 
+/// Signed int4 activation code. `id` is `7 / max(|x|)` over the 32-element
+/// block, and `rintf` is round-to-nearest, ties to even.
+fn quant_i4(x: f32, id: f32) -> i32 {
+    let q = (x * id).round_ties_even();
+    let q = if q.is_finite() { q as i32 } else { 0 };
+    q.clamp(-8, 7)
+}
+
+/// Decode-GEMV contract for an IU4 tensor.
+///
+/// `x` is one FWHT-256-rotated vector. Each 32-element block is quantized to
+/// signed int4 with `d = max(|x|) / 7`. Each eight weights then fold as
+///
+/// ```text
+/// acc += (d * scale) * dot(q_w, q_x) + zero * (d * sum(q_x))
+/// ```
+///
+/// with the weight operand unsigned. That is one `v_dot8_i32_iu4`. The
+/// integer dot is exact. The activation quant is the approximation, so this
+/// is the dot of the dequantized row with the requantized activation, not
+/// with `x` itself. The device kernel adds the warp partials in xor-tree
+/// order, so a GPU result can differ from this sequential sum in the last
+/// bits.
+pub fn gemv_iu4_dot8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, String> {
+    validate(bytes, m, k, Layout::Iu4)?;
+    if x.len() != k {
+        return Err(format!(
+            "IU4 GEMV activation length {}, expected K={k}",
+            x.len()
+        ));
+    }
+    let row_b = row_bytes(k, Layout::Iu4).expect("validate checked the shape");
+    let code_b = code_bytes(k, Layout::Iu4).expect("validate checked the shape");
+    let mut y = vec![0.0f32; m];
+    for row in 0..m {
+        let raw = &bytes[row * row_b..(row + 1) * row_b];
+        let codes = &raw[..code_b];
+        let scales = &raw[code_b..];
+        let mut acc = 0.0f32;
+        let mut col = 0;
+        while col < k {
+            let mut amax = 0.0f32;
+            for j in 0..32 {
+                amax = amax.max(x[col + j].abs());
+            }
+            let d = amax / 7.0;
+            let id = if amax > 0.0 { 7.0 / amax } else { 0.0 };
+            for chunk in 0..4 {
+                let base = col + chunk * 8;
+                let mut dot = 0i32;
+                let mut sumq = 0i32;
+                for j in 0..8 {
+                    let q = quant_i4(x[base + j], id);
+                    let w = i32::from(code_at(codes, base + j, Layout::Iu4));
+                    dot += w * q;
+                    sumq += q;
+                }
+                let pair = (base / HALF) * SCALE_PAIR_BYTES;
+                let scale = load_f16(&scales[pair..pair + 2]);
+                let zero = load_f16(&scales[pair + 2..pair + 4]);
+                acc += (d * scale) * (dot as f32) + zero * (d * (sumq as f32));
+            }
+            col += 32;
+        }
+        y[row] = acc;
+    }
+    Ok(y)
+}
+
 /// Dequantise an IU tensor back to f32 in the rotated basis.
 ///
 /// `w[row, k] = f32(scale) * code + f32(zero)` with the pair for
@@ -490,5 +561,43 @@ mod tests {
         // qt 58 stores MQ4 nibbles. A signed Q8 code does not fit that range.
         assert!(packed[0] > 15);
         assert!(repack_q8f16(&src, m, 48).is_err());
+    }
+
+    #[test]
+    fn iu4_dot8_gemv_folds_each_half_and_keeps_the_signed_nibble() {
+        let k = 512usize;
+        let row_b = row_bytes(k, Layout::Iu4).unwrap();
+        let mut tensor = vec![0u8; 2 * row_b];
+        let row = &mut tensor[..row_b];
+        // Index 5 (odd): high nibble of byte 2. Index 6: low nibble of byte 3.
+        row[2] = 3 << 4;
+        row[3] = 1;
+        // Index 128, even: low nibble of byte 64. Group 0, half 1.
+        row[64] = 1;
+        // Index 256, even: low nibble of byte 128. Group 1, half 0.
+        row[128] = 2;
+        let codes = k / 2;
+        let put = |buf: &mut [u8], at: usize, v: f32| {
+            buf[at..at + 2].copy_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+        };
+        put(row, codes, 1.0);
+        put(row, codes + 2, 0.5);
+        put(row, codes + 4, 2.0);
+        put(row, codes + 6, -1.0);
+        put(row, codes + 8, 4.0);
+        put(row, codes + 10, 0.0);
+
+        let mut x = vec![0.0f32; k];
+        x[5] = 7.0;
+        x[6] = 3.6;
+        x[128] = 7.0;
+        x[256] = 7.0;
+
+        let y = gemv_iu4_dot8(&tensor, &x, 2, k).unwrap();
+        // Block 0: q(7)=7, q(3.6)=4. (1)(3*7 + 1*4) + 0.5*(7+4) = 25 + 5.5.
+        // Half 1: (2)(1*7) + (-1)*(7) = 7. Group 1: (4)(2*7) = 56.
+        assert!((y[0] - 93.5).abs() < 1e-4, "y0 {}", y[0]);
+        assert_eq!(y[1], 0.0);
+        assert!(gemv_iu4_dot8(&tensor, &x[..k - 1], 2, k).is_err());
     }
 }

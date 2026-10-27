@@ -89,7 +89,7 @@
 54  QwenI64      reserved     Qwen4 raw-I64 metadata record (non-weight; written by the Qwen4 producer, no QuantType variant)
 55  FP8E4M3B128  passthrough  OCP e4m3fn codes verbatim + 128x128 bf16 s_inv block scales, expert-blocked payload (docs/quant-formats/fp8-e4m3.md); Qwen4 stock-FP8 routed experts, gfx942 only
 56  FP8E4M3PT    arch-loaded  OCP e4m3fn codes + one per-tensor bf16 scale in a 16-B header; read by the Qwen4 PLE row store, not the passthrough table
-57  IU4G256      passthrough  MQ4V2 codes in an unsigned-nibble row (codes, then per-128 f16 scale/zero); IU4 WMMA operand layout; no GPU kernel yet (docs/quant-formats/iu.md)
+57  IU4G256      passthrough  MQ4V2 codes in an unsigned-nibble row (codes, then per-128 f16 scale/zero); decode GEMV is v_dot8_i32_iu4; prefill GEMM has no kernel yet (docs/quant-formats/iu.md)
 58  IU8G256      passthrough  same codes, one byte 0..=15 per weight, then the same scale plane; IU8 WMMA operand layout; no GPU kernel yet
 59  IU8G32       passthrough  Q8F16 grid (signed int8, f16 scale per 32, no FWHT) with scales at the row tail; signed IU8 WMMA operand for embeddings, lm_head, and the fixed tier; no GPU kernel yet (docs/quant-formats/iu.md)
 131 MQ3I4G128R256  arch-loaded  MQ3-I4 gate/up: planar 3-bit codes + per-128 f16 scales (R256 FWHT); typed-qwen4 expert-slab only; no GPU kernels yet and the loader refuses it; codec in hipfire-runtime/src/mq_i4.rs; qt=130 is the compact-Hessian record id

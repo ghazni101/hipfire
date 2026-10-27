@@ -1461,6 +1461,56 @@ fn mq4g128v2_is_explicitly_rejected_by_generic_dispatch_families() {
 }
 
 #[test]
+fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
+    let fam = GemvFamily::new();
+    assert!(fam
+        .resolve(
+            DType::IU4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::IU4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna4(),
+            None
+        )
+        .is_ok());
+    assert!(fam
+        .resolve(
+            DType::IU4G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna2(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::IU8G256,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_err());
+    assert!(fam
+        .resolve(
+            DType::IU8G32,
+            GemvVariant::Prerotated,
+            false,
+            &ctx_rdna3(),
+            None
+        )
+        .is_err());
+}
+
+#[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
     assert!(fam

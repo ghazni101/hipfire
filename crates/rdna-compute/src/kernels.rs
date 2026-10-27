@@ -2770,6 +2770,10 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
 /// activation quantizer and the v4 (persistent, all of K in LDS) / v3
 /// (LDS-staged chunks, two rows per warp) GEMVs, one module per batch (2..=5)
 /// and residual flavour, each with a `_multi` twin for up to four weights.
+/// IU4G256 decode GEMV. One wave per row, `v_dot8_i32_iu4` on the planar
+/// nibble row. See `kernels/src/gemv_iu4.hip`.
+pub const GEMV_IU4G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.hip");
+
 pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
     "#define Q8X_QUANT 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")

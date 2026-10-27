@@ -88,7 +88,7 @@ pub fn run_mtp_fill_mq4(
 pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
     if dtype.is_iu_quant() {
         panic!(
-            "residual_gemm_key_for: {} has no residual key — no GPU kernel reads the IU operand layouts",
+            "residual_gemm_key_for: {} has no residual GEMM — the IU4 decode GEMV does not cover this launch",
             dtype.iu_quant_name().unwrap_or("IU")
         );
     }

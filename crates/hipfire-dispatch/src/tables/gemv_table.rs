@@ -78,6 +78,7 @@ fn register_plain(registry: &mut KernelRegistry) {
 fn register_prerotated(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::MQ4G256,
+        DType::IU4G256,
         DType::MQ4G256V2,
         DType::MQ5G256V2,
         DType::MQ6G256V2,

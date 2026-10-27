@@ -5,9 +5,10 @@ The products are `iu4` and `iu8`, each with the three rungs in
 [ladder.md](ladder.md). `--format iu4` and `--format iu8` on
 `hipfire-quantize` use the MQ4V2 tensor map for the body. A role the rung
 lifts is stored as IU8G32 (qt 59), a contiguous signed-int8 operand, instead
-of interleaved Q8F16. Norms stay F16. A K-map promotion can still rewrite a
-body row that the rung does not own to MQ6. Pass `--uniform` when every
-eligible body row must stay on this layout. `--moe-expert-down` is refused:
+of interleaved Q8F16. Norms stay F16. K-map Promote6 does not rewrite a
+body row to MQ6. Those rows stay on this layout, which is the operand
+`v_wmma_i32_16x16x16_iu4` and `v_dot4_i32_iu8` can load. Q8 and F16 K-map
+decisions are unchanged. `--uniform` still turns the K-map off entirely. `--moe-expert-down` is refused:
 there is no G128 IU layout.
 
 ## Products
@@ -76,10 +77,21 @@ is already K element `m`, so IU4 needs no permute before
 ## What a kernel binds
 
 `hipfire_runtime::iu_quant` is the oracle: `repack_mq4v2`, `validate`,
-`dequant`, `row_bytes`, `code_bytes`. Dequant is the rotated-basis f32 value
-above. Generic GEMV, GEMM, and DFlash refuse both dtypes. A new kernel should
-load `row_bytes(K)` per row, take the code plane at offset 0, and fold
-`scale * acc + zero * sum(x)` per 128 K after the integer dot.
+`dequant`, `gemv_iu4_dot8`, `row_bytes`, `code_bytes`. Dequant is the
+rotated-basis f32 value above.
+
+Decode GEMV for qt 57 is `gemv_iu4g256` (RDNA3 and RDNA4). One wave per row
+loads the code plane at offset 0 and issues it unsigned to
+`v_dot8_i32_iu4`. The activation is signed int4, one scale per 32 elements
+(`d = max(|x|) / 7`), and each eight weights fold
+
+```text
+acc += (d * scale) * dot(q, xq) + zero * (d * sum(xq))
+```
+
+`x` is the FWHT-256 activation. The integer dot is exact. The activation
+quant is the approximation. Prefill GEMM, DFlash, qt 58, and qt 59 still
+refuse the dtype.
 
 ## Lifted roles (qt 59)
 
@@ -107,4 +119,4 @@ IU8G32, one row, K = 256                         272 B/row = 8.5 bpw
 
 Norms stay F16. The embedding table is a gather, not a matrix instruction. On the normal rung it is stored this way so a tied `lm_head` is the same buffer the int8 unit can load. Attention and the router are not rungs; on a MoE model the Q8 pin still holds them.
 
-Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. Generic GEMV, GEMM, and DFlash refuse qt 59 along with qt 57 and 58.
+Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. Generic GEMM and DFlash refuse qt 57, 58, and 59. Decode GEMV runs qt 57 only.

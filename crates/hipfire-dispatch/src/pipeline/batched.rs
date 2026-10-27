@@ -190,11 +190,11 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
             0,
             "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
         ))
-    } else if dtype.is_iu_quant() {
+    } else if dtype == DType::IU8G256 || dtype == DType::IU8G32 {
         Err(HipError::new(
             0,
             &format!(
-                "this model uses the {} weight format (qt 57/58/59): an integer-matrix operand layout, and no GPU kernel reads it yet",
+                "this model uses the {} weight format (qt 58/59): an integer-matrix operand layout, and no GPU kernel reads it yet",
                 dtype.iu_quant_name().unwrap_or("IU")
             ),
         ))

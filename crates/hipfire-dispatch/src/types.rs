@@ -181,9 +181,9 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 
 /// Refusal for the typed-qwen4-only planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134)
 /// on every generic GEMV/GEMM family resolution: they have no generic kernel.
-/// Refusal for IU4/IU8 (qt=57/58). The bytes are an operand layout for a
-/// kernel that does not exist yet; a generic GEMV would read them as a
-/// different quant.
+/// Refusal for an IU dtype this family does not run. qt 57 decode GEMV is
+/// `GemvIu4G256Prerotated`. qt 58, qt 59, and every GEMM of these layouts
+/// still land here.
 pub(crate) fn reject_iu(dtype: DType, family: &'static str) -> DispatchError {
     DispatchError::UnsupportedVariant {
         family,
@@ -315,6 +315,8 @@ pub enum KernelKey {
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
+    /// qt 57 decode GEMV. `v_dot8_i32_iu4` on the planar nibble row.
+    GemvIu4G256Prerotated,
     GemvMq4CG256Prerotated,
     GemvMq5G256V2Prerotated,
     GemvMq6G256V2Prerotated,
@@ -868,7 +870,7 @@ impl KernelKey {
                 | E8PI4G128R128,
                 _,
             ) => Err(reject_mq_i4(dtype, "gemv")),
-            (IU4G256 | IU8G256 | IU8G32, _) => Err(reject_iu(dtype, "gemv")),
+            (IU8G256 | IU8G32, _) => Err(reject_iu(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -882,6 +884,7 @@ impl KernelKey {
         use DType::*;
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
+            IU4G256 => Ok(Self::GemvIu4G256Prerotated),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
             // qt=52 reuses the qt=44 dispatch key: the LAUNCH arm branches on
             // w.dtype and selects the LUT kernel (fail-closed on missing LUT).
@@ -929,7 +932,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
+            IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -1087,9 +1090,10 @@ impl KernelKey {
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => ArchPredicate::Always,
-            // qt=57/58/59 have no kernel. Explicit so they cannot inherit a
-            // neighbouring MQ4 or Q8 route.
-            IU4G256 | IU8G256 | IU8G32 => ArchPredicate::Always,
+            // qt 57 decode GEMV issues `v_dot8_i32_iu4`, which is on the same
+            // RDNA3/RDNA4 parts as integer WMMA. qt 58/59 still have no kernel.
+            IU4G256 => ArchPredicate::HasWmma,
+            IU8G256 | IU8G32 => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -1172,6 +1176,8 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP2G32E8
             | ParoQ4G128
             | ParoQ4G64
+            | IU4G256
+            | IU8G256
     )
 }
 
@@ -1211,6 +1217,15 @@ mod tests {
             KernelKey::GemvMq4G256V2SwiGLUResidual
         );
         assert!(dtype_needs_rotation(DType::MQ4G256V2Lloyd));
+        assert_eq!(
+            KernelKey::for_gemv_prerotated(DType::IU4G256).unwrap(),
+            KernelKey::GemvIu4G256Prerotated
+        );
+        assert!(dtype_needs_rotation(DType::IU4G256));
+        assert!(dtype_needs_rotation(DType::IU8G256));
+        assert!(!dtype_needs_rotation(DType::IU8G32));
+        assert!(KernelKey::for_gemv_prerotated(DType::IU8G256).is_err());
+        assert!(KernelKey::for_gemv_residual(DType::IU4G256).is_err());
         assert!(
             KernelKey::gemv_steps(DType::MQ4G256V2Lloyd, GemvVariant::WithResidual)
                 .contains(&PipelineOp::RotateFwht)

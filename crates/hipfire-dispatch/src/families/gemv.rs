@@ -157,6 +157,11 @@ impl Default for RotateInputs<'_> {
 /// Pure selection of the RotationFamily variant from the sign-domain plan
 /// and the caller's fusion intent. AWQ/batched are NOT part of this — they
 /// are derived inside RotationFamily from awq_scale/batch_size.
+/// qt 58 and qt 59 still have no GEMV. qt 57 is `gemv_iu4g256`.
+fn iu_without_gemv(dtype: DType) -> bool {
+    dtype.is_iu_quant() && dtype != DType::IU4G256
+}
+
 pub fn select_rotation_variant(
     plan: RotationPlan,
     has_norm: bool,
@@ -275,7 +280,7 @@ impl GemvFamily {
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
         }
-        if w.dtype.is_iu_quant() {
+        if iu_without_gemv(w.dtype) {
             return Err(crate::types::reject_iu(w.dtype, "gemv"));
         }
         let x_buf = match input {
@@ -346,7 +351,7 @@ impl GemvFamily {
         if params.w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(params.w.dtype, "gemv"));
         }
-        if params.w.dtype.is_iu_quant() {
+        if iu_without_gemv(params.w.dtype) {
             return Err(crate::types::reject_iu(params.w.dtype, "gemv"));
         }
         let shape = ShapeInfo {
@@ -404,7 +409,7 @@ impl GemvFamily {
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
         }
-        if w.dtype.is_iu_quant() {
+        if iu_without_gemv(w.dtype) {
             return Err(crate::types::reject_iu(w.dtype, "gemv"));
         }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
@@ -552,6 +557,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvIu4G256Prerotated => hip!(gpu.gemv_iu4g256(w.buf, x, y, m, k)),
         K::GemvMq4G256V2Prerotated => {
             // qt=52 shares the qt=44 dispatch key: branch on the WEIGHT dtype,
             // never the key. LUT None fails closed (a Lloyd tensor without its

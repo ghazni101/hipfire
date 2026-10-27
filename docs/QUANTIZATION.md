@@ -34,7 +34,7 @@ Production defaults for day-to-day use:
 | `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
-| `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. No GPU kernel yet |
+| `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV is `v_dot8_i32_iu4`. Prefill GEMM has no kernel yet |
 | `iu8` | `IU8G256` (qt 58) | 4 | 8.25 | 264 (K bytes of codes 0..=15, then the same scales) | Same codes, pre-expanded for the IU8 unit. Not an 8-bit grid |
 | `iu4` / `iu8` lifted roles | `IU8G32` (qt 59) | 8 | 8.5 | 272 (K signed codes, then 2 B scale per 32) | Q8 grid, scales at the row tail. Embeddings every rung; lm_head on `iu4`/`iu8` and `pro`; ssm_out on `pro` |
 
