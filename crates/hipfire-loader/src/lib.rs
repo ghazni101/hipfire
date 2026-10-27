@@ -1653,9 +1653,39 @@ pub enum EpArch {
         dn_states: Vec<hipfire_arch_qwen35::qwen35::DeltaNetState>,
         scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
     },
+    /// Dense Qwen tensor parallelism on the generic mesh executor
+    /// (`HIPFIRE_DENSE_TP_ROUTE=mesh`): one `Qwen35TpRank` per device (weights,
+    /// KV, DeltaNet state and scratch), the split plan of exactly those shards
+    /// and the program validated against them once at load. The ranks are
+    /// driven epoch by epoch through `Gpus::submit_mesh_epoch`.
+    Qwen35MeshTp {
+        global: hipfire_arch_qwen35::qwen35::Qwen35Config,
+        ranks: Vec<hipfire_arch_qwen35::qwen35::mesh_tp::Qwen35TpRank>,
+        plan: hipfire_runtime::mesh_split::SplitPlan,
+        program: hipfire_arch_qwen35::qwen35::mesh_tp::Qwen35TpProgram,
+        /// The last mesh op id issued (strictly increasing per epoch).
+        next_op: u64,
+        /// Tickets of the epochs enqueued and not yet drained, oldest first.
+        /// Drained together (`Gpus::drain_mesh_epochs`) at the serve loop's
+        /// rank-0 logits read, at per-request reset and abort, at unload and
+        /// by the bench sync; never left across a request boundary.
+        pending: Vec<hipfire_runtime::multi_gpu::executor::MeshTicket>,
+    },
 }
 
 impl EpArch {
+    /// Whether this EP load's serve loop applies a request's repeat, presence
+    /// and frequency penalties to its logits. The Qwen3.5 loops (dense TP on
+    /// either route, MoE EP) do, over rank 0's logits with the single-GPU host
+    /// arithmetic; DeepSeek4 and MiniMax sample without a penalty stage, so
+    /// the daemon refuses penalties for them.
+    pub fn applies_request_penalties(&self) -> bool {
+        matches!(
+            self,
+            EpArch::Qwen35 { .. } | EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }
+        )
+    }
+
     // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
     pub fn model_dims(&self) -> (usize, usize, usize) {
         match self {
@@ -1674,6 +1704,7 @@ impl EpArch {
                 .first()
                 .map(|c| (c.dim, c.n_layers, c.vocab_size))
                 .unwrap_or((0, 0, 0)),
+            EpArch::Qwen35MeshTp { global, .. } => (global.dim, global.n_layers, global.vocab_size),
         }
     }
 }
@@ -2663,7 +2694,17 @@ fn finish_qwen35_load(
         }
     }
     let mtp_present = mtp.is_some();
-    let mtp = mtp.map(|(head, _source)| head);
+    let mtp = mtp.map(|(mut head, _source)| {
+        // Exact gfx1100: draft over a fixed token subset sliced from the trunk
+        // lm_head (`HIPFIRE_GFX1100_DRAFT_VOCAB=0` keeps the full-vocab draft).
+        hipfire_arch_qwen35::draft_vocab::attach_trunk_draft_vocab(
+            &mut *ctx.gpu,
+            &mut head,
+            &bundle.weights.output,
+            &tokenizer,
+        );
+        head
+    });
     // Auto-attached drafters (mode `auto`, not forced `on`) get one line that
     // names the artifact and the switch, so an A/B never starts with a hunt.
     let auto_draft = match (ctx.spec.dflash, &dflash, ctx.draft_path) {
@@ -3047,6 +3088,9 @@ fn resolve_route_plan(
             }
         }
     }
+    // The tower's kernels are outside the closed route plan whether the tower
+    // is resident or streamed, so every non-`off` mode that resolves a tower
+    // (`auto`, `resident`, `on`) falls back to the ordinary loader.
     if req.vision_path.is_some()
         || hfq
             .find_tensor_info("model.visual.patch_embed.proj.weight")
@@ -3725,6 +3769,7 @@ pub fn load_admitted_with_gemma4_drafter(
                 model_ctx: s.model_ctx,
                 automatic: s.bound != "user",
                 card_cap: 0,
+                reserve_bytes: 0,
             }),
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
@@ -4938,7 +4983,13 @@ fn load_model_ep_qwen35(
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(
+        let dense_tp_route = hipfire_config::developer_var("HIPFIRE_DENSE_TP_ROUTE").ok();
+        let route = parse_dense_tp_route(dense_tp_route.as_deref())?;
+        let load = match resolve_dense_tp_route(route, &config, tp, spec.mtp == Some(true)) {
+            DenseTpRoute::Mesh => load_model_tp_qwen35_mesh,
+            _ => load_model_tp_qwen35_dense,
+        };
+        return load(
             path,
             max_seq,
             tp,
@@ -5399,6 +5450,13 @@ fn load_model_tp_qwen35_dense(
     };
     let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
     eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
+    eprintln!(
+        "[loader] dense qwen TP route=hand (hand dense-TP forward): {tp} ranks, peer_access={peer}"
+    );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(peer)
+    );
     let mtp_present = mtp_head.is_some();
     // Block-verify drafters cannot run on the mesh (`Qwen35DenseTpTarget`
     // refuses `verify_block`), so an `ngram=on` request must not build one
@@ -5425,6 +5483,397 @@ fn load_model_tp_qwen35_dense(
                 kv_caches,
                 dn_states,
                 scratches,
+            },
+        }),
+        qwen35_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+            chat_template_source,
+        )
+    })
+}
+
+/// The dense Qwen TP route `HIPFIRE_DENSE_TP_ROUTE` selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenseTpRoute {
+    /// The default: the generic mesh executor wherever it admits the load,
+    /// else the hand route ([`resolve_dense_tp_route`]).
+    Auto,
+    /// The hand dense-TP forward (`load_model_tp_qwen35_dense`): the rollback,
+    /// and the only route for uneven TP3/TP5 splits and dense-TP MTP.
+    Hand,
+    /// The generic mesh executor (`load_model_tp_qwen35_mesh`), forced: a
+    /// load it does not admit fails instead of falling back.
+    Mesh,
+}
+
+/// `HIPFIRE_DENSE_TP_ROUTE`: `auto` (also unset or empty), `mesh` or `hand`;
+/// any other value is a load error.
+fn parse_dense_tp_route(value: Option<&str>) -> Result<DenseTpRoute, String> {
+    match value {
+        None | Some("") | Some("auto") => Ok(DenseTpRoute::Auto),
+        Some("hand") => Ok(DenseTpRoute::Hand),
+        Some("mesh") => Ok(DenseTpRoute::Mesh),
+        Some(other) => Err(format!(
+            "HIPFIRE_DENSE_TP_ROUTE={other:?} is not a dense TP route; accepted values: \
+             `auto` (default; also unset or empty), `mesh` (generic mesh executor), `hand` (hand route)"
+        )),
+    }
+}
+
+/// `Auto` takes the mesh route unless the load needs what only the hand route
+/// has: an uneven head/FFN split (TP3/TP5 on the 27B) or dense-TP MTP
+/// (`speculation.mtp = on`). Logs the fallback reason. `Hand`/`Mesh` pass through.
+fn resolve_dense_tp_route(
+    route: DenseTpRoute,
+    config: &qwen35::Qwen35Config,
+    tp: usize,
+    mtp: bool,
+) -> DenseTpRoute {
+    if route != DenseTpRoute::Auto {
+        return route;
+    }
+    let reason = if mtp {
+        Some("MTP requested (the mesh route has no MTP verify)".to_string())
+    } else {
+        qwen35::mesh_tp::tp_rank_layouts(config, tp)
+            .err()
+            .map(|e| format!("uneven split: {e}"))
+    };
+    match reason {
+        Some(reason) => {
+            eprintln!("[loader] dense qwen TP route=auto -> hand: {reason}");
+            DenseTpRoute::Hand
+        }
+        None => DenseTpRoute::Mesh,
+    }
+}
+
+#[cfg(test)]
+mod dense_tp_route_tests {
+    use super::{parse_dense_tp_route, DenseTpRoute};
+
+    #[test]
+    fn route_knob_selects_mesh_and_refuses_unknown_values() {
+        assert_eq!(parse_dense_tp_route(None), Ok(DenseTpRoute::Auto));
+        assert_eq!(parse_dense_tp_route(Some("")), Ok(DenseTpRoute::Auto));
+        assert_eq!(parse_dense_tp_route(Some("auto")), Ok(DenseTpRoute::Auto));
+        assert_eq!(parse_dense_tp_route(Some("hand")), Ok(DenseTpRoute::Hand));
+        assert_eq!(parse_dense_tp_route(Some("mesh")), Ok(DenseTpRoute::Mesh));
+        for bad in ["Mesh", "1", "generic", " mesh"] {
+            let error = parse_dense_tp_route(Some(bad)).unwrap_err();
+            assert!(
+                error.contains("`mesh`") && error.contains("`hand`") && error.contains("`auto`"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// Transactional owner for the mesh-route dense Qwen TP construction: the
+/// `Gpus` (with its provisioned mesh edges) and the ranks loaded so far. An
+/// early return drains the mesh edges first and then frees every rank on its
+/// own device, so a failed load strands no VRAM. A failed drain quarantines:
+/// the ranks and the `Gpus` are leaked rather than freed under possibly
+/// in-flight work.
+struct Qwen35MeshTpStaging {
+    gpus: Option<Gpus>,
+    ranks: Vec<qwen35::mesh_tp::Qwen35TpRank>,
+}
+
+impl Qwen35MeshTpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            ranks: Vec::new(),
+        }
+    }
+
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("mesh TP staging gpus taken")
+    }
+
+    fn into_parts(mut self) -> (Gpus, Vec<qwen35::mesh_tp::Qwen35TpRank>) {
+        (
+            self.gpus.take().expect("mesh TP into_parts called twice"),
+            std::mem::take(&mut self.ranks),
+        )
+    }
+}
+
+impl Drop for Qwen35MeshTpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        if let Err(error) = gpus.drain_mesh_edges() {
+            eprintln!(
+                "[loader] dense qwen TP mesh load failed and the mesh drain failed ({error}); \
+                 resources quarantined until process restart"
+            );
+            std::mem::forget(std::mem::take(&mut self.ranks));
+            std::mem::forget(gpus);
+            return;
+        }
+        for (rank, state) in self.ranks.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                state.free_gpu(gpu);
+            }
+        }
+        for gpu in &mut gpus.devices {
+            let _ = gpu.bind_thread();
+            gpu.invalidate_weight_caches();
+            gpu.invalidate_graph_state();
+            gpu.drain_pool();
+        }
+        let _ = gpus.free_tp_graph_signals();
+    }
+}
+
+/// Dense Qwen tensor parallelism on the generic mesh executor
+/// (`HIPFIRE_DENSE_TP_ROUTE=mesh`): the same signature and preamble as
+/// [`load_model_tp_qwen35_dense`], then `Qwen35TpRank`s provisioned with the
+/// executor's byte-qualified reduction transport. AR decode and chunked
+/// prefill only: MTP, uneven layouts and non-legacy KV backends are refused
+/// before any GPU allocation.
+#[allow(clippy::too_many_arguments)]
+fn load_model_tp_qwen35_mesh(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_k: Option<&str>,
+    kv_v: Option<&str>,
+    qwen_default_q8: bool,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+    mtp_path: Option<&Path>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
+) -> Result<LoadedModel, String> {
+    use hipfire_arch_qwen35::qwen35::mesh_tp::{
+        qwen35_tp_plan_for_ranks, tp_rank_layouts, Qwen35TpProgram, Qwen35TpRank,
+    };
+    use hipfire_runtime::mesh_placement::{AdmittedMesh, AdmittedRank, BandPlacement};
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let _ = mtp_path;
+    let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("qwen35 config: {e}"))?;
+    let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride)
+        .map_err(|e| format!("dense TP ShardConfig: {e}"))?;
+    let state_quant_resolved = parse_state_quant(state_quant)?;
+    let kv_backend_raw = kv_backend.unwrap_or("legacy");
+    let kv_backend_resolved: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
+    let config_mode = hipfire_runtime::config::get();
+    let kv_raw = kv_mode.unwrap_or(config_mode.kv_mode.as_str());
+    let pair = kv_mode::resolve_kv_pair(
+        kv_raw,
+        kv_k,
+        kv_v,
+        &kv_mode::QWEN35_TP_POLICY,
+        "multi-gpu",
+        qwen_default_q8,
+    )
+    .map_err(|e| format!("Qwen dense TP KV: {e}"))?;
+    let kv_mode_resolved = pair.k();
+    let Some(v_mode) = pair.v() else {
+        return Err("Qwen native KV has no multi-GPU constructor".into());
+    };
+    if v_mode != llama::VMode::Q8 {
+        return Err("Qwen dense TP has no multi-GPU Lloyd-V constructor; use --kv-v q8".into());
+    }
+    eprintln!(
+        "  KV cache: requested mode={kv_raw}, effective K={} V={}",
+        kv_mode::qwen_k_display_name(kv_mode_resolved),
+        kv_mode::qwen_v_display_name(v_mode)
+    );
+    // Preflight weights before GPU allocation (validates qt geometry/blob/sidecar).
+    qwen35::preflight_weights_dense_tp(&hfq, &config, &shard)?;
+
+    // Refusals of the mesh route, all before any GPU allocation.
+    if spec.mtp == Some(true) {
+        return Err(
+            "MTP is not wired on the mesh TP route; set HIPFIRE_DENSE_TP_ROUTE=auto \
+                    (or hand) for dense-TP MTP, or use speculation off"
+                .into(),
+        );
+    }
+    if spec.ngram_draft == Some(true) {
+        eprintln!("  dense TP: n-gram drafter refused (block verify is not wired on the mesh)");
+    }
+    tp_rank_layouts(&config, tp).map_err(|e| format!("dense TP mesh layout: {e}"))?;
+
+    let arch_id = hfq.arch_id;
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+    let eos_tok = {
+        let ids = tokenizer.encode("<|im_end|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            config.eos_token
+        }
+    };
+
+    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    if gpus.devices.len() != tp {
+        return Err(format!(
+            "init_tp gave {} devices, expected tp={tp}",
+            gpus.devices.len()
+        ));
+    }
+    let mut staging = Qwen35MeshTpStaging::new(gpus);
+    for rank in 0..tp {
+        ensure_vmm_ready_for_load(&mut staging.gpus_mut().devices[rank])
+            .map_err(|err| format!("dense TP VMM preflight rank {rank}: {err}"))?;
+    }
+    // Mesh work never runs on the null stream: every device owns a launch
+    // stream before the edges are provisioned.
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
+    // The hand serve route's prefill chunk; also the rank batch scratch rows.
+    let chunk = qwen35::prefill_max_batch_tp(&staging.gpus_mut().devices[0], tp).max(1);
+    for rank in 0..tp {
+        let loaded = Qwen35TpRank::load(
+            &mut hfq,
+            &config,
+            &mut staging.gpus_mut().devices[rank],
+            rank,
+            tp,
+            kv_mode_resolved,
+            kv_backend_resolved,
+            state_quant_resolved,
+            max_seq,
+            chunk,
+        )
+        .map_err(|e| format!("dense TP mesh load rank {rank}: {e}"))?;
+        staging.ranks.push(loaded);
+    }
+    drop(hfq);
+
+    let mesh = staging.gpus_mut().mesh.clone();
+    let mut admitted_ranks = Vec::with_capacity(tp);
+    for (logical, gpu) in staging.gpus_mut().devices.iter().enumerate() {
+        gpu.bind_thread()
+            .map_err(|e| format!("dense TP bind rank {logical}: {e:?}"))?;
+        let pci_bus_id = gpu
+            .hip
+            .device_pci_bus_id(gpu.device_id)
+            .map_err(|e| format!("dense TP PCI bus id rank {logical}: {e:?}"))?;
+        admitted_ranks.push(AdmittedRank {
+            logical,
+            device_ordinal: gpu.device_id,
+            pci_bus_id: Some(pci_bus_id),
+            arch: gpu.arch.clone(),
+        });
+    }
+    let admitted = AdmittedMesh {
+        mesh: mesh.clone(),
+        ranks: admitted_ranks,
+        edges: Vec::new(),
+        family: "qwen35-tp".into(),
+        numerical_policy: "f32".into(),
+    };
+    let placement =
+        BandPlacement::uniform(&mesh, 1).map_err(|e| format!("dense TP mesh placement: {e}"))?;
+    let max_bytes = (chunk * config.dim * std::mem::size_of::<f32>()).next_multiple_of(16);
+    // TP2 whole-token decode graph (`HIPFIRE_TP_FULL_GRAPH`, on by default for
+    // an exact gfx1100 or gfx1201 pair), as the hand loader: the runtime
+    // admits it and prepares its signal tape (one barrier per collective, two
+    // per layer) and payload exchange before peer access is enabled, which
+    // the provisioning's `qualify_peer` does.
+    let barriers = config.n_layers * 2;
+    let peer = staging
+        .gpus_mut()
+        .can_access_peer_all()
+        .map_err(|e| format!("dense TP mesh can_access_peer_all: {e:?}"))?;
+    if peer {
+        let whole_token_graph = staging
+            .gpus_mut()
+            .prepare_tp2_whole_token_graph(barriers, config.dim * std::mem::size_of::<f32>())
+            .map_err(|e| format!("prepare TP2 whole-token graph: {e:?}"))?;
+        if whole_token_graph {
+            let arch = staging.gpus_mut().devices[0].arch.clone();
+            eprintln!(
+                "[loader] dense qwen {arch} mesh TP2 whole-token graph signal tape: {barriers} barriers"
+            );
+        }
+    }
+    staging
+        .gpus_mut()
+        .provision_mesh_edges(&admitted, &placement, max_bytes)
+        .map_err(|e| format!("dense TP mesh provisioning: {e}"))?;
+    let transport = staging
+        .gpus_mut()
+        .mesh_tp_transport()
+        .ok_or("dense TP mesh provisioning left no TP transport")?;
+    // Every rank's buffers exist now. Idempotent after the provisioning's
+    // qualification; it sets the flag the TP2 direct-peer reduction (and so
+    // the whole-token graph) requires. Emulated ranks share a device and
+    // report `false`, which keeps the copy-fold reduction.
+    if transport == "peer" {
+        staging
+            .gpus_mut()
+            .enable_peer_all()
+            .map_err(|e| format!("dense TP mesh enable_peer_all: {e:?}"))?;
+    }
+
+    let plan = qwen35_tp_plan_for_ranks(&config, &staging.ranks, &mesh)
+        .map_err(|e| format!("dense TP mesh plan: {e}"))?;
+    if plan.collectives.len() != barriers {
+        return Err(format!(
+            "dense TP mesh plan has {} collectives per epoch, not the {barriers} \
+             (two per layer) the whole-token graph signal tape is sized for",
+            plan.collectives.len()
+        ));
+    }
+    let tp_epoch = staging
+        .gpus_mut()
+        .mesh_tp_epoch()
+        .ok_or("dense TP mesh provisioning left no TP group")?;
+    let program = Qwen35TpProgram::new(&config, &staging.ranks, &plan, tp_epoch)
+        .map_err(|e| format!("dense TP mesh program: {e}"))?;
+    eprintln!(
+        "[loader] dense qwen TP route=mesh (generic mesh executor): {tp} ranks, \
+         transport={transport}, prefill chunk={chunk}, {} collectives/epoch",
+        plan.collectives.len()
+    );
+    eprintln!(
+        "[loader] dense qwen TP exchange={} (HIPFIRE_TP_EXCHANGE)",
+        hipfire_runtime::multi_gpu::tp_exchange::tp_exchange_label(transport == "peer")
+    );
+
+    let (gpus, ranks) = staging.into_parts();
+    // No drafter runs on the mesh route: `mtp=on` was refused above and block
+    // verify is not wired, so the speculator is built with neither.
+    let mesh_spec = hipfire_runtime::loader_api::SpecLoadCfg {
+        ngram_draft: Some(false),
+        ..spec
+    };
+    let speculator =
+        crate::spec_build::build_speculator(arch_id, None, None, true, max_seq, mesh_spec);
+
+    Ok(LoadedModel {
+        speculator,
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Qwen35MeshTp {
+                global: config,
+                ranks,
+                plan,
+                program,
+                next_op: 0,
+                pending: Vec::new(),
             },
         }),
         qwen35_eos_tok: eos_tok,
@@ -5743,6 +6192,39 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     if let Some(dev) = gpus.devices.get_mut(rank) {
                         let _ = dev.bind_thread();
                         weights.free_gpu(dev);
+                    }
+                }
+            }
+            EpArch::Qwen35MeshTp {
+                ranks, mut pending, ..
+            } => {
+                // Retire the undrained epochs (one ticketed drain), then stop
+                // and drain every epoch and mesh edge before freeing
+                // anything the epochs touch; a failed drain quarantines, so
+                // the ranks and the devices leak instead of being freed under
+                // possibly in-flight work.
+                let pending_drain = if pending.is_empty() {
+                    Ok(())
+                } else {
+                    gpus.drain_mesh_epochs(std::mem::take(&mut pending))
+                };
+                if let Err(e) = pending_drain.and_then(|()| gpus.drain_mesh_edges()) {
+                    std::mem::forget(ranks);
+                    std::mem::forget(gpus);
+                    return Err(format!(
+                        "unload dense qwen TP mesh: {e}; mesh resources quarantined until process restart"
+                    ));
+                }
+                for (rank, state) in ranks.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        state.free_gpu(dev);
+                        // Per-rank VMM teardown gate, as the hand route's.
+                        if let Err(e) = dev.ensure_vmm_cleaned() {
+                            if ep_first_err.is_none() {
+                                ep_first_err =
+                                    Some(format!("unload dense qwen TP VMM rank {rank}: {e:?}"));
+                            }
+                        }
                     }
                 }
             }

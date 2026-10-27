@@ -86,12 +86,24 @@ pub fn shared_i8_shadow_layer_bytes(
     hidden: usize,
     down_rows: usize,
 ) -> Option<u64> {
+    let (gate_up, down) = shared_i8_shadow_plane_bytes(intermediate, hidden, down_rows)?;
+    gate_up.checked_add(down)
+}
+
+/// `(gate_up plane bytes, down plane bytes)` of one layer's INT8 shadows, with the same
+/// admissibility checks as [`shared_i8_shadow_layer_bytes`].
+pub fn shared_i8_shadow_plane_bytes(
+    intermediate: usize,
+    hidden: usize,
+    down_rows: usize,
+) -> Option<(u64, u64)> {
     if hidden == 0 || hidden % 256 != 0 || intermediate == 0 || intermediate % 128 != 0 {
         return None;
     }
-    let words = plane_words(hidden, intermediate.checked_mul(2)?)
-        .checked_add(plane_words(intermediate, down_rows))?;
-    u64::try_from(words.checked_mul(4)?).ok()
+    let gate_up =
+        u64::try_from(plane_words(hidden, intermediate.checked_mul(2)?).checked_mul(4)?).ok()?;
+    let down = u64::try_from(plane_words(intermediate, down_rows).checked_mul(4)?).ok()?;
+    Some((gate_up, down))
 }
 
 /// The flag half of the route's admission, shared with the Qwen4 VRAM census: the INT8 route
@@ -163,6 +175,12 @@ impl Gpu {
         self.bind_thread()?;
         Self::shared_i8_check_weights(w)?;
         let key = w.gate.buf.as_ptr() as usize;
+        if let Some(state) = self.shadow_borrow.as_ref() {
+            let (gu, dn) = state
+                .i8_lookup(key, w.intermediate, w.hidden, w.down_rows)
+                .map_err(|m| HipError::new(0, &format!("qwen4_shared_i8: {m}")))?;
+            return Ok((gu as *mut c_void, dn as *mut c_void));
+        }
         if let Some(s) = self.shared_i8_shadows.get(&key) {
             if s.intermediate != w.intermediate
                 || s.hidden != w.hidden
@@ -178,35 +196,17 @@ impl Gpu {
         let (i, k, m_down) = (w.intermediate, w.hidden, w.down_rows);
         let gate_up = self.alloc_tensor(&[plane_words(k, 2 * i)], DType::F32)?;
         let down = self.alloc_tensor(&[plane_words(i, m_down)], DType::F32)?;
-        self.ensure_kernel(
-            QUANT_MODULE,
-            kernels::QWEN4_SHARED_I8_QUANT_GFX12_SRC,
-            QUANT_ENTRY_ROT256,
-        )?;
-        self.ensure_kernel(
-            QUANT_MODULE,
-            kernels::QWEN4_SHARED_I8_QUANT_GFX12_SRC,
-            QUANT_ENTRY_ROT128,
-        )?;
-        self.ensure_mq_signs()?;
-        self.ensure_mq_signs_128()?;
         let gu_ptr = gate_up.buf.as_ptr();
         let dn_ptr = down.buf.as_ptr();
-        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        for (weight, mode) in [(w.gate, 1i32), (w.up, 2i32)] {
-            self.shared_i8_rot256_launch(weight.buf.as_ptr(), gu_ptr, s1, s2, k, i, 2 * i, mode)?;
-        }
-        let t1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
-        let t2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
-        self.shared_i8_rot128_launch(
+        self.shared_i8_build_planes(
+            w.gate.buf.as_ptr(),
+            w.up.buf.as_ptr(),
             w.down.buf.as_ptr(),
-            dn_ptr,
-            t1,
-            t2,
-            std::ptr::null_mut(),
             i,
+            k,
             m_down,
+            gu_ptr,
+            dn_ptr,
         )?;
         self.shared_i8_shadows.insert(
             key,
@@ -219,6 +219,44 @@ impl Gpu {
             },
         );
         Ok((gu_ptr, dn_ptr))
+    }
+
+    /// Quantize one layer's BF16 shared-expert weights into the INT8 planes at
+    /// `gu_dst` / `dn_dst` (caller-owned; sized by [`shared_i8_shadow_plane_bytes`]) on the
+    /// current stream. Shared by the lazy builder and the borrowed-region rebuild.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shared_i8_build_planes(
+        &mut self,
+        gate: *mut c_void,
+        up: *mut c_void,
+        down: *mut c_void,
+        intermediate: usize,
+        hidden: usize,
+        down_rows: usize,
+        gu_dst: *mut c_void,
+        dn_dst: *mut c_void,
+    ) -> HipResult<()> {
+        let (i, k, m_down) = (intermediate, hidden, down_rows);
+        self.ensure_kernel(
+            QUANT_MODULE,
+            kernels::QWEN4_SHARED_I8_QUANT_GFX12_SRC,
+            QUANT_ENTRY_ROT256,
+        )?;
+        self.ensure_kernel(
+            QUANT_MODULE,
+            kernels::QWEN4_SHARED_I8_QUANT_GFX12_SRC,
+            QUANT_ENTRY_ROT128,
+        )?;
+        self.ensure_mq_signs()?;
+        self.ensure_mq_signs_128()?;
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        for (weight, mode) in [(gate, 1i32), (up, 2i32)] {
+            self.shared_i8_rot256_launch(weight, gu_dst, s1, s2, k, i, 2 * i, mode)?;
+        }
+        let t1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let t2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        self.shared_i8_rot128_launch(down, dn_dst, t1, t2, std::ptr::null_mut(), i, m_down)
     }
 
     #[allow(clippy::too_many_arguments)]

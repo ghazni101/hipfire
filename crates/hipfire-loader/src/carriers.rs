@@ -827,6 +827,7 @@ impl Carrier for Qwen4Carrier {
         let native_mtp = native_mtp && dflash_draft.is_none();
         let meta = resolve_source_meta(&src, ctx.path)?;
         let shared = Qwen4RankShared {
+            continuous_batch: ctx.batch_request.lanes().is_some(),
             path: ctx.path.to_string(),
             max_seq: ctx.max_seq,
             sequence: ctx.sequence,
@@ -1344,6 +1345,10 @@ pub struct Qwen4RankShared {
     /// rank attaches its own head).
     pub native_mtp: bool,
     pub max_k: usize,
+    /// The load requests continuous batching (the daemon stages lanes after
+    /// the load): decode-share is single-stream and refuses (a lane needs a
+    /// scratch bank of its own). `false` for every caller that stages no lanes.
+    pub continuous_batch: bool,
 }
 
 /// The source model's tokenizer and chat template, from which a session
@@ -2079,7 +2084,63 @@ fn qwen4_expert_table_bytes(
         .ok_or_else(|| "table/mask component union overflows".into())
 }
 
+/// First 8 bytes of a digest as 16 lowercase hex digits (the load-log form).
+fn digest_hex16(digest: &[u8; 32]) -> String {
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Bytes of the BorrowPrefill device pointer tables a decode-share plan owns:
+/// per prefill class view, gate/up and down, two `u64` pointers per expert
+/// (`24,576 x 2 x 8`); 0 for a plan without donors. The codec table is shared.
+fn qwen4_decode_share_table_bytes(
+    plan: &hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
+    (layers, experts, _): (usize, usize, bool),
+) -> Result<u64, String> {
+    let Some(tail) = plan
+        .decode_share_tail()
+        .filter(|tail| !tail.donors.is_empty())
+    else {
+        return Ok(0);
+    };
+    let views = tail.class_donors.len().max(1) as u64;
+    (layers as u64)
+        .checked_mul(experts as u64)
+        .and_then(|entries| entries.checked_mul(2 * 8))
+        .and_then(|bytes| bytes.checked_mul(views))
+        .ok_or_else(|| "decode-share table bytes overflow".to_string())
+}
+
+/// Record the borrowed weight-shadow region (`shadow_bytes` at the start of
+/// the donor tail; every class span of `plan` already includes it) on a plan
+/// that carries a donor tail built for `sharing`. A plan without a donor tail
+/// (sharing refused or ineligible) is returned untouched: its shadows stay
+/// resident.
+fn qwen4_record_shadow_region(
+    plan: hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
+    sharing: bool,
+    shadow_bytes: u64,
+) -> Result<hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan, String> {
+    if sharing && plan.decode_share_tail().is_some() {
+        plan.with_decode_share_shadows(shadow_bytes)
+            .map_err(|error| format!("decode-share shadow region: {error}"))
+    } else {
+        Ok(plan)
+    }
+}
+
 /// The production hotset/stage fixed point, without I/O or admission effects.
+///
+/// `decode_share_need` is `Some(S)` when decode-share `bind` is admitted: the
+/// ranked plan is re-laid out with a donor tail of at least `S` bytes
+/// ([`ExpertTierPlan::with_decode_share`]). The device bytes that layout adds
+/// (`O = shared - plain` owner bytes, the guard and any padding growth) and
+/// the second device pointer tables join this fixed point beside the stage
+/// bytes, which are sized from the BorrowPrefill placement. The hot budget
+/// is not grown: the ranked prefix is the plain plan's up to the experts `O`
+/// displaces. `None` keeps every byte of the plain path.
 fn qwen4_plan_hotset_placement(
     slabs: &[hipfire_arch_qwen4::expert_slab_table::ExpertSlab],
     rank: &[u32],
@@ -2087,6 +2148,8 @@ fn qwen4_plan_hotset_placement(
     total: u64,
     stage_enabled: bool,
     table_geometry: (usize, usize, bool),
+    decode_share_need: Option<u64>,
+    decode_share_class_spans: &[u64],
 ) -> Result<
     (
         hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan,
@@ -2097,15 +2160,21 @@ fn qwen4_plan_hotset_placement(
 > {
     use hipfire_arch_qwen4::expert_hotset as hotsets;
     use hipfire_arch_qwen4::expert_residency as residency;
+    use hipfire_arch_qwen4::expert_tier_plan::Placement;
     const MIB: u64 = 1 << 20;
     let mut stage = 0u64;
     // The base tier table is already charged by expert_hotset_budget. The
     // separate stage tables and optional masks must share its fixed point.
     let mut extra_tables =
         qwen4_expert_table_bytes(false, table_geometry)? - residency::EXPERT_TIER_TABLE_BYTES;
+    // Device bytes the donor layout adds over the plain plan (zero until a
+    // shared plan has been laid out).
+    let mut share_overhead = 0u64;
+    let mut share = decode_share_need.filter(|need| *need > 0);
     loop {
         let available = hotsets::require_budget(total.checked_sub(stage)
-            .and_then(|bytes| bytes.checked_sub(extra_tables)).ok_or_else(|| {
+            .and_then(|bytes| bytes.checked_sub(extra_tables))
+            .and_then(|bytes| bytes.checked_sub(share_overhead)).ok_or_else(|| {
             format!(
                 "the {} MiB expert budget cannot hold the {} MiB of long-prefill stage buffers; free GPU memory or lower the expert placement",
                 total / MIB,
@@ -2113,26 +2182,62 @@ fn qwen4_plan_hotset_placement(
             )
         })).map_err(|skip| skip.to_string())?;
         let budget = hotset_budget.select(available)?;
-        let plan =
+        let plain =
             hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(slabs, rank, budget)
                 .map_err(|error| error.to_string())?;
-        hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+        hotsets::require_experts(plain.device_experts()).map_err(|skip| skip.to_string())?;
+        let mut overhead = 0u64;
+        let plan = match share {
+            Some(need) => {
+                match plain
+                    .clone()
+                    .with_decode_share(rank, need)
+                    .and_then(|(shared, _)| {
+                        if decode_share_class_spans.is_empty() {
+                            Ok(shared)
+                        } else {
+                            shared.with_decode_share_classes(decode_share_class_spans)
+                        }
+                    }) {
+                    Ok(shared) => {
+                        overhead = shared
+                            .owner_bytes(Placement::Device)
+                            .checked_sub(plain.owner_bytes(Placement::Device))
+                            .ok_or("decode-share layout shrank the device owner")?;
+                        shared
+                    }
+                    Err(error) => {
+                        eprintln!("  qwen4 decode-share: ineligible: {error}; plain placement");
+                        share = None;
+                        if share_overhead != 0 {
+                            // The earlier iterations reserved room for the donor
+                            // layout; re-plan without it.
+                            share_overhead = 0;
+                            continue;
+                        }
+                        plain
+                    }
+                }
+            }
+            None => plain,
+        };
         // new_tier allocates no stage without a host owner; the byte helper
         // alone still includes both tail pads for an empty host tier.
-        let stage_possible = stage_enabled
-            && plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped) > 0;
+        let stage_possible = stage_enabled && plan.owner_bytes(Placement::HostMapped) > 0;
         let need = if stage_possible {
-            residency::expert_tier_stage_bytes(&plan)
+            residency::expert_tier_stage_bytes_prefill(&plan)
         } else {
             0
         };
         let need_tables = qwen4_expert_table_bytes(stage_possible, table_geometry)?
-            - residency::EXPERT_TIER_TABLE_BYTES;
-        if need <= stage && need_tables <= extra_tables {
+            - residency::EXPERT_TIER_TABLE_BYTES
+            + qwen4_decode_share_table_bytes(&plan, table_geometry)?;
+        if need <= stage && need_tables <= extra_tables && overhead <= share_overhead {
             return Ok((plan, budget, stage));
         }
         stage = stage.max(need);
         extra_tables = extra_tables.max(need_tables);
+        share_overhead = share_overhead.max(overhead);
     }
 }
 /// What the expert placement is sized from, for one rank of a `ranks`-way
@@ -2168,6 +2273,7 @@ fn qwen4_placement_inputs(
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
     ranks: usize,
     chunk_rows: usize,
+    share: Option<hipfire_arch_qwen4::expert_residency::DecodeShareForward>,
 ) -> Result<
     (
         u64,
@@ -2188,7 +2294,7 @@ fn qwen4_placement_inputs(
             &gpu.arch,
             usize::from(routed_experts),
         );
-    let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs(
+    let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(
         &hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
             gpu,
             config,
@@ -2206,6 +2312,7 @@ fn qwen4_placement_inputs(
             ranks,
             chunk_rows,
         },
+        share,
     )?;
     Ok((
         inputs.non_expert,
@@ -2706,6 +2813,7 @@ pub fn qwen4_ep_vram_layers(
         scratch_mode,
         ranks,
         chunk_rows,
+        None,
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -2957,7 +3065,7 @@ pub fn qwen4_preload_resource_plan(
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
     let mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let ttm_pool = residency::ttm_pool_estimate();
+    let ttm_pool = residency::ttm_pool_estimate_on(gpu);
     let preallocation_gtt = residency::gtt_budget();
     let hotset_policy_for_plan = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()
         .map_err(|error| format!("qwen4 preload plan: hotset policy unreadable: {error}"))?;
@@ -3062,6 +3170,11 @@ pub fn qwen4_preload_resource_plan(
                             config.num_experts,
                             config.expert_keep.is_some(),
                         ),
+                        // The preload plan sizes the forward at `Full` scratch
+                        // (its scratch mode is not decided yet), which decode-share
+                        // refuses, so it never predicts a donor tail.
+                        None,
+                        &[],
                     )
                     .map_err(|error| format!("qwen4 preload plan: hotset plan: {error}"))?;
                     plan.check_executable(&gpu.arch)
@@ -4466,7 +4579,7 @@ fn load_qwen4_rank_scoped(
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
     let preallocation_mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let preallocation_ttm_pool = residency::ttm_pool_estimate();
+    let preallocation_ttm_pool = residency::ttm_pool_estimate_on(&*ctx.gpu);
     let preallocation_gtt = residency::gtt_budget();
     // Exactly one owner of the planning inputs, including explicit-layers and
     // whole-first resident paths that previously never invoked `auto`.
@@ -4488,7 +4601,106 @@ fn load_qwen4_rank_scoped(
             scratch_mode,
             ep_ranks,
             placement_chunk,
+            None,
         )?)
+    } else {
+        None
+    };
+    // Decode-share `on` (verdict change 4): an admitted load charges only the
+    // dedicated forward (resident bank + persistent token ids + speculative
+    // buffers) instead of the whole prefill scratch, because the prefill
+    // scratch lives on the donor tail. The reserve is computed here beside
+    // the plain one, from the same facts, and only used if the decision
+    // below admits sharing and the plan carries a donor tail; every other
+    // load never reads it (and the plain reserve is byte-identical).
+    let decode_share_mode = hipfire_arch_qwen4::decode_share::DecodeShareMode::from_env();
+    // The weight shadows an admitted `on` / `fixed` load keeps in the donor
+    // tail instead of resident VRAM (F16 weight shadows + shared-expert INT8
+    // shadows, read only by the borrowed >= 512-row prompt tiles; rebuilt per
+    // borrow epoch). `None`: they stay resident and charged as today. The
+    // region is laid out by the one pure plan the forward re-derives at attach.
+    let decode_share_shadow_region: Option<
+        hipfire_arch_qwen4::decode_share_shadows::ShadowRegionPlan,
+    > = if band.is_none()
+        && decode_share_mode.borrows_shadows(
+            &ctx.gpu.arch,
+            hipfire_arch_qwen4::decode_share::decode_share_shadows_enabled(),
+        )
+        && placement_chunk > hipfire_arch_qwen4::gpu_forward::QWEN4_DECODE_SHARE_RESIDENT_ROWS
+    {
+        match hipfire_arch_qwen4::decode_share_shadows::shadow_flags(
+            &ctx.gpu.arch,
+            ctx.gpu.qwen4_f16_shadow_capable(),
+            ctx.gpu.qwen4_shared_i8_enabled(),
+            placement_chunk,
+        ) {
+            Ok((f16, shared_i8)) => hipfire_arch_qwen4::decode_share_shadows::plan_shadow_region(
+                &manifest.weights,
+                config.num_hidden_layers,
+                f16,
+                shared_i8,
+            )
+            .map_err(|error| format!("qwen4 decode-share: {error}"))?
+            .into_nonempty(),
+            Err(reason) => {
+                if hipfire_arch_qwen4::decode_share::DecodeShareMode::explicit() {
+                    eprintln!("  qwen4 decode-share: weight shadows stay resident ({reason})");
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let decode_share_shadow_bytes: u64 = decode_share_shadow_region
+        .as_ref()
+        .map_or(0, |region| region.total_bytes);
+    let shared_placement_inputs = if band.is_none()
+        && decode_share_mode.grows_hot_budget()
+        && ctx.gpu.arch == "gfx1201"
+        && ep.is_none()
+        && scratch_mode == hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::FnSymGfx1201
+        && placement_chunk > hipfire_arch_qwen4::gpu_forward::QWEN4_DECODE_SHARE_RESIDENT_ROWS
+        && !hotset_budget.is_fixed()
+    {
+        match (
+            hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_dedicated_bytes(
+                &config,
+                placement_chunk,
+                scratch_mode,
+            ),
+            hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_borrow_bytes(
+                &config,
+                placement_chunk,
+                scratch_mode,
+            ),
+        ) {
+            (Some(dedicated), Some(borrowed)) => qwen4_placement_inputs(
+                &*ctx.gpu,
+                &config,
+                &manifest.weights,
+                &bytes_of,
+                backend,
+                use_ranges,
+                ctx.max_seq,
+                vmm_granularity,
+                ctx.spec,
+                max_k,
+                placement_native_mtp,
+                routed_experts,
+                state_format,
+                scratch_mode,
+                ep_ranks,
+                placement_chunk,
+                Some(hipfire_arch_qwen4::expert_residency::DecodeShareForward {
+                    dedicated,
+                    borrowed,
+                    shadows_borrowed: decode_share_shadow_bytes,
+                }),
+            )
+            .ok(),
+            _ => None,
+        }
     } else {
         None
     };
@@ -4764,11 +4976,132 @@ fn load_qwen4_rank_scoped(
     // binding, source/manifest eligibility, host limits, plan and a fresh
     // free-VRAM check. A fixed budget fails closed; otherwise a refusal
     // leaves whole-layer placement untouched.
+    // Decode-share (`HIPFIRE_QWEN4_DECODE_SHARE`): `bind` plans a donor tail
+    // inside the ranked hot-set plan below and builds the mirror and both read
+    // views at materialization; the forward does not use them yet. Admission
+    // (verdict change 5) is checked here, before any placement is sized, from
+    // facts known at this point: the arch, the single-device topology (no band,
+    // no expert parallelism, no NPU trunk), the ranked hot-set tier (a sidecar
+    // applies, whole-first does not), the load's scratch plan, the S1
+    // slow-link verdict, DFlash, the explicit `memory.offload_exec` and a forced
+    // `HIPFIRE_QWEN4_D2_DEFAULT=1`, and the placement chunk. The measured
+    // (unset) D2 default is only decided inside `attach_forward`; it is
+    // re-checked after attach below. A refusal logs its reason and keeps the
+    // plain placement.
+    // A refusal (and the pin below) logs only when the knob was set
+    // explicitly: an unset knob is the product default and a load it does not
+    // admit stays silent and exactly as without decode-share.
+    let decode_share_explicit = hipfire_arch_qwen4::decode_share::DecodeShareMode::explicit();
+    let decode_share_need = if decode_share_mode
+        == hipfire_arch_qwen4::decode_share::DecodeShareMode::Off
+    {
+        None
+    } else if !decode_share_mode.plans_donors() {
+        if decode_share_explicit {
+            eprintln!(
+                "  qwen4 decode-share: mode {} plans no donor tail; plain placement",
+                decode_share_mode.name()
+            );
+        }
+        None
+    } else {
+        let facts = hipfire_arch_qwen4::decode_share::DecodeShareFacts {
+            arch: &ctx.gpu.arch,
+            pipeline_band: band.is_some(),
+            expert_parallel: ep.is_some() || expert_vram_layers.is_some(),
+            // An unparseable NPU knob is the attach's error to report; here it
+            // only means "not selected" for this decision.
+            npu_trunk: match hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env() {
+                Ok(npu) => {
+                    hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(&ctx.gpu.arch, npu)
+                }
+                Err(_) => false,
+            },
+            ranked_hotset_tier: hotset_path.is_some() && band.is_none(),
+            scratch_mode,
+            slowlink_profile: slowlink_profile.is_some(),
+            dflash: ctx.spec.dflash == Some(true),
+            offload_exec: hipfire_config::memory::offload_exec_explicit(),
+            d2_default_forced: hipfire_config::memory::qwen4_d2_default() == Some(true),
+            continuous_batch: shared.continuous_batch,
+            prefill_chunk: placement_chunk,
+        };
+        match hipfire_arch_qwen4::decode_share::decode_share_admission(&facts) {
+            Err(reason) => {
+                if decode_share_explicit {
+                    eprintln!("  qwen4 decode-share: refused: {reason}; plain placement");
+                }
+                None
+            }
+            Ok(())
+                if hipfire_arch_qwen4::decode_share::pinned_budget_refusal(
+                    decode_share_mode,
+                    hotset_budget.is_fixed(),
+                )
+                .is_some() =>
+            {
+                // A pinned hot budget does not grow, so sharing would reclaim
+                // no residency: `on` is `off` for this load (`fixed` / `bind`
+                // are controls and still apply).
+                if decode_share_explicit {
+                    eprintln!(
+                        "{}",
+                        hipfire_arch_qwen4::decode_share::pinned_budget_refusal(
+                            decode_share_mode,
+                            true
+                        )
+                        .unwrap_or_default()
+                    );
+                }
+                None
+            }
+            Ok(()) => {
+                // The donor tail holds the borrowed weight shadows (if any)
+                // and then the largest class's scratch: the largest class span.
+                let span = hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_class_spans(
+                    &config,
+                    placement_chunk,
+                    scratch_mode,
+                    decode_share_shadow_bytes,
+                )
+                .and_then(|spans| spans.last().copied());
+                if span.is_none() && decode_share_explicit {
+                    eprintln!(
+                        "  qwen4 decode-share: refused: the borrowed scratch span cannot be sized; plain placement"
+                    );
+                }
+                span
+            }
+        }
+    };
+    // The donor-tail bytes each prefill class dirties: the plan builds one
+    // BorrowPrefill view per class (donors a class can overwrite read their
+    // mirror, the rest stay in VRAM). Empty (one all-donors view) only if the
+    // spans cannot be sized.
+    let decode_share_class_spans: Vec<u64> = if decode_share_need.is_some() {
+        hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_class_spans(
+            &config,
+            placement_chunk,
+            scratch_mode,
+            decode_share_shadow_bytes,
+        )
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // `on` grows the hot budget from the dedicated reserve; `bind` / `fixed`
+    // keep the plain budget (controls).
+    let decode_share_grow = decode_share_need.is_some()
+        && decode_share_mode.grows_hot_budget()
+        && shared_placement_inputs.is_some();
+    // The growth of an applied `on` placement: budget bytes gained, device
+    // experts before and after, and the reserve actually used.
+    let mut decode_share_growth: Option<(u64, usize, usize, residency::AutoReserve)> = None;
     let mut hotset_host_bytes = 0;
     let (hotset, hotset_plan) = if let Some(path) =
         hotset_path.as_deref().filter(|_| band.is_none())
     {
-        let prepare = || -> Result<_, String> {
+        let prepare = |grow: bool, need: Option<u64>| -> Result<_, String> {
             let base = hotsets::HotsetBase::from_hfq(&hfq)?;
             let sidecar = hotsets::HotsetSidecar::load_bound(
                 path,
@@ -4783,9 +5116,19 @@ fn load_qwen4_rank_scoped(
                 .map_err(|error| error.to_string())?;
             let slabs =
                 hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(&hfq, &config, &manifest)?;
-            let (free, non_expert, _, reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
-            let reserve_note = reserve.describe();
-            let reserve = reserve.bytes();
+            let (free, non_expert, _, plain_reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
+            // "Decide share -> compute reserve -> plan": a growing attempt sizes
+            // the budget from the dedicated reserve, every other attempt from
+            // the plain one (never a plain forward on a budget sized for sharing).
+            let reserve_obj = if grow {
+                shared_placement_inputs
+                    .map(|inputs| inputs.2)
+                    .ok_or("the decode-share reserve is unavailable")?
+            } else {
+                plain_reserve
+            };
+            let reserve_note = reserve_obj.describe();
+            let reserve = reserve_obj.bytes();
             let total =
                 hotsets::require_budget(residency::expert_hotset_budget(free, non_expert, reserve))
                     .map_err(|skip| skip.to_string())?;
@@ -4804,7 +5147,40 @@ fn load_qwen4_rank_scoped(
                 total,
                 stage_enabled,
                 table_geometry,
+                need,
+                &decode_share_class_spans,
             )?;
+            // Every class span already includes the borrowed weight-shadow
+            // region at the start of the donor tail; record it so the lease
+            // (and the forward) know the scratch backing starts after it.
+            let plan = qwen4_record_shadow_region(plan, need.is_some(), decode_share_shadow_bytes)?;
+            let growth = if grow && plan.decode_share_tail().is_some() {
+                // What the plain reserve would have placed, for the load log.
+                let plain_total = hotsets::require_budget(residency::expert_hotset_budget(
+                    free,
+                    non_expert,
+                    plain_reserve.bytes(),
+                ))
+                .map_err(|skip| skip.to_string())?;
+                let (plain_plan, _, _) = qwen4_plan_hotset_placement(
+                    &slabs,
+                    sidecar.rank(),
+                    hotset_budget,
+                    plain_total,
+                    stage_enabled,
+                    table_geometry,
+                    None,
+                    &[],
+                )?;
+                Some((
+                    total.saturating_sub(plain_total),
+                    plain_plan.device_experts(),
+                    plan.device_experts(),
+                    reserve_obj,
+                ))
+            } else {
+                None
+            };
             // The base tier table was already subtracted by expert_hotset_budget.
             let extra_tables = qwen4_expert_table_bytes(
                 stage_enabled
@@ -4812,7 +5188,8 @@ fn load_qwen4_rank_scoped(
                         .owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
                         > 0,
                 table_geometry,
-            )? - residency::EXPERT_TIER_TABLE_BYTES;
+            )? - residency::EXPERT_TIER_TABLE_BYTES
+                + qwen4_decode_share_table_bytes(&plan, table_geometry)?;
             plan.check_executable(&ctx.gpu.arch)
                 .map_err(|error| error.to_string())?;
             let host_bytes = plan
@@ -4879,11 +5256,31 @@ fn load_qwen4_rank_scoped(
                 budget,
                 host_bytes,
                 stage,
+                growth,
             ))
         };
-        match prepare() {
-            Ok((sidecar, plan, budget, host_bytes, stage)) => {
+        // An `on` attempt that lowered the reserve is only kept if the plan
+        // really carries the donor tail; a refusal anywhere after the reserve
+        // was lowered recomputes the placement with the plain reserve.
+        let attempt = match prepare(decode_share_grow, decode_share_need) {
+            Ok(done) if !decode_share_grow || done.1.decode_share_tail().is_some() => Ok(done),
+            refused if decode_share_grow => {
+                match &refused {
+                    Err(reason) => eprintln!(
+                        "  qwen4 decode-share: on: sharing refused after the reserve was lowered ({reason}); recomputing the placement with the plain reserve"
+                    ),
+                    Ok(_) => eprintln!(
+                        "  qwen4 decode-share: on: no donor tail after the reserve was lowered; recomputing the placement with the plain reserve"
+                    ),
+                }
+                prepare(false, None)
+            }
+            other => other,
+        };
+        match attempt {
+            Ok((sidecar, plan, budget, host_bytes, stage, growth)) => {
                 hotset_host_bytes = host_bytes;
+                decode_share_growth = growth;
                 settled_placement_charges = Some(residency::PlacementCharges {
                     margin: residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
                     stage,
@@ -5357,6 +5754,18 @@ fn load_qwen4_rank_scoped(
     // Freeze the settled manifest/tier ownership before `hotset_plan`, HFQ and
     // the fulfillment transaction consume their sources. Trunk tiers replace
     // the removed aggregate owners; only unchanged MTP entries remain here.
+    // An `on` load settled against the dedicated reserve: the evidence is
+    // sized from the reserve the placement actually used.
+    let placement_inputs =
+        placement_inputs.map(|(non_expert, layer_experts, reserve, mtp, gather)| {
+            (
+                non_expert,
+                layer_experts,
+                decode_share_growth.map_or(reserve, |growth| growth.3),
+                mtp,
+                gather,
+            )
+        });
     let mut resource_evidence = if let Some((non_expert, layer_experts, reserve, ..)) =
         placement_inputs.filter(|_| {
             ep.is_none()
@@ -5399,7 +5808,16 @@ fn load_qwen4_rank_scoped(
                 config.num_experts,
                 config.expert_keep.is_some(),
             ),
-        )?;
+        )? + hotset_plan.as_ref().map_or(Ok(0), |(plan, _)| {
+            qwen4_decode_share_table_bytes(
+                plan,
+                (
+                    config.num_hidden_layers,
+                    config.num_experts,
+                    config.expert_keep.is_some(),
+                ),
+            )
+        })?;
         // Restore sources are disjoint host-only allocations, never another
         // copy of the borrowed device donors. Use the actual owning planner's
         // largest layer payload and the allocators' tail/pinned padding rules,
@@ -5585,6 +6003,7 @@ fn load_qwen4_rank_scoped(
     let expert_tiers = if let Some((plan, budget)) = hotset_plan {
         use hipfire_arch_qwen4::expert_tier_plan::Placement;
         let device_experts = plan.device_experts();
+        let share_tail = plan.decode_share_tail().cloned();
         let tiers_io0 = rdna_compute::load_phases::thread_io();
         let tiers_started = std::time::Instant::now();
         let source = |offset, len| {
@@ -5637,6 +6056,94 @@ fn load_qwen4_rank_scoped(
             lease.generation(), digest_hex,
             sidecar.base_size(), &sidecar.base_index_sha256()[..12],
         );
+        if let Some(tail) = share_tail.as_ref().filter(|tail| !tail.donors.is_empty()) {
+            let share_digest = |view| {
+                lease
+                    .view_digest(view)
+                    .map(|digest| digest_hex16(&digest))
+                    .expect("a decode-share lease carries both views")
+            };
+            let mut donor_layers: Vec<u32> = tail.donors.iter().map(|id| id / 512).collect();
+            donor_layers.dedup();
+            // `, shadows S MiB in donor tail (F16 F MiB, INT8 I MiB)` when the
+            // weight shadows are borrowed inside the tail; empty otherwise.
+            let shadows_text = match (tail.shadow_bytes, decode_share_shadow_region.as_ref()) {
+                (0, _) => String::new(),
+                (bytes, Some(region)) => format!(
+                    ", shadows {} MiB in donor tail (F16 {} MiB, INT8 {} MiB)",
+                    bytes / MIB,
+                    region.f16_bytes / MIB,
+                    region.i8_bytes / MIB,
+                ),
+                (bytes, None) => format!(", shadows {} MiB in donor tail", bytes / MIB),
+            };
+            eprintln!(
+                "  qwen4 decode-share: mode {}, {} donors ({} MiB) from {} layers, device tail [{}, {}), mirror host +{} MiB, guard {} B, borrow digest {}, resident digest {}{shadows_text}",
+                decode_share_mode.name(),
+                tail.donors.len(),
+                tail.donor_bytes / MIB,
+                donor_layers.len(),
+                tail.donor_offset,
+                tail.donor_offset + tail.donor_bytes,
+                tail.donor_bytes / MIB,
+                tail.donor_offset - tail.guard_offset,
+                share_digest(hipfire_arch_qwen4::expert_tier_owners::ExpertReadView::BorrowPrefill(
+                    lease.borrow_classes().saturating_sub(1)
+                )),
+                share_digest(hipfire_arch_qwen4::expert_tier_owners::ExpertReadView::Resident),
+            );
+            {
+                let rows =
+                    hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_classes(placement_chunk);
+                let donors = lease.borrow_class_donors();
+                let classes = if rows.len() == donors.len() {
+                    rows.iter()
+                        .zip(&donors)
+                        .map(|(rows, donors)| format!("{rows}:{donors}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    format!("all:{}", donors.last().copied().unwrap_or(0))
+                };
+                eprintln!("  qwen4 decode-share: classes [{classes}] donors dirty");
+            }
+            if let Some((grown_bytes, plain_experts, experts, _)) = decode_share_growth {
+                let dedicated =
+                    hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_dedicated_bytes(
+                        &config,
+                        placement_chunk,
+                        scratch_mode,
+                    )
+                    .unwrap_or(0);
+                eprintln!(
+                    "  qwen4 decode-share: on, hot budget +{} MiB (+{} experts: {} -> {}), {} donors ({} MiB) from {} layers, resident bank {} rows ({} MiB dedicated), prefill classes {:?}, restore <= {} MiB{shadows_text}",
+                    grown_bytes / MIB,
+                    experts.saturating_sub(plain_experts),
+                    plain_experts,
+                    experts,
+                    tail.donors.len(),
+                    tail.donor_bytes / MIB,
+                    donor_layers.len(),
+                    hipfire_arch_qwen4::gpu_forward::QWEN4_DECODE_SHARE_RESIDENT_ROWS,
+                    dedicated / MIB,
+                    hipfire_arch_qwen4::gpu_forward::qwen4_decode_share_classes(placement_chunk),
+                    tail.donor_bytes / MIB,
+                );
+            }
+            if hipfire_arch_qwen4::decode_share::decode_share_verify_enabled() {
+                let prefix = usize::try_from(tail.donor_bytes)
+                    .map_err(|_| "qwen4 decode-share: donor extent overflows usize".to_string())?;
+                let sha = lease.verify_donor_tail(ctx.gpu, prefix).map_err(|error| {
+                    format!("qwen4 decode-share: donor tail verification failed: {error}")
+                })?;
+                eprintln!(
+                    "  qwen4 decode-share: donor tail verified sha256 {}",
+                    sha.iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+            }
+        }
         eprintln!(
             "  qwen4 expert hot set identity: aggregate-MQ4 structure validated (no full artifact digest held by this loader; artifact not rehashed); model_sha256 {}, counts_sha256 {}, format_map {}, format_map_sha256 {}",
             sidecar.model_sha256(), sidecar.counts_sha256(), sidecar.format_map(), sidecar.format_map_sha256(),
@@ -5645,6 +6152,9 @@ fn load_qwen4_rank_scoped(
     } else {
         None
     };
+    let decode_share_active = expert_tiers
+        .as_ref()
+        .is_some_and(|lease| lease.decode_share().is_some());
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
     let mut source = HfqModelSource::from_hfq(hfq);
     // Preserve the incumbent direct-read path outside the admission-owned S1 arenas.
@@ -5927,6 +6437,19 @@ fn load_qwen4_rank_scoped(
         );
     }
     let split_layers = split_kinds.len();
+    // The measured D2 default of an unset `memory.offload_exec` is decided inside
+    // `attach_forward`, after the donor tail was materialized: the one admission
+    // condition that cannot be applied at the plan point. A shared plan cannot
+    // fall back to the plain placement here, so a CPU split on any layer fails
+    // the load with the way out.
+    if decode_share_active && (split_layers > 0 || bundle.has_cpu_deferred_experts()) {
+        let _ = bundle.free_gpu(ctx.gpu);
+        return Err(format!(
+            "qwen4 decode-share: the D2 CPU expert split armed on {split_layers} layers after the donor tail was bound; \
+             set HIPFIRE_QWEN4_D2_DEFAULT=0 (or {}=off) so decode-share and the CPU split are not combined",
+            hipfire_arch_qwen4::decode_share::DECODE_SHARE_ENV
+        ));
+    }
     if bundle.has_cpu_deferred_experts() && split_layers == 0 {
         eprintln!(
             "  qwen4 routed experts: CPU splice armed (offload_exec=cpu): decode and <=4-row verify run host-placed experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)"
@@ -6079,7 +6602,7 @@ fn load_qwen4_rank_scoped(
             if let Err(reason) = residency::check_host_ram(
                 host_inc_bytes,
                 current_mem_available,
-                residency::ttm_pool_estimate(),
+                residency::ttm_pool_estimate_on(&*ctx.gpu),
             ) {
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!(
@@ -7203,6 +7726,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
     let max_k = qwen4_native_mtp_k(ctx.spec, &ctx.gpu.arch);
     let meta = resolve_source_meta(&src, ctx.path)?;
     let shared = Qwen4RankShared {
+        continuous_batch: false,
         path: ctx.path.to_string(),
         max_seq: ctx.max_seq,
         sequence: None,
@@ -7624,8 +8148,34 @@ impl Carrier for Qwen35Carrier {
                 // sidecars, so a sidecar failure here fails the load closed —
                 // an explicitly requested tower must never silently serve text.
                 let (vision_config, vision_weights) = {
+                    use hipfire_arch_qwen35_vl::qwen35_vl::{
+                        self, load_vision_weights, TowerResidency,
+                    };
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
+
+                    let residency = TowerResidency::from_vision_mode(&ctx.vision_mode);
+                    // After a tower loads (either residency) the automatic
+                    // max_seq must leave room for its activation scratch.
+                    fn reserve_tower_activation(
+                        ctx: &mut LoadCtx<'_>,
+                        vc: &qwen35_vl::VisionConfig,
+                        residency: TowerResidency,
+                    ) {
+                        let patches = qwen35_vl::max_image_patches(vc);
+                        let bytes = qwen35_vl::tower_activation_peak_bytes(vc, patches);
+                        if let Some(seq) = ctx.sequence.as_mut() {
+                            seq.reserve_bytes = seq.reserve_bytes.saturating_add(bytes);
+                        }
+                        eprintln!(
+                            "  vision tower: {}; activation reserve {} MiB for {patches} patches",
+                            match residency {
+                                TowerResidency::Resident => "resident",
+                                TowerResidency::Streamed => "streamed",
+                            },
+                            bytes >> 20
+                        );
+                    }
 
                     // Vision tower sidecar resolution: an explicit
                     // `--vision-path` (or HIPFIRE_VL_FILE) must never be
@@ -7656,7 +8206,7 @@ impl Carrier for Qwen35Carrier {
                             "  loading vision weights from .vl sidecar: {}",
                             vl.display()
                         );
-                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                        let vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                         let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
                             .map_err(|e| format!(".vl vision_config: {e}"))?;
@@ -7699,8 +8249,9 @@ impl Carrier for Qwen35Carrier {
                         // misleading "no vision encoder" message. A corrupt
                         // or truncated .vl must be a load-time error the
                         // operator can see.
-                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                        let vw = load_vision_weights(&vl_hfq, &vc, ctx.gpu, residency)
                             .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model: vision encoder (hidden={}, layers={})",
                             vc.hidden_size, vc.num_layers
@@ -7710,9 +8261,12 @@ impl Carrier for Qwen35Carrier {
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                         match vc {
                             Some(vc) => {
-                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                let vw = load_vision_weights(&hfq_file, &vc, ctx.gpu, residency)
                                     .map_err(|e| eprintln!("  VL weight load failed: {e}"))
                                     .ok();
+                                if vw.is_some() {
+                                    reserve_tower_activation(ctx, &vc, residency);
+                                }
                                 eprintln!(
                                     "  VL model: vision encoder (hidden={}, layers={})",
                                     vc.hidden_size, vc.num_layers
@@ -7721,11 +8275,11 @@ impl Carrier for Qwen35Carrier {
                             }
                             _ => (None, None),
                         }
-                    } else if let Some(p) = ctx.vision_path.as_ref() {
-                        let mut sidecar =
-                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
-                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
-                            )?;
+                    } else if let Some(p) = ctx.vision_path.clone().as_ref() {
+                        let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p))
+                            .map_err(|e| {
+                                format!("vision sidecar '{}': open failed: {e}", p.display())
+                            })?;
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file)
                             .ok()
                             .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
@@ -7735,10 +8289,10 @@ impl Carrier for Qwen35Carrier {
                                  the sidecar with --include-vision"
                                     .to_string()
                             })?;
-                        let vw =
-                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
-                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
-                            })?;
+                        let vw = load_vision_weights(&sidecar, &vc, ctx.gpu, residency).map_err(
+                            |e| format!("vision sidecar '{}': tower load failed: {e}", p.display()),
+                        )?;
+                        reserve_tower_activation(ctx, &vc, residency);
                         eprintln!(
                             "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
                             p.display(),
@@ -8012,6 +8566,9 @@ impl Carrier for Qwen35Carrier {
             swap_disk_bytes: cfg.swap_disk_bytes,
             is_vl: cfg.is_vl,
             vl_path: cfg.vl_path,
+            vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::from_vision_mode(
+                &cfg.vision_mode,
+            ),
             mtp_k: cfg.mtp_k,
             mtp_mode: cfg.mtp_mode,
             kv_mode_raw: cfg.kv_mode_raw,
@@ -10627,6 +11184,439 @@ mod qwen4_admission_tests {
         );
         assert_eq!(qwen4_ep_emulation_map(&[0, 1, 0]), "0->0, 1->1, 2->0");
     }
+
+    /// Uniform metadata slabs (padded payload 1,536 B per expert) and the id
+    /// rank, as the placement fixture above.
+    fn decode_share_fixture() -> (
+        Vec<hipfire_arch_qwen4::expert_slab_table::ExpertSlab>,
+        Vec<u32>,
+    ) {
+        use hipfire_arch_qwen4::{
+            expert_slab_table::{ExpertSlab, ExpertSlabSpan},
+            expert_slabs::ExpertFormat,
+        };
+        let slabs = (0..48 * 512)
+            .map(|id| ExpertSlab {
+                format: ExpertFormat::Mq4Xts,
+                gate_up: ExpertSlabSpan {
+                    offset: id * 1500,
+                    len: 1000,
+                },
+                down: ExpertSlabSpan {
+                    offset: id * 1500 + 1000,
+                    len: 500,
+                },
+            })
+            .collect();
+        // Round-robin over layers (expert 0 of every layer first): every layer
+        // keeps host experts, so every resident expert may donate.
+        let rank = (0..512u32)
+            .flat_map(|expert| (0..48u32).map(move |layer| layer * 512 + expert))
+            .collect();
+        (slabs, rank)
+    }
+
+    fn device_ids(plan: &hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan) -> Vec<usize> {
+        use hipfire_arch_qwen4::expert_tier_plan::Placement;
+        (0..48 * 512)
+            .filter(|id| plan.entry(id / 512, id % 512).unwrap().tier == Placement::Device)
+            .collect()
+    }
+
+    #[test]
+    fn decode_share_hotset_off_is_byte_identical_to_the_plain_fixed_point() {
+        use hipfire_arch_qwen4::{
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_tier_plan::{plan_expert_tiers_from_slabs, Placement},
+        };
+        let (slabs, rank) = decode_share_fixture();
+        for (stage_enabled, payload_room) in
+            [(false, 16u64 << 20), (true, 16 << 20), (true, 64 << 20)]
+        {
+            let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + payload_room;
+            let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+            let run = |need| {
+                super::qwen4_plan_hotset_placement(
+                    &slabs,
+                    &rank,
+                    HotsetBudget::parse(None).unwrap(),
+                    total,
+                    stage_enabled,
+                    (48, 512, false),
+                    need,
+                    &[],
+                )
+                .unwrap()
+            };
+            let (plan, budget, stage) = run(None);
+            assert!(plan.decode_share_tail().is_none());
+            // The plain solve: today's plan for the same budget, stage from the
+            // Resident placement, no second pointer tables.
+            let direct = plan_expert_tiers_from_slabs(&slabs, &rank, budget).unwrap();
+            assert_eq!(plan.logical_digest(), direct.logical_digest());
+            let staged = stage_enabled && plan.owner_bytes(Placement::HostMapped) > 0;
+            assert_eq!(
+                stage,
+                if staged {
+                    residency::expert_tier_stage_bytes(&plan)
+                } else {
+                    0
+                }
+            );
+            let tables = super::qwen4_expert_table_bytes(staged, (48, 512, false)).unwrap();
+            assert_eq!(
+                budget + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+                free
+            );
+            // A zero-byte request is "off" too.
+            let (zero, zero_budget, zero_stage) = run(Some(0));
+            assert_eq!(zero.logical_digest(), plan.logical_digest());
+            assert_eq!((zero_budget, zero_stage), (budget, stage));
+        }
+    }
+
+    #[test]
+    fn decode_share_hotset_bind_keeps_the_ranked_prefix_and_charges_its_overhead() {
+        use hipfire_arch_qwen4::{
+            expert_arena::ARENA_TAIL_PAD_BYTES,
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_tier_plan::{plan_expert_tiers_from_slabs, Placement},
+        };
+        const PADDED: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let need = 1u64 << 20;
+        for (stage_enabled, payload_room) in
+            [(false, 16u64 << 20), (true, 16 << 20), (true, 24 << 20)]
+        {
+            let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + payload_room;
+            let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+            let run = |need| {
+                super::qwen4_plan_hotset_placement(
+                    &slabs,
+                    &rank,
+                    HotsetBudget::parse(None).unwrap(),
+                    total,
+                    stage_enabled,
+                    (48, 512, false),
+                    need,
+                    &[],
+                )
+                .unwrap()
+            };
+            let (plain, plain_budget, plain_stage) = run(None);
+            let (shared, budget, stage) = run(Some(need));
+            let tail = shared
+                .decode_share_tail()
+                .expect("bind lays out a donor tail");
+            assert!(tail.donor_bytes >= need);
+            // The ranked set: the first `n` ranked ids, a prefix of the plain
+            // plan's, losing only what the extra bytes displace.
+            let ranked = |plan: &hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan| {
+                let mut want: Vec<usize> = rank[..plan.device_experts()]
+                    .iter()
+                    .map(|id| *id as usize)
+                    .collect();
+                want.sort_unstable();
+                want
+            };
+            let plain_ids = device_ids(&plain);
+            let shared_ids = device_ids(&shared);
+            assert_eq!(plain_ids, ranked(&plain));
+            assert_eq!(shared_ids, ranked(&shared));
+            assert!(shared_ids
+                .iter()
+                .all(|id| plain_ids.binary_search(id).is_ok()));
+            // The extra device bytes are the guard (and nothing else here:
+            // every offset is already 256-aligned).
+            let same_budget = plan_expert_tiers_from_slabs(&slabs, &rank, budget).unwrap();
+            let overhead =
+                shared.owner_bytes(Placement::Device) - same_budget.owner_bytes(Placement::Device);
+            let tail_pad = ((ARENA_TAIL_PAD_BYTES as u64).max(256) + 255) & !255;
+            assert_eq!(
+                overhead, tail_pad,
+                "stage {stage_enabled} room {payload_room}"
+            );
+            assert_eq!(tail.donor_offset - tail.guard_offset, tail_pad);
+            // Every byte is charged exactly once: budget + overhead + stage +
+            // tables (base, stage, second device pointer tables) + margin.
+            let staged = stage_enabled && shared.owner_bytes(Placement::HostMapped) > 0;
+            let share_tables = (48 * 512 * 2 * 8) as u64;
+            assert_eq!(
+                super::qwen4_decode_share_table_bytes(&shared, (48, 512, false)).unwrap(),
+                share_tables
+            );
+            let tables =
+                super::qwen4_expert_table_bytes(staged, (48, 512, false)).unwrap() + share_tables;
+            assert_eq!(
+                budget + overhead + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+                free
+            );
+            assert!(
+                shared.owner_bytes(Placement::Device)
+                    + stage
+                    + tables
+                    + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES
+                    <= free
+            );
+            // Stage bytes come from the BorrowPrefill placement.
+            assert_eq!(
+                stage,
+                if staged {
+                    residency::expert_tier_stage_bytes_prefill(&shared)
+                } else {
+                    0
+                }
+            );
+            assert!(stage >= plain_stage);
+            // Displaced experts: at most what the budget difference holds.
+            let lost = plain.device_experts() - shared.device_experts();
+            assert!(budget <= plain_budget);
+            assert!(
+                lost as u64 <= (plain_budget - budget).div_ceil(PADDED),
+                "lost {lost} experts for {} B",
+                plain_budget - budget
+            );
+            assert!(
+                shared.owner_bytes(Placement::HostMapped)
+                    > plain.owner_bytes(Placement::HostMapped)
+            );
+        }
+    }
+
+    #[test]
+    fn decode_share_hotset_insufficient_donors_keep_the_plain_plan() {
+        use hipfire_arch_qwen4::{expert_hotset::HotsetBudget, expert_residency as residency};
+        let (slabs, rank) = decode_share_fixture();
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (16u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        let run = |need| {
+            super::qwen4_plan_hotset_placement(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(None).unwrap(),
+                total,
+                true,
+                (48, 512, false),
+                need,
+                &[],
+            )
+            .unwrap()
+        };
+        let (plain, plain_budget, plain_stage) = run(None);
+        // More than every resident expert holds: ineligible, plain plan.
+        let (kept, budget, stage) = run(Some(1 << 40));
+        assert!(kept.decode_share_tail().is_none());
+        assert_eq!(kept.logical_digest(), plain.logical_digest());
+        assert_eq!((budget, stage), (plain_budget, plain_stage));
+    }
+
+    /// One BorrowPrefill table set per prefill class: the fixed point charges
+    /// every set, a class-less plan still owns exactly one.
+    #[test]
+    fn decode_share_table_charge_counts_every_class_set() {
+        use hipfire_arch_qwen4::{
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_tier_plan::{plan_expert_tiers_from_slabs, Placement},
+        };
+        const PADDED: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let need = 1u64 << 20;
+        let spans = [need / 4, need / 2, need];
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (24u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        let run = |spans: &[u64]| {
+            super::qwen4_plan_hotset_placement(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(None).unwrap(),
+                total,
+                true,
+                (48, 512, false),
+                Some(need),
+                spans,
+            )
+            .unwrap()
+        };
+        let one_set = (48 * 512 * 2 * 8) as u64;
+        let (single, single_budget, _) = run(&[]);
+        let (three, budget, stage) = run(&spans);
+        let tail = three.decode_share_tail().unwrap();
+        assert_eq!(tail.class_spans, spans);
+        // Donors start every PADDED bytes: a class dirties ceil(span / PADDED).
+        assert_eq!(
+            tail.class_donors,
+            spans
+                .iter()
+                .map(|span| span.div_ceil(PADDED) as usize)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(*tail.class_donors.last().unwrap(), tail.donors.len());
+        assert_eq!(single.decode_share_tail().unwrap().class_donors.len(), 1);
+        let geometry = (48, 512, false);
+        assert_eq!(
+            super::qwen4_decode_share_table_bytes(&single, geometry).unwrap(),
+            one_set
+        );
+        assert_eq!(
+            super::qwen4_decode_share_table_bytes(&three, geometry).unwrap(),
+            3 * one_set
+        );
+        // The fixed point pays for the two extra sets out of the hot budget.
+        assert!(
+            budget + 2 * one_set <= single_budget + PADDED,
+            "{budget} vs {single_budget}"
+        );
+        assert!(budget < single_budget);
+        let staged = three.owner_bytes(Placement::HostMapped) > 0;
+        let same_budget = plan_expert_tiers_from_slabs(&slabs, &rank, budget).unwrap();
+        let overhead =
+            three.owner_bytes(Placement::Device) - same_budget.owner_bytes(Placement::Device);
+        let tables = super::qwen4_expert_table_bytes(staged, geometry).unwrap() + 3 * one_set;
+        assert_eq!(
+            budget + overhead + stage + tables + residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
+            free
+        );
+    }
+
+    /// The borrowed weight-shadow region is part of the class spans (every class
+    /// dirties it), recorded on the plan's tail, and absent (plain placement,
+    /// shadows resident) when sharing was refused or the region is zero.
+    #[test]
+    fn decode_share_shadow_region_is_recorded_in_the_tail_and_in_every_class_span() {
+        use hipfire_arch_qwen4::{expert_hotset::HotsetBudget, expert_residency as residency};
+        const PADDED: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let shadow = 3 * 256u64;
+        let scratch = [PADDED, 2 * PADDED, 4 * PADDED];
+        let spans: Vec<u64> = scratch.iter().map(|span| span + shadow).collect();
+        let need = *spans.last().unwrap();
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (24u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        let (plan, _, _) = super::qwen4_plan_hotset_placement(
+            &slabs,
+            &rank,
+            HotsetBudget::parse(None).unwrap(),
+            total,
+            true,
+            (48, 512, false),
+            Some(need),
+            &spans,
+        )
+        .unwrap();
+        let shared = super::qwen4_record_shadow_region(plan.clone(), true, shadow).unwrap();
+        let tail = shared.decode_share_tail().unwrap();
+        assert_eq!(tail.shadow_bytes, shadow);
+        assert_eq!(tail.class_spans, spans);
+        // Every class dirties at least the donors the shadow region spans.
+        let region_donors = shadow.div_ceil(PADDED) as usize;
+        assert!(tail
+            .class_donors
+            .iter()
+            .all(|&donors| donors >= region_donors));
+        assert_eq!(*tail.class_donors.last().unwrap(), tail.donors.len());
+        // The donor tail covers the shadows and the largest scratch class.
+        assert!(tail.donor_bytes >= need);
+        // Refused sharing (`need` absent) records nothing and changes nothing.
+        let (plain, _, _) = super::qwen4_plan_hotset_placement(
+            &slabs,
+            &rank,
+            HotsetBudget::parse(None).unwrap(),
+            total,
+            true,
+            (48, 512, false),
+            None,
+            &[],
+        )
+        .unwrap();
+        let same = super::qwen4_record_shadow_region(plain.clone(), false, shadow).unwrap();
+        assert!(same.decode_share_tail().is_none());
+        assert_eq!(same.logical_digest(), plain.logical_digest());
+        // A zero region (shadows stay resident) leaves a sharing plan's tail at 0.
+        let none = super::qwen4_record_shadow_region(plan, true, 0).unwrap();
+        assert_eq!(none.decode_share_tail().unwrap().shadow_bytes, 0);
+        // A region the donor tail cannot hold is a load error, never a silent shrink.
+        let too_big = *tail.class_spans.first().unwrap() + 256;
+        assert!(super::qwen4_record_shadow_region(shared, true, too_big).is_err());
+    }
+
+    /// `on` against the real Flash-Next expert size (2,611,200 B padded) and the
+    /// R9700 budget: the grown budget (the reserve the dedicated scratch no
+    /// longer needs) places at least 0.8 K more experts than `off`, the donor
+    /// tail stays within K plus rounding, and a refused tail recomputes the
+    /// plain placement, which is exactly the `off` plan.
+    #[test]
+    fn decode_share_on_grows_the_resident_set_and_a_refusal_recomputes_the_off_plan() {
+        use hipfire_arch_qwen4::{
+            expert_hotset::HotsetBudget,
+            expert_residency as residency,
+            expert_slab_table::{ExpertSlab, ExpertSlabSpan},
+            expert_slabs::ExpertFormat,
+        };
+        const GU: usize = 1_740_800;
+        const DN: usize = 870_400;
+        const PADDED: u64 = (GU + DN) as u64;
+        let slabs: Vec<ExpertSlab> = (0..48 * 512)
+            .map(|id: usize| ExpertSlab {
+                format: ExpertFormat::Mq4Xts,
+                gate_up: ExpertSlabSpan {
+                    offset: id * (GU + DN),
+                    len: GU,
+                },
+                down: ExpertSlabSpan {
+                    offset: id * (GU + DN) + GU,
+                    len: DN,
+                },
+            })
+            .collect();
+        let rank: Vec<u32> = (0..512u32)
+            .flat_map(|expert| (0..48u32).map(move |layer| layer * 512 + expert))
+            .collect();
+        let free = residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES + (14_525u64 << 20);
+        let total = residency::expert_hotset_budget(free, 0, 0).unwrap();
+        // F - D and S of the R9700 receipt, rounded down / up.
+        let (reclaimed, span) = (4_400_000_000u64, 4_700_000_000u64);
+        let run = |total, need| {
+            super::qwen4_plan_hotset_placement(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(None).unwrap(),
+                total,
+                true,
+                (48, 512, false),
+                need,
+                &[],
+            )
+            .unwrap()
+        };
+        let (off, off_budget, off_stage) = run(total, None);
+        assert!(off.decode_share_tail().is_none());
+        let (on, _, _) = run(total + reclaimed, Some(span));
+        let tail = on.decode_share_tail().expect("on lays out a donor tail");
+        let donors = tail.donors.len() as u64;
+        assert!(tail.donor_bytes >= span);
+        assert!(
+            donors >= span.div_ceil(PADDED) && donors <= span.div_ceil(PADDED) + 2,
+            "{donors} donors for {span} B"
+        );
+        let gain = (on.device_experts() - off.device_experts()) as u64;
+        assert!(
+            gain * 10 >= donors * 8,
+            "grew {gain} experts for {donors} donors (< 0.8 K)"
+        );
+        // The grown placement is never larger than the grown budget.
+        assert!(on.device_experts() > off.device_experts());
+        // Insufficient donors at the grown budget: no tail, so the loader
+        // recomputes with the plain reserve; that plan is the `off` plan exactly.
+        let (refused, _, _) = run(total + reclaimed, Some(1 << 50));
+        assert!(refused.decode_share_tail().is_none());
+        let (again, again_budget, again_stage) = run(total, None);
+        assert_eq!(again.logical_digest(), off.logical_digest());
+        assert_eq!((again_budget, again_stage), (off_budget, off_stage));
+    }
+
     #[test]
     fn expert_placement_budgets_disjoint_tables_and_stage() {
         use hipfire_arch_qwen4::{
@@ -10667,6 +11657,8 @@ mod qwen4_admission_tests {
                 total,
                 stage_enabled,
                 (48, 512, keep),
+                None,
+                &[],
             )
             .unwrap();
             let host = plan.owner_bytes(Placement::HostMapped) > 0;
@@ -12269,6 +13261,8 @@ mod qwen4_preload_plan_tests {
                 total,
                 stage_enabled,
                 (48, 512, keep),
+                None,
+                &[],
             )
             .unwrap();
             // Match actual stage construction: two F32[2 * experts] pointer

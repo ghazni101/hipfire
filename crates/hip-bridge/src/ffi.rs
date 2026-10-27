@@ -6,12 +6,177 @@
 //! No link-time dependency — runtime loads the shared library.
 
 use crate::error::{HipError, HipResult};
+use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::{DeviceBuffer, MemcpyKind};
+#[cfg(unix)]
+use core::ffi::CStr;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[cfg(unix)]
+extern "C" {
+    fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
+/// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+#[repr(C)]
+#[cfg(unix)]
+struct DlInfo {
+    dli_fname: *const c_char,
+    dli_fbase: *mut c_void,
+    dli_sname: *const c_char,
+    dli_saddr: *mut c_void,
+}
+
+/// Loader-reported path backing `ptr`, for diagnostics only, not object identity.
+#[cfg(unix)]
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = DlInfo {
+        dli_fname: ptr::null(),
+        dli_fbase: ptr::null_mut(),
+        dli_sname: ptr::null(),
+        dli_saddr: ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call.
+    if unsafe { dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Kernel32 entry points for [`dladdr_fname`]. Declared directly with an
+/// explicit link so hip-bridge gains no dependency edge (and no Cargo.lock
+/// change).
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    pub(super) const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub(super) fn GetModuleHandleExW(
+            flags: u32,
+            module_name_or_address: *const u16,
+            module: *mut *mut c_void,
+        ) -> i32;
+        pub(super) fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32)
+            -> u32;
+    }
+}
+
+/// Loader-reported path backing `ptr` (the DLL that contains that address), for
+/// diagnostics only, not object identity.
+#[cfg(windows)]
+fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    use win32::*;
+    let mut module: *mut c_void = ptr::null_mut();
+    // SAFETY: FROM_ADDRESS makes the second argument an address, not a string;
+    // UNCHANGED_REFCOUNT means the returned handle needs no FreeLibrary and
+    // cannot outlive the caller's own hold on the mapping. `module` is a valid
+    // out-pointer.
+    let ok = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            ptr as *const u16,
+            &mut module,
+        )
+    };
+    if ok == 0 || module.is_null() {
+        return None;
+    }
+    // Grow until the path fits: GetModuleFileNameW truncates silently and
+    // returns the buffer size when it does. 32768 UTF-16 units is the NT limit.
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `buf` is valid for `buf.len()` UTF-16 units and the length is
+        // passed as the size.
+        let len =
+            unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..len]));
+        }
+        if buf.len() >= 32768 {
+            return None;
+        }
+        let grown = buf.len() * 2;
+        buf.resize(grown, 0);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn dladdr_fname(_ptr: *const c_void) -> Option<String> {
+    None
+}
+
+/// Map one HIP runtime candidate. Non-Windows hosts keep plain `Library::new`.
+///
+/// # Safety
+/// Same contract as `libloading::Library::new`: loading runs the library's
+/// initialisation routines.
+#[cfg(not(windows))]
+unsafe fn open_library(candidate: &str) -> Result<Library, libloading::Error> {
+    Library::new(candidate)
+}
+
+/// Map one HIP runtime candidate on Windows.
+///
+/// Plain `Library::new` is `LoadLibraryExW(path, NULL, 0)`: the named DLL loads
+/// from its absolute path, but its own dependencies (amd_comgr*.dll, ...) go
+/// through the standard search order, where System32 precedes PATH. The AMD
+/// display driver installs an older amdhip64/comgr into System32, so a HIP SDK
+/// (or shipped runtime) DLL would silently pair with the driver's comgr.
+/// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` makes the DLL's own directory the first
+/// place its dependencies resolve; `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` keeps the
+/// application directory, System32 and AddDllDirectory entries as fallbacks.
+///
+/// Both flags reject relative names, and DEFAULT_DIRS excludes PATH, so a bare
+/// name (the legacy PATH fallback) keeps `Library::new`. If the flagged load of
+/// an existing absolute path fails (a lone runtime DLL, e.g. the installer's
+/// `~\.hipfire\runtime` copy, whose dependencies are reachable only through
+/// PATH), the pre-flag `Library::new` load is retried so a setup that loaded
+/// before still loads.
+///
+/// # Safety
+/// Same contract as `libloading::Library::new`.
+#[cfg(windows)]
+unsafe fn open_library(candidate: &str) -> Result<Library, libloading::Error> {
+    use libloading::os::windows::{
+        Library as WinLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    if !std::path::Path::new(candidate).is_absolute() {
+        return Library::new(candidate);
+    }
+    // The SEARCH_* flags want a normalised backslash path; a root taken from an
+    // env var may carry forward slashes. Verbatim (`\\?\`) paths are literal.
+    let normalized;
+    let path = if candidate.starts_with(r"\\?\") || !candidate.contains('/') {
+        candidate
+    } else {
+        normalized = candidate.replace('/', "\\");
+        normalized.as_str()
+    };
+    match WinLibrary::load_with_flags(
+        path,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+    ) {
+        Ok(lib) => Ok(Library::from(lib)),
+        Err(_) if std::path::Path::new(path).is_file() => Library::new(path),
+        Err(error) => Err(error),
+    }
+}
 
 #[cfg(feature = "kernel-timing")]
 pub mod kernel_timing;
@@ -635,6 +800,8 @@ pub struct HipRuntime {
     launch_grid_yz_limit: AtomicU32,
     /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
     stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
+    /// Plan-mode tape (railgun design A authoring); idle unless a plan is active.
+    plan: PlanGate,
     #[cfg(feature = "kernel-timing")]
     kernel_timing_control: std::sync::OnceLock<Arc<kernel_timing::TimingControl>>,
 }
@@ -854,6 +1021,22 @@ fn host_maps_qwen4_experts() -> bool {
 }
 
 impl HipRuntime {
+    /// Address of this runtime's resolved `hipEventRecord` implementation.
+    ///
+    /// Compare only while both runtime owners are alive, in the same process.
+    /// Unlike a pathname, this identifies the live implementation even after a
+    /// library is renamed or replaced. It makes no HIP call and does not use a
+    /// process-global first-loader cache: each GPU's actual runtime is checked.
+    pub fn event_record_address(&self) -> usize {
+        self.fn_event_record as usize
+    }
+
+    /// Loader-reported library path for diagnostics. Identity comparisons must
+    /// use [`Self::event_record_address`]; a missing path never proves equality.
+    pub fn mapped_hip_library(&self) -> Option<String> {
+        dladdr_fname(self.fn_event_record as *const c_void)
+    }
+
     /// Load the HIP runtime via dlopen.
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
@@ -872,14 +1055,14 @@ impl HipRuntime {
         // the host's preferred filenames (amdhip64*.dll vs libamdhip64.so*).
         let candidates =
             hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
-        // SAFETY: libloading::Library::new maps a shared object by path; on success
-        // the Library owns the mapping for the process. Failure paths only
-        // read the error value.
+        // SAFETY: open_library maps a shared object by path (plain
+        // libloading::Library::new off Windows); on success the Library owns the
+        // mapping for the process. Failure paths only read the error value.
         let lib = unsafe {
             let mut loaded = None;
             let mut last_err = None;
             for candidate in &candidates {
-                match Library::new(candidate) {
+                match open_library(candidate) {
                     Ok(l) => {
                         loaded = Some(l);
                         break;
@@ -1505,6 +1688,7 @@ impl HipRuntime {
             _lib: Arc::new(lib),
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
             stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
+            plan: PlanGate::default(),
             #[cfg(feature = "kernel-timing")]
             kernel_timing_control: std::sync::OnceLock::new(),
         };
@@ -1521,6 +1705,146 @@ impl HipRuntime {
         let code = unsafe { (runtime.fn_init)(0) };
         runtime.check(code, "hipInit")?;
         Ok(runtime)
+    }
+
+    // ── Plan mode (railgun design A authoring) ──────────────────
+
+    /// Begin a plan tape on this thread. Blob launches, D2D copies and memsets
+    /// are recorded instead of issued; every other HIP API refuses.
+    pub fn plan_begin(&self) -> HipResult<()> {
+        self.plan.begin()
+    }
+
+    /// Finish the plan tape and take its events / first refusal.
+    pub fn plan_end(&self) -> PlanTape {
+        self.plan.end()
+    }
+
+    /// True on the thread that began an active plan tape.
+    pub fn plan_active(&self) -> bool {
+        self.plan.active()
+    }
+
+    /// Mark the active plan refused (a no-op outside plan mode).
+    pub fn plan_refuse(&self, why: &str) {
+        if self.plan.active() {
+            let _ = self.plan.refuse(why);
+        }
+    }
+
+    /// Label stamped on every launch recorded from now on.
+    pub fn plan_set_label(&self, label: &'static str) {
+        if self.plan.active() {
+            self.plan.set_label(label);
+        }
+    }
+
+    /// Events recorded so far (0 outside plan mode).
+    pub fn plan_event_count(&self) -> usize {
+        self.plan.event_count()
+    }
+
+    /// Index of the most recent recorded launch.
+    pub fn plan_last_launch_index(&self) -> Option<usize> {
+        self.plan.last_launch_index()
+    }
+
+    /// Start recording every real blob launch of this thread (they still
+    /// execute / get graph-captured): the oracle's ground truth for what an
+    /// ordinary window launches, compared against a plan's launch list.
+    pub fn launch_witness_begin(&self) -> HipResult<()> {
+        self.plan.witness_begin()
+    }
+
+    /// Stop the launch witness and take its launches (in order).
+    pub fn launch_witness_end(&self) -> Vec<PlanEvent> {
+        self.plan.witness_end()
+    }
+
+    #[inline]
+    fn plan_deny(&self, api: &str) -> HipResult<()> {
+        if self.plan.active() {
+            Err(self
+                .plan
+                .refuse(&format!("HIP API {api} reached in plan mode")))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    fn plan_copy_at(
+        &self,
+        api: &str,
+        dst: &DeviceBuffer,
+        dst_off: usize,
+        src: &DeviceBuffer,
+        src_off: usize,
+        size: usize,
+    ) -> Option<HipResult<()>> {
+        if !self.plan.active() {
+            return None;
+        }
+        Some(self.plan.copy_range(
+            api,
+            dst.as_ptr() as u64,
+            dst.size(),
+            dst_off,
+            src.as_ptr() as u64,
+            src.size(),
+            src_off,
+            size,
+        ))
+    }
+
+    /// Stream-ordered D2D copy of raw device addresses (the emitted-twin
+    /// runner of a plan's `Copy` op). Not plan-recorded.
+    ///
+    /// # Safety
+    /// `[src, src+size)` and `[dst, dst+size)` must lie in live, disjoint
+    /// device allocations that outlive the copy.
+    pub unsafe fn memcpy_dtod_async_raw(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: the caller guarantees both ranges are live disjoint device
+        // allocations; Rust does not deref device pointers.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst,
+                src,
+                size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream_raw,
+            )
+        };
+        memory_effects::dtod();
+        self.check(code, "hipMemcpyAsync D2D raw")
+    }
+
+    /// Stream-ordered 32-bit fill of raw device words (the emitted-twin
+    /// runner of a plan's `Fill` op). Not plan-recorded.
+    ///
+    /// # Safety
+    /// `[dst, dst + 4*words)` must lie in a live device allocation that
+    /// outlives the fill.
+    pub unsafe fn memset_d32_async_raw(
+        &self,
+        dst: *mut c_void,
+        value: i32,
+        words: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: the caller guarantees the word range is a live device
+        // allocation; Rust does not deref device pointers.
+        let code = unsafe { (self.fn_memset_d32_async)(dst, value, words, stream_raw) };
+        memory_effects::memset();
+        self.check(code, "hipMemsetD32Async raw")
     }
 
     fn check(&self, code: u32, context: &str) -> HipResult<()> {
@@ -1543,17 +1867,46 @@ impl HipRuntime {
 
     // ── Version ────────────────────────────────────────────────
 
-    /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
-    pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
+    /// Raw `hipRuntimeGetVersion` value (HIP encoding:
+    /// `major * 10_000_000 + minor * 100_000 + patch`).
+    pub fn runtime_version_raw(&self) -> HipResult<i32> {
         let mut version: c_int = 0;
         // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
         // stack locals (or caller-provided device ids). No host pointer aliasing.
         let code = unsafe { (self.fn_runtime_get_version)(&mut version) };
         self.check(code, "hipRuntimeGetVersion")?;
+        Ok(version)
+    }
+
+    /// Get HIP runtime version as (major, minor). E.g. ROCm 6.3 → (6, 3).
+    pub fn runtime_version(&self) -> HipResult<(i32, i32)> {
+        let version = self.runtime_version_raw()?;
         // HIP version encoding: major * 10000000 + minor * 100000 + patch
         let major = version / 10_000_000;
         let minor = (version % 10_000_000) / 100_000;
         Ok((major, minor))
+    }
+
+    /// Raw `hipDriverGetVersion` value. The symbol is resolved from the held
+    /// library on each call rather than in the eager table in [`Self::load`], so
+    /// a runtime that lacks it still loads; the error names the missing symbol.
+    pub fn driver_version(&self) -> HipResult<i32> {
+        let mut version: c_int = 0;
+        // SAFETY: the symbol is resolved from the live `Library` owned by
+        // `_lib` and called while that borrow is held; the out-param is a stack
+        // local.
+        let code = unsafe {
+            let f: Symbol<'_, unsafe extern "C" fn(*mut c_int) -> u32> =
+                self._lib.get(b"hipDriverGetVersion").map_err(|e| {
+                    HipError::new(
+                        0,
+                        &format!("failed to load symbol hipDriverGetVersion: {e}"),
+                    )
+                })?;
+            f(&mut version)
+        };
+        self.check(code, "hipDriverGetVersion")?;
+        Ok(version)
     }
 
     // ── Device management ───────────────────────────────────────
@@ -1666,6 +2019,7 @@ impl HipRuntime {
         src_device: i32,
         size: usize,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyPeer")?;
         assert!(
             size <= dst.size(),
             "size ({size}) exceeds dst ({})",
@@ -1702,6 +2056,7 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyPeerAsync")?;
         assert!(
             size <= dst.size(),
             "size ({size}) exceeds dst ({})",
@@ -1741,6 +2096,7 @@ impl HipRuntime {
     // ── Memory management ───────────────────────────────────────
 
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
+        self.plan_deny("hipMalloc")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_raw(size);
         };
@@ -1774,6 +2130,7 @@ impl HipRuntime {
     /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
     /// callers receive a scoped error only when they request signal memory.
     pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        self.plan_deny("hipMalloc(signal)")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_signal_raw(size);
         };
@@ -1811,6 +2168,7 @@ impl HipRuntime {
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, mut buf: DeviceBuffer) -> HipResult<()> {
+        self.plan_deny("hipFree")?;
         if !buf.is_hip_allocation() {
             return Err(HipError::new(
                 0,
@@ -1837,6 +2195,7 @@ impl HipRuntime {
     /// is then the *host* pointer — use [`Self::host_get_device_pointer`] for the
     /// address to hand a kernel.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
+        self.plan_deny("hipHostMalloc")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.host_malloc_raw(size, flags);
         };
@@ -1865,6 +2224,7 @@ impl HipRuntime {
     /// HIP treats `host` as an opaque address; Rust never dereferences it.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_get_device_pointer(&self, host: *mut c_void, flags: u32) -> HipResult<*mut c_void> {
+        self.plan_deny("hipHostGetDevicePointer")?;
         let func =
             self.missing_vmm_symbol("hipHostGetDevicePointer", self.fn_host_get_device_pointer)?;
         let mut dev: *mut c_void = ptr::null_mut();
@@ -1880,6 +2240,7 @@ impl HipRuntime {
     /// HIP treats `host` as an opaque address; Rust never dereferences it.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn host_free(&self, host: *mut c_void) -> HipResult<()> {
+        self.plan_deny("hipHostFree")?;
         let func = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let raw = || {
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -1923,6 +2284,7 @@ impl HipRuntime {
     /// Own reusable pinned host storage, portable across devices. The library
     /// stays loaded until the allocation is freed, even if the runtime drops.
     pub fn host_buffer(&self, size: usize) -> HipResult<PinnedHostBuffer> {
+        self.plan_deny("pinned host_buffer alloc")?;
         if size == 0 {
             return Err(HipError::new(0, "host_buffer requires non-zero size"));
         }
@@ -1955,6 +2317,7 @@ impl HipRuntime {
     /// Reusable pinned CPU/GPU transfer storage. Same-stream downloads may be
     /// queued after an outstanding upload without exposing host references.
     pub fn transfer_buffer(&self, size: usize) -> HipResult<PinnedTransferBuffer> {
+        self.plan_deny("pinned transfer_buffer alloc")?;
         Ok(PinnedTransferBuffer {
             storage: Some(self.host_buffer(size)?),
             device: self.current_device()?,
@@ -1975,6 +2338,7 @@ impl HipRuntime {
     /// alias); there is no host-pointer fallback. Starts zeroed, `Retired`,
     /// generation 0. The library stays loaded until the allocation is freed.
     pub fn mapped_host_buffer(&self, size: usize) -> HipResult<MappedHostBuffer> {
+        self.plan_deny("mapped_host_buffer alloc")?;
         check_mapped_extent(size)?;
         let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
         let device = self.current_device()?;
@@ -2078,6 +2442,7 @@ impl HipRuntime {
         Ok(prop)
     }
     pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
+        self.plan_deny("hipMemAddressReserve")?;
         let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -2092,6 +2457,7 @@ impl HipRuntime {
         size: usize,
         prop: &HipMemAllocationProp,
     ) -> HipResult<HipMemGenericAllocationHandle> {
+        self.plan_deny("hipMemCreate")?;
         let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
         let raw = || {
             let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
@@ -2125,6 +2491,7 @@ impl HipRuntime {
         size: usize,
         handle: HipMemGenericAllocationHandle,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemMap")?;
         let func = self.missing_vmm_symbol("hipMemMap", self.fn_mem_map)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2141,6 +2508,7 @@ impl HipRuntime {
     /// # Safety
     /// `ptr..ptr+size` must describe a currently mapped VMM range.
     pub unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        self.plan_deny("hipMemUnmap")?;
         let func = self.missing_vmm_symbol("hipMemUnmap", self.fn_mem_unmap)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2159,6 +2527,7 @@ impl HipRuntime {
         size: usize,
         descs: &[HipMemAccessDesc],
     ) -> HipResult<()> {
+        self.plan_deny("hipMemSetAccess")?;
         let func = self.missing_vmm_symbol("hipMemSetAccess", self.fn_mem_set_access)?;
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
@@ -2170,6 +2539,7 @@ impl HipRuntime {
     /// `handle` must be live, owned by the caller, and no mapped range may
     /// still reference it.
     pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
+        self.plan_deny("hipMemRelease")?;
         let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
         let raw = || {
             // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
@@ -2339,6 +2709,7 @@ impl HipRuntime {
         offset: usize,
         src: &[u8],
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy H2D offset")?;
         assert!(
             offset + src.len() <= dst.size,
             "offset ({}) + source ({}) exceeds device buffer ({})",
@@ -2373,6 +2744,16 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpy D2D at offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -2401,6 +2782,9 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at("hipMemcpy D2D offset", dst, 0, src, src_offset, size) {
+            return r;
+        }
         assert!(size <= dst.size, "size ({size}) exceeds dst ({})", dst.size);
         assert!(src_offset + size <= src.size, "src_offset+size exceeds src");
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -2419,6 +2803,7 @@ impl HipRuntime {
     }
 
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        self.plan_deny("hipMemcpy H2D")?;
         if hip_fault_consume(0, "upload") {
             return Err(hip_fault_err("upload"));
         }
@@ -2447,6 +2832,7 @@ impl HipRuntime {
 
     #[track_caller]
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: &DeviceBuffer) -> HipResult<()> {
+        self.plan_deny("hipMemcpy D2H")?;
         assert!(
             dst.len() <= src.size,
             "destination ({}) exceeds device buffer ({})",
@@ -2497,6 +2883,7 @@ impl HipRuntime {
         src: &DeviceBuffer,
         src_offset: usize,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy D2H at offset")?;
         assert!(
             src_offset + dst.len() <= src.size,
             "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
@@ -2548,6 +2935,9 @@ impl HipRuntime {
         src: &DeviceBuffer,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at("hipMemcpy D2D", dst, 0, src, 0, size) {
+            return r;
+        }
         assert!(size <= dst.size && size <= src.size);
         let t = std::time::Instant::now();
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2577,6 +2967,10 @@ impl HipRuntime {
         src: *const c_void,
         size: usize,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            self.plan.copy_raw(dst as u64, src as u64, size as u64);
+            return Ok(());
+        }
         let f = self.fn_memcpy_dtod.ok_or_else(|| {
             HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
         })?;
@@ -2591,6 +2985,15 @@ impl HipRuntime {
 
     #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_bytes(
+                "hipMemset",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
+        }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
@@ -2629,6 +3032,15 @@ impl HipRuntime {
         count: usize,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_words(
+                "hipMemsetD32Async",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                count,
+            );
+        }
         assert!(count * 4 <= buf.size);
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2649,6 +3061,15 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return self.plan.memset_bytes(
+                "hipMemsetAsync",
+                buf.as_ptr() as u64,
+                buf.size(),
+                value,
+                size,
+            );
+        }
         assert!(size <= buf.size);
         let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
@@ -2681,6 +3102,7 @@ impl HipRuntime {
     // ── Streams ─────────────────────────────────────────────────
 
     pub fn stream_create(&self) -> HipResult<Stream> {
+        self.plan_deny("hipStreamCreate")?;
         let mut stream: HipStream = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2693,6 +3115,7 @@ impl HipRuntime {
     /// A stream that does not synchronize with the legacy null stream
     /// (`hipStreamNonBlocking`).
     pub fn stream_create_non_blocking(&self) -> HipResult<Stream> {
+        self.plan_deny("hipStreamCreateWithFlags")?;
         let mut stream: HipStream = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2703,6 +3126,7 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        self.plan_deny("hipStreamSynchronize")?;
         if hip_fault_consume(2, "sync") {
             return Err(hip_fault_err("sync"));
         }
@@ -2721,10 +3145,12 @@ impl HipRuntime {
     /// whole device. `Stream` has no `Drop`, so the temporary NULL handle is never
     /// destroyed.
     pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        self.plan_deny("hipStreamSynchronize(default)")?;
         self.stream_synchronize(&Stream(ptr::null_mut()))
     }
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
+        self.plan_deny("hipStreamDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -2735,6 +3161,7 @@ impl HipRuntime {
     // ── Modules & Kernels ───────────────────────────────────────
 
     pub fn module_load(&self, path: &str) -> HipResult<Module> {
+        self.plan_deny("hipModuleLoad")?;
         let c_path =
             CString::new(path).map_err(|_| HipError::new(1, "invalid path for module_load"))?;
         let mut module: HipModule = ptr::null_mut();
@@ -2750,6 +3177,7 @@ impl HipRuntime {
     }
 
     pub fn module_load_data(&self, image: &[u8]) -> HipResult<Module> {
+        self.plan_deny("hipModuleLoadData")?;
         let mut module: HipModule = ptr::null_mut();
         let code =
             // SAFETY: module/function handles are live HIP objects from earlier loads;
@@ -2769,6 +3197,7 @@ impl HipRuntime {
     }
 
     pub fn module_get_function(&self, module: &Module, name: &str) -> HipResult<Function> {
+        self.plan_deny("hipModuleGetFunction")?;
         let c_name = CString::new(name)
             .map_err(|_| HipError::new(1, "invalid kernel name for module_get_function"))?;
         let mut func: HipFunction = ptr::null_mut();
@@ -2823,6 +3252,17 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        if self.plan.active() {
+            return Err(self.plan.refuse(&format!(
+                "HIP API hipModuleLaunchKernel(kernelParams) function handle {:#x} reached in plan mode",
+                func.0 as usize
+            )));
+        }
+        if self.plan.witnessing() {
+            // kernelParams form: the kernarg bytes are not recoverable here.
+            self.plan
+                .witness_launch(func.0 as usize, grid, block, shared_mem, &[]);
+        }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
@@ -2888,6 +3328,16 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        if self.plan.active() {
+            self.validate_launch_grid(grid)?;
+            self.plan
+                .launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
+            return Ok(());
+        }
+        if self.plan.witnessing() {
+            self.plan
+                .witness_launch(func.0 as usize, grid, block, shared_mem, kernarg_blob);
+        }
         #[cfg(feature = "kernel-timing")]
         let mut timing = kernel_timing::LaunchTiming::new(self)?;
         self.validate_launch_grid(grid)?;
@@ -2967,6 +3417,7 @@ impl HipRuntime {
     // ── Events ──────────────────────────────────────────────────
 
     pub fn event_create(&self) -> HipResult<Event> {
+        self.plan_deny("hipEventCreate")?;
         let mut event: HipEvent = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2982,6 +3433,7 @@ impl HipRuntime {
     /// without `hipEventDisableSystemFence`. Cross-device producers may add
     /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
     pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
+        self.plan_deny("hipEventCreateWithFlags")?;
         let mut event: HipEvent = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -2992,6 +3444,7 @@ impl HipRuntime {
     }
 
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
+        self.plan_deny("hipEventRecord")?;
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3001,6 +3454,7 @@ impl HipRuntime {
     }
 
     pub fn event_synchronize(&self, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipEventSynchronize")?;
         let t = std::time::Instant::now();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3011,6 +3465,7 @@ impl HipRuntime {
     }
 
     pub fn event_query(&self, event: &Event) -> HipResult<bool> {
+        self.plan_deny("hipEventQuery")?;
         // Non-blocking by construction: hipSuccess = recorded and complete,
         // hipErrorNotReady (600) = work still outstanding, anything else is
         // a real failure (invalid handle, device lost) and propagates.
@@ -3030,6 +3485,7 @@ impl HipRuntime {
     }
 
     pub fn event_elapsed_ms(&self, start: &Event, stop: &Event) -> HipResult<f32> {
+        self.plan_deny("hipEventElapsedTime")?;
         let mut ms: f32 = 0.0;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3040,6 +3496,7 @@ impl HipRuntime {
     }
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
+        self.plan_deny("hipEventDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3048,10 +3505,24 @@ impl HipRuntime {
     }
 
     pub fn stream_wait_event(&self, stream: &Stream, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitEvent")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_wait_event)(stream.0, event.0, 0) };
+        self.check(code, "hipStreamWaitEvent")
+    }
+
+    /// [`Self::stream_wait_event`] on an optional stream: `None` is the
+    /// legacy/default (null) stream, the one `rdna_compute::Gpu` launches on
+    /// while it has no active stream.
+    pub fn stream_wait_event_on(&self, stream: Option<&Stream>, event: &Event) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitEvent")?;
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
+        // wrappers; out-params are stack locals. Destroy/sync require the caller
+        // to have drained dependent work first where HIP demands it.
+        let code = unsafe { (self.fn_stream_wait_event)(stream_raw, event.0, 0) };
         self.check(code, "hipStreamWaitEvent")
     }
 
@@ -3073,6 +3544,7 @@ impl HipRuntime {
         src: &[u8],
         stream: &Stream,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D")?;
         if hip_fault_consume(0, "upload") {
             return Err(hip_fault_err("upload"));
         }
@@ -3096,6 +3568,7 @@ impl HipRuntime {
     /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
     /// stay unchanged until the stream reaches the copy.
     pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D(default stream)")?;
         assert!(src.len() <= dst.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3119,6 +3592,7 @@ impl HipRuntime {
         src: &DeviceBuffer,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync D2H")?;
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3149,6 +3623,16 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -3186,6 +3670,16 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        if let Some(r) = self.plan_copy_at(
+            "hipMemcpyAsync D2D offset default stream",
+            dst,
+            dst_offset,
+            src,
+            src_offset,
+            size,
+        ) {
+            return r;
+        }
         assert!(dst_offset + size <= dst.size);
         assert!(src_offset + size <= src.size);
         // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
@@ -3244,6 +3738,7 @@ impl HipRuntime {
         height: usize,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        self.plan_deny("hipMemcpy2DAsync D2D")?;
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -3308,6 +3803,7 @@ impl HipRuntime {
     /// Begin capturing all operations on `stream` into a graph.
     /// mode=0 is hipStreamCaptureModeGlobal.
     pub fn stream_begin_capture(&self, stream: &Stream, mode: u32) -> HipResult<()> {
+        self.plan_deny("hipStreamBeginCapture")?;
         #[cfg(feature = "kernel-timing")]
         kernel_timing::reject_active(self, "graph capture unsupported by kernel timing")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
@@ -3319,6 +3815,7 @@ impl HipRuntime {
 
     /// End capture on `stream`, returning the captured graph.
     pub fn stream_end_capture(&self, stream: &Stream) -> HipResult<Graph> {
+        self.plan_deny("hipStreamEndCapture")?;
         let mut graph: HipGraph = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3331,6 +3828,7 @@ impl HipRuntime {
     /// Whether `stream` is inside a `hipStreamBeginCapture` window. An
     /// invalidated capture still counts: work issued to it is not executed.
     pub fn stream_is_capturing(&self, stream: &Stream) -> HipResult<bool> {
+        self.plan_deny("hipStreamIsCapturing")?;
         let mut status: c_uint = 0;
         // SAFETY: `stream` is a live opaque HIP handle owned by the wrapper;
         // `status` is a stack out-param.
@@ -3342,6 +3840,7 @@ impl HipRuntime {
 
     /// Instantiate an executable graph from a captured graph.
     pub fn graph_instantiate(&self, graph: &Graph) -> HipResult<GraphExec> {
+        self.plan_deny("hipGraphInstantiate")?;
         let mut exec: HipGraphExec = ptr::null_mut();
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3355,6 +3854,7 @@ impl HipRuntime {
 
     /// Launch an executable graph on `stream`.
     pub fn graph_launch(&self, exec: &GraphExec, stream: &Stream) -> HipResult<()> {
+        self.plan_deny("hipGraphLaunch")?;
         #[cfg(feature = "kernel-timing")]
         kernel_timing::reject_active(self, "graph replay unsupported by kernel timing")?;
         let t = std::time::Instant::now();
@@ -3367,6 +3867,7 @@ impl HipRuntime {
     }
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
+        self.plan_deny("hipGraphExecDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3375,6 +3876,7 @@ impl HipRuntime {
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
+        self.plan_deny("hipGraphDestroy")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3393,6 +3895,7 @@ impl HipRuntime {
         value: u32,
         flags: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWriteValue32")?;
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
@@ -3445,6 +3948,7 @@ impl HipRuntime {
         flags: u32,
         mask: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitValue32")?;
         let Some(wait_value32) = self.fn_stream_wait_value32 else {
             return Err(HipError::new(
                 0,
@@ -3509,6 +4013,7 @@ impl HipRuntime {
         word: &SignalWord,
         value: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWriteSignal")?;
         if !SignalGen::is_generation(value) {
             return Err(mapped_err("signal write value is not a generation"));
         }
@@ -3531,6 +4036,7 @@ impl HipRuntime {
         word: &SignalWord,
         generation: u32,
     ) -> HipResult<()> {
+        self.plan_deny("hipStreamWaitSignal")?;
         if !SignalGen::is_generation(generation) {
             return Err(mapped_err("signal wait value is not a generation"));
         }
@@ -3545,6 +4051,7 @@ impl HipRuntime {
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
+        self.plan_deny("hipDeviceSynchronize")?;
         if hip_fault_consume(2, "sync") {
             return Err(hip_fault_err("sync"));
         }
@@ -4989,6 +5496,13 @@ pub struct Function(HipFunction);
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for Function {}
 
+impl Function {
+    /// Raw `hipFunction_t` handle, for identity keys only (never dereferenced).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
+
 /// GPU event for timing.
 pub struct Event(HipEvent);
 // SAFETY: Event is an opaque HIP handle (*mut c_void). Sending the handle
@@ -5009,6 +5523,24 @@ pub struct GraphExec(HipGraphExec);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
+
+#[cfg(test)]
+mod mapped_library_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_lookup_resolves_a_live_symbol_without_hip() {
+        let path = dladdr_fname(dladdr as *const c_void)
+            .expect("the dynamic loader must resolve its own dladdr symbol");
+        assert!(!path.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_lookup_handles_an_unknown_address() {
+        assert_eq!(dladdr_fname(ptr::null()), None);
+    }
+}
 
 #[cfg(test)]
 mod pageable_copy_staging_tests {

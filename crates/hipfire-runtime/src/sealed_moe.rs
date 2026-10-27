@@ -18,6 +18,19 @@ use crate::weight_manifest::{
 use rdna_compute::DType;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+/// Flash-Next's EP protocol: every rank runs the replicated trunk, owned
+/// experts write their slot rows, and a copy-only owner row exchange feeds the
+/// unchanged slot-order combine on every rank. Sealed plans carrying this
+/// execution string express that exchange as an owner-routed row gather, never
+/// an all-reduce.
+pub const OWNER_ROUTED_EP_EXECUTION: &str = "qwen4-owner-row-gather-replicated-combine";
+
+/// Whether `execution` names the owner-routed copy-only exchange rather than an
+/// arithmetic reduction.
+pub fn is_owner_routed_execution(execution: &str) -> bool {
+    execution == OWNER_ROUTED_EP_EXECUTION
+}
+
 /// CPU metadata for one manifest source.  The loader must populate this from
 /// the actual encoded tensor, never from an artifact basename or model config.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -895,26 +908,23 @@ fn validate_manifest_row(
     spec: &ExpertGroupSpec,
     entry: &WeightEntry,
     plan: &ManifestPlan,
-    expected_kind: Option<DimKind>,
+    expected: Option<CollectiveHint>,
 ) -> Result<Option<crate::weight_manifest::CollectiveScheduleEntry>, String> {
     let row = plan
         .collective_schedule
         .iter()
         .find(|row| row.name == entry.name && entry.layer == Some(row.layer))
         .cloned();
-    match (expected_kind, row) {
+    match (expected, row) {
         (None, Some(_)) => Err(format!(
             "{}: Single group source '{}' unexpectedly authorizes a collective",
             context(spec),
             entry.name
         )),
-        (Some(kind), Some(row)) => {
-            if !matches!(
-                row.hint,
-                CollectiveHint::AllReduce { kind: actual } if actual == kind
-            ) {
+        (Some(hint), Some(row)) => {
+            if row.hint != hint {
                 return Err(format!(
-                    "{}: source '{}' has unauthorized collective {:?}",
+                    "{}: source '{}' has unauthorized collective {:?} (expected {hint:?})",
                     context(spec),
                     entry.name,
                     row.hint
@@ -963,11 +973,19 @@ fn validate_and_build_group(
         for (label, entry) in [("gate", gate_entry), ("up", up_entry), ("down", down_entry)] {
             // TP gate/up are column shards and intentionally have no
             // collective row; only the row-sharded down projection reduces.
+            let owner_routed = is_owner_routed_execution(&spec.execution);
             let source_kind = match (spec.parallelism, label) {
                 (ExpertParallelism::Single, _) => None,
-                (ExpertParallelism::TensorParallel, "down") => Some(DimKind::Tp),
+                (ExpertParallelism::TensorParallel, "down") => {
+                    Some(CollectiveHint::AllReduce { kind: DimKind::Tp })
+                }
                 (ExpertParallelism::TensorParallel, _) => None,
-                (ExpertParallelism::ExpertParallel, _) => Some(DimKind::Ep),
+                (ExpertParallelism::ExpertParallel, _) if owner_routed => {
+                    Some(CollectiveHint::OwnerRowGather { kind: DimKind::Ep })
+                }
+                (ExpertParallelism::ExpertParallel, _) => {
+                    Some(CollectiveHint::AllReduce { kind: DimKind::Ep })
+                }
             };
             if let Some(row) = validate_manifest_row(spec, entry, plan, source_kind)? {
                 if !collective_rows.iter().any(
@@ -1700,6 +1718,9 @@ pub fn execution_contract_for_plan(
                 CollectiveHint::AllReduce { kind } => ContractCollectiveHint::AllReduce {
                     kind: map_axis(kind),
                 },
+                CollectiveHint::OwnerRowGather { kind } => ContractCollectiveHint::OwnerRowGather {
+                    kind: map_axis(kind),
+                },
                 CollectiveHint::BandXfer { src, dst } => {
                     ContractCollectiveHint::BandXfer { src, dst }
                 }
@@ -1726,6 +1747,94 @@ pub fn execution_contract_for_plan(
         collective_rows,
     )
     .map_err(|error| format!("sealed expert contract: {error:?}"))
+}
+
+/// Checked owner-routed row-gather execution metadata for one sealed expert
+/// group.
+///
+/// Derived from a sealed [`ExpertExecutionPlan`]: the exchange copies every
+/// owned down-projection row from its owner (`e % ranks`, stride) to every
+/// other rank, then runs the unchanged slot-order combine replicated on every
+/// rank. `derive` binds the schedule to the plan's execution string and its
+/// owner-routed collective rows, and rejects a plan that does not authorize the
+/// copy-only exchange before any side effect. The arithmetic all-reduce
+/// (`CollectiveHint::AllReduce`) and the root-routed reduction are a different
+/// contract and are refused here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerRoutedEpSchedule {
+    n_ranks: usize,
+    layer: Option<usize>,
+    n_experts: usize,
+    hidden: usize,
+}
+
+impl OwnerRoutedEpSchedule {
+    /// Derive the checked owner-routed exchange schedule from one sealed plan.
+    pub fn derive(plan: &ExpertExecutionPlan) -> Result<Self, String> {
+        if plan.execution() != OWNER_ROUTED_EP_EXECUTION {
+            return Err(format!(
+                "owner-routed schedule requires execution '{OWNER_ROUTED_EP_EXECUTION}', got '{}'",
+                plan.execution()
+            ));
+        }
+        if plan.parallelism() != ExpertParallelism::ExpertParallel {
+            return Err(format!(
+                "owner-routed schedule requires expert parallelism, got {:?}",
+                plan.parallelism()
+            ));
+        }
+        if plan.assignment() != ExpertAssign::Stride {
+            return Err(format!(
+                "owner-routed schedule requires stride ownership, got {:?}",
+                plan.assignment()
+            ));
+        }
+        let rows = plan.collective_rows();
+        if rows.is_empty()
+            || !rows.iter().all(|row| {
+                matches!(
+                    row.hint,
+                    CollectiveHint::OwnerRowGather { kind: DimKind::Ep }
+                )
+            })
+        {
+            return Err(
+                "owner-routed schedule requires owner-routed EP collective rows (not an all-reduce)"
+                    .to_string(),
+            );
+        }
+        let dims = plan.dimensions();
+        if dims.hidden == 0 {
+            return Err("owner-routed schedule requires a non-zero hidden size".to_string());
+        }
+        Ok(Self {
+            n_ranks: plan.physical_devices().len(),
+            layer: plan.layer(),
+            n_experts: plan.n_experts(),
+            hidden: dims.hidden,
+        })
+    }
+
+    pub fn rank_count(&self) -> usize {
+        self.n_ranks
+    }
+
+    pub fn layer(&self) -> Option<usize> {
+        self.layer
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// Bytes of one owned down-projection row (`hidden` f32 values).
+    pub fn row_bytes(&self) -> usize {
+        self.hidden * std::mem::size_of::<f32>()
+    }
 }
 
 /// Build and adapt a Single-device expert plan from loader-attested metadata.
@@ -1943,9 +2052,24 @@ pub fn plan_packed_expert_parallel(
         .unwrap_or(0);
     let placement = crate::mesh_placement::BandPlacement::uniform(mesh, n_layers)
         .map_err(|error| format!("{family}: expert manifest planning: {error}"))?;
-    let manifest_plan =
+    let mut manifest_plan =
         crate::weight_manifest::plan_manifest(&manifest, &[], mesh, n_layers, &placement)
             .map_err(|error| format!("{family}: expert manifest planning: {error}"))?;
+    // The generic manifest planner records every expert-sharded source as an
+    // EP all-reduce. The owner-routed protocol exchanges owned rows by copy
+    // (no arithmetic), so re-express those rows as an owner-routed gather.
+    if is_owner_routed_execution(execution) {
+        for entry in &mut manifest_plan.collective_schedule {
+            if matches!(entry.hint, CollectiveHint::AllReduce { kind: DimKind::Ep }) {
+                entry.hint = CollectiveHint::OwnerRowGather { kind: DimKind::Ep };
+            }
+        }
+        for (_, hint) in &mut manifest_plan.layer_collectives {
+            if matches!(*hint, CollectiveHint::AllReduce { kind: DimKind::Ep }) {
+                *hint = CollectiveHint::OwnerRowGather { kind: DimKind::Ep };
+            }
+        }
+    }
     plan_expert_execution(
         &manifest,
         &manifest_plan,
@@ -2607,6 +2731,87 @@ mod tests {
             plan_packed_expert_parallel(&groups, "t", "x", &source, "gen", &mesh, &[0, 1, 1, 2])
                 .unwrap_err();
         assert!(error.contains("duplicate"), "{error}");
+    }
+
+    /// The owner-routed execution string turns the sealed plan's EP collective
+    /// rows into a copy-only owner-routed gather (not an all-reduce), and the
+    /// owner-routed schedule derives from that plan; a reduction plan refuses.
+    #[test]
+    fn owner_routed_execution_expresses_an_owner_row_gather_schedule() {
+        let range =
+            |name: &str, dtype: &str, shape: &[usize], row_bytes: usize| SourceRangeIdentity {
+                name: name.to_string(),
+                file_index: 0,
+                offset: 0,
+                length: (shape[..shape.len() - 1].iter().product::<usize>() * row_bytes) as u64,
+                dtype: dtype.to_string(),
+                logical_shape: shape.to_vec(),
+            };
+        let groups = vec![PackedExpertGroup {
+            layer: 0,
+            router: "l0.gate".into(),
+            gate_up: "l0.gate_up".into(),
+            down: "l0.down".into(),
+        }];
+        let manifest = vec![
+            range("l0.gate", "F32", &[6, 256], 1024),
+            range("l0.gate_up", "MQ4G256V2", &[6, 4, 256], 136),
+            range("l0.down", "MQ4G128V2", &[6, 256, 2], 68),
+        ];
+        let source = SourceIdentity {
+            canonical_path: "/m.hfq".into(),
+            format: SourceFormat::Hfq,
+            files: vec![crate::model_source::SourceFileIdentity {
+                canonical_path: "/m.hfq".into(),
+                dev: 1,
+                ino: 2,
+                len: 3,
+                mtime_secs: 4,
+                mtime_nanos: 5,
+            }],
+            metadata_json: String::new(),
+            manifest,
+        };
+        let mesh = DeviceMesh::rect(&[(DimKind::Ep, 4)]).unwrap();
+        let devices = [3, 1, 2, 0];
+
+        let owner = plan_packed_expert_parallel(
+            &groups,
+            "t",
+            OWNER_ROUTED_EP_EXECUTION,
+            &source,
+            "gen",
+            &mesh,
+            &devices,
+        )
+        .unwrap();
+        assert_eq!(owner.len(), 1);
+        let plan = &owner[0];
+        let rows = plan.collective_rows();
+        // Fused gate/up is one source: two rows (gate_up, down), each an
+        // owner-routed gather, never an all-reduce.
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(
+                matches!(
+                    row.hint,
+                    CollectiveHint::OwnerRowGather { kind: DimKind::Ep }
+                ),
+                "unexpected collective row {row:?}"
+            );
+        }
+        let schedule = OwnerRoutedEpSchedule::derive(plan).unwrap();
+        assert_eq!(schedule.rank_count(), 4);
+        assert_eq!(schedule.n_experts(), 6);
+        assert_eq!(schedule.row_bytes(), schedule.hidden() * 4);
+
+        // A reduction-style execution string produces all-reduce rows, which
+        // the owner-routed schedule refuses before any side effect.
+        let reduced =
+            plan_packed_expert_parallel(&groups, "t", "x", &source, "gen", &mesh, &devices)
+                .unwrap();
+        let error = OwnerRoutedEpSchedule::derive(&reduced[0]).unwrap_err();
+        assert!(error.contains("execution"), "{error}");
     }
 
     fn ep_fixture() -> (

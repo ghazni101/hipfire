@@ -10,10 +10,10 @@
 //! `qwen_dflash_semantic_terminal_tests.rs` so that file's rustfmt debt is not
 //! dragged into this change.
 
+use hipfire_engine::turn_cache::apply_turn_cache_action;
 use hipfire_generate::common::qwen_dflash_hit_length_cap;
 use hipfire_generate::qwen::{
-    qwen_dflash_apply_cache_action, qwen_dflash_cache_action, qwen_dflash_wire_terminal,
-    QwenDflashWireTerminal,
+    qwen_dflash_cache_action, qwen_dflash_wire_terminal, QwenDflashWireTerminal,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use hipfire_runtime::spec::{ClientEvent, FinishSummary};
@@ -64,8 +64,10 @@ fn ctx_exhausted_maps_to_length_with_budget_unspent() {
     }
     let action = qwen_dflash_cache_action(&term);
     assert!(!action.store);
-    assert!(
-        qwen_dflash_apply_cache_action(|_, _| panic!("must not insert"), &action, vec![1, 2])
-            .is_none()
-    );
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
+        |_, _| panic!("must not insert"),
+        &action,
+        vec![1, 2]
+    )
+    .is_none());
 }

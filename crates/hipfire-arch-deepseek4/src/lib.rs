@@ -75,6 +75,7 @@ pub mod heterogeneous;
 
 pub mod mtp_speculator;
 mod program;
+mod routed_seal;
 mod rows_program;
 pub mod sampling;
 pub mod spec_decode;

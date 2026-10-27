@@ -19,6 +19,7 @@
  0 hipfire-atlas
  0 hipfire-config
  0 hipfire-detect
+ 0 hipfire-kernel-abi
  0 hipfire-xdna
  0 peacemaker-cdna
  0 peacemaker-ir
@@ -29,6 +30,7 @@
  1 hip-bridge
  1 hipfire-client
  2 peacemaker-isa
+ 2 pm-census
  1 hipfire-registry
  1 hsa-bridge
  1 peacemaker-author

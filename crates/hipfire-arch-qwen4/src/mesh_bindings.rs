@@ -581,6 +581,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
                 dtype_bytes,
                 bytes,
             },
+            partial_slot: None,
         })
     }
 

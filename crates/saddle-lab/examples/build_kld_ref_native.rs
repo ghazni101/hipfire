@@ -827,7 +827,7 @@ fn main() {
             // — no hybrid prefix/per-token split, so it does NOT share the
             // batched↔per-token boundary defect that gemma/glimmer had. The
             // batched path is the calibration-proven chokepoint
-            // forward_decode_batch_lfm:290 → batched_proj:61 (tap3), with
+            // forward_decode_batch_lfm → ProjectLadder::Gemm (tap3), with
             // explicit positions 0..b-1 per lane. Keeping batched here is
             // correct; per-token fallback would be slower and unnecessary.
             let b = n_ctx - 1;

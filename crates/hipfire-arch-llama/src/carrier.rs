@@ -2419,6 +2419,48 @@ mod tests {
         out
     }
 
+    /// DFlash prefill capture on weights the batched chunk refuses
+    /// (`is_batchable_la` false, e.g. `hipfire-quantize --format mq4` =
+    /// MQ4G256V2) must take the per-token fallback and still append one
+    /// `extract × dim` row per prompt token (HIPF-196: it used to assert).
+    /// Fixture: `LLAMA_NONBATCHABLE_FIXTURE`, any LLaMA-arch HFQ with a
+    /// non-batchable projection dtype; skips when unset or without a GPU.
+    #[test]
+    fn spec_advance_captures_on_non_batchable_weights() {
+        use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(fixture) = std::env::var("LLAMA_NONBATCHABLE_FIXTURE") else {
+            eprintln!("skip: LLAMA_NONBATCHABLE_FIXTURE unset");
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let hfq = HfqFile::open(Path::new(&fixture)).expect("open fixture");
+        let cask = CaskConfig::default();
+        let mut ctx = load_ctx(Path::new(&fixture), &mut gpu, &cask);
+        ctx.max_seq = 64;
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load fixture");
+        drop(ctx);
+        let extract = vec![0, bundle.config.n_layers - 1];
+        bundle.dflash_extract_layers = extract.clone();
+        let tokens: Vec<u32> = (0..16).map(|i| bundle.config.bos_token + 100 + i).collect();
+        let mut hidden = Vec::new();
+        let r = bundle
+            .spec_advance(&mut gpu, &tokens, 0, true, &|| false, Some(&mut hidden))
+            .expect("spec_advance");
+        assert!(matches!(r, SpecAdvance::Ready { .. }));
+        assert_eq!(
+            hidden.len(),
+            tokens.len() * extract.len() * bundle.config.dim
+        );
+        assert!(hidden.iter().all(|v| v.is_finite()));
+        assert!(hidden.iter().any(|&v| v != 0.0));
+    }
+
     fn argmax_index(logits: &[f32]) -> usize {
         let mut best = 0usize;
         for (index, value) in logits.iter().enumerate() {

@@ -22,7 +22,7 @@ use crate::config::EmbedConfig;
 use crate::names::{self, TensorBytes};
 use half::f16;
 use hipfire_arch_qwen35_vl::qwen35_vl::{
-    vision_forward, VisionConfig, VisionLayerWeights, VisionWeights,
+    vision_forward, TowerMats, VisionConfig, VisionLayerMats, VisionLayerWeights, VisionWeights,
 };
 use hipfire_runtime::loader_api::ModelSource;
 use rdna_compute::Gpu;
@@ -268,47 +268,77 @@ pub fn load_vision_weights(
     }
     let h = vis.hidden_size;
     let mut layers = Vec::with_capacity(vis.num_layers);
+    let mut layer_mats = Vec::with_capacity(vis.num_layers);
     for i in 0..vis.num_layers {
         let p = format!("blocks.{i}");
-        layers.push(VisionLayerWeights {
-            norm1_w: up_vec(gpu, src, offload, &format!("{p}.norm1.weight"), h)?,
-            norm1_b: up_vec(gpu, src, offload, &format!("{p}.norm1.bias"), h)?,
-            qkv_w: up_lin(gpu, src, offload, &format!("{p}.attn.qkv.weight"))?,
-            qkv_b: up_vec(gpu, src, offload, &format!("{p}.attn.qkv.bias"), 3 * h)?,
-            proj_w: up_lin(gpu, src, offload, &format!("{p}.attn.proj.weight"))?,
-            proj_b: up_vec(gpu, src, offload, &format!("{p}.attn.proj.bias"), h)?,
-            norm2_w: up_vec(gpu, src, offload, &format!("{p}.norm2.weight"), h)?,
-            norm2_b: up_vec(gpu, src, offload, &format!("{p}.norm2.bias"), h)?,
-            fc1_w: up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc1.weight"))?,
-            fc1_b: up_vec(
-                gpu,
-                src,
-                offload,
-                &format!("{p}.mlp.linear_fc1.bias"),
-                vis.mlp_dim,
-            )?,
-            fc2_w: up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc2.weight"))?,
-            fc2_b: up_vec(gpu, src, offload, &format!("{p}.mlp.linear_fc2.bias"), h)?,
-        });
-    }
-    let merge_dim = h * vis.spatial_merge_size * vis.spatial_merge_size;
-    Ok(VisionWeights {
-        patch_embed_w: up_lin(gpu, src, offload, "patch_embed.proj.weight")?,
-        patch_embed_b: up_vec(gpu, src, offload, "patch_embed.proj.bias", h)?,
-        pos_embed: host_vec(src, "pos_embed.weight", vis.num_position_embeddings * h)?,
-        layers,
-        merger_norm_w: up_vec(gpu, src, offload, "merger.norm.weight", h)?,
-        merger_norm_b: up_vec(gpu, src, offload, "merger.norm.bias", h)?,
-        merger_fc1_w: up_lin(gpu, src, offload, "merger.linear_fc1.weight")?,
-        merger_fc1_b: up_vec(gpu, src, offload, "merger.linear_fc1.bias", merge_dim)?,
-        merger_fc2_w: up_lin(gpu, src, offload, "merger.linear_fc2.weight")?,
-        merger_fc2_b: up_vec(
+        let norm1_w = up_vec(gpu, src, offload, &format!("{p}.norm1.weight"), h)?;
+        let norm1_b = up_vec(gpu, src, offload, &format!("{p}.norm1.bias"), h)?;
+        let qkv_w = up_lin(gpu, src, offload, &format!("{p}.attn.qkv.weight"))?;
+        let qkv_b = up_vec(gpu, src, offload, &format!("{p}.attn.qkv.bias"), 3 * h)?;
+        let proj_w = up_lin(gpu, src, offload, &format!("{p}.attn.proj.weight"))?;
+        let proj_b = up_vec(gpu, src, offload, &format!("{p}.attn.proj.bias"), h)?;
+        let norm2_w = up_vec(gpu, src, offload, &format!("{p}.norm2.weight"), h)?;
+        let norm2_b = up_vec(gpu, src, offload, &format!("{p}.norm2.bias"), h)?;
+        let fc1_w = up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc1.weight"))?;
+        let fc1_b = up_vec(
             gpu,
             src,
             offload,
-            "merger.linear_fc2.bias",
-            vis.out_hidden_size,
-        )?,
+            &format!("{p}.mlp.linear_fc1.bias"),
+            vis.mlp_dim,
+        )?;
+        let fc2_w = up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc2.weight"))?;
+        let fc2_b = up_vec(gpu, src, offload, &format!("{p}.mlp.linear_fc2.bias"), h)?;
+        layers.push(VisionLayerWeights {
+            norm1_w,
+            norm1_b,
+            qkv_b,
+            proj_b,
+            norm2_w,
+            norm2_b,
+            fc1_b,
+            fc2_b,
+            // Packed (not K-padded): the shared tower routes a packed fc2
+            // with `mlp_dim % 64 != 0` through `gemm_f16_wmma_mb8`.
+            fc2_ld: vis.mlp_dim,
+        });
+        layer_mats.push(VisionLayerMats {
+            qkv_w,
+            proj_w,
+            fc1_w,
+            fc2_w,
+        });
+    }
+    let merge_dim = h * vis.spatial_merge_size * vis.spatial_merge_size;
+    let patch_embed_w = up_lin(gpu, src, offload, "patch_embed.proj.weight")?;
+    let patch_embed_b = up_vec(gpu, src, offload, "patch_embed.proj.bias", h)?;
+    let pos_embed = host_vec(src, "pos_embed.weight", vis.num_position_embeddings * h)?;
+    let merger_norm_w = up_vec(gpu, src, offload, "merger.norm.weight", h)?;
+    let merger_norm_b = up_vec(gpu, src, offload, "merger.norm.bias", h)?;
+    let merger_fc1_w = up_lin(gpu, src, offload, "merger.linear_fc1.weight")?;
+    let merger_fc1_b = up_vec(gpu, src, offload, "merger.linear_fc1.bias", merge_dim)?;
+    let merger_fc2_w = up_lin(gpu, src, offload, "merger.linear_fc2.weight")?;
+    let merger_fc2_b = up_vec(
+        gpu,
+        src,
+        offload,
+        "merger.linear_fc2.bias",
+        vis.out_hidden_size,
+    )?;
+    Ok(VisionWeights {
+        patch_embed_w,
+        patch_embed_b,
+        pos_embed,
+        layers,
+        merger_norm_w,
+        merger_norm_b,
+        merger_fc1_b,
+        merger_fc2_b,
+        mats: TowerMats::Resident {
+            layers: layer_mats,
+            merger_fc1_w,
+            merger_fc2_w,
+        },
     })
 }
 

@@ -358,6 +358,9 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// Int8 activation scratch `(xq, dx)` of the opt-in exact-gfx1100
+    /// small-batch verify GEMV (`gemv_q8x.rs`), allocated on first use.
+    pub q8x_act: Option<(GpuTensor, GpuTensor)>,
     /// Dedicated F32 `x_out` operand for `Gpu::mq6_fp8_prepare_x` (the MQ4v2 FP8
     /// producer's rotated-row output, `[batch * k]`; the in-register producer
     /// never writes it). Lazily allocated, grown on demand, never shrunk.
@@ -1247,7 +1250,12 @@ pub(crate) fn launch_maybe_blob(
         .map_err(|e| e.with_kernel(func_name))?;
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
     let observe = replay.as_ref().is_some_and(|r| r.is_g0_observing());
-    let result: HipResult<()> = if record || observe || capture_mode || force_blob_path {
+    let result: HipResult<()> = if record
+        || observe
+        || capture_mode
+        || force_blob_path
+        || hip.plan_active()
+    {
         let mut blob = blob_builder();
         blob.pad_to(16);
         if observe {
@@ -1417,6 +1425,26 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// and holding both at once is what we are trying to avoid. On allocation
 /// failure the slot is left empty with a zero byte count, so the `?` in the
 /// caller returns before any `unwrap`, and a later call retries cleanly.
+/// Bumped every time a scratch slot's old buffer is freed (growth replaces
+/// it) or a growth is announced by [`Gpu::invalidate_for_scratch_growth`].
+/// Anything that caches device pointers into scratch slots (the certified
+/// railgun window's prepared skeletons) must treat a changed epoch as "every
+/// pointer I hold into scratch may be freed": a captured hipGraph and the
+/// retained Redline route are invalidated or re-resolved the same way, but a
+/// railgun skeleton's bound images would otherwise keep pointing at the freed
+/// buffer (whose address range is then reused, e.g. by the retained kernarg
+/// pool) and write through it.
+static SCRATCH_GROWTH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current scratch growth epoch (see [`SCRATCH_GROWTH_EPOCH`]).
+pub fn scratch_growth_epoch() -> u64 {
+    SCRATCH_GROWTH_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn note_scratch_growth() {
+    SCRATCH_GROWTH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 fn grow_scratch_buffer(
     hip: &HipRuntime,
     slot: &mut Option<DeviceBuffer>,
@@ -1425,6 +1453,9 @@ fn grow_scratch_buffer(
 ) -> HipResult<()> {
     if !scratch_will_grow(*have_bytes, slot.is_some(), needed) {
         return Ok(());
+    }
+    if slot.is_some() {
+        note_scratch_growth();
     }
     if let Some(old) = slot.take() {
         // The caller invalidated captured graphs before delegating (see the
@@ -1964,6 +1995,7 @@ impl ScratchState {
             // first (same contract as `grow_scratch_buffer`), so sync + free.
             if let Some(old) = self.gemv_residual_tmp.take() {
                 hip.device_synchronize()?;
+                note_scratch_growth();
                 let _ = hip.free(old.buf);
             }
             self.gemv_residual_tmp = Some(GpuTensor {
@@ -1993,6 +2025,7 @@ impl ScratchState {
         if needs_grow {
             if let Some(old) = self.mq6_fp8_x_rot.take() {
                 hip.device_synchronize()?;
+                note_scratch_growth();
                 let _ = hip.free(old.buf);
             }
             self.mq6_fp8_x_rot = Some(GpuTensor {
@@ -2062,6 +2095,7 @@ impl ScratchState {
         if self.mq_rmsnorm_awq_wavegrid_scratch.is_none() {
             let scratch = hip.malloc(2048)?;
             if let Err(err) = hip.memset(&scratch, 0, 2048) {
+                note_scratch_growth();
                 let _ = hip.free(scratch);
                 return Err(err);
             }
@@ -2121,6 +2155,7 @@ impl ScratchState {
         // Free-before-alloc: `GpuTensor` has no `Drop`; see `ensure_gemv_residual_tmp`.
         if let Some(old) = self.paro_x_scratch.take() {
             hip.device_synchronize()?;
+            note_scratch_growth();
             let _ = hip.free(old.buf);
         }
         let buf = hip.malloc(dim * 4)?; // F32
@@ -2167,6 +2202,7 @@ impl ScratchState {
                             },
                         );
                         hip.device_synchronize()?;
+                        note_scratch_growth();
                         let _ = hip.free(old.buf);
                     }
                 }
@@ -4737,5 +4773,22 @@ mod device_code_object_tests {
         image.extend([2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         image.extend(ELF);
         assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+}
+
+#[cfg(test)]
+mod scratch_growth_epoch_tests {
+    use super::{note_scratch_growth, scratch_growth_epoch};
+
+    /// Every announced or performed scratch growth moves the epoch the railgun
+    /// window caches key on.
+    #[test]
+    fn scratch_growth_moves_the_epoch() {
+        let before = scratch_growth_epoch();
+        note_scratch_growth();
+        assert!(scratch_growth_epoch() > before);
+        let mid = scratch_growth_epoch();
+        note_scratch_growth();
+        assert!(scratch_growth_epoch() > mid);
     }
 }

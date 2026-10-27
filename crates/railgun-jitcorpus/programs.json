@@ -224,11 +224,11 @@
   }
  ],
  "railgun_kernels": {
-  "source": "rdna_compute::kernel_registry::railgun_entries: the copy kernels railgun lowers Node::Copy / Node::CopyBatch to (crates/railgun/src/copy.rs, kernels/src/railgun_copy.hip); any railgun program with a copy node launches them",
+  "source": "rdna_compute::kernel_registry::railgun_entries: the copy kernels railgun lowers Node::Copy / Node::CopyBatch to (crates/railgun/src/copy.rs, kernels/src/railgun_copy.hip) and the typed fill (kernels/src/railgun_fill.hip); any railgun program with a copy or fill node launches them",
   "archs": ["gfx1201", "gfx1100", "gfx1151"],
   "nodes": [
    ["railgun_copy", "railgun_copy"],
-   ["railgun_copy_batch", "railgun_copy"]
+   ["railgun_copy_batch", "railgun_copy"], ["railgun_fill_u32", "railgun_fill"]
   ]
  }
 }

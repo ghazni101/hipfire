@@ -1547,6 +1547,14 @@ mod tests {
             "global_load_d16_hi_b16",
             &[0xee08_c07c, 0x0000_0000, 0x0000_0006],
         ), // global_load_d16_hi_b16 v0, v[6:7], off
+        (Arch::Gfx1201, "s_clz_i32_u32", &[0xbeaf_0a32]),            // s_clz_i32_u32 s47, s50
+        (Arch::Gfx1201, "s_max_u32", &[0x8a9e_231e]),                // s_max_u32 s30, s30, s35
+        (Arch::Gfx1201, "ds_max_u32", &[0xd820_0040, 0x0000_0107]),  // ds_max_u32 v7, v1 offset:64
+        (
+            Arch::Gfx1201,
+            "v_alignbyte_b32",
+            &[0xd617_0006, 0x0686_0702],
+        ), // v_alignbyte_b32 v6, v2, v3, v161.l
         (Arch::Gfx1201, "s_bcnt1_i32_b32", &[0xbe80_1805]),          // s_bcnt1_i32_b32 s0, s5
         (Arch::Gfx1201, "s_bfe_i32", &[0x9380_ff75, 0x0001_001d]),   // s_bfe_i32 s0, ttmp9, 0x1001d
         (Arch::Gfx1201, "s_bitcmp0_b32", &[0xbf0c_8018]),            // s_bitcmp0_b32 s24, 0
@@ -1593,6 +1601,7 @@ mod tests {
             "v_cmp_nle_f32_e64",
             &[0xd41c_0002, 0x0202_22ff, 0x0d80_0000],
         ), // v_cmp_nle_f32_e64 s2, 0xd800000, v17
+        (Arch::Gfx1201, "v_cmpx_le_u64_e32", &[0x7db6_0416]), // v_cmpx_le_u64_e32 s[22:23], v[2:3]
         (Arch::Gfx1201, "v_cmpx_eq_f32_e32", &[0x7d24_0d04]), // v_cmpx_eq_f32_e32 v4, v6
         (Arch::Gfx1201, "v_cmpx_eq_u16_e32", &[0x7d74_1281]), // v_cmpx_eq_u16_e32 1, v9.l
         (

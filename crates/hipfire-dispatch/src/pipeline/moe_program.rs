@@ -143,6 +143,10 @@ pub(super) struct MoeDecodeSelection {
     pub(super) ninepath_d4: bool,
     pub(super) ninepath_mq3l: bool,
     pub(super) ninepath_mq4v2: bool,
+    /// qt53 (`MQ4G128V2`) routed down on the typed fallback: the nine-path
+    /// kernel also owns the routed activation (silu*up + FWHT128), so the
+    /// Activation stage launches nothing. Implies `ninepath_d4`.
+    pub(super) ninepath_mq4g128v2: bool,
     pub(super) ninepath_mq6v2: bool,
     /// The routed expert FFN runs in the arch's CPU splice after this program:
     /// no routed GPU stage may be lowered (see
@@ -1199,8 +1203,11 @@ impl<'a> SealedMoeOp<'a> {
                     if self.state.call.router_input() == MoeRouterInput::SigmoidTopK {
                         #[cfg(feature = "deltanet")]
                         {
-                            gpu.sigmoid_f32(params.router_logits)
-                                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                            // Precomputed scores are already activated.
+                            if !params.router_scores_precomputed() {
+                                gpu.sigmoid_f32(params.router_logits)
+                                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                            }
                             match params.selection_bias {
                                 Some(bias) => gpu.deepseek4_moe_topk_bias_aware_f32(
                                     params.router_logits,
@@ -1501,6 +1508,11 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn activation(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
+            if selection.ninepath_mq4g128v2 {
+                // The fused down kernel forms silu(gate)*up and the qt53
+                // FWHT128 rotation itself; nothing is owed here.
+                return Ok(());
+            }
             let view = self.state.masked_decode(params, selection)?;
             let params = view.as_ref().unwrap_or(params);
             return super::decode_activation_stage(
@@ -1554,10 +1566,7 @@ impl<'a> SealedMoeOp<'a> {
                 Some("ninepath_d4")
             } else if selection.down_last_combine {
                 Some("down_last_combine")
-            } else if !crate::families::moe::moe_down_writes_expanded(
-                params.dtypes.routed_down,
-                params.expert_dtype_tags.is_some(),
-            ) {
+            } else if !params.down_writes_expanded() {
                 Some("self_combining_down")
             } else {
                 None
@@ -1580,6 +1589,7 @@ impl<'a> SealedMoeOp<'a> {
                 selection.ninepath_d4,
                 selection.ninepath_mq3l,
                 selection.ninepath_mq4v2,
+                selection.ninepath_mq4g128v2,
                 selection.ninepath_mq6v2,
                 selection.down_last_combine,
                 selection.route,
@@ -2286,10 +2296,13 @@ fn lower_decode<'a>(
         }
         MoeRecipe::SigmoidRoutedNoShared => {
             if !adopted {
-                append_step(
-                    &mut steps,
-                    Step::MoeStage(op(state), MoeStage::RouterProjection),
-                )?;
+                // Precomputed scores arrive activated: no router projection.
+                if !params.router_scores_precomputed() {
+                    append_step(
+                        &mut steps,
+                        Step::MoeStage(op(state), MoeStage::RouterProjection),
+                    )?;
+                }
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
                 if owner_assign {
                     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
@@ -2337,11 +2350,7 @@ fn lower_decode<'a>(
             // and before the canonical combine of the original route.
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
         }
-        let down_self_combines = selection.down_last_combine
-            || !crate::families::moe::moe_down_writes_expanded(
-                params.dtypes.routed_down,
-                params.expert_dtype_tags.is_some(),
-            );
+        let down_self_combines = selection.down_last_combine || !params.down_writes_expanded();
         let combine_after_down = !selection.cpu_deferred_experts
             && params.ep_mode != crate::families::moe::MoeEpMode::RootRoutedPartial
             && !selection.ninepath_d4
@@ -2589,7 +2598,14 @@ fn lower_prefill<'a>(
     );
     match params.recipe {
         MoeRecipe::SoftmaxGatedShared { .. } => {
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            // Paro: the routed basis is the routed experts' own Givens rotation
+            // in `x_rot_batch`, which a Paro shared gate/up reuses as its
+            // rotation scratch. Produce it after the shared stages, right
+            // before the routed tail reads it.
+            let paro = selection.resolution.paro_mode;
+            if !paro {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            }
             if !adopted {
                 append_step(
                     &mut steps,
@@ -2608,6 +2624,9 @@ fn lower_prefill<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+            if paro {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            }
         }
         MoeRecipe::SigmoidRoutedNoShared => {
             if !adopted {
@@ -3093,19 +3112,40 @@ pub(super) fn select_decode(
         resolution.use_gpu_topk = true;
         resolution.needs_x_rot_local = true;
     }
-    if params.selection_bias.is_some() {
-        // The bias-aware selector writes any width up to eight. At top-8 every
-        // generic indexed route applies; below it, of the indexed routed
-        // kernels only the uniform FWHT-basis MQ4G256 and MQ6G256 gate/up,
-        // activation, down and combine read that width at run time.
-        use rdna_compute::DType::{MQ4G256, MQ6G256};
-        let runtime_width = matches!(
+    if params.mq2_lloyd.is_some() {
+        // A declared MQ2-Lloyd route runs only the uniform MQ2G256Lloyd kernels.
+        use rdna_compute::DType::MQ2G256Lloyd;
+        let uniform = matches!(
             (params.dtypes.routed_gate_up, params.dtypes.routed_down),
-            (MQ4G256, MQ4G256) | (MQ6G256, MQ6G256)
+            (MQ2G256Lloyd, MQ2G256Lloyd)
         ) && !params.dtypes.routed_has_mixed_experts
             && params.expert_dtype_tags.is_none()
             && params.expert_down_awq_ptrs.is_none()
-            && params.routed_gate_up_paro.is_none();
+            && params.routed_gate_up_paro.is_none()
+            && params.routed_down_paro.is_none();
+        if !uniform {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "mq2-lloyd-declaration-needs-uniform-mq2g256-lloyd-experts",
+                arch: "",
+                quant: "",
+            });
+        }
+    }
+    if params.selection_bias.is_some() {
+        // The bias-aware selector writes any width up to eight. At top-8 every
+        // generic indexed route applies; below it, only the declared MQ2-Lloyd
+        // route (uniform, checked above) and the uniform FWHT-basis MQ4G256 and
+        // MQ6G256 gate/up, activation, down and combine read that width at run time.
+        use rdna_compute::DType::{MQ4G256, MQ6G256};
+        let runtime_width = params.mq2_lloyd.is_some()
+            || matches!(
+                (params.dtypes.routed_gate_up, params.dtypes.routed_down),
+                (MQ4G256, MQ4G256) | (MQ6G256, MQ6G256)
+            ) && !params.dtypes.routed_has_mixed_experts
+                && params.expert_dtype_tags.is_none()
+                && params.expert_down_awq_ptrs.is_none()
+                && params.routed_gate_up_paro.is_none();
         if params.k < MOE_BIASED_SIGMOID_MAX_K && !runtime_width {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
@@ -3229,10 +3269,7 @@ pub(super) fn select_decode(
                 "root-routed EP decode requires routed_out=Some (the zeroed partial)".into(),
             ));
         }
-        if !crate::families::moe::moe_down_writes_expanded(
-            params.dtypes.routed_down,
-            params.expert_dtype_tags.is_some(),
-        ) {
+        if !params.down_writes_expanded() {
             return Err(DispatchError::Hip(
                 "root-routed EP decode requires an expanded-output down projection".into(),
             ));
@@ -3354,7 +3391,22 @@ pub(super) fn select_decode(
     let ninepath_mq6v2 = ninepath_shape_ok
         && params.dtypes.routed_gate_up == rdna_compute::DType::MQ6G256V2
         && params.dtypes.routed_down == rdna_compute::DType::MQ6G256V2;
-    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq6v2;
+    // qwen35 qt53 routed-down typed fallback (A3B mq4rs): MQ4G256V2 gate/up and
+    // MQ4G128V2 down, F32 recipe, no specialized route. wave32 gfx1201 only
+    // (the kernel is exact-shaped: down_k 512, down_m % 16 == 0).
+    let ninepath_mq4g128v2 = ninepath_shape_ok
+        && route.is_none()
+        && !params.recipe.bf16_round_trip()
+        && ctx.arch.is_gfx1201()
+        && params.routed_down_k == 512
+        && params.routed_down_m % 16 == 0
+        && params.routed_gate_up_paro.is_none()
+        && params.routed_down_paro.is_none()
+        && params.dtypes.routed_gate_up == rdna_compute::DType::MQ4G256V2
+        && params.dtypes.routed_down == rdna_compute::DType::MQ4G128V2
+        && params.dtypes.qt53_routed_down_fallback();
+    let ninepath_eligible =
+        ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2 || ninepath_mq4g128v2 || ninepath_mq6v2;
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
@@ -3371,6 +3423,9 @@ pub(super) fn select_decode(
             && !matches!(ninepath_mode, "0" | "off" | "d3"),
         ninepath_mq3l: ninepath_mq3l && !cpu_split,
         ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
+        ninepath_mq4g128v2: ninepath_mq4g128v2
+            && !cpu_split
+            && !matches!(ninepath_mode, "0" | "off" | "d3"),
         ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
@@ -3565,10 +3620,7 @@ pub(super) fn cpu_split_decode_conflict(
     {
         return Some("does not admit AWQ or Paro sidecars");
     }
-    if !crate::families::moe::moe_down_writes_expanded(
-        params.dtypes.routed_down,
-        params.expert_dtype_tags.is_some(),
-    ) {
+    if !params.down_writes_expanded() {
         return Some("requires an expanded-output (non self-combining) down projection");
     }
     executor.and_then(|executor| {

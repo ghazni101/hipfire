@@ -91,8 +91,8 @@ use hipfire_arch_qwen35::qwen35::prefill::multi::{
 };
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Config, StateQuant};
 use hipfire_arch_qwen35::speculative::{
-    dflash_greedy_accept_commit_parts, DflashCbDraft, DflashTargetParts, DflashVerifyOutput,
-    ModelSlot, VerifyScratch,
+    dflash_greedy_accept_commit_parts, dflash_seed_checkpoint_positions, last_dflash_seed_ceiling,
+    DflashCbDraft, DflashTargetParts, DflashVerifyOutput, ModelSlot, VerifyScratch,
 };
 use hipfire_arch_qwen35::{load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::dflash::{ring_segments, DraftCtxMode};
@@ -914,6 +914,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
             model_ctx,
             automatic: true,
             card_cap: 0,
+            reserve_bytes: 0,
         }),
         deepseek4_compute_placement: Default::default(),
         deepseek4_experts_per_token: None,
@@ -4264,6 +4265,25 @@ struct Walked {
     position: usize,
     seed: u32,
     history: Vec<u32>,
+    /// Prefill chunk plan this walk's cold seed ran under (it is memory-admitted
+    /// and so differs between walks): drives the plan-aware checkpoint compare.
+    plan: CkptPlan,
+}
+
+/// The inputs that fix a cold seed's DeltaNet checkpoint positions.
+#[derive(Clone, Copy)]
+struct CkptPlan {
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+}
+
+impl CkptPlan {
+    /// Positions `take_dn_checkpoint` leaves for this plan (engine simulation).
+    fn expected(&self) -> Vec<usize> {
+        dflash_seed_checkpoint_positions(self.prompt_len, self.ceiling, self.interval, self.cap)
+    }
 }
 
 /// The singleton trajectory: cold prefill through the production
@@ -4308,6 +4328,7 @@ fn dflash_walk(
         PrefillOutcome::Ready { first_token } => first_token,
         PrefillOutcome::Aborted => return Err("DFlash prefill aborted".into()),
     };
+    let ceiling_after_prefill = last_dflash_seed_ceiling();
     let mut history = f.tokens.clone();
     history.push(first);
     let (mut position, mut seed) = (f.prefix, first);
@@ -4326,10 +4347,17 @@ fn dflash_walk(
         position += s.emit.len();
         seed = s.next_seed;
     }
+    let policy = dflash_of(d)?.checkpoint_policy();
     Ok(Walked {
         position,
         seed,
         history,
+        plan: CkptPlan {
+            prompt_len: f.tokens.len(),
+            ceiling: ceiling_after_prefill,
+            interval: policy.interval,
+            cap: policy.cap,
+        },
     })
 }
 
@@ -4368,14 +4396,39 @@ fn take_lane(
     Ok((lane, rows, singleton_ckpts))
 }
 
-/// The singleton's own checkpoint positions as a named array (pre-window
-/// reference vs lane-walk compare: both sides are singleton trajectories, so
-/// the singleton's checkpoint compare is unchanged).
-fn singleton_ckpt_array(ck: &[usize]) -> (String, Vec<u8>) {
-    (
-        "singleton.checkpoints.positions".into(),
-        le_u64s(&ck.iter().map(|&p| p as u64).collect::<Vec<_>>()),
-    )
+/// The singleton's own checkpoint positions as a named array, plan-aware.
+/// Positions follow the prefill chunk plan, whose ceiling is memory-admitted
+/// per walk, so equal ceilings compare the raw positions; walks with different
+/// ceilings each must equal the engine's simulated `take_dn_checkpoint` result
+/// for their own ceiling (`dflash_seed_checkpoint_positions`). The reference
+/// (`reference == None`) is validated or the oracle errors; a lane that passes
+/// validation under a different ceiling is substituted by the reference's
+/// bytes, one that fails keeps its actual positions plus a marker so it always
+/// differs.
+fn singleton_ckpt_array(
+    ck: &[usize],
+    plan: &CkptPlan,
+    reference: Option<(&[usize], &CkptPlan)>,
+) -> Result<(String, Vec<u8>)> {
+    let name = "singleton.checkpoints.positions".to_string();
+    let enc = |v: &[usize]| le_u64s(&v.iter().map(|&p| p as u64).collect::<Vec<_>>());
+    let valid = ck == plan.expected().as_slice();
+    match reference {
+        None if !valid => Err(format!(
+            "reference checkpoint positions {ck:?} differ from the simulated plan {:?} (ceiling {})",
+            plan.expected(),
+            plan.ceiling
+        )
+        .into()),
+        None => Ok((name, enc(ck))),
+        Some((_, rp)) if rp.ceiling == plan.ceiling => Ok((name, enc(ck))),
+        Some((rck, _)) if valid => Ok((name, enc(rck))),
+        Some(_) => {
+            let mut bytes = enc(ck);
+            bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+            Ok((name, bytes))
+        }
+    }
 }
 
 fn ctx_mode_str(df: &DflashState) -> String {
@@ -4392,6 +4445,8 @@ struct PreRef {
     seed: u32,
     rows: usize,
     ctx_mode: String,
+    ckpt_positions: Vec<usize>,
+    plan: CkptPlan,
 }
 
 /// Frozen outputs of the isolated singleton probed window of `(fixture, E)`.
@@ -4440,9 +4495,9 @@ fn ensure_pre(
         &lane,
         w.position,
     )
-    .map(|mut v| {
-        v.push(singleton_ckpt_array(&singleton_ck));
-        v
+    .and_then(|mut v| {
+        v.push(singleton_ckpt_array(&singleton_ck, &w.plan, None)?);
+        Ok(v)
     });
     let ctx_mode = ctx_mode_str(&lane.df);
     lane.free_gpu(gpu);
@@ -4455,6 +4510,8 @@ fn ensure_pre(
             seed: w.seed,
             rows,
             ctx_mode,
+            ckpt_positions: singleton_ck,
+            plan: w.plan,
         },
     );
     Ok(())
@@ -4639,9 +4696,14 @@ fn g0_lane_open(
         }
     };
     let pre_set =
-        match full_state(gpu, &slot.config, &rs.kv, &rs.dn, &lane, w.position).map(|mut v| {
-            v.push(singleton_ckpt_array(&singleton_ck));
-            v
+        match full_state(gpu, &slot.config, &rs.kv, &rs.dn, &lane, w.position).and_then(|mut v| {
+            let pr = &refs.pre[&fi];
+            v.push(singleton_ckpt_array(
+                &singleton_ck,
+                &w.plan,
+                Some((&pr.ckpt_positions, &pr.plan)),
+            )?);
+            Ok(v)
         }) {
             Ok(v) => v,
             Err(err) => {

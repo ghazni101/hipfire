@@ -203,10 +203,7 @@ pub fn block_rule(base: &[f64], cand: &[f64], n: usize) -> Result<BlockRule> {
     let (lo, hi) = min_max(&bm);
     let (clo, chi) = min_max(&cm);
     let block_disjoint = chi < lo || clo > hi;
-    let mut rr = Vec::with_capacity(bm.len() / 2);
-    for (b, c) in bm.chunks_exact(2).zip(cm.chunks_exact(2)) {
-        rr.push((c[0] + c[1]) / (b[0] + b[1]));
-    }
+    let rr = round_ratios_from_blocks(&bm, &cm);
     let faster = rr.iter().filter(|r| **r < 1.0).count();
     let slower = rr.iter().filter(|r| **r > 1.0).count();
     let tied = rr.len() - faster - slower;
@@ -230,6 +227,123 @@ pub fn block_rule(base: &[f64], cand: &[f64], n: usize) -> Result<BlockRule> {
         baseline_block_medians: bm,
         candidate_block_medians: cm,
     })
+}
+
+/// Per ABBA round, the mean of the candidate's two block medians over the mean
+/// of the baseline's (candidate / baseline) — the exact per-round ratios that
+/// [`block_rule`] runs its sign test over. Same input contract as
+/// [`block_rule`]: equal whole ABBA rounds of both arms.
+pub fn round_ratios(base: &[f64], cand: &[f64], n: usize) -> Result<Vec<f64>> {
+    if base.len() != cand.len() || base.len() % (2 * n.max(1)) != 0 {
+        return Err("block rule needs equal whole ABBA rounds of both arms".into());
+    }
+    let bm = block_medians(base, n)?;
+    let cm = block_medians(cand, n)?;
+    Ok(round_ratios_from_blocks(&bm, &cm))
+}
+
+/// The single implementation of the per-round ratio, shared by [`block_rule`]
+/// and [`round_ratios`]. Block medians come two per round.
+fn round_ratios_from_blocks(bm: &[f64], cm: &[f64]) -> Vec<f64> {
+    bm.chunks_exact(2)
+        .zip(cm.chunks_exact(2))
+        .map(|(b, c)| (c[0] + c[1]) / (b[0] + b[1]))
+        .collect()
+}
+
+/// Linear-interpolation quantile (`q` in `[0, 1]`) of an already ascending
+/// sorted, nonempty slice: position `q * (n - 1)`.
+fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
+    let pos = q * (sorted.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+}
+
+/// Dispersion summary of positive finite values (block medians, ratios).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dispersion {
+    pub n: usize,
+    pub median: f64,
+    /// Median absolute deviation from the median, unscaled.
+    pub mad: f64,
+    /// `p75 - p25`.
+    pub iqr: f64,
+    pub p05: f64,
+    pub p95: f64,
+    pub min: f64,
+    pub max: f64,
+    /// Sample standard deviation over the mean (0 for a single value).
+    pub cv: f64,
+    /// Sample standard deviation of `ln(v)` (0 for a single value).
+    pub log_sd: f64,
+}
+
+impl Dispersion {
+    pub fn json(&self) -> Value {
+        json!({"n": self.n, "median": self.median, "mad": self.mad, "iqr": self.iqr,
+            "p05": self.p05, "p95": self.p95, "min": self.min, "max": self.max,
+            "cv": self.cv, "log_sd": self.log_sd})
+    }
+}
+
+/// [`Dispersion`] of `v`; quantiles use linear interpolation between order
+/// statistics. Values must be nonempty, positive and finite.
+pub fn dispersion(v: &[f64]) -> Result<Dispersion> {
+    if v.is_empty() || v.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+        return Err("dispersion values must be nonempty, positive and finite".into());
+    }
+    let mut sorted = v.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let median = quantile_sorted(&sorted, 0.5);
+    let mut dev: Vec<f64> = sorted.iter().map(|x| (x - median).abs()).collect();
+    dev.sort_by(f64::total_cmp);
+    let sample_sd = |xs: &[f64]| {
+        if xs.len() < 2 {
+            return 0.0;
+        }
+        let m = xs.iter().sum::<f64>() / xs.len() as f64;
+        (xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (xs.len() - 1) as f64).sqrt()
+    };
+    let mean = sorted.iter().sum::<f64>() / n as f64;
+    let logs: Vec<f64> = sorted.iter().map(|x| x.ln()).collect();
+    let d = Dispersion {
+        n,
+        median,
+        mad: quantile_sorted(&dev, 0.5),
+        iqr: quantile_sorted(&sorted, 0.75) - quantile_sorted(&sorted, 0.25),
+        p05: quantile_sorted(&sorted, 0.05),
+        p95: quantile_sorted(&sorted, 0.95),
+        min: sorted[0],
+        max: sorted[n - 1],
+        cv: sample_sd(&sorted) / mean,
+        log_sd: sample_sd(&logs),
+    };
+    if !(d.cv.is_finite() && d.log_sd.is_finite() && d.median.is_finite()) {
+        return Err("nonfinite dispersion".into());
+    }
+    Ok(d)
+}
+
+/// Relative drift per block: the OLS slope of the block median against the
+/// block index, divided by the mean block median. 0 for fewer than 2 blocks.
+pub fn drift_per_round(block_medians: &[f64]) -> f64 {
+    let n = block_medians.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let xm = (nf - 1.0) / 2.0;
+    let ym = block_medians.iter().sum::<f64>() / nf;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (i, y) in block_medians.iter().enumerate() {
+        let dx = i as f64 - xm;
+        sxy += dx * (y - ym);
+        sxx += dx * dx;
+    }
+    (sxy / sxx) / ym
 }
 
 /// Why auto-extension stopped.
@@ -283,6 +397,71 @@ pub fn extend_rounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_ratios_match_block_rule() {
+        // n=2: 4 samples per arm per round, two 2-sample blocks per round.
+        let base = [10.0, 10.0, 10.0, 20.0, 10.0, 10.0, 10.0, 20.0];
+        let cand = [5.0, 5.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0];
+        let rr = round_ratios(&base, &cand, 2).unwrap();
+        let br = block_rule(&base, &cand, 2).unwrap();
+        assert_eq!(rr.len(), 2);
+        assert_eq!(
+            rr.iter().cloned().fold(f64::INFINITY, f64::min),
+            br.round_ratio_min
+        );
+        assert_eq!(
+            rr.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            br.round_ratio_max
+        );
+        assert!(round_ratios(&base, &cand[..4], 2).is_err());
+    }
+    #[test]
+    fn round_ratios_exact_values() {
+        let base = [10.0, 10.0, 20.0, 20.0];
+        let cand = [5.0, 5.0, 30.0, 30.0];
+        // n=1: blocks are single samples; round = (c0 + c1) / (b0 + b1).
+        let rr = round_ratios(&base, &cand, 1).unwrap();
+        assert_eq!(rr, vec![10.0 / 20.0, 60.0 / 40.0]);
+    }
+    #[test]
+    fn dispersion_known_values() {
+        let d = dispersion(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert_eq!(d.n, 5);
+        assert_eq!(d.median, 3.0);
+        assert_eq!(d.mad, 1.0);
+        assert_eq!(d.iqr, 2.0);
+        assert!((d.p05 - 1.2).abs() < 1e-12);
+        assert!((d.p95 - 4.8).abs() < 1e-12);
+        assert_eq!((d.min, d.max), (1.0, 5.0));
+        assert!((d.cv - 2.5f64.sqrt() / 3.0).abs() < 1e-12);
+        let logs: Vec<f64> = [1.0f64, 2.0, 3.0, 4.0, 5.0]
+            .iter()
+            .map(|x| x.ln())
+            .collect();
+        let m = logs.iter().sum::<f64>() / 5.0;
+        let sd = (logs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / 4.0).sqrt();
+        assert!((d.log_sd - sd).abs() < 1e-12);
+    }
+    #[test]
+    fn dispersion_single_and_invalid() {
+        let d = dispersion(&[2.0]).unwrap();
+        assert_eq!(
+            (d.median, d.mad, d.iqr, d.cv, d.log_sd),
+            (2.0, 0.0, 0.0, 0.0, 0.0)
+        );
+        assert!(dispersion(&[]).is_err());
+        assert!(dispersion(&[1.0, 0.0]).is_err());
+        assert!(dispersion(&[1.0, f64::NAN]).is_err());
+    }
+    #[test]
+    fn drift_is_relative_ols_slope() {
+        assert_eq!(drift_per_round(&[5.0]), 0.0);
+        assert_eq!(drift_per_round(&[7.0, 7.0, 7.0, 7.0]), 0.0);
+        // y = 10 + i: slope 1, mean 11.5.
+        let d = drift_per_round(&[10.0, 11.0, 12.0, 13.0]);
+        assert!((d - 1.0 / 11.5).abs() < 1e-12);
+    }
 
     #[test]
     fn exact_abba_two_rounds() {

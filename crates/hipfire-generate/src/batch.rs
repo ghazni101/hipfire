@@ -28,6 +28,7 @@ use hipfire_engine::emit::*;
 use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 use hipfire_engine::wire_seed;
 use hipfire_loader::{EpArch, EpState, LoadedModel};
 use hipfire_runtime::emit_text::{
@@ -2547,7 +2548,7 @@ struct VmmLaneCtl {
     /// Finished and feeding its last rows; `commit_ready` follows.
     drain: Option<VmmDrain>,
     /// Verbatim assistant turn stored when the client commits.
-    turn_store: Option<(QwenArCacheAction, Vec<u32>)>,
+    turn_store: Option<(TurnCacheAction, Vec<u32>)>,
 }
 
 struct VmmDrain {
@@ -3844,7 +3845,7 @@ pub fn drive_qwen_vmm_continuous_batch(
                         let started = ctl[idx].started_in_think;
                         if let Some(tok) = model.tokenizer.as_ref() {
                             let cache = &mut model.asst_turn_cache;
-                            let _ = qwen_ar_apply_cache_action(
+                            let _ = apply_turn_cache_action(
                                 |fp, seq| {
                                     cache.insert(
                                         fp,

@@ -572,6 +572,7 @@ mod tests {
             swap_disk_bytes: 0,
             is_vl: true,
             vl_path: None,
+            vision_mode: "off".into(),
             mtp_k: 0,
             mtp_mode: hipfire_config::MtpMode::Off,
             kv_mode_raw: String::new(),

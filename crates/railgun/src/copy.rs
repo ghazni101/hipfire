@@ -24,7 +24,15 @@ pub const COPY_SYMBOL: &str = "railgun_copy";
 /// `railgun_copy_batch(const RailgunCopyEntry* table, u32 n, const u8* s0..s7, u8* d0..d7)`.
 pub const BATCH_SYMBOL: &str = "railgun_copy_batch";
 
-/// Threads per block, both kernels.
+/// Fill kernel source/module: a separate module from the copy kernels.
+pub const FILL_SOURCE: &str = include_str!("../../../kernels/src/railgun_fill.hip");
+pub const FILL_MODULE: &str = "railgun_fill";
+/// `railgun_fill_u32(u8* dst, u32 value, u32 words)`.
+pub const FILL_SYMBOL: &str = "railgun_fill_u32";
+/// Largest single fill: the kernel's byte offset `i << 2` is 32-bit.
+pub const MAX_FILL_WORDS: u64 = 1 << 30;
+
+/// Threads per block, all kernels.
 pub const BLOCK: u32 = 256;
 /// Bytes of the largest copy per block of grid.x: each thread moves about
 /// two 16 B vectors of it. For the DFlash scatter's 20 KiB rows, 1 to 8
@@ -115,6 +123,49 @@ pub fn copy_launch(src: u64, dst: u64, bytes: u32) -> Launch {
     }
 }
 
+/// `railgun_fill_u32` writing `value` to `words` 32-bit words at `dst`
+/// (`1 ≤ words ≤ MAX_FILL_WORDS`, `dst` 4-byte aligned; the caller bounds
+/// `dst + 4*words` to the destination allocation). Writes `dst` only.
+pub fn fill_launch(dst: u64, value: u32, words: u32) -> Launch {
+    assert!(
+        words >= 1 && u64::from(words) <= MAX_FILL_WORDS,
+        "fill of {words} words"
+    );
+    assert!(dst % 4 == 0, "fill destination {dst:#x} not 4-byte aligned");
+    let mut kernarg = Vec::with_capacity(16);
+    kernarg.extend_from_slice(&dst.to_le_bytes());
+    kernarg.extend_from_slice(&value.to_le_bytes());
+    kernarg.extend_from_slice(&words.to_le_bytes());
+    Launch {
+        symbol: FILL_SYMBOL,
+        grid: [grid_x(u64::from(words) * 4), 1, 1],
+        block: [BLOCK, 1, 1],
+        kernarg,
+    }
+}
+
+/// Checked fill extent: `words` words at byte offset `dst_offset` of a
+/// `dst_size`-byte resource. Returns the byte offset on success.
+pub fn check_fill(dst_offset: u64, words: u64, dst_size: u64) -> Result<u64, String> {
+    if words == 0 || words > MAX_FILL_WORDS {
+        return Err(format!(
+            "fill of {words} words outside 1..={MAX_FILL_WORDS}"
+        ));
+    }
+    if dst_offset % 4 != 0 {
+        return Err(format!("fill offset {dst_offset} not 4-byte aligned"));
+    }
+    let end = dst_offset
+        .checked_add(words * 4)
+        .ok_or_else(|| "fill extent overflows".to_string())?;
+    if end > dst_size {
+        return Err(format!(
+            "fill end {end} exceeds resource of {dst_size} bytes"
+        ));
+    }
+    Ok(dst_offset)
+}
+
 /// `railgun_copy_batch` over the first `n ≥ 1` entries of the table at
 /// `table`, whose largest entry is `max_bytes`, with source slot `k` bound
 /// to `src[k]` and destination slot `k` to `dst[k]`. Unused slots are null,
@@ -146,6 +197,19 @@ pub fn batch_launch(table: u64, n: u32, src: &[u64], dst: &[u64], max_bytes: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_launch_and_bounds() {
+        let l = fill_launch(0x1000, 0xDEAD_BEEF, 100);
+        assert_eq!(l.symbol, FILL_SYMBOL);
+        assert_eq!(l.kernarg.len(), 16);
+        assert_eq!(l.grid, [1, 1, 1]);
+        assert_eq!(check_fill(8, 4, 24), Ok(8));
+        assert!(check_fill(8, 5, 24).is_err());
+        assert!(check_fill(2, 1, 24).is_err());
+        assert!(check_fill(0, 0, 24).is_err());
+        assert!(check_fill(u64::MAX - 3, 1, u64::MAX).is_err());
+    }
 
     #[test]
     fn geometry_keeps_the_kernel_stride_in_32_bits() {

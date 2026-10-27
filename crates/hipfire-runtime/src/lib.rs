@@ -27,6 +27,7 @@ pub mod cask;
 pub mod chatml;
 pub mod checkpoint_pool;
 pub mod config;
+pub mod coproc;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
 #[cfg(feature = "deltanet")]
@@ -84,6 +85,7 @@ pub mod ple_q4;
 pub mod ple_sidecar;
 pub mod prefix;
 pub mod prefix_index;
+pub mod rank_pool;
 pub mod reset_core;
 pub mod rope;
 pub mod safetensors_source;

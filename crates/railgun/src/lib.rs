@@ -27,12 +27,16 @@
 //! (see [`copy`]); where inside each resource the accesses land is the
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
+pub mod contract;
 pub mod copy;
+pub mod index_bind;
 pub mod kernel;
+pub mod mq6;
 #[cfg(feature = "npu")]
 pub mod npu;
 pub mod plan;
 pub mod shadow;
+pub mod window;
 
 use std::ops::RangeInclusive;
 
@@ -90,7 +94,7 @@ impl Formula {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ResourceId(pub u32);
 
 /// §1.1 `Resource.kind`.

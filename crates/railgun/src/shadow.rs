@@ -530,6 +530,7 @@ fn describe(b: &BoundaryState) -> String {
 fn word_kind(role: &WordRole) -> String {
     match role {
         WordRole::GdnFrame { frames } => format!("gdn_frame(frames={frames})"),
+        WordRole::Window => "window_scalar32".to_owned(),
     }
 }
 
@@ -608,7 +609,9 @@ pub fn diff(
             let Some(rg) = railgun_groups.get(&k) else {
                 canonical_equal = false;
                 let reason = match &program.nodes[k].lowering {
-                    Lowering::HipDirect { reason } | Lowering::Graph { reason } => reason.clone(),
+                    Lowering::HipDirect { reason }
+                    | Lowering::Graph { reason }
+                    | Lowering::Conditional { reason } => reason.clone(),
                     Lowering::Pm4 => "no IB group".to_owned(),
                 };
                 c.add(

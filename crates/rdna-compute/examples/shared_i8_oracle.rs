@@ -372,7 +372,7 @@ fn main() {
         // 0. The fused front producer's three outputs against the standalone chain it extends:
         // the F16 X and the IU4 sidecar of `qwen4_moe_front_producer` and the A8 blocks of
         // `mq6_i8_prepare_x`.
-        if gpu.qwen4_moe_front_fuse_applies() {
+        if gpu.arch == "gfx1201" && gpu.qwen4_moe_front_fuse_applies() {
             let (p4, x16r) = gpu.qwen4_moe_front_producer(&x, H, n).unwrap();
             let p4r = download_raw(
                 &gpu,

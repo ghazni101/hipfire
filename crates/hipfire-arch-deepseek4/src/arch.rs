@@ -628,6 +628,7 @@ impl DeepseekV4 {
             )
             .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
         layer.expert_w2_stride = w2_stride;
+        layer.expert_w2_ptr_entries = w2_ptrs;
 
         let gate_up_tensor = gpu
             .upload_raw(&gate_up_blob, &[n_owned, combined_stride])
@@ -676,6 +677,7 @@ impl DeepseekV4 {
             )
             .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
         layer.expert_gate_up_stride = combined_stride;
+        layer.expert_gate_up_ptr_entries = gate_up_ptrs;
         Ok(())
     }
 
@@ -799,6 +801,7 @@ impl DeepseekV4 {
                 )
                 .map_err(|e| format!("deepseek4: copy ptr table {prefix}.w2: {e:?}"))?;
             layer.expert_w2_stride = stride;
+            layer.expert_w2_ptr_entries = ptrs;
         }
         // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
         // upload. Non-owned ptr → a shared ZEROED dummy gate_up buffer.
@@ -900,6 +903,7 @@ impl DeepseekV4 {
                 )
                 .map_err(|e| format!("deepseek4: copy gate_up ptr table {prefix}: {e:?}"))?;
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_gate_up_ptr_entries = ptrs;
         }
         Ok(())
     }
@@ -3226,6 +3230,7 @@ impl DeepseekV4 {
             layer.expert_w2_blob = Some(blob_tensor);
             layer.expert_w2_ptrs = Some(ptr_tensor);
             layer.expert_w2_stride = stride;
+            layer.expert_w2_ptr_entries = ptrs;
         }
 
         // gate_up (combined w1 ‖ w3).
@@ -3301,6 +3306,7 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_gate_up_ptr_entries = ptrs;
         }
         Ok(())
     }

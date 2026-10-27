@@ -847,6 +847,10 @@ pub struct DeepseekV4LayerWeights {
     /// Drop, so this MUST be threaded into the layer (previously
     /// `std::mem::forget`-leaked).
     pub expert_gate_up_dummy: Option<rdna_compute::GpuTensor>,
+    /// Host copies of the device addresses uploaded to `expert_gate_up_ptrs`
+    /// and `expert_w2_ptrs` (`[n_routed_experts]`), for the sealed MoE binding.
+    pub expert_gate_up_ptr_entries: Vec<u64>,
+    pub expert_w2_ptr_entries: Vec<u64>,
 }
 
 impl DeepseekV4LayerWeights {
@@ -930,6 +934,8 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
             expert_gate_up_stride: self.expert_gate_up_stride,
             expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
+            expert_gate_up_ptr_entries: self.expert_gate_up_ptr_entries.clone(),
+            expert_w2_ptr_entries: self.expert_w2_ptr_entries.clone(),
         }
     }
 
@@ -1005,6 +1011,8 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
             expert_gate_up_dummy: None,
+            expert_gate_up_ptr_entries: Vec::new(),
+            expert_w2_ptr_entries: Vec::new(),
         }
     }
 
@@ -1890,6 +1898,11 @@ pub struct DeepseekV4State {
     pub moe_rot_batch: Option<rdna_compute::GpuTensor>,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic MoE combine.
     pub moe_down_expert_outputs: Option<rdna_compute::GpuTensor>,
+    /// Sealed-MoE bindings of the score layers' routed experts, built on
+    /// first use (host-only), keyed by the layer's gate/up pointer table.
+    pub(crate) routed_seals: Vec<crate::routed_seal::RoutedSeal>,
+    /// Context the sealed routed-expert calls borrow.
+    pub(crate) routed_ctx: Option<hipfire_dispatch::context::DispatchCtx>,
 
     /// Buffer of all-ones, length `head_dim`, used as the weight arg
     /// to the per-head Q RMSNorm (upstream DeepSeek V4 has NO learnable scale
@@ -2073,6 +2086,8 @@ impl DeepseekV4State {
             moe_up_batch: None,
             moe_rot_batch: None,
             moe_down_expert_outputs: None,
+            routed_seals: Vec::new(),
+            routed_ctx: None,
             q_head_ones: None,
             attn_out_raw: None,
             attn_out_raw_rot: None,

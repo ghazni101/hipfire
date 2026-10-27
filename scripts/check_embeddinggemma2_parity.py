@@ -341,7 +341,7 @@ def main():
     if vision_on:
         model_dir = ensure_vision_sidecar(args.model, args.quantizer)
     d = Daemon(args.daemon, model_dir,
-               params={"vision_mode": "auto"} if vision_on else None)
+               params={"vision_mode": "auto" if vision_on else "off"})
     print(f"loaded: arch={d.loaded.get('arch')} vision={'on' if vision_on else 'off'}")
 
     failures = 0

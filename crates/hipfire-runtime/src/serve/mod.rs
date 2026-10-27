@@ -376,6 +376,10 @@ pub struct SlotEngineConfig {
     /// the text HFQ. Ladder-gated like [`Self::is_vl`]: `off` leaves it
     /// `None`, so an engine must not rediscover a sibling on its own.
     pub vl_path: Option<PathBuf>,
+    /// The load's resolved `vision.mode` (`off`/`auto`/`resident`/`on`). An
+    /// engine that loads a tower derives its residency from it (`resident`
+    /// uploads the whole tower; every other mode streams it).
+    pub vision_mode: String,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone

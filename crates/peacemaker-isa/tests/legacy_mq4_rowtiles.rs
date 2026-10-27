@@ -1494,9 +1494,9 @@ fn down_all_logical_r_match_r1_and_ar_reference() {
 /// singleton source and JIT flags
 /// (`fixtures/legacy_mq4_down/gfx1151-current-d9e0-05e096e0.elf`, raw
 /// `05e096e066a9c503e3d762584bb3a21a50d95f45785f22a31764b5500947be8b`, HIP
-/// source `d9e092ea9131e5bbf4c14aa53b3e9a891552aa6b8d741e1e71d9f6b86afd51f8`:
-/// the unchanged one-row body from the previously pinned `a8f8c821...` source
-/// plus the PR #909 K=640 four-row twin), SHA-pinned and lifted with
+/// source `e50f30807a2f88c6ab20b57d9c27493f88f1809e0226be9209b0427881965745`:
+/// PR #941's alternate-entry macros preserve the complete prior generic ELF
+/// byte-for-byte with the recorded JIT recipe, including the K=640 twin), SHA-pinned and lifted with
 /// `Frontend::Hipcc` through the same byte-exact roundtrip helper on
 /// `Arch::Gfx1151`. Both singletons live in this one object.
 fn lift_current_source_gfx1151_down() -> Program {
@@ -1506,7 +1506,7 @@ fn lift_current_source_gfx1151_down() -> Program {
     );
     assert_eq!(
         format!("{:x}", Sha256::digest(source)),
-        "d9e092ea9131e5bbf4c14aa53b3e9a891552aa6b8d741e1e71d9f6b86afd51f8",
+        "e50f30807a2f88c6ab20b57d9c27493f88f1809e0226be9209b0427881965745",
         "current-source gfx1151 down reference no longer matches the singleton HIP source"
     );
     lift_checked_actual(

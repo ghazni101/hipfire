@@ -1211,6 +1211,7 @@ fn layer_steps<'a>(
                 },
             },
             pos_buf: &s.pos_buf,
+            attend_through: None,
             positions: Some(&v.pos_tail),
             gate: None,
             wo: layer.o_proj.dispatch_ref(),

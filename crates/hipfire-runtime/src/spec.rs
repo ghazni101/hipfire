@@ -966,6 +966,13 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// Whether the drafter can continue a target restored or continued live
+    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
+    /// session planner prefills cold when it cannot.
+    fn can_resume_at(&self, _prompt: &[u32], _start: usize) -> bool {
+        true
+    }
+
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
     /// error rather than a silent VRAM leak.

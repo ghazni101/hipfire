@@ -509,13 +509,30 @@ fn hfq_weight(
                     m * k * 2,
                     "dflash {name} F16 byte-size mismatch"
                 );
-                let buf = upload_raw_weight(gpu, data, &[m * k])?;
+                // gfx1151: a power-of-two row pitch (K % 2048 == 0) camps every
+                // wave on the same DRAM channels (~50 GB/s); 128 pad halfs per
+                // row restore ~200 GB/s. Only gemm_dispatch reads these
+                // weights, and it routes padded ones to gemm_f16_pitched_gfx1151.
+                let ld = if gpu.arch_caps.is_gfx1151() && k % 2048 == 0 {
+                    k + 128
+                } else {
+                    k
+                };
+                let buf = if ld == k {
+                    upload_raw_weight(gpu, data, &[m * k])?
+                } else {
+                    let mut padded = vec![0u8; m * ld * 2];
+                    for (dst, src) in padded.chunks_exact_mut(ld * 2).zip(data.chunks_exact(k * 2)) {
+                        dst[..k * 2].copy_from_slice(src);
+                    }
+                    upload_raw_weight(gpu, &padded, &[m * ld])?
+                };
                 Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
                     buf,
                     gpu_dtype: DType::F16,
                     m,
                     k,
-                    row_stride: 0,
+                    row_stride: if ld == k { 0 } else { ld * 2 },
                     paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
@@ -2464,6 +2481,9 @@ fn gemm_dispatch(
     };
     let result = match w.gpu_dtype {
         DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F16 if w.row_stride != 0 => {
+            gpu.gemm_f16_pitched_gfx1151(&w.buf, x, y, w.m, w.k, w.row_stride / 2, batch)
+        }
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G128V2 => Err(hip_bridge::HipError::new(
             0,
@@ -3007,7 +3027,7 @@ static ORDERED_DRAFT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 
 /// Whether the draft body runs its D2D copies stream-ordered
 /// ([`ORDERED_DRAFT`]); resolved once per process.
-pub(crate) fn ordered_draft() -> bool {
+pub fn ordered_draft() -> bool {
     *ORDERED_DRAFT
 }
 
@@ -3288,6 +3308,87 @@ pub fn draft_forward_based(
     scratch: &mut DflashScratch,
     graph_ffn: bool,
 ) -> HipResult<()> {
+    draft_forward_based_impl(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        target_hidden_base,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        graph_ffn,
+        None,
+        true,
+    )
+}
+
+/// Device-resident staging of one window's positions (Design A §4): the owner
+/// packed the B absolute Q positions and the live K-position words
+/// (`positions_k[pos_base..]`: the `thlog.abs_positions()` suffix followed by
+/// the B noise positions) into pinned storage and uploaded them once to `buf`
+/// before the window.
+pub struct DraftStagedInputs<'a> {
+    pub buf: &'a DeviceBuffer,
+    /// Byte offset of the B Q-position words.
+    pub q_byte_off: usize,
+    /// Byte offset of the K-position words (`ctx_len - pos_base + B` of them).
+    pub k_byte_off: usize,
+}
+
+/// The GPU-resident, planned draft forward: [`draft_forward_based`] for the
+/// `target_hidden = None` / `noise_embedding = None` route (noise rows already
+/// in `scratch.x`), with the position uploads replaced by D2D copies out of
+/// `staged` and **no host watermark published** (`thlog` is read, never
+/// written): the owner commits `mark_proj_cached(ctx_len)` after completion
+/// (Design A §2 `WindowHostDelta`). The FFN graph route is never taken.
+pub fn draft_forward_planned(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    staged: &DraftStagedInputs<'_>,
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+) -> HipResult<()> {
+    draft_forward_based_impl(
+        gpu,
+        weights,
+        cfg,
+        None,
+        None,
+        0,
+        &[],
+        &[],
+        block_size,
+        ctx_len,
+        scratch,
+        false,
+        Some(staged),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_forward_based_impl(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    target_hidden_base: usize,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    graph_ffn: bool,
+    staged: Option<&DraftStagedInputs<'_>>,
+    publish: bool,
+) -> HipResult<()> {
     let base = target_hidden_base;
     let b = block_size;
     let l = ctx_len;
@@ -3318,8 +3419,15 @@ pub fn draft_forward_based(
             )
         }
     }
-    assert_eq!(positions_q.len(), b, "positions_q size");
-    assert_eq!(positions_k.len(), tot, "positions_k size");
+    if staged.is_none() {
+        assert_eq!(positions_q.len(), b, "positions_q size");
+        assert_eq!(positions_k.len(), tot, "positions_k size");
+    } else {
+        assert!(
+            noise_embedding.is_none() && target_hidden.is_none(),
+            "staged draft inputs own the positions only; embeddings and target hidden are GPU-resident"
+        );
+    }
 
     // Draft context windowing (DraftCtxMode::Windowed). `swa_w`/`full_w` are
     // the per-layer ring moduli (usize::MAX in Legacy ⇒ identity ring math,
@@ -3441,11 +3549,35 @@ pub fn draft_forward_based(
         // prev == l: nothing new to upload (wouldn't happen in practice
         // since caller always appends, but harmless).
     }
-    upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
-    if windowed {
-        upload_slice_i32(gpu, &scratch.positions_k, &positions_k[pos_base..])?;
-    } else {
-        upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+    match staged {
+        // Owner-staged inputs (Design A §4): the positions were packed into
+        // pinned storage and uploaded once before the window; the draft only
+        // moves them D2D, which a plan sink records as typed copies.
+        Some(st) => {
+            gpu.memcpy_dtod_at_ordered_async(
+                &scratch.positions_q.buf,
+                0,
+                st.buf,
+                st.q_byte_off,
+                b * 4,
+            )?;
+            let k_rows = if windowed { tot - pos_base } else { tot };
+            gpu.memcpy_dtod_at_ordered_async(
+                &scratch.positions_k.buf,
+                0,
+                st.buf,
+                st.k_byte_off,
+                k_rows * 4,
+            )?;
+        }
+        None => {
+            upload_slice_i32(gpu, &scratch.positions_q, positions_q)?;
+            if windowed {
+                upload_slice_i32(gpu, &scratch.positions_k, &positions_k[pos_base..])?;
+            } else {
+                upload_slice_i32(gpu, &scratch.positions_k, positions_k)?;
+            }
+        }
     }
 
     // ── 1. target_hidden_proj = hidden_norm(fc @ target_hidden) ──────────
@@ -4125,7 +4257,9 @@ pub fn draft_forward_based(
     // All rows [0..l) of target_hidden_proj and every layer's
     // k_ctx_cached / v_ctx_cached now contain finalized per-layer
     // projections. Next call's delta starts from here.
-    scratch.thlog.mark_proj_cached(l);
+    if publish {
+        scratch.thlog.mark_proj_cached(l);
+    }
 
     Ok(())
 }
@@ -4753,6 +4887,33 @@ pub fn propose_candidates_from_rows(
     temperature: f32,
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_from_rows_capture(
+        weights,
+        projection,
+        ids,
+        unaries,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        None,
+    )
+}
+
+/// [`propose_candidates_from_rows`] that also appends every row's `k` scores
+/// (`unary + dot`, row-major `[rows*K]`) to `capture`: the byte reference of
+/// the device selector `dflash_selector_greedy_exact`.
+pub fn propose_candidates_from_rows_capture(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    capture: Option<&mut Vec<f32>>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -4777,7 +4938,7 @@ pub fn propose_candidates_from_rows(
         return Err(hip_bridge::HipError::new(0, "ids/unaries length != rows*K"));
     }
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
-    propose_inner(
+    propose_inner_capture(
         vocab,
         weights,
         projection,
@@ -4789,10 +4950,11 @@ pub fn propose_candidates_from_rows(
         anchor,
         temperature,
         uniforms,
+        capture,
     )
 }
 
-fn propose_inner(
+fn propose_inner_capture(
     vocab_size: usize,
     weights: &DflashWeights,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
@@ -4804,6 +4966,7 @@ fn propose_inner(
     anchor: u32,
     temperature: f32,
     uniforms: Option<&[f32]>,
+    mut capture: Option<&mut Vec<f32>>,
 ) -> HipResult<DflashCandidateProposal> {
     if temperature > 0.0 && uniforms.is_none() {
         return Err(hip_bridge::HipError::new(
@@ -4855,6 +5018,9 @@ fn propose_inner(
                 dot += p * proj[d] * s;
             }
             scores.push(unary + dot);
+        }
+        if let Some(c) = capture.as_deref_mut() {
+            c.extend_from_slice(&scores);
         }
         // Softmax (temperature 1) mass of the selected candidate, at every
         // request temperature: the draft's own confidence in this row.
@@ -5061,6 +5227,427 @@ pub fn propose_candidates_device(
         temperature,
         uniforms,
     )
+}
+
+/// The kernel half of [`propose_candidates_device`] for the exact device
+/// greedy selector (Design A §4), with no host transfer: the same selector
+/// hidden-projection GEMM (`gemm_dispatch` into `scratch.selector_proj`), the
+/// same raw `topk_values_batched_f32`, then
+/// [`SelectorGreedyBlock::enqueue`] (which scores, picks and publishes the
+/// proposal block on the device). Kernel order matches the eager path; only
+/// the two D2H round trips and the host scorer are replaced. Plan-mode safe.
+pub fn enqueue_selector_greedy_device(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    books: &SelectorDeviceCodebooks,
+    block: &SelectorGreedyBlock,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+) -> HipResult<()> {
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rows = block.rows;
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if rank != block.rank || k != block.k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector block rank/k disagree with the loaded selector metadata",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    if logits.buf.size() < rows * vocab * 4 {
+        return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
+    }
+    let proj = scratch
+        .selector_proj
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
+    let hp = weights.selector_hidden_proj.as_ref().unwrap();
+    let proj_slice = proj.sub_offset(0, rows * rank);
+    gemm_dispatch(
+        gpu,
+        hidden,
+        hp,
+        &proj_slice,
+        rows,
+        scratch.mq_x_rot.as_ref(),
+        scratch.mq_x_rot_f16.as_ref(),
+    )?;
+    let ids_slice = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?
+        .sub_offset(0, rows * k);
+    let vals_slice = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?
+        .sub_offset(0, rows * k);
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
+    block.enqueue(gpu, books, &proj_slice, &ids_slice, &vals_slice)
+}
+
+/// Selector codebooks resident on the device, uploaded once. Element values
+/// are exactly `SelectorCodebook::get_f32`: f32 books are copied bit for bit;
+/// f16 books keep their 16-bit patterns, which the kernel widens exactly as
+/// `half::f16::to_f32` does (the widening is lossless).
+pub struct SelectorDeviceCodebooks {
+    pub pred: GpuTensor,
+    pub succ: GpuTensor,
+    pub pred_f16: bool,
+    pub succ_f16: bool,
+    pub vocab: usize,
+    pub rank: usize,
+}
+
+fn codebook_device_bytes(cb: &SelectorCodebook) -> HipResult<(&[u8], bool)> {
+    let elems = cb
+        .vocab
+        .checked_mul(cb.rank)
+        .ok_or_else(|| hip_bridge::HipError::new(0, "codebook extent overflow"))?;
+    match (&cb.f16_data, &cb.f32_data) {
+        (Some(h), None) if h.len() == elems => {
+            // SAFETY: u16 slice viewed as its own initialized bytes.
+            Ok((
+                unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u8, h.len() * 2) },
+                true,
+            ))
+        }
+        (None, Some(f)) if f.len() == elems => {
+            // SAFETY: f32 slice viewed as its own initialized bytes.
+            Ok((
+                unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) },
+                false,
+            ))
+        }
+        _ => Err(hip_bridge::HipError::new(
+            0,
+            "codebook must hold exactly one dtype with vocab*rank elements",
+        )),
+    }
+}
+
+impl SelectorDeviceCodebooks {
+    pub fn upload(gpu: &mut Gpu, weights: &DflashWeights) -> HipResult<Self> {
+        if !weights.has_candidate_selector() {
+            return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+        }
+        let pred_cb = weights.predecessor_codebook.as_ref().unwrap();
+        let succ_cb = weights.successor_codebook.as_ref().unwrap();
+        let rank = weights.selector_rank.unwrap_or(256);
+        if pred_cb.rank != rank || succ_cb.rank != rank || pred_cb.vocab != succ_cb.vocab {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "codebook rank/vocab disagree with loaded selector metadata",
+            ));
+        }
+        let (pb, pred_f16) = codebook_device_bytes(pred_cb)?;
+        let (sb, succ_f16) = codebook_device_bytes(succ_cb)?;
+        let shape = [pred_cb.vocab, rank];
+        let pred = gpu.upload_raw(pb, &shape)?;
+        let succ = match gpu.upload_raw(sb, &shape) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.hip.free(pred.buf);
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            pred,
+            succ,
+            pred_f16,
+            succ_f16,
+            vocab: pred_cb.vocab,
+            rank,
+        })
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let _ = gpu.hip.free(self.pred.buf);
+        let _ = gpu.hip.free(self.succ.buf);
+    }
+}
+
+/// Result of one device greedy selection, read back for diagnostics/oracle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectorGreedyReadback {
+    /// 0 = ok, else `code | (row+1) << 8` (see `dflash_selector_greedy_exact.hip`).
+    pub status: u32,
+    /// `[rows+1]`: `block[0]` = seed, `block[r+1]` = id chosen at row `r`.
+    pub block: Vec<u32>,
+    /// `[rows*K]` raw `unary + dot` scores.
+    pub scores: Vec<f32>,
+}
+
+/// Dedicated window-immutable proposal block for the device greedy selector:
+/// never aliased with `verify_scratch.argmax`/logits. Exact-size allocations.
+pub struct SelectorGreedyBlock {
+    seed: GpuTensor,
+    scores: GpuTensor,
+    block: GpuTensor,
+    status: GpuTensor,
+    pub rows: usize,
+    pub k: usize,
+    pub rank: usize,
+}
+
+impl SelectorGreedyBlock {
+    pub fn new(gpu: &mut Gpu, weights: &DflashWeights, rows: usize) -> HipResult<Self> {
+        let rank = weights.selector_rank.unwrap_or(256);
+        let k = weights.selector_top_k.unwrap_or(16);
+        if rows == 0 || rows > rdna_compute::dflash_selector::DFLASH_SELECTOR_MAX_ROWS {
+            return Err(hip_bridge::HipError::new(0, "selector rows not in 1..=15"));
+        }
+        if k == 0 || k > 16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector_top_k must be in [1,16]",
+            ));
+        }
+        let seed = gpu.alloc_tensor_exact(&[1], DType::F32)?;
+        let scores = gpu.alloc_tensor_exact(&[rows * k], DType::F32)?;
+        let block = gpu.alloc_tensor_exact(&[rows + 1], DType::F32)?;
+        let status = gpu.alloc_tensor_exact(&[1], DType::F32)?;
+        Ok(Self {
+            seed,
+            scores,
+            block,
+            status,
+            rows,
+            k,
+            rank,
+        })
+    }
+
+    /// Device word the owner's pinned staging fills with the seed token.
+    pub fn seed_buffer(&self) -> &DeviceBuffer {
+        &self.seed.buf
+    }
+
+    /// The proposal block `[rows+1]` u32 (`block[0]` = seed): the railgun copy
+    /// source for the verify token vector.
+    pub fn block_buffer(&self) -> &DeviceBuffer {
+        &self.block.buf
+    }
+
+    pub fn status_buffer(&self) -> &DeviceBuffer {
+        &self.status.buf
+    }
+
+    pub fn scores_buffer(&self) -> &DeviceBuffer {
+        &self.scores.buf
+    }
+
+    /// Enqueue the exact greedy selector over `rows` rows of the existing GPU
+    /// selector projection and raw top-K scratch (`topk_values_batched_f32`
+    /// outputs). The seed word must already be on the device.
+    pub fn enqueue(
+        &self,
+        gpu: &mut Gpu,
+        books: &SelectorDeviceCodebooks,
+        proj: &GpuTensor,
+        top_ids: &GpuTensor,
+        top_vals: &GpuTensor,
+    ) -> HipResult<()> {
+        if books.rank != self.rank {
+            return Err(hip_bridge::HipError::new(0, "codebook rank != block rank"));
+        }
+        gpu.dflash_selector_greedy_exact(&rdna_compute::dflash_selector::DflashSelectorGreedyArgs {
+            pred_cb: &books.pred.buf,
+            succ_cb: &books.succ.buf,
+            pred_f16: books.pred_f16,
+            succ_f16: books.succ_f16,
+            proj: &proj.buf,
+            top_ids: &top_ids.buf,
+            top_vals: &top_vals.buf,
+            seed: &self.seed.buf,
+            scores: &self.scores.buf,
+            block: &self.block.buf,
+            status: &self.status.buf,
+            rows: self.rows,
+            k: self.k,
+            rank: self.rank,
+            vocab: books.vocab,
+        })
+    }
+
+    /// Blocking D2H of status, block and scores (default-stream ordered).
+    pub fn read_back(&self, gpu: &Gpu) -> HipResult<SelectorGreedyReadback> {
+        let mut status = [0u8; 4];
+        gpu.hip.memcpy_dtoh(&mut status, &self.status.buf)?;
+        let mut blk = vec![0u8; (self.rows + 1) * 4];
+        gpu.hip.memcpy_dtoh(&mut blk, &self.block.buf)?;
+        let mut sc = vec![0u8; self.rows * self.k * 4];
+        gpu.hip.memcpy_dtoh(&mut sc, &self.scores.buf)?;
+        Ok(SelectorGreedyReadback {
+            status: u32::from_le_bytes(status),
+            block: blk
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            scores: sc
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        })
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        for t in [self.seed, self.scores, self.block, self.status] {
+            let _ = gpu.hip.free(t.buf);
+        }
+    }
+}
+
+/// Byte offsets of the sections written by
+/// [`PinnedWindowInputs::pack_seed_mask_positions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowInputOffsets {
+    pub seed: usize,
+    pub mask: usize,
+    pub q_positions: usize,
+    pub verify_positions: usize,
+    pub total_bytes: usize,
+}
+
+/// Persistent pinned owner-input staging (Design A §4 "Before the IB"): the
+/// host-known seed, mask id and position words are packed into reusable
+/// `hipHostMalloc` storage, uploaded with ONE `hipMemcpyAsync` on the owner
+/// stream, and retired by ONE event (the completion fence). The staging bytes
+/// are immutable while a transfer is in flight: `pack_*` and a second
+/// `submit` are refused until [`Self::complete`]. Pageable host memory is
+/// never the source of a GPU input.
+pub struct PinnedWindowInputs {
+    host: hip_bridge::PinnedHostBuffer,
+    fence: hip_bridge::Event,
+    packed: usize,
+    in_flight: bool,
+}
+
+impl PinnedWindowInputs {
+    pub fn new(gpu: &Gpu, capacity_bytes: usize) -> HipResult<Self> {
+        if capacity_bytes == 0 || capacity_bytes % 4 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "staging capacity must be a non-zero multiple of 4",
+            ));
+        }
+        Ok(Self {
+            host: gpu.hip.host_buffer(capacity_bytes)?,
+            fence: gpu
+                .hip
+                .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+            packed: 0,
+            in_flight: false,
+        })
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    /// Pack `sections` back to back as little-endian u32 words from offset 0;
+    /// returns each section's byte offset.
+    pub fn pack(&mut self, sections: &[&[u32]]) -> HipResult<Vec<usize>> {
+        if self.in_flight {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "staging buffer is in flight; complete() before repacking",
+            ));
+        }
+        let total: usize = sections.iter().map(|s| s.len() * 4).sum();
+        if total > self.host.size() {
+            return Err(hip_bridge::HipError::new(0, "staging capacity exceeded"));
+        }
+        let bytes = self.host.as_bytes_mut();
+        let mut at = 0usize;
+        let mut offsets = Vec::with_capacity(sections.len());
+        for s in sections {
+            offsets.push(at);
+            for w in s.iter() {
+                bytes[at..at + 4].copy_from_slice(&w.to_le_bytes());
+                at += 4;
+            }
+        }
+        self.packed = total;
+        Ok(offsets)
+    }
+
+    /// The seed / mask-id / absolute-Q-position / verify-position layout.
+    pub fn pack_seed_mask_positions(
+        &mut self,
+        seed: u32,
+        mask_id: u32,
+        q_positions: &[u32],
+        verify_positions: &[u32],
+    ) -> HipResult<WindowInputOffsets> {
+        let seed = [seed];
+        let mask = [mask_id];
+        let o = self.pack(&[&seed, &mask, q_positions, verify_positions])?;
+        Ok(WindowInputOffsets {
+            seed: o[0],
+            mask: o[1],
+            q_positions: o[2],
+            verify_positions: o[3],
+            total_bytes: self.packed,
+        })
+    }
+
+    /// One async H2D of the packed bytes into `dst[0..packed]` on `stream`,
+    /// then record the fence on `stream`.
+    pub fn submit(
+        &mut self,
+        gpu: &Gpu,
+        dst: &DeviceBuffer,
+        stream: &hip_bridge::Stream,
+    ) -> HipResult<()> {
+        if self.in_flight {
+            return Err(hip_bridge::HipError::new(0, "staging already in flight"));
+        }
+        if self.packed == 0 || self.packed > dst.size() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "staged bytes empty or exceed the destination",
+            ));
+        }
+        let n = self.packed;
+        gpu.hip
+            .memcpy_htod_async(dst, &self.host.as_bytes_mut()[..n], stream)?;
+        gpu.hip.event_record(&self.fence, Some(stream))?;
+        self.in_flight = true;
+        Ok(())
+    }
+
+    /// Host wait on the fence; afterwards the staging bytes are reusable.
+    pub fn complete(&mut self, gpu: &Gpu) -> HipResult<()> {
+        if self.in_flight {
+            gpu.hip.event_synchronize(&self.fence)?;
+            self.in_flight = false;
+        }
+        Ok(())
+    }
+
+    /// Drain the fence, then release the staging storage and the event. Drop
+    /// without this leaks the event and, if a copy is in flight, is the
+    /// caller's bug: the pinned bytes would be freed under the DMA.
+    pub fn destroy(mut self, gpu: &Gpu) -> HipResult<()> {
+        self.complete(gpu)?;
+        gpu.hip.event_destroy(self.fence)
+    }
+
+    /// Non-blocking fence query; true (and retires) once the copy is done.
+    pub fn poll(&mut self, gpu: &Gpu) -> HipResult<bool> {
+        if !self.in_flight {
+            return Ok(true);
+        }
+        if gpu.hip.event_query(&self.fence)? {
+            self.in_flight = false;
+        }
+        Ok(!self.in_flight)
+    }
 }
 
 /// One lane of [`propose_candidates_lanes_device`]: its `rows` candidate rows

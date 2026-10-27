@@ -1070,7 +1070,6 @@ impl Gpu {
             kernels::TOPK_LOGSUMEXP_BATCHED_SRC,
             "topk_logsumexp_batched_f32",
         )?;
-        let func = &self.functions["topk_logsumexp_batched_f32"];
         let mut lp = logits.buf.as_ptr();
         let mut ti = top_idx.buf.as_ptr();
         let mut to = top_out.buf.as_ptr();
@@ -1090,16 +1089,23 @@ impl Gpu {
         const MAX_K: u32 = 16;
         let nth: u32 = 256;
         let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [b as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_params_or_plan(
+            "topk_logsumexp_batched_f32",
+            [b as u32, 1, 1],
+            [nth, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut bl = hip_bridge::KernargBlob::new();
+                bl.push_ptr(lp);
+                bl.push_ptr(ti);
+                bl.push_ptr(to);
+                bl.push_i32(vs);
+                bl.push_i32(kk);
+                bl.push_i32(raw);
+                bl
+            },
+        )
     }
 
     pub fn argmax_token_chain_f32(

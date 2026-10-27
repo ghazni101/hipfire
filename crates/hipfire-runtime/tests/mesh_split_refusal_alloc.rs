@@ -355,7 +355,6 @@ fn split_program_refuses_without_allocating() {
         for (case, policies, ladder) in [
             ("gated mlp geometry", &split, MlpLadder::Trunk),
             ("gated mlp mixed policy", &mixed, MlpLadder::Trunk),
-            ("gated mlp ladder", &split, MlpLadder::SandwichWide),
         ] {
             let shapes = [[INTER, HIDDEN], [INTER, HIDDEN], [HIDDEN, INTER]];
             let names = ["gate", "up", "down"];
@@ -417,11 +416,7 @@ fn split_program_refuses_without_allocating() {
                     parts: 2,
                     align: 256,
                 },
-                "gated mlp mixed policy" => SplitError::UnsupportedPolicy { op, resource: down },
-                _ => SplitError::UnshardableOp {
-                    op,
-                    kind: OpKind::GatedMlp,
-                },
+                _ => SplitError::UnsupportedPolicy { op, resource: down },
             };
             assert_eq!(refusal(case, &graph, &plan, &mesh), expected, "{case}");
         }

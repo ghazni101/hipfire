@@ -25,6 +25,17 @@ const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
 const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
+const PACKET3_COND_EXEC: u32 = 0x22;
+/// Largest `COND_EXEC` count railgun emits: 14 bits, a conservative bound
+/// (the probe in `railgun/examples/cond_probe.rs` stays far below it).
+pub const COND_EXEC_MAX_DWORDS: u32 = 0x3fff;
+
+/// An open `COND_EXEC` region: the stream position its count covers from.
+#[derive(Debug)]
+#[must_use = "close the region with end_cond_exec"]
+pub struct CondExec {
+    count_at: usize,
+}
 
 // GFX10/GFX11 SET_SH_REG offsets, matching ROCr's legacy compute command
 // builder and Hipfire's independently exercised gfx1010 implementation.
@@ -206,6 +217,9 @@ impl Gfx11ComputeResourceLimitsPolicy {
 pub struct Gfx10Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
+    /// `dwords.len()` at the last [`Self::end_cond_exec`]: a flush right
+    /// before it may be skipped, so it does not make the tail idle.
+    cond_exec_end: usize,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
     resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
 }
@@ -244,6 +258,7 @@ impl Gfx10Pm4CommandBuffer {
         Self {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         }
@@ -523,6 +538,46 @@ impl Gfx10Pm4CommandBuffer {
         self.wait_memory_value(address, value);
     }
 
+    /// Open a `COND_EXEC` region (PM4 0x22, Mesa's GFX7+ compute shape): the
+    /// CP discards every dword up to [`Self::end_cond_exec`] when the `u32`
+    /// at `address` reads zero. The caller orders the flag's producer first
+    /// (e.g. [`Self::dependency_fence`]). Register-state elision restarts at
+    /// both edges, since `SET_SH_REG`s inside may not execute.
+    pub fn begin_cond_exec(&mut self, address: u64) -> CondExec {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        self.clear_register_state();
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_COND_EXEC, 4, false),
+            address as u32,
+            (address >> 32) as u32,
+            0,
+            0,
+        ]);
+        CondExec {
+            count_at: self.dwords.len() - 1,
+        }
+    }
+
+    /// Close `region`, patching its count; `Err(count)` past
+    /// [`COND_EXEC_MAX_DWORDS`].
+    pub fn end_cond_exec(&mut self, region: CondExec) -> Result<(), u32> {
+        let count = (self.dwords.len() - region.count_at - 1) as u32;
+        if count > COND_EXEC_MAX_DWORDS {
+            return Err(count);
+        }
+        self.dwords[region.count_at] = count;
+        self.cond_exec_end = self.dwords.len();
+        self.clear_register_state();
+        Ok(())
+    }
+
+    fn clear_register_state(&mut self) {
+        if let Some(register_state) = self.register_state.as_mut() {
+            register_state.clear();
+        }
+    }
+
     /// Append one HSA-ABI dispatch, explicitly materializing gfx10's enabled
     /// implicit user SGPRs.
     pub fn dispatch(
@@ -618,8 +673,10 @@ impl Gfx10Pm4CommandBuffer {
     }
 
     pub fn ends_with_compute_idle(&self) -> bool {
-        self.dwords
-            .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
+        self.dwords.len() != self.cond_exec_end
+            && self
+                .dwords
+                .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -1245,6 +1302,7 @@ mod tests {
         let empty_value = Gfx10Pm4CommandBuffer {
             dwords: vec![packet3(PACKET3_SET_SH_REG, 1, true), COMPUTE_PGM_LO],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1258,6 +1316,7 @@ mod tests {
                 1,
             ],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1267,6 +1326,7 @@ mod tests {
         let short_dispatch = Gfx10Pm4CommandBuffer {
             dwords: vec![packet3(PACKET3_DISPATCH_DIRECT, 2, true), 1, 1],
             register_state: None,
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         };
@@ -1320,5 +1380,28 @@ mod tests {
         assert_eq!(commands.dwords(), before.as_slice());
         let _ = commands.packet_census().unwrap();
         assert_eq!(commands.dwords(), before.as_slice());
+    }
+
+    /// The region is one well-formed 5-dword packet whose count spans
+    /// exactly the commands up to its end, and stateful elision restarts on
+    /// both sides (a skipped `SET_SH_REG` must not be assumed set).
+    #[test]
+    fn cond_exec_counts_the_skipped_dwords_and_resets_register_state() {
+        let mut c = Gfx10Pm4CommandBuffer::new_stateful();
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        let region = c.begin_cond_exec(0x1000);
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        c.wait_compute_idle();
+        assert!(c.ends_with_compute_idle());
+        c.end_cond_exec(region).unwrap();
+        assert!(
+            !c.ends_with_compute_idle(),
+            "a flush inside the region may be skipped"
+        );
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        let d = c.dwords();
+        assert_eq!(&d[3..8], [0xc003_2200, 0x1000, 0, 0, 5]);
+        assert_eq!(c.packet_census().unwrap()[&(0x22, 5)], 1);
+        assert_eq!(c.packet_census().unwrap()[&(0x76, 3)], 3);
     }
 }

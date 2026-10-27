@@ -22,11 +22,12 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
   **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
   hardcode a required release — install a supported stack for your GPU.
-- **Windows (recommended): WSL2 with ROCm 7.2.1 and AMD's ROCDXG library.**
-  hipfire runs as the ordinary Linux build inside the distro; see
-  [Windows — WSL2](#windows--wsl2-recommended) for the driver, ROCm and
-  `librocdxg` steps and the supported GPU list.
-- **Windows (native, best-effort):** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`). Slower and narrower than WSL2; see [the limits](#windows--native-best-effort).
+- **Windows (untested on GPU hardware):** nothing in hipfire has been run on a
+  Windows GPU yet, on either route; see [Windows status](#windows--status).
+  - **WSL2 with ROCm 7.2.1 and AMD's ROCDXG library:** hipfire is the ordinary
+    Linux build inside the distro; see [Windows — WSL2](#windows--wsl2) for the
+    driver, ROCm and `librocdxg` steps and the supported GPU list.
+  - **Native:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`); see [the limits](#windows--native).
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
@@ -72,7 +73,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.4.1
+PIN=v0.4.4
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -80,7 +81,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.4.1` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.4` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -139,12 +140,45 @@ directory or URL holding the assets (`https://…`, `file:///…`, or a plain
 path), for mirrors and offline installs:
 
 ```bash
-bash install.sh --tag v0.4.0 --kernel-pack-url file:///srv/hipfire-packs/v0.4.0
+bash install.sh --tag v0.4.4 --kernel-pack-url file:///srv/hipfire-packs/v0.4.4
 ```
 
 `hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
 runs the same download and checks on an existing install, for example to
 restore kernels on a machine without hipcc.
+
+#### Hosts outside the pack's ROCm range (Ubuntu amdrocm 10.0)
+
+Ubuntu's `amdrocm` 10.0 packages are the common host a pack's `[10.1, 11.0)`
+range excludes. Nothing about the model runtime differs on such a host: the
+same kernels compile locally through its own hipcc.
+
+- On `beta` and from 0.4.4, `install.sh --tag <tag>` (and
+  `hipfire update --tag <tag>`) handles this on its own. When the pack is
+  skipped for the range, setup selects the umbrella `/opt/rocm` root
+  automatically (the amdrocm packaging installs it alongside versioned
+  children like `/opt/rocm/core-10.0` and a compiler-only `/usr`), finds
+  `bin/hipcc` there, and compiles.
+- On v0.4.3.x the automatic selection is absent (#967), and the amdrocm layout
+  makes the roots ambiguous enough that naming them explicitly is the reliable
+  path: run the installer once to fetch the source (it stops at the pack
+  check), then complete with setup directly:
+
+```bash
+curl -fsSL https://hipfire.dev/install.sh | bash -s -- --tag v0.4.3.1 --yes   # stops at the pack check
+export PATH="$HOME/.cargo/bin:$PATH"                                          # cargo is required
+hipfire setup --source ~/.hipfire/src \
+  --rocm-root /opt/rocm --hipcc /opt/rocm/bin/hipcc \
+  --yes --compile-kernels
+```
+
+`~/.cargo/bin` must be on PATH for non-interactive shells (`rustup` installs
+it; the bootstrap checks cargo up front, a direct `hipfire setup` reaches the
+daemon build without checking). Verified on a live amdrocm `10.0.0-4` host
+(gfx1151, issues #967 and #966): every kernel compiles through the host hipcc
+in a few minutes, the runtime verifies all indexes at load, and the Flash-Next
+NPU trunk JIT-compiles its object when the certified pack does not match the
+local toolchain.
 
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
@@ -162,9 +196,9 @@ Repository variables choose another image
 publish from a local toolchain instead:
 
 ```bash
-scripts/build-kernel-pack.sh --tag v0.4.0 --out dist            # every admitted arch
-scripts/build-kernel-pack.sh --tag v0.4.0 --out dist gfx1201    # or a subset
-gh release upload v0.4.0 dist/hipfire-kernels-v0.4.0-*
+scripts/build-kernel-pack.sh --tag v0.4.4 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.4 --out dist gfx1201    # or a subset
+gh release upload v0.4.4 dist/hipfire-kernels-v0.4.4-*
 ```
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
@@ -172,10 +206,19 @@ no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
 and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
 declares a range other than the default; it must contain the build's ROCm.
 
-### Windows — WSL2 (recommended)
+### Windows — status
 
-WSL2 is the supported way to run hipfire on Windows. Inside the distro hipfire
-is the Linux build (Linux installer, `hipfire update`, file locks, signals);
+> **Native Windows and WSL2 are both untested on GPU hardware.** The only
+> Windows CI job is `Windows MSVC (no GPU)` on a hosted runner without
+> a GPU, and the hardware gate runs on Linux only. Neither route is certified
+> until a community test report lands; the notes below describe what the code
+> does, not what has been observed on a card. To help, see
+> [Help test Windows](#help-test-windows).
+
+### Windows — WSL2
+
+Inside the distro hipfire is the Linux build (Linux installer, `hipfire update`,
+file locks, signals);
 ROCm reaches the GPU through AMD's ROCDXG library and Microsoft's DXCore
 device `/dev/dxg`, while the Windows Adrenalin driver owns the card. AMD's
 current method (ROCm 7.2.1, ROCDXG; the older `amdgpu-install --usecase=wsl`
@@ -229,8 +272,8 @@ What differs from native Linux until each piece is certified on WSL hardware:
   KFD topology), so `hardware.devices` is refused; select cards with
   `HIP_VISIBLE_DEVICES`. AMD does not support multi-GPU under WSL.
 - The retained Redline PM4 default falls back to the HIP graph with one
-  `[redline] retained default refused` log line (historically measured about
-  4–6% slower decode on the routes that default to PM4), and an explicit `replay.backend=redline`
+  `[redline] retained default refused` log line (historically measured on Linux
+  about 4–6% slower decode on the routes that default to PM4), and an explicit `replay.backend=redline`
   is refused. `HIPFIRE_UNSAFE_WSL_REDLINE=1` lifts this; it is **unsafe
   until certified**.
 - The KV cache uses the legacy backend; an explicit `kv_backend=vmm` is
@@ -243,7 +286,7 @@ What differs from native Linux until each piece is certified on WSL hardware:
   models. `rocm-smi`/`amd-smi` are limited and the ROCm profiler and debugger
   are unsupported under WSL.
 
-### Windows — native (best-effort)
+### Windows — native
 
 ```powershell
 # Current master:
@@ -254,18 +297,27 @@ iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/inst
   -Branch beta
 ```
 
-For a reviewed, pinned installation:
+For a reviewed, pinned installation of the latest release (recommended for
+testers: a release install uses the release's prebuilt kernel pack instead of a
+long local kernel compile):
 
 ```powershell
-$Pin = "v0.4.1"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/$Pin/scripts/install.ps1" `
+$Pin = (Invoke-RestMethod https://api.github.com/repos/warpfront/hipfire/releases/latest).tag_name
+$Pin
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
 notepad "$env:TEMP\hipfire-install.ps1"
-& "$env:TEMP\hipfire-install.ps1" -Ref $Pin
+& "$env:TEMP\hipfire-install.ps1" -Tag $Pin
 ```
 
-PowerShell also accepts `-Branch beta`, `-Tag v0.4.1`, and `-Commit <sha>`.
+The installer script is downloaded from `master` rather than from the tag:
+`scripts/install.ps1` in every release from `v0.4.1` through `v0.4.3.1` starts with a doubled UTF-8
+byte-order mark, which prevents `-Tag`, `-Ref`, `-Branch`, `-Commit`,
+`-CompileKernels` and `-KernelPackUrl` from binding (#979). Releases up to
+`v0.4.3.1` also predate Windows kernel-pack acceptance and the HIP DLL
+selection below, so on Windows they compile kernels locally.
+PowerShell also accepts `-Branch beta` and `-Commit <sha>`.
 On Windows, `hipfire update` reports the installed version and exits non-zero
 without changing files: Windows updates require re-running `scripts/install.ps1`
 after stopping the engine. For current master:
@@ -277,31 +329,47 @@ iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/inst
 Use the reviewed, pinned command above when selecting a specific revision.
 
 Builds `daemon.exe` and the native CLI from the same selected source revision
-under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
-the installer runs `hipfire kernel-pack install` for the tag's
+under `~\.hipfire\src`. A release install (`-Tag vX.Y.Z`, a tag-named `-Ref`, or
+a branch/ref whose checked-out HEAD has a release tag pointing at it) on an
+admitted GPU runs `hipfire kernel-pack install` for that release's
 [prebuilt kernel pack](#prebuilt-kernel-packs) (`-KernelPackUrl` overrides the
-download location, `-CompileKernels` skips it). Otherwise, or when the pack
-cannot be used, hipcc from the HIP SDK packages exact registry sources: the
-installer runs `daemon.exe --precompile` to produce indexed packages in
+download location, `-CompileKernels` skips the pack and forces a local compile).
+The pack objects are HSA code objects built on Linux; whether the Windows HIP
+runtime loads them is unverified until a test report lands. Otherwise, or when
+the pack cannot be used, hipcc from the HIP SDK packages exact registry sources:
+the installer runs `daemon.exe --precompile` to produce indexed packages in
 `~\.hipfire\bin\kernels\compiled\<arch>\`. Re-run `install.ps1` after
 upgrading: copying bare `.hsaco` files is insufficient.
 
 Unsupported GPU architectures likewise require hipcc JIT at runtime; the
 installer does not copy bare checkout objects into the installed cache.
 
-Native Windows is best-effort: it builds and runs, but it is slower and
-narrower than WSL2 on the same card. Known limits:
+Native Windows has not been run on GPU hardware (see [Windows status](#windows--status)).
+The limits below are properties of the code, not observations from a card:
 
 - **No Redline PM4.** The Windows HIP SDK ships no ROCr (`libhsa-runtime64`),
-  so decode runs on the HIP graph: historically measured about 4–6% slower than the
-  Linux/WSL PM4 default (one gfx1201 Qwen3.8 27B tg128 at 8K measurement,
-  ≈38.2 instead of 40.3 tok/s; not a current baseline).
+  so decode runs on the HIP graph. On Linux the HIP graph has been measured
+  about 4–6% slower than the PM4 default (one gfx1201 Qwen3.8 27B tg128 at 8K
+  measurement, ≈38.2 instead of 40.3 tok/s; a Linux number, not a current
+  baseline, and not measured on Windows).
   An explicit `replay.backend=redline` is refused.
 - **Legacy KV only.** HIP VMM growth is not certified on Windows; automatic
   KV selects legacy and `kv_backend=vmm` is refused.
 - **No tensor or pipeline parallel**: the HIP SDK has no RCCL. One GPU per
   daemon; `hardware.devices` is unavailable, so select the card with
   `HIP_VISIBLE_DEVICES`.
+- **HIP runtime DLL selection.** hipfire loads `amdhip64*.dll` by absolute path
+  from the selected HIP SDK root (`HIP_PATH`, `HIPFIRE_ROCM_PATH`, `ROCM_PATH`,
+  or `Program Files\AMD\ROCm`), searching the DLL's own directory first for its
+  dependencies, so the older copy the AMD driver installs in `System32` cannot
+  shadow the SDK's. With no SDK root it tries hipfire's exe directory, then
+  `~\.hipfire\runtime`, then the standard DLL search. The daemon logs the
+  resolved DLL path and the HIP runtime/driver versions at start, and
+  `hipfire diag --json` reports them under `live_gpu`
+  (`hip_runtime_library`, `hip_runtime_version_raw`, `hip_driver_version_raw`).
+- **Model file mapping.** On unified-memory GPUs (Strix Halo) the model file
+  mapping is released after the headers are read, as on Linux; discrete GPUs
+  keep it on both OSes.
 - GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
   (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
   holder PID, as on Linux.
@@ -318,10 +386,13 @@ narrower than WSL2 on the same card. Known limits:
 
 #### CI developer artifact
 
-The advisory `Windows MSVC (advisory, no GPU)` job in
+The required `Windows MSVC (no GPU)` job in
 [CI](../.github/workflows/ci.yml) builds the native CLI and daemon, tests the
-config/registry/client libraries, and checks `hipfire --version` and parseable
-`hipfire diag --json` output without an AMD HIP runtime. It is promoted to a
+config/registry/client libraries, checks that `scripts/*.ps1` parse and that
+`install.ps1`'s parameters bind, checks `hipfire --version` and parseable
+`hipfire diag --json` output without an AMD HIP runtime, and lists the DLLs the
+packaged binaries import against the allowlist in `scripts/check-pe-imports.ps1`.
+It is promoted to a
 required check after its first green run on `beta`; adding the job is not
 evidence of a passing Windows run or GPU certification.
 
@@ -341,6 +412,41 @@ The Windows build does not imply support for Unix-only PLE conversion,
 hot-row/direct-read or hot-pack I/O, cache-residency probing, or prewarm paths;
 those I/O entry points report unsupported on Windows. POSIX-FD VMM sharing,
 Redline, and VMM KV are not native Windows capabilities.
+
+### Help test Windows
+
+No maintainer has a Windows GPU machine, so native Windows (and WSL2) stay
+unverified until someone runs them on a card. A one-script test kit and an issue
+form exist for that.
+
+Native Windows:
+
+1. Install a release as shown [above](#windows--native) (the pinned `-Tag`
+   install).
+2. Run the kit (the installer clones the source into `~\.hipfire\src`):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\.hipfire\src\scripts\windows-check.ps1
+   ```
+
+   `-ExecutionPolicy Bypass` on the command line applies to that one process
+   only; it does not change the machine or user execution policy.
+3. File the result with the
+   [Windows test report form](https://github.com/warpfront/hipfire/issues/new?template=windows-test-report.yml),
+   including the generated `report.txt` and `report.json`.
+
+[`scripts/windows-check.ps1`](../scripts/windows-check.ps1) collects the OS,
+driver, HIP SDK, `amdhip64.dll` resolution and GPU architecture; pulls the
+smallest Qwen3.5 text model; runs a short greedy generation and a short
+`hipfire bench`; and, with `-Include27B` when VRAM is at least 24 GB, also tries
+a 27B model. It writes `report.json` and `report.txt` and does not change system
+settings. Parameters: `-OutDir`, `-SkipModel`, `-Include27B`, `-HipfireExe`
+(see the parameter block at the top of the script). The model download uses
+disk space and network under `~\.hipfire\models`.
+
+WSL2: the kit is a PowerShell script for the native install. For a WSL2 report,
+use the same issue form and include `hipfire diag --json` and `rocminfo` output
+from inside the distro.
 
 ### Source checkout
 
@@ -411,7 +517,7 @@ one build, then prints one `fix:` line per problem
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.4.1
+hipfire update --tag v0.4.4
 hipfire update --commit <sha>
 ```
 
@@ -502,7 +608,7 @@ pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
 eviction is deprecated and will be removed in 0.5.0 — off by default, not
 supported, and not a recommended route to long context.
 
-**YaRN context extension (0.4.2, Qwen3.8-Flash-Next only).** The engine can
+**YaRN context extension (since 0.4.2, Qwen3.8-Flash-Next only).** The engine can
 apply YaRN RoPE scaling at load through `attention.yarn_factor` (env
 `HIPFIRE_YARN_FACTOR`): unset/`null` keeps the checkpoint's own
 `rope_parameters`, a value above 1 extends the admitted context to
@@ -527,11 +633,9 @@ tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
 regression.
 
-## Flash-Next on 0.4.2 (beta)
+## Flash-Next multi-device and NPU defaults
 
-These behaviors are on the 0.4.2 line (CHANGELOG "Unreleased (0.4.2)"); the
-latest tagged release is v0.4.1. Install them with `--branch beta` until 0.4.2
-is tagged.
+These behaviors shipped in 0.4.2 and are in every later release.
 
 - **Strix Halo NPU trunk (gfx1151).** `fusions.npu_trunk` /
   `HIPFIRE_QWEN4_NPU_TRUNK` (`off|auto|on|emulate`) defaults to `auto`. Auto

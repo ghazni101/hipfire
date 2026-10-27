@@ -95,6 +95,7 @@ DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap", "cask_off"}
 DEFAULT_REACHED_ALLOWLIST = {
     ("crates/hipfire-runtime/src/config.rs", "MQ4R route selection by file extension"),
     ("crates/hipfire-runtime/src/config.rs", "DS4 MQ2R selection by file extension"),
+    ("crates/hipfire-runtime/src/config.rs", "A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension"),
     ("crates/hipfire-cli/src/serve/mod.rs", "MQ4R route selection by file extension"),
     ("crates/hipfire-arch-deepseek4/src/deepseek4.rs", "DS4 MQ2R selection by file extension"),
 }

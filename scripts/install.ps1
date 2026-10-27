@@ -1,4 +1,4 @@
-﻿﻿# hipfire installer for Windows — detects GPU, builds binaries + indexed kernels.
+# hipfire installer for Windows - detects GPU, builds binaries + indexed kernels.
 # Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
 # A -Tag (or a tag-named -Ref) installs that release's prebuilt kernel pack when it
 # verifies against the checkout; otherwise, or with -CompileKernels, hipcc compiles them.
@@ -28,14 +28,14 @@ function Invoke-Git {
     }
 }
 
-# ─── Paths ───────────────────────────────────────────────
+# --- Paths -----------------------------------------------
 $HipfireDir  = "$env:USERPROFILE\.hipfire"
 $BinDir      = "$HipfireDir\bin"
 $RuntimeDir  = "$HipfireDir\runtime"
 $ModelsDir   = "$HipfireDir\models"
 $SrcDir      = "$HipfireDir\src"
 
-# ─── Constants ───────────────────────────────────────────
+# --- Constants -------------------------------------------
 $GithubRepo = "warpfront/hipfire"
 $InstallRef = if ($env:HIPFIRE_INSTALL_REF) { $env:HIPFIRE_INSTALL_REF } else { "master" }
 $InstallRefKind = if ($env:HIPFIRE_INSTALL_REF) { "auto" } else { "branch" }
@@ -123,7 +123,7 @@ Write-Host "=== hipfire installer ===" -ForegroundColor Cyan
 Write-Host "Requested source: $InstallRefKind '$InstallRef'"
 Write-Host ""
 
-# ─── GPU Detection ───────────────────────────────────────
+# --- GPU Detection ---------------------------------------
 Write-Host "Checking for AMD GPU..." -ForegroundColor Cyan
 
 $GpuArch = "unknown"
@@ -180,7 +180,7 @@ if ($GpuArch -eq "unknown") {
 }
 Write-Host "  GPU arch: $GpuArch" -ForegroundColor Green
 
-# ─── Create directories ──────────────────────────────────
+# --- Create directories ----------------------------------
 Write-Host ""
 Write-Host "Creating directories..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $BinDir    | Out-Null
@@ -190,7 +190,7 @@ Write-Host "  $BinDir" -ForegroundColor Green
 Write-Host "  $RuntimeDir" -ForegroundColor Green
 Write-Host "  $ModelsDir" -ForegroundColor Green
 
-# ─── HIP DLL (amdhip64.dll) ──────────────────────────────
+# --- HIP DLL (amdhip64.dll) ------------------------------
 Write-Host ""
 Write-Host "Checking HIP runtime (amdhip64.dll)..." -ForegroundColor Cyan
 
@@ -199,7 +199,7 @@ $HipDllDest  = "$RuntimeDir\amdhip64.dll"
 
 # Check RuntimeDir first (idempotent re-runs)
 if (Test-Path $HipDllDest) {
-    Write-Host "  amdhip64.dll: found in RuntimeDir ✓" -ForegroundColor Green
+    Write-Host "  amdhip64.dll: found in RuntimeDir OK" -ForegroundColor Green
     $HipDllFound = $true
 }
 
@@ -208,7 +208,7 @@ if (-not $HipDllFound -and $env:HIP_PATH) {
     foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
         $candidate = Join-Path $env:HIP_PATH "bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
@@ -225,7 +225,7 @@ if (-not $HipDllFound) {
             foreach ($verDir in (Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
                 $candidate = Join-Path $verDir.FullName "bin\$dllName"
                 if (Test-Path $candidate) {
-                    Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+                    Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
                     Copy-Item $candidate $HipDllDest -Force
                     $HipDllFound = $true
                     break
@@ -236,7 +236,7 @@ if (-not $HipDllFound) {
         # Also check flat layout
         $candidate = "C:\Program Files\AMD\ROCm\bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
@@ -250,7 +250,7 @@ if (-not $HipDllFound) {
     $DllUrl = "https://github.com/$GithubRepo/releases/download/hip-runtime/amdhip64.dll"
     try {
         Invoke-WebRequest -Uri $DllUrl -OutFile $HipDllDest -UseBasicParsing
-        Write-Host "  amdhip64.dll: downloaded ✓" -ForegroundColor Green
+        Write-Host "  amdhip64.dll: downloaded OK" -ForegroundColor Green
         $HipDllFound = $true
     } catch {
         Write-Host "  amdhip64.dll: download failed: $_" -ForegroundColor Red
@@ -272,7 +272,7 @@ if ($HipDllFound) {
     $env:PATH = "$RuntimeDir;$env:PATH"
 }
 
-# ─── HIP version vs GPU arch check ──────────────────────
+# --- HIP version vs GPU arch check ----------------------
 if ($HipDllFound -and $GpuArch -ne "unknown") {
     # Try to get HIP version from the DLL or hipconfig
     $HipVer = ""
@@ -315,7 +315,7 @@ if ($HipDllFound -and $GpuArch -ne "unknown") {
     }
 }
 
-# ─── Clone / update repo ─────────────────────────────────
+# --- Clone / update repo ---------------------------------
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
 
@@ -335,7 +335,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
         Invoke-Git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
         if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
         Checkout-InstallRef $SrcDir
-        Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
+        Write-Host "  Checked out $InstallRefKind '$InstallRef' OK" -ForegroundColor Green
     } catch {
         Write-Host "  Checkout failed: $_" -ForegroundColor Red
         exit 1
@@ -375,7 +375,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
         try {
             $env:GIT_TERMINAL_PROMPT = "0"
             Checkout-InstallRef $SrcDir
-            Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
+            Write-Host "  Checked out $InstallRefKind '$InstallRef' OK" -ForegroundColor Green
         } catch {
             Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
         }
@@ -391,7 +391,7 @@ if (-not $ResolvedRef) {
 if (-not $ResolvedRef) { $ResolvedRef = "detached" }
 Write-Host "Source resolved: $ResolvedRef @ $ResolvedCommit" -ForegroundColor Green
 
-# ─── Build / install binaries ────────────────────────────
+# --- Build / install binaries ----------------------------
 Write-Host ""
 Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
 
@@ -417,7 +417,7 @@ $TargetDir = $Meta.target_directory
 $BuiltExe = "$TargetDir\release\daemon.exe"
 if (-not (Test-Path $BuiltExe)) { throw "daemon source build did not produce $BuiltExe" }
 Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force
-Write-Host "  daemon.exe built from selected revision ✓" -ForegroundColor Green
+Write-Host "  daemon.exe built from selected revision OK" -ForegroundColor Green
 
 # Build the native CLI from the same checkout and revision as the daemon.
 $CliExe = "$TargetDir\release\hipfire.exe"
@@ -440,9 +440,9 @@ foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
 }
 
-# Terminal UI (workspace bin — lives under target\release\, not examples\).
+# Terminal UI (workspace bin - lives under target\release\, not examples\).
 # Build on demand if the pre-built tree didn't include it. The TUI is
-# OPTIONAL — a failed build (or absent cargo) must NOT abort the install,
+# OPTIONAL - a failed build (or absent cargo) must NOT abort the install,
 # but it must NOT be swallowed silently either: warn clearly so the user
 # knows the terminal UI won't be available and how to get it.
 $TuiExe = "$TargetDir\release\hipfire-tui.exe"
@@ -454,12 +454,12 @@ if (-not (Test-Path $TuiExe)) {
 }
 if (Test-Path $TuiExe) {
     Copy-Item $TuiExe "$BinDir\hipfire-tui.exe" -Force
-    Write-Host "  hipfire-tui (terminal UI) installed ✓" -ForegroundColor Green
+    Write-Host "  hipfire-tui (terminal UI) installed OK" -ForegroundColor Green
 } else {
     # Windows remedy: `hipfire update` is NOT Windows-aware (its GPU-arch +
     # git-reset path is Linux/sysfs-only), so recommend the direct cargo build
     # as the PRIMARY fix on Windows, then re-running this installer to copy it.
-    Write-Warning "hipfire-tui (terminal UI) was not built — it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
+    Write-Warning "hipfire-tui (terminal UI) was not built - it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
 }
 
 # CPU quantizer (optional, but build it on demand so `hipfire quantize` works
@@ -475,16 +475,16 @@ if (Test-Path $QuantExe) {
     Write-Warning "hipfire-quantize was not built; the quantize subcommand will be unavailable."
 }
 
-# ─── Native CLI ──────────────────────────────────────────
+# --- Native CLI ------------------------------------------
 Write-Host ""
 Write-Host "Installing CLI..." -ForegroundColor Cyan
 $LegacyCliDir = "$HipfireDir\cli"
 if (Test-Path $LegacyCliDir) { Remove-Item $LegacyCliDir -Recurse -Force }
 $LegacyWrapper = "$BinDir\hipfire.cmd"
 if (Test-Path $LegacyWrapper) { Remove-Item $LegacyWrapper -Force }
-Write-Host "  Native CLI: $BinDir\hipfire.exe ✓" -ForegroundColor Green
+Write-Host "  Native CLI: $BinDir\hipfire.exe OK" -ForegroundColor Green
 
-# ─── Indexed kernel package ──────────────────────────────
+# --- Indexed kernel package ------------------------------
 # A release tag's prebuilt pack is used when `hipfire kernel-pack install`
 # verifies its SHA-256, manifest, ROCm range and every index against this
 # checkout. Otherwise the daemon resolves the active GPU architecture and
@@ -495,12 +495,21 @@ $DaemonExe = "$BinDir\daemon.exe"
 $AdmittedArches = @("gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942")
 if (Test-Path $DaemonExe) {
     $PackInstalled = $false
-    if ($InstallRefKind -eq "tag" -and -not $CompileKernels -and $GpuArch -in $AdmittedArches) {
+    # Tag whose prebuilt pack to try: the requested tag, or (for a branch/ref)
+    # a release tag (vN...) pointing at the checked-out HEAD.
+    $PackTag = $null
+    if ($InstallRefKind -eq "tag") {
+        $PackTag = $InstallRef
+    } else {
+        $headTags = @((Invoke-Git -C $RepoDir tag --points-at HEAD 2>$null) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^v\d' })
+        if ($headTags.Count -gt 0) { $PackTag = $headTags[0] }
+    }
+    if ($PackTag -and -not $CompileKernels -and $GpuArch -in $AdmittedArches) {
         Write-Host ""
-        Write-Host "Installing prebuilt kernel pack $InstallRef for $GpuArch..." -ForegroundColor Cyan
+        Write-Host "Installing prebuilt kernel pack $PackTag for $GpuArch..." -ForegroundColor Cyan
         $PackArgs = @(
             "kernel-pack", "install",
-            "--tag", $InstallRef,
+            "--tag", $PackTag,
             "--arch", $GpuArch,
             "--source", $RepoDir,
             "--dest", "$BinDir\kernels\compiled\$GpuArch"
@@ -516,7 +525,7 @@ if (Test-Path $DaemonExe) {
             $ErrorActionPreference = $prev
         }
         if ($PackInstalled) {
-            Write-Host "  Kernel pack verified and installed ✓" -ForegroundColor Green
+            Write-Host "  Kernel pack verified and installed OK" -ForegroundColor Green
         } else {
             Write-Warning "Kernel pack not used (reason above); compiling kernels locally."
         }
@@ -542,14 +551,14 @@ if (Test-Path $DaemonExe) {
             if ($LASTEXITCODE -ne 0) {
                 throw "Indexed kernel packaging failed (exit $LASTEXITCODE). No compiler-free install was produced."
             }
-            Write-Host "  Indexed kernel package complete ✓" -ForegroundColor Green
+            Write-Host "  Indexed kernel package complete OK" -ForegroundColor Green
         } else {
             Write-Warning "No indexed kernel registry for $GpuArch; this GPU requires hipcc JIT. Compiler-free operation is unavailable."
         }
     }
 }
 
-# ─── Config ──────────────────────────────────────────────
+# --- Config ----------------------------------------------
 $ConfigFile = "$HipfireDir\config.toml"
 $LegacyConfigFile = "$HipfireDir\config.json"
 if (-not (Test-Path $ConfigFile) -and -not (Test-Path $LegacyConfigFile)) {
@@ -558,7 +567,7 @@ if (-not (Test-Path $ConfigFile) -and -not (Test-Path $LegacyConfigFile)) {
     Write-Host "Config written: $ConfigFile" -ForegroundColor Green
 }
 
-# ─── PATH ────────────────────────────────────────────────
+# --- PATH ------------------------------------------------
 Write-Host ""
 $NoPath = $args -contains "--no-path"
 $CurrentUserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -581,16 +590,16 @@ if ($NoPath) {
         } else {
             [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
             $env:PATH = "$BinDir;$env:PATH"
-            Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+            Write-Host "  PATH updated OK (restart your shell to apply)" -ForegroundColor Green
         }
     } else {
         Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "hipfire already in PATH ✓" -ForegroundColor Green
+    Write-Host "hipfire already in PATH OK" -ForegroundColor Green
 }
 
-# ─── Calibration offer ───────────────────────────────────
+# --- Calibration offer -----------------------------------
 # Offer `hipfire calibrate` only on an interactive console and only when no fresh record covers
 # this host (`calibrate --check` fails). Never fatal: a calibrate failure is a warning.
 $HipfireExe = "$BinDir\hipfire.exe"
@@ -633,7 +642,7 @@ if (Test-Path $HipfireExe) {
     }
 }
 
-# ─── Quick start ─────────────────────────────────────────
+# --- Quick start -----------------------------------------
 Write-Host ""
 Write-Host "=== hipfire installed ===" -ForegroundColor Cyan
 if (Test-Path "$BinDir\hipfire.exe") {

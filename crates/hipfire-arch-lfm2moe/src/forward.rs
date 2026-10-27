@@ -20,7 +20,7 @@
 
 use crate::config::Lfm2MoeConfig;
 use crate::lfm2moe::{Lfm2MoeState, Lfm2MoeWeights};
-use crate::program::{head_steps, LayerRefs};
+use crate::program::{head_steps, Bufs, LayerRefs};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
 use rdna_compute::Gpu;
@@ -352,17 +352,18 @@ fn decode_step_layers_and_head(
         hipfire_config::developer_var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
     let ctx = DispatchCtx::new(gpu);
     let pos = position as usize;
+    let bufs = Bufs::single(state, pos);
     for (l, layer) in weights.layers.iter().enumerate() {
         let refs = LayerRefs::new(layer);
         let mixer = refs
-            .mixer_steps(cfg, state, pos)
+            .mixer_steps(cfg, &bufs)
             .map_err(|e| format!("lfm2moe L{l}: mixer program: {e}"))?;
         execute_steps(gpu, &ctx, &mixer).map_err(|e| format!("lfm2moe L{l}: mixer: {e}"))?;
         if capture_postmixer {
             capture_h(gpu, state, l, capture.as_deref_mut())?;
         }
         let ffn = refs
-            .ffn_steps(cfg, &ctx, state, l)
+            .ffn_steps(cfg, &ctx, &bufs, l)
             .map_err(|e| format!("lfm2moe L{l}: ffn program: {e}"))?;
         execute_steps(gpu, &ctx, &ffn).map_err(|e| format!("lfm2moe L{l}: ffn: {e}"))?;
         if !capture_postmixer {
@@ -370,7 +371,7 @@ fn decode_step_layers_and_head(
         }
     }
     let lm_head = weights.lm_head.dispatch_ref();
-    execute_steps(gpu, &ctx, &head_steps(cfg, weights, &lm_head, state))
+    execute_steps(gpu, &ctx, &head_steps(cfg, weights, &lm_head, &bufs))
         .map_err(|e| format!("lfm2moe: head: {e}"))?;
     state.n_tokens = pos + 1;
     Ok(())

@@ -562,6 +562,33 @@ pub(crate) struct PlanItem {
     pub download: bool,
 }
 
+/// Whether this host's GPUs apply the pinned trunk overlay, so the pull
+/// fetches it. The loader applies the sidecar only on the one architecture of
+/// its trunk default (`TrunkIu4Default::arch`, gfx1151 for the pinned
+/// `gfx1151-zab-v1` overlays) unless `HIPFIRE_QWEN4_TRUNK_OVERLAY=1` applies it
+/// anywhere (`hipfire_arch_qwen4::trunk_overlay::decide_overlay`). A host with
+/// no detected GPU keeps the download: the pull cannot know where the model
+/// will run. A mixed host with any gfx1151 card keeps it too.
+pub(crate) fn trunk_overlay_wanted(gpu_arches: &[String]) -> bool {
+    trunk_overlay_applies(
+        hipfire_arch_qwen4::TrunkOverlayPolicy::from_env()
+            .unwrap_or(hipfire_arch_qwen4::TrunkOverlayPolicy::Auto),
+        gpu_arches,
+    )
+}
+
+/// [`trunk_overlay_wanted`] under an explicit load policy.
+fn trunk_overlay_applies(
+    policy: hipfire_arch_qwen4::TrunkOverlayPolicy,
+    gpu_arches: &[String],
+) -> bool {
+    if policy == hipfire_arch_qwen4::TrunkOverlayPolicy::On {
+        return true;
+    }
+    let applying = rdna_compute::TrunkIu4Default::Gfx1151ZabV1.arch();
+    gpu_arches.is_empty() || gpu_arches.iter().any(|arch| arch == applying)
+}
+
 /// Every file the pull of `choice` touches, in pull order.
 pub(crate) fn plan_items(
     ctx: &PullContext<'_, '_>,
@@ -640,7 +667,9 @@ pub(crate) fn plan_items(
         ..entry.clone()
     });
     let identity = identity.as_ref().unwrap_or(entry);
-    if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, ctx.overlay_pins) {
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, ctx.overlay_pins)
+        .filter(|_| trunk_overlay_wanted(&ctx.host.gpu_arches))
+    {
         let local = if served.is_some() {
             format!(
                 "{model_file}{}",
@@ -1801,6 +1830,67 @@ mod tests {
             (items[0].file.as_str(), items[0].download),
             (STOCK_BASE, false)
         );
+    }
+
+    /// The file set of a stock Flash-Next pull per host: the trunk overlay is
+    /// planned only where the loader applies it (gfx1151; or no detected GPU,
+    /// where the pull cannot tell), and `HIPFIRE_QWEN4_TRUNK_OVERLAY=1` plans
+    /// it everywhere.
+    #[test]
+    fn the_trunk_overlay_is_planned_only_where_the_loader_applies_it() {
+        use hipfire_arch_qwen4::TrunkOverlayPolicy::{Auto, Off, On};
+        let arches = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        for (hosts, policy, planned) in [
+            (arches(&["gfx1151"]), Auto, true),
+            (arches(&["gfx1201"]), Auto, false),
+            (arches(&["gfx1100"]), Auto, false),
+            (arches(&["gfx1100", "gfx1201"]), Auto, false),
+            (arches(&["gfx1100", "gfx1151"]), Auto, true),
+            (arches(&["gfx906"]), Auto, false),
+            (arches(&[]), Auto, true),
+            (arches(&["gfx1201"]), On, true),
+            (arches(&["gfx1151"]), Off, true),
+        ] {
+            assert_eq!(
+                trunk_overlay_applies(policy, &hosts),
+                planned,
+                "{hosts:?} {policy:?}"
+            );
+        }
+        // The plan itself, with the default policy: gfx1201 downloads the
+        // base, the q8 PLE rows and the hot set, but no overlay.
+        let absent = |_: &str, _: Option<u64>| false;
+        let plan = |arch: &str| -> Vec<String> {
+            let registry = stock_registry();
+            let host = host_with_arch(arch);
+            let (tag, entry) = registry.model("qwen3.8:flash").unwrap();
+            let ctx = PullContext {
+                registry: &registry,
+                host: &host,
+                overlay_pins: hipfire_registry::TRUNK_OVERLAY_PINS,
+                hotset_pins: hipfire_registry::EXPERT_HOTSET_PINS,
+                grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
+                present: &absent,
+            };
+            let items = plan_items(
+                &ctx,
+                &PullChoice::defaults(tag, entry, &PullFlags::default()),
+                false,
+            );
+            for item in &items {
+                eprintln!("{arch}: {} {} {:?}", item.label, item.file, item.size);
+            }
+            items.into_iter().map(|item| item.label).collect()
+        };
+        assert!(plan("gfx1151").contains(&"overlay".to_owned()));
+        for arch in ["gfx1201", "gfx1100"] {
+            let labels = plan(arch);
+            assert!(
+                !labels.contains(&"overlay".to_owned()),
+                "{arch}: {labels:?}"
+            );
+            assert!(labels.contains(&"Expert hot set".to_owned()), "{arch}");
+        }
     }
 
     /// hipx (a gfx1100 next to a gfx1151): the summary lists the union of what

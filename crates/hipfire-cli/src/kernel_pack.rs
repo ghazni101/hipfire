@@ -40,7 +40,9 @@ pub(crate) struct PackRequest<'a> {
     pub dest: &'a Path,
     /// Directory or URL holding the release assets (`https://`, `file://`, or a path).
     pub base: &'a str,
-    /// `<rocm root>/.info/version` of the machine's ROCm, if known.
+    /// `<rocm root>/.info/version` of the machine's ROCm, if known. Not a
+    /// Windows admission input (see `install`).
+    #[cfg_attr(windows, allow(dead_code))]
     pub rocm_version: Option<&'a str>,
 }
 
@@ -86,11 +88,23 @@ pub(crate) fn install(request: &PackRequest<'_>) -> std::result::Result<PackMani
                 manifest.tag, request.tag
             ));
         }
+        // Windows: the pack objects are AMDGPU code objects loaded by the HIP
+        // runtime, not by the local compiler, so the local HIP SDK root's
+        // ROCm range and hipcc identity do not gate acceptance. Whether the
+        // Windows HIP runtime accepts these code-object-v6 objects is
+        // UNVERIFIED until a volunteer report; the pack is built on Linux.
+        #[cfg(windows)]
+        manifest.check_identity(request.arch, request.commit)?;
+        #[cfg(not(windows))]
         manifest.check(request.arch, request.commit, request.rocm_version)?;
         // Validate first: the snapshot below panics on an invalid config.
         hipfire_config::load_local_process_config()
             .map_err(|e| format!("invalid hipfire configuration: {e}"))?;
+        #[cfg(windows)]
+        let local: Option<String> = None;
+        #[cfg(not(windows))]
         let local = rdna_compute::KernelCompiler::local_toolchain_id();
+        #[cfg(not(windows))]
         if let Some(local) = local
             .as_deref()
             .filter(|local| *local != manifest.toolchain_id)

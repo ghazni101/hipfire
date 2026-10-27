@@ -11,19 +11,41 @@ static PM_VERIFIED: LazyLock<bool> = LazyLock::new(|| {
 });
 
 /// G80 panel geometry. All panels use the same padded row count.
+/// `n512 = false`: the N1280 program (256-row waves, 4 A segments, 1280-column native-tile panels; the GPU consume and
+/// emulate GEMM read this A). `n512 = true`: the N512 program (512-row waves, 8 A segments, 512-column panels the NPU
+/// writes row-major itself). Both A streams are `rows * K * 9 / 8` bytes of identical 4608-byte K64 half chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NpuBf16Layout {
     pub padded_rows: usize,
     pub k: usize,
     pub panels: usize,
+    pub n512: bool,
 }
 impl NpuBf16Layout {
+    /// Rows of one wave of the program (the M padding unit).
+    pub fn wave_rows(self) -> usize {
+        if self.n512 {
+            512
+        } else {
+            256
+        }
+    }
+    /// Columns of one panel.
+    pub fn panel_n(self) -> usize {
+        if self.n512 {
+            512
+        } else {
+            1280
+        }
+    }
     pub fn validate(self) -> HipResult<()> {
+        // K is bounded by the N512 program's resident B panel (99 K64 chunks); the N1280 NPU program itself holds
+        // K <= 2560, but its A layout also feeds the K-generic emulate GEMM (27B, K = 5120).
         if self.padded_rows == 0
             || self.padded_rows > 65536
-            || self.padded_rows % 256 != 0
+            || self.padded_rows % self.wave_rows() != 0
             || self.k == 0
-            || self.k > 3968
+            || self.k > 6336
             || self.k % 64 != 0
             || self.panels == 0
             || self.panels > 51
@@ -38,14 +60,22 @@ impl NpuBf16Layout {
         }
         Ok(())
     }
+    /// N1280 only: native tiles and the emulate GEMM's A addressing.
+    fn n1280(self) -> HipResult<()> {
+        self.validate()?;
+        if self.n512 {
+            return Err(HipError::new(1, "npu trunk: N1280 layout required"));
+        }
+        Ok(())
+    }
     pub fn a_bytes(self) -> usize {
-        4 * (self.padded_rows / 256) * (self.k / 64) * 4608
+        self.padded_rows * (self.k / 64) * 72
     }
     pub fn c_bytes(self) -> usize {
-        self.padded_rows * 1280 * self.panels * 2
+        self.padded_rows * self.padded_cols() * 2
     }
     pub fn padded_cols(self) -> usize {
-        self.panels * 1280
+        self.panels * self.panel_n()
     }
 }
 /// One native projection destination. Dtype is taken from the tensor (F32/BF16).
@@ -153,7 +183,7 @@ impl Gpu {
         a: *mut c_void,
         d: &GpuTensor,
     ) -> HipResult<()> {
-        let fast = layout.k == 2560 && self.arch_caps.is_gfx1151();
+        let fast = matches!(layout.k, 2560 | 5120) && self.arch_caps.is_gfx1151();
         unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a, d, fast) }
     }
     unsafe fn npu_trunk_pack_a_impl(
@@ -171,17 +201,17 @@ impl Gpu {
         }
         need(x, rows * layout.k * 2)?;
         need(d, rows * 4)?;
-        let symbol = if fast {
-            "npu_trunk_pack_a_bf16"
-        } else {
-            "npu_trunk_pack_a_bf16_old"
+        let symbol = match (fast, layout.k) {
+            (false, _) => "npu_trunk_pack_a_bf16_old",
+            (true, 2560) => "npu_trunk_pack_a_bf16",
+            _ => "npu_trunk_pack_a_bf16_k5120",
         };
         self.ensure_kernel_public("npu_trunk", kernels::NPU_TRUNK_SRC, symbol)?;
         let mut b = KernargBlob::new();
         b.push_ptr(x.buf.as_ptr());
         b.push_ptr(a);
         b.push_ptr(d.buf.as_ptr());
-        for n in [rows, layout.k, layout.padded_rows] {
+        for n in [rows, layout.k, layout.padded_rows, layout.wave_rows()] {
             b.push_i32(n as i32);
         }
         self.npu_launch(
@@ -207,7 +237,7 @@ impl Gpu {
         outs: &[NpuTrunkOutput<'_>],
         rows: usize,
     ) -> HipResult<()> {
-        layout.validate()?;
+        layout.n1280()?;
         need(c, layout.c_bytes())?;
         unsafe { self.npu_trunk_consume_bf16_ptr(c.buf.as_ptr(), layout, outs, rows) }
     }
@@ -220,6 +250,7 @@ impl Gpu {
         outs: &[NpuTrunkOutput<'_>],
         rows: usize,
     ) -> HipResult<()> {
+        layout.n1280()?;
         outputs(layout, rows, outs)?;
         if c.is_null() {
             return Err(HipError::new(1, "npu trunk: null C arena"));
@@ -250,7 +281,7 @@ impl Gpu {
         outs: &[NpuTrunkOutput<'_>],
         rows: usize,
     ) -> HipResult<()> {
-        layout.validate()?;
+        layout.n1280()?;
         need(c, layout.c_bytes())?;
         unsafe { self.npu_trunk_consume_bf16_fast_ptr(c.buf.as_ptr(), layout, outs, rows) }
     }
@@ -264,6 +295,7 @@ impl Gpu {
         outs: &[NpuTrunkOutput<'_>],
         rows: usize,
     ) -> HipResult<()> {
+        layout.n1280()?;
         outputs(layout, rows, outs)?;
         if c.is_null() {
             return Err(HipError::new(1, "npu trunk: null C arena"));
@@ -310,7 +342,7 @@ impl Gpu {
         rows: usize,
         n: usize,
     ) -> HipResult<()> {
-        layout.validate()?;
+        layout.n1280()?;
         if rows == 0
             || rows > layout.padded_rows
             || n == 0
@@ -408,6 +440,7 @@ mod tests {
             padded_rows: 4864,
             k: 2560,
             panels: 13,
+            n512: false,
         };
         l.validate().unwrap();
         assert_eq!(l.a_bytes(), 4 * 19 * 40 * 4608);
@@ -428,6 +461,40 @@ mod tests {
         }
         .validate()
         .is_err());
+        // 27B dense in-projection on the N512 program: 512-row waves, 512-column panels, K5120.
+        let dense = NpuBf16Layout {
+            padded_rows: 8192,
+            k: 5120,
+            panels: 33,
+            n512: true,
+        };
+        dense.validate().unwrap();
+        use peacemaker_npu::kernels::{gemm_core, gemm_g80_n512::design_g80_n512};
+        let design = design_g80_n512(
+            8192,
+            512,
+            5120,
+            gemm_core::Epilogue::Bf16,
+            gemm_core::Control::Fast,
+        );
+        assert_eq!(dense.a_bytes(), design.args[0].bytes);
+        assert_eq!(dense.padded_cols(), 16896);
+        assert!(NpuBf16Layout {
+            padded_rows: 4864,
+            ..dense
+        }
+        .validate()
+        .is_err());
+        assert!(NpuBf16Layout { k: 6400, ..dense }.validate().is_err());
+        // The N1280 layout at K5120 is the emulate GEMM's input (no N1280 NPU program reaches it).
+        let emulate = NpuBf16Layout {
+            n512: false,
+            panels: 13,
+            ..dense
+        };
+        emulate.validate().unwrap();
+        assert_eq!(emulate.a_bytes(), dense.a_bytes());
+        assert!(dense.n1280().is_err() && emulate.n1280().is_ok());
     }
     #[test]
     fn fast_uint4_lds_reorder_matches_g80_byte_offsets() {

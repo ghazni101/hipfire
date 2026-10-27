@@ -121,6 +121,9 @@ pub struct Gemma4Drafter {
     pending_hidden: GpuTensor,
     /// Per-row post-norm hidden of a verify block, `[(k + 1) · dim]`.
     verify_hidden: GpuTensor,
+    /// The target's last forward wrote the pending seed's row (a verify row
+    /// past the accepted prefix), so the next round's drafter attends it.
+    seed_row_cached: bool,
     k: usize,
     ctx_capacity: usize,
     vocab: usize,
@@ -196,6 +199,7 @@ impl Gemma4Drafter {
             scratch,
             pending_hidden,
             verify_hidden,
+            seed_row_cached: false,
             k: draft_len,
             ctx_capacity: target.state.max_seq,
             vocab: target.config.vocab_size,
@@ -210,8 +214,9 @@ impl Gemma4Drafter {
     }
 
     /// The target's post-norm hidden of its last processed position becomes
-    /// the pending seed's conditioning hidden.
-    fn take_target_hidden(&self, gpu: &mut Gpu, bundle: &Gemma4Bundle) -> Result<(), String> {
+    /// the pending seed's conditioning hidden; the seed's row is not cached.
+    fn take_target_hidden(&mut self, gpu: &mut Gpu, bundle: &Gemma4Bundle) -> Result<(), String> {
+        self.seed_row_cached = false;
         let bytes = bundle.config.dim * 4;
         gpu.hip
             .memcpy_dtod_at(&self.pending_hidden.buf, 0, &bundle.state.tmp.buf, 0, bytes)
@@ -294,7 +299,7 @@ impl MtpDrafter for Gemma4Drafter {
         }
         let k = k.min(self.k);
         self.scratch
-            .begin_round(gpu, &self.pending_hidden, position)?;
+            .begin_round(gpu, &self.pending_hidden, position, self.seed_row_cached)?;
         let mut block = Vec::with_capacity(k + 1);
         block.push(seed);
         for _ in 0..k {
@@ -342,6 +347,7 @@ impl MtpDrafter for Gemma4Drafter {
         // The seed and every committed token but the last are in the KV; the
         // last stays pending, conditioned on the hidden of the row before it.
         bundle.state.n_tokens = position + committed;
+        self.seed_row_cached = committed < block.len();
         let row = hidden.sub_offset((committed - 1) * dim, dim);
         gpu.hip
             .memcpy_dtod_at(&self.pending_hidden.buf, 0, &row.buf, 0, dim * 4)

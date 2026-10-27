@@ -498,6 +498,12 @@ const fn text(
 }
 
 const AUTO_ON_OFF_OPTIONS: &[(&str, &str)] = &[("auto", "auto"), ("on", "on"), ("off", "off")];
+const VISION_MODE_OPTIONS: &[(&str, &str)] = &[
+    ("auto", "auto"),
+    ("resident", "resident"),
+    ("off", "off"),
+    ("on", "on"),
+];
 
 /// Every §3.1 curated row, in group order.
 pub const CURATED: &[SettingKnob] = &[
@@ -695,6 +701,13 @@ pub const CURATED: &[SettingKnob] = &[
         &[],
         "How many past answers are kept so their text is not re-read.",
         "More entries save time on long chats and use a little more memory.",
+    ),
+    text(
+        "vision.mode",
+        "Vision tower",
+        VISION_MODE_OPTIONS,
+        "Vision tower: auto streams it per image, resident keeps it in VRAM.",
+        "Resident is fastest on the first image; off is text-only, on needs a tower.",
     ),
     // Speculation
     text(

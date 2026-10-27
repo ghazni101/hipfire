@@ -661,6 +661,11 @@ pub struct Gemma4DrafterScratch {
     pub token_ids: GpuTensor,
     /// device i32 query position scalar (constant across a round).
     pub pos_buf: hip_bridge::DeviceBuffer,
+    /// `[1]` i32 last key position of a round whose query row is not in the
+    /// target cache (`query_pos - 1`).
+    pub through: GpuTensor,
+    /// `Some(query_pos - 1)` while the round's query row is not cached.
+    pub attend_through: Option<usize>,
     /// Ranks the tied `lm_head` and returns the draft token.
     pub head: DraftHead,
 }
@@ -699,9 +704,10 @@ impl Gemma4DrafterScratch {
             let ffn_out = alloc(gpu, cfg.hidden, "ffn_out")?;
             let normed = alloc(gpu, cfg.hidden, "normed")?;
             let token_ids = alloc(gpu, 1, "token_ids")?;
+            let through = alloc(gpu, 1, "through")?;
             Ok((
                 concat, x, residual, tmp, x_rot, q, attn_out, gate_ffn, up_ffn, ffn_hidden,
-                ffn_out, normed, token_ids,
+                ffn_out, normed, token_ids, through,
             ))
         })();
         let rollback = |gpu: &mut Gpu, owned: Vec<GpuTensor>| {
@@ -723,6 +729,7 @@ impl Gemma4DrafterScratch {
             ffn_out,
             normed,
             token_ids,
+            through,
         ) = match built {
             Ok(v) => v,
             Err(e) => {
@@ -771,6 +778,8 @@ impl Gemma4DrafterScratch {
             normed,
             token_ids,
             pos_buf,
+            through,
+            attend_through: None,
             head,
         })
     }
@@ -791,6 +800,7 @@ impl Gemma4DrafterScratch {
             self.ffn_out,
             self.normed,
             self.token_ids,
+            self.through,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -800,15 +810,33 @@ impl Gemma4DrafterScratch {
 
     /// Start a round at the constant `query_pos` with the target `hidden`
     /// (`[backbone_hidden]`) as the first step's hidden half.
+    ///
+    /// `query_row_cached`: the target cache holds a row at `query_pos`
+    /// written by its last forward. HF's candidate generator hands the
+    /// drafter the target K/V cut to the committed length, so it attends that
+    /// row only then (a verify row past the accepted prefix); otherwise the
+    /// row is stale (an older verify or an earlier request) and the round
+    /// attends through `query_pos - 1`.
     pub fn begin_round(
-        &self,
+        &mut self,
         gpu: &mut Gpu,
         hidden: &GpuTensor,
         query_pos: usize,
+        query_row_cached: bool,
     ) -> Result<(), String> {
         let bb = self.concat.numel() / 2;
         gpu.memcpy_htod_auto(&self.pos_buf, &(query_pos as i32).to_ne_bytes())
             .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
+        self.attend_through = if query_row_cached {
+            None
+        } else {
+            let through = query_pos
+                .checked_sub(1)
+                .ok_or("gemma4-drafter: a round at position 0 has no context")?;
+            gpu.memcpy_htod_auto(&self.through.buf, &(through as i32).to_ne_bytes())
+                .map_err(|e| format!("gemma4-drafter: htod through: {e:?}"))?;
+            Some(through)
+        };
         gpu.hip
             .memcpy_dtod_at(&self.concat.buf, bb * 4, &hidden.buf, 0, bb * 4)
             .map_err(|e| format!("gemma4-drafter: stage hidden half: {e:?}"))
@@ -907,6 +935,7 @@ fn run_step(
             kv_sliding: &target_state.kv_sliding,
             kv_full: &target_state.kv_full,
             pos_buf: &ds.pos_buf,
+            attend_through: ds.attend_through.map(|p| (p, &ds.through.buf)),
             v_norm_ones: &target_state.v_norm_ones,
             flash_partials: &target_state.q8_flash_partials,
         },
@@ -1023,6 +1052,8 @@ pub fn drafter_step_from_concat(
             dcfg.pre_proj_in()
         ));
     }
+    // The oracle's target cache holds the query row (HF's shared K/V).
+    ds.attend_through = None;
     gpu.memcpy_htod_auto(&ds.pos_buf, &(query_pos as i32).to_ne_bytes())
         .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
     gpu.hip

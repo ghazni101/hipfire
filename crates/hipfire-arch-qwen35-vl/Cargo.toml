@@ -17,6 +17,8 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 # `vl_yuv_preprocess` kernels straight to device patches. Default off; the
 # CPU decode path is unchanged when disabled.
 vcn-jpeg = ["dep:va-bridge"]
+# Diagnostic/lab examples (`vl_tower_dump`); not built by default.
+lab = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
@@ -36,3 +38,8 @@ image.workspace = true
 # Encodes the synthetic JPEG fixtures in `tests/image_from_bytes.rs`
 # (the `image` crate's JPEG encoder left with its `jpeg` feature).
 libjpeg-turbo-rs.workspace = true
+sha2.workspace = true
+
+[[example]]
+name = "vl_tower_dump"
+required-features = ["lab"]

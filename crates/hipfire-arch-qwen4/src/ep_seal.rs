@@ -27,8 +27,10 @@ use std::sync::Arc;
 
 /// Flash-Next's EP protocol: every rank runs the replicated trunk, owned
 /// experts write their slot rows, and a copy-only owner row exchange feeds the
-/// unchanged slot-order combine on every rank.
-pub const QWEN4_EP_EXECUTION: &str = "qwen4-owner-row-gather-replicated-combine";
+/// unchanged slot-order combine on every rank. The canonical execution string
+/// lives with the sealed planner so the runtime can recognize the owner-routed
+/// exchange (rather than an all-reduce) when it plans the collective schedule.
+pub const QWEN4_EP_EXECUTION: &str = hipfire_runtime::sealed_moe::OWNER_ROUTED_EP_EXECUTION;
 
 const GATE_UP: &str = ".mlp.experts.gate_up_proj";
 const DOWN: &str = ".mlp.experts.down_proj";

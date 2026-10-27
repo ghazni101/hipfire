@@ -18,6 +18,7 @@
 //!                [--arch <name>=auto-from-gpu] \
 //!                [--kv-mode <mode>=asym3] \
 //!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
+//!                [--scored-max-batch <N>]
 //!
 //! Scoring modes (per `docs/plans/issue-113-quant-quality-eval.md` §5), with
 //! the kernel admission each one runs (qwen35). Hidden rows are captured
@@ -74,6 +75,15 @@
 //!              prompt route; not comparable with `prefill-whole` kldseqs
 //!              where a route is capture-gated.
 //!
+//! `--scored-max-batch N` (split `prefill` mode only, qwen35, N >= 2): the
+//! scored-region call goes through `forward_prefill_batch_capped` with cap N,
+//! so the scored rows run as consecutive N-row verify-capture forwards (the
+//! shape of an MTP K = N-1 verify) instead of one 1023-row call. The prefix
+//! call is unchanged. Use it to measure routes that gate on a small row count
+//! (e.g. the exact-gfx1100 2..=5-row verify GEMV); compare like with like,
+//! since the KV/state commit cadence differs from the default split mode.
+//! Absent (the default), the scored call is byte-for-byte the historical one.
+//!
 //! Output: HFKSEQ format (see kldref_format.py) — per-sequence (mean, p99)
 //! KLD as fp64 pairs.
 //!
@@ -111,6 +121,8 @@ fn main() {
         kv_v: String,
         scoring_mode: String,
         max_chunks: Option<usize>,
+        scored_max_batch: Option<usize>,
+        tp: Option<usize>,
     }
     // Every mode's kernel admission, shared by the --scoring-mode error and
     // --help text (kept in sync with the module docs above).
@@ -135,6 +147,8 @@ fn main() {
     let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
+    let mut scored_max_batch: Option<usize> = None;
+    let mut tp: Option<usize> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -198,8 +212,23 @@ fn main() {
                 max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
                 i += 2;
             }
+            "--tp" => {
+                tp = Some(argv[i + 1].parse().expect("--tp must be integer"));
+                i += 2;
+            }
+            "--scored-max-batch" => {
+                let n: usize = argv[i + 1]
+                    .parse()
+                    .expect("--scored-max-batch must be integer");
+                if n < 2 {
+                    eprintln!("--scored-max-batch must be >= 2 (got {n})");
+                    std::process::exit(1);
+                }
+                scored_max_batch = Some(n);
+                i += 2;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N]\n{SCORING_MODE_HELP}");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
                 std::process::exit(0);
             }
             other => {
@@ -216,7 +245,31 @@ fn main() {
         kv_v,
         scoring_mode,
         max_chunks,
+        scored_max_batch,
+        tp,
     };
+    if args.scored_max_batch.is_some() && args.scoring_mode != "prefill" {
+        eprintln!("--scored-max-batch applies to --scoring-mode prefill only");
+        std::process::exit(1);
+    }
+    if let Some(tp) = args.tp {
+        if !(2..=8).contains(&tp) {
+            eprintln!("--tp must be in 2..=8 (got {tp})");
+            std::process::exit(1);
+        }
+        if args.scoring_mode != "prefill" || args.scored_max_batch.is_some() {
+            eprintln!("--tp applies to --scoring-mode prefill only (no --scored-max-batch)");
+            std::process::exit(1);
+        }
+        if args.kv_mode != "q8" || args.kv_v != "q8" {
+            eprintln!("--tp requires --kv-mode q8 --kv-v q8 (per-rank q8 KV)");
+            std::process::exit(1);
+        }
+        if args.model.is_dir() {
+            eprintln!("--tp is not supported for safetensors/paro model directories");
+            std::process::exit(1);
+        }
+    }
 
     // -------- eval-mode env vars (must precede Gpu::init / forward) --------
     // Per plan §"Eval-mode hipfire flags": force OFF for prompt normalize +
@@ -300,6 +353,12 @@ fn main() {
     let is_gemma = arch_id == 13;
     let is_glimmer = arch_id == 14;
     let is_lfm = arch_id == 11;
+    if args.tp.is_some() && !is_qwen35 {
+        eprintln!(
+            "eval_hipfire: --tp is implemented for qwen35 (arch_id 5|6) only (got {arch_id})"
+        );
+        std::process::exit(1);
+    }
     if !(is_llama || is_qwen35 || is_gemma || is_glimmer || is_lfm) {
         eprintln!(
             "unsupported arch_id {arch_id}: eval_hipfire wires dense 0|1 (llama), 5|6 (qwen35), 13 (gemma4), 14 (glimmer), 11 (lfm2) — matches calib_sweep.rs:658"
@@ -389,7 +448,230 @@ fn main() {
     let scoring_start = n_ctx / 2;
 
     // ===== Arch dispatch (mirrors calib_sweep.rs:684ff) =====
-    if is_qwen35 {
+    if let (true, Some(tp)) = (is_qwen35, args.tp) {
+        // ----- qwen35 dense tensor-parallel prefill scoring (`--tp N`) -----
+        // Hand dense-TP route over `tp` devices: the prefix and the scored
+        // region go through `forward_prefill_dense_tp_with_hidden` (the scored
+        // call captures the post-output-norm hidden row of every token on
+        // rank 0); the per-row lm_head + KLD scoring is the single-card code
+        // on rank 0's full output weights. `forward_prefill_dense_tp_with_hidden`
+        // chunks internally (`prefill_max_batch_tp`) and allocates its own
+        // per-call PrefillBatchScratch, so the rank `Qwen35Scratch` only needs
+        // the decode-batch width (128, as the serve loader) plus `kv_max`.
+        use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+        use hipfire_runtime::multi_gpu::Gpus;
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+        // A device-0 context from the single-card init above would sit beside
+        // rank 0's own; the TP route owns every device.
+        drop(gpu);
+
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let global = qwen35::config_from_hfq(&hfq).expect("read config");
+        if global.num_experts != 0 {
+            eprintln!(
+                "eval_hipfire: --tp is dense-only (num_experts={})",
+                global.num_experts
+            );
+            std::process::exit(1);
+        }
+        if ref_n_vocab != global.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                global.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: {e:?}");
+            std::process::exit(1)
+        });
+        let layouts = qwen35::dense_tp_rank_layouts(&global, &shard).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: dense TP layout: {e}");
+            std::process::exit(1)
+        });
+        qwen35::preflight_weights_dense_tp(&hfq, &global, &shard).unwrap_or_else(|e| {
+            eprintln!("eval_hipfire: --tp {tp}: dense TP preflight: {e}");
+            std::process::exit(1)
+        });
+        let configs: Vec<qwen35::Qwen35Config> = layouts
+            .iter()
+            .map(|l| qwen35::local_dense_tp_config(&global, l))
+            .collect();
+
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+
+        let mut gpus = Gpus::init_tp(tp, global.n_layers).expect("init_tp");
+        let kv_max = n_ctx + 16;
+        let (mut weights, mut scratches, mut kvs, mut dns) = (vec![], vec![], vec![], vec![]);
+        for (rank, g) in gpus.devices.iter_mut().enumerate() {
+            g.bind_thread().expect("bind rank thread");
+            g.active_stream = Some(g.hip.stream_create().expect("rank stream"));
+            let local = &configs[rank];
+            weights.push(
+                qwen35::load_weights_dense_tp_rank(&mut hfq, &global, g, &layouts[rank])
+                    .unwrap_or_else(|e| panic!("load TP rank {rank}: {e:?}")),
+            );
+            scratches
+                .push(Qwen35Scratch::new_with_kv_max(g, local, 128, kv_max).expect("rank scratch"));
+            kvs.push(
+                KvCache::new_gpu_q8(g, local.n_layers, local.n_kv_heads, local.head_dim, kv_max)
+                    .expect("rank kv"),
+            );
+            dns.push(DeltaNetState::new(g, local).expect("rank DeltaNet state"));
+        }
+        let peer = gpus.can_access_peer_all().expect("can_access_peer_all");
+        if peer {
+            gpus.prepare_tp2_whole_token_graph(global.n_layers * 2, global.dim * 4)
+                .expect("prepare_tp2_whole_token_graph");
+            assert!(gpus.enable_peer_all().expect("enable_peer_all"));
+        }
+        eprintln!("eval_hipfire: dense TP route=hand tp={tp} peer_access={peer}");
+        {
+            let mut knobs: Vec<(String, String)> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("HIPFIRE_TP_"))
+                .collect();
+            knobs.sort();
+            if knobs.is_empty() {
+                eprintln!("eval_hipfire: no HIPFIRE_TP_* env set");
+            }
+            for (k, v) in knobs {
+                eprintln!("eval_hipfire: {k}={v}");
+            }
+        }
+
+        gpus.devices[0].bind_thread().expect("bind rank 0");
+        let h_buf = gpus.devices[0]
+            .alloc_tensor(
+                &[scored_per_chunk + usize::from(pad_scoring_tail), global.dim],
+                DType::F32,
+            )
+            .expect("alloc hidden_buf");
+        let vocab = global.vocab_size;
+        let f16_lmhead = weights[0].output.gpu_dtype == DType::F16;
+
+        for c in 0..effective_n_chunk {
+            for (rank, g) in gpus.devices.iter_mut().enumerate() {
+                g.bind_thread().expect("bind rank thread");
+                dns[rank].reset(g).expect("reset DeltaNet state");
+            }
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            qwen35::forward_prefill_dense_tp_with_hidden(
+                &mut gpus,
+                &shard,
+                &weights,
+                &configs,
+                &chunk_tokens[0..scoring_start],
+                0,
+                &mut kvs,
+                &mut dns,
+                &scratches,
+                None,
+            )
+            .expect("forward_prefill_dense_tp prefix");
+            qwen35::forward_prefill_dense_tp_with_hidden(
+                &mut gpus,
+                &shard,
+                &weights,
+                &configs,
+                &chunk_tokens[scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail))],
+                scoring_start,
+                &mut kvs,
+                &mut dns,
+                &scratches,
+                Some(&h_buf),
+            )
+            .expect("forward_prefill_dense_tp scored");
+
+            gpus.devices[0].bind_thread().expect("bind rank 0");
+            let gpu0 = &mut gpus.devices[0];
+            let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
+                let alloc = gpu0
+                    .alloc_tensor(&[scored_per_chunk, vocab], DType::F32)
+                    .expect("alloc batched lm_head logits");
+                gpu0.gemm_f16_batched_lmhead(
+                    &weights[0].output.buf,
+                    &h_buf,
+                    &alloc,
+                    vocab,
+                    global.dim,
+                    scored_per_chunk,
+                )
+                .expect("gemm_f16_batched_lmhead");
+                Some(alloc)
+            } else {
+                None
+            };
+
+            for j in 0..scored_per_chunk {
+                let logits_view = if let Some(all_logits) = &batched_logits {
+                    all_logits.sub_offset(j * vocab, vocab)
+                } else {
+                    let row_view = h_buf.sub_offset(j * global.dim, global.dim);
+                    let ctx = hipfire_runtime::llama::DispatchCtx::new(gpu0);
+                    let _ = hipfire_runtime::llama::gemv_family()
+                        .run_auto(
+                            &ctx,
+                            gpu0,
+                            &weights[0].output.dispatch_ref(),
+                            &row_view,
+                            &scratches[0].logits,
+                        )
+                        .expect("gemv lm_head");
+                    scratches[0].logits.sub_offset(0, vocab)
+                };
+                let pos = scoring_start + j;
+                let actual_next = chunk_tokens[pos + 1] as usize;
+                ref_in.read_exact(&mut block_buf).expect("read ref block");
+                let cand_logits = gpu0.download_f32(&logits_view).expect("download logits");
+                let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                chunk_klds.push(kld);
+                if let Some(n) = nll {
+                    chunk_nll_sum += n;
+                    chunk_nll_count += 1;
+                }
+                total_scored_done += 1;
+                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                    let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    eprint!(
+                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                        c + 1,
+                        effective_n_chunk,
+                        total_scored_done,
+                        total_scored,
+                        pct,
+                        rate
+                    );
+                }
+            }
+            if let Some(alloc) = batched_logits {
+                let _ = gpus.devices[0].free_tensor(alloc);
+            }
+
+            let (mean, p99, mean_nll) = hipfire_runtime::eval_common::seq_stats(
+                &chunk_klds,
+                chunk_nll_sum,
+                chunk_nll_count,
+            );
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        let _ = gpus.devices[0].free_tensor(h_buf);
+        let _ = gpus.free_peer_reduce_scratch();
+    } else if is_qwen35 {
         // ----- qwen35 5|6 — WIRED (preserved byte-identical behavior) -----
         // Quant dtypes admitted: MQ4G256 (campaign --format mq4), MQ8G256,
         // HFQ4G256, Q8_0, F32, BF16 (via HIPFIRE_CALIB_BF16 / F32 widen). The
@@ -728,6 +1010,43 @@ fn main() {
                         plan.scored_rows * config.dim,
                     );
                     &whole_scored
+                } else if let Some(cap) = args.scored_max_batch {
+                    // `--scored-max-batch`: the same prefix call, then the
+                    // scored region as consecutive `cap`-row verify-capture
+                    // forwards (the shape of an MTP K = cap-1 verify).
+                    qwen35::forward_prefill_batch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[0..scoring_start],
+                        0,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("forward_prefill_batch prefix (scored-max-batch)");
+                    let scored_rows = scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail));
+                    qwen35::forward_prefill_batch_capped(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        &chunk_tokens[scored_rows],
+                        scoring_start,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                        None,
+                        Some(h_buf),
+                        None,
+                        None,
+                        cap,
+                    )
+                    .expect("forward_prefill_batch_capped scored");
+                    h_buf
                 } else {
                     qwen35::forward_prefill_batch(
                         &mut gpu,
@@ -1404,7 +1723,7 @@ fn main() {
         // ----- lfm2 11 — WIRED (dense 1.2b/350m, num_experts==0) -----
         // Quant dtypes admitted: dense projections Q8_0/HFQ4G256/MQ4G256 (batch_weight_formats_supported);
         // embeddings Q8/HFQ4; lm_head Q8/HFQ4/MQ4/HFQ6/MQ6/MQ3 (+F32/BF16 teachers).
-        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and forward_batch::batched_proj.
+        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and dispatch's ProjectLadder::Gemm.
         // Uses forward_decode_batch_lfm with explicit positions; KV is q8 and only some layers carry KV
         // (KvCache q8 filtered on is_kv_layer, lane_capacity = n_ctx+16).
         use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;

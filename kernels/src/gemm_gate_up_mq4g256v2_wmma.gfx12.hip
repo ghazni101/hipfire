@@ -58,11 +58,14 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma_gfx12(
     int K, int N
 ) {
     const int total_m = gate_m + up_m;
-    const int row_start = blockIdx.x * 16;
+    const int row_tiles = (total_m + 15) / 16;
+    // Persistent row-tile loop (HIPFIRE_GFX12_GATE_UP_TILE_LOOP): with
+    // gridDim.x == row_tiles this runs exactly one iteration per block.
+    for (int tile = blockIdx.x; tile < row_tiles; tile += gridDim.x) {
+    const int row_start = tile * 16;
     const int batch_start = blockIdx.y * 16;
     const int tid = threadIdx.x;
 
-    if (row_start >= total_m) return;
     if (batch_start >= N) return;
 
     // Lane decomposition (gfx12 wave32 WMMA):
@@ -172,6 +175,7 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma_gfx12(
                 Y[(long long)out_col * out_stride + proj_row] = acc[j];
             }
         }
+    }
     }
 }
 

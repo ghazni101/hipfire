@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Indexed MoE gate_up tail parity: K2816 (eleven groups, three-group tail)
-//! and K2048 (eight groups, no tail) through both the MQ4 launcher
+//! Indexed MoE gate_up tail parity: K2816 (eleven groups, three-group tail),
+//! K2048 (eight groups, no tail), and K512 / K1280 / K1536 (two / five / six
+//! groups: no full quad, tail 1, tail 2) through both the MQ4 launcher
 //! (`gemv_mq4g256_moe_gate_up_k8_indexed`, FWHT-rotated input) and the HFQ
 //! launcher (`gemv_hfq4g256_moe_gate_up_k8_indexed`, plain input), against a
 //! CPU dequant reference built from the documented 136 B/group packed layout.
@@ -22,8 +23,10 @@
 //!
 //!   cargo test -p rdna-compute --release --test moe_gate_up_tail_parity -- --ignored
 //!
-//! Tail-3 input lanes AND tail-group weights are forced nonzero, so a
-//! tail-dropping kernel fails the K2816 cases by construction.
+//! Tail input lanes AND tail-group weights are forced nonzero, so a
+//! tail-dropping kernel fails every K with K/256 % 4 != 0 by construction.
+//! K512 is the MiniMax tiny fixture's hidden size: the generic kernel wrote
+//! all-zero gate/up there, so routed experts contributed nothing (HIPF-92).
 
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -154,10 +157,10 @@ fn indexed_moe_gate_up_tail_parity() {
         return;
     }
 
-    // topk cycles 2 experts; x tail lanes forced nonzero for K=2816.
+    // topk cycles 2 experts; x lanes past the last full group quad forced nonzero.
     let topk: Vec<i32> = (0..K_TOP).map(|j| (j % N_EXP) as i32).collect();
 
-    for k in [2816usize, 2048usize] {
+    for k in [2816usize, 2048, 512, 1280, 1536] {
         let groups = k / 256;
         let mut st = 0xABCDu64 + k as u64;
         let mut x: Vec<f32> = (0..k)
@@ -168,8 +171,9 @@ fn indexed_moe_gate_up_tail_parity() {
                 ((st >> 40) as f32 / (1u64 << 24) as f32) - 0.5
             })
             .collect();
-        if k == 2816 {
-            for (i, v) in x[2048..].iter_mut().enumerate() {
+        let quad_end = k / 1024 * 1024;
+        if quad_end < k {
+            for (i, v) in x[quad_end..].iter_mut().enumerate() {
                 *v = if i % 2 == 0 { 0.75 } else { -0.75 };
             }
         }

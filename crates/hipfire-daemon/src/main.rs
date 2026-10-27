@@ -35,13 +35,12 @@ use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
     ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
     deepseek4_spec_requested_from_policy, emit_qwen_ar_done, generate, llama_prefill_sample_seed,
-    llama_qwen3_batched_prefill_eligible, model_retry_reset_eligible, qwen_ar_apply_cache_action,
-    qwen_ar_cache_action, qwen_ar_done_value, qwen_ar_drain_pending_into_router,
-    qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
-    qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
-    qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
-    select_generation_route, truncate_checkpoints, write_error, GenerationRoute,
-    GenerationRouteInputs, QwenArCacheAction, QwenArForwardFailAction, QwenArRawCommitDisposition,
+    model_retry_reset_eligible, qwen_ar_cache_action, qwen_ar_done_value,
+    qwen_ar_drain_pending_into_router, qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route,
+    qwen_ar_forward_fail_action, qwen_ar_forward_fail_message, qwen_ar_observe_and_route,
+    qwen_ar_raw_commit_token, qwen_ar_route_filter_text, qwen_ar_route_think_events,
+    reset_core_arch_key, select_generation_route, truncate_checkpoints, write_error,
+    GenerationRoute, GenerationRouteInputs, QwenArForwardFailAction, QwenArRawCommitDisposition,
     QwenArRouteFinish, QwenArSemanticProducer, QwenArTerminalCause,
 };
 use hipfire_generate::batch::{
@@ -590,7 +589,7 @@ fn media_refusal_message(tower: MediaTower, vision_gated_off: Option<&str>) -> S
     let noun = tower.noun();
     match vision_gated_off {
         Some(sidecar) => format!(
-            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+            "model has no {noun} encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `resident`/`on`) and reload"
         ),
         None => format!("model has no {noun} encoder"),
     }
@@ -1752,9 +1751,25 @@ fn main() {
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string()),
                 };
+                // DFlash is not served on an EP/TP mesh (tp>1 refuses a draft
+                // below). An `auto` mode only pairs the registry draft when one
+                // exists, so on tp>1 it drops the pairing instead of failing
+                // the load; an explicit `on` still reaches that refusal.
+                let draft_tp = msg
+                    .get("params")
+                    .and_then(|p| p.get("tp"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 let draft_path = if dflash_mode == "off" {
                     if let Some(d) = raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
+                    }
+                    None
+                } else if dflash_mode == "auto" && draft_tp > 1 {
+                    if let Some(d) = raw_draft {
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=auto with tp={draft_tp} — DFlash is not served on EP/TP; skipping draft load ({d})"
+                        );
                     }
                     None
                 } else {
@@ -1767,10 +1782,10 @@ fn main() {
                 // admission validates (arch 5|6, tower tensor present) and the
                 // Qwen35 carrier loads the tower from it.
                 //
-                // `vision_mode=off` (the default) is a hard daemon-side override,
+                // `vision_mode=off` is a hard daemon-side override,
                 // mirroring the `dflash_mode=off` guard above: even an explicit
-                // sidecar is skipped, so a default load never pays the +~1 GB
-                // tower VRAM. CLI-side gating is the primary path; this guard
+                // sidecar is skipped, so an `off` load never pays the +~1 GB
+                // tower VRAM (the schema default is `auto`). CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
                 //
                 // One implementation for both load arms: `resolve_vision_ladder`
@@ -3520,7 +3535,17 @@ fn main() {
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
                 let has_vl = m.has_vision_encoder();
                 let tp = m.ep.is_some();
-                if request_guards::refuse_ep_request(&mut stdout, id, &msg, tp, has_image) {
+                let tp_penalties =
+                    m.ep.as_ref()
+                        .is_some_and(|ep| ep.inner.applies_request_penalties());
+                if request_guards::refuse_ep_request(
+                    &mut stdout,
+                    id,
+                    &msg,
+                    tp,
+                    tp_penalties,
+                    has_image,
+                ) {
                     continue;
                 }
 
@@ -4885,6 +4910,23 @@ fn main() {
                     kv_warning_json,
                     kv_mode_json,
                 );
+                // Windows only: which amdhip64*.dll actually loaded (System32's
+                // driver copy can shadow an SDK's) and the raw runtime/driver
+                // version ints. null when unavailable. Same splice as
+                // `append_diag_emu` below.
+                #[cfg(windows)]
+                {
+                    let lib_json = serde_json::to_string(&gpu.hip.mapped_hip_library())
+                        .expect("hip_runtime_library serializable");
+                    let rt_json = serde_json::to_string(&gpu.hip.runtime_version_raw().ok())
+                        .expect("hip_runtime_version_raw serializable");
+                    let drv_json = serde_json::to_string(&gpu.hip.driver_version().ok())
+                        .expect("hip_driver_version_raw serializable");
+                    diag_line.pop();
+                    diag_line.push_str(&format!(
+                        r#","hip_runtime_library":{lib_json},"hip_runtime_version_raw":{rt_json},"hip_driver_version_raw":{drv_json}}}"#
+                    ));
+                }
                 emu_daemon::append_diag_emu(&gpu, &mut diag_line);
                 let _ = writeln!(stdout, "{diag_line}");
                 let _ = stdout.flush();
@@ -5129,8 +5171,8 @@ mod tests {
     }
 
     #[test]
-    fn vision_mode_auto_and_on_pass_the_ladder_result_through() {
-        for mode in ["auto", "on"] {
+    fn vision_mode_auto_resident_and_on_pass_the_ladder_result_through() {
+        for mode in ["auto", "resident", "on"] {
             assert_eq!(
                 apply_vision_mode_gate(mode, Some("/models/qwen3.8-27b-vision.hfq".into())),
                 Some("/models/qwen3.8-27b-vision.hfq".to_owned())

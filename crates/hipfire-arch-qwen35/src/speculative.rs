@@ -231,7 +231,7 @@ fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) ->
     }
 }
 
-fn dflash_moe_verify_graph_lmhead_eligible(
+pub(crate) fn dflash_moe_verify_graph_lmhead_eligible(
     num_experts: usize,
     want_full_logits: bool,
     tree_verify_present: bool,
@@ -308,7 +308,7 @@ pub(crate) fn dflash_verify_graph_env_eligible(
     true
 }
 
-fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
+pub(crate) fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
     matches!(
         dtype,
         rdna_compute::DType::Q8_0
@@ -1126,7 +1126,16 @@ impl ModelSlot {
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
-        let scratch = Qwen35Scratch::new(gpu, &config, slot_config.repeat_window)?;
+        // Size flash partials for the slot's real KV capacity (as the carrier
+        // path does). `Qwen35Scratch::new` assumes 8192, which at long context
+        // leaves room for one verify row, so VerifyAttn re-scans the whole KV
+        // once per verify row.
+        let scratch = Qwen35Scratch::new_with_kv_max(
+            gpu,
+            &config,
+            slot_config.repeat_window,
+            slot_config.max_seq.max(8192),
+        )?;
 
         Ok(Self {
             name,
@@ -3315,6 +3324,18 @@ impl VerifyScratch {
     }
 }
 
+/// Host-state change of committing staged rows to the hidden ring (design A
+/// `WindowHostDelta` ring transitions): head `from -> to`, written
+/// `from -> to`. Computed by [`HiddenStateRingBuffer::commit_delta`], published
+/// once by [`HiddenStateRingBuffer::apply_commit_delta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HiddenCommitDelta {
+    pub head_from: usize,
+    pub head_to: usize,
+    pub written_from: usize,
+    pub written_to: usize,
+}
+
 pub struct HiddenStateRingBuffer {
     pub layer_bufs: Vec<GpuTensor>,
     pub extract_layers: Vec<usize>,
@@ -3551,6 +3572,55 @@ impl HiddenStateRingBuffer {
     /// rest of the engine relies on for ordering with null-stream consumers
     /// (e.g. the draft forward's D2H of hidden rows after this commit).
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        // If running under an explicit stream (graph capture path), wait
+        // for the captured writes to complete before the scatter so we
+        // don't read uninitialized staging.
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        self.emit_commit_staging(gpu, n)?;
+        // Head/written advance only after successful enqueue, preserving the
+        // existing stream synchronization boundary above.
+        let delta = self.commit_delta(n);
+        self.apply_commit_delta(delta);
+        Ok(())
+    }
+
+    /// The host-state change committing `n` staged rows makes: head
+    /// `(head + n) % max_positions`, written `+ n`. Pure (design A
+    /// `WindowHostDelta` ring transitions); nothing is published until
+    /// [`Self::apply_commit_delta`].
+    pub fn commit_delta(&self, n: usize) -> HiddenCommitDelta {
+        HiddenCommitDelta {
+            head_from: self.head,
+            head_to: (self.head + n) % self.max_positions,
+            written_from: self.written,
+            written_to: self.written + n,
+        }
+    }
+
+    /// Publish a [`HiddenCommitDelta`] computed against the current head.
+    pub fn apply_commit_delta(&mut self, delta: HiddenCommitDelta) {
+        debug_assert_eq!(
+            delta.head_from, self.head,
+            "stale hidden commit delta (head)"
+        );
+        debug_assert_eq!(
+            delta.written_from, self.written,
+            "stale hidden commit delta (written)"
+        );
+        self.head = delta.head_to;
+        self.written = delta.written_to;
+    }
+
+    /// GPU half of [`Self::commit_staging_to_ring`]: enqueue the staging ->
+    /// ring scatter at the current head. No stream synchronization and no
+    /// host-state mutation (head/written stay put; apply
+    /// [`Self::commit_delta`] separately). Returns `true` when the scatter is
+    /// the fused `commit5` kernel, whose `head` kernarg (byte 80) is the one
+    /// per-window scalar; `false` when the per-extract copy loop ran (its
+    /// copy offsets bake the head).
+    pub fn emit_commit_staging(&self, gpu: &mut Gpu, n: usize) -> HipResult<bool> {
         assert!(
             n <= self.max_batch,
             "commit_staging_to_ring: n {} > staging max_batch {} — a chunk wider than \
@@ -3562,12 +3632,6 @@ impl HiddenStateRingBuffer {
         let head = self.head;
         let max_pos = self.max_positions;
 
-        // If running under an explicit stream (graph capture path), wait
-        // for the captured writes to complete before the scatter so we
-        // don't read uninitialized staging.
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_synchronize(stream)?;
-        }
         // S2 launch fusion: pure-copy commit5 kernel (exact gfx1100/gfx1151/gfx1201). Copies
         // staging[ext][r, :] -> layer_bufs[ext][(head + r) % max_pos, :] for
         // all five extracts in one launch (bit-identical: one writer per
@@ -3576,8 +3640,6 @@ impl HiddenStateRingBuffer {
         // reuses without its own `&mut` ensure. Any failed predicate
         // (non-admitted arch, kill switch, capture/recording, non-5-extract or
         // non-F32 shapes, n > max_pos) falls through to today's loop.
-        // Head/written advance only after successful enqueue, preserving the
-        // existing stream synchronization boundary above.
         if gpu.dflash_hidden_commit5_applicable(
             &self.staging_bufs,
             &self.layer_bufs,
@@ -3593,9 +3655,7 @@ impl HiddenStateRingBuffer {
                 self.hidden_dim,
                 max_pos,
             )?;
-            self.head = (head + n) % max_pos;
-            self.written += n;
-            return Ok(());
+            return Ok(true);
         }
 
         for ei in 0..self.layer_bufs.len() {
@@ -3625,9 +3685,7 @@ impl HiddenStateRingBuffer {
                 )?;
             }
         }
-        self.head = (head + n) % max_pos;
-        self.written += n;
-        Ok(())
+        Ok(false)
     }
 
     /// Whether a ring-carrying prompt prefill may take the ordinary (AR)
@@ -5364,10 +5422,15 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
 /// Actual verify-route facts the decision→commit body needs. These are
 /// measured by whoever ran the verify forward, never assumed by the commit.
 ///
-/// * `verify_on_hip`: the verify ran the ordinary HIP/HipGraph body (no
-///   retained-PM4 route, or a PM4 route that planned this window as an ordinary
-///   HIP window). Only then may a full accept keep the verify-advanced DeltaNet
-///   state (pre-factor singleton `spec_step_dflash` lines 7174-7180).
+/// * `same_as_hip_graph`: certified state parity
+///   (`railgun::window::WindowVerifyReceipt::same_as_hip_graph`): the verify
+///   left exactly the state the ordinary HIP/HipGraph body leaves (live
+///   DeltaNet, tape, KV, hidden staging, frames). True for the ordinary
+///   HIP/HipGraph route (or a PM4 route that planned this window as an
+///   ordinary HIP window) and for a railgun window whose plan was certified;
+///   false for legacy retained-PM4 windows. Only then may a full accept keep
+///   the verify-advanced DeltaNet state (pre-factor singleton
+///   `spec_step_dflash` lines 7174-7180).
 /// * `tape_populated`: the verify actually captured the GDN tape into the
 ///   state's `gdn_tape` at offset 0 (caller supplied a tape AND
 ///   `prefill_batch_pbs_eligible` held; the singleton's
@@ -5375,13 +5438,13 @@ fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape:
 ///   forward fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DflashVerifyReceipt {
-    pub verify_on_hip: bool,
+    pub same_as_hip_graph: bool,
     pub tape_populated: bool,
 }
 
 /// Receipt for a window whose verify ran the shared eager HIP route
 /// (`forward_prefill_batch` + tape capture) over `b` rows on explicit trunk
-/// owners: `verify_on_hip = true`, `tape_populated` = the actual
+/// owners: `same_as_hip_graph = true`, `tape_populated` = the actual
 /// `prefill_batch_pbs_eligible` decision the verify used (pre-factor greedy
 /// lines 3839-3853).
 pub fn dflash_eager_hip_verify_receipt(
@@ -5405,7 +5468,7 @@ pub fn dflash_eager_hip_verify_receipt(
         moe_router_logits_present,
     );
     DflashVerifyReceipt {
-        verify_on_hip: true,
+        same_as_hip_graph: true,
         tape_populated: dflash_use_gdn_tape_replay(true, verify_populates_tape),
     }
 }
@@ -5438,7 +5501,7 @@ struct DflashCommitWindow<'a> {
     seed_token: u32,
     block: &'a [u32],
     decision: SampledWindowDecision,
-    verify_on_hip: bool,
+    same_as_hip_graph: bool,
     phase_on: bool,
 }
 
@@ -5478,7 +5541,7 @@ fn dflash_commit_decision_borrowed(
         seed_token,
         block,
         decision,
-        verify_on_hip,
+        same_as_hip_graph,
         phase_on,
     } = window;
     let b = block.len();
@@ -5553,7 +5616,7 @@ fn dflash_commit_decision_borrowed(
         tape.replay_from_snapshot_admits(gpu, &*target.dn_state, target_snap, accept_len + 1)
     });
     let keep_verified = replay_from_snapshot
-        && verify_on_hip
+        && same_as_hip_graph
         && accept_len + 1 == b
         && !target.dn_state.s_ef_residual.is_empty();
     if !replay_from_snapshot {
@@ -5677,7 +5740,7 @@ pub fn dflash_commit_decision_parts(
             seed_token: draft.seed,
             block,
             decision,
-            verify_on_hip: verify.verify_on_hip,
+            same_as_hip_graph: verify.same_as_hip_graph,
             phase_on: false,
         },
     )?;
@@ -5931,6 +5994,119 @@ fn verify_dflash_block_inner(
     r
 }
 
+/// Launch-fusion context of a verify window: the frozen AR/verify
+/// discriminator. The split variant is selected only when this exact live
+/// window also satisfies the dense gfx1100 Q8 attention route. That prevents
+/// the split flag from widening capture-time F16/LDS auxiliary kernels below
+/// the crossover or on unsupported model shapes. Shared by the verify body
+/// and the railgun plan emitter so both read one decision.
+pub(crate) fn dflash_verify_fusion_ctx(
+    gpu: &Gpu,
+    target: &ModelSlot,
+    tree_verify_present: bool,
+    b: usize,
+    required_tokens: usize,
+) -> qwen35::DflashFusionCtx {
+    if !tree_verify_present {
+        if qwen35::prefill::gfx1100_split_verify_admitted(
+            gpu,
+            &target.config,
+            target.kv_cache.quant_q8 && matches!(target.kv_cache.v_mode, llama::VMode::Q8),
+            target.kv_cache.uses_vmm_backend(),
+            b,
+            required_tokens,
+            target.scratch.flash_partials.numel(),
+        ) {
+            qwen35::DflashFusionCtx::ChainVerifySplit
+        } else {
+            qwen35::DflashFusionCtx::ChainVerify
+        }
+    } else {
+        qwen35::DflashFusionCtx::Off
+    }
+}
+
+/// Route class of one DFlash verify window for the HipGraph cache: does the
+/// gfx1201 native-fp8 split-KV verifier (`Gpu::fp8_fa2_split_verify_admitted`)
+/// serve it at its LIVE context (`start_pos + b`)? A captured graph replays
+/// at any context, so it is re-captured whenever this class changes (the
+/// graph's attend is sized by `physical_cap`, which says nothing about the
+/// window). Plain chain verify only: tree windows and non-fp8 KV never take
+/// the route.
+fn dflash_fp8_split_verify_class(
+    gpu: &Gpu,
+    target: &ModelSlot,
+    start_pos: usize,
+    b: usize,
+    tree: bool,
+) -> bool {
+    !tree
+        && target.kv_cache.quant_fp8
+        && gpu
+            .fp8_fa2_split_verify_admitted(
+                start_pos + b,
+                target.config.n_heads,
+                target.config.n_kv_heads,
+                target.config.head_dim,
+                b,
+                target.scratch.flash_partials.numel(),
+            )
+            .is_some()
+}
+
+/// Whether this verify window takes the HIP-graph body (warmup / capture /
+/// replay of `forward_prefill_batch_single_chunk_captured_opts`). Shared by
+/// the verify body and the railgun plan emitter so both read one decision.
+pub(crate) fn dflash_verify_hip_graph_route_ok(
+    gpu: &Gpu,
+    target: &ModelSlot,
+    verify_scratch: &VerifyScratch,
+    b: usize,
+    tree_ok_for_graph: bool,
+) -> bool {
+    // NB: NO Q8-long-context skip-gate here. The captured single-chunk verify
+    // forward is capture-safe at any physical_cap for Q8 (non-asym) KV:
+    // forward_prefill_chunk routes max_ctx_len > 8192 to the tiled
+    // attention_flash_q8_0_tile_batched (O(1) LDS, no per-position malloc), so there
+    // is no malloc-in-capture and no per-ctx LDS scaling — see the comment in
+    // forward_prefill_batch_single_chunk_captured in qwen35.rs. The former
+    // `VERIFY_GRAPH_Q8_CTX_LIMIT = 15000` skip (re-introduced by #481, obsolete once
+    // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
+    // would skip a verify-graph that now replays fine and forfeit the long-context
+    // spec speedup.
+    let moe_router_logits_present = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|pbs| pbs.moe_router_logits_batch.is_some())
+        .unwrap_or(true);
+    let pbs_eligible = qwen35::prefill_batch_pbs_eligible(
+        &target.weights,
+        &target.config,
+        &target.dn_state,
+        b,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
+    // See `dflash_verify_graph_env_eligible`: exact gfx1100 MQ*V2 / MQ4G256 and
+    // exact gfx1201 MQ4G256 are default-off for HipGraph only.
+    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
+    dflash_verify_graph_env_eligible(
+        gpu.arch.as_str(),
+        target.weights.output.gpu_dtype,
+        verify_graph_env.as_deref(),
+    ) && tree_ok_for_graph
+        && matches!(
+            target.weights.embd_format,
+            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
+                | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
+        )
+        && verify_scratch.prefill_batch.is_some()
+        && pbs_eligible
+        // IU4 verify: the gfx1201 A4 producers are eager-only (their gates
+        // refuse capture), so the scoped verify always runs eager.
+        && !gpu.iu4_verify_scope
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_dflash_block_inner_body(
     gpu: &mut Gpu,
@@ -5990,23 +6166,7 @@ fn verify_dflash_block_inner_body(
     // dense gfx1100 Q8 attention route. That prevents the split flag from
     // widening capture-time F16/LDS auxiliary kernels below the crossover or
     // on unsupported model shapes.
-    let fusion = if tree_verify.is_none() {
-        if qwen35::prefill::gfx1100_split_verify_admitted(
-            gpu,
-            &target.config,
-            target.kv_cache.quant_q8 && matches!(target.kv_cache.v_mode, llama::VMode::Q8),
-            target.kv_cache.uses_vmm_backend(),
-            b,
-            required_tokens,
-            target.scratch.flash_partials.numel(),
-        ) {
-            qwen35::DflashFusionCtx::ChainVerifySplit
-        } else {
-            qwen35::DflashFusionCtx::ChainVerify
-        }
-    } else {
-        qwen35::DflashFusionCtx::Off
-    };
+    let fusion = dflash_verify_fusion_ctx(gpu, target, tree_verify_present, b, required_tokens);
     let moe_lmhead_graph_env =
         hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
@@ -6082,37 +6242,8 @@ fn verify_dflash_block_inner_body(
     // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
     // would skip a verify-graph that now replays fine and forfeit the long-context
     // spec speedup.
-    let moe_router_logits_present = verify_scratch
-        .prefill_batch
-        .as_ref()
-        .map(|pbs| pbs.moe_router_logits_batch.is_some())
-        .unwrap_or(true);
-    let pbs_eligible = qwen35::prefill_batch_pbs_eligible(
-        &target.weights,
-        &target.config,
-        &target.dn_state,
-        b,
-        gpu.arch.as_str(),
-        moe_router_logits_present,
-    );
-    // See `dflash_verify_graph_env_eligible`: exact gfx1100 MQ*V2 / MQ4G256 and
-    // exact gfx1201 MQ4G256 are default-off for HipGraph only.
-    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
-    let verify_graph_ok = dflash_verify_graph_env_eligible(
-        gpu.arch.as_str(),
-        target.weights.output.gpu_dtype,
-        verify_graph_env.as_deref(),
-    ) && tree_ok_for_graph
-        && matches!(
-            target.weights.embd_format,
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
-                | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
-        )
-        && verify_scratch.prefill_batch.is_some()
-        && pbs_eligible
-        // IU4 verify: the gfx1201 A4 producers are eager-only (their gates
-        // refuse capture), so the scoped verify always runs eager.
-        && !gpu.iu4_verify_scope;
+    let verify_graph_ok =
+        dflash_verify_hip_graph_route_ok(gpu, target, verify_scratch, b, tree_ok_for_graph);
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
@@ -6173,6 +6304,30 @@ fn verify_dflash_block_inner_body(
         }
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+        // gfx1201 native-fp8 split-KV verifier: the route depends on this
+        // window's LIVE context (`start_pos + b`), which a replay cannot
+        // change, so the graph carries the route class it was captured in.
+        // Load the launcher's kernels and grow its Q scratch HERE, outside
+        // any capture (growth may drop graph state, so before the cache is
+        // consulted); then a graph whose class differs from this window's is
+        // dropped and re-warmed/captured at the new class.
+        let split_class =
+            dflash_fp8_split_verify_class(gpu, target, start_pos, b, tree_verify.is_some());
+        if split_class && !gpu.fp8_fa2_split_verify_capture_ready(b) {
+            gpu.fp8_fa2_split_verify_prepare_capture(b)?;
+        }
+        if gpu.graphs.verify_has_graph(b) && gpu.graphs.verify_graph_has_fp8_split(b) != split_class
+        {
+            gpu.hip
+                .stream_synchronize(gpu.active_stream.as_ref().unwrap())?;
+            gpu.graphs.verify_graph_destroy(&gpu.hip, gpu.device_id, b);
+            eprintln!(
+                "[verify-graph] B={} route class changed at ctx {} (fp8 split-KV verify {}) — re-warming",
+                b,
+                start_pos + b,
+                if split_class { "on" } else { "off" },
+            );
         }
         if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
@@ -6313,6 +6468,9 @@ fn verify_dflash_block_inner_body(
                 if capture_lmhead_argmax {
                     gpu.graphs.verify_mark_graph_lmhead_argmax(b);
                     graph_includes_lmhead_argmax = true;
+                }
+                if split_class {
+                    gpu.graphs.verify_mark_graph_fp8_split(b);
                 }
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
@@ -7257,9 +7415,12 @@ pub fn download_hidden_block(
 /// Returns `true` when the fast path ran. Returns `false` — leaving every
 /// buffer untouched — when the route predicates fail, in which case the
 /// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
-/// exact gfx1100, `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, `1 <= b <=
-/// max_block_size`. The batched kernel dequantizes each row with the same
-/// per-element math as the scalar loop, so the plane is bit-identical.
+/// `1 <= b <= max_block_size`, and either exact gfx1100 with
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset or the gfx1201 batched noise lookup
+/// ([`noise_embed_batch_admitted`], kill switch
+/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0`) that the lane-batched draft already
+/// uses. The batched kernel dequantizes each row with the same per-element
+/// math as the scalar loop, so the plane is bit-identical.
 ///
 /// Weights-based core shared with the dense-TP mesh (which owns rank shards,
 /// not a `ModelSlot`).
@@ -7276,11 +7437,13 @@ pub fn build_dflash_noise_embeddings_weights(
     ) {
         return Ok(false);
     }
-    if !gpu.draft_collapse_fused_enabled() {
-        return Ok(false);
-    }
     let b = block.len();
     if b == 0 || b > draft_scratch.max_block_size {
+        return Ok(false);
+    }
+    if !gpu.draft_collapse_fused_enabled()
+        && !noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b)
+    {
         return Ok(false);
     }
     let ids: Vec<i32> = block.iter().map(|&t| t as i32).collect();
@@ -7600,6 +7763,135 @@ fn draft_dflash_forward_rank(
     Ok(())
 }
 
+/// The batched LM-head GEMM of the draft (rows `1..B` of `draft_scratch.x`
+/// into `logits`) for every `use_batched_gemm` weight dtype: the one launch
+/// sequence shared by [`draft_dflash_block_rank`] and the planned draft
+/// emitter (`dflash_draft_emit`). `hidden_rows` is `x[h..]`, `logits_batch`
+/// the `[batch × vocab]` view of `verify_scratch.logits`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draft_lmhead_batched(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    verify_scratch: &VerifyScratch,
+    hidden_rows: &GpuTensor,
+    logits_batch: &GpuTensor,
+    batch: usize,
+    h: usize,
+) -> HipResult<()> {
+    match w_out.gpu_dtype {
+        rdna_compute::DType::Q8_0 => {
+            dflash_gemm_q8_lmhead(gpu, w_out, hidden_rows, logits_batch, batch)?;
+        }
+        rdna_compute::DType::HFQ4G256 => {
+            run_spec_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
+                &w_out.buf,
+                w_out.gpu_dtype,
+                hidden_rows,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        rdna_compute::DType::MQ4G256 => {
+            assert!(
+                batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for draft lm_head"
+            );
+            let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+            llama::rotate_x_mq_batched_for(gpu, w_out, hidden_rows, &rotated, h, batch)?;
+            run_spec_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
+                &w_out.buf,
+                w_out.gpu_dtype,
+                &rotated,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        rdna_compute::DType::MQ4G256V2
+        | rdna_compute::DType::MQ6G256V2
+        | rdna_compute::DType::MQ5G256V2
+        | rdna_compute::DType::MQ3G256V2
+        | rdna_compute::DType::MQ2G256V2 => {
+            assert!(
+                batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ v2 draft lm_head"
+            );
+            let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+            llama::rotate_x_mq_batched_for(gpu, w_out, hidden_rows, &rotated, h, batch)?;
+            gemm_mq_batched_lmhead_draft(
+                gpu,
+                w_out.gpu_dtype,
+                &w_out.buf,
+                &rotated,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        rdna_compute::DType::MQ3G256 => {
+            assert!(
+                batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ3 draft lm_head"
+            );
+            let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+            llama::rotate_x_mq_batched_for(gpu, w_out, hidden_rows, &rotated, h, batch)?;
+            run_spec_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq3G256BatchedLmhead,
+                &w_out.buf,
+                w_out.gpu_dtype,
+                &rotated,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        rdna_compute::DType::HFQ6G256 => {
+            run_spec_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
+                &w_out.buf,
+                w_out.gpu_dtype,
+                hidden_rows,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        rdna_compute::DType::MQ6G256 => {
+            assert!(
+                batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ6 draft lm_head"
+            );
+            let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+            llama::rotate_x_mq_batched_for(gpu, w_out, hidden_rows, &rotated, h, batch)?;
+            run_spec_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
+                &w_out.buf,
+                w_out.gpu_dtype,
+                &rotated,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 /// Greedy rank-local draft production: the forward prefix above plus the
 /// temp==0 LM-head leaves (batched GEMM + selector-device / GPU argmax, or
 /// the non-batched selector-host / per-row argmax fallbacks). Returns
@@ -7608,7 +7900,7 @@ fn draft_dflash_forward_rank(
 /// stay inline in `spec_step_dflash`. Called by the single-GPU greedy fast
 /// path and by every dense-TP mesh rank.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn draft_dflash_block_rank(
+pub fn draft_dflash_block_rank(
     gpu: &mut Gpu,
     target_weights: &Qwen35Weights,
     draft_weights: &DflashWeights,
@@ -7667,117 +7959,15 @@ pub(crate) fn draft_dflash_block_rank(
         );
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
-        match w_out.gpu_dtype {
-            rdna_compute::DType::Q8_0 => {
-                dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)?;
-            }
-            rdna_compute::DType::HFQ4G256 => {
-                run_spec_gemm_key(
-                    gpu,
-                    hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
-                    &w_out.buf,
-                    w_out.gpu_dtype,
-                    &hidden_rows,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ4G256 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                run_spec_gemm_key(
-                    gpu,
-                    hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
-                    &w_out.buf,
-                    w_out.gpu_dtype,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ4G256V2
-            | rdna_compute::DType::MQ6G256V2
-            | rdna_compute::DType::MQ5G256V2
-            | rdna_compute::DType::MQ3G256V2
-            | rdna_compute::DType::MQ2G256V2 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ v2 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gemm_mq_batched_lmhead_draft(
-                    gpu,
-                    w_out.gpu_dtype,
-                    &w_out.buf,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ3G256 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ3 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                run_spec_gemm_key(
-                    gpu,
-                    hipfire_dispatch::types::KernelKey::GemmHfq3G256BatchedLmhead,
-                    &w_out.buf,
-                    w_out.gpu_dtype,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::HFQ6G256 => {
-                run_spec_gemm_key(
-                    gpu,
-                    hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
-                    &w_out.buf,
-                    w_out.gpu_dtype,
-                    &hidden_rows,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            rdna_compute::DType::MQ6G256 => {
-                assert!(
-                    batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
-                    "verify_scratch.rot undersized for MQ6 draft lm_head"
-                );
-                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                run_spec_gemm_key(
-                    gpu,
-                    hipfire_dispatch::types::KernelKey::GemmHfq6G256BatchedLmhead,
-                    &w_out.buf,
-                    w_out.gpu_dtype,
-                    &rotated,
-                    &logits_batch,
-                    w_out.m,
-                    w_out.k,
-                    batch,
-                )?;
-            }
-            _ => unreachable!(),
-        }
+        draft_lmhead_batched(
+            gpu,
+            w_out,
+            verify_scratch,
+            &hidden_rows,
+            &logits_batch,
+            batch,
+            h,
+        )?;
         if selector_mode {
             let proposal = dflash::propose_candidates_device(
                 gpu,
@@ -7926,7 +8116,7 @@ static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLo
 /// `(float)half(d) * (float)int8(q)` with the same 256-thread element
 /// striding — one block per row instead of one launch per row — so each
 /// row's bytes cannot differ.
-fn noise_embed_batch_admitted(
+pub(crate) fn noise_embed_batch_admitted(
     gpu: &Gpu,
     target_weights: &Qwen35Weights,
     shared: &DflashScratch,
@@ -8470,6 +8660,16 @@ pub trait DflashTailSource {
     /// `Some(k)` with `1 <= k` and the tail (`1..=b-1-k` tokens) written into
     /// `tail` (cleared first); `None` keeps the incumbent window unchanged.
     fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize>;
+
+    /// `NoTailAction` (railgun design A "Whole16 vs HostSplice"): a pure,
+    /// conservative predicate over the source's current (immutable) decision
+    /// state. `true` only when **no** `splice` over a `candidates`-candidate
+    /// learned block can return `Some`, whatever the learned tokens and
+    /// whatever the lookup context offers. The default `false` never proves
+    /// it, so an unknown source always keeps the HostSplice shape.
+    fn declines_every_tail(&self, _candidates: usize) -> bool {
+        false
+    }
 }
 
 fn lookup_err(msg: &str) -> hip_bridge::HipError {
@@ -8737,6 +8937,87 @@ pub fn spec_step_dflash(
     verify_pm4: Option<&mut DflashVerifyPm4>,
     lookup: Option<DflashLookup<'_>>,
 ) -> HipResult<SpecStepResult> {
+    spec_step_dflash_with_railgun(
+        gpu,
+        target,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        hidden_rb,
+        target_hidden_host,
+        target_snap,
+        verify_scratch,
+        position,
+        seed_token,
+        ctx_slice,
+        gdn_tape,
+        temp,
+        top_p,
+        top_k,
+        rng_state,
+        block_size_override,
+        ngram_cache,
+        prev_committed,
+        cactus_delta,
+        pld_spine,
+        repeat_penalty,
+        repeat_window,
+        max_accept,
+        verify_pm4,
+        lookup,
+        None,
+    )
+}
+
+/// The railgun window owner a `DflashSpeculator` lends one DFlash window
+/// (`None` everywhere else: [`spec_step_dflash`] passes `None`, so every
+/// other caller keeps the incumbent route byte for byte).
+pub struct RailgunStep<'a> {
+    pub owner: &'a mut crate::dflash_railgun::RailgunWindowOwner,
+    /// The lookup layer planned this window as a price probe (it keeps its
+    /// HIP owner).
+    pub probe: bool,
+}
+
+/// [`spec_step_dflash`] with an optional certified-window owner (design A
+/// slice A6). With `railgun = None` this is `spec_step_dflash` exactly. With
+/// `Some`, an admitted window runs `Whole16` (draft + selector + verify +
+/// hidden commit in one lowered segment, then the unchanged CPU accept /
+/// clamp / scatter / GDN repair) or `HostSplice` (draft segment, then the
+/// existing host splice and the incumbent verify at its actual B); any
+/// refusal before the queue is touched runs the window on the ordinary HIP
+/// route with nothing changed.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_dflash_with_railgun(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    verify_scratch: &VerifyScratch,
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    mut gdn_tape: Option<&mut GdnTape>,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+    block_size_override: Option<usize>,
+    ngram_cache: Option<&NgramCache>,
+    prev_committed: &[u32],
+    cactus_delta: f32,
+    pld_spine: Option<&[u32]>,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_accept: Option<usize>,
+    verify_pm4: Option<&mut DflashVerifyPm4>,
+    lookup: Option<DflashLookup<'_>>,
+    mut railgun: Option<RailgunStep<'_>>,
+) -> HipResult<SpecStepResult> {
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
         if pld_spine.is_some() {
@@ -8908,7 +9189,126 @@ pub fn spec_step_dflash(
     let mut c8_draft_tokens_dev: Option<GpuTensor> = None;
     let mut c8_draft_p_at_token_dev: Option<GpuTensor> = None;
 
-    if let Some(pld) = pld_spine {
+    // ── Railgun certified window (design A slice A6) ────────────────────
+    // Inert unless the speculator lends an owner (`HIPFIRE_DFLASH_RAILGUN_WINDOW=1`
+    // at build): with `railgun = None` nothing below this comment block
+    // executes and every later stage is the incumbent code unchanged.
+    // `Whole16` supplies the proposals AND the verify picks; `HostSplice`
+    // supplies the proposals only (splice and verify stay incumbent).
+    // Every refusal leaves all state untouched and falls through to HIP.
+    let mut railgun_draft: Option<Vec<u32>> = None;
+    let mut railgun_verify: Option<crate::dflash_railgun::RailgunVerify> = None;
+    let mut railgun_shape: Option<railgun::window::WindowShape> = None;
+    if let Some(rg) = railgun.as_mut() {
+        use crate::dflash_railgun as drg;
+        railgun_shape = drg::RailgunWindowOwner::shape_hint(
+            position,
+            draft_scratch,
+            hidden_rb,
+            target.kv_cache.compact_offset,
+            target.kv_cache.physical_cap,
+        );
+        let static_verdict = rg.owner.static_verdict(|| {
+            let kv = &target.kv_cache;
+            drg::StaticFacts {
+                arch: gpu.arch.clone(),
+                num_experts: target.config.num_experts,
+                dim: target.config.dim,
+                ffn_dim: target.config.hidden_dim,
+                n_heads: target.config.n_heads,
+                n_kv_heads: target.config.n_kv_heads,
+                kv_fp8: kv.quant_fp8,
+                kv_other_quant: kv.quant_q8
+                    || kv.quant_int8
+                    || kv.quant_hfq4
+                    || kv.quant_asym4
+                    || kv.quant_asym3
+                    || kv.quant_asym2
+                    || kv.quant_fwht
+                    || kv.quant_bf16,
+                // The runtime proposal width (16 on the 27B pair, whose draft
+                // was trained at block 8), not the draft's trained block.
+                draft_block: requested_b,
+                ctx_mode: draft_scratch.ctx_mode,
+                retained_pm4_admitted: verify_pm4.as_deref().map_or(false, |r| r.admitted()),
+                online_tuner: draft_scratch.online.is_some(),
+            }
+        });
+        match static_verdict {
+            Err(why) => rg.owner.refuse(why, ""),
+            Ok(()) => {
+                // `NoTailAction`: an armed Tail source is Whole16 only when
+                // it proves every legal tail decision declines; Copy and
+                // price-probe windows planned before the draft keep HIP.
+                let lookup_facts = if rg.probe {
+                    drg::LookupFacts::Probe
+                } else {
+                    match &lookup {
+                        None => drg::LookupFacts::None,
+                        Some(DflashLookup::Copy(_)) => drg::LookupFacts::Copy,
+                        Some(DflashLookup::Tail(src)) => {
+                            if src.declines_every_tail(b.saturating_sub(1)) {
+                                drg::LookupFacts::TailDeclinesAll
+                            } else {
+                                drg::LookupFacts::TailMayAct
+                            }
+                        }
+                    }
+                };
+                let seed_oracle = hipfire_config::developer_var("HIPFIRE_DFLASH_SEED_ORACLE")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+                let facts = drg::WindowFacts {
+                    b,
+                    greedy: !use_temp_sampling,
+                    cactus: cactus_delta != 0.0,
+                    pld: pld_spine.is_some(),
+                    ngram_cache: ngram_cache.is_some(),
+                    repeat_penalty: repeat_penalty != 1.0,
+                    host_path: host_path_active,
+                    diagnostics: phase_on || seed_oracle,
+                    ctx_slice: ctx_slice.is_some(),
+                    gdn_tape: gdn_tape.is_some(),
+                    gdn_frame_independent: target.dn_state.quant != qwen35::StateQuant::Q8
+                        || !target.dn_state.s_ef_residual.is_empty(),
+                    lookup: lookup_facts,
+                };
+                match drg::admit_window(&facts) {
+                    Err(why) => rg.owner.refuse(why, ""),
+                    Ok(execution) => {
+                        let attempt = rg.owner.run(
+                            drg::WindowOwners {
+                                gpu: &mut *gpu,
+                                target: &mut *target,
+                                draft_weights,
+                                draft_cfg,
+                                draft_scratch: &mut *draft_scratch,
+                                hidden_rb: &mut *hidden_rb,
+                                verify_scratch,
+                                gdn_tape: gdn_tape.as_deref_mut(),
+                                target_snap: &mut *target_snap,
+                                position,
+                                seed: seed_token,
+                            },
+                            execution,
+                        )?;
+                        if let drg::RailgunAttempt::Ran(run) = attempt {
+                            railgun_draft = Some(run.block);
+                            railgun_verify = run.verify;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let railgun_ran = railgun_draft.is_some();
+
+    if let Some(rail_block) = railgun_draft.take() {
+        // The certified segment already produced the proposal block (the
+        // selector-greedy block with the seed at [0]).
+        drafted = rail_block;
+    } else if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
         // At temp>0, draft "probability" at each PLD token is 1.0 — PLD is
         // context-deterministic, not a softmax. The rejection math below
@@ -9439,6 +9839,14 @@ pub fn spec_step_dflash(
             }
         }
     };
+    if railgun_verify.is_some() && b != 16 {
+        // `NoTailAction` proved the splice declines; a splice here means the
+        // proof was wrong after the window already ran. Fail loud.
+        return Err(hip_bridge::HipError::new(
+            0,
+            "railgun Whole16 window: the host splice changed the verify rows (NoTailAction violated)",
+        ));
+    }
     block.truncate(b);
     for i in 1..b {
         block[i] = drafted[i];
@@ -9495,7 +9903,9 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    if railgun_verify.is_none() {
+        target_snap.save_from(&target.dn_state, gpu)?;
+    }
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
@@ -9510,7 +9920,10 @@ pub fn spec_step_dflash(
         gpu.arch.as_str(),
         moe_router_logits_present,
     );
-    let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
+    let use_tape_replay = match &railgun_verify {
+        Some(rv) => rv.tape_populated,
+        None => dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape),
+    };
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
 
     if phase_on {
@@ -9526,14 +9939,71 @@ pub fn spec_step_dflash(
     // Railgun D8: a kept full accept relies on the HIP/HipGraph verify body —
     // no route, or a route that planned this window as its ordinary HIP window
     // (`full_hip`/`partial_hip` advanced; prime/capture/PM4 windows do not).
-    let mut verify_on_hip = verify_pm4.is_none();
-    let verify_out = match verify_pm4 {
-        Some(route) => {
-            let replay_failures_before = route.counters().replay_failures;
-            let hip_windows =
-                |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
-            let hip_windows_before = hip_windows(route);
-            match verify_dflash_block_retained(
+    let mut same_as_hip_graph = verify_pm4.is_none();
+    let verify_out = if let Some(rv) = railgun_verify.take() {
+        // `Whole16`: the lowered segment ran the verify, the hidden commit and
+        // the head; the state is exactly the HIP graph body's iff certified.
+        same_as_hip_graph = rv.same_as_hip_graph;
+        DflashVerifyOutput {
+            argmax_per_pos: rv.argmax_per_pos,
+            logits_per_pos: Vec::new(),
+        }
+    } else {
+        match verify_pm4 {
+            Some(route) => {
+                let replay_failures_before = route.counters().replay_failures;
+                let hip_windows =
+                    |r: &DflashVerifyPm4| r.counters().full_hip + r.counters().partial_hip;
+                let hip_windows_before = hip_windows(route);
+                match verify_dflash_block_retained(
+                    gpu,
+                    target,
+                    &block,
+                    position,
+                    hidden_rb,
+                    gdn_tape_opt.as_deref_mut(),
+                    want_full_logits,
+                    verify_scratch,
+                    route,
+                ) {
+                    Ok(out) => {
+                        same_as_hip_graph = hip_windows(route) == hip_windows_before + 1;
+                        out
+                    }
+                    Err(error) => {
+                        // Fail closed when quiescence was never proven: a PM4 body
+                        // may still be executing against KV, DeltaNet state, and
+                        // hidden staging, so restoring or re-running would race it.
+                        if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
+                            return Err(error);
+                        }
+                        // Not a retained-execution failure — an ordinary model
+                        // error propagates exactly as it does on the HIP path.
+                        if route.counters().replay_failures == replay_failures_before {
+                            return Err(error);
+                        }
+                        // Proven-quiescent replay failure. Rewind the recurrent
+                        // state to the pre-window snapshot and redo the window on
+                        // the ordinary route; KV slots, hidden staging,
+                        // final_hidden, and the GDN tape are all overwritten by the
+                        // retry, and the ring is committed exactly once because the
+                        // failed attempt never committed.
+                        target_snap.restore_to(&mut target.dn_state, gpu)?;
+                        route.note_safe_hip_retry();
+                        verify_dflash_block(
+                            gpu,
+                            target,
+                            &block,
+                            position,
+                            hidden_rb,
+                            gdn_tape_opt.as_deref_mut(),
+                            want_full_logits,
+                            verify_scratch,
+                        )?
+                    }
+                }
+            }
+            None => verify_dflash_block(
                 gpu,
                 target,
                 &block,
@@ -9542,55 +10012,8 @@ pub fn spec_step_dflash(
                 gdn_tape_opt.as_deref_mut(),
                 want_full_logits,
                 verify_scratch,
-                route,
-            ) {
-                Ok(out) => {
-                    verify_on_hip = hip_windows(route) == hip_windows_before + 1;
-                    out
-                }
-                Err(error) => {
-                    // Fail closed when quiescence was never proven: a PM4 body
-                    // may still be executing against KV, DeltaNet state, and
-                    // hidden staging, so restoring or re-running would race it.
-                    if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
-                        return Err(error);
-                    }
-                    // Not a retained-execution failure — an ordinary model
-                    // error propagates exactly as it does on the HIP path.
-                    if route.counters().replay_failures == replay_failures_before {
-                        return Err(error);
-                    }
-                    // Proven-quiescent replay failure. Rewind the recurrent
-                    // state to the pre-window snapshot and redo the window on
-                    // the ordinary route; KV slots, hidden staging,
-                    // final_hidden, and the GDN tape are all overwritten by the
-                    // retry, and the ring is committed exactly once because the
-                    // failed attempt never committed.
-                    target_snap.restore_to(&mut target.dn_state, gpu)?;
-                    route.note_safe_hip_retry();
-                    verify_dflash_block(
-                        gpu,
-                        target,
-                        &block,
-                        position,
-                        hidden_rb,
-                        gdn_tape_opt.as_deref_mut(),
-                        want_full_logits,
-                        verify_scratch,
-                    )?
-                }
-            }
+            )?,
         }
-        None => verify_dflash_block(
-            gpu,
-            target,
-            &block,
-            position,
-            hidden_rb,
-            gdn_tape_opt.as_deref_mut(),
-            want_full_logits,
-            verify_scratch,
-        )?,
     };
 
     if phase_on {
@@ -9991,7 +10414,7 @@ pub fn spec_step_dflash(
                 seed_token,
                 block: &block,
                 decision,
-                verify_on_hip,
+                same_as_hip_graph,
                 phase_on,
             },
         )?
@@ -10037,6 +10460,14 @@ pub fn spec_step_dflash(
         );
     }
     let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end);
+    // A chain window that ran on the ordinary HIP route has materialized the
+    // lazy scratch/JIT of its shape family: later windows of the family may
+    // be planned (never before: planning refuses a `hipModuleLoad`/`hipMalloc`).
+    if let (Some(rg), Some(shape), false, 16) =
+        (railgun.as_mut(), railgun_shape.as_ref(), railgun_ran, b)
+    {
+        rg.owner.note_hip_window(shape);
+    }
 
     Ok(SpecStepResult {
         accepted: accept_len,
@@ -11825,13 +12256,20 @@ fn ddtree_commit_row_runs(accepted_node_indices: &[usize]) -> Vec<(usize, usize,
 /// `s' >= d' > d` — every source is read before anything overwrites it. Distinct
 /// block rows map to distinct physical rows, so this also holds when the caller
 /// maps through a ring modulus.
+///
+/// That argument is about separate moves. Within one coalesced run the ranges
+/// overlap whenever `src - dst < n` (e.g. `(1, 2, 3)`), and a D2D memcpy over
+/// overlapping ranges is undefined: the blit copies chunks in parallel, so which
+/// bytes win varies run to run (HIPF-136, greedy DDTree nondeterminism). Each run
+/// is therefore issued as ascending chunks of at most `src - dst` rows; chunk k
+/// overwrites only rows chunk k-1 already read.
 fn move_rows_in_place(
     gpu: &Gpu,
     buf: &GpuTensor,
     row_bytes: usize,
     moves: &[(usize, usize, usize)],
 ) -> HipResult<()> {
-    for &(dst, src, n) in moves {
+    for (dst, src, n) in moves.iter().flat_map(|&m| non_overlapping_chunks(m)) {
         let (dst_off, src_off, size) = (dst * row_bytes, src * row_bytes, n * row_bytes);
         match gpu.active_stream.as_ref() {
             // Stream-ordered: the moves serialize against each other and against
@@ -11845,6 +12283,18 @@ fn move_rows_in_place(
         }
     }
     Ok(())
+}
+
+/// Split a `(dst, src, n)` move with `src > dst` into ascending sub-moves whose
+/// source and destination ranges are disjoint.
+fn non_overlapping_chunks(
+    (dst, src, n): (usize, usize, usize),
+) -> impl Iterator<Item = (usize, usize, usize)> {
+    debug_assert!(src > dst, "in-place row moves only shift rows down");
+    let step = src - dst;
+    (0..n)
+        .step_by(step)
+        .map(move |k| (dst + k, src + k, step.min(n - k)))
 }
 
 /// DDTree post-accept gather: relocate the accepted chain's rows from their
@@ -12653,20 +13103,48 @@ pub fn dflash_seed_checkpoint_count(
     interval: usize,
     cap: usize,
 ) -> usize {
+    dflash_seed_checkpoint_positions(prompt_len, ceiling, interval, cap).len()
+}
+
+/// Positions (the ring's final contents, oldest first) of the DeltaNet
+/// checkpoints a cold DFlash prompt seed of `prompt_len` rows takes under
+/// outer-chunk `ceiling`; same simulation of [`take_dn_checkpoint`] as
+/// [`dflash_seed_checkpoint_count`], which is its length.
+pub fn dflash_seed_checkpoint_positions(
+    prompt_len: usize,
+    ceiling: usize,
+    interval: usize,
+    cap: usize,
+) -> Vec<usize> {
+    let mut ring = std::collections::VecDeque::new();
     if cap == 0 {
-        return 0;
+        return Vec::new();
     }
-    let (mut pos, mut last, mut len) = (0usize, None::<usize>, 0usize);
+    let (mut pos, mut last) = (0usize, None::<usize>);
     while pos < prompt_len {
         pos += dflash_seed_outer_chunk_len(prompt_len - pos, ceiling);
         if last.is_some_and(|p| pos < p.saturating_add(interval)) {
             continue;
         }
-        len = (len + 1).min(cap);
+        if ring.len() >= cap {
+            ring.pop_front();
+        }
+        ring.push_back(pos);
         last = Some(pos);
     }
-    len
+    ring.into()
 }
+
+/// Outer chunk ceiling of the most recent cold DFlash prompt seed
+/// (`seed_target_hidden_from_prompt_abortable_parts`) in this process; `0`
+/// before any. Read by the state oracle to compare checkpoint positions
+/// between walks that planned the same ceiling.
+pub fn last_dflash_seed_ceiling() -> usize {
+    LAST_DFLASH_SEED_CEILING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LAST_DFLASH_SEED_CEILING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Upper bound on [`dflash_seed_checkpoint_count`] for every outer-chunk
 /// ceiling the seed can take at least `min_ceiling`: the maximum over
@@ -12939,6 +13417,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
         }
     }
     let mut seed = SeedPrefill::plan(gpu, target);
+    LAST_DFLASH_SEED_CEILING.store(seed.ceiling, std::sync::atomic::Ordering::Relaxed);
     let result = (|| -> HipResult<bool> {
         let mut seq_pos: usize = 0;
         while seq_pos < prompt_tokens.len() {
@@ -13840,6 +14319,37 @@ mod tests {
             ddtree_commit_row_runs(&[1, 2, 4]),
             vec![(1, 2, 2), (3, 5, 1)]
         );
+    }
+
+    /// A coalesced run overlaps itself when its shift is shorter than the run
+    /// (HIPF-136). The issued copies must be pairwise source/destination
+    /// disjoint and, executed in order, must equal the per-row move.
+    #[test]
+    fn move_chunks_never_overlap_and_match_per_row_moves() {
+        assert_eq!(
+            non_overlapping_chunks((1, 2, 3)).collect::<Vec<_>>(),
+            vec![(1, 2, 1), (2, 3, 1), (3, 4, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 3, 5)).collect::<Vec<_>>(),
+            vec![(1, 3, 2), (3, 5, 2), (5, 7, 1)]
+        );
+        assert_eq!(
+            non_overlapping_chunks((1, 9, 4)).collect::<Vec<_>>(),
+            vec![(1, 9, 4)]
+        );
+        for n in 1..12 {
+            for step in 1..12 {
+                let (dst, src) = (1, 1 + step);
+                let mut rows: Vec<usize> = (0..dst + step + n).collect();
+                for (d, s, m) in non_overlapping_chunks((dst, src, n)) {
+                    assert!(s >= d + m, "chunk ({d}, {s}, {m}) overlaps itself");
+                    rows.copy_within(s..s + m, d);
+                }
+                let want: Vec<usize> = (src..src + n).collect();
+                assert_eq!(rows[dst..dst + n], want[..], "n={n} step={step}");
+            }
+        }
     }
 
     /// The in-place, scratch-free move is only sound because every move reads a

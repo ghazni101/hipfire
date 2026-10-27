@@ -653,7 +653,7 @@ mod tests {
     fn splices_cached_assistant_turn_like_the_chat_path() {
         let t = tok();
         let mut cache = AsstTurnCache::new_from_env();
-        let fp = crate::common::asst_turn_fingerprint(
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint(
             &crate::common::normalize_asst_turn_for_fingerprint("yo"),
             &[],
         );

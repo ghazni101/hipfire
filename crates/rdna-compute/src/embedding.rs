@@ -43,8 +43,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("embedding_q8", kernels::EMBEDDING_Q8_SRC, "embedding_q8")?;
-        let func = &self.functions["embedding_q8"];
-
         let mut tp = table.buf.as_ptr();
         let mut op = output.buf.as_ptr();
         let mut tid = token_id as i32;
@@ -57,10 +55,29 @@ impl Gpu {
             &mut d as *mut _ as *mut c_void,
         ];
 
-        unsafe {
-            self.hip
-                .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+        if !self.hip.plan_active() {
+            let func = &self.functions["embedding_q8"];
+            // SAFETY: params match the kernel signature; null stream as before.
+            return unsafe {
+                self.hip
+                    .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+            };
         }
+        self.launch_maybe_blob(
+            "embedding_q8",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_i32(tid);
+                b.push_i32(d);
+                b
+            },
+        )
     }
 
     /// Q8 embedding lookup driven by a device token-id scalar, broadcasting
@@ -145,8 +162,6 @@ impl Gpu {
             kernels::EMBEDDING_HFQ4G256_SRC,
             "embedding_hfq4g256",
         )?;
-        let func = &self.functions["embedding_hfq4g256"];
-
         let mut tp = table.buf.as_ptr();
         let mut op = output.buf.as_ptr();
         let mut tid = token_id as i32;
@@ -162,16 +177,21 @@ impl Gpu {
         let bytes = crate::profile::embedding_hfq4g256_bytes(dim);
         let timer =
             crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "embedding_hfq4g256",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_i32(tid);
+                b.push_i32(d);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -525,8 +545,6 @@ impl Gpu {
             kernels::EMBEDDING_HFQ4G128_SRC,
             "embedding_hfq4g128",
         )?;
-        let func = &self.functions["embedding_hfq4g128"];
-
         let mut tp = table.buf.as_ptr();
         let mut op = output.buf.as_ptr();
         let mut tid = token_id as i32;
@@ -539,16 +557,21 @@ impl Gpu {
             &mut d as *mut _ as *mut c_void,
         ];
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "embedding_hfq4g128",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_i32(tid);
+                b.push_i32(d);
+                b
+            },
+        )
     }
 
     /// Batched HFQ4-G128 embedding lookup. `output` is `[n × dim]` row-major

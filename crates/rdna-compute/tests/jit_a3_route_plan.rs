@@ -322,6 +322,39 @@ fn ar_plan_carries_no_native_mtp_head_or_unrelated_model_recipe() {
     }
 }
 
+const MTP_HEAD_KERNELS: [&str; 5] = [
+    "fused_rmsnorm_mq_rotate",
+    "fused_silu_mul_mq_rotate",
+    "fused_gate_up_hfq4g256",
+    "fused_qkv_hfq4g256",
+    "gemv_hfq4g256_residual",
+];
+
+/// The MQ4-v1 sidecar uses the typed layer program's plain fused producers
+/// and residual projections even when every trunk projection has AWQ scales.
+#[test]
+fn native_mtp_closes_sidecar_kernels_independently_of_trunk_awq() {
+    for pm_decode in [false, true] {
+        for keep_awq in [false, true] {
+            let keep = |name: &str| keep_awq || !name.ends_with(".awq_scale.weight");
+            let ar = manifest(&plan_27b(KernelSpecRoute::Ar, pm_decode, keep));
+            let mtp = manifest(&plan_27b(KernelSpecRoute::NativeMtp, pm_decode, keep));
+            for module in MTP_HEAD_KERNELS {
+                let entry = mtp.get(module).unwrap_or_else(|| {
+                    panic!("pm_decode={pm_decode} trunk_awq={keep_awq}: missing {module}")
+                });
+                assert!(entry.4.contains(module), "missing export {module}");
+                if keep_awq {
+                    assert!(
+                        !ar.contains_key(module),
+                        "AR must not gain head-only {module}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A no-AWQ 27B load (the canonical header minus every `*.awq_scale.weight`
 /// sidecar) launches the plain rotate producers: RMSNorm, SwiGLU and gated
 /// norm rotation, the standalone rotate, the gfx1201 non-slab IU4 prefill
@@ -428,9 +461,9 @@ fn manifest_without_sidecars(spec: KernelSpecRoute, pm_decode: bool, stems: &[&s
     }))
 }
 
-/// The AWQ closure is untouched: the full-sidecar plan plans no plain-only
-/// module (its exact module/image identity is the frozen-manifest test), and
-/// dropping sidecars of weights that feed no plain producer changes nothing.
+/// The AWQ trunk closure is untouched: plain-only producers belong only to
+/// the MTP head. Dropping sidecars of weights that feed no plain trunk
+/// producer changes nothing.
 #[test]
 fn awq_27b_plan_is_unchanged_by_the_plain_closure() {
     for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
@@ -439,7 +472,9 @@ fn awq_27b_plan_is_unchanged_by_the_plain_closure() {
             for (family, modules) in PLAIN_FAMILIES {
                 for module in modules {
                     assert!(
-                        !awq.contains_key(*module),
+                        awq.contains_key(*module)
+                            == (matches!(spec, KernelSpecRoute::NativeMtp)
+                                && MTP_HEAD_KERNELS.contains(module)),
                         "{spec:?} pm_decode={pm_decode}: AWQ plan carries {family} module {module}"
                     );
                 }
@@ -467,9 +502,9 @@ fn awq_27b_plan_is_unchanged_by_the_plain_closure() {
     }
 }
 
-/// Each producer family is planned exactly when a weight it feeds lacks its
-/// sidecar; the non-slab `_b1` bundle rides with any plain family, and its
-/// F1-lite gate/up SwiGLU symbol whenever the RMSNorm producer is plain.
+/// Each trunk producer family is planned exactly when a weight it feeds lacks
+/// its sidecar, in addition to the independent MTP head closure. The non-slab
+/// `_b1` bundle and its F1-lite symbol still depend only on the trunk.
 #[test]
 fn partial_sidecars_plan_only_their_plain_families() {
     let cases: [(&[&str], &[&str]); 5] = [
@@ -487,7 +522,9 @@ fn partial_sidecars_plan_only_their_plain_families() {
                     for module in modules {
                         assert_eq!(
                             got.contains_key(*module),
-                            want.contains(&family),
+                            want.contains(&family)
+                                || (matches!(spec, KernelSpecRoute::NativeMtp)
+                                    && MTP_HEAD_KERNELS.contains(module)),
                             "{spec:?} pm_decode={pm_decode} without {stems:?}: module {module} ({family})"
                         );
                     }

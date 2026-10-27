@@ -1386,9 +1386,10 @@ fn execute_hyper_read_inner(
             }
             None => hip(hyper_norm_f16(gpu, &norm, &x16, !wmma_read))?,
         }
-        // gfx1201 HC-down + activation as one launch (byte-identical to the
-        // F16 WMMA GEMM + `hc_activation_fused_f32` chain): the packed BF16
-        // `low_bf16` is the only output the WMMA read consumes.
+        // gfx1201 / gfx1151 HC-down + activation as one launch (byte-identical to the
+        // F16 WMMA GEMM + `hc_activation_fused_f32` chain on the same arch): the packed BF16
+        // `low_bf16` is the only output the WMMA read consumes.  The NPU trunk pair route
+        // (`HcFusionCursor` windows) reaches this same call through `execute_hyper_read_inner`.
         match low_bf16.as_ref().filter(|_| {
             wmma_read
                 && op.low_rank == op.input_mix_down.m
@@ -5017,7 +5018,27 @@ pub fn execute_hyper_norm(gpu: &mut Gpu, op: &HyperNormOp<'_>) -> Result<(), Dis
     ))
 }
 
-/// One [`project_weight`] over `rows` row-major input rows.
+/// The kernel ladder a [`ProjectOp`] runs on. The ladders give different bits
+/// for the same payload (Q8: scalar F32 vs WMMA), so the binding family names
+/// the one it was validated on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectLadder {
+    /// [`project_weights`]: shared F16 rotation, few-row verify GEMVs, gfx942
+    /// BF16 MFMA. Qwen4.
+    Trunk,
+    /// The dispatcher-entry batched GEMMs, each keeping its own arch routing:
+    /// `gemm_q8_0_batched_chunked`, `gemm_hfq4g256` (MQ4G256 after its batched
+    /// FWHT), `gemm_f32_batched`, gfx942 BF16 MFMA. LFM2 decode lanes.
+    Gemm,
+    /// [`Self::Gemm`] for an LM head: the `*_batched_lmhead` GEMMs (HFQ4 /
+    /// HFQ6 / HFQ3 payloads and their MQ rotations). Q8, F32 and BF16 keep
+    /// the `Gemm` arms. No calibration tap, except the BF16 MFMA arm's.
+    GemmLmHead,
+}
+
+/// One projection over `rows` row-major input rows on its [`ProjectLadder`],
+/// optionally followed by `residual += output` (a separate add, not a fused
+/// residual GEMM).
 pub struct ProjectOp<'a> {
     pub weight: WeightRef<'a>,
     pub input: &'a GpuTensor,
@@ -5025,6 +5046,9 @@ pub struct ProjectOp<'a> {
     pub rows: usize,
     /// FWHT basis scratch (`rows * k`), required by the rotated payloads.
     pub rotation: Option<&'a GpuTensor>,
+    pub ladder: ProjectLadder,
+    /// F32 `[rows, m]`, distinct from `output`.
+    pub residual: Option<&'a GpuTensor>,
 }
 
 impl ProjectOp<'_> {
@@ -5033,12 +5057,22 @@ impl ProjectOp<'_> {
         if self.rows == 0 {
             return Err(DispatchError::Hip("projection has no rows".into()));
         }
-        require_weight(&self.weight, m, k, "projection")?;
+        // The `Gemm` ladders admit their payloads in `gemm_ladder_rotation` below.
+        if self.ladder == ProjectLadder::Trunk {
+            require_weight(&self.weight, m, k, "projection")?;
+        }
         let input = checked_mul(self.rows, k, "projection input")?;
         require_tensor(self.input, input, DType::F32, "projection input")?;
         let output = checked_mul(self.rows, m, "projection output")?;
         require_tensor(self.output, output, DType::F32, "projection output")?;
-        if !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0) {
+        if let Some(residual) = self.residual {
+            require_tensor(residual, output, DType::F32, "projection residual")?;
+        }
+        let rotated = match self.ladder {
+            ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
+            ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
+        };
+        if rotated {
             let rotation = self.rotation.ok_or_else(|| {
                 DispatchError::Hip("rotated projection payload needs rotation scratch".into())
             })?;
@@ -5049,7 +5083,76 @@ impl ProjectOp<'_> {
 }
 
 pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
-    project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
+    match op.ladder {
+        ProjectLadder::Trunk => {
+            project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
+        }
+        ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
+    }
+    match op.residual {
+        Some(residual) => hip(gpu.add_inplace_f32(residual, op.output)),
+        None => Ok(()),
+    }
+}
+
+/// Whether the `Gemm` / `GemmLmHead` ladder admits `dtype` and reads it in an
+/// FWHT basis.
+fn gemm_ladder_rotation(dtype: DType, lm_head: bool) -> Result<bool, DispatchError> {
+    match (dtype, lm_head) {
+        (DType::F32 | DType::BF16 | DType::Q8_0 | DType::HFQ4G256, _) => Ok(false),
+        (DType::HFQ6G256, true) => Ok(false),
+        (DType::MQ4G256, _) | (DType::MQ6G256 | DType::MQ3G256, true) => Ok(true),
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "gemm-ladder-payload",
+            arch: "",
+            quant: "unsupported",
+        }),
+    }
+}
+
+/// The `Gemm` / `GemmLmHead` arms of [`execute_project`]. The calibration tap
+/// sees the pre-rotation activation (the AWQ / Hessian basis).
+fn project_gemm(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
+    let (w, rows, y) = (&op.weight, op.rows, op.output);
+    let (m, k) = (w.m, w.k);
+    let lm_head = op.ladder == ProjectLadder::GemmLmHead;
+    let rotated = gemm_ladder_rotation(w.dtype, lm_head)?;
+    if w.dtype == DType::BF16 {
+        return project_g942_mfma(gpu, op.input, rows, op.rotation, &[(w, y)], &[0], k);
+    }
+    if !lm_head {
+        gpu.maybe_capture_activation(w.buf, op.input, rows, k);
+    }
+    let scratch = if rotated {
+        let rotation = op.rotation.ok_or(DispatchError::UnsupportedVariant {
+            family: "layer-operations",
+            variant: "rotation-scratch-absent",
+            arch: "",
+            quant: "quantized",
+        })?;
+        let scratch = view(rotation, 0, checked_mul(rows, k, "rotation scratch")?);
+        hip(crate::pipeline::batched::rotate_x_mq_batched_for(
+            gpu, w, op.input, &scratch, k, rows,
+        ))?;
+        Some(scratch)
+    } else {
+        None
+    };
+    let x = scratch.as_ref().unwrap_or(op.input);
+    hip(match (w.dtype, lm_head) {
+        (DType::F32, _) => gpu.gemm_f32_batched(w.buf, x, y, m, k, rows),
+        (DType::Q8_0, _) => gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, rows),
+        (DType::HFQ4G256 | DType::MQ4G256, false) => gpu.gemm_hfq4g256(w.buf, x, y, m, k, rows),
+        (DType::HFQ4G256 | DType::MQ4G256, true) => {
+            gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, rows)
+        }
+        (DType::HFQ6G256 | DType::MQ6G256, true) => {
+            gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, rows)
+        }
+        (DType::MQ3G256, true) => gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, rows),
+        _ => unreachable!("gemm_ladder_rotation admits only the arms above"),
+    })
 }
 
 /// Largest causal window the gated short-convolution kernel holds per thread.
@@ -5119,6 +5222,88 @@ pub fn execute_gated_short_conv(
         op.rows,
         op.channels,
         op.kernel_size,
+    ))
+}
+
+/// Lane-isolated Q8 attention for `rows` independent decode lanes: row `r`
+/// writes its K/V at `positions[r]` into lane `r`'s slice
+/// (`[r * lane_capacity, (r + 1) * lane_capacity)` positions) of the Q8 caches,
+/// then attends over that slice only.
+pub struct LaneAttentionOp<'a> {
+    /// F32 `[rows, n_heads * head_dim]`, RoPE'd.
+    pub q: &'a GpuTensor,
+    /// F32 `[rows, n_kv_heads * head_dim]` each, RoPE'd K.
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub k_cache: &'a GpuTensor,
+    pub v_cache: &'a GpuTensor,
+    /// `rows` I32 positions.
+    pub positions: &'a GpuTensor,
+    /// F32 `[rows, n_heads * head_dim]`.
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub lane_capacity: usize,
+    pub max_ctx_len: usize,
+}
+
+impl LaneAttentionOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.lane_capacity == 0 || self.head_dim == 0 {
+            return Err(DispatchError::Hip(
+                "lane attention has empty geometry".into(),
+            ));
+        }
+        let q = checked_mul(self.rows, self.n_heads * self.head_dim, "lane attention q")?;
+        let kv = checked_mul(
+            self.rows,
+            self.n_kv_heads * self.head_dim,
+            "lane attention kv",
+        )?;
+        require_tensor(self.q, q, DType::F32, "lane attention q")?;
+        require_tensor(self.k, kv, DType::F32, "lane attention k")?;
+        require_tensor(self.v, kv, DType::F32, "lane attention v")?;
+        require_tensor(self.output, q, DType::F32, "lane attention output")?;
+        if self.positions.numel() < self.rows {
+            return Err(DispatchError::Hip(format!(
+                "lane attention: {} positions for {} rows",
+                self.positions.numel(),
+                self.rows
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_lane_attention(
+    gpu: &mut Gpu,
+    op: &LaneAttentionOp<'_>,
+) -> Result<(), DispatchError> {
+    for (cache, src) in [(op.k_cache, op.k), (op.v_cache, op.v)] {
+        hip(gpu.kv_cache_write_q8_0_independent(
+            cache,
+            src,
+            op.positions,
+            op.n_kv_heads,
+            op.head_dim,
+            op.rows,
+            op.lane_capacity,
+        ))?;
+    }
+    hip(gpu.attention_q8_0_kv_independent(
+        op.q,
+        op.k_cache,
+        op.v_cache,
+        op.output,
+        op.positions,
+        op.n_heads,
+        op.n_kv_heads,
+        op.head_dim,
+        op.lane_capacity,
+        op.max_ctx_len,
+        op.rows,
     ))
 }
 

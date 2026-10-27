@@ -1138,7 +1138,7 @@ pub fn load_weight_tensor(
     // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
     // straight from the page-cache-backed slice — no heap staging copy.
     // Pread fallback preserves UMA behavior (mmap dropped there).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
@@ -1193,7 +1193,7 @@ pub fn load_weight_tensor(
         }
         return Ok(wt);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let (info, data, matched_name) = {
             let mut found = None;
@@ -2602,7 +2602,8 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 /// per-tensor `quant_type` bytes and, if running on RDNA2 with any RDNA3+-only
 /// dtype present, prints a clear warning listing the offending formats. RDNA2 is
 /// wave32 (so the WMMA-free MQ3-Lloyd scalar kernels now resolve — W4 fix), but
-/// MQ5/MQ6/HFQ6 (HasMmq, RDNA3/4 only), the WMMA-only HFP4G32-fused prefill path,
+/// MQ5 (HasMmq, RDNA3/4 only), MQ6/HFQ6 (the GEMV rows resolve on RDNA2 since #478 but
+/// are untested on RDNA2 hardware), the WMMA-only HFP4G32-fused prefill path,
 /// and the E8-lattice formats have NO validated RDNA2 kernel and are best-effort.
 ///
 /// Additive and arch-gated to RDNA2 — no effect on RDNA3/4/CDNA loads.
@@ -2611,7 +2612,8 @@ fn warn_rdna2_unvalidated_dtypes(hfq: &HfqFile, gpu: &Gpu) {
         return;
     }
     // (quant_type byte, human label) for dtypes with NO validated RDNA2 kernel.
-    //   8=HFQ6G256, 15=MQ6G256, 31=MQ5G256  → HasMmq (RDNA3/4 only)
+    //   8=HFQ6G256, 15=MQ6G256              → resolve via HasHfq6Gemv (#478), unvalidated
+    //   31=MQ5G256                          → HasMmq (RDNA3/4 only)
     //   24=MFP4G32, 33=MFP4G32P             → HFP4G32-fused (WMMA-only prefill)
     //   34/35=MFP4G32E8/SOA, 36=MFP3G32E8, 37=MFP2G32E8 → E8 lattice (RDNA3/4)
     const RDNA3PLUS_ONLY: &[(u8, &str)] = &[
@@ -3045,16 +3047,23 @@ impl WeightSource for HfqSource<'_> {
         // `hipfire_runtime::offload`), which also prints the residency line; this
         // source no longer decides or announces placement.
         // Keep the mmap alive on discrete GPUs (the carrier cleared
-        // `evict_page_cache` there): weight uploads DMA straight out of
-        // page-cache pages with no heap staging copy — measured 11–16 GB/s
-        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // `evict_page_cache` there, on Linux and Windows alike): weight uploads
+        // DMA straight out of page-cache pages with no heap staging copy —
+        // measured 11–16 GB/s end-to-end vs ~4 GB/s through a pread staging
+        // buffer (measured on Linux).
         // UMA keeps the drop — evict=true is exactly the carrier's UMA
-        // signal — so cached model pages can't starve hipMalloc of RAM.
+        // signal (`Gpu::is_uma`, hipDeviceAttributeIntegrated, which is also
+        // queried on Windows) — so mapped model pages and the GPU copy are
+        // not both resident and cached model pages can't starve hipMalloc of
+        // RAM. After the drop every tensor read in this source goes through
+        // `tensor_data_pread` / `tensor_data_vec`, which use positioned reads
+        // (`pread` on unix, `seek_read` on Windows) on a normally buffered
+        // handle; no unbuffered (FILE_FLAG_NO_BUFFERING) reopen is used.
         //
         // NOTE: do NOT madvise-populate the mapping here. A blocking
         // MAP_POPULATE measured identical totals (it relocates the same
         // soft-fault work out of the upload loop into one serial stall).
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }

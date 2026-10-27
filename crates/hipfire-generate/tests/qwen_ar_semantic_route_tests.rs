@@ -290,7 +290,7 @@ fn length_cap_prose_only_stores_cache() {
     // The production cache action really mutates the sink.
     let action = qwen_ar_cache_action(&fin, &visible);
     let mut sink = HashMap::new();
-    let fp = qwen_ar_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -639,7 +639,7 @@ fn eos_trailing_marker_prefix_prose_flushed_and_cacheable() {
     let mut sink = HashMap::new();
     let action = qwen_ar_cache_action(&fin, &visible);
     assert!(action.store);
-    let fp = qwen_ar_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -804,7 +804,7 @@ fn eos_inside_open_think_is_reasoning_only_stop_ha13() {
     assert!(fin.store_cache);
     let action = qwen_ar_cache_action(&fin, &visible);
     let mut sink = HashMap::new();
-    assert!(qwen_ar_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -869,7 +869,7 @@ fn decoded_eot_beats_length_on_final_budget_token_primary() {
     let mut sink = HashMap::new();
     let action = qwen_ar_cache_action(&fin, &visible);
     assert!(action.store);
-    let fp = qwen_ar_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -1225,7 +1225,7 @@ fn cache_sink_mutation_seam_store_and_skip() {
     let fin = fin.expect("stop");
     let action = qwen_ar_cache_action(&fin, &visible);
     let mut sink = HashMap::new();
-    let fp = qwen_ar_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -1241,7 +1241,7 @@ fn cache_sink_mutation_seam_store_and_skip() {
     let fin_len = fin_len.expect("length");
     let action_len = qwen_ar_cache_action(&fin_len, "Hello world");
     assert!(action_len.store);
-    let fp_len = qwen_ar_apply_cache_action(
+    let fp_len = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -1267,7 +1267,7 @@ fn cache_sink_mutation_seam_store_and_skip() {
     let fin_hidden = fin_hidden.expect("length");
     let action_hidden = qwen_ar_cache_action(&fin_hidden, &visible_hidden);
     assert!(!action_hidden.store);
-    assert!(qwen_ar_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -1537,7 +1537,7 @@ fn finish_defers_tool_calls_until_commit_effects() {
     let mut cache = HashMap::new();
     let action = qwen_ar_cache_action(&fin, &visible);
     assert!(action.store);
-    let fp = qwen_ar_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             cache.insert(k, v);
         },
@@ -1614,7 +1614,7 @@ fn abort_effects_suppress_calls_cache_and_normal_done() {
     let mut cache = HashMap::new();
     let mut action = qwen_ar_cache_action(&fin, &visible);
     action.store = effects.store_cache && action.store;
-    assert!(qwen_ar_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             cache.insert(k, v);
         },

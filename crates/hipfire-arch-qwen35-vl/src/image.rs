@@ -70,8 +70,9 @@ const VISION_MAX_PIXELS: usize = 2_000_000;
 const VISION_LDS_MAX_PIXELS: usize = 4_128_768;
 
 /// Resolve the vision input pixel budget, honouring `HIPFIRE_VL_MAX_PIXELS`
-/// but never exceeding what the attention kernel's LDS can hold.
-fn vision_max_pixels() -> usize {
+/// but never exceeding what the attention kernel's LDS can hold. Also the
+/// source of `qwen35_vl::max_image_patches`.
+pub(crate) fn vision_max_pixels() -> usize {
     hipfire_config::developer_var("HIPFIRE_VL_MAX_PIXELS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

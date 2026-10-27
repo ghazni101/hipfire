@@ -7,7 +7,7 @@
 // Taps:
 //   TAP1 llama.rs:1460 weight_gemm → dispatch.rs:2848 (llama 0/1, prefill_forward:1508)
 //   TAP2 families/gemm.rs:146 GemmFamily::run_key (glimmer forward.rs:80, qwen35 migrated sites qwen35.rs:12877/12928/13230)
-//   TAP3 forward_batch.rs:79 batched_proj (lfm2 dense, single chokepoint)
+//   TAP3 hipfire_dispatch layer_ops::project_gemm (ProjectLadder::Gemm; lfm2 dense lanes, single chokepoint)
 
 use hipfire_runtime::calibration::{collect, collect_grouped, CalibForward};
 use hipfire_runtime::hfq::HfqFile;
@@ -1847,7 +1847,7 @@ fn main() {
             eprintln!("unsupported lfm2 MoE (lfm2.5:8b-a1b num_experts={} >0): MoE experts have no dense Hessian tap in this MQ4 dense lane — only the dense 1.2b/350m variants (num_experts==0) are admitted. Refusing to avoid a .calib.hfq with missing expert tensors.", cfg.num_experts);
             std::process::exit(2);
         }
-        // batched_proj chokepoint note: dense 1.2b/350m variants only
+        // ProjectLadder::Gemm chokepoint note: dense 1.2b/350m variants only
         let weights = hipfire_arch_lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &cfg, &mut gpu)
             .unwrap_or_else(|e| panic!("lfm2 weights: {e}"));
         {
@@ -1864,7 +1864,7 @@ fn main() {
         if let Err(e) =
             hipfire_arch_lfm2moe::forward_batch::batch_weight_formats_supported(&weights)
         {
-            eprintln!("unsupported lfm2 weight formats for batched decode: {e} — batched_proj only supports Q8_0/HFQ4G256/MQ4G256 dense; refusing.");
+            eprintln!("unsupported lfm2 weight formats for batched decode: {e} — the Gemm projection ladder only supports Q8_0/HFQ4G256/MQ4G256 dense; refusing.");
             std::process::exit(2);
         }
         let kv_max = seq_len + 16;
@@ -1877,9 +1877,9 @@ fn main() {
         });
         let lpp = lpp.max(1);
         let peak = estimate_peak_lfm(&weights, 0, lpp.min(cfg.num_hidden_layers));
-        eprintln!("grouped n_layers={} lpp={} n_groups={} peak≈{:.1} MB lane_capacity={} (seq_len+16) max_batch={} proj_rot {} ; capture_names over Mixer::Conv(in_proj/out_proj) + Attn(q/k/v/o) + Dense(w1/w3/w2) at forward_batch.rs:79 batched_proj (BEFORE rotate, pre-rotation x)", cfg.num_hidden_layers, lpp, (cfg.num_hidden_layers+lpp-1)/lpp, peak as f64/1_048_576.0, kv_max, max_batch, state.proj_rot.numel());
+        eprintln!("grouped n_layers={} lpp={} n_groups={} peak≈{:.1} MB lane_capacity={} (seq_len+16) max_batch={} proj_rot {} ; capture_names over Mixer::Conv(in_proj/out_proj) + Attn(q/k/v/o) + Dense(w1/w3/w2) at layer_ops::project_gemm (BEFORE rotate, pre-rotation x)", cfg.num_hidden_layers, lpp, (cfg.num_hidden_layers+lpp-1)/lpp, peak as f64/1_048_576.0, kv_max, max_batch, state.proj_rot.numel());
         let batch_actual = seq_len.min(n_tok.max(1));
-        eprintln!("batching: lfm::forward_batch::forward_decode_batch_lfm:290 → batched_proj:61 → gpu.maybe_capture_activation:79 tap3 direct gemm_* (not GemmFamily) batch={} ; batched_proj is SINGLE chokepoint for all dense projections: conv in/out_proj (l={:?}), wq/wk/wv (395-399), wo (474), dense w1/w3/w2 (487-489/494)", batch_actual, cfg.layer_types);
+        eprintln!("batching: lfm::forward_batch::forward_decode_batch_lfm → Step::Project (ProjectLadder::Gemm) → layer_ops::project_gemm → gpu.maybe_capture_activation tap3, direct gemm_* (not GemmFamily) batch={} ; project_gemm is the SINGLE chokepoint for all dense projections: conv in/out_proj (l={:?}), wq/wk/wv, wo, dense w1/w3/w2", batch_actual, cfg.layer_types);
         let t0 = std::time::Instant::now();
         let grouped = lpp < cfg.num_hidden_layers;
         let calib_prefix_grouped = calib_prefix.clone();
@@ -1909,7 +1909,7 @@ fn main() {
                     (
                         "calib_driver",
                         serde_json::json!(
-                            "calib_sweep lfm forward_decode_batch_lfm:290 → batched_proj:61 tap3"
+                            "calib_sweep lfm forward_decode_batch_lfm → project_gemm tap3"
                         ),
                     ),
                 ],
@@ -1948,7 +1948,7 @@ fn main() {
                     (
                         "calib_driver",
                         serde_json::json!(
-                            "calib_sweep lfm forward_decode_batch_lfm:290 → batched_proj:61 tap3"
+                            "calib_sweep lfm forward_decode_batch_lfm → project_gemm tap3"
                         ),
                     ),
                 ],

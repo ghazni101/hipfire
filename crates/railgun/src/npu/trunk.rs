@@ -24,49 +24,74 @@ pub const PANEL_K: usize = 2560;
 /// Out-projection panels: five 512-column panels of K = 6144 (the G80 N512 program, its own PDI / hardware context).
 pub const OUT_PANEL_N: usize = 512;
 pub const OUT_PANEL_K: usize = 6144;
+/// qwen3.8-27b dense in-projections: K = 5120 (the hidden size) on the G80 N512 program, 512-column panels.
+pub const DENSE_PANEL_K: usize = 5120;
+/// Number of [`Shape`]s; every per-shape table is indexed by [`Shape::index`].
+pub const SHAPES: usize = 6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     GdnIn,
     QsaIn,
     GdnOut,
     QsaO,
+    /// 27B GDN in-projection, fused qkv 10240 + z 6144 + a 48 + b 48 = 16480 columns.
+    DenseGdnIn,
+    /// 27B full-attention in-projection, fused gated q 12288 + k 1024 + v 1024 = 14336 columns.
+    DenseFaIn,
 }
 impl Shape {
-    pub const ALL: [Shape; 4] = [Self::GdnIn, Self::QsaIn, Self::GdnOut, Self::QsaO];
+    pub const ALL: [Shape; SHAPES] = [
+        Self::GdnIn,
+        Self::QsaIn,
+        Self::GdnOut,
+        Self::QsaO,
+        Self::DenseGdnIn,
+        Self::DenseFaIn,
+    ];
+    /// Flash-Next out projections (the residual-wide K = 6144 programs).
     pub fn is_out(self) -> bool {
         matches!(self, Self::GdnOut | Self::QsaO)
+    }
+    /// Runs the G80 N512 program (512-row waves, 512-column panels, the `a_out` A arena); otherwise the N1280 one.
+    pub fn is_n512(self) -> bool {
+        !matches!(self, Self::GdnIn | Self::QsaIn)
     }
     pub fn panels(self) -> usize {
         match self {
             Self::GdnIn => 13,
             Self::QsaIn => 11,
             Self::GdnOut | Self::QsaO => 5,
+            Self::DenseGdnIn => 33,
+            Self::DenseFaIn => 28,
         }
     }
-    /// Columns of one panel: 1280 (input shapes) or 512 (out shapes).
+    /// Columns of one panel: 1280 (N1280 shapes) or 512 (N512 shapes).
     pub fn panel_n(self) -> usize {
-        if self.is_out() {
+        if self.is_n512() {
             OUT_PANEL_N
         } else {
             PANEL_N
+        }
+    }
+    /// Reduction dimension of the shape's program.
+    pub fn k(self) -> usize {
+        match self {
+            Self::GdnIn | Self::QsaIn => PANEL_K,
+            Self::GdnOut | Self::QsaO => OUT_PANEL_K,
+            Self::DenseGdnIn | Self::DenseFaIn => DENSE_PANEL_K,
         }
     }
     pub fn pitch(self) -> usize {
         self.panels() * self.panel_n()
     }
     fn index(self) -> usize {
-        match self {
-            Self::GdnIn => 0,
-            Self::QsaIn => 1,
-            Self::GdnOut => 2,
-            Self::QsaO => 3,
-        }
+        self as usize
     }
 }
 
 /// One row-major design per shape, with col0=0; every panel reuses it.
-/// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes (input shapes) or
-/// build_panel_program_out(rows_max, 2560, 0)'s bytes (out shapes: a different PDI, one hardware context per distinct PDI).
+/// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes (N1280 shapes) or
+/// build_panel_program_n512(rows_max, pitch, 0, shape.k())'s bytes (N512 shapes: one PDI, hence one hardware context, per K).
 pub struct PanelProgram {
     pub shape: Shape,
     pub pdi: Vec<u8>,
@@ -85,11 +110,11 @@ pub type TxnBuilder = Arc<dyn Fn(Shape, usize) -> Result<PanelBuild, String> + S
 /// Hardware contexts the row-adaptive chains may hold beyond the full-row ones: the (class, rows) variants in use. A kick
 /// whose variant would exceed it runs the full-row chain.
 pub const MAX_ADAPTIVE_CONTEXTS: usize = 4;
-/// Rows of a bank of `rows` live rows rounded up to the whole waves of the shape's program: 256-row waves (input
-/// shapes), 512-row waves (out shapes). The A arena is packed for exactly this many rows and the chain runs exactly this
+/// Rows of a bank of `rows` live rows rounded up to the whole waves of the shape's program: 256-row waves (N1280
+/// shapes), 512-row waves (N512 shapes). The A arena is packed for exactly this many rows and the chain runs exactly this
 /// many waves.
 pub fn padded_rows_of(shape: Shape, rows: usize) -> usize {
-    let wave = if shape.is_out() { 512 } else { 256 };
+    let wave = if shape.is_n512() { 512 } else { 256 };
     rows.div_ceil(wave) * wave
 }
 /// Every entry is already pack_b_bf16 encoded, including Sm/Se sidecars.
@@ -99,64 +124,60 @@ pub struct LayerPanels {
     pub panels: Vec<Vec<u8>>,
 }
 
-/// Per-bank arenas: input shapes use `a` (`rows * 2880` B) and the C arenas of GdnIn / QsaIn (256-row padded); out shapes use
-/// `a_out` (`rows * 6912` B: K = 6144 packed A, 512-row padded) and their own BF16 C arenas (`rows * 2560 * 2` B).
+/// Per-bank arenas: N1280 shapes use `a` and N512 shapes `a_out`, each sized for the largest K of its open shapes
+/// (`rows * K * 9 / 8` B of packed A: 2880 B per row at K2560, 6912 at K6144, 5760 at K5120), plus one BF16 C arena per
+/// shape (row-major at the shape's pitch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaLayout {
     pub padded_rows: usize,
     pub a_bytes: usize,
-    pub b_bytes: usize,
     /// `rows_max` rounded up to 512-row N512 waves.
     pub out_padded_rows: usize,
     pub a_out_bytes: usize,
-    pub b_out_bytes: usize,
-    pitches: [usize; 4],
+    pitches: [usize; SHAPES],
 }
 impl ArenaLayout {
     pub fn new(rows_max: usize) -> Result<Self, String> {
         if !(1..=65536).contains(&rows_max) {
             return Err("rows_max outside 1..=65536".into());
         }
-        let padded_rows = rows_max.div_ceil(256) * 256;
-        let out_padded_rows = rows_max.div_ceil(512) * 512;
-        Ok(Self {
-            padded_rows,
-            a_bytes: padded_rows * 2880,
-            b_bytes: 8 * 40 * 2 * 5504,
-            out_padded_rows,
-            a_out_bytes: out_padded_rows * 6912,
-            b_out_bytes: 8 * 96 * 4352,
-            pitches: [
-                Shape::GdnIn.pitch(),
-                Shape::QsaIn.pitch(),
-                Shape::GdnOut.pitch(),
-                Shape::QsaO.pitch(),
-            ],
-        })
+        let mut layout = Self {
+            padded_rows: rows_max.div_ceil(256) * 256,
+            a_bytes: 0,
+            out_padded_rows: rows_max.div_ceil(512) * 512,
+            a_out_bytes: 0,
+            pitches: Shape::ALL.map(Shape::pitch),
+        };
+        layout.fit_a();
+        Ok(layout)
     }
-    /// Padded rows of the shape's program: 256-row waves (input shapes), 512-row waves (out shapes).
+    /// Size each A arena class for the largest K among its shapes with a non-zero pitch.
+    fn fit_a(&mut self) {
+        let class = |n512: bool| {
+            Shape::ALL
+                .into_iter()
+                .filter(|&s| s.is_n512() == n512 && self.pitches[s.index()] != 0)
+                .map(|s| self.a_bytes_for(s))
+                .max()
+                .unwrap_or(0)
+        };
+        (self.a_bytes, self.a_out_bytes) = (class(false), class(true));
+    }
+    /// Padded rows of the shape's program: 256-row waves (N1280 shapes), 512-row waves (N512 shapes).
     pub fn padded_rows_for(self, shape: Shape) -> usize {
-        if shape.is_out() {
+        if shape.is_n512() {
             self.out_padded_rows
         } else {
             self.padded_rows
         }
     }
-    /// Packed A bytes of one bank for the shape's program.
+    /// Packed A bytes of one bank for the shape's program (a prefix of its class arena): 4608 B per 64 rows per K64.
     pub fn a_bytes_for(self, shape: Shape) -> usize {
-        if shape.is_out() {
-            self.a_out_bytes
-        } else {
-            self.a_bytes
-        }
+        self.padded_rows_for(shape) * shape.k() / 64 * 72
     }
-    /// Bytes of one resident B panel of the shape.
+    /// Bytes of one resident B panel of the shape: per K64 chunk, eight columns of 2 x 5504 B (N1280) or 4352 B (N512).
     pub fn b_bytes_for(self, shape: Shape) -> usize {
-        if shape.is_out() {
-            self.b_out_bytes
-        } else {
-            self.b_bytes
-        }
+        8 * shape.k() / 64 * if shape.is_n512() { 4352 } else { 2 * 5504 }
     }
     pub fn c_bytes(self, shape: Shape) -> usize {
         self.padded_rows_for(shape) * self.pitches[shape.index()] * 2
@@ -175,19 +196,18 @@ impl ArenaLayout {
     }
     pub fn set_pitch(&mut self, shape: Shape, pitch: usize) {
         self.pitches[shape.index()] = pitch;
+        self.fit_a();
     }
-    /// Arena bytes of one bank, `[a_in, a_out, c GdnIn, c QsaIn, c GdnOut, c QsaO]`. An absent shape (or A class)
+    /// Arena bytes of one bank, `[a_in, a_out, c of each shape in Shape::ALL order]`. An absent shape (or A class)
     /// keeps only one registration page for the fixed binding table, never a full arena.
-    pub fn bank_arena_bytes(self, has_in: bool, has_out: bool) -> [usize; 6] {
-        let c = |shape: Shape| self.c_bytes(shape).max(4096);
-        [
-            if has_in { self.a_bytes } else { 0 }.max(4096),
-            if has_out { self.a_out_bytes } else { 0 }.max(4096),
-            c(Shape::GdnIn),
-            c(Shape::QsaIn),
-            c(Shape::GdnOut),
-            c(Shape::QsaO),
-        ]
+    pub fn bank_arena_bytes(self, has_in: bool, has_out: bool) -> [usize; 2 + SHAPES] {
+        let mut bytes = [0; 2 + SHAPES];
+        bytes[0] = if has_in { self.a_bytes } else { 0 };
+        bytes[1] = if has_out { self.a_out_bytes } else { 0 };
+        for shape in Shape::ALL {
+            bytes[2 + shape.index()] = self.c_bytes(shape);
+        }
+        bytes.map(|n| n.max(4096))
     }
     /// Bytes `banks` banks of arenas pin against `RLIMIT_MEMLOCK`: every arena rounded up to whole pages.
     pub fn pinned_bytes(self, banks: usize, has_in: bool, has_out: bool) -> usize {
@@ -206,13 +226,13 @@ impl ArenaLayout {
         programs: &[(Shape, usize)],
     ) -> Result<usize, String> {
         let mut layout = Self::new(rows_max)?;
-        layout.pitches = [0; 4];
+        layout.pitches = [0; SHAPES];
         for &(shape, pitch) in programs {
             layout.set_pitch(shape, pitch);
         }
         let (has_in, has_out) = (
-            programs.iter().any(|(s, _)| !s.is_out()),
-            programs.iter().any(|(s, _)| s.is_out()),
+            programs.iter().any(|(s, _)| !s.is_n512()),
+            programs.iter().any(|(s, _)| s.is_n512()),
         );
         Ok(layout.pinned_bytes(banks, has_in, has_out))
     }
@@ -256,7 +276,7 @@ pub struct ShapeChainStats {
 /// Per-shape relay chain statistics, indexed in [`Shape::ALL`] order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChainStats {
-    pub shapes: [ShapeChainStats; 4],
+    pub shapes: [ShapeChainStats; SHAPES],
 }
 impl ChainStats {
     pub fn shape(&self, shape: Shape) -> ShapeChainStats {
@@ -373,10 +393,10 @@ impl Arena {
         })
     }
 }
-/// `a[0]` / `c[0..2]`: input shapes; `a[1]` / `c[2..4]`: out shapes (one page when no out shape is open).
+/// `a[0]`: N1280 shapes, `a[1]`: N512 shapes; `c[s]`: shape `s` (one page when the A class / shape is not open).
 struct Bank {
     a: [Arena; 2],
-    c: [Arena; 4],
+    c: [Arena; SHAPES],
     control: Arena,
     ready: HipEvent,
     acquire: HipEvent,
@@ -387,14 +407,14 @@ struct Binding {
     handle: u32,
     addr: u64,
 }
-/// Registered-page bindings of one bank: `[a_in, a_out, c0, c1, c2, c3]`.
-type BankBindings = [Binding; 6];
+/// Registered-page bindings of one bank: `[a_in, a_out, c of each shape]`.
+type BankBindings = [Binding; 2 + SHAPES];
 #[derive(Clone, Copy)]
 struct BankPages {
     a: [usize; 2],
     a_len: [usize; 2],
-    c: [usize; 4],
-    c_len: [usize; 4],
+    c: [usize; SHAPES],
+    c_len: [usize; SHAPES],
 }
 struct Job {
     seq: Seq,
@@ -585,7 +605,7 @@ pub struct NpuTrunkRuntime {
     panel_counts: Vec<usize>,
     state: RefCell<Vec<BankState>>,
     builder: bool,
-    variants: RefCell<Vec<(bool, usize)>>,
+    variants: RefCell<Vec<(usize, usize)>>,
     shared: Arc<Shared>,
     tx: Option<mpsc::SyncSender<Job>>,
     relay: Option<thread::JoinHandle<()>>,
@@ -609,6 +629,17 @@ impl NpuTrunkRuntime {
             OpenOptions::default(),
         )
     }
+    /// Address of the relay's resolved `hipEventRecord`. Compare to the serving
+    /// runtime while both owners remain alive, before passing it serving streams.
+    pub fn hip_event_record_address(&self) -> usize {
+        self.hip.event_record_address()
+    }
+
+    /// Loader-reported library path for diagnostics, not live object identity.
+    pub fn hip_mapped_library(&self) -> Option<String> {
+        self.hip.mapped_hip_library()
+    }
+
     /// CPU oracle access requires `cpu_reads`; a 1 ns watchdog forces the real
     /// timeout path in the transport gate without a production environment flag.
     pub fn open_with_options(
@@ -636,7 +667,7 @@ impl NpuTrunkRuntime {
             return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into());
         }
         let mut layout = ArenaLayout::new(rows_max)?;
-        layout.pitches = [0; 4];
+        layout.pitches = [0; SHAPES];
         if banks == 0 {
             return Err("trunk needs at least one bank".into());
         }
@@ -687,8 +718,8 @@ impl NpuTrunkRuntime {
         }
         let panel_counts: Vec<usize> = layers.iter().map(|l| l.panels.len()).collect();
         let (has_in, has_out) = (
-            shapes.iter().any(|s| !s.is_out()),
-            shapes.iter().any(|s| s.is_out()),
+            shapes.iter().any(|s| !s.is_n512()),
+            shapes.iter().any(|s| s.is_n512()),
         );
         let sizes = layout.bank_arena_bytes(has_in, has_out);
         // Every arena becomes a userptr BO whose pages the driver pins against RLIMIT_MEMLOCK; settle the limit
@@ -701,14 +732,13 @@ impl NpuTrunkRuntime {
         let api = hip.relay_api()?;
         let mut storage = Vec::with_capacity(banks);
         for _ in 0..banks {
+            let c: Vec<Arena> = sizes[2..]
+                .iter()
+                .map(|&n| Arena::new(&hip, n))
+                .collect::<Result<_, _>>()?;
             storage.push(Bank {
                 a: [Arena::new(&hip, sizes[0])?, Arena::new(&hip, sizes[1])?],
-                c: [
-                    Arena::new(&hip, sizes[2])?,
-                    Arena::new(&hip, sizes[3])?,
-                    Arena::new(&hip, sizes[4])?,
-                    Arena::new(&hip, sizes[5])?,
-                ],
+                c: c.try_into().map_err(|_| "C arena count")?,
                 control: Arena::new(&hip, 4096)?,
                 ready: hip.system_event()?,
                 acquire: hip.system_event()?,
@@ -720,18 +750,8 @@ impl NpuTrunkRuntime {
             .map(|b| BankPages {
                 a: [b.a[0].pages.ptr as usize, b.a[1].pages.ptr as usize],
                 a_len: [b.a[0].pages.len, b.a[1].pages.len],
-                c: [
-                    b.c[0].pages.ptr as usize,
-                    b.c[1].pages.ptr as usize,
-                    b.c[2].pages.ptr as usize,
-                    b.c[3].pages.ptr as usize,
-                ],
-                c_len: [
-                    b.c[0].pages.len,
-                    b.c[1].pages.len,
-                    b.c[2].pages.len,
-                    b.c[3].pages.len,
-                ],
+                c: b.c.each_ref().map(|c| c.pages.ptr as usize),
+                c_len: b.c.each_ref().map(|c| c.pages.len),
             })
             .collect();
         let shared = Arc::new(Shared {
@@ -887,7 +907,8 @@ impl NpuTrunkRuntime {
         if !self.builder || padded >= full {
             return full;
         }
-        let class = (shape.is_out(), padded);
+        // One program (PDI) per K at a padded row count: N1280 K2560, N512 K6144 / K5120.
+        let class = (shape.k(), padded);
         let mut variants = self.variants.borrow_mut();
         if variants.contains(&class) {
             return padded;
@@ -955,10 +976,15 @@ impl NpuTrunkRuntime {
             if !state.retired || (!state.prepared && !self.api.query(b.retired.raw())?) {
                 return Err("bank consumer not retired".into());
             }
-            self.wait_host(Seq {
-                bank,
-                value: state.generation,
-            })?;
+            // prepare_bank already waited for this generation before queuing
+            // retirement and the next producer. A kick without prepare still
+            // needs the host completion check before reusing the bank.
+            if !state.prepared {
+                self.wait_host(Seq {
+                    bank,
+                    value: state.generation,
+                })?;
+            }
         }
         // signed-difference GEQ implementations must never see generation wrap.
         if state.generation == i32::MAX as u32 {
@@ -1172,8 +1198,8 @@ fn prepared_panel(
 /// (`padded` = the full program rows, which never collides with an adaptive row count).
 #[derive(Default)]
 struct Adaptive {
-    ctx: std::collections::HashMap<(bool, usize), usize>,
-    pdi: std::collections::HashMap<(bool, usize), Vec<u8>>,
+    ctx: std::collections::HashMap<(usize, usize), usize>,
+    pdi: std::collections::HashMap<(usize, usize), Vec<u8>>,
     insts: std::collections::HashMap<(usize, usize), usize>,
     /// (layer, bank, padded) -> index of the first of the layer's panel commands in `extra_commands`.
     commands: std::collections::HashMap<(usize, usize, usize), usize>,
@@ -1199,7 +1225,7 @@ fn adaptive_chain<'d>(
     r: &mut Resources<HwCtx<'d>>,
     ad: &mut Adaptive,
 ) -> Result<(usize, usize), String> {
-    let class = (shape.is_out(), padded);
+    let class = (shape.k(), padded);
     let key = (layer, bank, padded, panels.start, panels.end);
     if let Some(&chain) = ad.chains.get(&key) {
         return Ok((chain, ad.ctx[&class]));
@@ -1243,7 +1269,7 @@ fn adaptive_chain<'d>(
             }
             let (insts, l) = (ad.insts[&insts_key], &layers[layer]);
             let start = r.extra_commands.len();
-            let a = if shape.is_out() {
+            let a = if shape.is_n512() {
                 &r.a_out[bank]
             } else {
                 &r.a[bank]
@@ -1254,7 +1280,7 @@ fn adaptive_chain<'d>(
                     &r.extra_insts[insts],
                     a,
                     &r.b[b_starts[layer] + panel],
-                    &r.c[bank * 4 + shape.index()],
+                    &r.c[bank * SHAPES + shape.index()],
                     layout.c_offset(shape, panel)?,
                     layout.c_span(shape),
                 )?;
@@ -1357,21 +1383,16 @@ fn relay_main(
         for p in &pages {
             let a = dev.userptr_bo(p.a[0] as *mut u8, p.a_len[0])?;
             let a_out = dev.userptr_bo(p.a[1] as *mut u8, p.a_len[1])?;
-            let mut binding = [
-                Binding {
-                    handle: a.handle,
-                    addr: a.dev_addr(),
-                },
-                Binding {
-                    handle: a_out.handle,
-                    addr: a_out.dev_addr(),
-                },
-                Binding { handle: 0, addr: 0 },
-                Binding { handle: 0, addr: 0 },
-                Binding { handle: 0, addr: 0 },
-                Binding { handle: 0, addr: 0 },
-            ];
-            for s in 0..4 {
+            let mut binding: BankBindings = [Binding { handle: 0, addr: 0 }; 2 + SHAPES];
+            binding[0] = Binding {
+                handle: a.handle,
+                addr: a.dev_addr(),
+            };
+            binding[1] = Binding {
+                handle: a_out.handle,
+                addr: a_out.dev_addr(),
+            };
+            for s in 0..SHAPES {
                 let c = dev.userptr_bo(p.c[s] as *mut u8, p.c_len[s])?;
                 binding[2 + s] = Binding {
                     handle: c.handle,
@@ -1401,7 +1422,7 @@ fn relay_main(
             for bank in 0..pages.len() {
                 let start = r.commands.len();
                 cmd_starts.push(start);
-                let a = if l.shape.is_out() {
+                let a = if l.shape.is_n512() {
                     &r.a_out[bank]
                 } else {
                     &r.a[bank]
@@ -1412,7 +1433,7 @@ fn relay_main(
                         &r.insts[program],
                         a,
                         &r.b[b_start + panel],
-                        &r.c[bank * 4 + l.shape.index()],
+                        &r.c[bank * SHAPES + l.shape.index()],
                         layout.c_offset(l.shape, panel)?,
                         layout.c_span(l.shape),
                     )?);
@@ -1480,7 +1501,7 @@ fn relay_main(
                 .position(|l| l.layer == job.layer && l.shape == job.shape)
                 .ok_or("unknown relay layer")?;
             options.flush_for_cpu_reads(|| {
-                if job.shape.is_out() {
+                if job.shape.is_n512() {
                     resources.a_out[job.seq.bank].flush()
                 } else {
                     resources.a[job.seq.bank].flush()
@@ -1572,8 +1593,9 @@ fn relay_main(
             // The transaction tail synchronizes all NPU C DMA writes to DRAM.
             // GPU consumers wait on the terminal word then system-acquire; CPU
             // caches hold no C lines in production after the open-time flush.
-            options
-                .flush_for_cpu_reads(|| resources.c[job.seq.bank * 4 + job.shape.index()].flush());
+            options.flush_for_cpu_reads(|| {
+                resources.c[job.seq.bank * SHAPES + job.shape.index()].flush()
+            });
             Ok(Completion {
                 kick_to_done: job.start.elapsed(),
                 npu_busy,
@@ -1650,15 +1672,18 @@ mod tests {
             (Shape::QsaO, 1127, 1536),
             (Shape::QsaO, 4672, 5120),
             (Shape::GdnOut, 8192, 8192),
+            (Shape::DenseGdnIn, 4647, 5120),
+            (Shape::DenseFaIn, 8192, 8192),
         ] {
             assert_eq!(padded_rows_of(shape, rows), padded, "{shape:?} {rows}");
             assert!(padded >= rows && padded - rows < shape_wave(shape));
         }
-        // The packed A of a bank is a prefix of the arena: 2880 B per padded row (K2560), 6912 B (K6144).
+        // The packed A of a bank is a prefix of the arena: 2880 B per padded row (K2560), 6912 B (K6144), 5760 B (K5120).
         let layout = ArenaLayout::new(8192).unwrap();
         for rows in [1127usize, 4647, 4672, 8192] {
             assert!(padded_rows_of(Shape::GdnIn, rows) * 2880 <= layout.a_bytes);
             assert!(padded_rows_of(Shape::QsaO, rows) * 6912 <= layout.a_out_bytes);
+            assert!(padded_rows_of(Shape::DenseGdnIn, rows) * 5760 <= layout.a_out_bytes);
         }
         assert!(
             MAX_ADAPTIVE_CONTEXTS >= 2,
@@ -1666,7 +1691,7 @@ mod tests {
         );
     }
     fn shape_wave(shape: Shape) -> usize {
-        if shape.is_out() {
+        if shape.is_n512() {
             512
         } else {
             256
@@ -1675,7 +1700,7 @@ mod tests {
     #[test]
     fn compacted_qkv_arena_has_eight_panel_windows() {
         let mut l = ArenaLayout::new(8192).unwrap();
-        l.pitches = [10240, 0, 0, 0];
+        l.pitches = [10240, 0, 0, 0, 0, 0];
         assert_eq!(l.c_bytes(Shape::GdnIn), 8192 * 10240 * 2);
         assert_eq!(l.c_bytes(Shape::QsaIn), 0);
         for panel in 0..8 {
@@ -1692,7 +1717,7 @@ mod tests {
     fn production_arena_sizes_and_offsets() {
         let l = ArenaLayout::new(8192).unwrap();
         assert_eq!(l.a_bytes, 23_592_960);
-        assert_eq!(l.b_bytes, 3_522_560);
+        assert_eq!(l.b_bytes_for(Shape::GdnIn), 3_522_560);
         for shape in [Shape::GdnIn, Shape::QsaIn] {
             assert_eq!(l.c_bytes(shape), 8192 * shape.pitch() * 2);
             for p in 0..shape.panels() {
@@ -1708,14 +1733,14 @@ mod tests {
         }
         assert_eq!(l.c_bytes(Shape::GdnIn), 272_629_760);
         assert_eq!(l.c_bytes(Shape::QsaIn), 230_686_720);
-        // Two banks x (A 8192x2880, GdnIn + QsaIn C, three 4 KiB placeholders): the shipped trunk's pin.
+        // Two banks x (A 8192x2880, GdnIn + QsaIn C, five 4 KiB placeholders): the shipped trunk's pin.
         let shipped = [
             (Shape::GdnIn, Shape::GdnIn.pitch()),
             (Shape::QsaIn, Shape::QsaIn.pitch()),
         ];
         assert_eq!(
             ArenaLayout::trunk_pinned_bytes(8192, 2, &shipped).unwrap(),
-            1_053_843_456
+            1_053_859_840
         );
         assert!(ArenaLayout::trunk_pinned_bytes(0, 2, &shipped).is_err());
         assert_eq!(ArenaLayout::new(257).unwrap().padded_rows, 512);
@@ -1747,7 +1772,7 @@ mod tests {
         let l = ArenaLayout::new(8192).unwrap();
         // K = 6144 packed A: 8 segments of waves * 96 * 4608 B = rows * 6912; B panel 8 * 96 * 4352; BF16 C 8192 x 2560.
         assert_eq!(
-            (l.out_padded_rows, l.a_out_bytes, l.b_out_bytes),
+            (l.out_padded_rows, l.a_out_bytes, l.b_bytes_for(Shape::QsaO)),
             (8192, 56_623_104, 3_342_336)
         );
         assert_eq!(l.a_out_bytes, 8 * (8192 / 512) * 96 * 4608);
@@ -1786,6 +1811,43 @@ mod tests {
         assert_eq!(
             (odd.padded_rows, odd.out_padded_rows, odd.a_out_bytes),
             (768, 1024, 1024 * 6912)
+        );
+    }
+    #[test]
+    fn dense_k5120_shapes_size_their_own_n512_arenas() {
+        for (shape, panels) in [(Shape::DenseGdnIn, 33), (Shape::DenseFaIn, 28)] {
+            assert!(shape.is_n512() && !shape.is_out());
+            assert_eq!(
+                (shape.k(), shape.panels(), shape.panel_n()),
+                (DENSE_PANEL_K, panels, OUT_PANEL_N)
+            );
+        }
+        // GDN 16480 live columns pad to 33 panels; FA 14336 fills 28 exactly.
+        assert_eq!(Shape::DenseGdnIn.pitch(), 16896);
+        assert_eq!(Shape::DenseFaIn.pitch(), 14336);
+        // Opened alone, the N512 A arena is sized for K5120 (8 segments of 16 waves * 80 chunks * 4608 B), not K6144.
+        let shapes = [
+            (Shape::DenseGdnIn, Shape::DenseGdnIn.pitch()),
+            (Shape::DenseFaIn, Shape::DenseFaIn.pitch()),
+        ];
+        let mut l = ArenaLayout::new(8192).unwrap();
+        l.pitches = [0; SHAPES];
+        for (shape, pitch) in shapes {
+            l.set_pitch(shape, pitch);
+        }
+        assert_eq!((l.a_bytes, l.a_out_bytes), (0, 8 * 16 * 80 * 4608));
+        assert_eq!(l.b_bytes_for(Shape::DenseGdnIn), 8 * 80 * 4352);
+        assert_eq!(l.c_bytes(Shape::DenseGdnIn), 8192 * 16896 * 2);
+        assert_eq!(
+            l.c_offset(Shape::DenseGdnIn, 32).unwrap() + l.c_span(Shape::DenseGdnIn),
+            l.c_bytes(Shape::DenseGdnIn)
+        );
+        // A K6144 out shape opened with them grows the shared N512 A arena to its K.
+        l.set_pitch(Shape::QsaO, Shape::QsaO.pitch());
+        assert_eq!(l.a_out_bytes, 8192 * 6912);
+        assert_eq!(
+            ArenaLayout::trunk_pinned_bytes(8192, 2, &shapes).unwrap(),
+            2 * (8192 * 5760 + 8192 * (16896 + 14336) * 2 + 5 * 4096)
         );
     }
     #[test]
@@ -2012,7 +2074,11 @@ mod tests {
                 &mut words,
                 0x1000,
                 4096,
-                &[0x2000, 0x3000 + panel as u64 * layout.b_bytes as u64, c],
+                &[
+                    0x2000,
+                    0x3000 + panel as u64 * layout.b_bytes_for(Shape::GdnIn) as u64,
+                    c,
+                ],
             );
             assert_eq!(u64::from(words[11]) | (u64::from(words[12]) << 32), c);
             assert_eq!(words[7], 0x2000);

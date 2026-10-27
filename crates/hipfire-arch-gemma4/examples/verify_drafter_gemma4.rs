@@ -366,7 +366,7 @@ fn main() {
         } else {
             if stage_hidden {
                 dscratch
-                    .begin_round(&mut gpu, &hidden_backbone, query_pos)
+                    .begin_round(&mut gpu, &hidden_backbone, query_pos, true)
                     .expect("begin_round");
                 stage_hidden = false;
             }

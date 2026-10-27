@@ -72,6 +72,9 @@ pub enum Step<'a> {
         q: &'a GpuTensor,
         k: &'a GpuTensor,
         pos_buf: &'a hip_bridge::DeviceBuffer,
+        /// `Some`: one I32 position per row (`rows` = its length), the batched
+        /// kernels; `pos_buf` is then unread. `None`: one row at `pos_buf`.
+        positions: Option<&'a GpuTensor>,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -110,6 +113,8 @@ pub enum Step<'a> {
     GroupedDepthwise(crate::pipeline::layer_ops::GroupedDepthwiseOp<'a>),
     /// Double-gated causal short convolution with its rolling state.
     GatedShortConv(crate::pipeline::layer_ops::GatedShortConvOp<'a>),
+    /// Lane-isolated Q8 KV write and attention of independent decode lanes.
+    LaneAttention(crate::pipeline::layer_ops::LaneAttentionOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
@@ -208,7 +213,10 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         Step::RmsnormAutomatic { rows: 1, .. } => Some(PipelineOp::RmsnormAutomatic),
         Step::RmsnormAutomatic { .. } => None,
         Step::Attend { .. } => Some(PipelineOp::Attend),
-        Step::Rope { .. } => Some(PipelineOp::Rope),
+        Step::Rope {
+            positions: None, ..
+        } => Some(PipelineOp::Rope),
+        Step::Rope { .. } => None,
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
         Step::BiasAdd { .. } => Some(PipelineOp::BiasAdd),
         Step::SiluMul { .. } => Some(PipelineOp::SiluMul),
@@ -218,6 +226,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::HyperWrite(_)
         | Step::GroupedDepthwise(_)
         | Step::GatedShortConv(_)
+        | Step::LaneAttention(_)
         | Step::Clear(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
@@ -876,6 +885,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperWrite(op) => op.validate_for_gpu(gpu)?,
             Step::GroupedDepthwise(op) => op.validate_for_gpu(gpu)?,
             Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
+            Step::LaneAttention(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
@@ -1907,11 +1917,24 @@ pub(crate) fn launch_op_rows(
             q,
             k,
             pos_buf,
+            positions,
             n_heads,
             n_kv_heads,
             head_dim,
             rope,
-        } => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
+        } => match positions {
+            Some(positions) => rope.apply_rows(
+                gpu,
+                q,
+                k,
+                positions,
+                *n_heads,
+                *n_kv_heads,
+                *head_dim,
+                positions.numel(),
+            ),
+            None => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
+        },
         Step::QkNorm {
             x,
             weight,
@@ -1937,6 +1960,7 @@ pub(crate) fn launch_op_rows(
             crate::pipeline::layer_ops::execute_grouped_depthwise(gpu, op)
         }
         Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
+        Step::LaneAttention(op) => crate::pipeline::layer_ops::execute_lane_attention(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),

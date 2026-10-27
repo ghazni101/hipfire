@@ -710,6 +710,7 @@ impl SlotBackend {
                 mtp_mode,
                 is_vl,
                 vl_path,
+                vision_mode: vision_mode.to_string(),
                 kv_mode_raw: kv_mode_raw.to_string(),
                 kv_backend: kv_backend.to_string(),
                 multi_slot_paged,
@@ -2121,9 +2122,12 @@ fn cpu_preflight(
         // The carrier reports the tower it FOUND (an explicit path, or the
         // `.vl` sibling); the load's ladder owns whether it is used — the
         // same rule the sequential arm applies (`vision_mode=off` is a hard
-        // override; `on` requires a tower). Without this gate the mode never
-        // reached a carrier-delegated preflight at all, so a multi-slot load
-        // asking for `auto` came back text-only and refused media.
+        // override; `on` requires a tower; `auto` and `resident` discover and
+        // never fail closed — `resident` only changes how a found tower is
+        // held, see `TowerResidency::from_vision_mode`). Without this gate the
+        // mode never reached a carrier-delegated preflight at all, so a
+        // multi-slot load asking for `auto` came back text-only and refused
+        // media.
         let (vl_path, is_vl) = match vision_mode {
             "off" => (None, false),
             _ => {
@@ -2177,11 +2181,13 @@ fn cpu_preflight(
     // tensors. If no .vl file exists, fall back to inline (backward compat).
     //
     // `vision_mode` is the SAME documented ladder the sequential load arm
-    // applies (`apply_vision_mode_gate`): `off` (the default) never wires a
+    // applies (`apply_vision_mode_gate`): `off` never wires a
     // sidecar — not even an explicit one — so a text load pays no tower
-    // VRAM; `on` requires a tower to resolve. The multi-slot arm used to
+    // VRAM; `on` requires a tower to resolve; `auto` and `resident` discover
+    // and never fail closed (`resident` uploads the found tower whole, the
+    // others stream it). The multi-slot arm used to
     // discover the sibling unconditionally, so a VL trunk paid the tower's
-    // ~1 GB even under the documented text-only default, and `serve --vision`
+    // ~1 GB even under `vision_mode=off`, and `serve --vision`
     // was dropped on this route entirely.
     let has_inline_vision = is_vision_hfq(&hfq);
     let vl_path: Option<PathBuf> = if vision_mode == "off" {

@@ -612,18 +612,26 @@ pub fn design_g80_n512_layout(
     }
 }
 
-/// CPU-only deployment builder for one K6144, N512 BF16 panel into a fused row-major arena (`pitch` even, `col0` even,
-/// `col0 + 512 <= pitch`; M padded to 512). Build once with `col0 = 0` and advance arg2's base by `panel_col0 * 2` through
+/// CPU-only deployment builder for one N512 BF16 panel of reduction `k` into a fused row-major arena (`pitch` even,
+/// `col0` even, `col0 + 512 <= pitch`; M padded to 512): the Flash-Next out projections ([`OUT_K`]) and the 27B dense
+/// in-projections (K = 5120). Build once with `col0 = 0` and advance arg2's base by `panel_col0 * 2` through
 /// `append_run_body` / `append_lean_run_body` for every panel; the caller retains the full arena behind that offset.
-pub fn build_panel_program_out(
+pub fn build_panel_program_n512(
     rows_max: usize,
     pitch: usize,
     col0: usize,
+    k: usize,
 ) -> Result<ArrayDesign, String> {
     if !(1..=MAX_WAVES * WAVE_M).contains(&rows_max) {
         return Err(format!(
             "G80 N512 rows_max {rows_max} outside 1..={}",
             MAX_WAVES * WAVE_M
+        ));
+    }
+    if k == 0 || k % CHUNK_K != 0 || k / CHUNK_K > MAX_KC {
+        return Err(format!(
+            "G80 N512 K {k} is not a multiple of 64 in 64..={}",
+            MAX_KC * CHUNK_K
         ));
     }
     let rows = rows_max.div_ceil(WAVE_M) * WAVE_M;
@@ -635,7 +643,7 @@ pub fn build_panel_program_out(
     Ok(design_g80_n512_layout(
         rows,
         WAVE_N,
-        OUT_K,
+        k,
         Epilogue::Bf16,
         Control::Fast,
         layout,

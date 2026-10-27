@@ -2453,31 +2453,39 @@ mod tests {
         }
     }
 
+    /// Every ladder's partial is reduced before a whole reader: for the
+    /// sandwich ladders that reader is the post-norm residual epilogue.
     #[test]
     fn gated_mlp_partial_reduces_before_a_whole_reader() {
         let mesh = tp2();
-        let mut b = B::new();
-        let x = b.act(MLP_H);
-        let (mlp, p, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, MlpLadder::Trunk);
-        let n = b.act(MLP_H);
-        let read = b.row_complete(Some(0), p, n);
-        let plan = b.plan(&mesh, 1);
-        let sp = split_program(&b.g, &plan, &mesh).unwrap();
-        assert_eq!(sp.collectives.len(), 1);
-        let c = &sp.collectives[0];
-        assert_eq!(
-            (c.kind, c.operand, c.producer, c.fulfils),
-            (CollectiveKind::AllReduce, p, mlp, down_entry(&plan, 0))
-        );
-        for rank in &sp.ranks {
+        for ladder in [
+            MlpLadder::Trunk,
+            MlpLadder::SandwichWide,
+            MlpLadder::SandwichSteps,
+        ] {
+            let mut b = B::new();
+            let x = b.act(MLP_H);
+            let (mlp, p, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, ladder);
+            let n = b.act(MLP_H);
+            let read = b.row_complete(Some(0), p, n);
+            let plan = b.plan(&mesh, 1);
+            let sp = split_program(&b.g, &plan, &mesh).unwrap();
+            assert_eq!(sp.collectives.len(), 1);
+            let c = &sp.collectives[0];
             assert_eq!(
-                rank.items,
-                [
-                    RankItem::Op(mlp),
-                    RankItem::Collective(CollectiveId(0)),
-                    RankItem::Op(read)
-                ]
+                (c.kind, c.operand, c.producer, c.fulfils),
+                (CollectiveKind::AllReduce, p, mlp, down_entry(&plan, 0))
             );
+            for rank in &sp.ranks {
+                assert_eq!(
+                    rank.items,
+                    [
+                        RankItem::Op(mlp),
+                        RankItem::Collective(CollectiveId(0)),
+                        RankItem::Op(read)
+                    ]
+                );
+            }
         }
     }
 
@@ -2539,19 +2547,6 @@ mod tests {
         assert_eq!(
             split_program(&b.g, &plan, &mesh).unwrap_err(),
             SplitError::LayoutMismatch { op, resource: down }
-        );
-        // The sandwich ladder has no shard-safe form.
-        let mut b = B::new();
-        let x = b.act(MLP_H);
-        let sandwich = MlpLadder::SandwichWide;
-        let (op, _, _) = gated_mlp(&mut b, 0, x, mlp_split(), MLP_INTER, sandwich);
-        let plan = b.plan(&mesh, 1);
-        assert_eq!(
-            split_program(&b.g, &plan, &mesh).unwrap_err(),
-            SplitError::UnshardableOp {
-                op,
-                kind: OpKind::GatedMlp
-            }
         );
         // The pre-norm needs whole rows: a split input is refused.
         let mut b = B::new();

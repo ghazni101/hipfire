@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-
 //! `railgun-cert certify [--out DIR] OBJECT...` writes one receipt per code
 //! object to `DIR/receipts/<arch>/<object_sha256>.receipt.json`.
 //!
@@ -10,6 +9,15 @@
 //! (sequence, kernel). Manifest lines: `sequence<TAB>kernel<TAB>object|-[<TAB>note]`;
 //! `#` starts a comment. A runtime sidecar `<stem>.radiowave.json` next to a
 //! `<stem>.hsaco` is used for the differential when present.
+//!
+//! `railgun-cert whole16-manifest|whole16-verify --sequence FILE --arch A
+//! (--toolchain-id ID | --toolchain-pin SHA256 | --corpus DIR) [--objects DIR]...
+//! [--manifest FILE] [--out DIR]` generates (or re-verifies) the Whole16
+//! window manifest, `DIR/whole16.manifest.json`, and the per-object receipts
+//! under `DIR/receipts/`. The sequence file is JSONL, one node per line:
+//! `{"phase":..,"symbol":..,"route":"railgun|hip_direct|graph","object":PATH}`
+//! or `"module":NAME` resolved in `--objects` as `NAME.hsaco`/`NAME.<key>.hsaco`.
+//! `whole16-classes` lists the required node classes.
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -111,9 +119,13 @@ fn merge(mut a: Value, b: Value) -> Value {
 
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let command = args
-        .next()
-        .ok_or("usage: railgun-cert certify|coverage ...")?;
+    let command = args.next().ok_or(
+        "usage: railgun-cert certify|coverage|whole16-manifest|whole16-verify|whole16-classes ...",
+    )?;
+    if command.starts_with("whole16-") {
+        let rest: Vec<String> = args.collect();
+        return railgun_cert::whole16::cli(&command, &rest);
+    }
     let mut out = PathBuf::from("railgun-cert-out");
     let mut manifest = None;
     let mut objects = Vec::new();

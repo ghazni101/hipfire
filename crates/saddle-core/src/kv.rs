@@ -1283,8 +1283,11 @@ impl KvCache {
             .chain(self.k_scales.iter())
             .chain(self.v_scales.iter())
         {
-            let bytes = gpu.vmm_mapped_bytes(t).unwrap_or_else(|| t.buf.size());
-            gpu.hip.memset(&t.buf, 0, bytes)?;
+            // A VMM owner's buffer already spans exactly its mapped bytes
+            // (`VmmArena::owner_buffer` caps the logical extent there). The
+            // arena's mapped prefix itself grows in granularity-rounded
+            // chunks and can end past the tensor, so it is not the length.
+            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
         }
         Ok(())
     }

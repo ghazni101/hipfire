@@ -9,9 +9,10 @@
 use peacemaker_npu::kernels::gemm_array::ArrayDesign;
 use peacemaker_npu::kernels::gemm_core::Epilogue;
 use peacemaker_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
-use peacemaker_npu::kernels::gemm_g80_n512::build_panel_program_out;
+use peacemaker_npu::kernels::gemm_g80_n512::build_panel_program_n512;
 
-use super::shapes::{EpilogueContract, FamilyMask, Shape, OUT_COLS};
+use super::shapes::{FamilyMask, Shape, OUT_COLS, OUT_K};
+use hipfire_runtime::coproc::EpilogueContract;
 
 /// Rows of one G80 M wave: every program is built for a whole number of these.
 const WAVE_ROWS: usize = 256;
@@ -203,7 +204,7 @@ pub fn build_out_programs(rows_max: usize) -> Result<NpuOutPrograms, String> {
     }
     let rows = rows_max.div_ceil(OUT_WAVE_ROWS) * OUT_WAVE_ROWS;
     let program = |shape: Shape| -> Result<ShapeProgram, String> {
-        let design = build_panel_program_out(rows, OUT_COLS, 0)?;
+        let design = build_panel_program_n512(rows, OUT_COLS, 0, OUT_K)?;
         Ok(ShapeProgram {
             shape,
             panel_count: shape.panels(),
@@ -251,7 +252,7 @@ pub fn build_program_for_rows(
         return Err(format!("npu-trunk: {padded_rows} rows is not a whole number of {shape} waves within 1..={ROWS_LIMIT}"));
     }
     let design = if shape.is_out() {
-        build_panel_program_out(padded_rows, OUT_COLS, 0)?
+        build_panel_program_n512(padded_rows, OUT_COLS, 0, OUT_K)?
     } else {
         build_panel_program_rowmajor(padded_rows, padded_cols.max(1280), 0)?
     };

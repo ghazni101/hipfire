@@ -480,17 +480,19 @@ pub(crate) struct MoeFront {
     x8: Option<rdna_compute::scratch::Int8MmqPrepared>,
 }
 
-/// Whether the symmetric IU4 route (exact gfx1201, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
+/// Whether the symmetric IU4 route (exact gfx1201 or exact gfx1151,
+/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
 /// `x_norm_batch` once in one producer instead of the chain's `mq_rotate_x` (whose F32 output
 /// nothing on this route reads: the symmetric gate/up consumes only the IU4 sidecar, and the
 /// router and shared projections are BF16 on the natural activation),
-/// `convert_f32_to_f16` (inside the router + shared F16 WMMA group launch) and the gate/up
-/// stage's `mq_rotate_x_i4`. The producer feeds exactly those three consumers, so it applies
-/// only where the router stage defers to the shared group's launch ([`router_shares_f16`]:
-/// the stages between the producer and that launch convert nothing and reserve no IU4
-/// scratch), the fused shared gate/up PM route is not taken, and the symmetric arm is the
-/// gate/up that runs ([`sym_iu4`], not the slab or FP8 routes). The caller adds the
-/// per-invocation conditions (plain program, no CPU split / deferral).
+/// `convert_f32_to_f16` (inside the router + shared F16 WMMA group launch, or on gfx1151 the
+/// fused shared gate/up PeaceMaker launch's own router + selector groups, [`shared_gu_pm`])
+/// and the gate/up stage's `mq_rotate_x_i4`. The producer feeds exactly those three
+/// consumers, so it applies only where the router stage defers to the shared group's launch
+/// ([`router_shares_f16`]: the stages between the producer and that launch convert nothing and
+/// reserve no IU4 scratch), and the symmetric arm is the gate/up that runs ([`sym_iu4`], not
+/// the slab or FP8 routes). The caller adds the per-invocation conditions (plain program, no
+/// CPU split / deferral).
 pub(crate) fn front_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
     let use_path2 = grouped_path(gpu, p, use_path2);
     gpu.qwen4_moe_front_fuse_applies()
@@ -502,7 +504,6 @@ pub(crate) fn front_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool
         && p.gate_up_k == p.prelude.router.k
         && sym_iu4(gpu, p, use_path2)
         && router_shares_f16(gpu, p)
-        && !shared_gu_pm(gpu, p, use_path2)
 }
 
 /// The fused input-basis stage: one launch writes the IU4 sidecar and the F16 X. The F32
@@ -780,7 +781,8 @@ fn shared_int8(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
 /// BF16 MFMA, all row counts); the router is projected by its own stage.
 ///
 /// `front`: the F16 X the fused front already left in the shared F16 scratch
-/// ([`input_basis_front`]); the router + shared WMMA group launch then skips its own
+/// ([`input_basis_front`]); the router + shared WMMA group launch (or the fused shared gate/up
+/// PeaceMaker launch's router + selector groups, [`shared_gu_pm`]) then skips its own
 /// `convert_f32_to_f16` of `x_norm_batch`.
 pub(crate) fn shared_gate_up_front(
     gpu: &mut Gpu,
@@ -788,7 +790,7 @@ pub(crate) fn shared_gate_up_front(
     use_path2: bool,
     front: Option<&MoeFront>,
 ) -> Result<(), DispatchError> {
-    if front.is_some() && !(router_shares_f16(gpu, p) && !shared_gu_pm(gpu, p, use_path2)) {
+    if front.is_some() && !router_shares_f16(gpu, p) {
         // The fused producer fed exactly the router + shared F16 group launch.
         return Err(DispatchError::Hip(
             "qt44/qt53 fused MoE front: the F16 X has no consumer on this route".into(),
@@ -835,6 +837,7 @@ pub(crate) fn shared_gate_up_front(
                 weights.up.buf,
                 &hidden,
                 p.x_norm_batch,
+                front.map(|f| &f.x16),
                 weights.gate.m,
                 router.k,
                 p.batch_size,
@@ -1892,6 +1895,26 @@ pub(crate) fn gate_up_front(
             p.batch_size,
         ))
     } else if use_path2 {
+        if gpu.arch_caps.is_gfx1151()
+            && p.mi == 640
+            && p.gate_up_k == 2560
+            && p.k_top == 10
+            && (1..=8).contains(&p.batch_size)
+        {
+            return hip(gpu.gemm_mq4g256v2_moe_grouped_top10_inverse(
+                gate_up_ptrs,
+                p.expert_tile_ids,
+                p.sorted_slot_index,
+                p.inverse_perm,
+                p.x_rot_batch,
+                p.y_gate_up_grouped,
+                2 * p.mi,
+                p.gate_up_k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ));
+        }
         hip(gpu.gemm_mq4g256v2_moe_grouped_top10(
             gate_up_ptrs,
             p.expert_tile_ids,

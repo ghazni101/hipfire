@@ -22,6 +22,7 @@ hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+railgun = { path = "../railgun" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
 sha2.workspace = true
@@ -46,6 +47,12 @@ required-features = ["deltanet"]
 [[example]]
 name = "test_qwen35_state_multi"
 path = "examples/test_qwen35_state_multi.rs"
+required-features = ["deltanet"]
+
+[[example]]
+# CPU-only: builds/checks the committed MTP draft-vocab subset (src/draft_vocab.rs).
+name = "mtp_draft_vocab"
+path = "examples/mtp_draft_vocab.rs"
 required-features = ["deltanet"]
 
 [[example]]
@@ -171,6 +178,18 @@ required-features = ["deltanet"]
 [[example]]
 name = "mq4v2_moe_down_parity"
 path = "examples/mq4v2_moe_down_parity.rs"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_draft_emit_oracle"
+path = "examples/dflash_draft_emit_oracle.rs"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_verify_emit_oracle"
+path = "examples/dflash_verify_emit_oracle.rs"
 required-features = ["lab"]
 
 [[test]]

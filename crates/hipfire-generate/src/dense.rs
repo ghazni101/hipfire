@@ -28,6 +28,7 @@ use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 
 use crate::common::*;
 use hipfire_arch_qwen35::qwen35;
@@ -186,13 +187,9 @@ pub fn ds4_cache_action(
     terminal: &Ds4SpecWireTerminal,
     finish: &FinishSummary,
     visible_for_cache: &str,
-) -> Ds4CacheAction {
+) -> TurnCacheAction {
     match terminal {
-        Ds4SpecWireTerminal::Malformed(_) => Ds4CacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
+        Ds4SpecWireTerminal::Malformed(_) => TurnCacheAction::skip(),
         Ds4SpecWireTerminal::Done {
             store_cache,
             release_tool_calls,
@@ -203,11 +200,7 @@ pub fn ds4_cache_action(
             } else {
                 Vec::new()
             };
-            Ds4CacheAction {
-                store: *store_cache,
-                fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
-                tool_calls,
-            }
+            ds4_turn_cache_action(*store_cache, visible_for_cache, tool_calls)
         }
     }
 }
@@ -756,7 +749,7 @@ pub fn generate_deepseek4_spec(
                         run.streamed_tokens.len(),
                     );
                 }
-                let _ = ds4_apply_cache_action(
+                let _ = apply_turn_cache_action(
                     |fp, seq| {
                         if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                             .ok()
@@ -1597,7 +1590,7 @@ pub fn generate_deepseek4(
                     cached_seq.len(),
                 );
             }
-            let _ = ds4_apply_cache_action(
+            let _ = apply_turn_cache_action(
                 |fp, seq| {
                     if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()

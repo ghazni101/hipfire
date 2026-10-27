@@ -264,6 +264,9 @@ pub(crate) struct Resident<'a> {
     pub kv_full: &'a KvCache,
     /// Device position scalar (`rows == 1`).
     pub pos_buf: &'a DeviceBuffer,
+    /// Draft head: last key position (and device scalar) when the query's
+    /// own row is not cached; `None` attends through the query position.
+    pub attend_through: Option<(usize, &'a DeviceBuffer)>,
     /// Ones vector of the larger head dim (weight-less V norm).
     pub v_norm_ones: &'a GpuTensor,
     pub flash_partials: &'a GpuTensor,
@@ -598,6 +601,7 @@ impl<'a> ProgramBinding<'a> {
                 },
             },
             pos_buf: r.pos_buf,
+            attend_through: r.attend_through,
             positions: self.positions,
             gate: None,
             wo: w.o.dispatch_ref(),

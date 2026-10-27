@@ -1490,6 +1490,9 @@ fn forward_lanes_scoped(
     out: &StepOutputs<'_>,
     policy: &LaneStagePolicy,
 ) -> Result<(), Qwen4GpuForwardError> {
+    // A decode-share load runs lane steps on the resident bank only (no prefill
+    // bank is ever swapped in across a call boundary).
+    fwd.share_require_resident(gpu)?;
     // Expert parallelism: every MoE invocation runs the singleton's gathered
     // forward over the rank's replicated trunk (the row gather must already be
     // installed; checked before any launch).
@@ -1623,10 +1626,18 @@ fn forward_lanes_scoped(
         }
     }
     if n > fwd.scratch.max_chunk {
-        return Err(invalid(format!(
-            "lane step of {n} rows exceeds the forward scratch ({} rows)",
-            fwd.scratch.max_chunk
-        )));
+        return Err(invalid(if fwd.decode_share_active() {
+            format!(
+                "lane step of {n} rows exceeds the decode-share resident bank ({} rows): lane \
+                 steps run on the resident bank only",
+                fwd.scratch.max_chunk
+            )
+        } else {
+            format!(
+                "lane step of {n} rows exceeds the forward scratch ({} rows)",
+                fwd.scratch.max_chunk
+            )
+        }));
     }
     fwd.scratch.note_forward_rows(n);
     match out {

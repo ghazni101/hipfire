@@ -46,6 +46,13 @@ BOOTSTRAP_ENV = {
     "HIPFIRE_QWEN35_TP_PARTS",
     "HIPFIRE_QWEN35_TP_ROWS",
     "HIPFIRE_QWEN35_TP_CHUNK",
+    # Same for the Glimmer TP oracle in hipfire-arch-muse-glimmer mesh_tp.rs
+    # #[cfg(test)]; never read by runtime code.
+    "HIPFIRE_GLIMMER_TP_MODEL",
+    "HIPFIRE_GLIMMER_TP_PARTS",
+    "HIPFIRE_GLIMMER_TP_ROWS",
+    "HIPFIRE_GLIMMER_TP_CHUNK",
+    "HIPFIRE_GLIMMER_TP_GREEDY",
     # Read by the daemon's init_tracing() before the CLI has sent the process
     # config; going through developer_var there installs the local fallback
     # snapshot and makes the real install fail ("already initialized").

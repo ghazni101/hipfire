@@ -2315,7 +2315,14 @@ pub(crate) fn complete_request_attempt(
                  left after the prompt"
             );
         }
-        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1;
+        // Configured penalty defaults ride along at tp>1 only where the daemon's
+        // tp>1 loop applies penalties (the Qwen family); DeepSeek4/MiniMax
+        // refuse any non-neutral penalty, so their defaults are not forwarded.
+        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1
+            || runtime
+                .current_arch
+                .as_deref()
+                .is_some_and(|arch| arch.to_ascii_lowercase().contains("qwen"));
         let normalized_messages = contract.messages;
         let conversation_messages = contract.conversation_messages;
         let tool_choice_policy = contract.tool_choice_policy;
@@ -4772,7 +4779,7 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_high["reasoning_effort"], "medium");
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
         assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),

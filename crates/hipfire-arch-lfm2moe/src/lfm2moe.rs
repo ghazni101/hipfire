@@ -2228,7 +2228,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
         EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 | EmbeddingFormat::F32 => {}
         _ => return Err("batched decode: unsupported embedding format".to_string()),
     }
-    // lm_head allowlist (keep aligned with lm_head_batched_lfm kernels).
+    // lm_head allowlist (keep aligned with dispatch's `ProjectLadder::GemmLmHead` arms).
     match weights.lm_head.gpu_dtype {
         DType::Q8_0
         | DType::HFQ4G256

@@ -124,7 +124,7 @@ fn mirror_action_rollback() {
 // glimmer_hidden_keep_len removed with device-capture session API cutover.
 #[test]
 fn glimmer_turn_key_ordinal_salts() {
-    let fp = hipfire_generate::common::asst_turn_fingerprint("Done.", &[]);
+    let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("Done.", &[]);
     let k0 = hipfire_generate::dense::glimmer_turn_key(fp, 0);
     let k1 = hipfire_generate::dense::glimmer_turn_key(fp, 1);
     let k2 = hipfire_generate::dense::glimmer_turn_key(fp, 2);

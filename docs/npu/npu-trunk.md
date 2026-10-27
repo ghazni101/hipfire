@@ -27,6 +27,14 @@ kept for provenance and are not current recommendations.
   only, with an open NPU and a matching keyed calibration; every other arch is
   effectively `off` with no NPU I/O or allocation. Any auto load refusal logs one
   reason and runs GPU-only. `off` is the kill switch.
+* **Confirmed hardware.** Strix Halo (Ryzen AI Max+ 395) and the Ryzen AI Max+
+  PRO 495 / Radeon 8065S: the latter is not a Strix Halo part but enumerates as
+  gfx1151 on the same PCI ID (`1002:1586`) and carries the same XDNA2 NPU
+  (fw 1.1.2.65). On a 192 GB PRO 495 host the built-in calibration applied with
+  the 5% kernel-release margin, `on` armed (`runtime=open`), pp16384 measured
+  1980.9 -> 2209.9 tok/s over `off` (+11.6%) with `qwen3.8:flash-next`, and a
+  greedy 400-token generation was byte-identical to `emulate`. Numbers are
+  STAPM-throttled chassis numbers; see issue #966 for the full report.
 * **Calibration.** The compiled-in measured Halo records are the normal path: they
   bind on arch, build, model index, epilogue and trunk route only, and apply on any
   Halo kernel, NPU firmware or GPU PCI address at margin 0.0 (see below).
@@ -52,7 +60,8 @@ kept for provenance and are not current recommendations.
   Details: Live rate scales (auto), below. Developer variable
   `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` forces the per-request subset.
 * **Trace.** `HIPFIRE_QWEN4_NPU_TRUNK_TRACE` is unset by default; set it to a
-  path to append per-(layer, bank) JSONL.
+  path to append per-(layer, bank) JSONL. Tracing changes timing; retain an
+  untraced run for primary correctness and performance evidence.
 * **Pairs and chains.** Natural 8192+B pairs, the planner's rebalanced last pair
   (two banks of about equal rows) and one interior session-snapshot row per pair
   execute. NPU chains are row-adaptive in 256-row waves: a bank below 8192 rows
@@ -294,7 +303,7 @@ wiring attempt are in the root changelog. The design description and
 Gate K0 below are historical simulator records.
 
 `peacemaker-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
-`build_panel_program_out(rows_max, pitch, col0)`) is the program of the QSA `o_proj` / GDN
+`build_panel_program_n512(rows_max, pitch, col0, 6144)`) is the program of the QSA `o_proj` / GDN
 `out_proj` shapes (`Shape::{QsaO, GdnOut}`, N = 2560 = five 512-column panels, one pass each,
 K = 6144). Numerics: integer-exact accumulation on the array over the whole K, one RNE to BF16
 (`bf16_direct`); no int32 partial, combine or fold anywhere. It reuses the silicon-proven V8 geometry
@@ -321,6 +330,26 @@ Host layout: arg0 = A, 8 segments of `W*kc*4608` B (`W` 512-row waves; 56,623,10
 arg1 = B, 8 segments of `kc*4352` B (3,342,336 B), arg2 = C row-major `rows*pitch*2` B (pitch 2560,
 panel `p` at `col0 = 512*p`, `append_run_body` / `append_lean_run_body` with `arena_base[2] =
 2*512*p`) or native 16,384 B tiles. `pack_a_bf16` / `pack_b_bf16` dispatch on the design.
+
+### qwen3.8-27b dense in-projections: K = 5120 on N512 (HIPF-161, kernel/program/transport only)
+
+The same N512 program at `k = 5120` (kc 80, two B groups of 40, credit 63; B panel 348,160 B per column) holds the
+27B in-projections, whose every NPU-eligible projection has K = 5120: GDN qkv 10240 + z 6144 + a 48 + b 48 = 16480
+columns (33 panels, pitch 16896) and FA gated q 12288 + k 1024 + v 1024 = 14336 (28 panels). One BF16 rounding after
+the whole K, as above; the N1280 core (`MAX_KC` 40) cannot hold K5120 without an int32 partial combine.
+
+- GPU producer: `Gpu::npu_trunk_pack_a_bf16` with `NpuBf16Layout { k: 5120, n512: true, .. }` writes the 8-segment
+  512-row-wave A stream (`rows * 5760` B) and the compact `Dm/De` vector (`npu_trunk_pack_a_bf16_k5120`, same grid15-up
+  quant DAG as K2560). `n512: false` writes the N1280 4-segment stream the emulate GEMM addresses (`npu_trunk_i8_gemm_pm`
+  is K-generic); consume and the emulate GEMM refuse `n512` layouts (the NPU writes row-major C itself).
+- Transport: `railgun::npu::trunk::Shape::{DenseGdnIn, DenseFaIn}` (`Shape::k()` = 5120, `is_n512()`); the N512 A arena is
+  sized for the largest K of the open N512 shapes, B panels from `k`. The relay keys adaptive contexts by `(k, padded rows)`.
+- Oracles: `npu_trunk_glue_check` (pack vs the CPU N512 stream, emulate vs `bf16_direct` at both shapes),
+  `g80_n512_k5120_*` and the ignored `g80_n512_real_27b_tile` (real qwen3.8-27b tiles) simulator tests,
+  `npu-trunk-transport --shape dense_gdn_in --shape dense_fa_in [--corun]` on silicon.
+
+Measured on gfx1151 (8192 rows, exact every round, fclk not pinned): GDN 60.5 ms busy p50 = 22.9 TOPS (wall 20.7),
+FA 51.3 ms = 23.4 TOPS (wall 21.2); against 16 GiB/round of GPU copies GDN 17.8 / 15.1 and FA 19.5 / 16.6 TOPS.
 
 ### Gate K0 (design round verdict section 2), simulator ticks, never silicon (historical)
 
@@ -419,6 +448,54 @@ F16, RNE half-integer ties and grid-scale boundaries are included even at one ro
 It prints old/new pack GPU-event timings and bandwidth for each row count, plus
 full-width consumer and integer GEMM timings; any mismatch exits 1. CPU layout/map tests:
 `cargo test --release -p hipfire-arch-qwen4 --lib npu_trunk::gpu::tests -j 12`.
+
+## Generic co-processor stage (`hipfire_runtime::coproc`, 0.4.4)
+
+The route's topology-free parts are shared runtime code; the Qwen4 module keeps
+only Flash-Next's shape description, weight packing, programs and the hooks of
+one (layer, bank) visit.
+
+* **Op-level stage map** (`coproc::stage::StageMap`). Per layer kind (0 = GDN,
+  1 = attention) the layer count, input-projection K and out family; the input
+  projection families the NPU may own, in fused order; and the ownership groups
+  (families that move as a unit, one contiguous fused-column range each). Mixer
+  core, recurrent/KV state, residual, FFN and head always stay on the GPU
+  (`StageMap::owner`). Flash-Next's map is `npu_trunk::FLASH_NEXT`: 36 GDN and 12
+  QSA layers, K = 2560, groups `qkv`, `zab`, `q`, `kvidx`.
+* **Ownership table** (`FamilySet`). The EP-like table of the families the NPU
+  owns, whole groups only, chosen by the planner per load (`select_families`) or
+  per request (`choose_families`).
+* **Numerics contract** (`EpilogueContract::Bf16Direct`, calibration spelling
+  `bf16`). Every NPU-owned output is exact integer accumulation over the whole K
+  with grid15-up scale sidecars and one BF16 rounding; no int32 partial, combine or
+  fold exists on either device.
+* **Calibration and planner** (`coproc::{calibration, plan, rates}`). The schema-4
+  record below is validated against a map (group names, kind names, out
+  families); the planner, crossover, selection, rate estimator and the
+  max-window budget (`admit_wave_budget`, at most four row-adaptive programs per
+  load) take the map. The arithmetic and the goldens are unchanged.
+* **Pair schedule** (`coproc::schedule`). A chunk pair is two micro-batches walked
+  layer-major: `Prepare(0,A)`, `Init(B)`, `Prepare(0,B)`, then per layer
+  `Run(l,A)`, `Prepare(l+1,A)`, `Run(l,B)`, `Prepare(l+1,B)`. `pair_edges` lists the
+  dependencies the order respects (activation pack to the NPU and its result
+  back, A-arena reuse after retire, residual rows, layer state A before B); the
+  Flash-Next pair executor iterates `pair_schedule`. Placing `Init(B)` after the
+  first kick is a latency choice (the pipeline fill), not a dependency.
+* **Model check.** At open, `StageMap::check_model` compares each kind's layer count
+  with the loaded model's mixers and `in_k` with its hidden size. A mismatch leaves
+  the route off with that reason (`on`: load error), so a map can never price
+  another model's plans.
+
+Limits of the stage as it stands (a third kind or a fifth group is a schema change):
+
+* Exactly two layer kinds (`KINDS = 2`) and four ownership groups (`GROUPS = 4`);
+  the planner enumerates the 15 nonempty group subsets.
+* Kind 1 is the attention mixer: the `qsa_*` GPU terms, `qsa_order` and the
+  attention out-family order stall price it; kind 0 takes `gdn_core_per_layer_ms`.
+* A pair's fill is the first bank-A chain of kind 0 when kind 0 moves anything,
+  else of kind 1 (the layer stack is assumed to start with kind 0).
+* A map with more natural families than four groups must merge them; the dense
+  27B test map owns FA `k` and `v` as one `kv` group.
 
 ## Stored calibration and deterministic planning (0.4.2)
 
@@ -1209,8 +1286,13 @@ anchor calibrated after initialization and **before** pipeline work; its host
 bracket width is reported as uncertainty. There is no per-layer GPU sync.
 `gpu_wait_enqueue_ns` records the actual enqueue-ahead call and should precede
 `npu_done_ns` while work overlaps. Relay submit/done timestamps are harvested at
-the next bank reuse, before its generation changes, and at the final pair check;
-no host completion lookup is added at rejoin. The transport gate additionally
+the next bank reuse, after `prepare_bank` has already waited for that chain,
+and at the final pair check. The trace lookup adds no new completion wait at
+bank reuse. Extra timing events and anchor/final GPU synchronization can still
+change scheduling. Keep tracing unset for
+primary correctness and performance runs; use a separate fresh traced run to
+inspect completed chains and overlap. A traced pass alone does not establish
+untraced handoff correctness. The transport gate additionally
 asserts enqueue-before-done on every exact round and prints NPU-done→GPU-resume
 event latency with clock-anchor uncertainty, plus a forced-watchdog release test.
 No trace records are emitted for GPU-only tails or `emulate`.
@@ -1227,15 +1309,31 @@ Run transport before either serving arm, with devices visible:
 
 ```sh
 target/release/npu-trunk-transport --pci <gfx1151 GPU PCI bus ID>
+# Exercise the production cross-crate handoff, with hip-bridge loaded first:
+target/release/npu-trunk-transport --pci <gfx1151 GPU PCI bus ID> --gpu-runtime serving
+# The same producer/consumer streams under GPU contention:
+target/release/npu-trunk-transport --pci <gfx1151 GPU PCI bus ID> --gpu-runtime serving --corun
 ```
+
+The default `--gpu-runtime relay` retains the standalone transport baseline.
+`--gpu-runtime serving` uses hip-bridge's allocations, copy kernels, streams and
+events for the GPU producers and consumers, including the co-run stream and
+forced-watchdog release control. The NPU relay still owns the registered arenas
+and its handoff events, just as it does during serving. Before submitting work,
+the gate requires both live runtimes to resolve the same `hipEventRecord`
+address; library paths are logged for diagnosis. A divergent preload fails at
+`stage=GPU-runtime-identity` rather than exercising unordered foreign handles.
+Both modes retain the full-C CPU oracle, alias/padding checks, enqueue-ahead
+assertion and all three negative controls. This transport result is hardware
+handoff evidence; the fresh-daemon model parity below remains a separate gate.
 
 ```sh
 export HIPFIRE_DAEMON_BIN="$PWD/target/release/daemon"
 export HIPFIRE_PREFILL_CHUNK_ROWS=8192
 unset HIPFIRE_SESSION_CACHE_BYTES # retain the product-default 8 GiB prefix cache
+unset HIPFIRE_QWEN4_NPU_TRUNK_TRACE # primary parity runs omit trace instrumentation
 # MODEL must name the pinned MQ6 family-B artifact, not an MQ4 artifact.
 HIPFIRE_QWEN4_NPU_TRUNK=on \
-HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-on.jsonl \
   target/release/hipfire serve "$MODEL" 127.0.0.1 11435 --max-seq 32768
 ```
 
@@ -1261,7 +1359,11 @@ HIPFIRE_QWEN4_NPU_TRUNK=emulate \
 Compare generated token IDs/content byte-for-byte separately for the cold request
 and cache-hit request (not the nondeterministic response ID/timestamp/timings).
 `on` must equal `emulate` on both. Inspect the `on` trace for paired A/B banks
-despite the default cache. Separately compare `off` to unchanged beta, not to
+despite the default cache in a separate fresh diagnostic run with
+`HIPFIRE_QWEN4_NPU_TRUNK_TRACE` set. For the untraced runs, retain the first
+scheduled-pair log, `mode=on`/`runtime=open` receipt and successful nonempty
+response together; the scheduled-pair line alone precedes execution and does
+not prove completion. Separately compare `off` to unchanged beta, not to
 BF16-direct `on`; repeat the cold/cache-hit gate with native MTP and `--spec off`.
 
 
@@ -1270,7 +1372,6 @@ In a separate terminal, then repeat in fresh processes with `emulate` and `off`:
 
 ```sh
 HIPFIRE_QWEN4_NPU_TRUNK=on \
-HIPFIRE_QWEN4_NPU_TRUNK_TRACE=/tmp/npu-trunk-bench.jsonl \
   target/release/hipfire bench "$MODEL" --ttft --prompt-file p16k --runs 3
 
 for mode in on emulate off; do

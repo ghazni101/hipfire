@@ -2503,7 +2503,7 @@ fn load_f16_tensor(
 /// + fadvise_dontneed (avoids page cache buildup on unified-memory APUs)
 /// and on non-Unix falls back to mmap. Sidecars are small (K ≤ ~12288
 /// elements, ~48 KB peak), so the owned-Vec copy is negligible.
-pub(crate) fn awq_scale_f32_bytes(hfq: &HfqFile, weight_name: &str, k: usize) -> Option<Vec<u8>> {
+pub fn awq_scale_f32_bytes(hfq: &HfqFile, weight_name: &str, k: usize) -> Option<Vec<u8>> {
     let sidecar_name = match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
         None => format!("{weight_name}.awq_scale.weight"),

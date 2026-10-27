@@ -34,6 +34,14 @@ fn json_sha<T: serde::Serialize>(v: &T) -> String {
     sha(&serde_json::to_string(v).unwrap())
 }
 
+// `hipfire-engine` intentionally enables serde_json/preserve_order (b26ba3b495).
+// Workspace feature unification must not turn JSON object ordering into a
+// kernel change: retain the sorted-key representation used by the original pins.
+fn contract_sha(mut value: serde_json::Value) -> String {
+    value.sort_all_objects();
+    json_sha(&value)
+}
+
 /// `(name, sha256)` in a fixed order.
 fn digests() -> Vec<(&'static str, String)> {
     let q8 = spec(FaKvCodec::Q8_0);
@@ -56,12 +64,12 @@ fn digests() -> Vec<(&'static str, String)> {
         ("fp8_module.proof", json_sha(&module8_proof)),
         (
             "contract.preconvert",
-            json_sha(&preconvert_contract(ARCH, &pre)),
+            contract_sha(preconvert_contract(ARCH, &pre)),
         ),
-        ("contract.direct", json_sha(&contract(ARCH, &direct))),
+        ("contract.direct", contract_sha(contract(ARCH, &direct))),
         (
             "contract.fp8_direct",
-            json_sha(&fp8_contract(ARCH, &direct8)),
+            contract_sha(fp8_contract(ARCH, &direct8)),
         ),
     ]
 }

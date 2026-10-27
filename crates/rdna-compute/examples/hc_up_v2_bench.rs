@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipEvent microbench: the persistent gfx1201 Qwen4 HC up+mix read tail
-//! `hyper_read_up_wmma_bf16_gfx1201_v2` against the retiled `_t128` entry it replaces, both through
+//! hipEvent microbench: the persistent gfx1201 / gfx1151 Qwen4 HC up+mix read tail
+//! `hyper_read_up_wmma_bf16_gfx1201_v2` / `_gfx1151_v2` against the retiled `_t128` / `_swap` entry it replaces, both through
 //! `tensor_ops::hyper_read_up_wmma_route`. hidden 2560, low_rank 320, `up_weight` BF16 [4 * 2560, 320],
 //! `low` BF16 [rows, 320], `normalized` F16 [rows, 4 * 2560]; random inputs (the oracle's class a).
 //!
@@ -26,7 +26,7 @@
 
 use half::f16;
 use rdna_compute::tensor_ops::{
-    hc_up_v2_groups, hyper_read_up_wmma_route, HcUpRoute, HyperReadUpFused,
+    hc_up_v2_1151_groups, hc_up_v2_groups, hyper_read_up_wmma_route, HcUpRoute, HyperReadUpFused,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -105,10 +105,11 @@ fn batched(gpu: &mut Gpu, mut f: impl FnMut(&mut Gpu)) -> (f64, f64) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
-    let available = gpu.arch == "gfx1201" && gpu.qwen4_f16_wmma_gfx1201();
+    let available =
+        (gpu.arch == "gfx1201" && gpu.qwen4_f16_wmma_gfx1201()) || gpu.arch == "gfx1151";
     println!("arch {} v2_available={available}", gpu.arch);
     if !available {
-        eprintln!("V2 is not available: it needs exact gfx1201 on the F16 WMMA route");
+        eprintln!("V2 is not available: it needs exact gfx1201 (F16 WMMA route) or exact gfx1151");
         std::process::exit(2);
     }
     println!(
@@ -172,7 +173,11 @@ fn main() {
         let low = upload_u16(&mut gpu, &lb[..rows * LOW_RANK], DType::BF16);
         let norm = upload_u16(&mut gpu, &nb[..rows * WIDE], DType::F16);
         let mixed = gpu.zeros(&[rows * HIDDEN], DType::F32).unwrap();
-        let groups = hc_up_v2_groups(rows);
+        let groups = if gpu.arch == "gfx1151" {
+            hc_up_v2_1151_groups(rows)
+        } else {
+            hc_up_v2_groups(rows)
+        };
         let mut time = |route: HcUpRoute| {
             batched(&mut gpu, |g| {
                 hyper_read_up_wmma_route(

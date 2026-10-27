@@ -53,6 +53,9 @@ pub struct Dflash2Speculator {
     /// ([`trim_feature_rows`]); otherwise `host_base` stays 0.
     target_hidden_host: Vec<f32>,
     host_base: usize,
+    /// Token of every committed position `0..host_end()`: tells a session
+    /// reuse whether the rows below its restart belong to that prompt.
+    host_tokens: Vec<u32>,
     /// Rows the draft reads (its declared sliding window); `None` keeps every
     /// row.
     feature_window: Option<usize>,
@@ -135,7 +138,43 @@ impl Dflash2Speculator {
         self.target_hidden_host.clear();
         self.target_hidden_host.shrink_to_fit();
         self.host_base = 0;
+        self.host_tokens.clear();
         self.scratch.reset_upload_tracking();
+    }
+
+    /// The target continues `prompt` at `start` (a session restore or a live
+    /// continuation): keep the host rows below `start` or restart the draft
+    /// context empty there ([`draft_resume_base`]). A hit the draft cannot
+    /// resume fails; the caller asks [`Speculator::can_resume_at`] first.
+    fn reuse_host(&mut self, prompt: &[u32], start: usize) -> Result<(), String> {
+        let base = draft_resume_base(
+            &self.host_tokens,
+            self.host_base,
+            self.feature_window,
+            prompt,
+            start,
+        )
+        .ok_or_else(|| {
+            format!(
+                "Dflash2Speculator: feature rows {}..{} cannot resume the draft at {start} of a {}-token prompt",
+                self.host_base,
+                self.host_end(),
+                prompt.len()
+            )
+        })?;
+        if base == start {
+            self.target_hidden_host.clear();
+            self.host_tokens.clear();
+            self.host_tokens.extend_from_slice(&prompt[..start]);
+        } else {
+            self.target_hidden_host
+                .truncate((start - base) * self.row_elems());
+            self.host_tokens.truncate(start);
+        }
+        self.host_base = base;
+        // Device copies of rows at or past `start` are stale now.
+        self.scratch.reset_upload_tracking();
+        Ok(())
     }
 
     /// A window that failed after its verify started must not leave the
@@ -180,12 +219,13 @@ impl Dflash2Speculator {
             target.verify_block(gpu, &block, position, vs.as_mut(), Some(&mut rows))?[0]
         };
         target.commit_prefix(gpu, &block, 0, position, self.verify_scratch()?.as_mut())?;
-        self.append_rows(&rows, 1)?;
+        self.append_rows(&rows, &block)?;
         Ok(SpecStep::new(std::iter::once(token), token, 0, 0).cap_emit(1))
     }
 
-    fn append_rows(&mut self, rows: &[f32], count: usize) -> Result<(), String> {
-        let elems = count * self.row_elems();
+    /// Append the feature rows of the committed `tokens`.
+    fn append_rows(&mut self, rows: &[f32], tokens: &[u32]) -> Result<(), String> {
+        let elems = tokens.len() * self.row_elems();
         if rows.len() < elems {
             return Err(format!(
                 "Dflash2Speculator: target captured {} feature floats, need {elems}",
@@ -193,6 +233,7 @@ impl Dflash2Speculator {
             ));
         }
         self.target_hidden_host.extend_from_slice(&rows[..elems]);
+        self.host_tokens.extend_from_slice(tokens);
         self.trim_host();
         Ok(())
     }
@@ -214,14 +255,16 @@ impl Speculator for Dflash2Speculator {
         _resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        // A cold prefill resets the target and a hit restores or continues
+        // it: either way no verify ticket is outstanding.
+        if let Some(vs) = self.verify_scratch.as_mut() {
+            vs.clear();
+        }
         let (fill, start) = if cache_hit {
+            self.reuse_host(prompt_tokens, prefill_start)?;
             (prefill_tokens, prefill_start)
         } else {
-            // A cold prefill resets the target: any verify ticket is gone.
             self.clear_host();
-            if let Some(vs) = self.verify_scratch.as_mut() {
-                vs.clear();
-            }
             (prompt_tokens, 0)
         };
         self.check_host_rows(start)?;
@@ -241,6 +284,7 @@ impl Speculator for Dflash2Speculator {
             } => (last_argmax, last_logits),
         };
         self.rebase_host(start + fill.len())?;
+        self.host_tokens.extend_from_slice(fill);
         self.check_host_rows(start + fill.len())?;
         let first_token = if self.sampled() {
             let logits = last_logits.ok_or(
@@ -377,6 +421,7 @@ impl Speculator for Dflash2Speculator {
             Some(&mut self.target_hidden_host),
         )? {
             self.rebase_host(start_pos + tokens.len())?;
+            self.host_tokens.extend_from_slice(tokens);
             self.check_host_rows(start_pos + tokens.len())?;
         }
         Ok(true)
@@ -408,6 +453,17 @@ impl Speculator for Dflash2Speculator {
 
     fn ctx_capacity(&self) -> usize {
         self.ctx_capacity
+    }
+
+    fn can_resume_at(&self, prompt: &[u32], start: usize) -> bool {
+        draft_resume_base(
+            &self.host_tokens,
+            self.host_base,
+            self.feature_window,
+            prompt,
+            start,
+        )
+        .is_some()
     }
 
     fn supports_temp_verify(&self) -> bool {
@@ -480,7 +536,7 @@ impl Dflash2Speculator {
             position,
             self.verify_scratch()?.as_mut(),
         )?;
-        self.append_rows(&rows, accepted + 1)?;
+        self.append_rows(&rows, &block[..=accepted])?;
         let emit = drafts[..accepted]
             .iter()
             .copied()
@@ -637,6 +693,7 @@ pub fn build_dflash2_speculator(
         config,
         target_hidden_host: Vec::new(),
         host_base: 0,
+        host_tokens: Vec::new(),
         feature_window,
         verify_scratch: Some(verify_scratch),
         block_size: block,
@@ -645,6 +702,32 @@ pub fn build_dflash2_speculator(
         request: SpecRequestConfig::default(),
         rng: SpecRng::new(0),
     }))
+}
+
+/// Where the draft context restarts when the target continues `prompt` at
+/// `start` (a session restore or a live continuation). The host holds rows
+/// `host_base..host_tokens.len()`, committed for `host_tokens`. The draft's
+/// next forward reads rows `prompt.len() - window..` (`window` `None`: every
+/// row) and needs all of them held; rows below `start` can only come from
+/// the host, and only when committed for this prompt's prefix.
+/// `Some(host_base)` keeps the host rows, `Some(start)` restarts empty at
+/// `start` (the forward reads nothing below it) and `None` cannot resume.
+fn draft_resume_base(
+    host_tokens: &[u32],
+    host_base: usize,
+    window: Option<usize>,
+    prompt: &[u32],
+    start: usize,
+) -> Option<usize> {
+    let first_read = window.map_or(0, |w| prompt.len().saturating_sub(w));
+    if start <= first_read {
+        return Some(start);
+    }
+    let kept = host_base <= first_read
+        && host_tokens
+            .get(..start)
+            .is_some_and(|held| prompt.get(..start) == Some(held));
+    kept.then_some(host_base)
 }
 
 /// Keep the last `keep` rows of `rows_elems`-wide feature rows once the
@@ -776,6 +859,57 @@ mod tests {
             0,
             "keep 0 never trims"
         );
+    }
+
+    /// A session reuse keeps the host rows only when they were committed for
+    /// this prompt and hold every row the draft's next forward reads; a
+    /// suffix of at least one window needs no host rows. Anything else must
+    /// prefill cold: restarting empty at `start` with a shorter suffix is
+    /// the draft forward's `base <= ctx - window` assert (HIPF-188).
+    #[test]
+    fn draft_resume_keeps_this_prompts_rows_or_needs_a_window_suffix() {
+        // 20-token prompt, window 4: the first draft forward reads rows 16..20.
+        let prompt: Vec<u32> = (0..20).collect();
+        let w = Some(4);
+        let held = &prompt[..19];
+        assert_eq!(draft_resume_base(held, 14, w, &prompt, 18), Some(14));
+        assert_eq!(
+            draft_resume_base(held, 16, w, &prompt, 19),
+            Some(16),
+            "live continuation"
+        );
+        let mut foreign = held.to_vec();
+        foreign[3] = 99;
+        assert_eq!(
+            draft_resume_base(&foreign, 14, w, &prompt, 18),
+            None,
+            "rows of another prompt"
+        );
+        assert_eq!(
+            draft_resume_base(held, 17, w, &prompt, 18),
+            None,
+            "rows 17.. miss row 16"
+        );
+        assert_eq!(
+            draft_resume_base(held, 19, w, &prompt, 18),
+            None,
+            "start below a trimmed base"
+        );
+        assert_eq!(
+            draft_resume_base(&[], 0, w, &prompt, 18),
+            None,
+            "rows cleared by a reset"
+        );
+        assert_eq!(
+            draft_resume_base(&foreign, 17, w, &prompt, 16),
+            Some(16),
+            "a window-long suffix restarts empty"
+        );
+        assert_eq!(draft_resume_base(&foreign, 17, w, &prompt, 0), Some(0));
+        // A draft that reads every row keeps rows from 0 or prefills cold.
+        assert_eq!(draft_resume_base(held, 0, None, &prompt, 18), Some(0));
+        assert_eq!(draft_resume_base(&[], 0, None, &prompt, 18), None);
+        assert_eq!(draft_resume_base(&[], 0, None, &prompt, 0), Some(0));
     }
 
     #[test]

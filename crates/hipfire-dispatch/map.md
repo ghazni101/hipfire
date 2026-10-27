@@ -22,6 +22,25 @@ Unified kernel dispatch abstraction: one entry point per kernel family. Owns `fa
 - Late-H switches are qualified exact-gfx1201 defaults (unset on there, `0` kills): `HIPFIRE_MOE_ROTATE_I4_PM` selects the PM down-A4 producer beneath the symmetric IU4 route; `HIPFIRE_PREFILL_IU4_C8_PM` selects the exact PM rotate/RMSNorm C8 twins beneath resolved F3. `HIPFIRE_GDN_CHUNK_PREP_PM` selects the PM prep twin only inside the architecture's admitted generalized 16/32 MoE GDN scan, with views/modules resolved before projection or conv-ring mutation; dense 16/48 retains its incumbent/fixup prep. Their leaf sources are [`rdna-compute/src/moe_rotate_i4_pm.rs`](../rdna-compute/src/moe_rotate_i4_pm.rs), [`iu4_c8_pm.rs`](../rdna-compute/src/iu4_c8_pm.rs) and [`gdn_chunk_prep_pm.rs`](../rdna-compute/src/gdn_chunk_prep_pm.rs).
 - `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` is the fourth late-H route: `prefill_shared_down_sigmoid_epi_admitted` in [`src/pipeline/mod.rs`](src/pipeline/mod.rs), with the grouped path in [`src/pipeline/qt44_qt53_prefill.rs`](src/pipeline/qt44_qt53_prefill.rs), admits an MQ4G256V2 shared-down HIP V3 sigmoid-gated residual epilogue, not PM. It preserves the incumbent zeroed-temporary + ADD arithmetic, upstream AWQ and checked prepared-token consumption; capture/recording and collectors needing the shared intermediate refuse it.
 
+## Family step programs
+
+Conventions for the `Step` program a model family declares. Decided in HIPF-86 and checked against beta after the #666 cutovers (#877, #884, #881, #886, #883, #889) and #929. Worked examples: [`docs/design/gemma4-declarative-program.md`](../../docs/design/gemma4-declarative-program.md) and [`docs/design/glimmer-declarative-program.md`](../../docs/design/glimmer-declarative-program.md). The dense MLP op is in [`docs/design/gated-mlp-op.md`](../../docs/design/gated-mlp-op.md).
+
+1. **Sandwich-norm decoders** run one `Step::SandwichAttention` per layer and one MLP step per layer (`pipeline::sandwich`). The MLP step is `Step::GatedMlp` with `MlpLadder::SandwichWide` and a `MlpOutput::PostNorm` epilogue for Gemma 4 dense layers, or `Step::SandwichMlp` for Glimmer. Family differences become op fields or route variants inside `sandwich`, for example `SandwichRoute`, `KvRoute`, `AttnGate`, `RopeKind::NoPe` and `post_eps`, not a new step.
+2. **Rows live in the op, with one explicit route.** An op that serves both decode and batched rows carries `rows` plus exactly one explicit route; `rows` never selects kernels (a one-row prefill chunk keeps its batched arithmetic).
+   - The shared discriminator is `pipeline::RowsRoute { Decode, Prefill, Verify }`.
+   - An op whose routes need route-only operands uses a per-op `XRoute::{Decode { .. }, Batched { .. }}` enum (the DS4 `mla` ops, e.g. `KvJointRoute`, `QLoraProjectRoute`).
+   - `validate_for_gpu` rejects `Decode` with `rows != 1`, and a batched route without `positions` or without its operands.
+   - No `*Rows` twin steps, no per-family rows sub-enum, and no decode-only composite next to a rows decomposition of the same sublayer: decode and prefill of a layer expose the same `OpKind` set.
+   - Rows projection of sandwich models is `sandwich::gemm_rows` (one definition; `Ladder::Wide` or a `RowsRoute`).
+3. **RoPE** is described by `sandwich::Rope { kind, theta }`, and `Step::Rope` carries it as `rope` (#884).
+4. **MoE routing** goes through sealed MoE (`Step::Moe`). The biased sigmoid selection (`MoeSelectionBias`, `src/families/moe.rs`) is defined once.
+5. **Existing families come first.** DFlash draft attention uses `AttentionFamily::run_full_attention` (or `run_full_attention_on` to pin a tile). Fused SiLU·up + FWHT uses `RotationFamily` with `RotationVariant::WithSwiGLU`. Device copies are recorded launches (`copy_f32_buffer`), never `hip.memcpy_dtod`.
+6. **Standard pre-norm decoders** (LFM2, MiniMax) keep the llama-style primitive steps (`RmsnormAutomatic`, `Gemv`, `QkNorm`, `Rope`, `Attend`, `GemvResidual`). A dense gated FFN is `Step::GatedMlp` (#929).
+7. **Row norms are row norms.** A hidden-width RMSNorm over `rows` rows uses `Step::RmsnormAutomatic` with `rows` (`OpKind::RmsnormAutomatic`, `SplitRule::RowComplete`), never `Step::QkNorm`, which is `HeadLocal`.
+8. **Every new `Step` variant gets an appended `OpKind` ID** in `src/pipeline/step_graph.rs`, and `op_kind_ids_frozen` is extended. IDs are never renumbered or reused: `18` (`DenseFfn`) and `20` (the first `SandwichMlp`) were retired when those ops folded into `GatedMlp = 28`, and the later `Step::SandwichMlp` took the appended ID `31`, not `20`. A hand-route ID that already exists (e.g. `OpKind::SiluMul = 1001`) is reused for its op rather than given a second ID.
+9. **Every op validates.** Each `Step` operand has `validate_for_gpu` (geometry, route/rows consistency, cache bounds, scratch sizes), and `validate_steps` (`src/pipeline/steps.rs`) calls it.
+
 ## Crate map
 
 <!-- crate-map:generated:begin -->
@@ -270,7 +289,9 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `cpu_split_executor_wide`
   - `CpuWideVerifyScope`
   - `crate`
+  - `deterministic_down`
   - `down_entries`
+  - `down_writes_expanded`
   - `EXPERT_TIER_DEVICE`
   - `EXPERT_TIER_HOST`
   - `ExpertTierIdentity`
@@ -294,11 +315,11 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `MOE_GROUPED_BLOCK_M`
   - `moe_prefill_topk_shape_supported`
   - `MoeBiasAwareMq2Backend`
-  - `MoeBiasAwareParams`
   - `MoeBiasAwarePrefillParams`
   - `MoeDtypes`
   - `MoeEpMode`
   - `MoeFamily`
+  - `MoeMq2Lloyd`
   - `MoeNormalization`
   - `MoeParams`
   - `MoePointerEntries`
@@ -315,6 +336,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `MoeRouteGeometry`
   - `MoeRoutePolicy`
   - `MoeRowGather`
+  - `MoeScores`
   - `MoeSelectedParams`
   - `MoeSelectionBias`
   - `MoeSharedDecode`
@@ -341,11 +363,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `routed_indexable`
   - `routed_uniform_mqv2_grouped_supported`
   - `RoutedExpertWeights`
-  - `run_bias_aware`
+  - `router_scores_precomputed`
   - `run_bias_aware_prefill`
   - `run_selected`
   - `sealed_fp8`
-  - `selected`
   - `sigmoid_routed_prefill_supported`
   - `slab_bucket_of_pair`
   - `slab_codec_of_pair`
@@ -466,6 +487,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `fused_silu_mul_rotate_mq_f16_batched_for`
   - `is_independent`
   - `mq_f16_projection_fast_route`
+  - `MropeRows`
   - `plain_gemm_key_for`
   - `q8_prefill_wmma_enabled`
   - `reject_typed_only_format`
@@ -482,6 +504,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `verify_dense_math`
   - `WIDENED_COMMIT_ROWS`
 - [`src/pipeline/batched_attention.rs`](src/pipeline/batched_attention.rs)
+  - `alloc`
+  - `attend`
   - `AttentionLayerView`
   - `batch_chunk_fa_attend`
   - `batch_chunk_fa_attend_ragged_fp8q`
@@ -495,12 +519,17 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `BatchedAttentionTap`
   - `dflash_fa_batch_fusion_admitted`
   - `execute_fa_attend_step`
+  - `FA_PAIR_BATCH`
+  - `FA_PAIR_ROWS`
   - `fa_pertoken_min_ctx`
   - `fa_pm_kv_codec`
   - `fa_pm_qprep_admitted`
   - `fa_prep_unfused_qk_norm`
   - `fa_prep_unfused_rope`
+  - `FaPairHalf`
+  - `FaPairStage`
   - `FlashScratch`
+  - `free_gpu`
   - `gfx1100_split_verify_admitted`
   - `gfx1100_split_verify_min_ctx`
   - `gfx12_fa_prep_admitted`
@@ -637,6 +666,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `execute_indexed_attention_core_rows`
   - `execute_indexed_attention_hc`
   - `execute_indexed_attention_uncovered`
+  - `execute_lane_attention`
   - `execute_lm_head`
   - `execute_project`
   - `GATED_SHORT_CONV_MAX_KERNEL`
@@ -657,11 +687,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `IndexedAttentionMode`
   - `IndexedAttentionOp`
   - `IndexedAttentionState`
+  - `LaneAttentionOp`
   - `MixerPhase`
   - `next_lengths`
   - `next_lengths_after`
   - `project_weight`
   - `project_weights`
+  - `ProjectLadder`
   - `ProjectOp`
   - `qsa_projection_hook_installed`
   - `QsaProjectionHook`
@@ -810,7 +842,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `RoutedDownRotation`
   - `router_observer`
   - `RowsRoute`
-  - `run_moe_decode_bias_aware`
   - `run_moe_decode_selected`
   - `run_moe_prefill_bias_aware`
   - `run_uniform_moe_down_expanded`
@@ -851,7 +882,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `execute_parallel_moe_mlp`
   - `execute_per_layer_input`
   - `execute_sandwich_attention`
+  - `execute_sandwich_attention_partial`
+  - `execute_sandwich_epilogue`
   - `execute_sandwich_mlp`
+  - `execute_sandwich_mlp_partial`
   - `execute_scale`
   - `execute_softcap`
   - `gemm_rows`

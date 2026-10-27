@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Halo-only byte oracle. Run: cargo run --release -p rdna-compute --features lab --example npu_trunk_glue_check
 //! Compares complete old/new packed arenas and sidecars, then reports pack/consume event timings.
+//! K = 2560: Flash-Next (N1280 pack, consume, emulate). K = 5120: qwen3.8-27b dense in-projections (N512 pack against
+//! the CPU N512 stream, N1280 pack feeding the emulate GEMM, emulate at the 27B GDN / FA fused shapes).
 use half::f16;
 use peacemaker_npu::kernels::{
     gemm_core::{Control, Epilogue},
     gemm_g80::{self, bf16_output_offset},
+    gemm_g80_n512,
     w8a8_epi::{bf16_direct, grid15_up},
 };
 use rdna_compute::{
     npu_trunk::{NpuBf16Layout, NpuTrunkOutput},
     DType, Gpu, GpuTensor,
 };
-const K: usize = 2560;
 const AP: usize = 32;
 const WP: usize = 64;
 // Same numeric DAG as lab quant_row(grid=1); repeated rows cache exact CPU dots,
 // not GPU results. Every output and every padding byte is still compared.
-fn activations() -> (Vec<u16>, Vec<i8>, Vec<(u16, i16)>) {
-    let mut x = vec![0u16; AP * K];
-    let mut a = vec![0i8; AP * K];
+fn activations(k: usize) -> (Vec<u16>, Vec<i8>, Vec<(u16, i16)>) {
+    let mut x = vec![0u16; AP * k];
+    let mut a = vec![0i8; AP * k];
     let mut ds = vec![(0, 0); AP];
     let mut seed = 0xa8e001u32;
     for t in 0..AP {
-        for i in 0..K {
+        for i in 0..k {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
@@ -45,9 +47,9 @@ fn activations() -> (Vec<u16>, Vec<i8>, Vec<(u16, i16)>) {
             } else {
                 ((seed & 0x83ff) | (((8 + t % 20) as u32) << 10)) as u16
             };
-            x[t * K + i] = h;
+            x[t * k + i] = h;
         }
-        let am = x[t * K..(t + 1) * K]
+        let am = x[t * k..(t + 1) * k]
             .iter()
             .map(|&h| f16::from_bits(h).to_f32().abs())
             .fold(0f32, f32::max);
@@ -55,13 +57,27 @@ fn activations() -> (Vec<u16>, Vec<i8>, Vec<(u16, i16)>) {
         ds[t] = (m, e);
         let d = (m as f64 * 2f64.powi(e as i32)) as f32;
         let inv = if am == 0.0 { 0.0 } else { 1.0f32 / d };
-        for i in 0..K {
-            a[t * K + i] = (f16::from_bits(x[t * K + i]).to_f32() * inv)
+        for i in 0..k {
+            a[t * k + i] = (f16::from_bits(x[t * k + i]).to_f32() * inv)
                 .round_ties_even()
                 .clamp(-127.0, 127.0) as i8;
         }
     }
     (x, a, ds)
+}
+/// CPU A stream of the layout's NPU program: N1280 (`design_g80`, K <= 2560) or N512. `None`: no CPU program exists
+/// (N1280 at K > 2560 only feeds the emulate GEMM; old/new parity and the end-to-end emulate oracle cover it).
+fn cpu_pack(layout: NpuBf16Layout, a: &[i8], d: &[(u16, i16)]) -> Option<Vec<u8>> {
+    let (p, k) = (layout.padded_rows, layout.k);
+    if layout.n512 {
+        let design = gemm_g80_n512::design_g80_n512(p, 512, k, Epilogue::Bf16, Control::Fast);
+        Some(gemm_g80::pack_a_bf16(&design, a, d))
+    } else if k <= 2560 {
+        let design = gemm_g80::design_g80(p, 1280, k, Epilogue::Bf16, Control::Fast);
+        Some(gemm_g80::pack_a_bf16(&design, a, d))
+    } else {
+        None
+    }
 }
 fn sides(s: &[(u16, i16)]) -> Vec<u8> {
     s.iter()
@@ -129,25 +145,27 @@ fn timed(gpu: &mut Gpu, label: &str, mut f: impl FnMut(&mut Gpu)) -> f32 {
     gpu.hip.event_destroy(end).unwrap();
     ms
 }
-fn pack_checks(gpu: &mut Gpu, xp: &[u16], ap: &[i8], dp: &[(u16, i16)]) {
+fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &[(u16, i16)]) {
     for rows in [1usize, 37, 512, 4647, 8151, 8192] {
         // Offset zero covers all mixed fixtures at large sizes; the other offsets
         // ensure even the one-row test exercises maxima, RNE ties and scale edges.
         for offset in [0usize, 2, 3, 4] {
-            let p = rows.div_ceil(256) * 256;
+            let wave = if n512 { 512 } else { 256 };
+            let p = rows.div_ceil(wave) * wave;
             let layout = NpuBf16Layout {
                 padded_rows: p,
-                k: K,
+                k,
                 panels: 1,
+                n512,
             };
-            let xbytes: Vec<u8> = (0..rows * K)
-                .flat_map(|i| xp[(i + offset * K) % (AP * K)].to_le_bytes())
+            let xbytes: Vec<u8> = (0..rows * k)
+                .flat_map(|i| xp[(i + offset * k) % (AP * k)].to_le_bytes())
                 .collect();
-            let x = typed(gpu, &xbytes, &[rows, K], DType::F16);
-            let a_cpu: Vec<i8> = (0..p * K)
+            let x = typed(gpu, &xbytes, &[rows, k], DType::F16);
+            let a_cpu: Vec<i8> = (0..p * k)
                 .map(|i| {
-                    if i / K < rows {
-                        ap[(i + offset * K) % (AP * K)]
+                    if i / k < rows {
+                        ap[(i + offset * k) % (AP * k)]
                     } else {
                         0
                     }
@@ -170,8 +188,9 @@ fn pack_checks(gpu: &mut Gpu, xp: &[u16], ap: &[i8], dp: &[(u16, i16)]) {
                 .unwrap();
             gpu.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap();
             gpu.hip.device_synchronize().unwrap();
-            let design = gemm_g80::design_g80(p, 1280, K, Epilogue::Bf16, Control::Fast);
-            let mut expected_a = gemm_g80::pack_a_bf16(&design, &a_cpu, &d_cpu);
+            // N1280 K > 2560 has no CPU program: the old scalar kernel is its byte oracle here.
+            let mut expected_a = cpu_pack(layout, &a_cpu, &d_cpu)
+                .unwrap_or_else(|| download(gpu, "old A", &old_a)[..layout.a_bytes()].to_vec());
             expected_a.extend([0xa5; 256]);
             let mut expected_d = sides(&d_cpu[..rows]);
             expected_d.extend([0xa5; 256]);
@@ -205,17 +224,24 @@ fn pack_checks(gpu: &mut Gpu, xp: &[u16], ap: &[i8], dp: &[(u16, i16)]) {
                 &download(gpu, "new D", &d),
                 &download(gpu, "old D", &old_d),
             );
-            println!("pack_exact rows={rows} fixture_offset={offset} old_vs_new=byte-exact padding=ok guards=ok");
+            println!("pack_exact k={k} n512={n512} cpu_ref={} rows={rows} fixture_offset={offset} old_vs_new=byte-exact padding=ok guards=ok",
+                if n512 || k <= 2560 { "peacemaker" } else { "old-scalar" });
             if offset == 0 {
-                let old = timed(gpu, &format!("pack-old rows={rows} k={K}"), |g| {
-                    g.npu_trunk_pack_a_bf16_old(&x, rows, layout, &old_a, &old_d)
-                        .unwrap()
-                });
-                let new = timed(gpu, &format!("pack-new rows={rows} k={K}"), |g| {
-                    g.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap()
-                });
-                let traffic = (rows * K * 2 + layout.a_bytes() + rows * 4) as f64;
-                println!("pack_bw rows={rows} old_ms={old:.4} new_ms={new:.4} old_GBps={:.2} new_GBps={:.2} speedup={:.2} target_GBps=180",
+                let old = timed(
+                    gpu,
+                    &format!("pack-old rows={rows} k={k} n512={n512}"),
+                    |g| {
+                        g.npu_trunk_pack_a_bf16_old(&x, rows, layout, &old_a, &old_d)
+                            .unwrap()
+                    },
+                );
+                let new = timed(
+                    gpu,
+                    &format!("pack-new rows={rows} k={k} n512={n512}"),
+                    |g| g.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap(),
+                );
+                let traffic = (rows * k * 2 + layout.a_bytes() + rows * 4) as f64;
+                println!("pack_bw k={k} n512={n512} rows={rows} old_ms={old:.4} new_ms={new:.4} old_GBps={:.2} new_GBps={:.2} speedup={:.2} target_GBps=180",
                     traffic/(old as f64*1e6),traffic/(new as f64*1e6),old/new);
                 compare(
                     "timed pack old/new arena",
@@ -238,39 +264,66 @@ fn run() {
     eprintln!("PHASE GPU initialization");
     let mut gpu = Gpu::init().expect("GPU init");
     assert_eq!(gpu.arch, "gfx1151");
-    eprintln!("PHASE CPU activation and integer-dot references");
-    let (xp, ap, dp) = activations();
-    pack_checks(&mut gpu, &xp, &ap, &dp);
-    let wp: Vec<i8> = (0..WP * K)
-        .map(|i| (((i * 73 + (i / K) * 31 + (i % K) * (i % K) * 3) % 255) as i32 - 127) as i8)
+    // Frozen S1 full ColumnMaps (Flash-Next, K2560) and the qwen3.8-27b in-projections (K5120), native projection
+    // widths in fused family order.
+    run_k(
+        &mut gpu,
+        2560,
+        &[
+            ("GdnIn", &[10240, 6144, 48, 48]),
+            ("QsaIn", &[12288, 512, 512, 640]),
+        ],
+    );
+    run_k(
+        &mut gpu,
+        5120,
+        &[
+            ("DenseGdnIn", &[10240, 6144, 48, 48]),
+            ("DenseFaIn", &[12288, 1024, 1024]),
+        ],
+    );
+    println!("RESULT PASS");
+}
+/// Pack (both layouts the K has an NPU program for), then per shape: consume (K2560, the N1280 native tiles) and the
+/// emulate twin (N1280 A + IU8 GEMM + `npu_trunk_epi_bf16`) against `bf16_direct` of CPU integer dots.
+fn run_k(mut gpu: &mut Gpu, k: usize, shapes: &[(&str, &[usize])]) {
+    eprintln!("PHASE CPU activation and integer-dot references k={k}");
+    let (xp, ap, dp) = activations(k);
+    pack_checks(gpu, k, false, &xp, &ap, &dp);
+    if k > 2560 {
+        pack_checks(gpu, k, true, &xp, &ap, &dp);
+    }
+    let consume = k <= 2560;
+    let wp: Vec<i8> = (0..WP * k)
+        .map(|i| (((i * 73 + (i / k) * 31 + (i % k) * (i % k) * 3) % 255) as i32 - 127) as i8)
         .collect();
     let dots: Vec<i32> = (0..AP * WP)
         .map(|i| {
-            ap[i / WP * K..(i / WP + 1) * K]
+            ap[i / WP * k..(i / WP + 1) * k]
                 .iter()
-                .zip(&wp[i % WP * K..(i % WP + 1) * K])
+                .zip(&wp[i % WP * k..(i % WP + 1) * k])
                 .map(|(&a, &w)| a as i32 * w as i32)
                 .sum()
         })
         .collect();
-    // Frozen S1 full ColumnMaps, native projection widths in fused family order.
     for rows in [512usize, 8192, 4647] {
-        eprintln!("PHASE activation/A/D preparation rows={rows}");
+        eprintln!("PHASE activation/A/D preparation k={k} rows={rows}");
         let p = rows.div_ceil(256) * 256;
-        let xbytes: Vec<u8> = (0..rows * K)
-            .flat_map(|i| xp[i % (AP * K)].to_le_bytes())
+        let xbytes: Vec<u8> = (0..rows * k)
+            .flat_map(|i| xp[i % (AP * k)].to_le_bytes())
             .collect();
-        let x = typed(&mut gpu, &xbytes, &[rows, K], DType::F16);
-        let a_cpu: Vec<i8> = (0..p * K)
-            .map(|i| if i / K < rows { ap[i % (AP * K)] } else { 0 })
+        let x = typed(&mut gpu, &xbytes, &[rows, k], DType::F16);
+        let a_cpu: Vec<i8> = (0..p * k)
+            .map(|i| if i / k < rows { ap[i % (AP * k)] } else { 0 })
             .collect();
         let d_cpu: Vec<_> = (0..p)
             .map(|t| if t < rows { dp[t % AP] } else { (0, 0) })
             .collect();
         let layout = NpuBf16Layout {
             padded_rows: p,
-            k: K,
+            k,
             panels: 1,
+            n512: false,
         };
         let a = arena(&mut gpu, layout.a_bytes());
         let d = arena(&mut gpu, rows * 4);
@@ -278,21 +331,19 @@ fn run() {
         gpu.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap();
         gpu.hip.device_synchronize().unwrap();
         eprintln!("PHASE packed-A and compact-D comparison rows={rows}");
-        let design = gemm_g80::design_g80(p, 1280, K, Epilogue::Bf16, Control::Fast);
-        compare(
-            "packed A (codes, replicated scales, padding)",
-            &download(&gpu, "packed A", &a),
-            &gemm_g80::pack_a_bf16(&design, &a_cpu, &d_cpu),
-        );
+        if let Some(want) = cpu_pack(layout, &a_cpu, &d_cpu) {
+            compare(
+                "packed A (codes, replicated scales, padding)",
+                &download(&gpu, "packed A", &a),
+                &want,
+            );
+        }
         compare(
             "compact D",
             &download(&gpu, "compact D", &d),
             &sides(&d_cpu[..rows]),
         );
-        for (name, widths) in [
-            ("GdnIn", [10240usize, 6144, 48, 48]),
-            ("QsaIn", [12288, 512, 512, 640]),
-        ] {
+        for &(name, widths) in shapes {
             eprintln!("PHASE weight/scales/I32/synthetic-C preparation rows={rows} shape={name}");
             let n: usize = widths.iter().sum();
             let layout = NpuBf16Layout {
@@ -301,8 +352,8 @@ fn run() {
             };
             let w = bytes(
                 &mut gpu,
-                &(0..n * K)
-                    .map(|i| wp[i % (WP * K)] as u8)
+                &(0..n * k)
+                    .map(|i| wp[i % (WP * k)] as u8)
                     .collect::<Vec<_>>(),
             );
             // Include zero weights scales, ties, underflow and overflow exponents.
@@ -320,8 +371,8 @@ fn run() {
                 .collect();
             let s = bytes(&mut gpu, &sides(&scales));
             let sums = arena(&mut gpu, rows * n * 4);
-            let mut synthetic = vec![0xa5; layout.c_bytes()];
-            for t in 0..p {
+            let mut synthetic = vec![0xa5; if consume { layout.c_bytes() } else { 4096 }];
+            for t in 0..if consume { p } else { 0 } {
                 for j in 0..layout.padded_cols() {
                     let bits = ((t * 131 + j * 37) as u16).wrapping_add(0x8000);
                     let off = (j / 1280) * p * 1280 * 2 + bf16_output_offset(p, t, j % 1280);
@@ -376,59 +427,61 @@ fn run() {
                         tensor,
                     })
                     .collect();
-                eprintln!("PHASE consume launch rows={rows} shape={name} dtype={dtype:?}");
-                gpu.npu_trunk_consume_bf16(&c, layout, &outs, rows).unwrap();
-                gpu.hip.device_synchronize().unwrap();
-                gpu.npu_trunk_consume_bf16_fast(&c, layout, &fast_outs, rows)
-                    .unwrap();
-                gpu.hip.device_synchronize().unwrap();
-                for (o, fast) in outs.iter().zip(&fast_outs) {
-                    eprintln!("PHASE consume comparison rows={rows} shape={name} dtype={dtype:?} col0={} cols={}",o.col0,o.cols);
-                    let mut expected = Vec::with_capacity(rows * o.cols * dtype.size() + 256);
-                    for t in 0..rows {
-                        for j in o.col0..o.col0 + o.cols {
-                            let bits = ((t * 131 + j * 37) as u16).wrapping_add(0x8000);
-                            if dtype == DType::BF16 {
-                                expected.extend(bits.to_le_bytes())
-                            } else {
-                                expected.extend(((bits as u32) << 16).to_le_bytes())
+                if consume {
+                    eprintln!("PHASE consume launch rows={rows} shape={name} dtype={dtype:?}");
+                    gpu.npu_trunk_consume_bf16(&c, layout, &outs, rows).unwrap();
+                    gpu.hip.device_synchronize().unwrap();
+                    gpu.npu_trunk_consume_bf16_fast(&c, layout, &fast_outs, rows)
+                        .unwrap();
+                    gpu.hip.device_synchronize().unwrap();
+                    for (o, fast) in outs.iter().zip(&fast_outs) {
+                        eprintln!("PHASE consume comparison rows={rows} shape={name} dtype={dtype:?} col0={} cols={}",o.col0,o.cols);
+                        let mut expected = Vec::with_capacity(rows * o.cols * dtype.size() + 256);
+                        for t in 0..rows {
+                            for j in o.col0..o.col0 + o.cols {
+                                let bits = ((t * 131 + j * 37) as u16).wrapping_add(0x8000);
+                                if dtype == DType::BF16 {
+                                    expected.extend(bits.to_le_bytes())
+                                } else {
+                                    expected.extend(((bits as u32) << 16).to_le_bytes())
+                                }
                             }
                         }
-                    }
-                    expected.extend([0xa5; 256]);
-                    let old = download(&gpu, "consume output", o.tensor);
-                    compare("consume and guard", &old, &expected);
-                    compare(
-                        "fast consume vs PM and guard",
-                        &download(&gpu, "fast consume output", fast.tensor),
-                        &old,
-                    );
-                }
-                println!("consume_exact rows={rows} shape={name} dtype={dtype:?} old_vs_fast=byte-exact guards=ok");
-                if rows == 8192 || rows == 4647 {
-                    let old = timed(
-                        &mut gpu,
-                        &format!("consume-old {name} rows={rows} {dtype:?}"),
-                        |g| g.npu_trunk_consume_bf16(&c, layout, &outs, rows).unwrap(),
-                    );
-                    let fast = timed(
-                        &mut gpu,
-                        &format!("consume-fast {name} rows={rows} {dtype:?}"),
-                        |g| {
-                            g.npu_trunk_consume_bf16_fast(&c, layout, &fast_outs, rows)
-                                .unwrap()
-                        },
-                    );
-                    let traffic = (rows * n * (2 + dtype.size())) as f64;
-                    println!("consume_bw rows={rows} shape={name} dtype={dtype:?} old_ms={old:.4} fast_ms={fast:.4} old_GBps={:.2} fast_GBps={:.2} speedup={:.2} target_GBps=180",
-                        traffic/(old as f64*1e6),traffic/(fast as f64*1e6),old/fast);
-                    // Check timed writes too, including untouched ragged-row/output guards.
-                    for (o, fast) in outs.iter().zip(&fast_outs) {
+                        expected.extend([0xa5; 256]);
+                        let old = download(&gpu, "consume output", o.tensor);
+                        compare("consume and guard", &old, &expected);
                         compare(
-                            "timed fast vs PM and guard",
-                            &download(&gpu, "timed fast", fast.tensor),
-                            &download(&gpu, "timed old", o.tensor),
+                            "fast consume vs PM and guard",
+                            &download(&gpu, "fast consume output", fast.tensor),
+                            &old,
                         );
+                    }
+                    println!("consume_exact rows={rows} shape={name} dtype={dtype:?} old_vs_fast=byte-exact guards=ok");
+                    if rows == 8192 || rows == 4647 {
+                        let old = timed(
+                            &mut gpu,
+                            &format!("consume-old {name} rows={rows} {dtype:?}"),
+                            |g| g.npu_trunk_consume_bf16(&c, layout, &outs, rows).unwrap(),
+                        );
+                        let fast = timed(
+                            &mut gpu,
+                            &format!("consume-fast {name} rows={rows} {dtype:?}"),
+                            |g| {
+                                g.npu_trunk_consume_bf16_fast(&c, layout, &fast_outs, rows)
+                                    .unwrap()
+                            },
+                        );
+                        let traffic = (rows * n * (2 + dtype.size())) as f64;
+                        println!("consume_bw rows={rows} shape={name} dtype={dtype:?} old_ms={old:.4} fast_ms={fast:.4} old_GBps={:.2} fast_GBps={:.2} speedup={:.2} target_GBps=180",
+                        traffic/(old as f64*1e6),traffic/(fast as f64*1e6),old/fast);
+                        // Check timed writes too, including untouched ragged-row/output guards.
+                        for (o, fast) in outs.iter().zip(&fast_outs) {
+                            compare(
+                                "timed fast vs PM and guard",
+                                &download(&gpu, "timed fast", fast.tensor),
+                                &download(&gpu, "timed old", o.tensor),
+                            );
+                        }
                     }
                 }
                 eprintln!("PHASE emulate launch rows={rows} shape={name} dtype={dtype:?}");
@@ -468,7 +521,7 @@ fn run() {
             if rows == 8192 {
                 timed(
                     &mut gpu,
-                    &format!("emulate GEMM {name} rows8192 k2560 n{n}"),
+                    &format!("emulate GEMM {name} rows8192 k{k} n{n}"),
                     |g| {
                         g.npu_trunk_emulate_i32(&a, &w, &sums, layout, rows, n)
                             .unwrap()
@@ -483,7 +536,6 @@ fn run() {
             gpu.free_tensor(t).unwrap();
         }
     }
-    println!("RESULT PASS");
 }
 fn main() {
     if std::panic::catch_unwind(run).is_err() {

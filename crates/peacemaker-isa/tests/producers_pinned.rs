@@ -23,12 +23,15 @@ fn hex(b: &[u8]) -> String {
         .collect()
 }
 
-/// The builder proof as canonical JSON without the build-environment fields.
+/// The builder proof as canonical JSON without the build-environment fields. Keys are sorted:
+/// `hipfire-engine` enables serde_json/preserve_order (b26ba3b495), and workspace feature
+/// unification must not turn object ordering into a moved pin.
 fn proof_json(e: &Emitted) -> String {
     let mut v = serde_json::to_value(&e.proof).unwrap();
     let o = v.as_object_mut().unwrap();
     o.remove("builder_git_sha");
     o.remove("builder_crate_version");
+    v.sort_all_objects();
     serde_json::to_string(&v).unwrap()
 }
 

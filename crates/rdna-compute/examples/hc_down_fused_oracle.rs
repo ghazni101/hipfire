@@ -2,14 +2,18 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle: the fused gfx1201 Qwen4 HC-down launch
-//! (`Gpu::gemm_bf16_xf16_hc_down_fused`, kernel `qwen4_hc_down_fused_b64_k32`) against
-//! the production chain it replaces, bit for bit.
+//! Byte oracle: the fused gfx1201 / gfx1151 Qwen4 HC-down launch
+//! (`Gpu::gemm_bf16_xf16_hc_down_fused`; kernel `qwen4_hc_down_fused_b64_k32` on gfx1201,
+//! `qwen4_hc_down_fused_gfx1151*` on gfx1151) against the production chain it replaces on the
+//! same arch, bit for bit.
 //!
 //! Chain (the F16 WMMA route's HC read down projection + activation):
-//!   `gemm_bf16_xf16_f16_wmma` (split-K=4 tile + reducer) -> F32 scratch `y`,
+//!   `gemm_bf16_xf16_f16_wmma` (gfx1201: split-K=4 tile + reducer; gfx1151: the ascending-K
+//!   160 x 64 tile from 2048 rows, 64 x 64 below) -> F32 scratch `y`,
 //!   `hc_activation_fused_f32` with `bf16_out` -> packed BF16 `R`.
-//! Fused: one launch -> packed BF16 `F`.
+//! Fused: one launch -> packed BF16 `F` (launched on every row count, also below the route's
+//! threshold, where the chain's tile differs but keeps each output's K order; the host gate's
+//! applies() verdict is checked against the threshold per case).
 //! `R` and `F` are allocated `rows * 320 + 4096` elements, pre-filled with 0xAB bytes; every
 //! u16 of the active region is compared and the guard region must keep its 0xAB fill (no write
 //! past `rows * 320` elements).
@@ -19,8 +23,9 @@
 //! F16 subnormal / 65504 values sprinkled into X by row kind, and NaN / inf / subnormal /
 //! F16-range-edge BF16 patterns in the weight rows).
 //!
-//! Exit 0: every case byte-identical. 1: a mismatch (first (row, col, bits) printed). 2: the
-//! fused route does not apply here (kill switch `HIPFIRE_QWEN4_HC_DOWN_FUSED=0`, other arch).
+//! Exit 0: every case byte-identical. 1: a mismatch (first (row, col, bits) printed) or a wrong
+//! applies() verdict. 2: the fused route does not apply here (kill switch
+//! `HIPFIRE_QWEN4_HC_DOWN_FUSED=0`, other arch).
 //! `ROWS=a,b,..` overrides the row list. Receipt: `HC_DOWN_ORACLE_RECEIPT` (default
 //! `./hc-down-fused-oracle.txt`).
 //!
@@ -237,7 +242,7 @@ fn main() {
     if !applies {
         eprintln!(
             "the fused route does not apply (kill switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} \
-             or arch {arch} is not gfx1201): the oracle needs the switch on"
+             or arch {arch} is not gfx1201/gfx1151): the oracle needs the switch on"
         );
         std::process::exit(2);
     }
@@ -250,7 +255,12 @@ fn main() {
                 .map(|t| t.parse().unwrap())
                 .collect()
         })
-        .unwrap_or_else(|| vec![1, 16, 4096, 16384, 4099, 4097, 1537]);
+        .unwrap_or_else(|| {
+            vec![
+                1, 16, 511, 1023, 1024, 1025, 1535, 1536, 1537, 2047, 2048, 2049, 4096, 4097, 4099,
+                8188, 8192, 16384,
+            ]
+        });
     let max_rows = *rows_list.iter().max().unwrap();
 
     let receipt_path = std::env::var("HC_DOWN_ORACLE_RECEIPT")
@@ -266,7 +276,16 @@ fn main() {
     writeln!(receipt, "date {date}").unwrap();
     writeln!(receipt, "git {}", git_sha()).unwrap();
     writeln!(receipt, "arch {arch}").unwrap();
-    writeln!(receipt, "kernel qwen4_hc_down_fused_b64_k32 vs chain gemm_bf16_xf16_f16_wmma + hc_activation_fused_f32(bf16_out)").unwrap();
+    writeln!(
+        receipt,
+        "kernel {} vs chain gemm_bf16_xf16_f16_wmma + hc_activation_fused_f32(bf16_out)",
+        if arch == "gfx1151" {
+            "qwen4_hc_down_fused_gfx1151"
+        } else {
+            "qwen4_hc_down_fused_b64_k32"
+        }
+    )
+    .unwrap();
     writeln!(
         receipt,
         "switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} scale={SCALE} m={M} k={K}"
@@ -287,7 +306,7 @@ fn main() {
             let y = gpu.zeros(&[n], DType::F32).unwrap();
             let fill = vec![0xABABu16; n + GUARD];
             let r = upload_u16(&mut gpu, &fill, DType::BF16);
-            let f = upload_u16(&mut gpu, &fill, DType::BF16);
+            let rb;
 
             // chain
             gpu.gemm_bf16_xf16_f16_wmma(&weight, &x, &y, M, K, rows)
@@ -303,50 +322,75 @@ fn main() {
             .unwrap();
             // fused
             let case_applies = gpu.qwen4_hc_down_fused_applies(M, K, rows);
-            gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &f, M, K, rows, SCALE)
-                .unwrap();
-            gpu.hip.device_synchronize().unwrap();
-            let rb = le_u16(&gpu.download_raw_bytes(&r).unwrap());
-            let fb = le_u16(&gpu.download_raw_bytes(&f).unwrap());
-
-            let mut mismatches = 0usize;
-            let mut first = None;
-            for i in 0..n {
-                if rb[i] != fb[i] {
-                    mismatches += 1;
-                    first.get_or_insert((i / M, i % M, rb[i], fb[i]));
-                }
-            }
-            let guard_bad = fb[n..].iter().filter(|&&v| v != 0xABAB).count();
-            let chain_guard_bad = rb[n..].iter().filter(|&&v| v != 0xABAB).count();
-            let (mut nan, mut inf, mut zero) = (0usize, 0usize, 0usize);
-            for &v in &rb[..n] {
-                match v & 0x7fff {
-                    0 => zero += 1,
-                    0x7f80 => inf += 1,
-                    e if e > 0x7f80 => nan += 1,
-                    _ => {}
-                }
-            }
-            let pass = mismatches == 0 && guard_bad == 0 && chain_guard_bad == 0;
-            cases += 1;
-            let line = if pass {
-                format!(
-                    "ORACLE PASS rows={rows} class={class} applies={case_applies} elems={n} nan={nan} inf={inf} zero={zero}"
-                )
+            let min_rows = if arch == "gfx1151" {
+                rdna_compute::gemm::HC_DOWN_FUSED_GFX1151_MIN_ROWS
             } else {
-                failures += 1;
-                let (row, col, rbits, fbits) = first.unwrap_or((0, 0, 0, 0));
-                format!(
-                    "ORACLE FAIL rows={rows} class={class} applies={case_applies} mismatches={mismatches} \
-                     first(row={row}, col={col}, chain={rbits:#06x}, fused={fbits:#06x}) \
-                     fused_guard_dirty={guard_bad} chain_guard_dirty={chain_guard_bad}"
-                )
+                rdna_compute::gemm::HC_DOWN_FUSED_MIN_ROWS
             };
-            println!("{line}");
-            writeln!(receipt, "{line}").unwrap();
+            let expect_applies = switch != "0" && rows >= min_rows;
+            if case_applies != expect_applies {
+                failures += 1;
+                let line = format!(
+                    "ORACLE FAIL rows={rows} class={class} applies()={case_applies} expected {expect_applies} (min rows {min_rows})"
+                );
+                println!("{line}");
+                writeln!(receipt, "{line}").unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            rb = le_u16(&gpu.download_raw_bytes(&r).unwrap());
+            {
+                let vname = if arch == "gfx1151" {
+                    "qwen4_hc_down_fused_gfx1151"
+                } else {
+                    "qwen4_hc_down_fused_b64_k32"
+                };
+                let f = upload_u16(&mut gpu, &fill, DType::BF16);
+                gpu.gemm_bf16_xf16_hc_down_fused(&weight, &x, &f, M, K, rows, SCALE)
+                    .unwrap();
+                gpu.hip.device_synchronize().unwrap();
+                let fb = le_u16(&gpu.download_raw_bytes(&f).unwrap());
 
-            for t in [x, y, r, f] {
+                let mut mismatches = 0usize;
+                let mut first = None;
+                for i in 0..n {
+                    if rb[i] != fb[i] {
+                        mismatches += 1;
+                        first.get_or_insert((i / M, i % M, rb[i], fb[i]));
+                    }
+                }
+                let guard_bad = fb[n..].iter().filter(|&&v| v != 0xABAB).count();
+                let chain_guard_bad = rb[n..].iter().filter(|&&v| v != 0xABAB).count();
+                let (mut nan, mut inf, mut zero) = (0usize, 0usize, 0usize);
+                for &v in &rb[..n] {
+                    match v & 0x7fff {
+                        0 => zero += 1,
+                        0x7f80 => inf += 1,
+                        e if e > 0x7f80 => nan += 1,
+                        _ => {}
+                    }
+                }
+                let pass = mismatches == 0 && guard_bad == 0 && chain_guard_bad == 0;
+                cases += 1;
+                let line = if pass {
+                    format!(
+                        "ORACLE PASS rows={rows} class={class} kernel={vname} applies={case_applies} elems={n} bytes={} differing_bytes=0 nan={nan} inf={inf} zero={zero}",
+                        n * 2
+                    )
+                } else {
+                    failures += 1;
+                    let (row, col, rbits, fbits) = first.unwrap_or((0, 0, 0, 0));
+                    format!(
+                        "ORACLE FAIL rows={rows} class={class} kernel={vname} applies={case_applies} mismatches={mismatches} \
+                         first(row={row}, col={col}, chain={rbits:#06x}, fused={fbits:#06x}) \
+                         fused_guard_dirty={guard_bad} chain_guard_dirty={chain_guard_bad}"
+                    )
+                };
+                println!("{line}");
+                writeln!(receipt, "{line}").unwrap();
+                gpu.free_tensor(f).unwrap();
+            }
+
+            for t in [x, y, r] {
                 gpu.free_tensor(t).unwrap();
             }
         }

@@ -54,6 +54,20 @@ pub struct Inventory {
     pub admission: String,
     pub programs: Vec<Program>,
     pub railgun_kernels: RailgunKernels,
+    /// Window node sets added at run time from a plan's node sequence
+    /// ([`Inventory::add_window_sequence`]); never part of `programs.json`.
+    #[serde(skip)]
+    pub window_sets: Vec<WindowSet>,
+}
+
+/// A certified-window node set (`DFlash Whole16`), from the sequence the
+/// window builder dumped (`HIPFIRE_DFLASH_RAILGUN_SEQUENCE_OUT`).
+#[derive(Clone, Debug)]
+pub struct WindowSet {
+    pub id: String,
+    pub arch: String,
+    /// Distinct `(symbol, module)`, first-seen order.
+    pub nodes: Vec<(String, String)>,
 }
 
 /// The kernels railgun's own lowering launches, on every arch in `archs`.
@@ -88,7 +102,54 @@ impl Inventory {
             arch,
             nodes: &self.railgun_kernels.nodes,
         });
-        programs.chain(railgun).collect()
+        let windows = self.window_sets.iter().map(|w| NodeSet {
+            id: w.id.clone(),
+            arch: &w.arch,
+            nodes: &w.nodes,
+        });
+        programs.chain(railgun).chain(windows).collect()
+    }
+
+    /// Add the node set of a window plan on `arch`. `jsonl` is the sequence
+    /// the window builder dumps (one `{"phase","symbol","route","module"}`
+    /// per node, as `railgun-cert whole16-manifest --sequence` reads); only
+    /// `symbol` and `module` matter here, duplicates collapse, and every node
+    /// must name its module. Every module must then resolve in the registry
+    /// (`plan` names each one that does not).
+    pub fn add_window_sequence(&mut self, id: &str, arch: &str, jsonl: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Line {
+            symbol: String,
+            module: Option<String>,
+        }
+        let mut nodes: Vec<(String, String)> = Vec::new();
+        for (n, line) in jsonl.lines().enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let l: Line = serde_json::from_str(line)
+                .map_err(|e| format!("window sequence line {}: {e}", n + 1))?;
+            let module = l.module.ok_or_else(|| {
+                format!(
+                    "window sequence line {}: node {} has no module",
+                    n + 1,
+                    l.symbol
+                )
+            })?;
+            let node = (l.symbol, module);
+            if !nodes.contains(&node) {
+                nodes.push(node);
+            }
+        }
+        if nodes.is_empty() {
+            return Err("window sequence names no node".into());
+        }
+        self.window_sets.push(WindowSet {
+            id: id.to_owned(),
+            arch: arch.to_owned(),
+            nodes,
+        });
+        Ok(())
     }
 }
 
@@ -1146,6 +1207,47 @@ pub fn verify_runtime_cache(capture: &Path, arch: &str) -> Result<Vec<CacheVerdi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_sequence_adds_a_node_set_the_plan_resolves() {
+        install_product_defaults().unwrap();
+        let mut inv = inventory().unwrap();
+        let jsonl = concat!(
+            "{\"phase\":\"transport\",\"symbol\":\"railgun_copy\",\"route\":\"railgun\",\"module\":\"railgun_copy\"}\n",
+            "{\"phase\":\"transport\",\"symbol\":\"railgun_fill_u32\",\"route\":\"railgun\",\"module\":\"railgun_fill\"}\n",
+            "{\"phase\":\"selector\",\"symbol\":\"dflash_selector_greedy_exact\",\"route\":\"railgun\",\"module\":\"dflash_selector_greedy_exact\"}\n",
+            "{\"phase\":\"transport\",\"symbol\":\"railgun_copy\",\"route\":\"railgun\",\"module\":\"railgun_copy\"}\n",
+        );
+        inv.add_window_sequence("dflash-whole16-gfx1201", "gfx1201", jsonl)
+            .unwrap();
+        let set = inv
+            .node_sets()
+            .into_iter()
+            .find(|s| s.id == "dflash-whole16-gfx1201")
+            .expect("window set");
+        assert_eq!(set.nodes.len(), 3, "duplicates collapse");
+        let resolved = plan(&inv, "gfx1201").unwrap_or_else(|e| panic!("{e}"));
+        for m in [
+            "railgun_copy",
+            "railgun_fill",
+            "dflash_selector_greedy_exact",
+        ] {
+            assert!(resolved.entries.iter().any(|e| e.module == m), "{m}");
+        }
+        // A module the registry lacks is named, not skipped.
+        let mut bad = inventory().unwrap();
+        bad.add_window_sequence(
+            "w",
+            "gfx1201",
+            "{\"symbol\":\"nope\",\"module\":\"no_such_module\"}\n",
+        )
+        .unwrap();
+        let err = plan(&bad, "gfx1201").err().expect("unresolved module");
+        assert!(err.contains("no_such_module"), "{err}");
+        assert!(inv
+            .add_window_sequence("w", "gfx1201", "{\"symbol\":\"x\"}\n")
+            .is_err());
+    }
 
     #[test]
     fn every_admitted_program_node_resolves_to_a_registry_module_that_exports_it() {

@@ -31,6 +31,7 @@ impl ColumnMap {
             padded_rows,
             k,
             panels: self.panel_count(),
+            n512: false,
         };
         layout.validate()?;
         Ok(layout)

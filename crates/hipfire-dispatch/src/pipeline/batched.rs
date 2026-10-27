@@ -156,6 +156,19 @@ pub struct BatchScratch<'a> {
     pub positions: &'a GpuTensor,
     /// RoPE phase per row (DDTree depth positions; else unused).
     pub rope_positions: &'a GpuTensor,
+    /// Explicit per-row M-RoPE phases of a VL prompt chunk. `Some` makes the
+    /// batched full-attention prep rotate with the batched M-RoPE kernel at
+    /// these phases (and bypass every fused prep that bakes 1D rope); `None`
+    /// (every other caller) keeps the 1D routes.
+    pub mrope: Option<MropeRows<'a>>,
+}
+
+/// `[rows][3]` absolute `(t, h, w)` phases (i32 stored in an F32 tensor) of a
+/// chunk plus the checkpoint's `mrope_section`.
+#[derive(Clone, Copy)]
+pub struct MropeRows<'a> {
+    pub pos3: &'a GpuTensor,
+    pub section: [usize; 3],
 }
 
 /// Weights of one dense SwiGLU FFN sublayer, as the rows route of

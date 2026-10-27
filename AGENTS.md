@@ -1,6 +1,6 @@
 # AGENTS.md — project notice + testing playbook
 
-Redline = retained PM4/AQL capture-and-replay of an eager decode step (default only for .mq4r and gfx1201 no-drafter loads).
+Redline = retained PM4/AQL capture-and-replay of an eager decode step (default only for .mq4r, gfx1201 no-drafter loads, and the gfx1201 A3B `.mq4rs` plain-AR load).
 railgun = certified typed dispatch programs (railgun, railgun-cert, railgun-corpus, railgun-jitcorpus), including railgun::npu (the Strix Halo NPU trunk runtime), D8 and G7. Do not conflate them.
 
 This file serves two purposes, in order:

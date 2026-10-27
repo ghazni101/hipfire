@@ -5,7 +5,7 @@ use crate::context::DispatchCtx;
 use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::{GemvFamily, WeightRef};
-use crate::families::moe::{MoeRouteCapability, MOE_GROUPED_BLOCK_M};
+use crate::families::moe::{MoeMq2Lloyd, MoeRouteCapability, MOE_GROUPED_BLOCK_M};
 use crate::tables::KernelRegistry;
 use crate::types::*;
 #[allow(unused_imports)]
@@ -60,7 +60,8 @@ pub use layer_ops::{
     set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
     GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
     HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
+    IndexedAttentionState, LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp,
+    QsaProjectionHook, QsaTrunkArenas,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
@@ -2595,43 +2596,6 @@ fn dtype_name(d: DType) -> &'static str {
     }
 }
 
-/// DeepSeek-V4 bias-aware MoE decode executor. Transcribes the routed sub-graph
-/// of `hipfire-arch-deepseek4::forward::ffn_routed` (the fused
-/// `expert_gate_up_blob` branch): bias-aware top-k select → indexed MQ2-Lloyd
-/// gate_up → batched silu·mul·clamp → batched FWHT rotate → indexed MQ2-Lloyd
-/// down with route-scaled residual accumulation into `ffn_out`.
-///
-/// The router GEMV + `sqrt_softplus` (producing `p.scores`) and the shared
-/// expert stay model-owned — the shared expert seeds `p.ffn_out` and this arm
-/// accumulates into it, so the model must run it first. Decode only
-/// (`batch_size == 1`); batched prefill is the grouped executor (Step 8).
-pub fn run_moe_decode_bias_aware(
-    gpu: &mut Gpu,
-    p: &crate::families::moe::MoeBiasAwareParams,
-) -> Result<(), DispatchError> {
-    if p.batch_size != 1 {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "bias-aware-decode-requires-batch-1",
-            arch: "",
-            quant: "",
-        });
-    }
-    // 1. Bias-aware top-K: select on (scores + bias), weight on the unbiased
-    //    scores, normalize, then fold in route_scale — all in one launch.
-    hip!(gpu.deepseek4_moe_topk_bias_aware_f32(
-        p.scores,
-        p.gate_bias,
-        p.topk_indices,
-        p.topk_weights,
-        p.n_exp as i32,
-        p.k_top as i32,
-        p.route_scale,
-    ))?;
-
-    run_moe_decode_selected(gpu, &p.selected())
-}
-
 /// Execute the routed-expert decode subgraph after model-owned route
 /// selection. Keeping this boundary in the shared family guarantees that the
 /// ordinary and heterogeneous DS4 paths use the same gate/up, activation,
@@ -2649,83 +2613,52 @@ pub fn run_moe_decode_selected(
         });
     }
 
+    let lloyd = MoeMq2Lloyd {
+        swiglu_limit: p.swiglu_limit,
+        uses_atomic_down: p.uses_atomic_moe_down,
+        native: p.native_mq2_backend,
+        nonowned_gate_up_dummy: p.nonowned_gate_up_dummy,
+    };
     // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
-    //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
-    if let Some(native) = p.native_mq2_backend {
-        hip!(native.gate_up(
-            gpu,
-            p.expert_gate_up_ptrs,
-            p.nonowned_gate_up_dummy,
-            p.topk_indices,
-            p.x_rot,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            p.hidden,
-            p.k_top,
-        ))?;
-    } else {
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            p.x_rot,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            p.hidden,
-            p.k_top,
-        ))?;
-    }
-
-    // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
-    hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+    //    (M = 2*mi; the kernel splits rows r<mi to gate, r>=mi to up).
+    mq2_lloyd_gate_up(
+        gpu,
+        Some(&lloyd),
+        p.expert_gate_up_ptrs,
+        p.topk_indices,
+        p.x_rot,
         p.gate_batch,
         p.up_batch,
+        2 * p.mi,
+        p.hidden,
+        p.k_top,
+    )?;
+    // 3. Batched silu*mul*clamp (in place into gate_batch), then batched FWHT rotate.
+    mq2_lloyd_silu_rotate(
+        gpu,
+        &lloyd,
         p.gate_batch,
+        p.up_batch,
+        p.rot_batch,
         p.mi,
         p.k_top,
-        p.swiglu_limit,
-    ))?;
-    if let Some(native) = p.native_mq2_backend {
-        hip!(native.rotate_x_batched(gpu, p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
-    } else {
-        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
-    }
-
+    )?;
     // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
-    //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
-    //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
-    //    atomicAdd-fused path (nondeterministic; bench only).
-    let deterministic = !p.uses_atomic_moe_down
-        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
-            != Ok("0");
-    if deterministic {
-        if let Some(native) = p.native_mq2_backend {
-            hip!(native.down_expanded(
-                gpu,
-                p.expert_down_ptrs,
-                p.expert_gate_up_ptrs,
-                p.nonowned_gate_up_dummy,
-                p.topk_indices,
-                p.rot_batch,
-                p.down_expanded,
-                p.hidden,
-                p.mi,
-                p.k_top,
-                1,
-            ))?;
-        } else {
-            hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-                p.expert_down_ptrs,
-                p.topk_indices,
-                p.rot_batch,
-                p.down_expanded,
-                p.hidden,
-                p.mi,
-                p.k_top,
-                1,
-            ))?;
-        }
+    //    write + fixed-order combine into ffn_out, bit-reproducible for greedy and
+    //    spec-decode. MOE_DETERMINISTIC=0 keeps the atomic residual (bench only).
+    if lloyd.deterministic_down() {
+        mq2_lloyd_down_expanded(
+            gpu,
+            &lloyd,
+            p.expert_down_ptrs,
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.rot_batch,
+            p.down_expanded,
+            p.hidden,
+            p.mi,
+            p.k_top,
+        )?;
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
             p.topk_weights,
@@ -2735,22 +2668,155 @@ pub fn run_moe_decode_selected(
             1,
         ))?;
     } else {
-        hip!(
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-                p.expert_down_ptrs,
-                p.topk_indices,
-                p.topk_weights,
-                p.rot_batch,
-                p.ffn_out,
-                p.hidden,
-                p.mi,
-                p.k_top,
-                p.uses_atomic_moe_down,
-            )
+        mq2_lloyd_down_residual(
+            gpu,
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            p.rot_batch,
+            p.ffn_out,
+            p.hidden,
+            p.mi,
+            p.k_top,
+            p.uses_atomic_moe_down,
         )?;
     }
-
     Ok(())
+}
+
+/// Indexed MQ2-Lloyd gate_up over the k_top experts (M = 2*mi: rows r<mi feed
+/// `y_gate`, r>=mi feed `y_up`). A native backend, when present, takes it.
+#[allow(clippy::too_many_arguments)]
+fn mq2_lloyd_gate_up(
+    gpu: &mut Gpu,
+    lloyd: Option<&MoeMq2Lloyd<'_>>,
+    expert_gate_up_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    x_rot: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    m: usize,
+    k: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    if let Some(native) = lloyd.and_then(|l| l.native) {
+        let dummy = lloyd.and_then(|l| l.nonowned_gate_up_dummy);
+        hip!(native.gate_up(
+            gpu,
+            expert_gate_up_ptrs,
+            dummy,
+            topk_indices,
+            x_rot,
+            y_gate,
+            y_up,
+            m,
+            k,
+            k_top,
+        ))
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+            expert_gate_up_ptrs,
+            topk_indices,
+            x_rot,
+            y_gate,
+            y_up,
+            m,
+            k,
+            k_top,
+        ))
+    }
+}
+
+/// Batched SwiGLU silu*mul*clamp (in place into `gate`), then the batched FWHT
+/// rotate of each expert's activation into `rot`.
+fn mq2_lloyd_silu_rotate(
+    gpu: &mut Gpu,
+    lloyd: &MoeMq2Lloyd<'_>,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    rot: &GpuTensor,
+    mi: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(gate, up, gate, mi, k_top, lloyd.swiglu_limit,))?;
+    if let Some(native) = lloyd.native {
+        hip!(native.rotate_x_batched(gpu, gate, rot, mi, k_top))
+    } else {
+        hip!(gpu.rotate_x_mq_batched(gate, rot, mi, k_top))
+    }
+}
+
+/// Indexed MQ2-Lloyd down into the per-expert expanded buffer (the deterministic
+/// path; the caller combines). A native backend, when present, takes it.
+#[allow(clippy::too_many_arguments)]
+fn mq2_lloyd_down_expanded(
+    gpu: &mut Gpu,
+    lloyd: &MoeMq2Lloyd<'_>,
+    expert_down_ptrs: &GpuTensor,
+    expert_gate_up_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    rot: &GpuTensor,
+    expanded: &GpuTensor,
+    m: usize,
+    k: usize,
+    k_top: usize,
+) -> Result<(), DispatchError> {
+    if let Some(native) = lloyd.native {
+        hip!(native.down_expanded(
+            gpu,
+            expert_down_ptrs,
+            expert_gate_up_ptrs,
+            lloyd.nonowned_gate_up_dummy,
+            topk_indices,
+            rot,
+            expanded,
+            m,
+            k,
+            k_top,
+            1,
+        ))
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+            expert_down_ptrs,
+            topk_indices,
+            rot,
+            expanded,
+            m,
+            k,
+            k_top,
+            1,
+        ))
+    }
+}
+
+/// Indexed MQ2-Lloyd down accumulated into `residual` (the atomic or
+/// non-deterministic path). Portable only, as in beta's selected decode.
+#[allow(clippy::too_many_arguments)]
+fn mq2_lloyd_down_residual(
+    gpu: &mut Gpu,
+    expert_down_ptrs: &GpuTensor,
+    topk_indices: &GpuTensor,
+    topk_weights: &GpuTensor,
+    rot: &GpuTensor,
+    residual: &GpuTensor,
+    m: usize,
+    k: usize,
+    k_top: usize,
+    atomic: bool,
+) -> Result<(), DispatchError> {
+    hip!(
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            expert_down_ptrs,
+            topk_indices,
+            topk_weights,
+            rot,
+            residual,
+            m,
+            k,
+            k_top,
+            atomic,
+        )
+    )
 }
 
 /// MQ2-Lloyd grouped-GEMM kernel variant (deepseek4 research levers; default
@@ -5849,7 +5915,9 @@ fn decode_gate_up_stage(
         // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
         // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at
         // M/2 internally); trailing k_top = p.k. X is the FWHT-rotated xr.
-        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        mq2_lloyd_gate_up(
+            gpu,
+            p.mq2_lloyd.as_ref(),
             p.expert_gate_up_ptrs,
             p.topk_indices,
             xr,
@@ -5858,7 +5926,7 @@ fn decode_gate_up_stage(
             2 * p.mi,
             gate_up_k,
             p.k,
-        ))?;
+        )?;
     } else if p.dtypes.routed_gate_up == DType::MQ3G256Lloyd {
         // Uniform MQ3-Lloyd routed experts: same indexed-Lloyd gate_up path,
         // MQ3 launcher.
@@ -6121,6 +6189,9 @@ fn decode_activation_stage(
             p.mi,
             p.k
         ))?;
+    } else if let Some(lloyd) = p.mq2_lloyd.as_ref() {
+        // Declared MQ2-Lloyd: SwiGLU clamp, then rotate (beta's selected-decode order).
+        mq2_lloyd_silu_rotate(gpu, lloyd, p.gate_batch, p.up_batch, p.rot_batch, p.mi, p.k)?;
     } else {
         // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
         hip!(gpu.fused_silu_mul_rotate_mq_batched(
@@ -6148,6 +6219,7 @@ fn decode_down_stage(
     ninepath_d4: bool,
     ninepath_mq3l: bool,
     ninepath_mq4v2: bool,
+    ninepath_mq4g128v2: bool,
     ninepath_mq6v2: bool,
     down_last_combine: bool,
     route: Option<MoeRouteCapability>,
@@ -6216,7 +6288,24 @@ fn decode_down_stage(
     }
     // Expanded write — down GEMV by the DOWN dtype (mixed mq6-down lands here).
     // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
-    if p.dtypes.routed_down == DType::MQ4G128V2 {
+    if ninepath_d4 && ninepath_mq4g128v2 {
+        // qwen35 qt53 nine-path: the Activation stage launched nothing; this one
+        // kernel forms silu(gate)*up, the FWHT128 rotation, the eight routed
+        // down GEMVs and the ascending-slot weighted fold into `out_target`
+        // (single owner per row), so the shared combine below is skipped like
+        // every other ninepath arm. Byte-exact with the sequence it replaces.
+        hip!(gpu.gemv_mq4g128v2_moe_ninepath_d4(
+            p.expert_down_ptrs,
+            p.topk_indices,
+            p.topk_weights,
+            p.gate_batch,
+            p.up_batch,
+            out_target,
+            down_m,
+            down_k,
+            p.n_exp,
+        ))?;
+    } else if p.dtypes.routed_down == DType::MQ4G128V2 {
         // qwen35 qt53 routed-down typed fallback: unweighted F32 expanded rows
         // `[k, hidden]` for the live `p.k` slots (the launcher's runtime k_top);
         // the existing F32 `moe_down_combine_k8_batched` applies route weights.
@@ -6308,6 +6397,36 @@ fn decode_down_stage(
             p.k,
             1,
         ))?;
+    } else if let Some(lloyd) = p.mq2_lloyd.as_ref() {
+        // Declared MQ2-Lloyd: expanded down + combine when deterministic (default),
+        // else the atomic self-combining residual (beta's selected-decode policy).
+        if lloyd.deterministic_down() {
+            mq2_lloyd_down_expanded(
+                gpu,
+                lloyd,
+                p.expert_down_ptrs,
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                p.k,
+            )?;
+        } else {
+            mq2_lloyd_down_residual(
+                gpu,
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+                p.k,
+                lloyd.uses_atomic_down,
+            )?;
+        }
     } else if matches!(
         p.dtypes.routed_down,
         DType::MQ2G256Lloyd | DType::MQ2G256LloydU
@@ -6458,13 +6577,7 @@ fn decode_down_stage(
             1,
         ))?;
     }
-    if p.recipe.bf16_round_trip()
-        && crate::families::moe::moe_down_writes_expanded(
-            p.dtypes.routed_down,
-            p.expert_dtype_tags.is_some(),
-        )
-        && !ninepath_d4
-        && !down_last_combine
+    if p.recipe.bf16_round_trip() && p.down_writes_expanded() && !ninepath_d4 && !down_last_combine
     {
         let active =
             p.k.checked_mul(p.hidden)

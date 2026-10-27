@@ -2688,6 +2688,12 @@ impl KernargBuffer {
         self.length == 0
     }
 
+    /// Bytes the pool actually allocated (the length rounded up to the pool
+    /// granule): the extent of the VA range this buffer owns.
+    pub fn allocation_size(&self) -> usize {
+        self.allocation_size
+    }
+
     /// True when the buffer lives in a GPU-agent (VRAM) pool.
     pub fn is_device_local(&self) -> bool {
         self.device_local

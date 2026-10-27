@@ -101,15 +101,16 @@ jobs:
         run: cargo test --locked -p rdna-compute --test dflash_accept_emu
       - name: Run MoE launcher ABI test (no GPU)
         run: cargo test --locked -p rdna-compute --test all_launcher_abi
+      - name: Run NPU transport CPU tests
+        run: cargo test --locked -p npu-tools --bin npu-trunk-transport
       - name: Run serve fault-injection tests
         run: cargo test --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
 
   windows:
-    name: Windows MSVC (advisory, no GPU)
+    name: Windows MSVC (no GPU)
     runs-on: windows-latest
-    # Promote to a required check after the first green run on beta.
+    # Required: build, package smoke and PE-import checks must pass.
     # Compile/smoke coverage is not Windows GPU/runtime certification.
-    continue-on-error: true
     defaults:
       run:
         shell: pwsh
@@ -121,11 +122,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-readobj for scripts/check-pe-imports.ps1.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
+      - name: PowerShell scripts parse; install.ps1 params bind
+        # Regression guard for #979: a BOM-damaged or unparsable script, or an
+        # install.ps1 whose param() block no longer binds, only fails on a
+        # user's machine. Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI,
+        # so one leading BOM is legal; a doubled BOM is not.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = New-Object System.Collections.Generic.List[string]
+          foreach ($script in Get-ChildItem -LiteralPath scripts -Filter '*.ps1' -File) {
+            $bytes = [System.IO.File]::ReadAllBytes($script.FullName)
+            $boms = @()
+            for ($i = 0; $i + 2 -lt $bytes.Length; $i++) {
+              if ($bytes[$i] -eq 0xEF -and $bytes[$i + 1] -eq 0xBB -and $bytes[$i + 2] -eq 0xBF) { $boms += $i }
+            }
+            if ($boms.Count -gt 1 -or ($boms.Count -eq 1 -and $boms[0] -ne 0)) {
+              $failed.Add("$($script.Name): BOM bytes at offsets $($boms -join ', ') (at most one, at offset 0)")
+            }
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors)
+            foreach ($e in $errors) { $failed.Add("$($script.Name):$($e.Extent.StartLineNumber): $($e.Message)") }
+            Write-Output ("{0}: {1} bytes, BOM={2}, parse errors={3}" -f $script.Name, $bytes.Length, ($boms.Count -eq 1), @($errors).Count)
+          }
+          $keys = (Get-Command (Join-Path $PWD 'scripts/install.ps1')).Parameters.Keys
+          foreach ($name in 'Ref', 'Branch', 'Tag', 'Commit', 'CompileKernels', 'KernelPackUrl') {
+            if ($keys -notcontains $name) { $failed.Add("install.ps1: parameter -$name does not bind") }
+          }
+          if ($failed.Count -gt 0) {
+            $failed | ForEach-Object { Write-Error $_ -ErrorAction Continue }
+            throw "$($failed.Count) PowerShell script problem(s)"
+          }
+      - name: PE import checker self-test
+        run: ./scripts/check-pe-imports.ps1 -SelfTest
       - name: Build native CLI and daemon (MSVC)
+        # Same cargo invocations and feature set as scripts/install.ps1's source
+        # build (`cargo build --release -p hipfire-daemon`, then `-p hipfire-cli`;
+        # no extra features). CI adds only --locked, which pins dependency
+        # versions and does not change the compiled code paths.
         run: cargo build --release --locked -p hipfire-cli -p hipfire-daemon
       - name: Test control-plane libraries (no GPU)
         run: cargo test --locked --lib -p hipfire-config -p hipfire-registry -p hipfire-client
+      - name: Test unsupported-platform loaded-code registration (no GPU)
+        run: cargo test --locked --lib -p rdna-compute loaded_code_check::tests::non_linux_hsa_registration_is_unavailable_and_unregisters -- --exact
       - name: Smoke version and JSON diagnostics without HIP
         run: |
           $ErrorActionPreference = 'Stop'
@@ -143,6 +186,59 @@ jobs:
           Write-Output $json
       - name: Package unsigned developer artifact
         run: ./scripts/package-windows.ps1
+      - name: Package smoke (restricted PATH)
+        # Runs the binaries from the extracted ZIP, not target/release, with a
+        # PATH of only the Windows system directories, so a missing runtime DLL
+        # or an accidental dependence on a dev tool on PATH fails here.
+        # find_daemon() probes HIPFIRE_DAEMON_BIN, then $HIPFIRE_HOME/bin, then
+        # the build-tree target/ directory baked in at compile time -- never the
+        # directory the CLI sits in. On this runner the build tree exists, so
+        # without HIPFIRE_DAEMON_BIN diag would silently report target/release's
+        # daemon instead of the packaged one. The env var pins it; the assertion
+        # below then proves diag reports the packaged daemon.exe.
+        # No GPU or HIP is expected on a hosted runner: only exit codes, version
+        # output and diag's JSON shape are asserted, never GPU values.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = @(Get-ChildItem -LiteralPath dist -Filter 'hipfire-*-x86_64-pc-windows-msvc.zip' -File)
+          if ($zip.Count -ne 1) { throw "Expected exactly one package ZIP in dist, found $($zip.Count)" }
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          if (Test-Path -LiteralPath $pkg) { Remove-Item -LiteralPath $pkg -Recurse -Force }
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $pkg
+          $daemon = Join-Path $pkg 'daemon.exe'
+          $cli = Join-Path $pkg 'hipfire.exe'
+          foreach ($f in $daemon, $cli) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "Missing from package: $f" }
+          }
+          $hipHome = Join-Path $env:RUNNER_TEMP 'hipfire-pkg-home'
+          if (Test-Path -LiteralPath $hipHome) { Remove-Item -LiteralPath $hipHome -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $hipHome | Out-Null
+          $env:HIPFIRE_HOME = $hipHome
+          $env:HIPFIRE_DAEMON_BIN = $daemon
+          $env:PATH = 'C:\Windows\System32;C:\Windows'
+          $daemonVersion = & $daemon --version
+          if ($LASTEXITCODE -ne 0) { throw "daemon.exe --version failed (exit $LASTEXITCODE)" }
+          Write-Output "daemon: $daemonVersion"
+          $cliVersion = & $cli --version
+          if ($LASTEXITCODE -ne 0) { throw "hipfire.exe --version failed (exit $LASTEXITCODE)" }
+          Write-Output "hipfire: $cliVersion"
+          $diag = & $cli diag --json
+          if ($LASTEXITCODE -ne 0) { throw "hipfire.exe diag --json failed (exit $LASTEXITCODE)" }
+          $json = $diag -join "`n"
+          if ([string]::IsNullOrWhiteSpace($json)) { throw 'Empty diagnostic output' }
+          $report = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+          Write-Output $json
+          if (-not $report.daemon -or ([System.IO.Path]::GetFullPath($report.daemon) -ne [System.IO.Path]::GetFullPath($daemon))) {
+            throw "diag reports daemon '$($report.daemon)', expected the packaged '$daemon'"
+          }
+      - name: PE imports (packaged binaries)
+        # Lists every DLL the shipped binaries import and fails on any outside
+        # the allowlist in scripts/check-pe-imports.ps1. HIP is loaded at run
+        # time, so no AMD DLL is expected in the list.
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          ./scripts/check-pe-imports.ps1 -Path (Join-Path $pkg 'daemon.exe'), (Join-Path $pkg 'hipfire.exe')
+          if ($LASTEXITCODE -ne 0) { throw "PE import check failed (exit $LASTEXITCODE)" }
       # upload-artifact@v4 is already used in hw-gate.yml and allowed here.
       - uses: actions/upload-artifact@v4
         with:

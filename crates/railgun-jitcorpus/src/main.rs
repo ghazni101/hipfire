@@ -17,6 +17,10 @@
 //!     them as `pm_native` under `native/<arch>/`.
 //!     Sources compile in the fixed `--build-dir` (default `DIR/build`) so
 //!     rebuilds repeat the bytes.
+//! Both `build` and `check` take `--window-sequence FILE` (repeatable): the
+//! node sequence the certified DFlash window builder dumped
+//! (`HIPFIRE_DFLASH_RAILGUN_SEQUENCE_OUT`), added as the node set
+//! `dflash-whole16-gfx1201` so the corpus covers every module of that plan.
 //! check  --corpus DIR
 //!     CI gate: every node of every admitted default program and of
 //!     railgun's own kernels must resolve, under the runtime's current JIT
@@ -46,6 +50,7 @@ struct Args {
     capture: Option<PathBuf>,
     archs: Vec<String>,
     jobs: usize,
+    window_sequences: Vec<PathBuf>,
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
@@ -58,6 +63,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
         capture: None,
         archs: Vec::new(),
         jobs: 16,
+        window_sequences: Vec::new(),
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -69,6 +75,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--json" => a.json = Some(value()?.into()),
             "--capture" => a.capture = Some(value()?.into()),
             "--arch" => a.archs.push(value()?),
+            "--window-sequence" => a.window_sequences.push(value()?.into()),
             "--jobs" => a.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -88,7 +95,16 @@ fn run() -> Result<bool> {
         std::fs::canonicalize(&args.work).map_err(|e| format!("{}: {e}", args.work.display()))?;
     // The runtime compiler seeds and writes a hot cache when constructed.
     std::env::set_var("HIPFIRE_KERNEL_CACHE", args.work.join("hot-cache"));
-    let inventory = corpus::inventory()?;
+    let mut inventory = corpus::inventory()?;
+    for (i, path) in args.window_sequences.iter().enumerate() {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let id = if i == 0 {
+            "dflash-whole16-gfx1201".to_owned()
+        } else {
+            format!("dflash-whole16-gfx1201-{}", i + 1)
+        };
+        inventory.add_window_sequence(&id, "gfx1201", &text)?;
+    }
     if args.archs.is_empty() {
         args.archs = corpus::archs(&inventory);
     }

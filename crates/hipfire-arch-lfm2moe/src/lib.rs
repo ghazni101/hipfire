@@ -18,8 +18,10 @@
 //!   * dense MLP   -> `SiluMul` between the gate/up and down projections
 //!   * MoE         -> sealed `Moe` call: sigmoid router with the expert
 //!                    selection bias (`MoeSelectionBias`), runtime top-k
-//! The continuous-batching decode (`forward_batch.rs`, dense only) is still
-//! its own loop.
+//! The continuous-batching decode (`forward_batch.rs`, dense only) runs the
+//! same program over `B` lanes: projections on `Project` (the `Gemm` /
+//! `GemmLmHead` ladders, residual added separately), `Rope` with per-row
+//! positions and `LaneAttention` (lane-isolated Q8 KV).
 pub mod arch;
 pub mod arch_model;
 pub mod batch;

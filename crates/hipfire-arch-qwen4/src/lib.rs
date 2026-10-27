@@ -25,6 +25,12 @@ pub mod chunk_dump;
 pub mod config;
 /// Per-load default of the D2 CPU tier split (measured engine-rate selector).
 pub mod d2_default;
+/// Decode-share developer knobs, mode enum and load admission.
+pub mod decode_share;
+/// Donor-tail loan state machine of decode-share (`fixed` / `on`).
+pub(crate) mod decode_share_loan;
+/// Layout of the weight-shadow region borrowed inside the donor tail.
+pub mod decode_share_shadows;
 /// Target side of the shared DFlash2 drafter (layer capture, embed, head).
 pub(crate) mod dflash_target;
 pub mod ep;

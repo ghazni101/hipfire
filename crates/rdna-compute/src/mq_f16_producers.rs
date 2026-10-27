@@ -604,6 +604,14 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
+        // The one-tile gfx12 kernel loops over row tiles (HIPFIRE_GFX12_GATE_UP_TILE_LOOP).
+        let grid_x = if func_name == "gemm_gate_up_mq4g256v2_wmma_gfx12"
+            && self.flags.gfx12_gate_up_tile_loop_enabled()
+        {
+            crate::gemm::gate_up_tile_loop_grid_x(row_tiles, self.cu_count_or_default())
+        } else {
+            row_tiles
+        };
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
             + batch_size * k * 2
@@ -616,7 +624,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             func_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
+            [grid_x as u32, batch_tiles as u32, 1],
             [block_x, 1, 1],
             0,
             &mut params,

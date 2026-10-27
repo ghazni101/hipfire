@@ -2,18 +2,21 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle and hipEvent microbench of the Qwen4 MoE front producer fusion (exact gfx1201,
-//! `HIPFIRE_QWEN4_MOE_FRONT_FUSE`).
+//! Byte oracle and hipEvent microbench of the Qwen4 MoE front producer fusion (exact gfx1201 or
+//! exact gfx1151, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`).
 //!
 //! The sealed grouped prefill's symmetric-IU4 route reads the HC `mixed` rows `[rows, 2560]` F32
-//! in three producers: `mq_rotate_x` (F32 rotated basis `x_rot_batch`, which no reader of the route
-//! consumes), `convert_f32_to_f16` (the F16 X of the router / shared-expert WMMA group launch) and
-//! `mq_rotate_x_i4` (the routed gate/up `block_i4_128` sidecar). `Gpu::qwen4_moe_front_producer`
-//! (`mq_rotate_x_i4_f16out`) emits the sidecar and the F16 X from one read of `mixed`.
+//! in three producers on gfx1201 (two on gfx1151, whose F16 WMMA gate/up rotates itself and so
+//! never launches the F32 one): `mq_rotate_x` (F32 rotated basis `x_rot_batch`, which no reader of
+//! the route consumes), `convert_f32_to_f16` (the F16 X of the router / shared-expert WMMA group
+//! launch, or on gfx1151 of the fused shared gate/up PeaceMaker launch's own router + selector
+//! groups) and `mq_rotate_x_i4` (the routed gate/up `block_i4_128` sidecar).
+//! `Gpu::qwen4_moe_front_producer` (`mq_rotate_x_i4_f16out`) emits the sidecar and the F16 X from
+//! one read of `mixed`.
 //!
 //! ## Phase A, byte oracle (default)
 //!
-//! For every `rows` in {1, 16, 4096, 16384, 4099 (non-multiple tail)} and every data set below,
+//! For every `rows` in {1, 16, 17, 511, 2047, 4099, 8188 (ragged tails), 8192, 16384} and every data set below,
 //! the unfused arm (`Gpu::qwen4_convert_f16_x`, then `Gpu::qwen4_moe_rotate256_i4`) and the fused
 //! arm (`Gpu::qwen4_moe_front_producer`) run from a `0xA5` sentinel in the F16 scratch and the IU4
 //! sidecar region; EVERY byte of the F16 X (`rows * 2560 * 2`) and of the sidecar
@@ -28,17 +31,20 @@
 //!
 //! Random BF16 router / selector / gate / up weights; `Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`
 //! (converts X itself) against `Gpu::qwen4_moe_front_producer` + `..._groups_x16(Some(x16))`:
-//! router logits, selector scalar, gate and up outputs compared bytewise.
+//! router logits, selector scalar, gate and up outputs compared bytewise. On gfx1151 also
+//! `Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(.., None)` against
+//! `..._shared_gu_pm(.., Some(x16))`: router logits, post-sigmoid selector and the F16 hidden.
 //!
 //! ## Phase C, microbench (`--bench`)
 //!
 //! hipEvent time per launch (median of 3 passes of `--reps`, inputs cycled over copies totalling
-//! more than the 64 MiB MALL so no arm reads a cache-warm `mixed`) at 4096 and 16384 rows:
-//! `mq_rotate_x` + `convert_f32_to_f16` + `mq_rotate_x_i4` (the replaced chain) against the fused
-//! launch, with the per-row bytes each moves.
+//! more than the 64 MiB MALL so no arm reads a cache-warm `mixed`) at each `--rows` >= 1024:
+//! the replaced chain (`mq_rotate_x` + `convert_f32_to_f16` + `mq_rotate_x_i4` on gfx1201,
+//! `convert_f32_to_f16` + `mq_rotate_x_i4` on gfx1151) against the fused launch, with the
+//! per-row bytes each moves.
 //!
 //! ```text
-//! cargo run --release -p rdna-compute --features lab --example qwen4_moe_front_oracle -- [--bench] [--rows 4096,16384]
+//! cargo run --release -p rdna-compute --features lab --example qwen4_moe_front_oracle -- [--bench] [--rows 8192,16384]
 //! ```
 //!
 //! Exit 0 when every comparison is byte-identical, 1 on any mismatch, 2 on an unsupported device.
@@ -402,6 +408,58 @@ fn phase_b(gpu: &mut Gpu, rows_list: &[usize], t: &mut Tally) {
                        "identical": d.is_none(), "first_diff_byte": d})
             );
         }
+        if gpu.arch == "gfx1151" {
+            // The Flash-Next shared gate/up PeaceMaker launch: its router + selector groups and
+            // the gate/up/activation/hidden-conversion kernel, from its own conversion (chain)
+            // against the front's F16 X (fused). Outputs: router logits, post-sigmoid selector,
+            // F16 hidden.
+            let mut pm = Vec::new();
+            for _ in 0..2 {
+                pm.push([
+                    gpu.zeros(&[rows, 512], DType::F32).unwrap(),
+                    gpu.zeros(&[rows], DType::F32).unwrap(),
+                    gpu.zeros(&[rows, 640], DType::F16).unwrap(),
+                ]);
+            }
+            let run_pm = |gpu: &mut Gpu, o: &[GpuTensor; 3], x16: Option<&GpuTensor>| {
+                gpu.gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(
+                    (&router, &o[0], 512),
+                    (&selector, &o[1], 1),
+                    &gate,
+                    &up,
+                    &o[2],
+                    &x,
+                    x16,
+                    640,
+                    K,
+                    rows,
+                )
+                .expect("shared gu pm")
+            };
+            assert!(run_pm(gpu, &pm[0], None), "pm chain arm must launch");
+            let (_tok, x16) = gpu
+                .qwen4_moe_front_producer(&x, K, rows)
+                .expect("front producer");
+            assert!(run_pm(gpu, &pm[1], Some(&x16)), "pm fused arm must launch");
+            sync(gpu);
+            let names = ["pm_router", "pm_selector", "pm_hidden_f16"];
+            let mut pm_all = true;
+            for i in 0..3 {
+                let a = gpu.download_raw_bytes(&pm[0][i]).unwrap();
+                let b = gpu.download_raw_bytes(&pm[1][i]).unwrap();
+                let d = first_diff(&a, &b);
+                pm_all &= d.is_none();
+                println!(
+                    "{}",
+                    json!({"phase": "B", "rows": rows, "output": names[i], "bytes": a.len(),
+                           "identical": d.is_none(), "first_diff_byte": d})
+                );
+            }
+            t.cases += 1;
+            if !pm_all {
+                t.mismatches += 1;
+            }
+        }
         t.cases += 1;
         if !all {
             t.mismatches += 1;
@@ -445,11 +503,18 @@ fn phase_c(gpu: &mut Gpu, rows_list: &[usize], reps: usize) {
         let xs: Vec<GpuTensor> = (0..copies)
             .map(|_| gpu.upload_f32(&host, &[rows, K]).expect("upload x"))
             .collect();
+        let gfx1201 = gpu.arch == "gfx1201";
+        // The F32 rotation only runs in the gfx1201 chain (gfx1151's F16 WMMA gate/up rotates
+        // itself and leaves no F32 basis launch).
         let x_rot = gpu.alloc_tensor(&[rows, K], DType::F32).expect("x_rot");
-        let t_rot = elapsed_us(gpu, reps, |g, i| {
-            g.rotate_x_mq_batched(&xs[i % copies], &x_rot, K, rows)
-                .expect("mq_rotate_x");
-        });
+        let t_rot = if gfx1201 {
+            elapsed_us(gpu, reps, |g, i| {
+                g.rotate_x_mq_batched(&xs[i % copies], &x_rot, K, rows)
+                    .expect("mq_rotate_x");
+            })
+        } else {
+            0.0
+        };
         let t_cvt = elapsed_us(gpu, reps, |g, i| {
             g.qwen4_convert_f16_x(&xs[i % copies], n).expect("convert");
         });
@@ -464,12 +529,14 @@ fn phase_c(gpu: &mut Gpu, rows_list: &[usize], reps: usize) {
         // The whole replaced chain launched back to back, as the route issues it.
         let t_chain = elapsed_us(gpu, reps, |g, i| {
             let x = &xs[i % copies];
-            g.rotate_x_mq_batched(x, &x_rot, K, rows)
-                .expect("mq_rotate_x");
+            if gfx1201 {
+                g.rotate_x_mq_batched(x, &x_rot, K, rows)
+                    .expect("mq_rotate_x");
+            }
             g.qwen4_convert_f16_x(x, n).expect("convert");
             g.qwen4_moe_rotate256_i4(x, K, rows).expect("rotate256_i4");
         });
-        let before_row = K * 4 + K * 4 // mq_rotate_x: read + write F32
+        let before_row = if gfx1201 { K * 4 + K * 4 } else { 0 } // mq_rotate_x: read + write F32
             + K * 4 + K * 2 // convert: read F32, write F16
             + K * 4 + (K / 128) * RECORD; // mq_rotate_x_i4: read F32, write sidecar
         let after_row = K * 4 + K * 2 + (K / 128) * RECORD;
@@ -477,8 +544,9 @@ fn phase_c(gpu: &mut Gpu, rows_list: &[usize], reps: usize) {
             "{}",
             json!({
                 "phase": "C", "rows": rows, "reps": reps, "inputs_cycled": copies,
-                "us_mq_rotate_x": t_rot, "us_convert_f32_to_f16": t_cvt, "us_mq_rotate_x_i4": t_i4,
+                "arch": gpu.arch, "us_mq_rotate_x": t_rot, "us_convert_f32_to_f16": t_cvt, "us_mq_rotate_x_i4": t_i4,
                 "us_sum_of_replaced": t_rot + t_cvt + t_i4, "us_chain_back_to_back": t_chain,
+                "us_saved_chain_minus_fused": t_chain - t_fused,
                 "us_fused": t_fused,
                 "bytes_per_row_before": before_row, "bytes_per_row_after": after_row,
                 "mb_moved_before": before_row * rows / 1_000_000, "mb_moved_after": after_row * rows / 1_000_000,
@@ -502,15 +570,15 @@ fn main() {
     };
     let rows_list: Vec<usize> = value("--rows")
         .map(|s| s.split(',').map(|v| v.parse().expect("rows")).collect())
-        .unwrap_or_else(|| vec![1, 16, 4096, 16384, 4099]);
+        .unwrap_or_else(|| vec![1, 16, 17, 511, 2047, 4099, 8188, 8192, 16384]);
     let reps: usize = value("--reps")
         .map(|s| s.parse().expect("reps"))
         .unwrap_or(50);
     let started = Instant::now();
     let mut gpu = Gpu::init().expect("gpu init");
-    if gpu.arch != "gfx1201" || !gpu.qwen4_moe_front_fuse_applies() {
+    if !matches!(gpu.arch.as_str(), "gfx1201" | "gfx1151") || !gpu.qwen4_moe_front_fuse_applies() {
         eprintln!(
-            "qwen4_moe_front_oracle: needs exact gfx1201 with HIPFIRE_QWEN4_MOE_FRONT_FUSE on \
+            "qwen4_moe_front_oracle: needs exact gfx1201 or gfx1151 with HIPFIRE_QWEN4_MOE_FRONT_FUSE on \
              (arch {}, applies {})",
             gpu.arch,
             gpu.qwen4_moe_front_fuse_applies()

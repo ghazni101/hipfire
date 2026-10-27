@@ -1273,11 +1273,15 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
     // :1665-1693: the developer draft ladder is already sampled in params,
     // but dflash_mode=off still suppresses even an explicit draft.
     let dflash_mode = params["dflash_mode"].as_str().unwrap_or("auto");
-    let draft = (dflash_mode != "off")
+    // An `auto` pairing is dropped on tp>1 (DFlash is not served on EP/TP);
+    // an explicit `on` keeps the draft and meets the tp>1 refusal below.
+    let draft = (dflash_mode != "off" && !(dflash_mode == "auto" && tp > 1))
         .then(|| str_param(params, "draft"))
         .flatten();
     // vision_ladder.rs:43-71, same ladder and hard mode gate.
-    let vision_mode = params["vision_mode"].as_str().unwrap_or("off");
+    let vision_mode = params["vision_mode"]
+        .as_str()
+        .unwrap_or(hipfire_config::vision_mode_default());
     let vision = (vision_mode != "off")
         .then(|| str_param(params, "vision"))
         .flatten();
@@ -1614,7 +1618,7 @@ mod tests {
         let a = admission_inputs(&empty);
         assert_eq!((a.tp, a.pp, a.max_seq), (1, 1, 0));
         assert_eq!(a.request, KvBackendRequest::Automatic);
-        assert_eq!(a.vision_mode, "off");
+        assert_eq!(a.vision_mode, hipfire_config::vision_mode_default());
         assert!(a.error.is_none());
         assert_eq!(
             admission_inputs(&json!({"max_seq": 2_000_000})).max_seq,
@@ -1663,6 +1667,12 @@ mod tests {
         assert_eq!(a.vision, Some("vision.hfq"));
         assert!(!a.cask.cask_m_folding);
         assert!(!a.options.cask); // only a sidecar activates this admission gate
+                                  // tp>1: an `auto` pairing is dropped (DFlash is not served on EP/TP),
+                                  // an explicit `on` keeps the draft for the tp>1 refusal.
+        let auto_tp = json!({"draft": "draft.hfq", "dflash_mode": "auto", "tp": 2});
+        assert_eq!(admission_inputs(&auto_tp).draft, None);
+        let on_tp = json!({"draft": "draft.hfq", "dflash_mode": "on", "tp": 2});
+        assert_eq!(admission_inputs(&on_tp).draft, Some("draft.hfq"));
     }
 
     #[test]

@@ -282,6 +282,10 @@ name = "eval_hipfire"
 required-features = ["deltanet"]
 
 [[example]]
+name = "verify_route_logits"
+required-features = ["deltanet"]
+
+[[example]]
 name = "collect_artifacts"
 required-features = ["lab"]
 
@@ -862,4 +866,9 @@ required-features = ["lab"]
 
 [[example]]
 name = "vmm_paged_swap_smoke"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_selector_greedy_oracle"
 required-features = ["lab"]

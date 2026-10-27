@@ -233,6 +233,26 @@ loader (MQ3 tier): greedy AR token ids equal the `qwen4_kld` reference on 8
 prompts, MTP output equals AR, and the q4 and q8 sidecars both load.
 Row-table semantics: [`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables).
 
+**MQ3 XTS on Strix Halo (gfx1151), native.** All 59.1 GB stay resident; W3
+experts run the slab route (K1 decode GEMV with F32 activations, K2 IU4
+prefill with A4 activations). Measured on hipfire ff859c360 with the q4 rows
+(row order) against the published BF16 teacher refs (WT2
+`bf16src-wt2-c512x32`, code24 `fn-bf16-code24-24x512.v3`). The matched
+reference is the MQ4 XTS monolith with its `.trunk-overlay`, which gives it
+the same QT44 linear-attention trunk as the MQ3 base, so the difference is
+the W3 experts alone. Prefill (all-row) KLD, MQ4 → W3: WT2 0.1073 → 0.1369
+(+0.030, 95% chunk bootstrap [+0.021, +0.038]); code24 0.1075 → 0.1393 (+0.032
+[+0.021, +0.043]). Decode (`--decode`, 8 chunks), MQ4 → W3: WT2 0.0750 →
+0.1150; code24 0.0754 → 0.1358. The overlay alone moves the plain monolith's
+code24 prefill KLD by +0.0072 (95% t [+0.0001, +0.0143]). Tool calls (12
+cases) and reasoning answers (18 problems, up to 6.3K reasoning tokens) passed
+with every one of seeds 1–3 on both models; reasoning length shows no
+detectable difference on the long set (10 problems × 3 seeds; mean W3 844 vs
+MQ4 931 tokens, W3/MQ4 ratio 0.91, 95% CI 0.75–1.17). Decode throughput:
+greedy W3 34.3 vs MQ4 33.8 tok/s, but sampled (T=1, top-k 20, top-p 0.95) W3
+30.0 vs MQ4 32.1 tok/s. The K1 slab GEMV matches its CPU twin byte for byte on
+real layers 0, 31 and 47 and over every wide R=1–8 slab cell, with C1 on and off.
+
 **MQ2 XTS tier (split bases).** `qwen3.8:flash-next-mq2-xts`
 (`qwen3.8-flash-next-base.mq2-xts`, 46.9 GB) keeps 6,306 hot routed experts as
 MQ4 XTS bytes; the other 18,270 trunk routed experts are E8P 2-bit (an
@@ -280,7 +300,7 @@ DSpark draft sidecars are declared on the DeepSeek V4 Flash entries (`deepseek-v
 
 Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — the schema default `dflash_mode` is **`off`** (pull ≠ enable) with one registry-scoped exception: the Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b` and the `mq3*` / `mq4*` tiers) get `auto` from the registry layer, so the draft is used when its file is present and the load keeps MTP `auto` when it is absent (which is AR for this Qwen35 producer, since it declares no measured AR floor; `--spec mtp` opts in; an explicit `dflash_mode=off` wins; [`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). Elsewhere `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
-Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — default **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so text loads pay no tower VRAM); `auto` uses the registry/sibling sidecar when present and stays silently text-only when absent; `on` requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
+Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so those loads pay no tower VRAM); **`auto`** (the default) uses the registry/sibling sidecar when present and stays silently text-only when absent — the Qwen3.5/3.8-VL tower is loaded on demand from host/disk and streamed per block through two small VRAM staging buffers during each image encode, so a text load pays no resident tower VRAM; **`resident`** uploads the whole tower into VRAM at load (~0.94 GiB on the 27B) for the lowest first-image latency, with the same sidecar-missing behaviour as `auto`; `on` streams like `auto` but requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
 MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above (`mq3*`, `mq4*`, `mq5*`, `mq6*`) declares the shared `mtp.file` `qwen3.8-27b.mtp` (225,716,224 B, sha256 `f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e`), so `hipfire pull <tag>` fetches it once for all tiers. It is the native `mtp.*` layer of the public `Qwen/Qwen3.8-27B` checkpoint, packed by `hipfire-quantize`'s `mtp_extract --quant mq4` (arch 21). It carries no trunk weights: the head reuses the trunk's embeddings and `lm_head`, which is why one file serves every tier. The DFlash drafts declare no head.
 - `speculation` and `mtp_mode` ([`CONFIG.md`](CONFIG.md#speculative-decode)) both default to `auto`. For the Qwen3.8-27B head (a Qwen35 producer) `auto` does **not** arm it: native MTP `auto` arms only a producer that declares a measured AR floor (today only Flash-Next / Qwen4), so the load keeps AR, loads no head and logs `MTP: off by default (no measured AR floor); opt in with --spec mtp`. `--spec mtp` / `speculation.mtp=on` is the explicit opt-in: the load then logs `MTP head loaded (sidecar …)` and each request logs `drafter=mtp`. `off` never loads the head, and `on` fails the load without it.
@@ -289,7 +309,7 @@ MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above 
 - On gfx1201 with H2 (`qwen3.8:27b-mq4-xts`), MTP decode against AR measured 1.09–1.65× on six of eight task genres, 0.96× on a tool answer and 0.95× on code editing. Greedy MTP output matches its own verifier's argmax, but it can differ from greedy AR output.
 - `hipfire rm` keeps the shared head while another installed tier still declares it ([`CLI.md`](CLI.md)).
 
-Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to the split base (sha256 `eafaff94…`, 70888270360 B), and the client carries a compiled-in pin for it naming the re-bound overlay `qwen3.8-flash-next-base.mq4-xts.trunk-overlay` (305543168 B, sha256 `e3e352ca…`, always the base file name plus `.trunk-overlay`) in `hipfire-models/qwen3.8-flash-next`. Its payload is identical to the pre-split overlay; only the base binding changed. `hipfire pull <tag>` fetches it next to the base. The client also keeps the pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B): `qwen3.8-flash-next.mq4-xts.trunk-overlay` (sha256 `df49bc0a…`), installed beside a grandfathered monolithic install instead. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
+Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to the split base (sha256 `eafaff94…`, 70888270360 B), and the client carries a compiled-in pin for it naming the re-bound overlay `qwen3.8-flash-next-base.mq4-xts.trunk-overlay` (305543168 B, sha256 `e3e352ca…`, always the base file name plus `.trunk-overlay`) in `hipfire-models/qwen3.8-flash-next`. Its payload is identical to the pre-split overlay; only the base binding changed. `hipfire pull <tag>` fetches it next to the base on a host with a gfx1151 GPU or no detected GPU (the loader applies it only on gfx1151; gfx1100 and gfx1201 hosts skip the download, and `HIPFIRE_QWEN4_TRUNK_OVERLAY=1` keeps it). The client also keeps the pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B): `qwen3.8-flash-next.mq4-xts.trunk-overlay` (sha256 `df49bc0a…`), installed beside a grandfathered monolithic install instead. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
 - `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
 - `hipfire rm` removes the overlay with its base. The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` baked tier is removed from the registry (no retired pin); the overlay on the stock tags supersedes it.
 
@@ -536,14 +556,14 @@ published for this to work.
 **Media needs the tower pack as a sibling.** Both rows declare their
 `<trunk>.vl` pack in the registry's `vision` slot (963 tensors: the checkpoint's
 vision + audio towers), and the loader also finds a `<trunk>.vl` sibling on its
-own. `vision_mode` still defaults to `off` — text-only, media refused per
-modality — so serve media with `hipfire config set vision_mode auto`.
+own. `vision_mode` defaults to `auto`, so a present pack is loaded and media is
+served; `hipfire config set vision_mode off` keeps the load text-only (media
+refused per modality, naming the knob).
 
 ```bash
 # One command, from the HF snapshot: quantize, install both files, register the tag.
 hipfire quantize ~/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/<rev> \
   --format q8f16 --install --register embeddinggemma-2:q8f16
-hipfire config set vision_mode auto
 hipfire embed embeddinggemma-2:q8f16 --kind query "what is in this picture <|image|>" \
   --image photo.png -j
 ```

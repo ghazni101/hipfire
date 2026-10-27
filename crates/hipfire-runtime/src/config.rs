@@ -40,7 +40,9 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
+/// The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) on exact gfx1201 is
+/// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
+/// ids identical to the HIP route. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// spill on either tier — an explicit layer or routed-expert count, or
 /// explicit `auto`) gets no retained default: its
@@ -75,6 +77,19 @@ pub fn retained_redline_default(
         && pp == 1
         && tp == 1
         && !has_drafter
+    {
+        return true;
+    }
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension; 0.5.0 selects by HFQ metadata (symmetric IU4 headers verified at load) (no runtime warning: only way to reach the route today)
+    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+        && model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+        && std::path::Path::new(model_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4rs"))
     {
         return true;
     }
@@ -465,6 +480,82 @@ mod tests {
             "/models/qwen3.6-35b-a3b.mq4r",
             1,
             2,
+        ));
+    }
+
+    #[test]
+    fn a3b_mq4rs_takes_retained_redline_on_gfx1201_only() {
+        let f = "/models/qwen3.6-35b-a3b-d53.mq4rs";
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            false
+        ));
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            "/models/A3B.MQ4RS",
+            1,
+            1,
+            false
+        ));
+        // drafter (MTP-loaded), other arches, multi-GPU, other families, other extensions
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            true
+        ));
+        for arch in ["gfx1200", "gfx1100", "gfx1151", "gfx942"] {
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                1,
+                1,
+                false
+            ));
+        }
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            2,
+            1,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            2,
+            false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201", "qwen3", f, 1, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5_moe",
+            "/models/a3b.mq4",
+            1,
+            1,
+            false
+        ));
+        assert!(!redline_with_ep(
+            "gfx1201",
+            "qwen3_5_moe",
+            f,
+            1,
+            1,
+            2,
+            false
         ));
     }
 

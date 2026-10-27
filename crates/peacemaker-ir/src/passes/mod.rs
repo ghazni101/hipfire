@@ -5,6 +5,7 @@
 pub mod barriers;
 pub mod cfg;
 pub mod hazards;
+mod kernarg_ix;
 pub mod kernargs;
 pub mod lds;
 pub mod liveness;

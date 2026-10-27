@@ -110,6 +110,7 @@ pub struct LaneFaWrite<'a> {
 /// One lane of a lane-batched VerifyAttn attend. `max_ctx_len` /
 /// `physical_cap` are exactly the singleton `attention_flash_fp8_e4m3_tile_batched`
 /// arguments of that lane (`max_ctx_len = start_pos + rows`).
+#[derive(Clone, Copy)]
 pub struct LaneFaAttend<'a> {
     pub q: &'a GpuTensor,
     pub k_cache: &'a GpuTensor,
@@ -497,5 +498,84 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// Which lanes of `lanes` the singleton attend serves with the native-fp8
+    /// split-KV verifier ([`Gpu::fp8_fa2_split_verify_admitted`] at that
+    /// lane's context over the singleton's `single_partials`): those lanes
+    /// keep their own singleton launch so batched == singleton holds.
+    pub fn lane_fa_split_lanes(
+        &self,
+        lanes: &[LaneFaAttend<'_>],
+        single_partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<bool> {
+        lanes
+            .iter()
+            .map(|l| {
+                self.fp8_fa2_split_verify_admitted(
+                    l.max_ctx_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    l.rows,
+                    single_partials.numel(),
+                )
+                .is_some()
+            })
+            .collect()
+    }
+
+    /// The attend of a lane-batched chunk, equal to one singleton
+    /// `attention_flash_fp8_e4m3_tile_batched` per lane. Lanes the singleton
+    /// serves with the native-fp8 split-KV verifier
+    /// ([`Self::lane_fa_split_lanes`]) run exactly that singleton launch over
+    /// `single_partials` (the model scratch's `flash_partials`, the
+    /// singleton's own); every other lane shares ONE VerifyAttn tile launch
+    /// and one reduce over `lane_partials`, laid out over those lanes only,
+    /// in lane order ([`Gpu::lane_fa_partials_len`]). The caller guarantees
+    /// [`Gpu::lane_fa_batch_admitted`].
+    pub fn attention_verify_fp8_lanes_routed(
+        &mut self,
+        lanes: &[LaneFaAttend<'_>],
+        lane_partials: &GpuTensor,
+        single_partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        let split = self.lane_fa_split_lanes(lanes, single_partials, n_heads, n_kv_heads, head_dim);
+        let mut plain: Vec<LaneFaAttend<'_>> = Vec::with_capacity(lanes.len());
+        for (l, &is_split) in lanes.iter().zip(&split) {
+            if is_split {
+                self.attention_flash_fp8_e4m3_tile_batched(
+                    l.q,
+                    l.k_cache,
+                    l.v_cache,
+                    l.out,
+                    l.positions,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    l.physical_cap,
+                    l.max_ctx_len,
+                    l.rows,
+                    single_partials,
+                    None,
+                    0,
+                    0,
+                    None,
+                )?;
+            } else {
+                plain.push(*l);
+            }
+        }
+        if plain.is_empty() {
+            return Ok(());
+        }
+        self.attention_verify_gqa_fp8_lanes(&plain, lane_partials, n_heads, n_kv_heads, head_dim)?;
+        self.attention_verify_reduce_lanes(&plain, lane_partials, n_heads)
     }
 }

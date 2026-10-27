@@ -644,7 +644,17 @@ fn select_target(
             )
             .map_err(|e| e.to_string())?;
             qsa.pooled_len = visible / config.indexer_compress_ratio;
-            qsa.selected_len = visible;
+            // The product's `Full`-mode commit (`IndexedAttentionOp::next_lengths`):
+            // top-`budget` pooled blocks plus the partial tail, bounded by the
+            // arena. `visible` itself overruns `selected_capacity` past the
+            // budget, which is not a state any forward can produce.
+            let complete = visible / config.indexer_compress_ratio;
+            qsa.selected_len = ((config.indexer_budget / config.indexer_compress_ratio)
+                .min(complete)
+                * config.indexer_compress_ratio
+                + visible
+                - complete * config.indexer_compress_ratio)
+                .min(config.qsa_selected_capacity());
         }
         Ok::<(), String>(())
     })();

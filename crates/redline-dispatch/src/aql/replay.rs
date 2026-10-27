@@ -450,6 +450,14 @@ impl SingleQueuePm4Ib {
         Ok(())
     }
 
+    /// Decode the retained indirect buffer as the CP will read it: every
+    /// `DISPATCH_DIRECT`'s raw dimensions and the `COMPUTE_NUM_THREAD`
+    /// workgroup size in force at it. Quiescent use only (a self-check of what
+    /// [`Self::patch_dispatch_dimensions`] and the builder left in the IB).
+    pub fn decode_dispatches(&mut self) -> Result<Vec<DecodedDispatch>, ReplayError> {
+        decode_pm4_dispatches(self.indirect.as_mut_bytes())
+    }
+
     pub fn in_flight(&self) -> bool {
         self.in_flight
     }
@@ -745,6 +753,78 @@ impl SingleQueuePm4Ib {
             }
         }
     }
+}
+
+/// One decoded `DISPATCH_DIRECT` of a retained IB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedDispatch {
+    /// The packet's three raw dimension dwords (GFX12: total work-items).
+    pub dimensions: [u32; 3],
+    /// `COMPUTE_NUM_THREAD_{X,Y,Z}` as last set before it (`None` when the
+    /// stream never set them).
+    pub workgroup: Option<[u32; 3]>,
+}
+
+/// `COMPUTE_NUM_THREAD_X` in the `SET_SH_REG` register space the builder uses
+/// (`redline-rocr` `pm4.rs`); `Y` and `Z` follow.
+const PM4_COMPUTE_NUM_THREAD_X: u32 = 0x207;
+const PM4_SET_SH_REG: u32 = 0x76;
+const PM4_DISPATCH_DIRECT: u32 = 0x15;
+
+fn decode_pm4_dispatches(bytes: &[u8]) -> Result<Vec<DecodedDispatch>, ReplayError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(ReplayError::MalformedPm4IndirectBuffer {
+            dword: bytes.len() / 4,
+        });
+    }
+    let dwords = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut threads: [Option<u32>; 3] = [None; 3];
+    let mut cursor = 0_usize;
+    while cursor < dwords.len() {
+        let header = dwords[cursor];
+        if header >> 30 != 3 {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let body_dwords = ((header >> 16) & 0x3fff) as usize + 1;
+        let next = cursor
+            .checked_add(1 + body_dwords)
+            .ok_or(ReplayError::MalformedPm4IndirectBuffer { dword: cursor })?;
+        if next > dwords.len() {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let body = &dwords[cursor + 1..next];
+        match (header >> 8) & 0xff {
+            PM4_SET_SH_REG => {
+                let first = body[0];
+                for (i, value) in body[1..].iter().enumerate() {
+                    let register = first + i as u32;
+                    if (PM4_COMPUTE_NUM_THREAD_X..PM4_COMPUTE_NUM_THREAD_X + 3).contains(&register)
+                    {
+                        threads[(register - PM4_COMPUTE_NUM_THREAD_X) as usize] = Some(*value);
+                    }
+                }
+            }
+            PM4_DISPATCH_DIRECT => {
+                if body_dwords != 4 {
+                    return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+                }
+                out.push(DecodedDispatch {
+                    dimensions: [body[0], body[1], body[2]],
+                    workgroup: match threads {
+                        [Some(x), Some(y), Some(z)] => Some([x, y, z]),
+                        _ => None,
+                    },
+                });
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    Ok(out)
 }
 
 fn pm4_dispatch_workgroup_offsets(bytes: &[u8]) -> Result<Vec<usize>, ReplayError> {
@@ -3501,6 +3581,56 @@ mod tests {
             .flat_map(|word| word.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(pm4_dispatch_workgroup_offsets(&bytes).unwrap(), vec![16]);
+    }
+
+    #[test]
+    fn decoded_dispatches_carry_the_workgroup_size_in_force() {
+        // SET NUM_THREAD (64,2,1); dispatch; SET only X (a cached/elided
+        // register run keeps Y,Z); dispatch.
+        let words = [
+            0xc003_7602_u32,
+            0x207,
+            64,
+            2,
+            1,
+            0xc003_1502,
+            8,
+            4,
+            1,
+            0x800d,
+            0xc001_7602,
+            0x207,
+            128,
+            0xc003_1502,
+            16,
+            4,
+            1,
+            0x800d,
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_pm4_dispatches(&bytes).unwrap(),
+            vec![
+                DecodedDispatch {
+                    dimensions: [8, 4, 1],
+                    workgroup: Some([64, 2, 1])
+                },
+                DecodedDispatch {
+                    dimensions: [16, 4, 1],
+                    workgroup: Some([128, 2, 1])
+                },
+            ]
+        );
+        // A dispatch before any NUM_THREAD write has no workgroup.
+        let early = [0xc003_1502_u32, 8, 4, 1, 0x800d]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(decode_pm4_dispatches(&early).unwrap()[0].workgroup, None);
+        assert!(decode_pm4_dispatches(&early[..6]).is_err());
     }
 
     #[test]

@@ -415,6 +415,7 @@ fn vlaunch(gpu: &mut Gpu, c: &VCase, bf: &VBufs, candidate: bool) {
                 &bf.part,
                 None,
                 0,
+                None,
             )
             .expect("verify_attn launch");
         assert!(ran, "VerifyAttn declined an admitted case: {c:?}");
@@ -435,6 +436,7 @@ fn vlaunch(gpu: &mut Gpu, c: &VCase, bf: &VBufs, candidate: bool) {
             None,
             0,
             0,
+            None,
         )
         .expect("reference fp8");
     }
@@ -785,6 +787,11 @@ fn bench(gpu: &mut Gpu, shapes: &[Shape]) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("verify");
+    // The fp8 reference is the VerifyAttn tile + reduce. The native-fp8
+    // split-KV verifier (default on from 8,192 tokens on gfx1201, H24/KV4)
+    // would replace it at long contexts, so pin it off before the process
+    // config snapshot is first read.
+    std::env::set_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8", "0");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
         gpu.arch == "gfx1201",

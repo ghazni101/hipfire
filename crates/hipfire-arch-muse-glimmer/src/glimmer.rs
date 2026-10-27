@@ -1071,18 +1071,106 @@ fn load_norm_plain(
     load_norm_with(hfq, gpu, name, dim, false)
 }
 
+/// One tensor-parallel rank's share of the model: the `rank`-th of `parts`
+/// even blocks of every split projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpSlice {
+    pub rank: usize,
+    pub parts: usize,
+}
+
+/// Which block of a projection a load keeps.
+#[derive(Clone, Copy)]
+enum Cut {
+    Whole,
+    /// The rank's block of output rows (head- or intermediate-split).
+    Rows(TpSlice),
+    /// The rank's block of input columns, whole quant groups of every row.
+    Cols(TpSlice),
+}
+
+impl Cut {
+    fn rows(shard: Option<TpSlice>) -> Self {
+        shard.map_or(Self::Whole, Self::Rows)
+    }
+
+    fn cols(shard: Option<TpSlice>) -> Self {
+        shard.map_or(Self::Whole, Self::Cols)
+    }
+}
+
+/// Input columns per quant block of an HFQ projection `quant_type`, for
+/// cutting whole blocks out of every row.
+fn quant_group_cols(quant_type: u8) -> Option<usize> {
+    match quant_type {
+        1 | 2 | 16 => Some(1),
+        3 => Some(32),
+        7 => Some(128),
+        4 | 6 | 8 | 9 | 11 | 13 | 15 | 17 | 19 => Some(256),
+        _ => None,
+    }
+}
+
+/// The `cut` block of the `[m, k]` projection `name`: its bytes, the local
+/// `(m, k)` and, for a column cut, the input-column range it keeps.
+fn cut_bytes<'a>(
+    name: &str,
+    quant_type: u8,
+    data: &'a [u8],
+    m: usize,
+    k: usize,
+    cut: Cut,
+) -> Result<
+    (
+        std::borrow::Cow<'a, [u8]>,
+        usize,
+        usize,
+        Option<std::ops::Range<usize>>,
+    ),
+    String,
+> {
+    use hipfire_runtime::tp_shard::{slice_uniform_group_cols, slice_uniform_rows};
+    let block = |extent: usize, s: TpSlice| {
+        (s.parts != 0 && s.rank < s.parts && extent % s.parts == 0)
+            .then(|| extent / s.parts * s.rank..extent / s.parts * (s.rank + 1))
+            .ok_or_else(|| format!("glimmer: {name}: {extent} does not split into {s:?}"))
+    };
+    let error = |e: String| format!("glimmer: {name}: {e}");
+    match cut {
+        Cut::Whole => Ok((data.into(), m, k, None)),
+        Cut::Rows(s) => {
+            let r = block(m, s)?;
+            let bytes = slice_uniform_rows(data, m, r.start, r.end).map_err(error)?;
+            Ok((bytes.into(), r.len(), k, None))
+        }
+        Cut::Cols(s) => {
+            let r = block(k, s)?;
+            let group = quant_group_cols(quant_type).ok_or_else(|| {
+                format!("glimmer: {name}: quant_type {quant_type} has no column split")
+            })?;
+            let bytes =
+                slice_uniform_group_cols(data, m, k, r.start, r.end, group).map_err(error)?;
+            Ok((bytes.into(), m, r.len(), Some(r)))
+        }
+    }
+}
+
 /// quant_type → DType mapping for projection weights.
-/// F16 is dequantized to F32 on upload.
+/// F16 is dequantized to F32 on upload. `cut` keeps one TP rank's block.
 fn load_wt(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
+    cut: Cut,
 ) -> Result<WeightTensor, String> {
     let (info, data) = hfq
         .tensor_data(name)
         .ok_or_else(|| format!("glimmer: tensor not found: {name}"))?;
+    let full_k = k;
+    let (data, m, k, cols) = cut_bytes(name, info.quant_type, data, m, k, cut)?;
+    let data = &data[..];
     if info.quant_type == 1 {
         let f32_data: Vec<f32> = data
             .chunks_exact(2)
@@ -1183,10 +1271,17 @@ fn load_wt(
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("glimmer: upload {name}: {e:?}"))?;
-    let awq_scale = if dtype.supports_awq_sidecar() {
-        hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k)
-    } else {
+    let awq_scale = if !dtype.supports_awq_sidecar() {
         None
+    } else if let Some(cols) = cols {
+        // The rank's input columns of the per-column AWQ scale.
+        hipfire_runtime::hfq::awq_scale_f32_bytes(hfq, name, full_k)
+            .map(|bytes| bytes[cols.start * 4..cols.end * 4].to_vec())
+            .map(|bytes| gpu.upload_raw(&bytes, &[bytes.len()]))
+            .transpose()
+            .map_err(|e| format!("glimmer: upload AWQ {name}: {e:?}"))?
+    } else {
+        hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k)
     };
     Ok(WeightTensor {
         buf,
@@ -1234,6 +1329,19 @@ pub struct GlimmerWeights {
 
 impl GlimmerWeights {
     pub fn load(hfq: &HfqFile, cfg: &GlimmerConfig, gpu: &mut Gpu) -> Result<Self, String> {
+        Self::load_shard(hfq, cfg, gpu, None)
+    }
+
+    /// [`Self::load`]; with `shard`, only that TP rank's block of every
+    /// head- and intermediate-split projection (attention q/k/v/gate and MLP
+    /// gate/up rows, o/down input columns). Embedding, LM head and norms are
+    /// whole.
+    pub fn load_shard(
+        hfq: &HfqFile,
+        cfg: &GlimmerConfig,
+        gpu: &mut Gpu,
+        shard: Option<TpSlice>,
+    ) -> Result<Self, String> {
         struct PendingLayer {
             input_layernorm: Option<GpuTensor>,
             post_attention_layernorm: Option<GpuTensor>,
@@ -1421,7 +1529,8 @@ impl GlimmerWeights {
             }
         };
         // ── Untied LM head ─────────────────────────────────────────────
-        let lm_head_val = match load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, dim) {
+        let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, dim, Cut::Whole);
+        let lm_head_val = match lm_head {
             Ok(w) => w,
             Err(e) => {
                 guard.cleanup(gpu);
@@ -1518,6 +1627,7 @@ impl GlimmerWeights {
                     &format!("{p}.self_attn.gate_proj.weight"),
                     q_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1534,6 +1644,7 @@ impl GlimmerWeights {
                     &format!("{p}.self_attn.q_proj.weight"),
                     q_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1550,6 +1661,7 @@ impl GlimmerWeights {
                     &format!("{p}.self_attn.k_proj.weight"),
                     kv_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1566,6 +1678,7 @@ impl GlimmerWeights {
                     &format!("{p}.self_attn.v_proj.weight"),
                     kv_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1582,6 +1695,7 @@ impl GlimmerWeights {
                     &format!("{p}.self_attn.o_proj.weight"),
                     dim,
                     q_dim,
+                    Cut::cols(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1598,6 +1712,7 @@ impl GlimmerWeights {
                     &format!("{p}.mlp.gate_proj.weight"),
                     hidden_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1614,6 +1729,7 @@ impl GlimmerWeights {
                     &format!("{p}.mlp.up_proj.weight"),
                     hidden_dim,
                     dim,
+                    Cut::rows(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {
@@ -1630,6 +1746,7 @@ impl GlimmerWeights {
                     &format!("{p}.mlp.down_proj.weight"),
                     dim,
                     hidden_dim,
+                    Cut::cols(shard),
                 ) {
                     Ok(w) => w,
                     Err(e) => {

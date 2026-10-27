@@ -355,7 +355,7 @@ fn pure_length_suppresses_calls_and_cache() {
     }
     let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
     assert!(!action.store);
-    assert!(hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |_, _| panic!("must not insert"),
         &action,
         vec![1, 2]
@@ -652,7 +652,7 @@ fn open_think_at_length_cap_is_length_done_not_error() {
     assert_eq!(raw, body, "emitter streamed exactly the generated body");
     assert!(!raw.contains(&1), "no synthetic end of turn in the body");
     let mut sink: Vec<(u64, Vec<u32>)> = Vec::new();
-    let fp = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |f, seq| sink.push((f, seq)),
         &action,
         raw.clone(),
@@ -662,7 +662,7 @@ fn open_think_at_length_cap_is_length_done_not_error() {
     assert_eq!(fp, Some(*stored_fp));
     assert_eq!(
         *stored_fp,
-        hipfire_generate::common::asst_turn_fingerprint(
+        hipfire_engine::turn_cache::asst_turn_fingerprint(
             &action.fingerprint_text,
             &action.tool_calls
         )
@@ -1602,7 +1602,7 @@ fn cache_fingerprint_uses_visible_not_raw_markers() {
     assert!(!action.fingerprint_text.contains("<think>"));
     assert!(action.fingerprint_text.contains("visible"));
     let mut stored = None;
-    let fp = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |f, seq| {
             stored = Some((f, seq));
         },
@@ -1614,7 +1614,7 @@ fn cache_fingerprint_uses_visible_not_raw_markers() {
     assert_eq!(seq, vec![10, 20, 30]);
     assert_eq!(
         f,
-        hipfire_generate::common::asst_turn_fingerprint(
+        hipfire_engine::turn_cache::asst_turn_fingerprint(
             &action.fingerprint_text,
             &action.tool_calls
         )
@@ -2719,7 +2719,7 @@ fn legacy_length_terminal_skips_assistant_cache_and_tool_release() {
         let stripped = hipfire_generate::common::strip_think_for_fingerprint(decoded_full);
         let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
         let emit_tool_calls = extract_tool_calls_from_text(decoded_full);
-        let fp = hipfire_generate::common::asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint(&emit_text, &emit_tool_calls);
         sink.insert(fp, cached_seq.clone());
     }
     assert!(
@@ -2742,7 +2742,7 @@ fn legacy_length_terminal_skips_assistant_cache_and_tool_release() {
     assert!(!hit_safe && finish.tool_calls > 0);
     let mut sink_safe = std::collections::HashMap::new();
     if !hit_safe && !cached_seq.is_empty() {
-        let fp = hipfire_generate::common::asst_turn_fingerprint("ok", &[]);
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("ok", &[]);
         sink_safe.insert(fp, cached_seq.clone());
     }
     assert_eq!(sink_safe.len(), 1, "safe stop still stores");
@@ -3667,7 +3667,7 @@ fn dflash_client_abort_suppresses_release_store_done() {
     let mut action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
     action.store = effects.store_cache && action.store;
     let mut stored = false;
-    let _ = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+    let _ = hipfire_engine::turn_cache::apply_turn_cache_action(
         |_fp, _seq| stored = true,
         &action,
         vec![1, 2, 3],

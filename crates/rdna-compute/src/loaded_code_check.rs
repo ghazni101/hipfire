@@ -85,7 +85,9 @@
 //! copies of the same image). Every registration leaves a record: either
 //! attributed ranges or at least one `unavailable` reason, counted in the report.
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::c_void;
+#[cfg(target_os = "linux")]
+use std::ffi::{c_char, c_int, CStr};
 use std::fmt::Write as _;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
@@ -977,12 +979,15 @@ fn match_object(
 // Real HSA adapter (libhsa-runtime64 already loaded; RTLD_NOLOAD; no init/shutdown)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
 }
+#[cfg(target_os = "linux")]
 const RTLD_NOW: c_int = 0x2;
+#[cfg(target_os = "linux")]
 const RTLD_NOLOAD: c_int = 0x4;
 
 const HSA_STATUS_SUCCESS: u32 = 0;
@@ -1086,6 +1091,7 @@ unsafe extern "C" fn collect_lco(
 }
 
 impl HsaLoader {
+    #[cfg(target_os = "linux")]
     fn resolve() -> Result<HsaLoader, String> {
         // SAFETY: dlopen/dlsym on a library that must already be loaded; symbol
         // types are the documented signatures from the installed headers.
@@ -1112,8 +1118,17 @@ impl HsaLoader {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn resolve() -> Result<HsaLoader, String> {
+        Err(format!(
+            "loaded-code HSA adapter is unsupported on {} (Linux only)",
+            std::env::consts::OS
+        ))
+    }
+
     /// # Safety
     /// `handle` must be a live handle returned by `dlopen`.
+    #[cfg(target_os = "linux")]
     unsafe fn resolve_from(handle: *mut c_void) -> Result<HsaLoader, String> {
         unsafe {
             let sym = |n: &CStr| -> Result<*mut c_void, String> {
@@ -1446,6 +1461,67 @@ mod tests {
         let mut s = String::new();
         let o = capture_into(reg, &mut |t| s.push_str(t));
         (o, s)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_hsa_registration_is_unavailable_and_unregisters() {
+        let elf = build_elf();
+        let reg = Mutex::new(Registry::new());
+        {
+            let mut registry = lock_blocking(&reg);
+            registry.register_hsa(7, "unsupported", &elf);
+            assert!(
+                registry.hsa.is_none(),
+                "no unsupported loader may be cached"
+            );
+            assert_eq!(
+                registry.modules.len(),
+                1,
+                "registration must not be dropped"
+            );
+            let module = &registry.modules[0];
+            assert_eq!(module.module, 7);
+            assert!(module.objects.is_empty(), "no loaded ranges are attributed");
+            assert_eq!(module.unavailable.len(), 1);
+            assert!(module.unavailable[0].contains("loaded-code HSA adapter is unsupported"));
+            assert!(module.unavailable[0].contains(std::env::consts::OS));
+            assert!(module.unavailable[0].contains("Linux only"));
+        }
+        let (outcome, report) = self_test_string(&reg);
+        assert_eq!(
+            outcome,
+            CaptureOutcome::Captured {
+                ranges: 0,
+                equal: 0,
+                differ: 0,
+                unavailable: 1,
+            }
+        );
+        assert!(report.contains("unavailable (not checked): module 'unsupported'"));
+        assert!(!report.contains("intact"));
+        {
+            let mut registry = lock_blocking(&reg);
+            // unregister_module uses this removal path before hipModuleUnload.
+            registry.remove(7);
+            assert!(registry.modules.is_empty());
+            assert!(registry.claimed_bases().is_empty());
+        }
+        let (outcome, _) = self_test_string(&reg);
+        assert_eq!(
+            outcome,
+            CaptureOutcome::Captured {
+                ranges: 0,
+                equal: 0,
+                differ: 0,
+                unavailable: 0,
+            }
+        );
+        lock_blocking(&reg).register_hsa(7, "reloaded", &elf);
+        assert_eq!(lock_blocking(&reg).modules.len(), 1);
+        assert_eq!(lock_blocking(&reg).modules[0].unavailable.len(), 1);
+        lock_blocking(&reg).remove(7);
+        assert!(lock_blocking(&reg).modules.is_empty());
     }
 
     #[test]

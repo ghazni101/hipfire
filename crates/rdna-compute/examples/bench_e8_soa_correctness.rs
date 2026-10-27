@@ -29,6 +29,10 @@ fn main() {
         run_prefill_coop(&mut gpu);
         return;
     }
+    if std::env::var_os("HIPFIRE_E8_GROUPED_PREFILL_ONLY").is_some() {
+        run_grouped_prefill_parity(&mut gpu);
+        return;
+    }
     if std::env::var_os("HIPFIRE_E8_GROUPED_GFX1201_ONLY").is_some() {
         run_grouped_gfx1201(&mut gpu);
         return;
@@ -926,57 +930,7 @@ fn main() {
             );
         }
 
-        // Grouped block-diagonal batched layout used by DeepSeek4 O-LoRA:
-        // weights [G,M,K], X [B,G,K], Y [B,G,M].
-        {
-            let (groups, batch, m, k) = (8usize, 17usize, 128usize, 2048usize);
-            let aos = synth_e8_aos(groups * m, k, 0xE84B_10C8);
-            let soa = aos_to_soa_full(&aos, groups * m, k);
-            let row_bytes = soa.len() / (groups * m);
-            let group_bytes = row_bytes * m;
-            let weights = gpu.upload_raw(&soa, &[soa.len()]).unwrap();
-            let x = gpu.alloc_tensor(&[batch * groups * k], DType::F32).unwrap();
-            let y_ref = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
-            let y_wmma = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
-            let x_host = make_x(batch * groups * k, 0xB10C_E8A5);
-            gpu.hip.memcpy_htod(&x.buf, bytes_of(&x_host)).unwrap();
-            for b in 0..batch {
-                for g in 0..groups {
-                    let w = weights.sub_offset(g * group_bytes, group_bytes);
-                    let xg = x.sub_offset((b * groups + g) * k, k);
-                    let yg = y_ref.sub_offset((b * groups + g) * m, m);
-                    gpu.gemv_mfp4g32_e8_soa(&w, &xg, &yg, m, k).unwrap();
-                }
-            }
-            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(&weights, &x, &y_wmma, groups, m, k, batch)
-                .unwrap();
-            gpu.hip.device_synchronize().unwrap();
-            let mut reference = vec![0f32; batch * groups * m];
-            let mut candidate = vec![0f32; batch * groups * m];
-            gpu.hip
-                .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
-                .unwrap();
-            gpu.hip
-                .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_wmma.buf)
-                .unwrap();
-            let mut err2 = 0.0f64;
-            let mut ref2 = 0.0f64;
-            let mut max_abs = 0.0f32;
-            for (&a, &b) in reference.iter().zip(&candidate) {
-                let d = (a - b).abs();
-                max_abs = max_abs.max(d);
-                err2 += (d as f64) * (d as f64);
-                ref2 += (a as f64) * (a as f64);
-            }
-            let rel_rmse = (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt();
-            eprintln!(
-                "  Grouped E8-SoA WMMA B2 parity: rel_rmse={rel_rmse:.6} max_abs={max_abs:.6}"
-            );
-            assert!(
-                candidate.iter().all(|v| v.is_finite()) && rel_rmse < 0.01,
-                "grouped E8-SoA WMMA B2 parity failed"
-            );
-        }
+        run_grouped_prefill_parity(&mut gpu);
 
         let (groups, m, k) = (8usize, 1024usize, 4096usize);
         let aos = synth_e8_aos(groups * m, k, 0x4752_4F55);
@@ -1174,6 +1128,94 @@ fn main() {
                 );
             }
         }
+    }
+}
+
+/// Grouped block-diagonal batched layout used by DeepSeek4 O-LoRA:
+/// weights [G,M,K], X [B,G,K], Y [B,G,M]. B=100 spans two 64-token launch
+/// blocks plus a ragged tail, and Y starts as NaN, so a launcher that leaves
+/// tokens unwritten fails here (HIPF-93).
+fn run_grouped_prefill_parity(gpu: &mut Gpu) {
+    assert!(matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201"));
+    let batch = std::env::args()
+        .nth(1)
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(100);
+    let (groups, m, k) = (8usize, 128usize, 2048usize);
+    let aos = synth_e8_aos(groups * m, k, 0xE84B_10C8);
+    let soa = aos_to_soa_full(&aos, groups * m, k);
+    let row_bytes = soa.len() / (groups * m);
+    let group_bytes = row_bytes * m;
+    let mut weights = gpu.upload_raw(&soa, &[soa.len()]).unwrap();
+    weights.dtype = DType::MFP4G32E8SOA;
+    let x = gpu.alloc_tensor(&[batch * groups * k], DType::F32).unwrap();
+    let y_ref = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
+    let y_wmma = gpu.alloc_tensor(&[batch * groups * m], DType::F32).unwrap();
+    let x_host = make_x(batch * groups * k, 0xB10C_E8A5);
+    gpu.hip.memcpy_htod(&x.buf, bytes_of(&x_host)).unwrap();
+    for b in 0..batch {
+        for g in 0..groups {
+            let w = weights.sub_offset(g * group_bytes, group_bytes);
+            let xg = x.sub_offset((b * groups + g) * k, k);
+            let yg = y_ref.sub_offset((b * groups + g) * m, m);
+            gpu.gemv_mfp4g32_e8_soa(&w, &xg, &yg, m, k).unwrap();
+        }
+    }
+    let mut reference = vec![0f32; batch * groups * m];
+    gpu.hip.device_synchronize().unwrap();
+    gpu.hip
+        .memcpy_dtoh(bytes_of_mut(&mut reference), &y_ref.buf)
+        .unwrap();
+    for tiles in if gpu.arch == "gfx1201" {
+        vec![1usize]
+    } else {
+        vec![1usize, 2]
+    } {
+        gpu.hip
+            .memset(&y_wmma.buf, 0xff, y_wmma.byte_size())
+            .unwrap();
+        if gpu.arch == "gfx1201" {
+            let x_f16 = gpu.alloc_tensor(&[batch * groups * k], DType::F16).unwrap();
+            gpu.deepseek4_convert_f32_to_f16(&x, &x_f16, (batch * groups * k) as i64)
+                .unwrap();
+            gpu.gemm_mfp4g32_e8_soa_grouped_wmma_gfx1201_f16(
+                &weights, &x_f16, &y_wmma, groups, m, k, batch,
+            )
+        } else {
+            match tiles {
+                1 => {
+                    gpu.gemm_mfp4g32_e8_soa_grouped_wmma(&weights, &x, &y_wmma, groups, m, k, batch)
+                }
+                _ => gpu.gemm_mfp4g32_e8_soa_grouped_wmma_b2(
+                    &weights, &x, &y_wmma, groups, m, k, batch,
+                ),
+            }
+        }
+        .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let mut candidate = vec![0f32; batch * groups * m];
+        gpu.hip
+            .memcpy_dtoh(bytes_of_mut(&mut candidate), &y_wmma.buf)
+            .unwrap();
+        let unwritten = candidate.iter().filter(|v| !v.is_finite()).count();
+        let mut err2 = 0.0f64;
+        let mut ref2 = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (&a, &b) in reference.iter().zip(&candidate) {
+            let d = (a - b).abs();
+            max_abs = max_abs.max(d);
+            err2 += (d as f64) * (d as f64);
+            ref2 += (a as f64) * (a as f64);
+        }
+        let rel_rmse = (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt();
+        eprintln!(
+            "  Grouped E8-SoA WMMA B{tiles} parity B={batch}: unwritten={unwritten} \
+             rel_rmse={rel_rmse:.6} max_abs={max_abs:.6}"
+        );
+        assert!(
+            unwritten == 0 && rel_rmse < 0.01,
+            "grouped E8-SoA WMMA B{tiles} parity failed"
+        );
     }
 }
 

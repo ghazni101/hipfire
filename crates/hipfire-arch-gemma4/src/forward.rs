@@ -534,6 +534,7 @@ fn eager_resident(state: &Gemma4State) -> Resident<'_> {
         kv_sliding: &state.kv_sliding,
         kv_full: &state.kv_full,
         pos_buf: &state.pos_buf.buf,
+        attend_through: None,
         v_norm_ones: &state.v_norm_ones,
         flash_partials: &state.q8_flash_partials,
     }

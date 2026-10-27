@@ -56,8 +56,7 @@ handlers. Every gate exists once:
   fused_attention_epilogue, qkvza_scalar_prep, conv_scalar_prep,
   conv_qknorm, gfx1151_radiowave, gfx1201_state_fusions}` read
   `HybridDims` (built by `program::hybrid_dims`).
-- The qwen35 copies are deleted. `kv_cache_attention_dispatch` (dense TP and
-  the batched-prefill FA fallback) calls `hybrid::kv_attention`.
+- The qwen35 copies are deleted.
   `forward_slots/vmm/exact.rs` calls the hybrid predicates. The dense 27B
   shape predicate is `HybridDims::is_dense_27b_shape` (the widened prefill
   admission uses it too).
@@ -167,8 +166,22 @@ attend's output, as on beta; the pair is admitted only for 24 query / 4 KV
 heads at head_dim 256 (`fa_pair_env_admitted`), which no MoE fixture on
 gfx1151 has.
 
-Remaining arch-side batched paths (HIPF-128): see [Still in the arch
-crate](#still-in-the-arch-crate).
+## Slice 5: per-row FA fallback, F2 pair attend (HIPF-128)
+
+- The batched prefill's full-attention fallback (FA layers the batched
+  attention does not admit, e.g. a BF16 KV tier) runs the decode steps per
+  row: `forward::forward_scratch_dense_layer` executes
+  `[GatedAttention, GatedMlp(Product)]` from `DecodeBinding`, as
+  `forward_scratch_layers` does. The hand body `run_fa_layer_body` and
+  `kv_cache_attention_dispatch` are deleted.
+- The F2 pair's staging and merged attend are
+  `pipeline::batched_attention::{FaPairStage, FaPairHalf, FA_PAIR_ROWS,
+  FA_PAIR_BATCH}`: `FaPairStage::alloc` / `attend` / `free_gpu`. The pair
+  admission (`fa_pair_merge_admitted`, `fa_pair_env_admitted`) and the
+  lockstep layer loop (`forward_prefill_chunk_pair`) stay with the chunk
+  loop they mirror.
+- Dense TP decode attention already runs through `MixerOutput::Write`
+  (slice 4); there is no `dense_tp_attention_partial` left.
 
 ## Slice 4: MTP layer, DFlash capture, VL mrope
 
@@ -246,13 +259,11 @@ across requests). Their handlers delegate to the hybrid stages.
 - The gfx1201 exact-VMM row twins (`forward_slots/vmm/exact.rs`), which must
   change in lockstep with `DeltaNetMixerOp::prepare` and
   `GatedAttentionOp::attend`.
-- The batched paths of HIPF-128: the per-token full-attention prefill
-  fallback (`batch_chunk_full_attn_fallback` / `run_fa_layer_body`) and the
-  F2 chunk pair (`forward_prefill_chunk_pair`, `FaPairStage`,
-  `batch_chunk_fa_attend_merged`).
+- The F2 pair's lockstep layer loop (`forward_prefill_chunk_pair`) and its
+  admission, beside the single-chunk loop `forward_batch_chunk_impl`.
 - `hipfire_runtime::llama::weight_gemv_swiglu_residual`, the twin of
-  the `Product` ladder's residual down. Its only callers are the PP decode loop and
-  `run_fa_layer_body`; it goes with them.
+  the `Product` ladder's residual down. Its only caller is the PP decode
+  loop; it goes with it.
 
 ## Blast radius outside Qwen3.5
 

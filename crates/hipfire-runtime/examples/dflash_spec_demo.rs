@@ -784,6 +784,14 @@ fn main() {
     if cask_sidecar.is_some() || use_cask {
         eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (--cask* flags)");
     }
+    if let Err(e) = hipfire_arch_qwen35::carrier::validate_ddtree_cask(
+        ddtree_enabled || ddtree_batched,
+        true,
+        cask_sidecar.is_some() || use_cask,
+    ) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 
     // Build the prompt manifest. Exactly one of --prompt, --prompt-file,
     // or --prompts-file is accepted. Single-prompt modes emit no row

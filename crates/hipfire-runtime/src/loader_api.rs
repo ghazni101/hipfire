@@ -109,6 +109,10 @@ pub struct SequenceHint {
     pub model_ctx: usize,
     pub automatic: bool,
     pub card_cap: usize,
+    /// Device bytes the automatic max_seq leaves free beyond the minimum
+    /// prefill reservation — today the vision tower's activation scratch for
+    /// the largest admitted image.
+    pub reserve_bytes: usize,
 }
 
 /// Per-load continuous-batch request, carried from admission to the carrier
@@ -159,10 +163,11 @@ pub struct LoadCtx<'a> {
     /// trunk. Read by `Qwen35Carrier` only, after the bundled trailer probe.
     /// `None` = look beside the canonical trunk (`<trunk>.with_extension("mtp")`).
     pub mtp_path: Option<PathBuf>,
-    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
-    /// discovery in the carrier — `vision_path` alone cannot distinguish
-    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
-    /// `off` suppresses discovery; `auto`/`on` allow it.
+    /// Resolved `vision.mode` (`off`/`auto`/`resident`/`on`). Gates `<stem>.vl`
+    /// sibling discovery in the carrier — `vision_path` alone cannot
+    /// distinguish "off" (never probe) from "auto with no explicit sidecar"
+    /// (probe). `off` suppresses discovery; `auto`/`resident`/`on` allow it.
+    /// `resident` uploads the whole tower to VRAM; every other mode streams it.
     pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.

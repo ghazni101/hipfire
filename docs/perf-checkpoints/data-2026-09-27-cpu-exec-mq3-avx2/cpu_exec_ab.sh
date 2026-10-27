@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # A/B driver for the qt49 AVX2 kernel, kept beside the JSON it produced.
 # Scratch during the measurement; committed here so the numbers have a recipe.
+# WARNING: run_arm kills with `pkill -f 'release/daemon'`, which matches every
+# worktree's release daemon on the host, not just this A/B's. Run it only on a
+# box where no other hipfire daemon is running.
 # Pre-change pair: /tmp/cpu_exec_pin/{hipfire,daemon}
 # Post-change pair: target/release/{hipfire,daemon}
 set -u

@@ -48,7 +48,16 @@ mod sys {
         pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         pub fn dlclose(handle: *mut c_void) -> c_int;
         pub fn dlerror() -> *mut c_char;
+        pub fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
         pub fn close(fd: c_int) -> c_int;
+    }
+    /// `struct dl_addr` of `dladdr(3)`; only `dli_fname` is read.
+    #[repr(C)]
+    pub struct DlInfo {
+        pub dli_fname: *const c_char,
+        pub dli_fbase: *mut c_void,
+        pub dli_sname: *const c_char,
+        pub dli_saddr: *mut c_void,
     }
     pub const RTLD_NOW: c_int = 2;
     pub const RTLD_NOLOAD: c_int = 4;
@@ -249,6 +258,28 @@ fn dl_error() -> String {
     } else {
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
+}
+
+/// Loader-reported path backing `ptr`, for diagnostics only. Filesystem paths
+/// can change after a library is loaded; they do not identify a live mapping.
+pub(crate) fn dladdr_fname(ptr: *const c_void) -> Option<String> {
+    let mut info = sys::DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid out-pointer for the lifetime of the call; dladdr
+    // only writes into it.
+    if unsafe { sys::dladdr(ptr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr leaves a NUL-terminated path there on success.
+    Some(
+        unsafe { CStr::from_ptr(info.dli_fname) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// dlsym every name in `names` from `lib` (opened as `source`); `Err` lists the missing ones (the library is NOT
@@ -709,6 +740,19 @@ pub struct HipRuntime {
 }
 
 impl HipRuntime {
+    /// Address of this runtime's resolved `hipEventRecord` implementation.
+    /// Compare only while both runtime owners are alive, in the same process.
+    /// This makes no HIP call; the optional pathname is diagnostic only.
+    pub fn event_record_address(&self) -> usize {
+        self.shared.gpu.event_record as usize
+    }
+
+    /// Loader-reported path of this runtime's `hipEventRecord` implementation,
+    /// for diagnostics. A missing path never proves equality with another runtime.
+    pub fn mapped_hip_library(&self) -> Option<String> {
+        dladdr_fname(self.shared.gpu.event_record as *const c_void)
+    }
+
     /// Load HIP, `hipInit`, find the device whose `hipDeviceGetPCIBusId` equals `pci` (e.g. `"0000:bf:00.0"`, ASCII
     /// case-insensitive) and `hipSetDevice` it. No other device is ever selected.
     pub fn load_for_pci(pci: &str) -> Result<Self, String> {
@@ -1558,6 +1602,27 @@ impl RelayApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dladdr_fname` must resolve a symbol that is definitely mapped: `dlopen`
+    /// itself lives in the process's dynamic linker/libc on every Linux host.
+    /// Test the guard's diagnostic on the real dynamic loader. The admission
+    /// decision itself compares live symbol addresses, not this path.
+    #[test]
+    fn dladdr_fname_resolves_the_object_of_a_live_symbol() {
+        let dlopen_ptr = sys::dlopen as unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+        let path =
+            dladdr_fname(dlopen_ptr as *const c_void).expect("dladdr must resolve dlopen itself");
+        assert!(!path.is_empty());
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "mapped object should exist on disk: {path}"
+        );
+    }
+
+    #[test]
+    fn dladdr_fname_handles_an_unknown_address() {
+        assert_eq!(dladdr_fname(core::ptr::null()), None);
+    }
 
     fn name(a: Attempt<'_>) -> (&str, bool) {
         (a.name, a.already_loaded)

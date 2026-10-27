@@ -636,6 +636,7 @@ fn moe_params_for_decode<'a>(
     });
     hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
+        mq2_lloyd: None,
         recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared {
             bf16_round_trip: false,
             shared_after_combine: false,
@@ -1661,13 +1662,20 @@ fn ar_graph_trace_enabled() -> bool {
 }
 
 #[inline]
-fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
+fn ar_graph_eligible_for_kv(
+    requested: bool,
+    compact_offset: usize,
+    seq_sized_attend: bool,
+) -> bool {
     // The captured single-token route is built while compact_offset is zero.
     // After eviction, Q/K RoPE must use physical_pos + compact_offset, and the
     // offset changes again at every later eviction. Neither hipGraph nor the
     // retained replay route currently has a dynamic offset input, so replaying
     // the old route silently rotates at the physical slot and corrupts decode.
-    requested && compact_offset == 0
+    // The int8/int8c/hfq4 decode attends size block and LDS (scores[seq_len])
+    // from the host seq_len, which a replay freezes at the capture position;
+    // longer contexts then overrun LDS and decode goes degenerate (HIPF-192).
+    requested && compact_offset == 0 && !seq_sized_attend
 }
 
 /// Identity of the caller buffers the AR hipGraph bakes at capture: the
@@ -1897,8 +1905,11 @@ pub fn forward_scratch(
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
     let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
-    let graph_eligible =
-        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
+    let graph_eligible = ar_graph_eligible_for_kv(
+        requested_graph_eligible,
+        kv_cache.compact_offset,
+        kv_cache.quant_int8 || kv_cache.quant_hfq4,
+    );
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -2513,6 +2524,41 @@ fn forward_scratch_layers(
         out: &s.logits,
     };
     execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+/// One dense layer's decode steps on `s.x` at `pos` (position already in
+/// `s.pos_buf`): the batched prefill's per-row fallback for full-attention
+/// layers the batched attention does not admit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_scratch_dense_layer(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    pos: usize,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let binding = super::program::DecodeBinding {
+        dims: super::program::hybrid_dims(config),
+        s,
+        kv_cache,
+        dn_state,
+        position: pos,
+        mrope_section: None,
+    };
+    let layer = &weights.layers[layer_idx];
+    let tap_fn = |gpu: &mut Gpu| {
+        triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
+    };
+    let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
+    let mixer = binding.mixer(layer, layer_idx, 0, false, tap, MixerOutput::Residual);
+    let ffn = super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual)
+        .expect("dense layer");
+    execute_steps(gpu, &ctx, &[mixer, Step::GatedMlp(ffn)])
+        .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 // ── Dispatch helpers ─────────────────────────────────────────────────────
@@ -3536,32 +3582,6 @@ fn triattn_tap(
     Ok(())
 }
 
-/// KV cache write + attention of one decode row through the shared hybrid
-/// attention stage; returns whether the fused epilogue applied the output gate
-/// and `wo`'s input rotation.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn kv_cache_attention_dispatch(
-    ctx: &DispatchCtx,
-    gpu: &mut Gpu,
-    kv_cache: &mut llama::KvCache,
-    s: &Qwen35Scratch,
-    config: &Qwen35Config,
-    wo: &WeightTensor,
-    layer_idx: usize,
-    pos: usize,
-) -> HipResult<bool> {
-    hybrid::kv_attention(
-        gpu,
-        ctx,
-        &super::program::hybrid_dims(config),
-        &super::program::attention_kv(kv_cache, s, layer_idx),
-        &super::program::attention_row(s, pos),
-        &wo.dispatch_ref(),
-        false,
-    )
-    .map_err(|e| HipError::new(0, &e.to_string()))
-}
-
 fn deltanet_sigmoid_alpha_gate(
     gpu: &mut Gpu,
     beta: &GpuTensor,
@@ -3630,6 +3650,7 @@ fn dense_tp_allreduce_add(
         return gpus.all_reduce_sum_f32_peer_add_routed(
             &partial_refs,
             &residuals,
+            1,
             count,
             Some(partial_slot),
         );
@@ -3664,7 +3685,13 @@ fn dense_tp_allreduce_batched(
             .map(|pbs| pbs.x_batch.sub_offset(0, count))
             .collect();
         let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
-        return gpus.all_reduce_sum_f32_peer_add_routed(&partial_refs, &residual_refs, count, None);
+        return gpus.all_reduce_sum_f32_peer_add_routed(
+            &partial_refs,
+            &residual_refs,
+            n,
+            count,
+            None,
+        );
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
@@ -4799,6 +4826,7 @@ pub fn forward_prefill_dense_tp_with_hidden(
     scratches: &[Qwen35Scratch],
     per_token_hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    super::vl_prefill::refuse_active("dense tensor-parallel prefill")?;
     if tokens.is_empty() {
         return Ok(());
     }
@@ -5744,10 +5772,11 @@ mod tests {
 
     #[test]
     fn ar_graph_is_ineligible_after_kv_compaction() {
-        assert!(ar_graph_eligible_for_kv(true, 0));
-        assert!(!ar_graph_eligible_for_kv(true, 1));
-        assert!(!ar_graph_eligible_for_kv(true, 128));
-        assert!(!ar_graph_eligible_for_kv(false, 0));
+        assert!(ar_graph_eligible_for_kv(true, 0, false));
+        assert!(!ar_graph_eligible_for_kv(true, 1, false));
+        assert!(!ar_graph_eligible_for_kv(true, 128, false));
+        assert!(!ar_graph_eligible_for_kv(false, 0, false));
+        assert!(!ar_graph_eligible_for_kv(true, 0, true));
     }
 
     // ── MQ6V2 / MQ4V2 FFN dtype recognition ───────────────────────────────

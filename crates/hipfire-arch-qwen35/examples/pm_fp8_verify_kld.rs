@@ -209,6 +209,7 @@ fn run() -> R<()> {
             model_ctx: 4096,
             automatic: true,
             card_cap: 0,
+            reserve_bytes: 0,
         }),
         deepseek4_compute_placement: Default::default(),
         deepseek4_experts_per_token: None,

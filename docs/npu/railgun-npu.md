@@ -189,7 +189,7 @@ accepts one `build_panel_program_rowmajor(rows_max, shape.pitch(), 0)` PDI/TXN
 per shape and resident `pack_b_bf16` panels including Sm/Se. The shape programs
 share the same G80 PDI/context but retain distinct pitch-specific instruction BOs.
 The out shapes (`Shape::GdnOut` / `Shape::QsaO`, K=6144, five 512-column panels,
-`build_panel_program_out(rows_max, 2560, 0)`) are supported by the runtime but are
+`build_panel_program_n512(rows_max, 2560, 0, 6144)`) are supported by the runtime but are
 **not requested by the 0.4.2 serving route** (out-projection is unwired; see the
 lifecycle note at the top). They run a different PDI: the relay creates one
 `HwCtx` + `config_cu` per distinct PDI (input shapes share one, both out shapes share one),

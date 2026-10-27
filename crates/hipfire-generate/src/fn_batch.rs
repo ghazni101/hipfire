@@ -54,6 +54,7 @@ use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::ThinkBudget;
 use hipfire_runtime::external_rows::ServingGuard;
@@ -94,7 +95,7 @@ struct LaneCtl {
     start: Instant,
     decode_start: Option<Instant>,
     prefill_ms: f64,
-    cache: Option<(QwenArCacheAction, Vec<u32>)>,
+    cache: Option<(TurnCacheAction, Vec<u32>)>,
     /// A promoted lane's pending seed was already streamed by the singleton:
     /// its first decode advance does not emit the plan seed again.
     skip_first_forward: bool,
@@ -1010,7 +1011,7 @@ pub fn drive_qwen4_lane_batch(
                                 if let Some((action, tokens)) = ctl.cache.take() {
                                     let tokenizer =
                                         m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
-                                    qwen_ar_apply_cache_action(
+                                    apply_turn_cache_action(
                                         |fp, seq| {
                                             m.asst_turn_cache.insert(
                                                 fp,

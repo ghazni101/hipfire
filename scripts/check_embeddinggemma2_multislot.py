@@ -69,7 +69,7 @@ def main():
     model_dir = ensure_vision_sidecar(args.model, args.quantizer) if vision_on else args.model
 
     seq = Daemon(args.daemon, model_dir,
-                 params={"vision_mode": "auto"} if vision_on else None)
+                 params={"vision_mode": "auto" if vision_on else "off"})
     print(f"sequential daemon: arch {seq.loaded.get('arch')}")
     img_key, img_kind, img_text, img_dims = IMAGE_CASES[0]
     img_b64 = _png_bytes(*img_dims) if vision_on else None
@@ -99,8 +99,7 @@ def main():
         "max_batch_tokens": 8192,
         "max_seq": 8192,
     }
-    if vision_on:
-        slot_params["vision_mode"] = "auto"
+    slot_params["vision_mode"] = "auto" if vision_on else "off"
     slot = Daemon(args.daemon, model_dir, params=slot_params)
     if not slot.loaded.get("experimental_multi_slot"):
         print("FAIL: daemon did not enter experimental_multi_slot")

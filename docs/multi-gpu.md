@@ -1166,7 +1166,7 @@ CLI-resolved `.mtp` sidecar, or the trunk's sibling `.mtp`); the request drafts 
 rank 0 and verifies across ranks. A missing head is a load error, as `mtp=on` is
 on one GPU. `auto` (the default) and `off` keep the AR mesh loop even when a head
 sits beside the trunk, so existing `tp>1` serves are unchanged. Block-verify
-drafters (n-gram, DFlash, DSpark) stay refused on dense TP, and the n-gram-mod
+drafters (n-gram, DFlash, DSpark) stay refused on dense TP (an `auto`-paired DFlash draft is dropped with a log line at `tp>1` by `serve`/`bench`; explicit `on` is still refused), and the n-gram-mod
 composition inside MTP (`HIPFIRE_MTP_NGRAM`) drafts natively there.
 
 Dense-TP MTP is not a byte-identical replacement for TP AR: speculative
@@ -1178,8 +1178,10 @@ throughput improvement alone does not qualify this route for automatic use.
 
 Dense Qwen3.5/3.6 TP decode reduces each layer's attention and FFN partials
 into the residual through `Gpus::all_reduce_sum_f32_peer_add_routed`
-(`hipfire-runtime`). Every route evaluates the same rank-ordered
-`x + (p0 + p1)`, so the output is the same bytes on each route. With two
+(`hipfire-runtime`). Every route evaluates the same rank-ordered sum, so the
+output is the same bytes on each route: with a 16-bit exchange
+(next section; `auto` picks it for multi-row and TP>=3 reductions) `x + (r(p0) + r(p1))`, with `HIPFIRE_TP_EXCHANGE=f32`
+`x + (p0 + p1)`. With two
 peer-access ranks the default is a symmetric direct-peer read; each reduction
 waits on the peer's producer event and, before the next layer overwrites a
 partial, on the peer's consumer-complete event.
@@ -1241,6 +1243,82 @@ token. The first decode token after load runs direct and the second captures
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
 `HIPFIRE_TP_FULL_GRAPH=0`.
 
+### Dense TP partial exchange: 16-bit (developer)
+
+The row-parallel stages (attention out-projection, FFN down-projection) leave
+one f32 partial per rank, and the all-reduce moves those partials between
+ranks. The residual stream is f32 and replicated. `HIPFIRE_TP_EXCHANGE`
+selects the format the ranks exchange:
+
+| value | exchange |
+|---|---|
+| unset / `auto` | the default: `bf16` for every multi-row reduction (prefill, speculative verify) at any TP degree and for single-row decode at TP>=3; `f32` for single-row decode at TP2, the one measured loss (bf16 there: -1.4% decode). One pure function, `tp_exchange::auto_exchange(rows, tp)` |
+| `bf16` | forced everywhere: each rank converts its f32 partial to bf16 once (round to nearest even); every rank sums the rounded, rank-ordered partials in f32 into its f32 residual |
+| `f16` | the same with IEEE half (three more mantissa bits, but a partial above 65,504 in magnitude becomes infinity and poisons the residual: overflow is not guarded) |
+| `f32` | forced everywhere: the f32 exchange, rank-ordered f32 sums of the f32 partials, as before |
+
+Only the exchange is 16-bit; the residual stream, the sums and the rooted
+route's broadcast of the finished f32 residual stay f32. Every rank, the
+producer included, adds the rounded value of every partial (`r(p) =
+up(pack(p))`) in the same order, so the replicated residual stays bit-identical
+across ranks and the hand and the generic dense TP routes, which reduce
+through the same `Gpus::all_reduce_sum_f32_peer_add_routed` (hand route, and
+the generic route's TP2) or the executor's `peer_reduce` (generic TP>2), stay
+byte-identical to each other (the `tp_prefill_decode_matches_hand_route`
+hardware test). The result is **not** byte-identical to the f32 exchange: the
+16-bit route is a numeric route, judged by KLD against the f32 exchange and
+the single-card pins, not by byte identity.
+
+The 16-bit route covers every peer-access reduction between distinct devices
+with 2 to 4 ranks and a row count x dim that is a multiple of 8:
+
+- **TP2 direct-peer read**: each rank packs its partial into its own slot of a
+  16-bit buffer (`tp_pack16_*`), records the producer event, waits the peer's,
+  and `tp_fold16_*` adds `r(p0) + r(p1)`, reading the peer's slot through its
+  P2P mapping, into the f32 residual. The alternating-slot protocol keeps one
+  slot per partial buffer.
+- **TP2 whole-token graph**: `tp_graph_signal_reduce16_*_gfx1100` publishes the
+  16-bit copy into the peer's coherent shadow (half the bytes of the f32
+  exchange), then reduces as above. The shadow segments the loader sizes for
+  f32 hold either format.
+- **TP>2**: the rooted fold gathers the peers' 16-bit partials (the root folds
+  its own f32 partial rounded in register), adds the sum to its residual and
+  broadcasts the f32 residual; the generic executor's small-payload all-pull
+  pulls the 16-bit slots and every rank folds them itself.
+
+The host-staged transport, same-device (`HIPFIRE_EMULATE_GPUS`) ranks, rank
+counts above 4, the no-target `AllReduce` and the expert-parallel reductions
+keep the f32 exchange. The dense TP load log reports the choice
+(`[loader] dense qwen TP exchange=bf16 (HIPFIRE_TP_EXCHANGE)`).
+
+Measured 2026-10-27 on hiptrx (R9700, gfx1201), Qwen3.8-27B mq4-xts (sha256
+`3e38ccba…`), `eval_hipfire --scoring-mode prefill --max-chunks 24 --tp N
+--kv-mode q8 --kv-v q8` (the hand dense-TP prefill with per-token hidden
+capture; `HIPFIRE_GRAPH=0`, fresh HOME and kernel cache per run), 24 chunks,
+mean KLD and the paired per-chunk difference against the f32 exchange of the
+same TP degree (95% t interval):
+
+| corpus | TP | f32 | bf16 | bf16 - f32 | f16 | f16 - f32 |
+|---|---|---:|---:|---|---:|---|
+| WT2 | 2 | 0.061277 | 0.059057 | -0.002220 [-0.004432, -0.000007] | 0.059953 | -0.001323 [-0.002996, +0.000350] |
+| code24 | 2 | 0.045400 | 0.045685 | +0.000286 [-0.002197, +0.002768] | 0.043671 | -0.001728 [-0.005858, +0.002401] |
+| WT2 | 4 | 0.059522 | 0.060439 | +0.000917 [-0.000328, +0.002161] | 0.059898 | +0.000375 [-0.001609, +0.002360] |
+| code24 | 4 | 0.042194 | 0.044125 | +0.001931 [-0.002018, +0.005880] | 0.044575 | +0.002381 [-0.001549, +0.006311] |
+
+Both 16-bit formats sit inside the f32 exchange's noise at TP2 and TP4. The
+single-card pins (gfx1201 A4, `--kv-mode fp8 --kv-v q8`: WT2 0.069571, code24
+0.052119) reproduce in the same harness. The TP route's own KLD is lower than
+the single-card pin for every exchange, f32 included (the cause is not
+established here), so the pin comparison does not bound the exchange error:
+the judged quantity is the paired difference above, and none of the 16-bit
+rows is worse than the single-card pin. bf16 is the default because it has the
+f32 range, so no partial can overflow, whereas f16 turns a partial above
+65,504 into infinity. A probe of the f32 partials over the same two TP2 runs
+(6,144 reductions, both ranks, prefill rows) found a largest magnitude of
+436.5 on WT2 and 412.9 on code24 and none above 1,000, so f16 has more than
+100x headroom on these corpora; that is a measurement, not a bound for other
+prompts.
+
 ### Generic mesh executor: TP collectives (developer)
 
 `Gpus::provision_mesh_edges` admits pure PP meshes (TP = EP = 1) and pure TP
@@ -1248,7 +1326,9 @@ meshes (PP = EP = 1). TP×PP and any EP axis are refused before any mesh state
 is written. For a pure TP mesh the executor runs the splitter's `AllReduceAdd`
 and `AllReduce` collectives over the group of every rank in rank order, with
 the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
-`p0 + p1 + …`, the same bytes on every rank. The transport is chosen once at
+`p0 + p1 + …` (with the default 16-bit exchange the `AllReduceAdd` partials are
+the rounded `r(p)` of the previous section; the no-target `AllReduce` stays
+f32), the same bytes on every rank. The transport is chosen once at
 provisioning, and each transport has exactly one route (no per-call choice;
 `peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
 not apply to it):
@@ -1259,6 +1339,13 @@ not apply to it):
   nothing into allocations made after peer enable) and folds the sum locally.
   Producer and read events order the cross-rank reads; nothing waits on the
   host.
+  A TP2 `AllReduceAdd` between two distinct devices instead uses the hand
+  route's direct-peer add kernel (`add_peer_residual_f32`, one launch per
+  rank); other shapes (TP>2, `AllReduce`, same-device emulation) use the
+  copy-fold.
+  For TP>2 payloads above 256 KiB (prefill) the copy-fold is rooted instead:
+  rank 0 gathers and folds in rank order, then each other rank pulls the
+  finished sum (`2(N-1)` copies, identical bytes).
 - **Host**: some pair is not peer-qualified. The hand route's host-staged
   rank-order reduction (`Gpus::all_reduce_sum_f32_host`), then `x + sum` on
   each rank. It synchronizes the rank streams. RCCL is never used, as in the
@@ -1272,7 +1359,10 @@ ascending, one occurrence per rank, F32 descriptors equal on every rank,
 as for PP edges. Family bindings return the operand as `BoundaryIo::view`, the
 `AllReduceAdd` target as `BoundaryIo::into`, and `Gpus::mesh_tp_epoch()` as
 the descriptor epoch. An `AllReduceAdd` operand's contents are unspecified
-afterwards.
+afterwards. A boundary's memory attributes (plain local device memory of its
+owner) are validated once per submission, in the preparation pass; the
+`reduce`/`transfer` re-check only compares the binding's identity (addresses,
+extents, descriptor, transport epoch, slot) and makes no HIP call.
 
 Oracle: byte identity against the single-device rank-order sum over three
 undrained epochs with distinct partials, for the provisioned transport and the
@@ -1319,8 +1409,11 @@ partial sum that its consumer reduces: an `Accumulate` fuses one
 weights, or a single TP part (a PP stage), keep the op whole and local.
 Admission refuses, without allocating, a mixed policy, gate/up/down that do
 not share one intermediate, `intermediate % (parts * group)` on the down
-weight, and a ladder with no shard-safe form (`SandwichWide`: its post-norm
-epilogue cannot take a partial sum).
+weight, and a ladder that has not opted in (`MlpLadder::tp_shardable`). Every
+ladder admits its `Write` form; the sandwich ladders (`SandwichWide`,
+`SandwichSteps`) split before their post-norm epilogue, which cannot take a
+partial sum, so a TP route binds the epilogue as a separate whole-row op
+after the reduction.
 
 The first end-to-end use is the Qwen4 dense developer profile: each rank
 holds the whole model with only its BF16 FFN slice
@@ -1359,9 +1452,10 @@ rank's slice with the layout it records); a prefill past the batch scratch,
 sessions, checkpoints and prefix repair are refused before any launch.
 Prefix repair is refused through the host-only
 `MeshStepBindings::admits_prefix_repair` capability, checked before the
-first callback, so the mesh stays healthy. The loader has no generic
-Qwen3.5 TP route; product dense TP stays on the hand route (see
-`docs/design/qwen35-declarative-program.md`, "What stays on the hand route").
+first callback, so the mesh stays healthy. The loader reaches this route by
+default (`HIPFIRE_DENSE_TP_ROUTE=auto`, below); `hand` is the rollback to the
+hand route (see `docs/design/qwen35-declarative-program.md`,
+"What stays on the hand route").
 Oracle (`HIPFIRE_QWEN35_TP_ROWS` prompt rows, default 16, as prefill epochs
 of at most `HIPFIRE_QWEN35_TP_CHUNK` rows, default 16; then 16 tokens
 teacher-forced to the plain card's greedy tokens, the first and the ninth as
@@ -1398,6 +1492,131 @@ not show localizes to the two transports. Record per model the two `TP2` lines, 
 binary MD5, `HIP_VISIBLE_DEVICES`, the ROCm version and, from the gfx1201
 emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card), the same lines for a
 same-box reference. Repeat with `0,1,2,3` and `HIPFIRE_QWEN35_TP_PARTS=4`.
+On a TP2 pair the runtime admits for the whole-token graph (both arms prepare
+it as the loaders do) the test also prints `whole-token graph admitted: true`
+and each rank's `whole-token graph epochs` counts, and asserts at least one
+capture and two replays among the 14 decode epochs; where the graph is not
+admitted (TP4) it asserts that decode ran no graphs.
+
+Loader route (developer): `HIPFIRE_DENSE_TP_ROUTE` picks the route
+`hipfire serve --tp N` loads for a dense Qwen3.5/3.6/3.8 model. `auto` (the
+default; also unset or empty) loads the generic mesh route whenever it admits
+the load, else the hand route (`load_model_tp_qwen35_dense`,
+`EpArch::Qwen35DenseTp`) with the log line
+`[loader] dense qwen TP route=auto -> hand: <reason>`; the reasons are
+`speculation.mtp = on` (the mesh route has no MTP verify) and an uneven
+head/FFN split (TP3/TP5). `mesh` forces the mesh route and refuses MTP and
+uneven splits; `hand` is the rollback to the hand route. Any other value is a
+load error naming the accepted values (`parse_dense_tp_route` /
+`resolve_dense_tp_route`, `crates/hipfire-loader/src/lib.rs`). The mesh load
+builds one `Qwen35TpRank` per device (`EpArch::Qwen35MeshTp`),
+prepares the TP2 whole-token graph exactly as the hand loader does (signal
+tape and payload exchange before peer access is enabled; a no-op unless the
+runtime admits the graph), provisions the reduction with
+`provision_mesh_edges` (peer when every rank pair passes byte qualification,
+else the host-staged reduction), calls `enable_peer_all` once the ranks'
+buffers exist when the transport is peer, and builds the program and plan
+once (`Qwen35TpProgram`; the load is refused unless the plan holds two
+collectives per layer, the signal tape's barriers). Each request epoch runs
+through `Qwen35TpProgram::run_epoch`. It serves the hand route's loop:
+chunked prefill (the rank's batch scratch rows, the hand route's prefill
+chunk) and single-token AR decode, on every KV backend (the VMM default
+included).
+DFlash and n-gram drafters are not built, and sessions, checkpoints and
+prefix repair are refused by the bindings. The load prints
+`[loader] dense qwen TP route=mesh (generic mesh executor): <tp> ranks,
+transport=<peer|host>, prefill chunk=<rows>, <n> collectives/epoch`; the
+hand route prints `[loader] dense qwen TP route=hand ...`. A failed epoch
+poisons the mesh (every later epoch is refused) until the model is reloaded.
+`serve` only enqueues mesh epochs (`run_epoch` returns the executor ticket) and
+drains them together at the rank-0 logits read, like the hand route's
+enqueue-then-download, so the first token no longer waits on a drained epoch.
+The mesh route is byte-identical to the hand route at TP2 and TP4 (physical
+hardware test, logits fnv64 equal).
+
+Measured on a 4x gfx1201 (R9700) host, Qwen3.8-27B mq4-xts,
+`hipfire bench --matrix --spec off --runs 3`, 3 fresh processes per arm,
+median tok/s:
+
+| Case | Mesh | Hand | Single card |
+|---|---:|---:|---:|
+| TP2 pp512 | 3289.5 | 2873.5 | 4892.6 |
+| TP2 pp2048 | 3355.2 | 2753.8 | 5251.9 |
+| TP2 tg64@128 | 54.67 | 54.94 | 41.36 |
+| TP2 tg64@4096 | 53.99 | 54.27 | 40.78 |
+| TP4 pp512 | 2061.0 | 1919.4 | - |
+| TP4 pp2048 | 2113.4 | 1997.4 | - |
+| TP4 tg64@128 | 51.77 | 43.96 | - |
+| TP4 tg64@4096 | 51.28 | 43.56 | - |
+
+Decode graphs on the mesh route: TP2 decode on an exact gfx1201 or gfx1100
+pair uses the same whole-token graph as the hand route
+(`HIPFIRE_TP_FULL_GRAPH`, on by default for those pairs). `run_epoch` runs each
+rank's embed eagerly, captures the executor submission of the rest on both
+ranks (the reductions record the signal-barrier kernels) and replays the
+graphs on every later token, so a replayed token costs the host only the
+epoch bookkeeping. The decode partials alternate two slots
+(`BoundaryIo::partial_slot`: mixer 0, FFN 1), which selects the alternating
+direct-peer reduction the graph can capture; prefill reuses one partial
+buffer and takes the ordinary protocol. Any other decode (TP4, another pair,
+`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`, a KV eviction offset) decodes
+eager through the executor. Per-segment hipGraphs (one per rank program
+segment between the collectives) measured slower than eager at TP4 on
+gfx1201 (45.99 vs 51.13 tok/s, Qwen3.8-27B) and were removed: TP2 uses the
+whole-token graph, TP>2 decodes eager. `HIPFIRE_AR_GRAPH_TRACE=1` prints
+`[qwen-mesh-tp-graph]` lines for whole-token captures and replays. Every mode
+computes the same bytes.
+
+The third use is Muse Glimmer (`muse_glimmer::mesh_tp`, #927 item 5). Both
+Glimmer sublayers end in the sandwich epilogue `x + post_norm(out)`, and the
+RMS post-norm cannot take a partial sum, so each sublayer is split at that
+boundary: the attention (`SplitRule::HeadMixer`, `SandwichAttention`) writes
+the rank's `o_proj` partial and the MLP (`SplitRule::GatedMlp`,
+`MlpLadder::SandwichSteps`) its `down` partial, and the whole-row epilogue op
+after each takes one rank-ordered `AllReduce` of the partial, then runs the
+single-card post-norm residual kernels on the reduced rows
+(`execute_sandwich_attention_partial`, `execute_sandwich_mlp_partial`,
+`execute_sandwich_epilogue`; the single-card ops are unchanged). Each rank
+holds an even block of the query and KV heads, the `o_proj` columns and the
+FFN intermediate in whole G256 groups (`GlimmerWeights::load_shard`); the
+embedding and LM head are replicated. `muse-glimmer-30b` (32 query / 2 KV
+heads, intermediate 19968) splits over two ranks only: TP4 is refused by the
+plan (`n_heads=2 not divisible by Tp=4`). The loader still serves Glimmer on
+one device only (`muse_glimmer: single-device only`); this route is the
+executor program and its oracle, with no loader TP route yet. Oracle
+(`HIPFIRE_GLIMMER_TP_ROWS` prompt rows, default 16, as prefill epochs of at
+most `HIPFIRE_GLIMMER_TP_CHUNK` rows, default 16; then
+`HIPFIRE_GLIMMER_TP_GREEDY` tokens, default 480, teacher-forced to the plain
+card's greedy tokens, the first and the ninth as 1-row Prefill epochs; byte
+identity of the executor against the single-device rank-order oracle, which
+runs every rank's program on one device and folds the partials
+`p0 + p1 + …` with the executor's kernels; tokens and the maximum logit
+difference reported against the plain card):
+
+```sh
+cargo test --release -p hipfire-arch-muse-glimmer --lib --no-run
+HIPFIRE_EMULATE_GPUS=2 HIPFIRE_GLIMMER_TP_MODEL=<models>/muse-glimmer-30b.mq4 \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+```
+
+Physical Glimmer TP2 runbook (gfx1201, e.g. hiptrx). Fixture
+`muse-glimmer-30b.mq4` (sha256 `87bc776a…c052`, 18614785024 B; about 10.7 GB
+of weights per rank, the Q8 embedding and LM head replicated, so it fits two
+16 GB cards; the plain card and the oracle arm load
+the whole model on device 0, which needs a 32 GB card such as the R9700):
+
+```sh
+HIP_VISIBLE_DEVICES=0,1 HIPFIRE_GLIMMER_TP_PARTS=2 \
+  HIPFIRE_GLIMMER_TP_MODEL=<models>/muse-glimmer-30b.mq4 \
+  <binary> mesh_tp::hw_tests --ignored --nocapture --test-threads=1
+```
+
+Pass: the test asserts the executor rows bitwise equal to the oracle's; record
+the `TP2 muse-glimmer-30b.mq4` line (oracle, TP and plain FNV-64, argmax
+agreement, max logit difference), the binary MD5, `HIP_VISIBLE_DEVICES`, the
+ROCm version and the transport `provision_mesh_edges` chose, plus the same
+line from the gfx1201 emulated arm (`HIPFIRE_EMULATE_GPUS=2`, one card) as a
+same-box reference.
 
 ### Architectural limits (current)
 

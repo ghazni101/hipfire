@@ -99,7 +99,7 @@ impl Knobs {
 pub trait Workload {
     /// `--kernel` name.
     fn kernel(&self) -> &'static str;
-    /// Target arch (always `gfx1201` today).
+    /// Target arch (`--arch`; `gfx1201` unless the workload supports more).
     fn arch(&self) -> &'static str;
     /// Parsed shape as JSON (every dimension the launch derives from).
     fn shape_json(&self) -> Value;
@@ -114,7 +114,7 @@ pub trait Workload {
     /// `peacemaker-isa emit --co`). Errors (e.g. a closed fold axis) are
     /// reported verbatim by the driver.
     fn candidate(&self) -> Result<Object>;
-    /// The shipped baseline (what production selects for gfx1201), or the
+    /// The shipped baseline (what production selects for `arch()`), or the
     /// `--base-*` knob variant. `source` names file:line / artifact + sha256.
     fn baseline(&self) -> Result<Object>;
 
@@ -144,4 +144,83 @@ pub trait Workload {
     /// shape if every instruction is qualified; otherwise
     /// `Value::String("refused (<reason>)")`. Never fabricate a result.
     fn emu(&self) -> Value;
+}
+
+/// Construction context the driver hands a [`ChainWorkload`].
+#[derive(Clone, Copy, Debug)]
+pub struct ChainCtx {
+    /// `--arch` (`gfx1201` default): the target the chain is selected for; the
+    /// driver refuses a device of another arch.
+    pub arch: &'static str,
+    /// `--null-control aa`: the candidate arm runs the BASELINE chain (same
+    /// launchers, same selector, same loaded modules) into the candidate arm's
+    /// own buffers, so the record is an A/A null of the whole chain.
+    pub null_control: bool,
+}
+
+/// R3 complete-chain workload. Each arm is an ordered multi-kernel chain
+/// enqueued on the default stream through `rdna_compute::Gpu`'s public
+/// launchers (the baseline arm: the chain the shipped selector issues at this
+/// shape/arch/residency), timed as ONE unit per launch slot (hipEvents around
+/// the whole chain). Constructed GPU-free (shape grammar, knob parsing, arm
+/// resolution); `setup` allocates and fills deterministic inputs.
+///
+/// Every chain workload is eager today (`mode() == "eager"`); graph replay is
+/// a later additive mode.
+pub trait ChainWorkload {
+    /// `--kernel` name.
+    fn kernel(&self) -> &'static str;
+    /// Target arch (from [`ChainCtx::arch`]).
+    fn arch(&self) -> &'static str;
+    /// Execution mode of both arms (`"eager"`).
+    fn mode(&self) -> &'static str {
+        "eager"
+    }
+    /// Parsed shape as JSON (every dimension the chain derives from,
+    /// including residency).
+    fn shape_json(&self) -> Value;
+    /// Candidate knobs as JSON.
+    fn candidate_knobs(&self) -> Value;
+    /// `{baseline: {...}, candidate: {...}}`: per arm the ordered stages
+    /// (`[{stage, launcher, symbols, origin: "hip"|"pm", source}]`), the
+    /// selector provenance (file:line of every predicate that picked a
+    /// stage), residency, scratch bytes. Called after `setup` (selection can
+    /// depend on the device).
+    fn chain_json(&self) -> Value;
+    /// Declared numeric contract: `{baseline, candidate, relation}` where
+    /// `relation` is `"exact"` (the candidate must reproduce the baseline's
+    /// bytes) or `"numeric"` (a different recipe: `identical_to_baseline` is
+    /// reported honestly and each arm passes on its own reference).
+    fn numeric_contract(&self) -> Value;
+    /// PM code objects `arm` launches (every export is M7-certified by the
+    /// driver for the candidate arm); empty when the arm launches no PM object.
+    fn pm_objects(&self, arm: Arm) -> Result<Vec<Object>>;
+
+    /// Allocate device buffers (two complete buffer sets, outputs and
+    /// scratch, one per arm under the current binding) and upload
+    /// deterministic synthetic inputs.
+    fn setup(&mut self, gpu: &mut Gpu) -> Result<()>;
+    /// Crossover binding of arms to buffer sets: `false` binds the baseline to
+    /// set 0 and the candidate to set 1, `true` swaps them. `encode_chain`,
+    /// `reset` and `outputs` follow the current binding. The driver flips it
+    /// every ABBA round so a buffer-placement effect alternates sign instead of
+    /// biasing one arm (an A/A with a fixed binding measured up to 0.9%).
+    fn set_buffer_swap(&mut self, swapped: bool);
+    /// Enqueue `arm`'s complete chain on the default stream. No host
+    /// synchronization, allocation or upload inside (the driver brackets it
+    /// with events).
+    fn encode_chain(&mut self, gpu: &mut Gpu, arm: Arm) -> Result<()>;
+    /// Restore `arm`'s accumulating state (e.g. the residual the combine adds
+    /// into) to its pre-chain bytes. Called outside event intervals.
+    fn reset(&mut self, gpu: &mut Gpu, arm: Arm) -> Result<()>;
+    /// Download `arm`'s outputs (every byte the correctness check covers,
+    /// including poisoned guard/tail regions).
+    fn outputs(&self, gpu: &mut Gpu, arm: Arm) -> Result<Vec<u8>>;
+    /// Compare `arm`'s downloaded outputs to that arm's CPU reference.
+    fn reference(&self, arm: Arm, out: &[u8]) -> Result<RefReport>;
+    /// Max absolute element difference between two output payloads; `inf`
+    /// on a NaN-ness mismatch; 0.0 iff element-wise equal.
+    fn max_abs_diff(&self, a: &[u8], b: &[u8]) -> Result<f64>;
+    /// `true` iff `numeric_contract().relation == "exact"`.
+    fn requires_baseline_identity(&self) -> bool;
 }

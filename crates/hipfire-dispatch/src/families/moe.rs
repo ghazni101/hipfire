@@ -259,14 +259,26 @@ impl MoeRecipe {
     }
 }
 
-/// Selection bias of a sigmoid router (LFM2, DeepSeek): experts are chosen on
-/// `sigmoid(logits) + bias`, weighted by the unbiased sigmoid scores,
+/// Selection bias of a sigmoid-style router (LFM2, MiniMax, DeepSeek-V4):
+/// experts are chosen on `score + bias`, weighted by the unbiased scores,
 /// normalized over the selection, then multiplied by `route_scale`.
 #[derive(Clone, Copy)]
 pub struct MoeSelectionBias<'a> {
     /// `[n_exp]` F32, read for selection only.
     pub bias: &'a GpuTensor,
     pub route_scale: f32,
+    /// Where the selector's scores come from.
+    pub scores: MoeScores,
+}
+
+/// Source of the scores the biased selector reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeScores {
+    /// Sealed decode runs the router GEMV and `sigmoid_f32` itself.
+    Sigmoid,
+    /// The model already wrote activated scores into `MoeParams::router_logits`;
+    /// sealed decode runs only the biased top-k over them.
+    Precomputed,
 }
 
 /// Widest selection the biased sigmoid router and the k8 routed kernels take.
@@ -509,8 +521,10 @@ fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Opti
     if dtypes.routed_has_mixed_experts {
         let (gate_up, down) = (dtypes.per_expert_gate_up?, dtypes.per_expert_down?);
         let (mut cold, mut mq4) = (None, false);
+        // `admits` once per distinct codec, not per expert: it resolves the arch's
+        // capability table and this pass runs per layer on every decode step.
         for (g, d) in gate_up.iter().zip(down) {
-            let codec = slab_codec_of_pair(*g, *d).filter(|codec| admits(*codec))?;
+            let codec = slab_codec_of_pair(*g, *d)?;
             if codec == 0 {
                 mq4 = true;
             } else if cold.map_or(true, |seen| seen == codec) {
@@ -519,7 +533,7 @@ fn layer_cold_codec(dtypes: &MoeDtypes<'_>, admits: &dyn Fn(u8) -> bool) -> Opti
                 return None;
             }
         }
-        (mq4 && cold.is_some()).then_some(cold)
+        (mq4 && admits(0) && cold.is_some_and(|codec| admits(codec))).then_some(cold)
     } else {
         let codec = slab_codec_of_pair(dtypes.routed_gate_up, dtypes.routed_down)
             .filter(|codec| admits(*codec))?;
@@ -1302,11 +1316,9 @@ pub enum MoeEpMode {
 /// mode writes the expanded buffer for every tier, so it always returns
 /// true here.
 ///
-/// This is the single home of the predicate `run_moe_decode` inlines as
-/// `routed_down_self_combines` (negated, ORed with the gfx1100 down-last
-/// experiment) and the sealed canonical preflight requires. Keep them in
-/// lockstep: miss a dtype here and a route silently zeroes out or
-/// double-counts.
+/// Dtype-only base of [`MoeParams::down_writes_expanded`]. Keep this dtype
+/// list in lockstep with the decode down arms: miss a dtype here and a route
+/// silently zeroes out or double-counts.
 pub fn moe_down_writes_expanded(routed_down: DType, has_dtype_tags: bool) -> bool {
     has_dtype_tags
         || !matches!(
@@ -1317,6 +1329,26 @@ pub fn moe_down_writes_expanded(routed_down: DType, has_dtype_tags: bool) -> boo
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
         )
+}
+
+impl MoeParams<'_> {
+    /// Whether the selection bias carries precomputed (activated) router scores.
+    pub fn router_scores_precomputed(&self) -> bool {
+        self.selection_bias
+            .is_some_and(|bias| bias.scores == MoeScores::Precomputed)
+    }
+
+    /// Whether the routed down writes the expanded buffer for a separate combine
+    /// (`true`) or self-combines into the residual (`false`). A declared
+    /// MQ2-Lloyd expert follows the model's down-combine policy.
+    pub fn down_writes_expanded(&self) -> bool {
+        match (&self.mq2_lloyd, self.dtypes.routed_down) {
+            (Some(lloyd), DType::MQ2G256Lloyd) => lloyd.deterministic_down(),
+            _ => {
+                moe_down_writes_expanded(self.dtypes.routed_down, self.expert_dtype_tags.is_some())
+            }
+        }
+    }
 }
 
 // ── Dispatch parameters ────────────────────────────────
@@ -1613,12 +1645,40 @@ pub struct MoeParams<'a> {
     /// `None` (every single-device caller) lowers exactly the historical
     /// stage sequence.
     pub ep_row_gather: Option<&'a dyn MoeRowGather>,
+    /// DeepSeek-V4 MQ2-Lloyd routed experts (k in 1..=8). `None` lowers the
+    /// generic sealed sequence unchanged.
+    pub mq2_lloyd: Option<MoeMq2Lloyd<'a>>,
 }
 
-// ── DeepSeek-V4 bias-aware decode parameters ───────────
+/// Model-owned MQ2-Lloyd routed-expert declaration (DeepSeek-V4): sealed decode
+/// runs these experts with the model's SwiGLU clamp and down-combine policy.
+#[derive(Clone, Copy)]
+pub struct MoeMq2Lloyd<'a> {
+    /// SwiGLU clamp passed to `deepseek4_silu_mul_clamp_f32_batched`.
+    pub swiglu_limit: f32,
+    /// Atomic self-combining down (the gfx1151 policy). When `false` and
+    /// `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC!=0`, the expanded write plus
+    /// `moe_down_combine_k8_batched` is used.
+    pub uses_atomic_down: bool,
+    /// Exact-device native backend, when the loader admitted one.
+    pub native: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    /// Shared zero gate_up buffer for expert-parallel non-owned slots.
+    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
+}
 
-/// Exact-device MQ2-Lloyd operations used by the DeepSeek4 bias-aware decode
-/// executor.
+impl MoeMq2Lloyd<'_> {
+    /// Expanded-down + combine policy (the default), read per call.
+    pub fn deterministic_down(&self) -> bool {
+        !self.uses_atomic_down
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
+                != Ok("0")
+    }
+}
+
+// ── MQ2-Lloyd routed-expert backend ───────────
+
+/// Exact-device MQ2-Lloyd operations used by sealed decode for DeepSeek-V4
+/// routed experts (`MoeMq2Lloyd::native`).
 ///
 /// The dispatch crate deliberately has no architecture detection here. A
 /// model crate may provide this capability only after its loader has admitted
@@ -1678,90 +1738,6 @@ pub trait MoeBiasAwareMq2Backend {
         k: usize,
         k_top: usize,
     ) -> Result<(), String>;
-}
-
-/// Parameters for the deepseek4 bias-aware MoE decode arm (k=6, MQ2-Lloyd routed
-/// experts). Kept distinct from [`MoeParams`] because the ds4 sub-graph has no
-/// fused gate-side and no shared-expert block: the shared expert is a separate
-/// model-owned step (`ffn_stub`) that runs first and seeds `ffn_out`, and this
-/// arm's routed-down kernel atomic-accumulates into that same buffer.
-///
-/// `scores` is the post-`sqrt_softplus(gate·x)` router output — the model owns
-/// the router GEMV + activation. Selection adds `gate_bias` while the routing
-/// weights use the *unbiased* `scores`; the bias-aware kernel handles that
-/// two-score semantic and folds in `route_scale`, all in one launch. The model
-/// pre-rotates the activation, so `x_rot` is consumed as-is (no re-rotation).
-pub struct MoeBiasAwareParams<'a> {
-    // dims / config scalars
-    pub hidden: usize,
-    pub mi: usize,
-    pub k_top: usize,
-    pub n_exp: usize,
-    pub route_scale: f32,
-    pub swiglu_limit: f32,
-    /// Model-local dispatch policy. The DS4 loader derives this from the
-    /// verified MQ2R backend; generic GPU state must not influence it.
-    pub uses_atomic_moe_down: bool,
-    /// Optional exact-device MQ2 backend selected by the loaded DeepSeek4
-    /// model. `None` retains the portable dispatcher for every other model and
-    /// architecture.
-    pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
-    /// EP-shard-only zero weight buffer. Exact-device backends may compare
-    /// selected gate/up pointers against it to skip non-owned expert work
-    /// while retaining the fixed graph shape. `None` on unsharded models.
-    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
-    /// Token-batch width. Decode = 1. A value > 1 must route to the grouped
-    /// prefill executor (Step 8), never this decode arm — guarded in the executor.
-    pub batch_size: usize,
-    // activations / residual
-    /// FWHT-rotated activation (model pre-rotates; this arm does not re-rotate).
-    pub x_rot: &'a GpuTensor,
-    /// Residual stream the routed-down kernel atomic-accumulates into. The
-    /// model's shared-expert step must have run first to seed this buffer.
-    pub ffn_out: &'a GpuTensor,
-    // router
-    pub scores: &'a GpuTensor, // post-sqrt_softplus gate·x (weights use these)
-    pub gate_bias: &'a GpuTensor, // per-expert routing bias (selection only)
-    // routed expert pointer tables
-    pub expert_gate_up_ptrs: &'a GpuTensor,
-    pub expert_down_ptrs: &'a GpuTensor,
-    // scratch buffers (model-owned)
-    pub topk_indices: &'a GpuTensor,
-    pub topk_weights: &'a GpuTensor,
-    pub gate_batch: &'a GpuTensor,
-    pub up_batch: &'a GpuTensor,
-    pub rot_batch: &'a GpuTensor,
-    /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
-    pub down_expanded: &'a GpuTensor,
-}
-
-impl<'a> MoeBiasAwareParams<'a> {
-    /// Borrow the routed-expert portion after route selection has already
-    /// populated `topk_indices` and `topk_weights`. Heterogeneous DS4 uses
-    /// this boundary to select routes on the dense owner and execute only the
-    /// selected experts on the routed owner.
-    pub fn selected(&self) -> MoeSelectedParams<'_> {
-        MoeSelectedParams {
-            hidden: self.hidden,
-            mi: self.mi,
-            k_top: self.k_top,
-            swiglu_limit: self.swiglu_limit,
-            uses_atomic_moe_down: self.uses_atomic_moe_down,
-            native_mq2_backend: self.native_mq2_backend,
-            nonowned_gate_up_dummy: self.nonowned_gate_up_dummy,
-            batch_size: self.batch_size,
-            x_rot: self.x_rot,
-            ffn_out: self.ffn_out,
-            expert_gate_up_ptrs: self.expert_gate_up_ptrs,
-            expert_down_ptrs: self.expert_down_ptrs,
-            topk_indices: self.topk_indices,
-            topk_weights: self.topk_weights,
-            gate_batch: self.gate_batch,
-            up_batch: self.up_batch,
-            rot_batch: self.rot_batch,
-            down_expanded: self.down_expanded,
-        }
-    }
 }
 
 /// Selected routed-expert decode subgraph. Route selection is intentionally
@@ -2779,26 +2755,6 @@ impl MoeFamily {
             MoeVariant::GroupedGemm => KernelKey::MoeGroupedGemm,
         };
         self.registry.resolve(key, ctx, shape)
-    }
-
-    /// Run a single-token deepseek4 bias-aware MoE decode step (k=6, MQ2-Lloyd
-    /// routed experts). Delegates to [`crate::pipeline::run_moe_decode_bias_aware`].
-    ///
-    /// The model owns the router GEMV + `sqrt_softplus` (producing
-    /// `params.scores`) and the shared expert (`ffn_stub`, which seeds
-    /// `params.ffn_out`); this entry runs only the bias-aware top-k + routed
-    /// MQ2-Lloyd expert sub-graph.
-    ///
-    /// Takes no `DispatchCtx`: the bias-aware path dispatches fixed MQ2-Lloyd
-    /// kernels with no arch-gated sub-dispatch, so building a `DispatchCtx`
-    /// per layer per token (an uncached generic policy parse) would
-    /// be pure waste on the decode hot path.
-    pub fn run_bias_aware(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
-        params: &MoeBiasAwareParams,
-    ) -> Result<(), DispatchError> {
-        crate::pipeline::run_moe_decode_bias_aware(gpu, params)
     }
 
     /// Run only the selected-expert portion of the single-token DeepSeek4

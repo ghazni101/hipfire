@@ -46,10 +46,10 @@
    "size_bytes": 436006912,
    "source": "https://huggingface.co/hipfire-models/qwen3-0.6b/resolve/6073b04be007df33136a5a161733f3281e62ee10/qwen3-0.6b.hf4"
   },
-  "qwen3.6-35b-a3b.mq4r": {
-   "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
-   "size_bytes": 18700048128,
-   "source": "https://huggingface.co/hipfire-models/qwen3.6-35b-a3b/resolve/605b30ea0d5c0a8bb93d7a30e43494402e6f663a/qwen3.6-35b-a3b.mq4r"
+  "qwen3.6-35b-a3b.mq4p": {
+   "sha256": "8eb3be6912aa9db2dcc89c3233b05ccdfe81a84a8d6ef43202f2098d7f2fc78f",
+   "size_bytes": 19757996288,
+   "source": "https://huggingface.co/hipfire-models/qwen3.6-35b-a3b/resolve/04bc60b0a70ce4029cf963681836eab2e7027d6d/qwen3.6-35b-a3b.mq4p"
   },
   "qwen3.8-27b-vision.hfq": {
    "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
@@ -1989,10 +1989,10 @@
   {
    "commands": {
     "negative": [
-     "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
+     "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
+     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
     ]
    },
    "env": {
@@ -2021,14 +2021,14 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4r cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4p cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
     ],
     "negative": []
    },
    "fixtures": [
     "qwen3.8:27b-mq4-xts",
     "ornith-1.5:35b-a3b-mq4r",
-    "qwen3.6:35b-a3b-mq4r"
+    "qwen3.6:35b-a3b-mq4p"
    ],
    "hosts": [
     "gfx1201",
@@ -2171,15 +2171,15 @@
      "hipfire run --temp 0 --kv-mode q8 --max-tokens 64 /nonexistent-a3b.mq4r \"Write a one-sentence greeting.\"  # expect nonzero fail-closed exit"
     ],
     "positive": [
-     "hipfire run --temp 0 --kv-mode q8 qwen3.6:35b-a3b-mq4r \"Write a one-sentence greeting.\"",
-     "hipfire run --temp 0 --kv-mode q8 qwen3.6:35b-a3b-mq4r \"Write a one-sentence greeting.\"  # immediate reload: byte-identical decode expected"
+     "hipfire run --temp 0 --kv-mode q8 qwen3.6:35b-a3b-mq4p \"Write a one-sentence greeting.\"",
+     "hipfire run --temp 0 --kv-mode q8 qwen3.6:35b-a3b-mq4p \"Write a one-sentence greeting.\"  # immediate reload: byte-identical decode expected"
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1"
    },
    "fixtures": [
-    "qwen3.6:35b-a3b-mq4r"
+    "qwen3.6:35b-a3b-mq4p"
    ],
    "hosts": [
     "gfx1151",
@@ -2214,7 +2214,7 @@
     ]
    },
    "fixtures": [
-    "qwen3.6:35b-a3b-mq4r"
+    "qwen3.6:35b-a3b-mq4p"
    ],
    "hosts": [
     "gfx1151",

@@ -1524,10 +1524,38 @@ impl Qwen4Bundle {
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
+        // A load that placed its experts for decode-share (`fixed` / `on`, a
+        // donor tail in the lease) sized the placement for exactly this chunk and
+        // this scratch plan: the chunk is final (no rung downshift) and a
+        // compact -> Full re-plan cannot fit the donor tail.
+        let sharing = crate::decode_share::DecodeShareMode::from_env().uses_donor_backing()
+            && self
+                .weights
+                .expert_tiers()
+                .is_some_and(|lease| lease.decode_share().is_some());
         let max_chunk = match s1_tile {
             // The charged tile, with no rung downshift: admission sized the
             // placement and the arena for exactly these rows.
             Some(tile) => tile,
+            None if sharing => {
+                let need = crate::gpu_forward::qwen4_decode_share_dedicated_bytes(
+                    &self.config,
+                    requested,
+                    mode,
+                )
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .ok_or_else(|| {
+                    BundleError::Forward("decode-share dedicated forward bytes overflow".into())
+                })?;
+                if need > free as u64 {
+                    return Err(BundleError::Forward(format!(
+                        "decode-share: the {requested}-row chunk the placement was sized for needs {} MiB of dedicated forward resources plus headroom but only {} MiB are free; set HIPFIRE_QWEN4_DECODE_SHARE=off to load without sharing",
+                        need >> 20,
+                        free as u64 >> 20
+                    )));
+                }
+                requested
+            }
             None => qwen4_prefill_chunk_rungs(requested)
                 .find(|&rows| {
                     qwen4_forward_device_bytes(&self.config, rows, mode)
@@ -1552,6 +1580,11 @@ impl Qwen4Bundle {
             // allocated. Re-plan Full against the memory now free. The NPU
             // trunk (gfx1151) never coexists with the gfx1201-only compact
             // plan, so nothing prepared is lost. S1 keeps its charged tile.
+            Err(Qwen4GpuForwardError::CompactUnverified { verified, total }) if sharing => {
+                return Err(BundleError::Forward(format!(
+                    "decode-share: the compact scratch plan was refused by the GPU symmetry check ({verified}/{total} layers verified) and a Full plan cannot fit the donor tail; set HIPFIRE_QWEN4_DECODE_SHARE=off to load without sharing"
+                )));
+            }
             Err(Qwen4GpuForwardError::CompactUnverified { verified, total })
                 if s1_tile.is_none() && mode == Qwen4ForwardScratchMode::FnSymGfx1201 =>
             {
@@ -1778,8 +1811,29 @@ impl Qwen4Bundle {
     pub fn spec_chunk_rows(&self) -> Option<usize> {
         self.execution
             .as_ref()
-            .map(|forward| forward.scratch.max_chunk)
+            .map(|forward| forward.prompt_chunk_rows())
             .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
+    }
+
+    /// A whole-prompt entry begins (see [`Qwen4GpuForward::share_prompt_begin`]):
+    /// drivers that issue several forward calls for one prompt bracket their
+    /// loop so decode-share finishes the prompt once, after its last tile.
+    /// No-op without decode-share or an attached forward.
+    pub(crate) fn share_prompt_begin(&mut self) {
+        if let Some(forward) = self.execution.as_mut() {
+            forward.share_prompt_begin();
+        }
+    }
+
+    /// The whole-prompt entry [`Self::share_prompt_begin`] opened ends (`ok`:
+    /// it returned `Ok`); the outermost one finishes the prompt.
+    pub(crate) fn share_prompt_end(&mut self, gpu: &mut Gpu, ok: bool) -> Result<(), BundleError> {
+        match self.execution.as_mut() {
+            Some(forward) => forward
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// The scratch plan the attached forward actually allocated: differs from
@@ -2045,8 +2099,7 @@ impl Qwen4Bundle {
             .ok_or_else(|| {
                 BundleError::Forward("Qwen4 forward resources are not attached".to_string())
             })?
-            .scratch
-            .max_chunk;
+            .prompt_chunk_rows();
         let capacity = self.spec_prefill_capacity(max_chunk);
         if tokens.len() > capacity {
             return Err(BundleError::Forward(format!(
@@ -2130,14 +2183,16 @@ impl Qwen4Bundle {
                 )));
             }
         }
-        let max_chunk = self
-            .execution
-            .as_ref()
-            .ok_or_else(|| {
-                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
-            })?
-            .scratch
-            .max_chunk;
+        let forward = self.execution.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+        })?;
+        // A prompt block tiles at the prompt chunk; a verify window is bounded
+        // by the bank it runs on (the resident bank on a decode-share load).
+        let max_chunk = if prefill {
+            forward.prompt_chunk_rows()
+        } else {
+            forward.scratch.max_chunk
+        };
         let capacity = if prefill {
             self.spec_prefill_capacity(max_chunk)
         } else {
@@ -2388,11 +2443,7 @@ impl Qwen4Bundle {
             forward.scratch.moe_down_expanded.numel(),
             slots.checked_mul(dim)?,
         )?;
-        let spec = crate::gpu_forward::qwen4_forward_device_bytes(
-            &self.config,
-            forward.scratch.max_chunk,
-            forward.scratch.mode,
-        )?;
+        let spec = forward.forward_device_bytes(&self.config)?;
         let capture = self.row_capture_planned_bytes_lab(rows)?;
         let (d2_input, d2_mask, d2_output, d2_transfer, d2_mapped, d2_device) =
             self.cpu_d2_storage_bytes().unwrap_or((0, 0, 0, 0, 0, 0));
@@ -2613,11 +2664,7 @@ impl Qwen4Bundle {
             forward.scratch.moe_down_expanded.numel(),
             slots.checked_mul(dim)?,
         )?;
-        let forward_device_bytes = crate::gpu_forward::qwen4_forward_device_bytes(
-            &self.config,
-            forward.scratch.max_chunk,
-            forward.scratch.mode,
-        )?;
+        let forward_device_bytes = forward.forward_device_bytes(&self.config)?;
         let capture_bytes = self.row_capture_planned_bytes_lab(requested_rows)?;
         Some(CpuStorageBytes {
             rows: requested_rows,
@@ -4053,7 +4100,7 @@ impl Qwen4Bundle {
     /// ([`SessionDriver::begin`]): a live continuation of this conversation's
     /// previous turn, a snapshot restore, or a cold start. Message-end
     /// boundaries of a live continuation are captured when active.
-    pub(crate) fn session_begin(
+    pub fn session_begin(
         &mut self,
         gpu: &mut Gpu,
         prompt: &[u32],
@@ -4283,6 +4330,20 @@ impl Qwen4Bundle {
         reused: usize,
         logits: &GpuTensor,
     ) -> Result<(), BundleError> {
+        self.share_prompt_begin();
+        let result = self.prefill_final_tiles(gpu, prompt, reused, logits);
+        let finish = self.share_prompt_end(gpu, result.is_ok());
+        result.and(finish)
+    }
+
+    /// The chunk loop of [`Self::prefill_final_from`].
+    fn prefill_final_tiles(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        logits: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         // The one selector verdict of the WHOLE remaining prompt, before the
         // session-boundary split below: a layer-major request keeps its
@@ -4386,6 +4447,17 @@ impl Qwen4Bundle {
         if self.execution.is_none() {
             return Err(BundleError::Forward(
                 "Qwen4 lanes need the attached forward".to_string(),
+            ));
+        }
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|forward| forward.decode_share_active())
+        {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes cannot be staged on a decode-share load: lane steps and lane prefill \
+                 waves need a bank of their own (not supported yet)"
+                    .to_string(),
             ));
         }
         if let Some(spec) = spec {

@@ -74,15 +74,23 @@ pub(crate) fn exit_if_gpu_poisoned(stdout: &mut impl Write) {
     }
 }
 
-/// Why a tensor-parallel (EP) request cannot be served: EP decode has no
-/// penalty sampler and the EP load carries no vision tower, so an image or an
-/// explicit non-neutral penalty is refused instead of silently dropped.
-fn ep_refusal(msg: &serde_json::Value, has_image: bool) -> Option<String> {
+/// Why an EP request cannot be served: the EP load carries no vision tower,
+/// and the EP archs without a penalty stage (`penalties_supported` false) samples without a
+/// penalty stage, so an image or a non-neutral penalty is refused instead of
+/// silently dropped.
+fn ep_refusal(
+    msg: &serde_json::Value,
+    has_image: bool,
+    penalties_supported: bool,
+) -> Option<String> {
     if has_image {
         return Some(
             "images are not supported at tp>1 (the tensor-parallel load has no vision tower)"
                 .to_owned(),
         );
+    }
+    if penalties_supported {
+        return None;
     }
     [
         ("repeat_penalty", 1.0),
@@ -98,21 +106,27 @@ fn ep_refusal(msg: &serde_json::Value, has_image: bool) -> Option<String> {
     })
     .map(|(key, _)| {
         format!(
-            "{key} is not supported at tp>1 (tensor-parallel decode has no penalty sampler); omit it or serve at tp=1"
+            "{key} is not supported at tp>1 for this architecture (its tp>1 decode has no penalty sampler); omit it or serve at tp=1"
         )
     })
 }
 
 /// At tp>1, answer a request [`ep_refusal`] rejects with an `unsupported`
 /// error. Returns true when the request was refused and must be skipped.
+/// `ep`: the load is expert/tensor parallel; `penalties_supported`: its serve
+/// loop applies penalties ([`hipfire_loader::EpArch::applies_request_penalties`]).
 pub(crate) fn refuse_ep_request(
     stdout: &mut impl Write,
     id: &str,
     msg: &serde_json::Value,
     ep: bool,
+    penalties_supported: bool,
     has_image: bool,
 ) -> bool {
-    let Some(message) = ep.then(|| ep_refusal(msg, has_image)).flatten() else {
+    let Some(message) = ep
+        .then(|| ep_refusal(msg, has_image, penalties_supported))
+        .flatten()
+    else {
         return false;
     };
     hipfire_generate::dense::emit_active_attempt_error(
@@ -125,4 +139,36 @@ pub(crate) fn refuse_ep_request(
     );
     let _ = stdout.flush();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ep_refusal;
+    use serde_json::json;
+
+    #[test]
+    fn a_penalty_is_refused_only_where_the_tp_loop_has_no_penalty_stage() {
+        let msg = json!({ "presence_penalty": 1.5, "repeat_penalty": 1.05 });
+        let refusal = ep_refusal(&msg, false, false).expect("ds4/minimax refuse a penalty");
+        assert!(refusal.starts_with("repeat_penalty is not supported at tp>1"));
+        assert_eq!(ep_refusal(&msg, false, true), None);
+    }
+
+    #[test]
+    fn neutral_penalties_pass_everywhere() {
+        let msg = json!({
+            "repeat_penalty": 1.0,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+        });
+        assert_eq!(ep_refusal(&msg, false, false), None);
+    }
+
+    #[test]
+    fn an_image_is_refused_at_tp_even_when_penalties_are_supported() {
+        assert!(ep_refusal(&json!({}), true, true)
+            .expect("image refused")
+            .starts_with("images are not supported at tp>1"));
+    }
 }

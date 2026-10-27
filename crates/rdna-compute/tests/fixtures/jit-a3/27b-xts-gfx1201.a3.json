@@ -1801,6 +1801,24 @@
      ]
     },
     {
+     "module": "fused_gate_up_hfq4g256",
+     "kind": "hip",
+     "sha256": "045eb4c2f74ff5e726bf10955aa91a6c482a64160f02dcf09aaf2ee5898b1f28",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "fused_gate_up_hfq4g256"
+     ]
+    },
+    {
      "module": "fused_gate_up_hfq4g256_mq4v2",
      "kind": "hip",
      "sha256": "f61a08770f8cfdfe2be45f85ef5002d4759c1f18d815e243dc6735d2e6215930",
@@ -1834,6 +1852,60 @@
      "scheduler_profile": "default",
      "symbols": [
       "fused_qk_l2_norm_scale_interleave_f32_batched"
+     ]
+    },
+    {
+     "module": "fused_qkv_hfq4g256",
+     "kind": "hip",
+     "sha256": "fdfb7ff9636f988bfc93d47a66f6a6916ba48cc43a6b3967160194afbcf7cd78",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "fused_qkv_hfq4g256"
+     ]
+    },
+    {
+     "module": "fused_rmsnorm_mq_rotate",
+     "kind": "hip",
+     "sha256": "f9cba0ca77c0c2a55ce49403da438d5843d0f0e120be94ff45594d61c024c1d8",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "fused_rmsnorm_mq_rotate"
+     ]
+    },
+    {
+     "module": "fused_silu_mul_mq_rotate",
+     "kind": "hip",
+     "sha256": "04032629886090dc4d7b2d3bff36fb8a4fb6adf097a242b8d21eaa9e0eb89815",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "fused_silu_mul_mq_rotate"
      ]
     },
     {
@@ -2493,6 +2565,24 @@
      ]
     },
     {
+     "module": "gemv_hfq4g256_residual",
+     "kind": "hip",
+     "sha256": "c798efbc1ab03075992ded23d4a559760504806af93e4eb12dfcad393406db87",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemv_hfq4g256_residual"
+     ]
+    },
+    {
      "module": "gemv_hfq4g256_multirow_default",
      "kind": "hip",
      "sha256": "032393bdd799b5815e5e7c3d1142bffec9a3557adc17a59042956f722fb8b8e8",
@@ -3098,7 +3188,7 @@
      ]
     }
    ],
-   "symbol_count": 141,
+   "symbol_count": 146,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
@@ -3109,12 +3199,17 @@
     "deinterleave",
     "deinterleave_batched",
     "dflash_gdn_replay_pre_ml",
+    "fused_gate_up_hfq4g256",
+    "fused_qkv_hfq4g256",
+    "fused_rmsnorm_mq_rotate",
+    "fused_silu_mul_mq_rotate",
     "fused_qk_l2_norm_scale_interleave_f32_batched",
     "gated_delta_net_q8_fast_ml",
     "gemm_hfq4g256",
     "gemm_hfq4g256_rows_pm",
     "gemv_hfq4g256",
     "gemv_hfq4g256_multirow_default",
+    "gemv_hfq4g256_residual",
     "greedy_accept",
     "kv_cache_write_q8_0",
     "kv_cache_write_q8_0_batched",

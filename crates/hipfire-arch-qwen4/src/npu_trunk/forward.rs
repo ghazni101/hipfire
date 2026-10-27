@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Calibrated Halo scheduler. Effective off performs no new I/O or allocation.
 use super::*;
-use crate::npu_trunk::{self as trunk, EpilogueContract, Family, FamilyMask, NpuTrunkMode, Shape};
+use crate::npu_trunk::{self as trunk, Family, FamilyMask, NpuTrunkMode, Shape, FLASH_NEXT};
 use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
     execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
     execute_indexed_attention_uncovered, execute_validated_steps_window, gdn_qkv_projection_bf16,
     CoreWindow, GdnTrunkArenas, HcFusionCursor, QsaTrunkArenas,
 };
+use hipfire_runtime::coproc::{self, EpilogueContract, PairOp};
 use railgun::npu::trunk::{
     padded_rows_of, LayerPanels, NpuTrunkRuntime, OpenOptions, PanelBuild, PanelProgram, Seq,
     TxnBuilder, MAX_ADAPTIVE_CONTEXTS,
@@ -21,7 +22,7 @@ pub(super) struct NpuForward {
     families: FamilyMask,
     request_families: FamilyMask,
     family_override: Option<FamilyMask>,
-    rates: Option<trunk::RateEstimator>,
+    rates: Option<coproc::RateEstimator>,
     sampling: Option<PairSampling>,
     request_epoch: u64,
     /// Snapshotted at request begin; changing the diagnostic control cannot alter an in-flight request.
@@ -30,7 +31,7 @@ pub(super) struct NpuForward {
     /// `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG=1`: one `pair-sample` line per resolved pair (auto), no added sync.
     sample_log: bool,
     /// The calibration (and estimator generation) the current auto request was planned with, kept for the sample log.
-    request_cal: Option<(u64, trunk::Calibration)>,
+    request_cal: Option<(u64, coproc::Calibration)>,
     layers: Vec<NpuLayer>,
     emulation: Option<EmulationScratch>,
     // The pack producer writes compact activation sidecars in both modes.
@@ -43,9 +44,9 @@ pub(super) struct NpuForward {
     host_ple: Vec<u8>,
     /// The pair or diagnostic-route line was already emitted for this request.
     pair_logged: bool,
-    calibration: Option<trunk::Calibration>,
+    calibration: Option<coproc::Calibration>,
     n_star_cache: Option<(u64, FamilyMask, Option<usize>)>,
-    request_plan: Option<trunk::Plan>,
+    request_plan: Option<coproc::Plan>,
     request_origin: usize,
     /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
     adaptive: Vec<usize>,
@@ -76,6 +77,29 @@ struct EmulationScratch {
 fn fail(e: impl std::fmt::Display) -> Qwen4GpuForwardError {
     invalid(format!("npu-trunk: {e}"))
 }
+/// Compare the live `hipEventRecord` implementations before passing serving
+/// streams to the relay (#926). Both runtime owners stay alive for this check.
+/// Paths are only diagnostic: renamed/replaced libraries and failed `dladdr`
+/// lookups must not let distinct implementations pass as one runtime.
+pub(super) fn two_hip_runtime_reason(
+    relay_address: usize,
+    serving_address: usize,
+    relay: Option<&str>,
+    serving: Option<&str>,
+) -> Option<String> {
+    if relay_address != 0 && relay_address == serving_address {
+        return None;
+    }
+    let relay = relay.unwrap_or("<unknown library>");
+    let serving = serving.unwrap_or("<unknown library>");
+    Some(format!(
+        "two HIP runtimes: the NPU relay loaded {relay} but the serving GPU runtime \
+         runs {serving}; hipEventRecord identity differs \
+         (relay={relay_address:#x}, serving={serving_address:#x}); \
+         point HIPFIRE_ROCM_PATH (and LD_LIBRARY_PATH) at one install \
+         so a single runtime serves both"
+    ))
+}
 fn stream(gpu: &Gpu) -> *mut c_void {
     gpu.active_stream
         .as_ref()
@@ -86,6 +110,7 @@ fn layout(map: &trunk::ColumnMap, rows: usize) -> NpuBf16Layout {
         padded_rows: rows.div_ceil(256) * 256,
         k: 2560,
         panels: map.panel_count(),
+        n512: false,
     }
 }
 fn family_view<'a>(
@@ -295,7 +320,7 @@ pub(crate) struct PreparedTrunk {
     pack_ms: f64,
     pre_overlay: bool,
     overlay_route: Option<rdna_compute::TrunkIu4Default>,
-    matched: Option<(trunk::Calibration, trunk::CalKey, &'static str)>,
+    matched: Option<(coproc::Calibration, coproc::CalKey, &'static str)>,
     families: FamilyMask,
 }
 
@@ -311,9 +336,17 @@ fn match_calibration(
     route: &str,
     mode: NpuTrunkMode,
     firmware: Option<&str>,
-) -> Result<(trunk::Calibration, trunk::CalKey, &'static str, FamilyMask), String> {
+) -> Result<
+    (
+        coproc::Calibration,
+        coproc::CalKey,
+        &'static str,
+        FamilyMask,
+    ),
+    String,
+> {
     let (mut cal, source) =
-        trunk::Calibration::load_with_builtin(hipfire_config::npu_trunk_calibration_path(), route)
+        trunk::load_calibration(hipfire_config::npu_trunk_calibration_path(), route)
             .map_err(|e| format!("calibration unavailable: {e}"))?;
     let index = bundle
         .npu_model_index
@@ -346,12 +379,12 @@ fn match_calibration(
         }
     }
     let families = if mode == NpuTrunkMode::Auto {
-        trunk::auto_admission(&cal, &key)?
+        coproc::auto_admission(&FLASH_NEXT, &cal, &key)?
     } else {
         cal.key_matches(&key)?;
-        trunk::select_families(&cal).0
+        coproc::select_families(&FLASH_NEXT, &cal).0
     };
-    Ok((cal, key, source, families))
+    Ok((cal, key, source, families.into()))
 }
 
 fn pack_stock(
@@ -475,6 +508,16 @@ impl NpuForward {
                         }
                     }
                 }
+                // The planner prices the map's layer counts and K: they must be this model's.
+                let kinds: Vec<usize> = bundle
+                    .weights
+                    .layer_refs
+                    .iter()
+                    .map(|l| usize::from(l.gdn.is_none()))
+                    .collect();
+                FLASH_NEXT
+                    .check_model(&kinds, bundle.config.hidden_size)
+                    .map_err(fail)?;
                 if mode == NpuTrunkMode::Auto {
                     // Reject the memory rung downgrade before downloading stock rows.
                     let (free, _) = gpu.device_mem_info()?;
@@ -643,7 +686,7 @@ impl NpuForward {
             Some((cal, mut key, source)) => {
                 key.trunk_route.clone_from(&trunk_route);
                 cal.key_matches(&key).map_err(fail)?;
-                let n_star = trunk::crossover(&cal, families);
+                let n_star = coproc::crossover(&FLASH_NEXT, &cal, families.into());
                 (Some(cal), n_star, Some(key), source)
             }
             None => (None, None, None, "none"),
@@ -712,6 +755,7 @@ impl NpuForward {
                     padded_rows: rows.div_ceil(256) * 256,
                     k: 2560,
                     panels: 1,
+                    n512: false,
                 }
                 .a_bytes();
                 let a = gpu.zeros(&[a_bytes], DType::Raw)?;
@@ -772,6 +816,9 @@ impl NpuForward {
                         T::QsaIn => (Shape::QsaIn, cols[1]),
                         T::GdnOut => (Shape::GdnOut, 0),
                         T::QsaO => (Shape::QsaO, 0),
+                        T::DenseGdnIn | T::DenseFaIn => {
+                            return Err(format!("{shape:?} is not a Flash-Next trunk shape"))
+                        }
                     };
                     trunk::build_program_for_rows(shape, cols, rows)
                         .map(|(pdi, txn)| PanelBuild { pdi, txn })
@@ -782,21 +829,35 @@ impl NpuForward {
                     Ok(n) if n > 0 => Some(n),
                     _ => { eprintln!("npu-trunk: HIPFIRE_QWEN4_NPU_TRUNK_FAULT_CHAIN={v:?} ignored (expects a chain number >= 1)"); None }
                 });
-                Some(
-                    NpuTrunkRuntime::open_with_builder(
-                        programs,
-                        resident,
-                        trunk::TRUNK_BANKS,
-                        trunk::TRUNK_ROWS_MAX,
-                        &pci,
-                        OpenOptions {
-                            fault_chain,
-                            ..OpenOptions::default()
-                        },
-                        Some(builder),
-                    )
-                    .map_err(fail)?,
+                let opened = NpuTrunkRuntime::open_with_builder(
+                    programs,
+                    resident,
+                    trunk::TRUNK_BANKS,
+                    trunk::TRUNK_ROWS_MAX,
+                    &pci,
+                    OpenOptions {
+                        fault_chain,
+                        ..OpenOptions::default()
+                    },
+                    Some(builder),
                 )
+                .map_err(fail)?;
+                // Fail closed on the residual #926 shape: `open_hip` reuses an
+                // already-mapped runtime by SONAME, so a second runtime only
+                // enters through a pre-existing mapping of another install. Two
+                // coexisting runtimes do not order their events against each
+                // other, so paired prefill would read stale panels; refuse
+                // instead. Under `auto` the admission barrier renders this as one
+                // WARN line and a GPU-only load; under `on` it fails the load.
+                if let Some(reason) = two_hip_runtime_reason(
+                    opened.hip_event_record_address(),
+                    gpu.hip.event_record_address(),
+                    opened.hip_mapped_library().as_deref(),
+                    gpu.hip.mapped_hip_library().as_deref(),
+                ) {
+                    return Err(fail(reason));
+                }
+                Some(opened)
             } else {
                 None
             };
@@ -841,23 +902,24 @@ impl NpuForward {
             if let (Some(cal), Some(key)) = (&calibration, &cal_key) {
                 eprintln!(
                     "{} cal_source={cal_source} host=[{}]",
-                    trunk::load_log_line(
+                    coproc::load_log_line(
+                        &FLASH_NEXT,
                         cal,
-                        &trunk::LoadLogKey {
+                        &coproc::LoadLogKey {
                             current: key,
                             mode: mode.as_str(),
-                            families,
+                            families: families.into(),
                         },
                         n_star,
-                        &trunk::plan(cal, families, 16384),
-                        &trunk::plan(cal, families, 65536)
+                        &coproc::plan(&FLASH_NEXT, cal, families.into(), 16384),
+                        &coproc::plan(&FLASH_NEXT, cal, families.into(), 65536)
                     ),
                     trunk::host_facts(gpu_pci.as_deref())
                 );
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
             let rates = (mode == NpuTrunkMode::Auto && runtime.is_some()).then(|| {
-                trunk::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
+                coproc::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
             });
             let sampling = if rates.is_some() {
                 Some(PairSampling::new(gpu, layers.len())?)
@@ -986,10 +1048,10 @@ impl NpuForward {
             .map(|snapshot| &snapshot.calibration)
             .or(self.calibration.as_ref());
         let selected = self.family_override.unwrap_or_else(|| match cal {
-            Some(cal) if self.mode == NpuTrunkMode::Auto => {
-                trunk::choose_families(cal, self.families, rows)
-            }
-            Some(cal) => trunk::select_families(cal).0,
+            Some(cal) if self.mode == NpuTrunkMode::Auto => FamilyMask::from(
+                coproc::choose_families(&FLASH_NEXT, cal, self.families.into(), rows),
+            ),
+            Some(cal) => coproc::select_families(&FLASH_NEXT, cal).0.into(),
             None => self.families,
         });
         self.request_families = intersect_families(selected, self.families);
@@ -1002,7 +1064,7 @@ impl NpuForward {
             match self.n_star_cache {
                 Some((g, mask, star)) if g == generation && mask == families => star,
                 _ => {
-                    let star = trunk::crossover(cal, families);
+                    let star = coproc::crossover(&FLASH_NEXT, cal, families.into());
                     self.n_star_cache = Some((generation, families, star));
                     star
                 }
@@ -1014,9 +1076,10 @@ impl NpuForward {
             request_plan(cal, self.mode, families, n_star, rows),
             &mut self.adaptive,
             |planned| {
-                trunk::executable_plan_for(
+                coproc::executable_plan_for(
+                    &FLASH_NEXT,
                     cal,
-                    families,
+                    families.into(),
                     planned,
                     rows,
                     armed_from(self.mode, n_star),
@@ -1024,7 +1087,7 @@ impl NpuForward {
             },
         );
         if self.mode == NpuTrunkMode::Auto {
-            let line = trunk::request_log_line(rows, &executable);
+            let line = coproc::request_log_line(&FLASH_NEXT, rows, &executable);
             let rest = line
                 .strip_prefix(&format!("npu-trunk: rows={rows}"))
                 .unwrap_or(&line);
@@ -1484,11 +1547,12 @@ struct PendingSample {
     prefixes: [usize; 2],
     mask: FamilyMask,
     covered: SmallVec<[bool; 128]>,
-    kinds: SmallVec<[trunk::LayerKind; 64]>,
+    /// Stage-map kind of each layer (0 = GDN, 1 = QSA).
+    kinds: SmallVec<[usize; 64]>,
     epoch: u64,
     position: usize,
     npu_busy_ms: f64,
-    planned: Option<(u64, trunk::Calibration)>,
+    planned: Option<(u64, coproc::Calibration)>,
 }
 impl PairSampling {
     fn new(gpu: &Gpu, layers: usize) -> Result<Self, Qwen4GpuForwardError> {
@@ -1585,14 +1649,15 @@ impl NpuForward {
             }
             let span_ms = gpu.hip.event_elapsed_ms(set.pair_start(), set.pair_end())? as f64;
             let pending = set.pending.take().expect("completed sample");
-            let model = trunk::pair_model(
+            let model = coproc::pair_model(
+                &FLASH_NEXT,
                 rates.prior(),
-                trunk::Moved::from(pending.mask),
+                coproc::Moved::of(&FLASH_NEXT, pending.mask.into()),
                 pending.rows,
                 pending.prefixes,
                 &pending.kinds,
             );
-            rates.observe(&trunk::RateSample {
+            rates.observe(&coproc::RateSample {
                 npu_measured_ms: pending.npu_busy_ms,
                 npu_model_ms: model.npu_ms,
                 window_measured_ms: windows_ms,
@@ -1601,19 +1666,20 @@ impl NpuForward {
             let snapshot = rates.snapshot();
             // The pair loses to GPU-only once the GPU's measured waits on the NPU exceed what pairing saves it. Both
             // sides avoid the model's prefix-dependent terms, so the model's error at depth cannot trip the guard.
-            let savings = trunk::pair_model(
+            let savings = coproc::pair_model(
+                &FLASH_NEXT,
                 &snapshot.calibration,
-                trunk::Moved::from(pending.mask),
+                coproc::Moved::of(&FLASH_NEXT, pending.mask.into()),
                 pending.rows,
                 pending.prefixes,
                 &pending.kinds,
             )
             .savings_ms;
             if self.sample_log || self.trace.is_some() {
-                let moved = trunk::Moved::from(pending.mask);
+                let moved = coproc::Moved::of(&FLASH_NEXT, pending.mask.into());
                 let planned = pending.planned.as_ref().map_or_else(|| "planned=n/a".to_owned(), |(generation, cal)| {
-                    let m = trunk::pair_model(cal, moved, pending.rows, pending.prefixes, &pending.kinds);
-                    let t = trunk::pair_time_moved(cal, moved, pending.rows[0], pending.prefixes[0], pending.rows[1], pending.prefixes[1]);
+                    let m = coproc::pair_model(&FLASH_NEXT, cal, moved, pending.rows, pending.prefixes, &pending.kinds);
+                    let t = coproc::pair_time_moved(&FLASH_NEXT, cal, moved, pending.rows[0], pending.prefixes[0], pending.rows[1], pending.prefixes[1]);
                     format!("planned(gen{generation}) npu={:.1} window={:.1} wait={:.1} pair={:.1} gpu_only={:.1} saving={:.1}",
                         m.npu_ms, m.window_ms, t.stall + t.fill, t.t, m.gpu_only_ms, m.savings_ms)
                 });
@@ -2236,97 +2302,86 @@ impl NpuForward {
             // Each bank's HC pairings cross its windows (prepare, Core, OutProj);
             // the gates they hand over live in the bank's private `hc_gates`.
             let mut hc = [HcFusionCursor::default(), HcFusionCursor::default()];
-            let mut seq = [
-                self.prepare(
-                    gpu,
-                    &ctx,
-                    &programs[0],
-                    &mut hc[0],
-                    0,
-                    0,
-                    &mut records,
-                    snapshot,
-                )?,
-                None,
-            ];
-            // Same stream: prepare(0, A) is enqueued before bank B's
-            // initialization overwrites the shared init buffers (Footprint table).
-            let bank_b_tokens = &tokens[rows[0]..];
-            initialize(
-                gpu,
-                bundle,
-                b,
-                bank_b_tokens,
-                &history,
-                programs[1].ple_rows_f16,
-                &mut host_tokens,
-                &mut host_ple,
-                ple_next.take(),
-                None,
-            )?;
-            for &token in bank_b_tokens {
-                history.push(token);
-            }
-            seq[1] = self.prepare(
-                gpu,
-                &ctx,
-                &programs[1],
-                &mut hc[1],
-                0,
-                1,
-                &mut records,
-                snapshot,
-            )?;
+            let mut seq = [None; 2];
             let mut last_seq = seq;
             // (GDN, QSA) layers already run per bank: the snapshot slots.
             let mut slots = [(0usize, 0usize); 2];
             let gdn_total = bundle.state.gdn.len();
-            for (layer, bank) in bank_visits(bundle.config.num_hidden_layers) {
-                let cut = match (geometry[bank].cut, &stage) {
-                    (Some(row), Some(stage)) => Some(CoreCut {
-                        stage,
-                        row,
-                        gdn_total,
-                        gdn_slot: slots[bank].0,
-                        qsa_slot: slots[bank].1,
-                    }),
-                    _ => None,
-                };
-                self.run_bank(
-                    gpu,
-                    &ctx,
-                    &mut programs[bank],
-                    &mut hc[bank],
-                    layer,
-                    bank,
-                    seq[bank],
-                    cut,
-                    &mut records,
-                )?;
-                let mixer = &programs[bank].steps[mixer_index(&programs[bank], layer)];
-                if geometry[bank].stage_after {
-                    if let Some(stage) = &stage {
-                        copy_mixer_state(gpu, stage, mixer, gdn_total, slots[0].0, slots[0].1)?;
+            for op in coproc::pair_schedule(bundle.config.num_hidden_layers) {
+                match op {
+                    PairOp::Prepare { layer, bank } => {
+                        seq[bank] = self.prepare(
+                            gpu,
+                            &ctx,
+                            &programs[bank],
+                            &mut hc[bank],
+                            layer,
+                            bank,
+                            &mut records,
+                            snapshot,
+                        )?;
+                        if seq[bank].is_some() {
+                            last_seq[bank] = seq[bank];
+                        }
                     }
-                }
-                match mixer {
-                    Step::GatedDeltaNet(_) => slots[bank].0 += 1,
-                    Step::IndexedAttention(_) => slots[bank].1 += 1,
-                    _ => unreachable!("typed mixer"),
-                }
-                if layer + 1 < bundle.config.num_hidden_layers {
-                    seq[bank] = self.prepare(
-                        gpu,
-                        &ctx,
-                        &programs[bank],
-                        &mut hc[bank],
-                        layer + 1,
-                        bank,
-                        &mut records,
-                        snapshot,
-                    )?;
-                    if seq[bank].is_some() {
-                        last_seq[bank] = seq[bank];
+                    // Bank A initialized before the pair; bank B's init follows kick(0, A) only as the
+                    // pipeline fill (NPU(0, A) does not wait behind bank B's embedding/PLE staging).
+                    PairOp::Init { bank: 1 } => {
+                        let bank_b_tokens = &tokens[rows[0]..];
+                        initialize(
+                            gpu,
+                            bundle,
+                            b,
+                            bank_b_tokens,
+                            &history,
+                            programs[1].ple_rows_f16,
+                            &mut host_tokens,
+                            &mut host_ple,
+                            ple_next.take(),
+                            None,
+                        )?;
+                        for &token in bank_b_tokens {
+                            history.push(token);
+                        }
+                    }
+                    PairOp::Run { layer, bank } => {
+                        let cut = match (geometry[bank].cut, &stage) {
+                            (Some(row), Some(stage)) => Some(CoreCut {
+                                stage,
+                                row,
+                                gdn_total,
+                                gdn_slot: slots[bank].0,
+                                qsa_slot: slots[bank].1,
+                            }),
+                            _ => None,
+                        };
+                        self.run_bank(
+                            gpu,
+                            &ctx,
+                            &mut programs[bank],
+                            &mut hc[bank],
+                            layer,
+                            bank,
+                            seq[bank],
+                            cut,
+                            &mut records,
+                        )?;
+                        let mixer = &programs[bank].steps[mixer_index(&programs[bank], layer)];
+                        if geometry[bank].stage_after {
+                            if let Some(stage) = &stage {
+                                copy_mixer_state(
+                                    gpu, stage, mixer, gdn_total, slots[0].0, slots[0].1,
+                                )?;
+                            }
+                        }
+                        match mixer {
+                            Step::GatedDeltaNet(_) => slots[bank].0 += 1,
+                            Step::IndexedAttention(_) => slots[bank].1 += 1,
+                            _ => unreachable!("typed mixer"),
+                        }
+                    }
+                    PairOp::Init { bank } => {
+                        unreachable!("the pair schedule initializes bank B only, not {bank}")
                     }
                 }
             }
@@ -2387,8 +2442,8 @@ impl NpuForward {
                     let kinds = (0..bundle.config.num_hidden_layers)
                         .map(
                             |layer| match &programs[0].steps[mixer_index(&programs[0], layer)] {
-                                Step::GatedDeltaNet(_) => trunk::LayerKind::Gdn,
-                                Step::IndexedAttention(_) => trunk::LayerKind::Qsa,
+                                Step::GatedDeltaNet(_) => 0,
+                                Step::IndexedAttention(_) => 1,
                                 _ => unreachable!("typed layer mixer"),
                             },
                         )
@@ -2668,19 +2723,19 @@ fn finish_bank(
 /// The request's executable plan. `auto` arms it from the crossover `n_star`; the forced modes (`on`, `emulate`)
 /// take the planner's pairs from the first row.
 fn request_plan(
-    cal: &trunk::Calibration,
+    cal: &coproc::Calibration,
     mode: NpuTrunkMode,
     families: FamilyMask,
     n_star: Option<usize>,
     rows: usize,
-) -> trunk::Plan {
-    let planned = trunk::plan_executable(cal, families, rows);
+) -> coproc::Plan {
+    let planned = coproc::plan_executable(&FLASH_NEXT, cal, families.into(), rows);
     let armed = if families.is_empty() {
         None
     } else {
         armed_from(mode, n_star)
     };
-    trunk::executable_plan_for(cal, families, &planned, rows, armed)
+    coproc::executable_plan_for(&FLASH_NEXT, cal, families.into(), &planned, rows, armed)
 }
 /// The row the executable plan arms pairs from: the crossover `n_star` in `auto`, the first row in the forced modes.
 fn armed_from(mode: NpuTrunkMode, n_star: Option<usize>) -> Option<usize> {
@@ -2691,52 +2746,33 @@ fn armed_from(mode: NpuTrunkMode, n_star: Option<usize>) -> Option<usize> {
     }
 }
 /// A bank below 8192 rows runs the row-adaptive NPU program of its own wave count, one relay hardware context per distinct
-/// count and at most [`MAX_ADAPTIVE_CONTEXTS`] per load. Admits the wave counts of `executable`'s pairs into `admitted`
-/// (first-use order, the order the relay meets them). A pair that would exceed the budget is dropped and `replan` rebuilds
-/// the plan from the remaining pairs, so its rows run GPU-native rather than through a full 8192-row NPU chain. Every mode
-/// applies it, so `on` and `emulate` demote the same pairs.
+/// count and at most [`MAX_ADAPTIVE_CONTEXTS`] per load (the max-window budget, [`coproc::admit_wave_budget`]). Every
+/// mode applies it, so `on` and `emulate` demote the same pairs.
 fn admitted_plan(
-    executable: trunk::Plan,
+    executable: coproc::Plan,
     admitted: &mut Vec<usize>,
-    replan: impl Fn(&trunk::Plan) -> trunk::Plan,
-) -> trunk::Plan {
-    let mut kept = executable.clone();
-    kept.steps.retain(|step| {
-        let trunk::Step::Pipe { a, b } = step else {
-            return true;
-        };
-        let mut next = admitted.clone();
-        for rows in
-            [a.len(), b.len()].map(|rows| padded_rows_of(transport_shape(Shape::GdnIn), rows))
-        {
-            if rows < trunk::CHUNK && !next.contains(&rows) {
-                next.push(rows);
-            }
-        }
-        let fits = next.len() <= MAX_ADAPTIVE_CONTEXTS;
-        if fits {
-            *admitted = next;
-        }
-        fits
-    });
-    if kept.steps.len() == executable.steps.len() {
-        executable
-    } else {
-        replan(&kept)
-    }
+    replan: impl Fn(&coproc::Plan) -> coproc::Plan,
+) -> coproc::Plan {
+    coproc::admit_wave_budget(
+        executable,
+        admitted,
+        MAX_ADAPTIVE_CONTEXTS,
+        |rows| padded_rows_of(transport_shape(Shape::GdnIn), rows),
+        replan,
+    )
 }
 /// Rows of the planned pair starting at `position` (the request began at `origin`) when it fits the remaining rows.
 fn planned_banks(
-    plan: &trunk::Plan,
+    plan: &coproc::Plan,
     origin: usize,
     position: usize,
     remaining: usize,
     chunk: usize,
 ) -> Option<[usize; 2]> {
-    if chunk != trunk::CHUNK {
+    if chunk != coproc::CHUNK {
         return None;
     }
-    let (a, b) = trunk::planned_pair(plan, position.checked_sub(origin)?)?;
+    let (a, b) = coproc::planned_pair(plan, position.checked_sub(origin)?)?;
     (a + b <= remaining).then_some([a, b])
 }
 
@@ -2752,7 +2788,50 @@ pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::npu_trunk::Calibration;
+    use crate::npu_trunk::load_calibration;
+    use hipfire_runtime::coproc::Calibration;
+    #[test]
+    fn two_hip_runtime_guard_uses_live_symbol_identity() {
+        let path = "/opt/rocm/lib/libamdhip64.so";
+        // One live implementation passes even if a path lookup failed or two
+        // diagnostic paths name different aliases. No filesystem lookup is needed.
+        for (relay, serving) in [
+            (None, None),
+            (Some(path), None),
+            (None, Some(path)),
+            (Some(path), Some("/opt/rocm/lib/libamdhip64.so.7")),
+        ] {
+            assert_eq!(two_hip_runtime_reason(0x1000, 0x1000, relay, serving), None);
+        }
+        // Distinct mappings refuse even when their recorded paths are identical
+        // (a library was replaced) or when either diagnostic lookup failed.
+        for (relay, serving) in [
+            (Some(path), Some(path)),
+            (Some(path), Some("/tmp/other/libamdhip64.so")),
+            (None, Some(path)),
+            (Some(path), None),
+            (None, None),
+        ] {
+            let reason = two_hip_runtime_reason(0x1000, 0x2000, relay, serving)
+                .expect("distinct implementations must refuse");
+            assert!(reason.starts_with("two HIP runtimes:"), "{reason}");
+            assert!(
+                reason.contains(relay.unwrap_or("<unknown library>")),
+                "{reason}"
+            );
+            assert!(
+                reason.contains(serving.unwrap_or("<unknown library>")),
+                "{reason}"
+            );
+            assert!(reason.contains("HIPFIRE_ROCM_PATH"), "{reason}");
+            assert!(
+                reason.contains("hipEventRecord identity differs"),
+                "{reason}"
+            );
+        }
+        assert!(two_hip_runtime_reason(0, 0, None, None).is_some());
+        assert!(two_hip_runtime_reason(0, 0x1000, None, None).is_some());
+    }
     #[test]
     fn family_override_parser_selects_groups_and_rejects_unknowns() {
         assert_eq!(parse_family_override("all").unwrap(), FamilyMask::ALL);
@@ -3300,6 +3379,7 @@ mod tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/npu_trunk")
                 .join(file),
+            &FLASH_NEXT,
         )
         .unwrap()
     }
@@ -3307,24 +3387,24 @@ mod tests {
     fn forced_modes_with_a_matched_calibration_run_the_planned_pairs() {
         // The built-in v4 overlay calibration: on and emulate take the planner's pairs
         // (rebalanced last pair included), exactly as auto does once armed.
-        let (cal, _) = Calibration::load_with_builtin(
+        let (cal, _) = load_calibration(
             "/nonexistent/npu-trunk-calibration.json",
             "overlay:gfx1151-zab-v1",
         )
         .unwrap();
-        let families = trunk::select_families(&cal).0;
-        let star = trunk::crossover(&cal, families);
+        let families = FamilyMask::from(coproc::select_families(&FLASH_NEXT, &cal).0);
+        let star = coproc::crossover(&FLASH_NEXT, &cal, families.into());
         let pairs = |mode: NpuTrunkMode, rows: usize| {
             let plan = request_plan(&cal, mode, families, star, rows);
             let mut at = 0;
             let mut out = Vec::new();
             while at < rows {
-                match planned_banks(&plan, 0, at, rows - at, trunk::CHUNK) {
+                match planned_banks(&plan, 0, at, rows - at, coproc::CHUNK) {
                     Some(banks) => {
                         out.push((at, banks));
                         at += banks[0] + banks[1];
                     }
-                    None => at = (at + trunk::CHUNK).min(rows),
+                    None => at = (at + coproc::CHUNK).min(rows),
                 }
             }
             out
@@ -3352,7 +3432,7 @@ mod tests {
     }
     #[test]
     fn forced_request_subsets_use_only_the_static_prior() {
-        let (cal, _) = Calibration::load_with_builtin(
+        let (cal, _) = load_calibration(
             "/nonexistent/npu-trunk-calibration.json",
             "overlay:gfx1151-zab-v1",
         )
@@ -3364,10 +3444,11 @@ mod tests {
             assert_eq!(on, emulate, "{names}");
             assert_eq!(
                 on,
-                trunk::executable_plan_for(
+                coproc::executable_plan_for(
+                    &FLASH_NEXT,
                     &cal,
-                    mask,
-                    &trunk::plan(&cal, mask, 16384),
+                    mask.into(),
+                    &coproc::plan(&FLASH_NEXT, &cal, mask.into(), 16384),
                     16384,
                     Some(0)
                 ),
@@ -3379,36 +3460,42 @@ mod tests {
             assert!(plan
                 .steps
                 .iter()
-                .all(|step| matches!(step, trunk::Step::Gpu { .. })));
+                .all(|step| matches!(step, coproc::Step::Gpu { .. })));
         }
     }
     #[test]
     fn row_adaptive_budget_demotes_pairs_beyond_it_to_gpu_chunks() {
         // A long-lived load meets many bank sizes: the first MAX_ADAPTIVE_CONTEXTS wave counts are admitted and keep their
         // pairs; a pair needing another wave count runs GPU-native, never through a full 8192-row NPU chain.
-        let (cal, _) = Calibration::load_with_builtin(
+        let (cal, _) = load_calibration(
             "/nonexistent/npu-trunk-calibration.json",
             "overlay:gfx1151-zab-v1",
         )
         .unwrap();
-        let families = trunk::select_families(&cal).0;
-        let star = trunk::crossover(&cal, families);
-        let classes = |plan: &trunk::Plan| {
+        let families = FamilyMask::from(coproc::select_families(&FLASH_NEXT, &cal).0);
+        let star = coproc::crossover(&FLASH_NEXT, &cal, families.into());
+        let classes = |plan: &coproc::Plan| {
             plan.steps
                 .iter()
                 .flat_map(|step| match step {
-                    trunk::Step::Pipe { a, b } => vec![a.len(), b.len()],
-                    trunk::Step::Gpu { .. } => Vec::new(),
+                    coproc::Step::Pipe { a, b } => vec![a.len(), b.len()],
+                    coproc::Step::Gpu { .. } => Vec::new(),
                 })
                 .map(|rows| padded_rows_of(transport_shape(Shape::GdnIn), rows))
-                .filter(|&rows| rows < trunk::CHUNK)
+                .filter(|&rows| rows < coproc::CHUNK)
                 .collect::<Vec<_>>()
         };
         let (mut admitted, mut demoted) = (Vec::new(), 0);
         for rows in (8704..16384).step_by(256) {
             let full = request_plan(&cal, NpuTrunkMode::Auto, families, star, rows);
             let got = admitted_plan(full.clone(), &mut admitted, |kept| {
-                trunk::executable_plan(&cal, kept, rows, armed_from(NpuTrunkMode::Auto, star))
+                coproc::executable_plan(
+                    &FLASH_NEXT,
+                    &cal,
+                    kept,
+                    rows,
+                    armed_from(NpuTrunkMode::Auto, star),
+                )
             });
             assert!(admitted.len() <= MAX_ADAPTIVE_CONTEXTS, "{rows}");
             assert!(classes(&got).iter().all(|r| admitted.contains(r)), "{rows}");
@@ -3417,8 +3504,8 @@ mod tests {
                 demoted += 1;
             }
             let end = got.steps.last().map(|step| match step {
-                trunk::Step::Gpu { chunk } => chunk.end,
-                trunk::Step::Pipe { b, .. } => b.end,
+                coproc::Step::Gpu { chunk } => chunk.end,
+                coproc::Step::Pipe { b, .. } => b.end,
             });
             assert_eq!(end, Some(rows), "{rows}");
         }
@@ -3436,17 +3523,22 @@ mod tests {
     #[test]
     fn rebalanced_pairs_schedule_with_and_without_the_session_cache() {
         let cal = fixture_calibration("g80bf16-overlay-v2.json");
-        let star = trunk::crossover(&cal, FamilyMask::ALL);
+        let star = coproc::crossover(&FLASH_NEXT, &cal, FamilyMask::ALL.into());
         let schedule = |rows: usize, cache: bool| {
-            let exec =
-                trunk::executable_plan(&cal, &trunk::plan(&cal, FamilyMask::ALL, rows), rows, star);
+            let exec = coproc::executable_plan(
+                &FLASH_NEXT,
+                &cal,
+                &coproc::plan(&FLASH_NEXT, &cal, FamilyMask::ALL.into(), rows),
+                rows,
+                star,
+            );
             let boundaries: Vec<usize> = if cache {
                 (1..=rows / 8192).map(|k| k * 8192).collect()
             } else {
                 Vec::new()
             };
             schedule_with(rows, &boundaries, &|pos| {
-                trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b])
+                coproc::planned_pair(&exec, pos).map(|(a, b)| [a, b])
             })
         };
         // 9,319: 4672 + 4647; the 8192 snapshot is bank B's local row 3520.
@@ -3483,7 +3575,7 @@ mod tests {
         // own snapshot row, state staged after the first launch (or after bank A
         // when the row is the A/B split). Pin it for the C1 sizes, cache on/off.
         let cal = fixture_calibration("g80bf16-overlay-v2.json");
-        let star = trunk::crossover(&cal, FamilyMask::ALL);
+        let star = coproc::crossover(&FLASH_NEXT, &cal, FamilyMask::ALL.into());
         for (rows, cache, expected) in [
             (
                 9319usize,
@@ -3526,15 +3618,20 @@ mod tests {
                 ],
             ),
         ] {
-            let exec =
-                trunk::executable_plan(&cal, &trunk::plan(&cal, FamilyMask::ALL, rows), rows, star);
+            let exec = coproc::executable_plan(
+                &FLASH_NEXT,
+                &cal,
+                &coproc::plan(&FLASH_NEXT, &cal, FamilyMask::ALL.into(), rows),
+                rows,
+                star,
+            );
             let boundaries: Vec<usize> = if cache {
                 (1..=rows / 8192).map(|k| k * 8192).collect()
             } else {
                 Vec::new()
             };
             let groups = schedule_with(rows, &boundaries, &|pos| {
-                trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b])
+                coproc::planned_pair(&exec, pos).map(|(a, b)| [a, b])
             });
             let geometries: Vec<_> = groups
                 .iter()
@@ -3579,13 +3676,14 @@ mod tests {
         for v in vectors.as_array().unwrap() {
             let file = v["file"].as_str().unwrap();
             let cal = fixture_calibration(file);
-            let star = trunk::crossover(&cal, FamilyMask::ALL);
+            let star = coproc::crossover(&FLASH_NEXT, &cal, FamilyMask::ALL.into());
             assert_eq!(star, v["n_star"].as_u64().map(|n| n as usize), "{file}");
             for case in v["cases"].as_array().unwrap() {
                 let rows = num(&case["rows"]);
-                let exec = trunk::executable_plan(
+                let exec = coproc::executable_plan(
+                    &FLASH_NEXT,
                     &cal,
-                    &trunk::plan(&cal, FamilyMask::ALL, rows),
+                    &coproc::plan(&FLASH_NEXT, &cal, FamilyMask::ALL.into(), rows),
                     rows,
                     star,
                 );
@@ -3596,9 +3694,9 @@ mod tests {
                     .map(|s| {
                         let range = |r: &serde_json::Value| num(&r[0])..num(&r[1]);
                         if let Some(r) = s.get("gpu") {
-                            trunk::Step::Gpu { chunk: range(r) }
+                            coproc::Step::Gpu { chunk: range(r) }
                         } else {
-                            trunk::Step::Pipe {
+                            coproc::Step::Pipe {
                                 a: range(&s["pipe"][0]),
                                 b: range(&s["pipe"][1]),
                             }
@@ -3616,7 +3714,7 @@ mod tests {
                 let cache: Vec<usize> = (1..=rows / 8192).map(|k| k * 8192).collect();
                 for (key, boundaries) in [("groups_off", &[][..]), ("groups_on", &cache[..])] {
                     let actual = schedule_with(rows, boundaries, &|pos| {
-                        trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b])
+                        coproc::planned_pair(&exec, pos).map(|(a, b)| [a, b])
                     });
                     let expected: Vec<_> = case[key]
                         .as_array()
@@ -3638,40 +3736,6 @@ mod tests {
         assert_eq!(spec_hidden_capacity_rows(8192, 8192, false), Some(8192));
         assert_eq!(spec_hidden_capacity_rows(20000, 8192, true), Some(20000));
         assert_eq!(spec_hidden_capacity_rows(8192, usize::MAX, true), None);
-    }
-    #[test]
-    fn arena_retirement_precedes_next_pack_and_state_order() {
-        let mut operations = vec![(0, 0, "pack"), (0, 1, "pack")];
-        for (layer, bank) in bank_visits(3) {
-            operations.extend([(layer, bank, "core"), (layer, bank, "retire")]);
-            if layer + 1 < 3 {
-                operations.push((layer + 1, bank, "pack"));
-            }
-        }
-        for layer in 0..3 {
-            let index = |bank, op| {
-                operations
-                    .iter()
-                    .position(|x| *x == (layer, bank, op))
-                    .unwrap()
-            };
-            assert!(index(0, "core") < index(1, "core"));
-            for bank in 0..2 {
-                assert!(index(bank, "core") < index(bank, "retire"));
-            }
-            if layer + 1 < 3 {
-                for bank in 0..2 {
-                    let next = operations
-                        .iter()
-                        .position(|x| *x == (layer + 1, bank, "pack"))
-                        .unwrap();
-                    assert!(index(bank, "retire") < next);
-                    if bank == 0 {
-                        assert!(next < index(1, "core"));
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -3728,8 +3792,4 @@ pub(super) fn run_pair_request(
     }
     owner.npu_trunk = Some(npu);
     result
-}
-
-fn bank_visits(layers: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..layers).flat_map(|layer| [(layer, 0), (layer, 1)])
 }

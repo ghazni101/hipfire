@@ -21,6 +21,7 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 pub mod executor;
+pub mod tp_exchange;
 pub mod transport;
 use std::ffi::c_void;
 
@@ -149,6 +150,12 @@ pub struct Gpus {
     /// `count` seen. Explicitly reclaimed via [`Gpus::free_peer_reduce_scratch`].
     peer_ar_tmp: Vec<Vec<DeviceBuffer>>,
     peer_ar_tmp_bytes: usize,
+    /// 16-bit TP exchange pack buffers (`HIPFIRE_TP_EXCHANGE`): one device
+    /// buffer per rank holding two slots of `tp_exch16_slot_bytes` each. A
+    /// rank packs its f32 partial into its own buffer; peers read it. Lazily
+    /// allocated / grown, reclaimed by [`Gpus::free_peer_reduce_scratch`].
+    tp_exch16: Vec<DeviceBuffer>,
+    tp_exch16_slot_bytes: usize,
     /// Persistent pageable host staging for the fallback host all-reduce
     /// ([`Gpus::all_reduce_sum_f32_host`]). Outer vec is per-rank, inner vec
     /// is `count` f32 per rank. Grown to the largest `count` seen and reused
@@ -462,6 +469,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            tp_exch16: Vec::new(),
+            tp_exch16_slot_bytes: 0,
             host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
@@ -523,6 +532,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            tp_exch16: Vec::new(),
+            tp_exch16_slot_bytes: 0,
             host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
@@ -577,6 +588,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            tp_exch16: Vec::new(),
+            tp_exch16_slot_bytes: 0,
             host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
@@ -1195,8 +1208,14 @@ impl Gpus {
         let bytes = std::mem::size_of::<u64>();
         let n = self.devices.len();
         if n == 2 {
+            let exchange = tp_exchange::tp_exchange_format();
             for gpu in &mut self.devices {
                 gpu.ensure_tp_graph_signal_gfx1100_kernels()?;
+                // The 16-bit twin is first launched inside graph capture,
+                // where JIT compilation is not safe.
+                if let Some(fmt) = exchange {
+                    gpu.ensure_tp_graph_signal_reduce16_gfx1100_kernel(fmt)?;
+                }
             }
         }
         // Every barrier kernel takes its rank's bounded-wait error block, and
@@ -1729,6 +1748,8 @@ impl Gpus {
             givens_sin_per_dev: Vec::new(),
             peer_ar_tmp: Vec::new(),
             peer_ar_tmp_bytes: 0,
+            tp_exch16: Vec::new(),
+            tp_exch16_slot_bytes: 0,
             host_ar_tmp: Vec::new(),
             active_peer_lease: None,
             peer_lease_buffers: Vec::new(),
@@ -2012,6 +2033,7 @@ impl Gpus {
                 "free_peer_reduce_scratch: peer scratch is leased — refuse free while a lease lives",
             ));
         }
+        self.free_tp_exch16()?;
         if self.peer_ar_tmp.is_empty() {
             self.peer_ar_tmp_bytes = 0;
             return Ok(());
@@ -2824,13 +2846,27 @@ impl Gpus {
     /// which is also the only reduction the TP2 whole-token graph can
     /// capture. `None`, or the protocol disabled, keeps the ordinary
     /// protocol. Every route computes the same rank-ordered sum.
+    ///
+    /// `HIPFIRE_TP_EXCHANGE` (see [`tp_exchange`]) selects what the ranks
+    /// exchange: 16-bit partials (each rank converts its f32 partial once,
+    /// every rank sums the rounded, rank-ordered partials in f32 into its f32
+    /// residual) or the f32 partials themselves. The default `auto` picks per
+    /// `rows` and rank count ([`tp_exchange::auto_exchange`]); `rows` is the
+    /// row count of the reduction (`count` = `rows` x dim). The 16-bit route covers the TP2 direct-peer read,
+    /// the TP2 whole-token graph and the rooted TP>2 fold alike, so the hand
+    /// and the generic dense TP routes, which both reduce through here and
+    /// through `executor::peer_reduce`, add identical bytes.
     pub fn all_reduce_sum_f32_peer_add_routed(
         &mut self,
         partials: &[&DeviceBuffer],
         residuals: &[&DeviceBuffer],
+        rows: usize,
         count: usize,
         partial_slot: Option<usize>,
     ) -> HipResult<()> {
+        if let Some(fmt) = self.tp_exchange16_for(rows, count) {
+            return self.all_reduce_peer_add16(fmt, partials, residuals, count, partial_slot);
+        }
         if self.devices.len() != 2 || !self.peer_access_enabled || !tp_peer_direct_enabled() {
             return self.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count);
         }

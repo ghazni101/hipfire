@@ -752,6 +752,38 @@ impl Rope {
         }
         .map_err(hip)
     }
+
+    /// RoPE of `rows` rows, row `r` at the I32 position `positions[r]`;
+    /// `n_kv_heads == 0` leaves K untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_rows(
+        &self,
+        gpu: &mut Gpu,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        rows: usize,
+    ) -> Result<(), DispatchError> {
+        let theta = self.theta;
+        match self.kind {
+            RopeKind::RotateHalf => {
+                gpu.rope_batched_f32(q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows)
+            }
+            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
+                q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
+            ),
+            RopeKind::PrefixHalfSplit { .. } => {
+                return Err(DispatchError::Hip(
+                    "prefix half-split RoPE is single-row only".into(),
+                ))
+            }
+            RopeKind::NoPe => return Ok(()),
+        }
+        .map_err(hip)
+    }
 }
 
 /// The K/V one attention sublayer attends. A sublayer with its own
@@ -927,6 +959,10 @@ pub struct SandwichAttentionOp<'a> {
     pub kv: SandwichKv<'a>,
     /// Device position scalar (decode).
     pub pos_buf: &'a DeviceBuffer,
+    /// Last key position and its device scalar for a single query-only row
+    /// whose own row is not cached (a draft head querying at the pending
+    /// token's position). `None` attends through `position`.
+    pub attend_through: Option<(usize, &'a DeviceBuffer)>,
     /// Per-row i32 positions (batched rows).
     pub positions: Option<&'a GpuTensor>,
     /// Output gate ([`SandwichRoute::Steps`] only).
@@ -972,6 +1008,15 @@ impl SandwichAttentionOp<'_> {
                 .positions
                 .ok_or_else(|| invalid(format!("{L}: batched rows need per-row positions")))?;
             need(positions, rows, L, "positions")?;
+        }
+        if let Some((through, _)) = self.attend_through {
+            let tier = matches!(self.kv.route, KvRoute::Tier { .. });
+            if s.batched() || self.kv_proj.is_some() || !tier || through >= self.position {
+                return Err(invalid(format!(
+                    "{L}: attending through {through} needs one query-only Tier row past it (position {})",
+                    self.position
+                )));
+            }
         }
         let mut weights = vec![&self.wq, &self.wo];
         weights.extend(self.wk());
@@ -1242,37 +1287,16 @@ impl SandwichAttentionOp<'_> {
                 .rope
                 .apply_row(gpu, self.q, self.k, self.pos_buf, n_heads, rope_kv, hd);
         }
-        let theta = self.rope.theta;
-        match self.rope.kind {
-            RopeKind::RotateHalf => gpu.rope_batched_f32(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                theta,
-                rows,
-            ),
-            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                rot_pairs,
-                theta,
-                rows,
-            ),
-            RopeKind::PrefixHalfSplit { .. } => {
-                return Err(DispatchError::Hip(
-                    "sandwich attention: prefix half-split RoPE is single-row only".into(),
-                ))
-            }
-            RopeKind::NoPe => return Ok(()),
-        }
-        .map_err(hip)
+        self.rope.apply_rows(
+            gpu,
+            self.q,
+            self.k,
+            self.positions()?,
+            n_heads,
+            rope_kv,
+            hd,
+            rows,
+        )
     }
 
     fn positions(&self) -> Result<&GpuTensor, DispatchError> {
@@ -1319,8 +1343,9 @@ impl SandwichAttentionOp<'_> {
         flash_partials: &GpuTensor,
     ) -> Result<(), DispatchError> {
         let kv = &self.kv;
+        let (pos, pos_buf) = self.attend_through.unwrap_or((self.position, self.pos_buf));
         let mut plan = KvTierPlan::derive(KvTierInputs {
-            pos: self.position,
+            pos,
             batch_size: 1,
             q8_windowed: true,
             window: kv.window as i32,
@@ -1338,8 +1363,8 @@ impl SandwichAttentionOp<'_> {
             v_cache: kv.v_cache,
             k_scales: None,
             v_scales: None,
-            pos_buf: self.pos_buf,
-            pos: self.position,
+            pos_buf,
+            pos,
             positions: None,
             n_heads: self.n_heads,
             n_kv_heads: self.n_kv_heads,
@@ -1708,6 +1733,21 @@ pub fn execute_sandwich_attention(
 ) -> Result<(), DispatchError> {
     let s = op.stream;
     s.save_residual_for(gpu, op.post_norm)?;
+    execute_sandwich_attention_partial(gpu, ctx, op)?;
+    s.post_norm_residual(gpu, s.normed, op.post_norm)
+}
+
+/// [`execute_sandwich_attention`] up to the output projection: `Wo·a` lands
+/// in `op.stream.normed` and the stream is untouched. A tensor-parallel rank
+/// runs this over its heads, so `normed` holds its partial sum; once reduced,
+/// [`execute_sandwich_epilogue`] applies the post-norm residual. The post-norm
+/// cannot take a partial sum, so this is the only TP split point.
+pub fn execute_sandwich_attention_partial(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &SandwichAttentionOp<'_>,
+) -> Result<(), DispatchError> {
+    let s = op.stream;
     op.project(gpu, ctx)?;
     op.position_encode(gpu)?;
     op.attend(gpu, ctx)?;
@@ -1726,11 +1766,30 @@ pub fn execute_sandwich_attention(
             s.bf16,
             s.rows,
             s.ladder(),
-        )?;
+        )
     } else {
-        gemv(gpu, ctx, &op.wo, op.attn_out, s.normed)?;
+        gemv(gpu, ctx, &op.wo, op.attn_out, s.normed)
     }
-    s.post_norm_residual(gpu, s.normed, op.post_norm)
+}
+
+/// The sandwich sublayer epilogue over a reduced sublayer output `out`:
+/// `x + post_norm(out)` into the stream ([`SandwichStream::out`] when set),
+/// the same kernels the whole sublayer ends with. Only a stream with an
+/// output stream is admitted: the in-place form reads the residual the
+/// sublayer saved first.
+pub fn execute_sandwich_epilogue(
+    gpu: &mut Gpu,
+    stream: &SandwichStream<'_>,
+    out: &GpuTensor,
+    post_norm: Option<&GpuTensor>,
+) -> Result<(), DispatchError> {
+    const L: &str = "sandwich epilogue";
+    stream.validate(L)?;
+    need(out, stream.len(), L, "sublayer output")?;
+    if stream.out.is_none() {
+        return Err(invalid(format!("{L}: needs an output stream")));
+    }
+    stream.post_norm_residual(gpu, out, post_norm)
 }
 
 /// Gated MLP activation.
@@ -1781,11 +1840,24 @@ pub fn execute_sandwich_mlp(
     ctx: &DispatchCtx,
     op: &SandwichMlpOp<'_>,
 ) -> Result<(), DispatchError> {
+    op.stream.save_residual_for(gpu, op.post_norm)?;
     dense_mlp(gpu, ctx, op)?;
     op.stream.post_norm_residual(gpu, op.out, op.post_norm)
 }
 
-/// Residual save, then `out = down(act(gate(n)) * up(n))`, `n = pre_norm(x)`.
+/// [`execute_sandwich_mlp`] up to the down projection: `out = down(..)`, the
+/// stream untouched. A tensor-parallel rank runs this over its intermediate
+/// slice (a partial sum in `op.out`), reduced before
+/// [`execute_sandwich_epilogue`].
+pub fn execute_sandwich_mlp_partial(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    op: &SandwichMlpOp<'_>,
+) -> Result<(), DispatchError> {
+    dense_mlp(gpu, ctx, op)
+}
+
+/// `out = down(act(gate(n)) * up(n))`, `n = pre_norm(x)`.
 fn dense_mlp(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -1793,7 +1865,6 @@ fn dense_mlp(
 ) -> Result<(), DispatchError> {
     let s = op.stream;
     let rows = s.rows;
-    s.save_residual_for(gpu, op.post_norm)?;
     if let Some(route) = s.steps_route() {
         return steps_mlp(gpu, ctx, op, route);
     }
@@ -2883,6 +2954,7 @@ mod validation_tests {
                 },
             },
             pos_buf: &pos_buf,
+            attend_through: None,
             positions: Some(&big),
             gate: None,
             wo: weight(&big),

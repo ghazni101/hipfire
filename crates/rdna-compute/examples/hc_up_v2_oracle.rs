@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte oracle: the persistent gfx1201 Qwen4 HC up+mix read tail `hyper_read_up_wmma_bf16_gfx1201_v2`
-//! against the retiled `hyper_read_up_wmma_bf16_gfx1201_t128` it replaces, every output u32 of `mixed`.
+//! Byte oracle: the persistent Qwen4 HC up+mix read tail `hyper_read_up_wmma_bf16_gfx1201_v2`
+//! (exact gfx1201) / `hyper_read_up_wmma_bf16_gfx1151_v2` (exact gfx1151) against the retiled
+//! `_gfx1201_t128` / `_swap` entry it replaces, every output u32 of `mixed`.
 //! Both run through the public route API (`tensor_ops::hyper_read_up_wmma_route`), so the real
 //! JIT-compiled kernels are exercised on the exact bytes.
 //!
@@ -26,8 +27,8 @@
 //!                   segment and F16 +0 elsewhere. Every gate input pattern reaches the epilogue exactly.
 //!
 //! Exit 0: every case byte-identical. 1: a mismatch (first row / col / bits, with NaN-vs-NaN
-//! payload-only differences counted apart from the rest). 2: V2 is not available (not gfx1201 on
-//! the F16 WMMA route). Receipt: `HC_UP_ORACLE_RECEIPT` (default `./hc-up-v2-oracle.txt`).
+//! payload-only differences counted apart from the rest). 2: V2 is not available (neither gfx1201
+//! on the F16 WMMA route nor gfx1151). Receipt: `HC_UP_ORACLE_RECEIPT` (default `./hc-up-v2-oracle.txt`).
 //!
 //! Run: cargo run --release --features lab --example hc_up_v2_oracle -p rdna-compute
 
@@ -312,13 +313,24 @@ fn run_case(gpu: &mut Gpu, w: &GpuTensor, c: &Case, rows: usize) -> Outcome {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.to_string();
-    let available = arch == "gfx1201" && gpu.qwen4_f16_wmma_gfx1201();
+    let available = (arch == "gfx1201" && gpu.qwen4_f16_wmma_gfx1201()) || arch == "gfx1151";
+    let (v2_name, ref_name) = if arch == "gfx1151" {
+        (
+            "hyper_read_up_wmma_bf16_gfx1151_v2",
+            "hyper_read_up_wmma_bf16_swap",
+        )
+    } else {
+        (
+            "hyper_read_up_wmma_bf16_gfx1201_v2",
+            "hyper_read_up_wmma_bf16_gfx1201_t128",
+        )
+    };
     println!(
         "arch {arch} f16_wmma_gfx1201={} v2_available={available}",
         gpu.qwen4_f16_wmma_gfx1201()
     );
     if !available {
-        eprintln!("V2 is not available: it needs exact gfx1201 on the F16 WMMA route");
+        eprintln!("V2 is not available: it needs exact gfx1201 (F16 WMMA route) or exact gfx1151");
         std::process::exit(2);
     }
 
@@ -347,7 +359,7 @@ fn main() {
     writeln!(receipt, "arch {arch}").unwrap();
     writeln!(
         receipt,
-        "kernel hyper_read_up_wmma_bf16_gfx1201_v2 vs hyper_read_up_wmma_bf16_gfx1201_t128 hidden={HIDDEN} low_rank={LOW_RANK} rows={rows_list:?}"
+        "kernel {v2_name} vs {ref_name} hidden={HIDDEN} low_rank={LOW_RANK} rows={rows_list:?}"
     )
     .unwrap();
 

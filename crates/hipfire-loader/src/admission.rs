@@ -1039,7 +1039,7 @@ pub struct SourceAdmission {
     /// arch crate opens at load. `None` = trunk-only (or explicit opt-out via
     /// empty string).
     pub vision_path: Option<std::path::PathBuf>,
-    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// The resolved `vision.mode` ladder value (`auto`/`resident`/`on`/`off`). The
     /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
     /// alone cannot distinguish "off" (never probe a sibling) from "auto with
     /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
@@ -2680,7 +2680,12 @@ pub fn admit_source_with_options(
     } else {
         false
     };
+    // A safetensors directory (ParoQuant) has no HFQ manifest to project from,
+    // and its carrier allocates KV at the admitted `max_seq` without a
+    // post-weight remeasure, so it keeps a fixed context (HIPF-34).
+    let dir_fixed_context = is_dir && matches!(arch_id, 5 | 6) && kv_backend == KvBackend::Vmm;
     let sequence = if matches!(arch_id, 5 | 6)
+        && !is_dir
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
         && !pinned_moe
@@ -2714,9 +2719,15 @@ pub fn admit_source_with_options(
         },
         |resolved| resolved.max_seq,
     );
-    let sequence_reason = (pinned_moe && max_seq == 0).then_some(
-        "max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default",
-    );
+    let sequence_reason = match (max_seq, pinned_moe, dir_fixed_context) {
+        (0, true, _) => {
+            Some("max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default")
+        }
+        (0, _, true) => Some(
+            "max_seq auto-capacity unsupported for safetensors directory sources; using default",
+        ),
+        _ => None,
+    };
     let mut has_vision = probe_vision(&source, arch_id)?;
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
@@ -4796,6 +4807,57 @@ mod tests {
             assert_eq!((sequence.max_seq, sequence.bound), (131072, "pending"));
             assert!(uma.sequence_reason.is_none());
             cleanup(&path);
+        }
+        /// HIPF-34: a safetensors directory (ParoQuant) has no HFQ manifest to
+        /// project from and its carrier never remeasures post-weight VRAM, so
+        /// it keeps a fixed context under VMM KV instead of being refused.
+        #[test]
+        fn safetensors_dir_skips_automatic_vmm_sizing() {
+            let dir =
+                std::env::temp_dir().join(format!("hipfire-paro-dir-admit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":1024,"max_position_embeddings":131072}}"#,
+            )
+            .unwrap();
+            let header =
+                br#"{"model.embed_tokens.weight":{"dtype":"F16","shape":[4,4],"data_offsets":[0,32]}}"#;
+            let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+            shard.extend_from_slice(header);
+            shard.extend_from_slice(&[0u8; 32]);
+            std::fs::write(dir.join("model.safetensors"), shard).unwrap();
+            let hints = KvBackendHints {
+                kv_mode: Some("q8"),
+                vmm_runtime_available: true,
+                free_vram_bytes: Some(96 << 30),
+                ..KvBackendHints::without_device()
+            };
+            let admit = |max_seq| {
+                super::super::admit_source(
+                    dir.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Automatic,
+                    None,
+                    "gfx1151",
+                    None,
+                    "off",
+                    None,
+                    max_seq,
+                    hints,
+                )
+            };
+            let explicit = admit(4096).expect("Dir MoE with explicit max_seq must load");
+            assert_eq!(explicit.kv_backend, KvBackend::Vmm);
+            assert_eq!(explicit.max_seq, 4096);
+            assert!(explicit.sequence.is_none());
+            assert!(explicit.sequence_reason.is_none());
+            let omitted = admit(0).expect("Dir MoE without max_seq must load");
+            assert_eq!(omitted.max_seq, 4096);
+            assert!(omitted.sequence.is_none());
+            assert!(omitted.sequence_reason.is_some());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
     /// The loader gate and the arch resolvers reach the same verdict for the

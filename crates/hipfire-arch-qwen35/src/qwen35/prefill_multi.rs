@@ -1160,6 +1160,7 @@ pub fn forward_prefill_batch_multi(
     reqs: &mut [MultiChunkRequest<'_>],
     hidden_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    crate::qwen35::vl_prefill::refuse_active("multi-request lane prefill")?;
     let refuse = |why: &str| {
         Err(HipError::new(
             0,
@@ -1850,14 +1851,18 @@ pub fn forward_prefill_batch_multi(
                             physical_cap: r.kv_cache.physical_cap,
                         })
                         .collect();
-                    gpu.attention_verify_gqa_fp8_lanes(
+                    // Lanes the singleton serves with the native-fp8 split-KV
+                    // verifier keep their singleton launch over the model's
+                    // own `flash_partials` (batched == singleton); the rest
+                    // share one VerifyAttn tile + reduce.
+                    gpu.attention_verify_fp8_lanes_routed(
                         &attends,
                         lane_partials,
+                        &s.flash_partials,
                         config.n_heads,
                         config.n_kv_heads,
                         config.head_dim,
                     )?;
-                    gpu.attention_verify_reduce_lanes(&attends, lane_partials, config.n_heads)?;
                 } else {
                     for ((r, view), &twin) in reqs.iter_mut().zip(&views).zip(&twin_attn) {
                         let n = r.tokens.len();

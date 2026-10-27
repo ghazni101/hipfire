@@ -190,8 +190,13 @@ fn main() {
         }
 
         eprintln!("Loading vision weights...");
-        let vision_weights = qwen35_vl::load_vision_weights(&hfq, &vision_config, &mut gpu)
-            .expect("failed to load vision weights");
+        let vision_weights = qwen35_vl::load_vision_weights(
+            &hfq,
+            &vision_config,
+            &mut gpu,
+            qwen35_vl::TowerResidency::Resident,
+        )
+        .expect("failed to load vision weights");
 
         eprintln!("Running vision encoder...");
         let t_vis = Instant::now();

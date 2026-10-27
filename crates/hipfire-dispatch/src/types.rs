@@ -688,6 +688,12 @@ pub enum ArchPredicate {
     /// production path). gfx110x has no sdot4 but does have the rdna3 kernel.
     HasHfq3G256Gemv,
     HasMmq,
+    /// MQ6G256 / HFQ6G256 GEMV admission (#478): everything `HasMmq` admits
+    /// (gfx906, RDNA3, RDNA4) plus RDNA1/RDNA2. `gemv_hfq6g256` and
+    /// `gemv_hfq6g256_residual` carry a generic [32,1,1] wave32 scalar baseline
+    /// with no WMMA/MMQ intrinsics (the dp4a/wave64 variants are arch ladders
+    /// above it), so gfx1030 was dead-gated by the table, not by the kernels.
+    HasHfq6Gemv,
     HasCdna3LdsGemv,
     /// `gemv_dp4a_enabled()` — gfx906-only by default (env-overridable).
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
@@ -1045,7 +1051,7 @@ impl KernelKey {
             // wave64 stays excluded (a [32,1,1] kernel needs wave32 lanes).
             MQ3G256 => ArchPredicate::HasWave32,
             MQ5G256 => ArchPredicate::HasMmq,
-            MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
+            MQ6G256 | HFQ6G256 => ArchPredicate::HasHfq6Gemv,
             // MQ2G256LloydU shares MQ2G256Lloyd's kernels byte-for-byte, so it
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,

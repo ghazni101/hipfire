@@ -174,7 +174,7 @@ fn store_cached_turn_self_then_user_inserts_both_channels() {
     assert!(ok, "store should succeed");
     let normalized =
         hipfire_runtime::tokenizer::maybe_normalize_prompt("answer body!").into_owned();
-    let fp_raw = hipfire_generate::common::asst_turn_fingerprint(&normalized, &[]);
+    let fp_raw = hipfire_engine::turn_cache::asst_turn_fingerprint(&normalized, &[]);
     let fp = hipfire_generate::dense::glimmer_turn_key(fp_raw, 0);
     let turn = cache
         .get(&fp)

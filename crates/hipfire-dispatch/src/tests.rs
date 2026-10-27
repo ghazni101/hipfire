@@ -3386,3 +3386,54 @@ fn cpu_exec_redline_conflict_is_exactly_the_conjunction() {
         "no replay controller: no conflict"
     );
 }
+
+/// #478: gfx1030 + MQ6G256/HFQ6G256 crashed with "no implementation for
+/// GemvMq6G256Prerotated" because the GEMV rows were gated `HasMmq`
+/// (gfx906/RDNA3/RDNA4). The kernels are generic wave32 scalar, so every GEMV
+/// variant must resolve on RDNA1/RDNA2, and the previously admitted archs must
+/// keep resolving. CDNA wave64 (no MMQ, not wave32) stays excluded.
+#[test]
+fn mq6_hfq6_gemv_resolves_on_rdna1_rdna2_and_keeps_prior_archs() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let variants = [
+        GemvVariant::Plain,
+        GemvVariant::Prerotated,
+        GemvVariant::WithResidual,
+        GemvVariant::WithSwiGLUResidual,
+    ];
+    for arch in [
+        "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx906", "gfx1100", "gfx1151", "gfx1200",
+        "gfx1201",
+    ] {
+        let ctx = DispatchCtx::for_test(arch);
+        for dtype in [DType::MQ6G256, DType::HFQ6G256] {
+            for variant in variants {
+                // MQ-family weights are only reached pre-rotated; HFQ6 has no
+                // Prerotated key (plain GEMV), so skip an unmapped pairing.
+                if variant == GemvVariant::Prerotated && dtype == DType::HFQ6G256 {
+                    continue;
+                }
+                let r = fam.resolve(dtype, variant, false, &ctx, None);
+                assert!(
+                    r.is_ok(),
+                    "{dtype:?}/{variant:?} must resolve on {arch}: {r:?}"
+                );
+            }
+        }
+    }
+    let cdna = DispatchCtx::for_test("gfx942");
+    assert!(fam
+        .resolve(DType::MQ6G256, GemvVariant::Prerotated, false, &cdna, None)
+        .is_err());
+}
+
+#[test]
+fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
+    assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna1()));
+    assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna2()));
+    assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna3()));
+    assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna4()));
+    assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_gfx906()));
+    assert!(!ArchPredicate::HasHfq6Gemv.eval_arch(&DispatchCtx::for_test("gfx942")));
+}

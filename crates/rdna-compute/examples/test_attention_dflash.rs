@@ -138,6 +138,11 @@ fn run_case(
         "wmma_n64" => gpu
             .attention_dflash_wmma_n64_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
             .unwrap(),
+        "wmma_kvsplit" => assert!(gpu
+            .try_attention_dflash_wmma_kvsplit(
+                &d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd
+            )
+            .unwrap()),
         "wmma_n64_f16kv" => {
             // Cast K and V to f16 first, then attention.
             let d_k_f16 = gpu
@@ -395,6 +400,35 @@ fn main() {
                     println!(
                         "{:>3}  {:>5}  {:>3}  {:>8}  {:>11}  {:>11}  {}",
                         b, l, hd, "wmma_n64", "—", "—", "SKIP (hd!=128)"
+                    );
+                }
+
+                // gfx1151 key-split twin of the N64 tile (the DFlash draft route there).
+                if hd == 128 && gpu.arch == "gfx1151" {
+                    let ks_diff = run_case(
+                        &mut gpu,
+                        "wmma_kvsplit",
+                        b,
+                        l,
+                        n_heads,
+                        n_kv_heads,
+                        hd,
+                        &out_ref,
+                    );
+                    total += 1;
+                    max_err_seen = max_err_seen.max(ks_diff);
+                    if ks_diff >= tol {
+                        failed += 1;
+                    }
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>8}  {:>11.3e}  {:>11}  {}",
+                        b,
+                        l,
+                        hd,
+                        "wmma_kvsplit",
+                        ks_diff,
+                        "—",
+                        if ks_diff < tol { "PASS" } else { "FAIL" }
                     );
                 }
 

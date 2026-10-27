@@ -320,6 +320,7 @@ fn decode_step_body(
                         per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
                         per_expert_down: down_mixed.then_some(down_dtypes),
                     },
+                    mq2_lloyd: None,
                     recipe: MoeRecipe::SigmoidRoutedNoShared,
                     route_policy: None,
                     normalization: MoeNormalization::Provided,

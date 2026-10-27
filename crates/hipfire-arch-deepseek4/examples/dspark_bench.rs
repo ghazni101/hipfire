@@ -34,7 +34,7 @@ use hipfire_arch_deepseek4::spec_decode::logits_argmax;
 use hipfire_arch_deepseek4::{forward, Deepseek4Bundle, DeepseekV4, DeepseekV4State};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::spec::{PrefillOutcome, Speculator};
+use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -68,13 +68,19 @@ fn decode_loop(
     let mut accepted: u64 = 0;
 
     // CACTUS acceptance-boost δ (bench knob; deliberately lossy at δ>0). Now
-    // threaded properly: set_sampling → DsparkDrafter → verify_block_sampled_capture_gpu
+    // threaded properly: configure_request → DsparkDrafter → verify_block_sampled_capture_gpu
     // → final_norm_and_sample_all_batched_lazy → kernel.
     let cactus: f32 = std::env::var("HIPFIRE_DEEPSEEK4_CACTUS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
-    spec.set_sampling(temp, top_p, top_k, cactus);
+    spec.configure_request(SpecRequestConfig {
+        temp,
+        top_p,
+        top_k: u32::try_from(top_k).ok().filter(|&k| k > 0),
+        cactus_delta: cactus,
+        ..SpecRequestConfig::default()
+    });
 
     // The first token is the prefill's argmax; it is emitted as the seed of the
     // first window's continuation (the daemon emits it before stepping).

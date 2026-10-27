@@ -939,7 +939,7 @@ pub fn batch_chunk_full_attn_prepare(
     _start_pos: usize,
     _max_ctx_len: usize,
     _ctx: &DispatchCtx,
-    _batch_semantics: BatchSemantics<'_>,
+    batch_semantics: BatchSemantics<'_>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     _kv_layer_idx: usize,
     layer_idx: usize,
@@ -952,6 +952,44 @@ pub fn batch_chunk_full_attn_prepare(
     fa_gate_in_place: bool,
     tap: Option<BatchedAttentionTap<'_>>,
 ) -> HipResult<()> {
+    // VL prompt chunk (`pbs.mrope`): explicit absolute (t, h, w) phases. The
+    // fused preps carry only 1D phases (and the fp8-Q prep a different Q
+    // format), so take the unfused deinterleave+Q-norm / K-norm chain and
+    // rotate with the batched M-RoPE kernel — the twin of the per-token
+    // `rope_mrope_halfsplit_f32` arm. KV write + attend are unchanged (they
+    // read the physical slots in `pbs.positions`). `pos_offset` is the
+    // cache's compact offset, like `upload_mrope_pos3`.
+    if let Some(mrope) = pbs.mrope {
+        if tree_verify.is_some() || batch_semantics.is_independent() {
+            return Err(HipError::new(
+                0,
+                "VL mrope rows cannot run under tree verify or independent batches",
+            ));
+        }
+        if gfx12_fa_prep || gfx12_fa_prep_fp8q || fa_gate_in_place {
+            return Err(HipError::new(
+                0,
+                "VL mrope rows cannot use the fused gfx12 FA prep (it bakes 1D rope)",
+            ));
+        }
+        fa_prep_unfused_qk_norm(gpu, layer, config, pbs, n)?;
+        if let Some(tap) = tap {
+            tap(gpu, layer_idx, &pbs.fa_q_batch, &pbs.fa_k_batch, n)?;
+        }
+        return gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &mrope.pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            config.n_rot,
+            config.rope_theta,
+            n,
+            kv_cache.compact_offset as i32,
+            mrope.section,
+        );
+    }
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
@@ -1448,8 +1486,9 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
 
 /// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
 /// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
-/// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
-/// the existing rows route). Default off. Read once per process.
+/// split count (`2`, `4`, `8`, `16`, `32` or `64`; default `8`; anything else
+/// fails closed to the existing rows route). Default off. Read once per
+/// process.
 fn gfx12_fa2_split_verify_splits() -> Option<usize> {
     static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
         let on = matches!(
@@ -1465,7 +1504,7 @@ fn gfx12_fa2_split_verify_splits() -> Option<usize> {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(8);
-        matches!(splits, 2 | 4 | 8).then_some(splits)
+        matches!(splits, 2 | 4 | 8 | 16 | 32 | 64).then_some(splits)
     });
     *SPLITS
 }
@@ -2055,6 +2094,30 @@ pub fn batch_chunk_fa_attend(
                 n,
             )?;
         }
+        // Exact-gfx1100 WMMA split-K verify attention (default on;
+        // `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN=0` keeps the routes below). Plain
+        // Q8 K and V only; the launcher declines (Ok(false)) outside 1..=8
+        // rows / H24-KV4-HD256, under capture or recording, or when
+        // `flash_partials` is too small.
+        if kv_cache.quant_q8
+            && kv_cache.v_q8
+            && !kv_cache.quant_fp8
+            && gpu.attention_verify_wmma_q8_gfx1100(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                start_pos + n,
+                n,
+                &s.flash_partials,
+            )?
+        {
+            return Ok(());
+        }
         // Experimental gfx1201 verifier arm: retain the FA2 packed-Q8/LDS
         // front end, split the live KV tile range to restore occupancy at
         // small verifier batches, then combine CK-style LSE/Oacc partials.
@@ -2325,6 +2388,128 @@ pub fn execute_fa_attend_step(
         .map_err(|e| HipError::new(0, &e.to_string()))
 }
 
+/// Rows per F2 pair half. Only two complete halves ever merge, never a
+/// partial chunk.
+pub const FA_PAIR_ROWS: usize = 512;
+/// Merged FA2 batch for one F2 pair.
+pub const FA_PAIR_BATCH: usize = 2 * FA_PAIR_ROWS;
+
+/// One F2 pair half's attend inputs (its own prefill scratch rows) and output.
+pub struct FaPairHalf<'a> {
+    pub q: &'a GpuTensor,
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub positions: &'a GpuTensor,
+    pub out: &'a GpuTensor,
+}
+
+/// Device-side staging for one F2 pair's merged FA2 step: contiguous
+/// 1024-row Q/K/V/positions inputs plus the 1024-row output. Allocated once
+/// per prefill call that forms at least one pair and shared by every FA layer
+/// of every pair (never per-layer).
+pub struct FaPairStage {
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    pos: GpuTensor,
+    out: GpuTensor,
+}
+
+impl FaPairStage {
+    pub fn alloc(gpu: &mut Gpu, dims: &HybridDims) -> HipResult<Self> {
+        let q_dim = dims.n_heads * dims.head_dim;
+        let kv_dim = dims.n_kv_heads * dims.head_dim;
+        let shapes = [q_dim, kv_dim, kv_dim, 1, q_dim].map(|w| FA_PAIR_BATCH * w);
+        // Transactional: free whatever was allocated if a later alloc fails.
+        let mut done: Vec<GpuTensor> = Vec::with_capacity(shapes.len());
+        for n in shapes {
+            match gpu.alloc_tensor(&[n], DType::F32) {
+                Ok(t) => done.push(t),
+                Err(e) => {
+                    for t in done {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let [q, k, v, pos, out]: [GpuTensor; 5] = done.try_into().ok().expect("five stage slots");
+        Ok(Self { q, k, v, pos, out })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        let mut first_err = None;
+        for t in [self.q, self.k, self.v, self.pos, self.out] {
+            if let Err(e) = gpu.free_tensor(t) {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// One merged FA2 step: stage both halves' Q/K/V/positions contiguously,
+    /// run [`execute_fa_attend_step`] once at [`FA_PAIR_BATCH`] rows, split
+    /// the output back into the halves. `start_c` is the first half's absolute
+    /// start; `max_ctx_len` is the value the second half would see.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend(
+        &self,
+        gpu: &mut Gpu,
+        dims: &HybridDims,
+        halves: [FaPairHalf<'_>; 2],
+        s: &FlashScratch<'_>,
+        kv_cache: &KvView<'_>,
+        start_c: usize,
+        max_ctx_len: usize,
+        ctx: &DispatchCtx,
+        layer_idx: usize,
+    ) -> HipResult<()> {
+        let q_bytes = FA_PAIR_ROWS * dims.n_heads * dims.head_dim * 4;
+        let kv_bytes = FA_PAIR_ROWS * dims.n_kv_heads * dims.head_dim * 4;
+        let pos_bytes = FA_PAIR_ROWS * 4;
+        // Same stream throughout: no sync between the staging copies, the
+        // attend step and the split copies.
+        for (dst, bytes, src) in [
+            (&self.q, q_bytes, [halves[0].q, halves[1].q]),
+            (&self.k, kv_bytes, [halves[0].k, halves[1].k]),
+            (&self.v, kv_bytes, [halves[0].v, halves[1].v]),
+            (
+                &self.pos,
+                pos_bytes,
+                [halves[0].positions, halves[1].positions],
+            ),
+        ] {
+            for (h, src) in src.into_iter().enumerate() {
+                gpu.hip
+                    .memcpy_dtod_at(&dst.buf, h * bytes, &src.buf, 0, bytes)?;
+            }
+        }
+        execute_fa_attend_step(
+            gpu,
+            dims,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.pos,
+            &self.out,
+            s,
+            kv_cache,
+            FA_PAIR_BATCH,
+            start_c,
+            max_ctx_len,
+            ctx,
+            None,
+            layer_idx,
+            None,
+        )?;
+        for (h, half) in halves.iter().enumerate() {
+            gpu.hip
+                .memcpy_dtod_at(&half.out.buf, 0, &self.out.buf, h * q_bytes, q_bytes)?;
+        }
+        Ok(())
+    }
+}
+
 /// The fp8q route's single write-then-attend step (what `batch_chunk_fa_attend`
 /// reduces to with `gfx12_fa_prep_fp8q`) with the A4 attention epilogue: the
 /// attention writes the out-projection's A4 slab into a fresh IU4
@@ -2520,25 +2705,31 @@ pub fn batch_chunk_full_attn_attn(
     // launch covers all N tokens at once.
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
-    let gfx12_fa_prep_f32 = gfx12_fa_prep_admitted(gpu, config, fusion, n, tap.is_some());
+    // VL mrope chunks (`pbs.mrope`) rotate in `batch_chunk_full_attn_prepare`'s
+    // unfused mrope arm: every fused prep below bakes 1D rope, and the fp8-Q
+    // prep additionally feeds an fp8-Q attend, so all stay off for them.
+    let vl_mrope = pbs.mrope.is_some();
+    let gfx12_fa_prep_f32 =
+        !vl_mrope && gfx12_fa_prep_admitted(gpu, config, fusion, n, tap.is_some());
     let math = verify_dense_math(gpu);
     // The PM FP8 verify scope has no in-place-gate / A4 out-projection arm
     // (`SingletonWmma` refuses them), so the fp8q prep stays off there.
-    let gfx12_fa_prep_fp8q = gfx12_fa_prep_fp8q_admitted(
-        gpu,
-        config,
-        kv_cache,
-        s,
-        n,
-        start_pos,
-        max_ctx_len,
-        batch_semantics,
-        tree_verify,
-        fa_attn_multirow,
-        fusion,
-        commit_stride,
-        tap.is_some(),
-    );
+    let gfx12_fa_prep_fp8q = !vl_mrope
+        && gfx12_fa_prep_fp8q_admitted(
+            gpu,
+            config,
+            kv_cache,
+            s,
+            n,
+            start_pos,
+            max_ctx_len,
+            batch_semantics,
+            tree_verify,
+            fa_attn_multirow,
+            fusion,
+            commit_stride,
+            tap.is_some(),
+        );
     let gfx12_fa_prep = gfx12_fa_prep_f32 || gfx12_fa_prep_fp8q;
     // Only the new ragged shape is admitted outside the incumbent n/commit
     // predicate. It keeps the F32 attention output (no A4 attention epilogue:
@@ -2594,6 +2785,7 @@ pub fn batch_chunk_full_attn_attn(
         math,
     )?;
     let fa_pm_qprep = fusion == DflashFusionCtx::Off
+        && !vl_mrope
         && !gfx12_fa_prep
         && !gfx12_fa_prep_fp8q
         && !fa_gate_in_place

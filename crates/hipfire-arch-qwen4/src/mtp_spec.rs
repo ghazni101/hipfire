@@ -1217,6 +1217,26 @@ impl Qwen4Bundle {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
+        hidden_out: Option<&mut Vec<f32>>,
+    ) -> Result<SpecAdvance, String> {
+        // The whole advance is one prompt for decode-share: the donor tail is
+        // restored once, after its last tile (`share_finish_prompt`).
+        self.share_prompt_begin();
+        let result = self.spec_advance_tiles(gpu, tokens, start_pos, reset, abort, hidden_out);
+        let finish = self
+            .share_prompt_end(gpu, result.is_ok())
+            .map_err(|error| error.to_string());
+        result.and_then(|advance| finish.map(|()| advance))
+    }
+
+    /// The tile loop of [`Self::spec_advance_from`].
+    fn spec_advance_tiles(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        start_pos: usize,
+        reset: bool,
+        abort: &dyn Fn() -> bool,
         mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         if self.dflash.is_none() {
@@ -1248,8 +1268,7 @@ impl Qwen4Bundle {
             .execution
             .as_ref()
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
-            .scratch
-            .max_chunk;
+            .prompt_chunk_rows();
         self.begin_npu_trunk_request(gpu)
             .map_err(|error| error.to_string())?;
         let plan_end = self
@@ -1336,15 +1355,16 @@ impl Qwen4Bundle {
         }
         let block_size = block_size.max(1);
         let max_chunk = match ops {
-            Qwen4Ops::Single(_) => {
-                self.execution
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "Qwen4 spec scratch requires attached forward resources".to_string()
-                    })?
-                    .scratch
-                    .max_chunk
-            }
+            // The block is the prompt tile the spec hidden capture holds: the
+            // prompt schedule capacity, not the resident bank of a
+            // decode-share load (S4-MAXCHUNK class a).
+            Qwen4Ops::Single(_) => self
+                .execution
+                .as_ref()
+                .ok_or_else(|| {
+                    "Qwen4 spec scratch requires attached forward resources".to_string()
+                })?
+                .prompt_chunk_rows(),
             Qwen4Ops::Mesh(_) => self
                 .pp_chunk_rows()
                 .ok_or_else(|| "Qwen4 spec scratch requires an attached mesh".to_string())?,
@@ -8928,6 +8948,37 @@ impl Qwen4MtpDrafter {
     /// chunk by chunk; each chunk's head continuation runs on the output
     /// device before the next chunk's wide capture can overwrite its rows.
     pub(crate) fn mtp_prefill_ops(
+        &mut self,
+        ops: &mut Qwen4Ops<'_>,
+        target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
+        start_pos: usize,
+        cache_hit: bool,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String> {
+        // The whole prompt is one decode-share prompt: the donor tail is
+        // restored once, after its last tile (`share_finish_prompt`). A mesh
+        // never takes decode-share.
+        let single = !ops.is_mesh();
+        if single {
+            Self::bundle(target)?.share_prompt_begin();
+        }
+        let result =
+            self.mtp_prefill_tiles(ops, target, prompt_tokens, start_pos, cache_hit, abort);
+        if !single {
+            return result;
+        }
+        let ok = result.is_ok();
+        let finish = Self::bundle(target).and_then(|bundle| {
+            bundle
+                .share_prompt_end(ops.gpu()?, ok)
+                .map_err(|error| error.to_string())
+        });
+        result.and_then(|outcome| finish.map(|()| outcome))
+    }
+
+    /// The tile loop of [`Self::mtp_prefill_ops`].
+    fn mtp_prefill_tiles(
         &mut self,
         ops: &mut Qwen4Ops<'_>,
         target: &mut dyn SpecTarget,

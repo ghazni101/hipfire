@@ -18,9 +18,9 @@ use crate::speculative::{
     seed_target_hidden_dense_tp2_abortable, seed_target_hidden_from_prompt_abortable,
     seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
     seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
-    spec_step_dflash, spec_step_dflash_dense_tp2, xorshift_next_unit, DdtreeScratch,
+    spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch,
     DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, SpecStepResult, VerifyScratch,
+    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -988,6 +988,11 @@ mod cycle_trace {
         /// Armed-lookup window kind: appended as trailing
         /// `"kind":..,"k":..,"lookup":..`.
         pub lookup: Option<LookupTag>,
+        /// Certified-window route of this cycle (`whole16`, `hostsplice`,
+        /// `hip:<reason>`): appended as a trailing `"railgun":"<route>"` only
+        /// when `HIPFIRE_DFLASH_RAILGUN_WINDOW=1`; absent otherwise, so
+        /// unset lines are byte-identical.
+        pub railgun: Option<&'static str>,
     }
 
     impl Cycle<'_> {
@@ -1019,6 +1024,9 @@ mod cycle_trace {
                     l.kind, l.k, l.lookup
                 );
             }
+            if let Some(r) = self.railgun {
+                let _ = write!(s, r#","railgun":"{r}""#);
+            }
             s.push('}');
             s
         }
@@ -1045,6 +1053,7 @@ mod cycle_trace {
                 step_us: 1234,
                 ddtree: false,
                 lookup: None,
+                railgun: None,
             };
             assert_eq!(
                 c.line(),
@@ -1069,6 +1078,7 @@ mod cycle_trace {
                 step_us: 0,
                 ddtree: true,
                 lookup: None,
+                railgun: None,
             };
             assert_eq!(
                 c.line(),
@@ -1106,6 +1116,7 @@ mod cycle_trace {
                 step_us: 10,
                 ddtree: false,
                 lookup,
+                railgun: None,
             };
             let plain = mk(None).line();
             assert!(!plain.contains("kind"), "{plain}");
@@ -1394,6 +1405,44 @@ mod lookup {
             self.spliced = r;
             r.map(|(k, _)| k)
         }
+
+        /// Enumerate every decision `splice` could face: `k = 1..n-1` kept
+        /// learned candidates and `offered = 1..=n-k` lookup candidates; build
+        /// the exact `LookupBudget` `splice` builds, run the existing
+        /// `LookupController::plan` and `clamp_tail_take`. Any positive take
+        /// refutes the proof. The controller is only read, so the
+        /// answer is for the state the following `splice` would see.
+        fn declines_every_tail(&self, candidates: usize) -> bool {
+            no_tail_action(self.ctl, self.base, self.position, candidates)
+        }
+    }
+
+    /// `NoTailAction`: true iff no `(k, offered)` decision of a
+    /// `candidates`-candidate learned block yields a positive Tail take.
+    /// Mirrors `TailSource::splice` + `tail_splice` exactly (same budget
+    /// construction, same `plan`, same `clamp_tail_take`); never approximates
+    /// prices and never infers from the previous window's outcome.
+    pub(super) fn no_tail_action(
+        ctl: &LookupController,
+        base: LookupBudget,
+        position: usize,
+        candidates: usize,
+    ) -> bool {
+        let mut base = base;
+        base.native_candidates = candidates;
+        for k in 1..candidates {
+            for offered in 1..=(candidates - k) {
+                let mut b = base;
+                b.model_drafts = k;
+                b.lookup_available = offered;
+                if let LookupAction::Tail { take } = ctl.plan(b, position) {
+                    if clamp_tail_take(take, offered, k, candidates, &b).is_some() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// What `step` decided for this window.
@@ -2032,6 +2081,57 @@ mod lookup {
             }
         }
 
+        /// `no_tail_action` against an independent enumeration of the decision
+        /// space `TailSource::splice` can face (`k = 1..15`, `offered =
+        /// 1..=15-k`, the same `plan` + `clamp_tail_take`) on fresh, priced and
+        /// tail-trained controllers.
+        #[test]
+        fn no_tail_action_matches_the_splice_decision_space() {
+            let (prompt, a) = mk_history();
+            let mut s = st(true);
+            s.begin_request(&prompt);
+            let base = lookup_budget(16, 16, 64, 1000, 100_000);
+            let decides = |ctl: &LookupController, k: usize, offered: usize| -> bool {
+                let mut b = base;
+                b.native_candidates = 15;
+                b.model_drafts = k;
+                b.lookup_available = offered;
+                match ctl.plan(b, 1000) {
+                    LookupAction::Tail { take } => {
+                        clamp_tail_take(take, offered, k, 15, &b).is_some()
+                    }
+                    _ => false,
+                }
+            };
+            let any_take =
+                |ctl: &LookupController| (1..15).any(|k| (1..=15 - k).any(|o| decides(ctl, k, o)));
+            let mut states = vec![s.ctl.clone()];
+            for _ in 0..12 {
+                let o = window_outcome(Ran::Native, 16, 1, &a[8..23], &a[8..23], 1000, 40_000.0);
+                s.ctl.observe(&o);
+            }
+            states.push(s.ctl.clone());
+            for _ in 0..12 {
+                let o = window_outcome(
+                    Ran::Tail { k: 3, l: 4 },
+                    8,
+                    7,
+                    &a[8..15],
+                    &a[8..15],
+                    1000,
+                    30_000.0,
+                );
+                s.ctl.observe(&o);
+            }
+            states.push(s.ctl.clone());
+            for ctl in &states {
+                assert_eq!(no_tail_action(ctl, base, 1000, 15), !any_take(ctl));
+            }
+            // Degenerate windows have no tail slot: always declined.
+            assert!(no_tail_action(&states[0], base, 1000, 0));
+            assert!(no_tail_action(&states[0], base, 1000, 1));
+        }
+
         #[test]
         fn lookup_arming_reasons_and_load_lines() {
             assert_eq!(arming(&inputs()), Ok(true));
@@ -2233,6 +2333,10 @@ pub struct DflashSpeculator {
     /// (`speculation.dflash_lookup`). `None` = not armed: the unarmed `step`
     /// is the incumbent window with no lookup state at all.
     lookup: Option<lookup::LookupState>,
+    /// Certified railgun DFlash window owner (design A). `None` unless
+    /// `HIPFIRE_DFLASH_RAILGUN_WINDOW=1` was read at build: the unset path
+    /// never constructs it, so it is the incumbent speculator exactly.
+    railgun: Option<crate::dflash_railgun::RailgunWindowOwner>,
 }
 
 /// Pre-window mark of the last completed window (terminal-prefix repair).
@@ -2282,6 +2386,7 @@ impl DflashSpeculator {
             trace_seq: 0,
             trace_cyc: 0,
             lookup: None,
+            railgun: None,
         }
     }
 
@@ -2295,6 +2400,15 @@ impl DflashSpeculator {
     /// `None` while the lane state is vacant.
     pub fn verify_pm4_mut(&mut self) -> Option<&mut DflashVerifyPm4> {
         self.df.as_mut().map(|df| &mut df.verify_pm4)
+    }
+
+    /// Resolved DeltaNet checkpoint cadence of this speculator.
+    pub fn checkpoint_policy(&self) -> DflashCheckpointPolicy {
+        DflashCheckpointPolicy {
+            resume_enabled: self.resume_enabled,
+            interval: self.ck_interval,
+            cap: self.ck_cap,
+        }
     }
 
     /// The lane state is currently moved out ([`Self::take_vmm_lane`]); the
@@ -2708,6 +2822,9 @@ impl Speculator for DflashSpeculator {
         // seed is not `emitted.last()`): the incumbent call, nothing observed.
         let mut lk_ran: Option<lookup::Ran> = None;
         let mut lk_probe = false;
+        if let Some(owner) = self.railgun.as_mut() {
+            owner.clear_route();
+        }
         let mut lk_wall_us = 0.0f64;
         let result = if let Some(dd) = df.ddtree.as_mut() {
             // Tree node budget is structural; max_accept is the commit bound.
@@ -2814,7 +2931,7 @@ impl Speculator for DflashSpeculator {
                 _ => None,
             };
             let call_t0 = ran.is_some().then(std::time::Instant::now);
-            let res = spec_step_dflash(
+            let res = spec_step_dflash_with_railgun(
                 gpu,
                 slot,
                 &df.draft_weights,
@@ -2849,6 +2966,10 @@ impl Speculator for DflashSpeculator {
                 max_accept,
                 Some(&mut df.verify_pm4),
                 lookup_arg,
+                self.railgun.as_mut().map(|owner| RailgunStep {
+                    owner,
+                    probe: lk_probe,
+                }),
             );
             if let Some(t) = call_t0 {
                 lk_wall_us = t.elapsed().as_secs_f64() * 1e6;
@@ -2968,6 +3089,7 @@ impl Speculator for DflashSpeculator {
                             k,
                             lookup,
                         }),
+                        railgun: self.railgun.as_ref().and_then(|o| o.last_route()),
                     }
                     .line(),
                 );
@@ -2979,6 +3101,9 @@ impl Speculator for DflashSpeculator {
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
         self.last_window = None;
+        if let Some(owner) = self.railgun.as_mut() {
+            owner.invalidate();
+        }
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.
         let df = self
@@ -3011,6 +3136,9 @@ impl Speculator for DflashSpeculator {
             df.draft_scratch.reset_upload_tracking();
         }
         self.last_window = None;
+        if let Some(owner) = self.railgun.as_mut() {
+            owner.invalidate();
+        }
         self.adaptive.reset();
         if let Some(lk) = self.lookup.as_mut() {
             lk.end_request();
@@ -3196,8 +3324,14 @@ impl Speculator for DflashSpeculator {
             df,
             vacant,
             checkpoints,
+            railgun,
             ..
         } = *self;
+        // Prepared windows and the builder's staging/selector buffers first:
+        // nothing is in flight between windows.
+        if let Some(owner) = railgun {
+            owner.release(gpu);
+        }
         if let Some(df) = df {
             df.free_gpu(gpu);
         }
@@ -3267,7 +3401,35 @@ pub fn build_dflash_speculator(
         hipfire_config::dflash_lookup_enabled(),
         hipfire_config::dflash_lookup_tail_enabled(),
     );
+    if crate::dflash_railgun::window_var_enabled() {
+        speculator.enable_railgun_window();
+    }
     Box::new(speculator)
+}
+
+impl DflashSpeculator {
+    /// Arm the certified railgun window (design A). Called once at build when
+    /// `HIPFIRE_DFLASH_RAILGUN_WINDOW=1`; windows the owner does not admit run
+    /// the ordinary HIP route with a counted, log-once refusal.
+    pub fn enable_railgun_window(&mut self) {
+        if self.railgun.is_none() {
+            eprintln!(
+                "[dflash] railgun window: enabled ({}=1; exact gfx1201 dense 27B, FP8 KV, fixed-16 greedy chain only)",
+                crate::dflash_railgun::RAILGUN_WINDOW_VAR
+            );
+            let mut owner = crate::dflash_railgun::RailgunWindowOwner::new();
+            owner.install_builder(Box::new(
+                crate::dflash_railgun_builder::RailgunWindowBuilder::from_env(),
+            ));
+            self.railgun = Some(owner);
+        }
+    }
+
+    /// The window owner (counters, quarantine, builder install); `None` when
+    /// the variable was unset at build.
+    pub fn railgun_window_mut(&mut self) -> Option<&mut crate::dflash_railgun::RailgunWindowOwner> {
+        self.railgun.as_mut()
+    }
 }
 
 // ─── Shared-asset VMM lanes (continuous batching) ───────────────────────

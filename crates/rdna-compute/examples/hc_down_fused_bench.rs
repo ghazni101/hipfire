@@ -2,9 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipEvent microbench: the fused gfx1201 Qwen4 HC-down launch
-//! (`Gpu::gemm_bf16_xf16_hc_down_fused`) against the two launches' worth of work it replaces
-//! (`gemm_bf16_xf16_f16_wmma` = split-K=4 tile + reducer, then `hc_activation_fused_f32` with
+//! hipEvent microbench: the fused gfx1201 / gfx1151 Qwen4 HC-down launch
+//! (`Gpu::gemm_bf16_xf16_hc_down_fused`) against the launches' worth of work it replaces
+//! (`gemm_bf16_xf16_f16_wmma` = gfx1201: split-K=4 tile + reducer; gfx1151: the 160 x 64 tile
+//! from 2048 rows; then `hc_activation_fused_f32` with
 //! `bf16_out`). Weight 320 x 10240 BF16 (F16 shadow built by the host), X F16 [rows, 10240].
 //!
 //! Per row count:
@@ -13,12 +14,15 @@
 //! * gemm / act / fused single: 40 individually event-bracketed calls, median per call (this
 //!   includes the launch gap to the event, so it overstates the back-to-back cost).
 //!
-//! X is reused across calls (so X <= the 64 MiB MALL stays cache-hot for both routes alike).
+//! X is reused across calls (so X <= the MALL stays cache-hot for both routes alike; at 8192
+//! rows X is 168 MB, DRAM-resident on both).
 //!
 //! Bytes per row (analytic, DRAM-ideal; each tensor counted once per touch, the 6.5 MB weight
 //! shadow is excluded):
-//!   before = X read 10240*2 + split partials write 4*320*4 + reducer partials read 4*320*4
+//!   gfx1201 before = X read 10240*2 + split partials write 4*320*4 + reducer partials read 4*320*4
 //!            + Y write 320*4 + activation Y read 320*4 + BF16 write 320*2 = 33920 B
+//!   gfx1151 before = X read TWICE (two 160-row M tiles) 2*10240*2 + Y write 320*4
+//!            + activation Y read 320*4 + BF16 write 320*2 = 43200 B
 //!   after  = X read 10240*2 + BF16 write 320*2                              = 21120 B
 //!
 //! `ROWS=a,b,..` overrides the row list. Run:
@@ -34,7 +38,8 @@ const SCALE: f32 = 0.25;
 const CALLS: usize = 40;
 const BATCHES: usize = 9;
 
-const BYTES_BEFORE: usize = K * 2 + 4 * M * 4 + 4 * M * 4 + M * 4 + M * 4 + M * 2;
+const BYTES_BEFORE_1201: usize = K * 2 + 4 * M * 4 + 4 * M * 4 + M * 4 + M * 4 + M * 2;
+const BYTES_BEFORE_1151: usize = 2 * K * 2 + M * 4 + M * 4 + M * 2;
 const BYTES_AFTER: usize = K * 2 + M * 2;
 
 fn lcg(n: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -121,6 +126,11 @@ fn single(gpu: &mut Gpu, mut f: impl FnMut(&mut Gpu)) -> f64 {
 
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
+    let bytes_before = if gpu.arch == "gfx1151" {
+        BYTES_BEFORE_1151
+    } else {
+        BYTES_BEFORE_1201
+    };
     println!(
         "arch {} applies(320,10240,4096)={} HIPFIRE_QWEN4_HC_DOWN_FUSED={:?}",
         gpu.arch,
@@ -128,10 +138,9 @@ fn main() {
         std::env::var("HIPFIRE_QWEN4_HC_DOWN_FUSED").unwrap_or_default()
     );
     println!(
-        "bytes/row accounting (weight shadow excluded): before = X 10240*2 + partial wr 4*320*4 + partial rd 4*320*4 \
-         + Y wr 320*4 + Y rd (activation) 320*4 + bf16 wr 320*2 = {BYTES_BEFORE} B; \
+        "bytes/row accounting (weight shadow excluded, see the header): before = {bytes_before} B; \
          after = X 10240*2 + bf16 wr 320*2 = {BYTES_AFTER} B ({:.3}x fewer)",
-        BYTES_BEFORE as f64 / BYTES_AFTER as f64
+        bytes_before as f64 / BYTES_AFTER as f64
     );
     println!("timing: {CALLS} calls/batch x {BATCHES} batches (min/med per call); gemm/act/fused1 = median of {CALLS} single event pairs");
 
@@ -143,7 +152,7 @@ fn main() {
                 .map(|t| t.parse().unwrap())
                 .collect()
         })
-        .unwrap_or_else(|| vec![512, 1024, 1536, 2048, 3072, 4096, 8192, 16384]);
+        .unwrap_or_else(|| vec![256, 512, 1024, 1536, 2048, 4096, 8192, 16384]);
     let max_rows = *rows_list.iter().max().unwrap();
 
     let wb: Vec<u16> = lcg(M * K, 11, 0.05).iter().map(|&v| bf16_bits(v)).collect();
@@ -204,26 +213,33 @@ fn main() {
             )
             .unwrap();
         });
-        let fused_ok = gpu
-            .gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
-            .is_ok();
-        let (fmin, fmed, f1) = if fused_ok {
-            let (a, b) = batched(&mut gpu, |g| {
-                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
-                    .unwrap();
-            });
-            let s = single(&mut gpu, |g| {
-                g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
-                    .unwrap();
-            });
-            (a, b, s)
-        } else {
-            (f64::NAN, f64::NAN, f64::NAN)
-        };
-        println!(
-            "{rows:>6} {cmin:>8.1} {cmed:>8.1} {gemm:>7.1} {act:>7.1} {fmin:>8.1} {fmed:>8.1} {f1:>8.1} {applies:>8} {:>6.3}x {BYTES_BEFORE:>9} {BYTES_AFTER:>9}",
-            cmin / fmin
-        );
+        {
+            let name = if gpu.arch == "gfx1151" {
+                "qwen4_hc_down_fused_gfx1151"
+            } else {
+                "qwen4_hc_down_fused_b64_k32"
+            };
+            let fused_ok = gpu
+                .gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
+                .is_ok();
+            let (fmin, fmed, f1) = if fused_ok {
+                let (a, b) = batched(&mut gpu, |g| {
+                    g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
+                        .unwrap();
+                });
+                let s = single(&mut gpu, |g| {
+                    g.gemm_bf16_xf16_hc_down_fused(&weight, &x, &fused_out, M, K, rows, SCALE)
+                        .unwrap();
+                });
+                (a, b, s)
+            } else {
+                (f64::NAN, f64::NAN, f64::NAN)
+            };
+            println!(
+                "{rows:>6} {cmin:>8.1} {cmed:>8.1} {gemm:>7.1} {act:>7.1} {fmin:>8.1} {fmed:>8.1} {f1:>8.1} {applies:>8} {:>6.3}x {bytes_before:>9} {BYTES_AFTER:>9}  {name}",
+                cmin / fmin
+            );
+        }
         for t in [x, y, low, fused_out] {
             gpu.free_tensor(t).unwrap();
         }

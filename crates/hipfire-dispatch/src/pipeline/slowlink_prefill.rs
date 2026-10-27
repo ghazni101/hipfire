@@ -2197,6 +2197,7 @@ fn run_k1_cohort(
                     false,
                     false,
                     false,
+                    false,
                     dt.route,
                 )?;
                 if let Some(tmp) = tmp.as_ref() {
@@ -4083,6 +4084,7 @@ pub mod selftest {
                 &p,
                 selection.resolution,
                 p.x_residual,
+                false,
                 false,
                 false,
                 false,

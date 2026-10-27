@@ -24,6 +24,7 @@ use hipfire_arch_qwen35::speculative;
 use hipfire_engine::emit::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{
     currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
@@ -424,42 +425,16 @@ pub fn qwen_ar_raw_commit_token(
     }
 }
 
-/// Cache-store action derived from a finish. Production and tests share this
-/// so `store_cache` is never asserted in isolation from the sink mutation.
-#[derive(Debug, Clone)]
-pub struct QwenArCacheAction {
-    pub store: bool,
-    pub fingerprint_text: String,
-    pub tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-}
-
+/// Cache-store action derived from a Qwen AR finish.
 pub fn qwen_ar_cache_action(
     finish: &QwenArRouteFinish,
     visible_for_cache: &str,
-) -> QwenArCacheAction {
-    QwenArCacheAction {
+) -> TurnCacheAction {
+    TurnCacheAction {
         store: finish.store_cache,
         fingerprint_text: crate::common::normalize_asst_turn_for_fingerprint(visible_for_cache),
         tool_calls: finish.wire_tool_calls.clone(),
     }
-}
-
-/// Apply a cache action through a shared insert seam (production `AsstTurnCache`
-/// or a test `HashMap`). Returns the fingerprint key when a store happened.
-pub fn qwen_ar_apply_cache_action<F>(
-    mut insert: F,
-    action: &QwenArCacheAction,
-    cached_seq: Vec<u32>,
-) -> Option<u64>
-where
-    F: FnMut(u64, Vec<u32>),
-{
-    if !action.store || cached_seq.is_empty() {
-        return None;
-    }
-    let fp = crate::common::asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
-    Some(fp)
 }
 
 /// Build the full Qwen AR `done` envelope (hostile-id safe). Used to stage
@@ -1684,6 +1659,8 @@ pub struct GenerationRouteInputs {
     pub ep: bool,
     /// EP-shaped topology that is actually a dense tensor-parallel trunk
     /// (`EpArch::Qwen35DenseTp`), the one mesh route that carries a drafter.
+    /// The generic mesh-executor route (`EpArch::Qwen35MeshTp`) carries none
+    /// (no MTP/DFlash/n-gram), so it stays `false` and serves on the EP AR arm.
     pub dense_tp: bool,
     pub pp: usize,
     pub has_speculator: bool,
@@ -1913,23 +1890,6 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     } else {
         GenerationRoute::Unknown
     }
-}
-
-#[inline]
-pub fn llama_qwen3_batched_prefill_eligible(
-    gpu_arch: &str,
-    model_arch: llama::ModelArch,
-    prefill_batched_enabled: bool,
-    quant_q8: bool,
-    has_eviction: bool,
-    token_count: usize,
-) -> bool {
-    model_arch == llama::ModelArch::Qwen3
-        && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
-        && prefill_batched_enabled
-        && quant_q8
-        && !has_eviction
-        && token_count >= 4
 }
 
 #[inline]
@@ -2444,7 +2404,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         let nl_set: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
         let cached_seq =
             crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
-        let _ = qwen_ar_apply_cache_action(
+        let _ = apply_turn_cache_action(
             |fp, seq| {
                 m.asst_turn_cache.insert(
                     fp,
@@ -2837,6 +2797,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
@@ -2864,6 +2828,10 @@ pub fn generate(
                 top_p,
                 top_k,
                 min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
             };
             crate::qwen::generate_ep(
                 m,
@@ -3459,6 +3427,24 @@ pub fn generate(
                 };
                 eprintln!(
                     "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
+                );
+            }
+            // Greedy + non-neutral penalty: DFlash verify implements no token
+            // penalties (`select_generation_route`: `qwen_greedy_route`), so the
+            // request is AR. A registry default (qwen3.5:9b general
+            // presence_penalty 1.5, injected by `serve` at tp<=1) triggers this
+            // on every request without the client ever sending a penalty.
+            else if m.speculator.is_some()
+                && route_inputs.nonneutral_penalties
+                && hipfire_loader::carrier_for(m.arch_id)
+                    .map(|c| c.caps().supports_dflash())
+                    .unwrap_or(false)
+                && !route_inputs.force_ar_chat
+            {
+                eprintln!(
+                    "[hipfire] id={id}: DFlash spec disabled -> AR (non-neutral repeat/presence/frequency penalty \
+                     repeat={repeat_penalty} presence={presence_penalty} frequency={frequency_penalty}; DFlash verify applies no penalties; \
+                     the registry default or config generation.presence_penalty may set it, 0 re-enables DFlash). Penalties honored; spec speedup off."
                 );
             }
         }
@@ -4061,7 +4047,7 @@ pub fn generate(
                     let stripped = crate::common::strip_think_for_fingerprint(&msg.content);
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-                    let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
                     // flat token vector, so project the content slot out of the per-channel
                     // cache value. Qwen turns are content-only, so nothing is dropped. The
@@ -6055,7 +6041,7 @@ pub fn generate(
             // Shared AR/spec value contract (`qwen_cached_turn_entry`): FULL
             // generated body verbatim plus the producer reasoning text.
             let tok = m.tokenizer.as_ref().unwrap();
-            let _ = qwen_ar_apply_cache_action(
+            let _ = apply_turn_cache_action(
                 |fp, seq| {
                     m.asst_turn_cache.insert(
                         fp,
@@ -6084,9 +6070,8 @@ pub fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = request_seed;
-        let batched_prefill = llama_qwen3_batched_prefill_eligible(
+        let batched_prefill = llama::llama_batched_prefill_eligible(
             &gpu.arch,
-            config.arch,
             hipfire_runtime::config::get().prefill_batched,
             kv.quant_q8,
             has_eviction,

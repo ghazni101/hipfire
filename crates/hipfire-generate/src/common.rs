@@ -16,6 +16,7 @@ use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_engine::turn_cache::*;
 use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::spec::{
@@ -42,64 +43,6 @@ pub(crate) fn latch_request_think_cap(
     *force_answer_latched = true;
     latch_gen_mark.get_or_insert(generated);
     newly_latched
-}
-
-/// Stable fingerprint over an assistant turn — pair of (text content,
-/// tool_calls canonical JSON). Output is identical for two messages
-/// that have the same content+tool_calls regardless of how the
-/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
-/// upstream. Used by the V4F prefix-cache to identify "this is the
-/// same assistant turn the model previously emitted, so reuse the
-/// emitted token IDs verbatim instead of re-encoding via the DSML
-/// renderer + BPE (which is not bijective)."
-pub fn asst_turn_fingerprint(
-    content: &str,
-    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    "assistant".hash(&mut h);
-    if tool_calls.is_empty() {
-        // Pure-text turn — content IS the message. Trim whitespace
-        // to absorb minor formatting drift between store (model's
-        // verbatim emission) and lookup (whatever the client preserved).
-        content.trim().hash(&mut h);
-    } else {
-        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
-        // the tool_calls — pi-coding-agent (and most OpenAI-compat
-        // clients) sends `content: null` on assistant messages that
-        // carry tool_calls, even when the model originally emitted
-        // prose ahead of the tool block (e.g. "Let me check the
-        // structure first.<｜DSML｜tool_calls>…"). The store-side
-        // sees the prose in `emit_text_buf`; the lookup-side sees
-        // content=`""`. Excluding content from the fingerprint when
-        // tool_calls is non-empty matches the client's effective
-        // identity for tool-call turns and lets the cache hit.
-        //
-        // Collision risk: two distinct turns with identical
-        // tool_calls hash to the same key; the later store wins,
-        // and a replay of the earlier turn replays the later turn's
-        // tokens. In practice this only matters when the model emits
-        // the SAME tool_call twice with different surrounding prose
-        // in the same conversation — uncommon for agent flows, and
-        // the worst-case effect is the model seeing slightly altered
-        // prose in its own history.
-    }
-    for tc in tool_calls {
-        tc.name.hash(&mut h);
-        // Serialize args in a CANONICAL form: walk the Value tree and
-        // emit objects with keys sorted lexically (recursively). The
-        // upstream `serde_json::Map` uses insertion order — fine for
-        // round-tripping a single payload, but two clients (or two
-        // parser passes on the same payload) can yield different
-        // insertion orders for the same logical args. Without
-        // canonicalization those two turns hash to DIFFERENT keys,
-        // dropping cache hit rate on otherwise-identical tool calls.
-        let args = canonical_json(&tc.arguments);
-        args.hash(&mut h);
-    }
-    h.finish()
 }
 
 /// Build the fingerprint-key string for an emitted assistant turn so
@@ -734,64 +677,38 @@ pub fn ds4_ar_ep_finish_route(
     }
 }
 
-/// Cache-store action for DS4 AR/EP/spec — production and tests share this seam
-/// so `store_cache` is never asserted in isolation from the sink mutation.
-/// Fingerprint text + wire tool_calls match `build_deepseek4_dsml_prompt` lookup.
-#[derive(Debug, Clone)]
-pub struct Ds4CacheAction {
-    pub store: bool,
-    pub fingerprint_text: String,
-    pub tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
+/// DS4 cache action for a safe terminal. Fingerprint text + wire tool_calls
+/// match `build_deepseek4_dsml_prompt` lookup; the stored `cached_seq` is the
+/// verbatim raw `streamed_tokens` body (no surround EOS/Assistant markers).
+/// Empty trimmed content AND no tool_calls collides on the hash of
+/// ("assistant", "") — such dead-weight empty turns never store.
+pub fn ds4_turn_cache_action(
+    store: bool,
+    visible_for_cache: &str,
+    tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
+) -> TurnCacheAction {
+    let fingerprint_text = normalize_asst_turn_for_fingerprint(visible_for_cache);
+    let replayable = !fingerprint_text.trim().is_empty() || !tool_calls.is_empty();
+    TurnCacheAction {
+        store: store && replayable,
+        fingerprint_text,
+        tool_calls,
+    }
 }
 
 /// Derive cache action from the AR/EP pure route terminal.
 pub fn ds4_ar_ep_cache_action(
     terminal: &Ds4ArEpRouteTerminal,
     visible_for_cache: &str,
-) -> Ds4CacheAction {
+) -> TurnCacheAction {
     match terminal {
-        Ds4ArEpRouteTerminal::Malformed(_) => Ds4CacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
+        Ds4ArEpRouteTerminal::Malformed(_) => TurnCacheAction::skip(),
         Ds4ArEpRouteTerminal::Safe {
             store_cache,
             wire_tool_calls,
             ..
-        } => Ds4CacheAction {
-            store: *store_cache,
-            fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
-            tool_calls: wire_tool_calls.clone(),
-        },
+        } => ds4_turn_cache_action(*store_cache, visible_for_cache, wire_tool_calls.clone()),
     }
-}
-
-/// Apply a DS4 cache action through a shared insert seam (production
-/// `AsstTurnCache` or a test `HashMap`). Returns the fingerprint when stored.
-/// `cached_seq` must be the verbatim raw `streamed_tokens` body expected by
-/// `build_deepseek4_dsml_prompt` replay (no surround EOS/Assistant markers).
-pub fn ds4_apply_cache_action<F>(
-    mut insert: F,
-    action: &Ds4CacheAction,
-    cached_seq: Vec<u32>,
-) -> Option<u64>
-where
-    F: FnMut(u64, Vec<u32>),
-{
-    if !action.store || cached_seq.is_empty() {
-        return None;
-    }
-    // Empty trimmed content AND no tool_calls collides on the hash of
-    // ("assistant", "") — skip the same dead-weight empty turns AR/EP skip.
-    let have_replayable_payload =
-        !action.fingerprint_text.trim().is_empty() || !action.tool_calls.is_empty();
-    if !have_replayable_payload {
-        return None;
-    }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
-    Some(fp)
 }
 
 /// Pure Commit/Abort side-effect gate for DS4 AR / EP / spec successful

@@ -98,6 +98,12 @@ pub struct PerBGraphCache {
     /// DFlash verify lm_head + argmax tail. Callers check this before
     /// deciding whether to enqueue lm_head outside the graph.
     pub lmhead_argmax: HashSet<usize>,
+    /// Subset of cache entries captured with the gfx1201 native-fp8 split-KV
+    /// verifier route (see `Gpu::fp8_fa2_split_verify_admitted`). The route
+    /// depends on the live context, which a replay cannot change, so a
+    /// caller compares this class with the window's own before each replay
+    /// and re-captures on a mismatch.
+    pub fp8_split: HashSet<usize>,
 }
 
 /// Graph-capture state split across AR forward, DFlash verify, and DeltaNet replay.
@@ -473,6 +479,33 @@ impl GraphState {
         self.verify.lmhead_argmax.insert(b);
     }
 
+    /// Was the captured verify graph for `b` recorded with the native-fp8
+    /// split-KV verifier route?
+    pub fn verify_graph_has_fp8_split(&self, b: usize) -> bool {
+        self.verify.fp8_split.contains(&b)
+    }
+
+    /// Mark the captured verify graph for `b` as recorded with the
+    /// native-fp8 split-KV verifier route.
+    pub fn verify_mark_graph_fp8_split(&mut self, b: usize) {
+        self.verify.fp8_split.insert(b);
+    }
+
+    /// Destroy the captured verify graph for `b` (and its warmup, so the
+    /// next window at `b` warms up and captures again), leaving every other
+    /// batch size. The caller must have synchronized the stream the graph
+    /// was launched on.
+    pub fn verify_graph_destroy(&mut self, hip: &HipRuntime, device_id: i32, b: usize) {
+        bind_thread_or_warn(hip, device_id);
+        if let Some((graph, exec, _blobs)) = self.verify.cache.remove(&b) {
+            let _ = hip.graph_exec_destroy(exec);
+            let _ = hip.graph_destroy(graph);
+        }
+        self.verify.warmed_up.remove(&b);
+        self.verify.lmhead_argmax.remove(&b);
+        self.verify.fp8_split.remove(&b);
+    }
+
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
         bind_thread_or_warn(hip, device_id);
@@ -482,6 +515,7 @@ impl GraphState {
         }
         self.verify.warmed_up.clear();
         self.verify.lmhead_argmax.clear();
+        self.verify.fp8_split.clear();
         self.verify.capturing = None;
     }
 
@@ -633,6 +667,7 @@ impl GraphState {
             warmed_up: HashSet::new(),
             capturing: None,
             lmhead_argmax: HashSet::new(),
+            fp8_split: HashSet::new(),
         };
         Self {
             capture_mode: false,

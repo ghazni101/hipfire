@@ -203,7 +203,7 @@ fn main() {
         });
 
         // The fused MoE front: its F16-X + IU4 producer with and without the A8 third output.
-        let front = if gpu.qwen4_moe_front_fuse_applies() {
+        let front = if gpu.arch == "gfx1201" && gpu.qwen4_moe_front_fuse_applies() {
             let f0 = time_us(&mut gpu, |gpu| {
                 gpu.qwen4_moe_front_producer(&x, H, n).unwrap();
             });

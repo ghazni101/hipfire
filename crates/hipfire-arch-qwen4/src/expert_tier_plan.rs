@@ -143,6 +143,97 @@ pub struct HostWindow {
     pub spans: Vec<(ExpertSlabSpan, u64)>,
 }
 
+/// Label of the decode-share donor mirror host window.
+pub const DECODE_SHARE_MIRROR_LABEL: &str = "decode-share-donor-mirror";
+
+/// The donor tail of a decode-share plan ([`ExpertTierPlan::with_decode_share`]).
+///
+/// Device layout: non-donor device experts from offset 0, then an always-zero
+/// guard of one tail pad, then the donors back to back (`donor_offset ..
+/// donor_offset + donor_bytes`), then the usual owner tail pad. The donors'
+/// source bytes are mirrored in the host owner so that mirror byte `i` equals
+/// device donor byte `i`: one contiguous H2D copy restores any prefix of the
+/// tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeShareTail {
+    /// Donor model ids (layer*512+expert), (layer, expert) ascending == physical order.
+    pub donors: Vec<u32>,
+    /// Device-owner offset of the always-zero guard placed between the last non-donor and the first donor.
+    pub guard_offset: u64,
+    /// Device-owner offset of the first donor byte (256-aligned). Donor bytes are contiguous to donor_offset + donor_bytes.
+    pub donor_offset: u64,
+    /// Contiguous donor extent B (sum of the donors' 256-padded projections; no gaps).
+    pub donor_bytes: u64,
+    /// Host-owner offset of the mirror window start; mirror byte i == device donor byte i for i < donor_bytes.
+    pub mirror_offset: u64,
+    /// The BorrowPrefill view: identical to the plan's entries except donors, which are
+    /// `Placement::HostMapped` with offsets into the host owner (inside the mirror window).
+    pub borrow_entries: Vec<ExpertTierEntry>,
+    /// Dirty byte prefix of each prefill capacity class, ascending: class `c`
+    /// overwrites `[donor_offset, donor_offset + class_spans[c])` while it is
+    /// the largest class of a borrow epoch. One entry (the whole tail) until
+    /// [`ExpertTierPlan::with_decode_share_classes`] sets the real spans; empty
+    /// without donors.
+    pub class_spans: Vec<u64>,
+    /// `class_donors[c]`: donors (physical order) whose device extent starts
+    /// below `donor_offset + class_spans[c]`, i.e. the donors class `c` dirties
+    /// (a partially overlapped donor counts). Nested ascending; the last is
+    /// `donors.len()`.
+    pub class_donors: Vec<usize>,
+    /// Bytes at the START of the donor tail (`donor_offset ..`) that hold the
+    /// borrowed F16 / INT8 weight shadows, rebuilt at the first acquire of
+    /// every borrow epoch ([`ExpertTierPlan::with_decode_share_shadows`]); the
+    /// scratch backing starts right after them. 0 when the shadows stay
+    /// resident. Every class span includes these bytes (the shadow region is
+    /// dirtied by every class).
+    pub shadow_bytes: u64,
+}
+
+impl DecodeShareTail {
+    /// Donors (physical order) whose device extent starts below the first
+    /// `span` bytes of the donor tail: the donors a scratch span of `span`
+    /// bytes dirties. Donor `k` starts at the mirror-relative offset of its
+    /// gate/up payload (mirror byte `i` == device donor byte `i`).
+    pub fn donors_dirtied_by(&self, span: u64) -> usize {
+        self.donors.partition_point(|&id| {
+            self.borrow_entries[id as usize]
+                .gate_up_offset
+                .saturating_sub(self.mirror_offset)
+                < span
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeShareError {
+    /// The eligible resident experts cannot supply `need` bytes.
+    Insufficient {
+        need: u64,
+        available: u64,
+    },
+    Overflow,
+    /// The plan already carries a donor tail; a plan is re-laid out once.
+    AlreadyShared,
+    /// The class spans are empty, descending, or do not end at the last donor.
+    BadClasses(String),
+}
+
+impl fmt::Display for DecodeShareError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Insufficient { need, available } => write!(
+                f,
+                "decode-share needs {need} donor bytes but the eligible resident experts hold {available}"
+            ),
+            Self::Overflow => write!(f, "decode-share plan arithmetic overflowed u64"),
+            Self::AlreadyShared => write!(f, "plan already carries a decode-share donor tail"),
+            Self::BadClasses(why) => write!(f, "decode-share class spans are invalid: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeShareError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertTierPlan {
     entries: Vec<ExpertTierEntry>,
@@ -151,6 +242,7 @@ pub struct ExpertTierPlan {
     host_bytes: u64,
     device_experts: usize,
     host_windows: Vec<HostWindow>,
+    decode_share: Option<DecodeShareTail>,
     artifact_sha256: Option<[u8; 32]>,
     digest: [u8; 32],
 }
@@ -234,6 +326,11 @@ impl ExpertTierPlan {
 
     pub fn entry(&self, layer: usize, expert: usize) -> Option<&ExpertTierEntry> {
         self.entries.get(Self::index(layer, expert)?)
+    }
+
+    /// Every entry in model id order (`layer * 512 + expert`).
+    pub fn entries(&self) -> &[ExpertTierEntry] {
+        &self.entries
     }
 
     /// `(gate_up, down)` source spans in the artifact.
@@ -353,6 +450,249 @@ impl ExpertTierPlan {
         self.artifact_sha256 = Some(sha);
         self.digest = self.recompute_digest();
         self
+    }
+
+    /// The donor tail of a plan built by [`Self::with_decode_share`].
+    pub fn decode_share_tail(&self) -> Option<&DecodeShareTail> {
+        self.decode_share.as_ref()
+    }
+
+    /// Re-lay out this (already admitted) plan with a donor tail of at least
+    /// `need_bytes`.
+    ///
+    /// Donors are the coldest `Device` experts of `rank` (walked from its end)
+    /// whose layer has at least one `HostMapped` expert in this plan, taken
+    /// until their padded payloads sum to `>= need_bytes`. Membership never
+    /// changes: the `Device` set and `device_experts` are identical before and
+    /// after; only offsets move (see [`DecodeShareTail`] for the layout). The
+    /// donors' source spans are appended as a host window labelled
+    /// [`DECODE_SHARE_MIRROR_LABEL`], in physical order, so the mirror is
+    /// byte-aligned with the device donor extent.
+    ///
+    /// `need_bytes == 0` returns the plan unchanged with an empty tail (no
+    /// donors, no guard, no window). Ids of `rank` that are out of range or
+    /// repeat are skipped (the plan builder already rejected them).
+    pub fn with_decode_share(
+        mut self,
+        rank: &[u32],
+        need_bytes: u64,
+    ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
+        use DecodeShareError::{AlreadyShared, Insufficient, Overflow};
+        if self.decode_share.is_some() {
+            return Err(AlreadyShared);
+        }
+        if need_bytes == 0 {
+            let tail = DecodeShareTail {
+                donors: Vec::new(),
+                guard_offset: 0,
+                donor_offset: 0,
+                donor_bytes: 0,
+                mirror_offset: 0,
+                borrow_entries: self.entries.clone(),
+                class_spans: Vec::new(),
+                class_donors: Vec::new(),
+                shadow_bytes: 0,
+            };
+            return Ok((self, tail));
+        }
+        let padded = |e: &ExpertTierEntry| -> Result<u64, DecodeShareError> {
+            align_up(e.gate_up_len)
+                .zip(align_up(e.down_len))
+                .and_then(|(g, d)| g.checked_add(d))
+                .ok_or(Overflow)
+        };
+
+        // Eligibility: Device here, in a layer that has a host expert here.
+        let mut layer_has_host = vec![false; TRUNK_LAYERS as usize];
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.tier == Placement::HostMapped {
+                layer_has_host[i / EXPERTS] = true;
+            }
+        }
+
+        // Selection: coldest eligible first.
+        let mut is_donor = vec![false; TOTAL_EXPERTS];
+        let mut got = 0u64;
+        for &id in rank.iter().rev() {
+            let idx = id as usize;
+            let Some(e) = self.entries.get(idx) else {
+                continue;
+            };
+            if e.tier != Placement::Device || !layer_has_host[idx / EXPERTS] || is_donor[idx] {
+                continue;
+            }
+            got = got.checked_add(padded(e)?).ok_or(Overflow)?;
+            is_donor[idx] = true;
+            if got >= need_bytes {
+                break;
+            }
+        }
+        if got < need_bytes {
+            return Err(Insufficient {
+                need: need_bytes,
+                available: got,
+            });
+        }
+
+        // Device layout: non-donors, guard, donors.
+        let place = |e: &mut ExpertTierEntry, cursor: &mut u64| -> Result<(), DecodeShareError> {
+            let gate_up_offset = align_up(*cursor).ok_or(Overflow)?;
+            let after_gu = gate_up_offset.checked_add(e.gate_up_len).ok_or(Overflow)?;
+            let down_offset = align_up(after_gu).ok_or(Overflow)?;
+            *cursor = down_offset.checked_add(e.down_len).ok_or(Overflow)?;
+            e.gate_up_offset = gate_up_offset;
+            e.down_offset = down_offset;
+            Ok(())
+        };
+        let mut cursor = 0u64;
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            if e.tier == Placement::Device && !is_donor[i] {
+                place(e, &mut cursor)?;
+            }
+        }
+        let guard_offset = align_up(cursor).ok_or(Overflow)?;
+        let donor_offset =
+            align_up(guard_offset.checked_add(tail_pad()).ok_or(Overflow)?).ok_or(Overflow)?;
+        cursor = donor_offset;
+        let mut donors = Vec::new();
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            if is_donor[i] {
+                place(e, &mut cursor)?;
+                donors.push(u32::try_from(i).map_err(|_| Overflow)?);
+            }
+        }
+        let donor_end = align_up(cursor).ok_or(Overflow)?;
+        let donor_bytes = donor_end - donor_offset;
+        assert_eq!(
+            donor_bytes, got,
+            "donor extent must equal the sum of padded donor payloads"
+        );
+        self.device_bytes = donor_end.checked_add(tail_pad()).ok_or(Overflow)?;
+
+        // Mirror window: the donors' source spans in physical order.
+        let mut spans = Vec::with_capacity(donors.len() * 2);
+        for &id in &donors {
+            let (gu, dn) = self.source[id as usize];
+            spans.push(gu);
+            spans.push(dn);
+        }
+        let mut plan = self
+            .with_host_window(DECODE_SHARE_MIRROR_LABEL, &spans)
+            .map_err(|_| Overflow)?;
+        let window = plan.host_windows.last().expect("window just appended");
+        let mirror_offset = window.spans.first().ok_or(Overflow)?.1;
+
+        // One contiguous copy must restore the whole tail: mirror byte i == device byte i.
+        let mut borrow_entries = plan.entries.clone();
+        for (k, &id) in donors.iter().enumerate() {
+            let e = &plan.entries[id as usize];
+            let (gu_dst, dn_dst) = (window.spans[2 * k].1, window.spans[2 * k + 1].1);
+            for (host_dst, device_off) in [(gu_dst, e.gate_up_offset), (dn_dst, e.down_offset)] {
+                let host_rel = host_dst.checked_sub(mirror_offset).ok_or(Overflow)?;
+                let device_rel = device_off.checked_sub(donor_offset).ok_or(Overflow)?;
+                if host_rel != device_rel {
+                    return Err(Overflow);
+                }
+            }
+            let b = &mut borrow_entries[id as usize];
+            b.tier = Placement::HostMapped;
+            b.gate_up_offset = gu_dst;
+            b.down_offset = dn_dst;
+        }
+        let mirror_end = mirror_offset.checked_add(donor_bytes).ok_or(Overflow)?;
+        if mirror_end > plan.host_bytes {
+            return Err(Overflow);
+        }
+
+        let donors_len = donors.len();
+        let tail = DecodeShareTail {
+            donors,
+            guard_offset,
+            donor_offset,
+            donor_bytes,
+            mirror_offset,
+            borrow_entries,
+            class_spans: vec![donor_bytes],
+            class_donors: vec![donors_len],
+            shadow_bytes: 0,
+        };
+        plan.decode_share = Some(tail.clone());
+        Ok((plan, tail))
+    }
+
+    /// Set the prefill capacity classes of this plan's donor tail: `spans[c]` is
+    /// the byte prefix of the tail class `c` dirties (scratch span of the class,
+    /// ascending). Computes `class_donors` (the donors each class dirties; a
+    /// donor partially overlapped counts) and requires the last class to dirty
+    /// every donor and no span to exceed the tail. A plan without donors is
+    /// returned unchanged.
+    pub fn with_decode_share_classes(mut self, spans: &[u64]) -> Result<Self, DecodeShareError> {
+        let Some(tail) = self.decode_share.as_mut() else {
+            return Ok(self);
+        };
+        if tail.donors.is_empty() {
+            return Ok(self);
+        }
+        let bad = |why: &str| Err(DecodeShareError::BadClasses(why.to_string()));
+        if spans.is_empty() {
+            return bad("no classes");
+        }
+        if spans.windows(2).any(|pair| pair[0] > pair[1]) {
+            return bad("spans descend");
+        }
+        if spans.last().is_some_and(|&last| last > tail.donor_bytes) {
+            return bad("a span exceeds the donor tail");
+        }
+        let class_donors: Vec<usize> = spans
+            .iter()
+            .map(|&span| tail.donors_dirtied_by(span))
+            .collect();
+        if class_donors.last() != Some(&tail.donors.len()) {
+            return bad("the largest class does not dirty every donor");
+        }
+        tail.class_spans = spans.to_vec();
+        tail.class_donors = class_donors;
+        Ok(self)
+    }
+
+    /// Declare the first `shadow_bytes` of this plan's donor tail to be the
+    /// borrowed shadow region (every class span already includes it, so
+    /// `class_spans[0] >= shadow_bytes`; the region is 256-aligned). A plan
+    /// without donors is returned unchanged (and `shadow_bytes` must be 0).
+    pub fn with_decode_share_shadows(
+        mut self,
+        shadow_bytes: u64,
+    ) -> Result<Self, DecodeShareError> {
+        let Some(tail) = self.decode_share.as_mut() else {
+            return if shadow_bytes == 0 {
+                Ok(self)
+            } else {
+                Err(DecodeShareError::BadClasses(
+                    "shadow bytes without a donor tail".to_string(),
+                ))
+            };
+        };
+        if shadow_bytes % 256 != 0 {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region is not 256-aligned".to_string(),
+            ));
+        }
+        if tail
+            .class_spans
+            .first()
+            .is_some_and(|&first| first < shadow_bytes)
+        {
+            return Err(DecodeShareError::BadClasses(
+                "a class span is smaller than the shadow region".to_string(),
+            ));
+        }
+        if shadow_bytes > tail.donor_bytes {
+            return Err(DecodeShareError::BadClasses(
+                "the shadow region exceeds the donor tail".to_string(),
+            ));
+        }
+        tail.shadow_bytes = shadow_bytes;
+        Ok(self)
     }
 
     fn recompute_digest(&self) -> [u8; 32] {
@@ -503,6 +843,7 @@ pub fn plan_expert_tiers_from_slabs(
         host_bytes,
         device_experts,
         host_windows: Vec::new(),
+        decode_share: None,
         artifact_sha256: None,
         digest,
     })
@@ -1029,5 +1370,382 @@ mod tests {
         assert!(e.to_string().contains("gfx1100"));
         let _: &dyn std::error::Error = &e;
         assert_eq!(CODEC_W2, 2);
+    }
+
+    // ---- decode-share donor tail ----
+
+    fn model_ids(layer: usize, experts: std::ops::Range<usize>) -> Vec<u32> {
+        experts.map(|e| (layer * EXPERTS + e) as u32).collect()
+    }
+
+    fn device_plan(rank: &[u32]) -> ExpertTierPlan {
+        plan_expert_tiers_from_slabs(&uniform(), rank, u64::MAX).unwrap()
+    }
+
+    /// Every device projection as `(offset, padded_len)`.
+    fn device_ranges(plan: &ExpertTierPlan) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for id in 0..TOTAL_EXPERTS {
+            let e = plan.entry(id / EXPERTS, id % EXPERTS).unwrap();
+            if e.tier == Placement::Device {
+                out.push((e.gate_up_offset, align_up(e.gate_up_len).unwrap()));
+                out.push((e.down_offset, align_up(e.down_len).unwrap()));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Every structural promise of `with_decode_share`, checked against the
+    /// pre-sharing plan.
+    fn check_shared(
+        before: &ExpertTierPlan,
+        after: &ExpertTierPlan,
+        tail_info: &DecodeShareTail,
+        rank: &[u32],
+        need: u64,
+    ) {
+        let pad = tail();
+        assert_eq!(after.decode_share_tail(), Some(tail_info));
+        // Membership and counts unchanged.
+        assert_eq!(after.device_experts(), before.device_experts());
+        let mut layer_has_host = [false; 48];
+        for id in 0..TOTAL_EXPERTS {
+            let (l, e) = (id / EXPERTS, id % EXPERTS);
+            let (b, a) = (before.entry(l, e).unwrap(), after.entry(l, e).unwrap());
+            assert_eq!(b.tier, a.tier, "tier of {id}");
+            assert_eq!(
+                (b.format, b.gate_up_len, b.down_len),
+                (a.format, a.gate_up_len, a.down_len)
+            );
+            assert_eq!(before.source(l, e), after.source(l, e));
+            layer_has_host[l] |= b.tier == Placement::HostMapped;
+        }
+        // Donors: ascending, Device, in the admitted rank, eligible layer.
+        let ids = &tail_info.donors;
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        let mut donor_sum = 0;
+        for &id in ids {
+            let (l, e) = (id as usize / EXPERTS, id as usize % EXPERTS);
+            assert_eq!(before.entry(l, e).unwrap().tier, Placement::Device);
+            assert!(rank.contains(&id));
+            assert!(layer_has_host[l], "donor {id} sits in an all-device layer");
+            donor_sum += PADDED;
+        }
+        assert_eq!(tail_info.donor_bytes, donor_sum);
+        assert!(tail_info.donor_bytes >= need);
+        // Coldest first: dropping the hottest donor must fall short of `need`.
+        assert!(tail_info.donor_bytes - PADDED < need);
+        // Layout.
+        let end = tail_info.donor_offset + tail_info.donor_bytes;
+        assert_eq!(tail_info.donor_offset % 256, 0);
+        assert_eq!(tail_info.guard_offset % 256, 0);
+        assert_eq!(tail_info.donor_offset, tail_info.guard_offset + pad);
+        assert_eq!(after.owner_bytes(Placement::Device), end + pad);
+        let ranges = device_ranges(after);
+        for (off, len) in &ranges {
+            assert_eq!(off % 256, 0);
+            assert!(len > &0);
+        }
+        for w in ranges.windows(2) {
+            assert!(w[0].0 + w[0].1 <= w[1].0, "overlap {w:?}");
+        }
+        let donor_set: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        for id in 0..TOTAL_EXPERTS {
+            let e = after.entry(id / EXPERTS, id % EXPERTS).unwrap();
+            if e.tier != Placement::Device {
+                continue;
+            }
+            let projs = [
+                (e.gate_up_offset, align_up(e.gate_up_len).unwrap()),
+                (e.down_offset, align_up(e.down_len).unwrap()),
+            ];
+            for (off, len) in projs {
+                if donor_set.contains(&(id as u32)) {
+                    assert!(off >= tail_info.donor_offset && off + len <= end);
+                } else {
+                    // Non-donors lie wholly below the guard.
+                    assert!(
+                        off + len <= tail_info.guard_offset,
+                        "non-donor {id} past guard"
+                    );
+                }
+                // Guard disjoint.
+                assert!(off + len <= tail_info.guard_offset || off >= tail_info.guard_offset + pad);
+            }
+        }
+        // Mirror window: exactly the donors' source spans in donor order.
+        let w = after.host_windows().last().unwrap();
+        assert_eq!(w.label, DECODE_SHARE_MIRROR_LABEL);
+        let expect: Vec<ExpertSlabSpan> = ids
+            .iter()
+            .flat_map(|&id| {
+                let (gu, dn) = before
+                    .source(id as usize / EXPERTS, id as usize % EXPERTS)
+                    .unwrap();
+                [gu, dn]
+            })
+            .collect();
+        assert_eq!(w.spans.iter().map(|(s, _)| *s).collect::<Vec<_>>(), expect);
+        assert_eq!(w.spans[0].1, tail_info.mirror_offset);
+        // Rule 5: host_dst - mirror_offset == device_offset - donor_offset.
+        for (k, &id) in ids.iter().enumerate() {
+            let e = after
+                .entry(id as usize / EXPERTS, id as usize % EXPERTS)
+                .unwrap();
+            assert_eq!(
+                w.spans[2 * k].1 - tail_info.mirror_offset,
+                e.gate_up_offset - tail_info.donor_offset
+            );
+            assert_eq!(
+                w.spans[2 * k + 1].1 - tail_info.mirror_offset,
+                e.down_offset - tail_info.donor_offset
+            );
+        }
+        assert!(
+            tail_info.mirror_offset + tail_info.donor_bytes
+                <= after.owner_bytes(Placement::HostMapped)
+        );
+        // borrow_entries differ from the plan's entries only at donors.
+        assert_eq!(tail_info.borrow_entries.len(), TOTAL_EXPERTS);
+        for id in 0..TOTAL_EXPERTS {
+            let plan_entry = after.entry(id / EXPERTS, id % EXPERTS).unwrap();
+            let borrow = &tail_info.borrow_entries[id];
+            if let Some(k) = ids.iter().position(|&d| d as usize == id) {
+                assert_eq!(borrow.tier, Placement::HostMapped);
+                assert_eq!(borrow.gate_up_offset, w.spans[2 * k].1);
+                assert_eq!(borrow.down_offset, w.spans[2 * k + 1].1);
+                assert_eq!(
+                    (borrow.gate_up_len, borrow.down_len),
+                    (plan_entry.gate_up_len, plan_entry.down_len)
+                );
+                assert_eq!(borrow.format, plan_entry.format);
+            } else {
+                assert_eq!(borrow, plan_entry, "entry {id}");
+            }
+        }
+        // Digest covers the new layout.
+        assert_ne!(after.logical_digest(), before.logical_digest());
+    }
+
+    #[test]
+    fn decode_share_exact_layout_and_size() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        let (after, t) = before.clone().with_decode_share(&rank, 3 * PADDED).unwrap();
+        assert_eq!(t.donors, vec![5, 6, 7]);
+        assert_eq!(t.donor_bytes, 3 * PADDED);
+        // Five non-donors: 4 * 1536 + 1024 + 500 payload bytes end.
+        let non_donor_end = 4 * PADDED + 1024 + DN as u64;
+        assert_eq!(t.guard_offset, align_up(non_donor_end).unwrap());
+        assert_eq!(t.donor_offset, t.guard_offset + tail());
+        assert_eq!(
+            after.owner_bytes(Placement::Device),
+            t.donor_offset + 3 * PADDED + tail()
+        );
+        let e5 = after.entry(0, 5).unwrap();
+        assert_eq!(
+            (e5.gate_up_offset, e5.down_offset),
+            (t.donor_offset, t.donor_offset + 1024)
+        );
+        let e7 = after.entry(0, 7).unwrap();
+        assert_eq!(e7.gate_up_offset, t.donor_offset + 2 * PADDED);
+        // Non-donors keep the dense (layer, expert) prefix layout.
+        let e4 = after.entry(0, 4).unwrap();
+        assert_eq!(e4.gate_up_offset, 4 * PADDED);
+        check_shared(&before, &after, &t, &rank, 3 * PADDED);
+    }
+
+    #[test]
+    fn decode_share_layout_with_odd_lengths_and_several_layers() {
+        let slabs = slabs_with(|_| (ExpertFormat::Mq4Xts, 1001, 3));
+        let rank: Vec<u32> = [model_ids(2, 0..30), model_ids(5, 100..140)].concat();
+        let before = plan_expert_tiers_from_slabs(&slabs, &rank, u64::MAX).unwrap();
+        let need = 40 * 1280;
+        let (after, t) = before.clone().with_decode_share(&rank, need).unwrap();
+        // 1001 -> 1024, 3 -> 256: 1280 padded per expert; the 40 coldest are layer 5's.
+        assert_eq!(t.donor_bytes, need);
+        assert_eq!(t.donors, model_ids(5, 100..140));
+        assert_eq!(after.device_experts(), 70);
+        assert_eq!(
+            after.owner_bytes(Placement::Device),
+            t.donor_offset + need + tail()
+        );
+        assert_eq!(
+            after.decode_share_tail().unwrap().borrow_entries[(5 * EXPERTS + 100)].tier,
+            Placement::HostMapped
+        );
+    }
+
+    #[test]
+    fn decode_share_invariants_over_mixed_ranks() {
+        // Resident experts spread over several layers, hot to cold.
+        let mut rank = Vec::new();
+        for e in 0..40 {
+            for l in [0usize, 3, 7, 47] {
+                rank.push((l * EXPERTS + e) as u32);
+            }
+        }
+        let before = device_plan(&rank);
+        for need in [1, PADDED, 7 * PADDED - 3, 50 * PADDED, 160 * PADDED] {
+            let (after, t) = before.clone().with_decode_share(&rank, need).unwrap();
+            check_shared(&before, &after, &t, &rank, need);
+        }
+    }
+
+    #[test]
+    fn decode_share_skips_experts_of_all_device_layers() {
+        // Layer 0 is entirely resident and coldest; layer 1 has 3 resident experts
+        // (and 509 host experts). Layer 0 never donates.
+        let mut rank = model_ids(1, 0..3);
+        rank.extend(model_ids(0, 0..512));
+        let before = device_plan(&rank);
+        assert_eq!(before.device_experts(), 515);
+
+        let (after, t) = before.clone().with_decode_share(&rank, 2 * PADDED).unwrap();
+        assert_eq!(t.donors, model_ids(1, 1..3));
+        check_shared(&before, &after, &t, &rank, 2 * PADDED);
+        // Layer 0's tier is untouched in both views.
+        for e in 0..512 {
+            assert_eq!(after.entry(0, e).unwrap().tier, Placement::Device);
+            assert_eq!(t.borrow_entries[e].tier, Placement::Device);
+        }
+
+        // Exactly three eligible experts exist; a fourth is not borrowable.
+        assert!(before.clone().with_decode_share(&rank, 3 * PADDED).is_ok());
+        assert_eq!(
+            before.with_decode_share(&rank, 3 * PADDED + 1),
+            Err(DecodeShareError::Insufficient {
+                need: 3 * PADDED + 1,
+                available: 3 * PADDED
+            })
+        );
+    }
+
+    #[test]
+    fn decode_share_insufficient_budget() {
+        // Nothing resident.
+        let none = device_plan(&[]);
+        assert_eq!(
+            none.with_decode_share(&[], 1),
+            Err(DecodeShareError::Insufficient {
+                need: 1,
+                available: 0
+            })
+        );
+        // A fully resident machine has no host expert anywhere: nothing donates.
+        let all: Vec<u32> = (0..TOTAL_EXPERTS as u32).collect();
+        let plan = device_plan(&all);
+        assert_eq!(
+            plan.with_decode_share(&all, 1),
+            Err(DecodeShareError::Insufficient {
+                need: 1,
+                available: 0
+            })
+        );
+        // Short by one byte.
+        let rank = model_ids(0, 0..4);
+        let plan = device_plan(&rank);
+        assert_eq!(
+            plan.with_decode_share(&rank, 4 * PADDED + 1),
+            Err(DecodeShareError::Insufficient {
+                need: 4 * PADDED + 1,
+                available: 4 * PADDED
+            })
+        );
+    }
+
+    #[test]
+    fn decode_share_one_expert_and_exact_fit_boundary() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        // need == one expert's padded bytes: exactly the coldest expert.
+        let (after, t) = before.clone().with_decode_share(&rank, PADDED).unwrap();
+        assert_eq!(t.donors, vec![7]);
+        assert_eq!(t.donor_bytes, PADDED);
+        check_shared(&before, &after, &t, &rank, PADDED);
+        // One byte more needs the second-coldest too.
+        let (after, t) = before.clone().with_decode_share(&rank, PADDED + 1).unwrap();
+        assert_eq!(t.donors, vec![6, 7]);
+        assert_eq!(t.donor_bytes, 2 * PADDED);
+        check_shared(&before, &after, &t, &rank, PADDED + 1);
+        // One byte less than one expert is still one expert.
+        let (_, t) = before.clone().with_decode_share(&rank, PADDED - 1).unwrap();
+        assert_eq!(t.donors, vec![7]);
+        // Donate every resident expert of the only host-bearing layer.
+        let (after, t) = before.with_decode_share(&rank, 8 * PADDED).unwrap();
+        assert_eq!(t.donors, model_ids(0, 0..8));
+        assert_eq!(t.guard_offset, 0);
+        assert_eq!(
+            after.owner_bytes(Placement::Device),
+            tail() + 8 * PADDED + tail()
+        );
+    }
+
+    #[test]
+    fn decode_share_need_zero_is_identity() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        let (after, t) = before.clone().with_decode_share(&rank, 0).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.logical_digest(), before.logical_digest());
+        assert!(after.host_windows().is_empty());
+        assert!(after.decode_share_tail().is_none());
+        assert!(t.donors.is_empty());
+        assert_eq!(
+            (
+                t.guard_offset,
+                t.donor_offset,
+                t.donor_bytes,
+                t.mirror_offset
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            t.borrow_entries,
+            (0..TOTAL_EXPERTS)
+                .map(|id| *before.entry(id / EXPERTS, id % EXPERTS).unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn decode_share_digest_changes_only_with_sharing() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        let twin = device_plan(&rank);
+        assert_eq!(before.logical_digest(), twin.logical_digest());
+        let (a, _) = before.clone().with_decode_share(&rank, PADDED).unwrap();
+        let (b, _) = before.clone().with_decode_share(&rank, 2 * PADDED).unwrap();
+        let (a2, _) = twin.with_decode_share(&rank, PADDED).unwrap();
+        assert_ne!(a.logical_digest(), before.logical_digest());
+        assert_ne!(a.logical_digest(), b.logical_digest());
+        assert_eq!(a.logical_digest(), a2.logical_digest());
+        assert_eq!(a.logical_digest(), a.recompute_digest());
+        // A sharing plan cannot be re-shared.
+        assert_eq!(
+            a.with_decode_share(&rank, PADDED).map(|_| ()),
+            Err(DecodeShareError::AlreadyShared)
+        );
+    }
+
+    #[test]
+    fn decode_share_keeps_existing_host_windows_and_rejects_duplicate_ranks() {
+        let rank = model_ids(0, 0..8);
+        let mtp = [ExpertSlabSpan {
+            offset: 9_000_000,
+            len: 777,
+        }];
+        let before = device_plan(&rank).with_host_window("mtp", &mtp).unwrap();
+        let (after, t) = before.clone().with_decode_share(&rank, 2 * PADDED).unwrap();
+        assert_eq!(after.host_windows().len(), 2);
+        assert_eq!(after.host_windows()[0], before.host_windows()[0]);
+        assert!(t.mirror_offset >= 1024);
+        check_shared(&before, &after, &t, &rank, 2 * PADDED);
+        // The plan builder, not the sharing pass, rejects a duplicate rank.
+        assert_eq!(
+            plan_expert_tiers_from_slabs(&uniform(), &[1, 2, 1], u64::MAX),
+            Err(ExpertTierError::RankDuplicate { id: 1 })
+        );
     }
 }

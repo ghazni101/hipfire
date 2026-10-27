@@ -3,12 +3,14 @@
 scripts/device-mesh/matrix.json. Existing harnesses/tests plus thin
 daemon-JSONL drivers for G1/G2 rows. Predicates parse structured output."""
 import argparse
+import collections
 import hashlib
 import json
 import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -106,12 +108,26 @@ def run_cmd(argv, env_extra, timeout):
     env = isolated_env(env_extra)
     start = time.time()
     try:
-        proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
-        return {"rc": proc.returncode, "out": proc.stdout + proc.stderr,
-                "stdout": proc.stdout, "elapsed": round(time.time() - start, 1)}
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        rc = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
-        return {"rc": rc, "out": "%s" % exc, "elapsed": 0.0}
+        # Own session: on timeout the whole tree dies. Killing only `cargo`
+        # orphans the test binary, which keeps the GPU busy for later rows.
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    except FileNotFoundError as exc:
+        return {"rc": 127, "out": "%s" % exc, "elapsed": 0.0}
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        rc, err = 124, "%s\ntimed out after %ss (process group killed)\n" % (err, timeout)
+    return {"rc": rc, "out": out + err, "stdout": out, "elapsed": round(time.time() - start, 1)}
+
+def porcelain_dirty(porcelain):
+    """True when `git status --porcelain` shows a tracked change. The untracked
+    `target-fi/` build dir (the #844 fault-inject daemon) is not a source
+    change and must not flip git.dirty on an otherwise-clean checkout."""
+    return any(l for l in porcelain.splitlines() if l and not l.startswith("?? target-fi/"))
 
 def git_identity(root):
     def git(*args):
@@ -120,7 +136,7 @@ def git_identity(root):
     return {"head": git("rev-parse", "HEAD") or "unknown",
             "branch": git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
             "base_beta": git("merge-base", "HEAD", "origin/beta") or "unknown",
-            "dirty": bool(git("status", "--porcelain"))}
+            "dirty": porcelain_dirty(git("status", "--porcelain"))}
 def best_effort(argv, limit=1024):
     res = run_cmd(argv, None, 30)
     return (res["out"][:limit] if res["rc"] == 0 else "unavailable: %s" % res["out"][:200]).strip()
@@ -137,6 +153,40 @@ def platform_probe():
 
 def has_gpu():
     return os.path.exists("/dev/kfd") or os.path.exists("/dev/dri")
+
+def rocr_reservation():
+    """Reserved ROCr tokens from the inherited ROCR_VISIBLE_DEVICES (the
+    fabric reservation on a multi-tenant host, e.g. ['GPU-9eb7…', 'GPU-0852…']).
+    Empty when the host is unrestricted."""
+    return [d.strip() for d in os.environ.get("ROCR_VISIBLE_DEVICES", "").split(",") if d.strip()]
+
+def reserved_devices(selector):
+    """Translate a comma-separated numeric device selector into the reserved
+    ROCr tokens. A numeric list is read by the daemon as PCI-order physical
+    cards (`[hardware].devices="0,1"`), which escapes a UUID reservation;
+    mapping each HIP index to its reserved ROCr token names the reserved cards
+    instead. Non-numeric tokens (UUID/PCI/gfxNNNN) and out-of-range indices
+    pass through. With no reservation the selector is returned unchanged (HIP
+    order == physical order)."""
+    reserved = rocr_reservation()
+    if not reserved:
+        return selector
+    def one(tok):
+        tok = tok.strip()
+        return reserved[int(tok)] if tok.isdigit() and int(tok) < len(reserved) else tok
+    return ",".join(one(t) for t in selector.split(",") if t.strip())
+
+def singleton_probe_env(dev):
+    """Env for probing a single HIP device `dev`. Under a fabric reservation
+    the inherited ROCR_VISIBLE_DEVICES still names the whole pair, which the
+    daemon refuses against a singleton HIP index; map HIP index n to its
+    reserved ROCr token plus HIP 0 and leave the full-pair case unchanged."""
+    reserved = rocr_reservation()
+    if dev is not None and reserved and str(dev).isdigit():
+        idx = int(dev)
+        if idx < len(reserved):
+            return {"HIP_VISIBLE_DEVICES": "0", "ROCR_VISIBLE_DEVICES": reserved[idx]}
+    return {"HIP_VISIBLE_DEVICES": dev} if dev is not None else {}
 
 def parse_cargo(text):
     counts = [(int(m.group(2)), int(m.group(3))) for m in CARGO_RE.finditer(text)]
@@ -349,6 +399,10 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
         finally:
             lines.put(None)
     threading.Thread(target=pump, daemon=True).start()
+    # An undrained stderr pipe blocks the daemon once ~64 KiB of load/kernel
+    # logging accumulates, which surfaces as an opaque `load: timed out`.
+    err_tail = collections.deque(maxlen=200)
+    threading.Thread(target=lambda: err_tail.extend(proc.stderr), daemon=True).start()
     budgets = {"until": 0.0}
     def read_line(context):
         rest = budgets["until"] - time.time()
@@ -463,6 +517,7 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
         except subprocess.TimeoutExpired:
             proc.kill()
         run["vram_raw"] = best_effort(["rocm-smi", "--showmeminfo", "vram"], 500)
+        run["stderr_tail"] = "".join(list(err_tail))[-4000:]
     return run
 
 def split_env(cmd):
@@ -507,7 +562,8 @@ def row_mapping(ctx, row, out):
     return {"$MODEL": model, "$MODEL_ALT": os.path.join(models_dir(), base), "$MODEL_DIR": os.path.dirname(model),
             "$MODELS_DIR": models_dir(), "$OUT": out, "$DAEMON_BIN": ctx["daemon_bin"] or "",
             "$CLI_BIN": ctx["cli_bin"] or "", "$PROMPT": row.get("prompt", ""),
-            "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", "")}
+            "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", ""),
+            "$DEVICES": reserved_devices("0,1")}
 def prompt_identity(ctx, row, mapping):
     if row.get("prompt"):
         return hashlib.md5(row["prompt"].encode()).hexdigest()
@@ -585,10 +641,14 @@ def save_logs(out, row_id, kind, results):
 def run_negatives(ctx, row, mapping, env, timeout):
     pred = row.get("negative_predicate") or {}
     kind = pred.get("kind", "")
+    # Positives receive the substituted row env (sub in execute_row); the
+    # negative probes must too, or `$CLI_BIN`/`$DAEMON_BIN` stay raw and the
+    # negative bypasses the operator's launcher.
+    sub = dict(ctx, row_env=env)
     if row.get("negative_session"):
         runs = [drive_session(ctx["daemon_bin"], row["negative_session"], mapping, env, timeout)]
         return eval_wire(runs, kind, pred), runs
-    results = [r for r in (exec_probe(ctx, c, timeout) for c in row.get("commands", {}).get("negative", []))
+    results = [r for r in (exec_probe(sub, c, timeout) for c in row.get("commands", {}).get("negative", []))
                if "skipped" not in r]
     if kind == "expect_nonzero":
         return (bool(results) and all(r["rc"] != 0 for r in results),
@@ -641,6 +701,7 @@ def execute_row(ctx, row, out, timeout):
     detail["logs"] = save_logs(out, row["id"], "positive", positives)
     broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
+        detail["stderr_tail"] = next(s.get("stderr_tail", "") for s in sessions if s.get("broken"))
         return "failed", "session driver: %s" % broken, detail
     detail["probes"] = [{"session": i, "broken": s.get("broken", ""),
                          "texts": [event_text(id_events(s, g))[:200] for g in s.get("generates", [])],
@@ -730,7 +791,8 @@ def show_plan(rows, ctx):
              "$MODEL_ALT": "$MODEL_ALT", "$MODEL_DIR": "$MODEL_DIR",
              "$MODELS_DIR": models_dir(), "$OUT": "$OUT", "$DAEMON_BIN": ctx["daemon_bin"] or "$DAEMON_BIN",
              "$CLI_BIN": ctx["cli_bin"] or "hipfire", "$PROMPT": row.get("prompt", ""),
-             "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", "")}
+             "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", ""),
+             "$DEVICES": reserved_devices("0,1")}
         print("== %s [%s] %s probe=%s ==" % (row["id"], row["milestone"],
                                              row.get("route", ""), row.get("probe", "")))
         print("   hosts: %s fixtures: %s" % (",".join(row.get("hosts", [])), ",".join(row.get("fixtures", [])) or "-"))
@@ -754,6 +816,14 @@ def self_test():
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
+    check("cmd-timeout-kills-tree", run_cmd(["sh", "-c", "sleep 30 & wait"], None, 1)["rc"] == 124)
+    # A daemon that logs >64 KiB to stderr before answering must not stall.
+    chatty = os.path.join(isolated_env(None)["HIPFIRE_HOME"], "chatty-daemon.sh")
+    with open(chatty, "w") as fh:
+        fh.write("#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' x >&2\necho '{\"type\":\"loaded\"}'\ncat >/dev/null\n")
+    os.chmod(chatty, 0o755)
+    chatty_run = drive_session(chatty, [{"send": {"type": "load"}, "expect": "loaded"}], {}, {}, 10)
+    check("session-drains-stderr", not chatty_run["broken"] and len(chatty_run["loaded"]) == 1)
     check("serve-clean", eval_serve_rows(SAMPLE_SERVE_CLEAN, True)[0])
     check("serve-dirty-fails", not eval_serve_rows(SAMPLE_SERVE_DIRTY, True)[0])
     check("serve-negative-accounting", eval_serve_rows(SAMPLE_SERVE_DIRTY, False)[0])
@@ -870,6 +940,57 @@ def self_test():
                     os.path.basename(path) not in catalogue.get("fixture_lock", {}):
                 unlocked.add("%s:%s" % (row["id"], path))
     check("catalogue-fixtures-locked%s" % (" %s" % sorted(unlocked) if unlocked else ""), not unlocked)
+    # Device reservation: numeric selectors must map to reserved ROCr tokens so
+    # they cannot escape a fabric reservation; a missing reservation passes the
+    # selector through unchanged (HIP order == physical order).
+    saved_rocr = os.environ.get("ROCR_VISIBLE_DEVICES")
+    try:
+        os.environ["ROCR_VISIBLE_DEVICES"] = "GPU-9eb7aeda51c88ffd,GPU-085289909a86cc63"
+        check("reserved-devices-maps-numeric",
+              reserved_devices("0,1") == "GPU-9eb7aeda51c88ffd,GPU-085289909a86cc63")
+        check("reserved-devices-maps-subset", reserved_devices("1") == "GPU-085289909a86cc63")
+        check("reserved-devices-passthru-uuid",
+              reserved_devices("GPU-9eb7aeda51c88ffd,GPU-085289909a86cc63")
+              == "GPU-9eb7aeda51c88ffd,GPU-085289909a86cc63")
+        check("reserved-devices-passthru-gfx", reserved_devices("gfx1201,gfx1201") == "gfx1201,gfx1201")
+        check("reserved-devices-oob-passthru", reserved_devices("5") == "5")
+        check("singleton-probe-hip0",
+              singleton_probe_env("0") == {"HIP_VISIBLE_DEVICES": "0",
+                                           "ROCR_VISIBLE_DEVICES": "GPU-9eb7aeda51c88ffd"})
+        check("singleton-probe-hip1",
+              singleton_probe_env("1") == {"HIP_VISIBLE_DEVICES": "0",
+                                           "ROCR_VISIBLE_DEVICES": "GPU-085289909a86cc63"})
+        check("singleton-probe-none-unchanged", singleton_probe_env(None) == {})
+    finally:
+        if saved_rocr is None:
+            os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+        else:
+            os.environ["ROCR_VISIBLE_DEVICES"] = saved_rocr
+    os.environ.pop("ROCR_VISIBLE_DEVICES", None)
+    check("reserved-devices-no-reservation", reserved_devices("0,1") == "0,1")
+    check("singleton-probe-no-reservation", singleton_probe_env("0") == {"HIP_VISIBLE_DEVICES": "0"})
+    # In-tree `target-fi/` must not dirty an otherwise-clean checkout, but any
+    # tracked change (or a different untracked path) still does.
+    check("dirty-ignores-target-fi", not porcelain_dirty("?? target-fi/\n"))
+    check("dirty-clean", not porcelain_dirty(""))
+    check("dirty-sees-tracked-change",
+          porcelain_dirty(" M scripts/device_mesh_matrix.py\n?? target-fi/\n"))
+    check("dirty-sees-other-untracked", porcelain_dirty("?? scratch/\n"))
+    # Negatives receive the substituted row env, not the raw ctx (finding 3).
+    captured = []
+    orig_probe = exec_probe
+    try:
+        def spy_probe(ctx, cmd, timeout):
+            captured.append(ctx)
+            return {"skipped": "spy"}
+        globals()["exec_probe"] = spy_probe
+        run_negatives({"daemon_bin": "", "row_env": {"CLI": "raw-$CLI_BIN"}},
+                      {"negative_predicate": {"kind": "expect_nonzero"},
+                       "commands": {"negative": ["cmd"]}},
+                      {"$CLI_BIN": "/bin/hipfire"}, {"CLI": "/bin/hipfire"}, 30)
+    finally:
+        globals()["exec_probe"] = orig_probe
+    check("negative-env-substituted", captured and captured[0]["row_env"] == {"CLI": "/bin/hipfire"})
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
@@ -930,8 +1051,11 @@ def main(argv=None):
         for dev in (visible if mesh else [None]):
             # The daemon initializes HIP lazily, on the first message: an immediate
             # EOF prints no banner. A ping is the cheapest thing that opens device 0.
+            # Under a fabric reservation a singleton HIP index must carry its
+            # reserved ROCr token plus HIP 0, or the daemon refuses the
+            # cardinality mismatch before GPU init (see singleton_probe_env).
             probe = run_cmd(["sh", "-c", 'printf \'{"type":"ping"}\\n\' | "$0"', daemon_bin],
-                            {"HIP_VISIBLE_DEVICES": dev} if dev is not None else {}, 120)
+                            singleton_probe_env(dev), 120)
             seen = re.findall(r"GPU dev \d+: (gfx\w+)", probe.get("out", ""))
             if not seen:
                 print("cannot determine GPU arch from %s (HIP_VISIBLE_DEVICES=%r); refusing to file "

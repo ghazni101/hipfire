@@ -9,6 +9,12 @@
 // head_dim 256). On gfx1100 (Q8 only) it also checks the multi-row twin
 // (`Gpu::try_attention_verify_gqa_rows`) against the R4/R8 tile + reduce
 // (`attention_flash_q8_0_rows_masked`), the eager Q8 verify route there.
+// `fwht4` / `fwht3` kinds compare `attention_verify_gqa_fwht{4,3}_<arch>`
+// (gfx1201 and gfx1100; Q8_0 V) against `attention_flash_fwht{4,3}_tile_batched`
+// (`Gpu::attention_flash_fwht{4,3}_batched_masked`, v_mode 8) + the same reduce,
+// on synthetic fwht K records (random cnorm incl. zero / denormal, random
+// 4-/3-bit codes) and +-1 sign tables of 128 / 256 entries; the K kind is
+// selected as the positional kv argument or `--kv fwht4|fwht3`.
 // On gfx1151 (Q8 only) it checks `Gpu::attention_verify_wmma_with` (the
 // production geometry and the other P.V walkers) against the single-slot WMMA
 // flash prefill it replaces (`attention_q8_0_flash_prefill_wmma_slots`); the
@@ -22,7 +28,7 @@
 // candidate must match byte for byte over the full allocations.
 //
 // Modes:
-//   oracle [fp8|q8|both]      B {1,4,16} (+2,5,9,32) x ctx {1,127,128,2K,8K,16K,32K,64K},
+//   oracle [fp8|q8|fwht4|fwht3|both]  B {1,4,16} (+2,5,9,32) x ctx {1,127,128,2K,8K,16K,32K,64K},
 //                             eager and graph-capture max_ctx_len, full and
 //                             sub-batched partials, cap 262144 capture grid.
 //                             gfx1100: plus the R4/R8 reference, B {4,16}
@@ -43,18 +49,44 @@
 //   bench_rows                Q8 eager: multi-row R4/R8 vs VerifyAttn wall-clock
 //                             (gfx1100: its R4/R8 twin; gfx1201: the tile twin).
 //   sweep                     (gfx1151) candidate wall-clock per launch geometry.
+// VA_NH=16 runs every mode at 16 q heads / 4 kv heads (GQA 4, Qwen3.5-9B;
+// gfx1151 WMMA twin only); default 24. VA_HD=128 (default 256) sets head_dim
+// (gfx1151 WMMA twin only; VA_NH=16 VA_HD=128 = Qwen3-8B).
 // Exit 0 = pass. Run: cargo run --release -p rdna-compute --example verify_attn_oracle -- oracle both
 
 use rdna_compute::attention::{VerifyKv, VerifyWmmaGeometry, VerifyWmmaPv};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
-const NH: usize = 24;
+/// Q heads: `VA_NH` (default 24, the H2 GQA 6 shape; 16 = Qwen3.5-9B GQA 4,
+/// gfx1151 only).
+static NH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VA_NH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24)
+});
+fn nh() -> usize {
+    *NH
+}
 const NKV: usize = 4;
-const HD: usize = 256;
+/// head_dim: `VA_HD` (default 256; 128 = Qwen3-8B, gfx1151 only).
+static HD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("VA_HD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+});
+fn hd() -> usize {
+    *HD
+}
 const TILE: usize = 128;
-const STRIDE: usize = 2 + HD;
-const QDIM: usize = NH * HD;
+fn stride() -> usize {
+    2 + hd()
+}
+fn qdim() -> usize {
+    nh() * hd()
+}
 /// Guard elements on each side of the output view and after the partials view.
 const GUARD: usize = 4096;
 const POS_GUARD: i32 = 0x3fff_ffff;
@@ -119,10 +151,21 @@ fn half_from_f32(x: f32) -> u16 {
     sign | r as u16
 }
 
-fn row_bytes(kv: VerifyKv) -> usize {
+/// Bytes of one K row (all kv heads): the fwht records are `4 + head_dim * bits / 8`
+/// per head (f32 cnorm + packed codes), everything else is the V row layout.
+fn k_row_bytes(kv: VerifyKv) -> usize {
     match kv {
-        VerifyKv::Q8 => NKV * (HD / 32) * 34,
-        VerifyKv::Fp8 => NKV * (HD + 2),
+        VerifyKv::Fwht4 => NKV * (4 + hd() / 2),
+        VerifyKv::Fwht3 => NKV * (4 + hd() * 3 / 8),
+        VerifyKv::Q8 | VerifyKv::Fp8 => v_row_bytes(kv),
+    }
+}
+
+/// Bytes of one V row: the fwht K tiers store V as Q8_0.
+fn v_row_bytes(kv: VerifyKv) -> usize {
+    match kv {
+        VerifyKv::Q8 | VerifyKv::Fwht4 | VerifyKv::Fwht3 => NKV * (hd() / 32) * 34,
+        VerifyKv::Fp8 => NKV * (hd() + 2),
     }
 }
 
@@ -138,16 +181,62 @@ fn scale_f16(rng: &mut Rng) -> u16 {
     }
 }
 
+/// fwht K record norm: mostly a positive O(1) norm, with some zero and
+/// subnormal values to pin signed-zero and denormal paths.
+fn cnorm_f32(rng: &mut Rng) -> f32 {
+    match rng.below(64) {
+        0 => 0.0,
+        1 => f32::from_bits(1 + rng.below(0x7f_ffff) as u32),
+        _ => 0.05 + 3.0 * rng.unit(),
+    }
+}
+
 /// K or V cache: `valid` random rows, then NaN-poisoned rows up to `cap`.
-fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
-    let rb = row_bytes(kv);
+/// `is_k` selects the K layout (fwht kinds: per-head f32 cnorm + packed codes;
+/// V is Q8_0 for every kind but fp8).
+fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize, is_k: bool) -> Vec<u8> {
+    let rb = if is_k {
+        k_row_bytes(kv)
+    } else {
+        v_row_bytes(kv)
+    };
     let mut buf = vec![0u8; cap * rb];
     for t in 0..cap {
         let row = &mut buf[t * rb..(t + 1) * rb];
         let poison = t >= valid;
-        match kv {
-            VerifyKv::Q8 => {
-                for blk in 0..NKV * (HD / 32) {
+        match (kv, is_k) {
+            (VerifyKv::Fwht4 | VerifyKv::Fwht3, true) => {
+                let head_bytes = rb / NKV;
+                for h in 0..NKV {
+                    let head = &mut row[h * head_bytes..(h + 1) * head_bytes];
+                    let cn = if poison { f32::NAN } else { cnorm_f32(rng) };
+                    head[..4].copy_from_slice(&cn.to_le_bytes());
+                    for b in &mut head[4..] {
+                        *b = if poison { 0xff } else { rng.next() as u8 };
+                    }
+                }
+            }
+            (VerifyKv::Fp8, _) => {
+                for i in 0..NKV * hd() {
+                    row[i] = if poison {
+                        0x7f
+                    } else {
+                        loop {
+                            let c = rng.next() as u8;
+                            if c & 0x7f != 0x7f {
+                                break c;
+                            }
+                        }
+                    };
+                }
+                for h in 0..NKV {
+                    let s = if poison { 0x7e00 } else { scale_f16(rng) };
+                    let o = NKV * hd() + 2 * h;
+                    row[o..o + 2].copy_from_slice(&s.to_le_bytes());
+                }
+            }
+            _ => {
+                for blk in 0..NKV * (hd() / 32) {
                     let o = blk * 34;
                     let s = if poison { 0x7e00 } else { scale_f16(rng) };
                     row[o..o + 2].copy_from_slice(&s.to_le_bytes());
@@ -162,28 +251,16 @@ fn fill_kv(kv: VerifyKv, rng: &mut Rng, valid: usize, cap: usize) -> Vec<u8> {
                     }
                 }
             }
-            VerifyKv::Fp8 => {
-                for i in 0..NKV * HD {
-                    row[i] = if poison {
-                        0x7f
-                    } else {
-                        loop {
-                            let c = rng.next() as u8;
-                            if c & 0x7f != 0x7f {
-                                break c;
-                            }
-                        }
-                    };
-                }
-                for h in 0..NKV {
-                    let s = if poison { 0x7e00 } else { scale_f16(rng) };
-                    let o = NKV * HD + 2 * h;
-                    row[o..o + 2].copy_from_slice(&s.to_le_bytes());
-                }
-            }
         }
     }
     buf
+}
+
+/// +-1 sign table of the fwht rotation (`n` = 128 for fwht4, 256 for fwht3).
+fn signs_table(rng: &mut Rng, n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|_| if rng.next() & 1 == 0 { 1.0 } else { -1.0 })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -224,7 +301,7 @@ impl Case {
         if self.wmma.is_some() {
             self.wmma_scratch_bytes() / 4
         } else {
-            self.partial_rows * NH * self.max_tiles() * STRIDE
+            self.partial_rows * nh() * self.max_tiles() * stride()
         }
     }
     /// f16 S tiles of the gfx1151 twin: row groups x kv heads x 6 x key tiles x 512 B.
@@ -260,27 +337,45 @@ struct Bufs {
     out_full: GpuTensor,
     part: GpuTensor,
     part_full: GpuTensor,
+    /// fwht kinds: the rotation's (signs1, signs2) tables.
+    signs: Option<(GpuTensor, GpuTensor)>,
 }
 
 impl Bufs {
     fn new(gpu: &mut Gpu, c: &Case, seed: u64) -> Bufs {
         let mut rng = Rng(seed);
-        let mut qh = vec![0f32; c.b * QDIM + GUARD];
+        let mut qh = vec![0f32; c.b * qdim() + GUARD];
         for (i, x) in qh.iter_mut().enumerate() {
-            *x = if i >= c.b * QDIM {
+            *x = if i >= c.b * qdim() {
                 f32::NAN
             } else {
                 // Rows alternate between ordinary and 12x-scaled queries so
                 // some tiles run their softmax deep into expf underflow.
-                let row = i / QDIM;
+                let row = i / qdim();
                 let amp = if row % 3 == 2 { 12.0 } else { 1.0 };
                 (rng.unit() * 2.0 - 1.0) * amp
             };
         }
         let q_full = gpu.upload_f32(&qh, &[qh.len()]).expect("q");
-        let q = q_full.sub_offset(0, c.b * QDIM);
-        let kh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
-        let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap);
+        let q = q_full.sub_offset(0, c.b * qdim());
+        let kh = fill_kv(c.kv, &mut rng, c.valid(), c.cap, true);
+        let vh = fill_kv(c.kv, &mut rng, c.valid(), c.cap, false);
+        let signs = match c.kv {
+            VerifyKv::Fwht4 | VerifyKv::Fwht3 => {
+                let n = if c.kv == VerifyKv::Fwht4 {
+                    hd() / 2
+                } else {
+                    hd()
+                };
+                let s1 = signs_table(&mut rng, n);
+                let s2 = signs_table(&mut rng, n);
+                Some((
+                    gpu.upload_f32(&s1, &[n]).expect("signs1"),
+                    gpu.upload_f32(&s2, &[n]).expect("signs2"),
+                ))
+            }
+            VerifyKv::Q8 | VerifyKv::Fp8 => None,
+        };
         let k = gpu.upload_raw(&kh, &[kh.len()]).expect("k");
         let v = gpu.upload_raw(&vh, &[vh.len()]).expect("v");
         let mut posh: Vec<i32> = (0..c.b).map(|i| (c.start() + i) as i32).collect();
@@ -288,9 +383,9 @@ impl Bufs {
         let pb: Vec<u8> = posh.iter().flat_map(|p| p.to_ne_bytes()).collect();
         let pos = gpu.upload_raw(&pb, &[posh.len()]).expect("pos");
         let out_full = gpu
-            .zeros(&[c.b * QDIM + 2 * GUARD], DType::F32)
+            .zeros(&[c.b * qdim() + 2 * GUARD], DType::F32)
             .expect("out");
-        let out = out_full.sub_offset(GUARD, c.b * QDIM);
+        let out = out_full.sub_offset(GUARD, c.b * qdim());
         let part_full = gpu
             .zeros(&[c.partials_len() + GUARD], DType::F32)
             .expect("partials");
@@ -305,6 +400,7 @@ impl Bufs {
             out_full,
             part,
             part_full,
+            signs,
         }
     }
 
@@ -318,6 +414,10 @@ impl Bufs {
             self.part_full,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some((s1, s2)) = self.signs {
+            let _ = gpu.free_tensor(s1);
+            let _ = gpu.free_tensor(s2);
         }
         let _ = (self.q, self.out, self.part);
     }
@@ -348,9 +448,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.max_ctx_len(),
                     c.b,
                     &bf.part,
@@ -365,9 +465,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 None,
@@ -387,9 +487,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -403,9 +503,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
@@ -419,6 +519,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
         return;
     }
     if candidate {
+        let signs = bf.signs.as_ref().map(|(s1, s2)| (s1, s2));
         let ran = gpu
             .try_attention_verify_gqa(
                 c.kv,
@@ -427,14 +528,15 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                 &bf.v,
                 &bf.out,
                 &bf.pos,
-                NH,
+                nh(),
                 NKV,
-                HD,
+                hd(),
                 c.max_ctx_len(),
                 c.b,
                 &bf.part,
                 None,
                 0,
+                signs,
             )
             .expect("verify_attn launch");
         assert!(ran, "VerifyAttn declined an admitted case: {c:?}");
@@ -447,9 +549,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -457,6 +559,7 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     None,
                     0,
                     0,
+                    None,
                 )
                 .expect("reference fp8"),
             VerifyKv::Q8 => gpu
@@ -466,9 +569,9 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     &bf.v,
                     &bf.out,
                     &bf.pos,
-                    NH,
+                    nh(),
                     NKV,
-                    HD,
+                    hd(),
                     c.cap,
                     c.max_ctx_len(),
                     c.b,
@@ -478,6 +581,54 @@ fn launch(gpu: &mut Gpu, c: &Case, bf: &Bufs, candidate: bool) {
                     0,
                 )
                 .expect("reference q8"),
+            VerifyKv::Fwht4 | VerifyKv::Fwht3 => {
+                let (s1, s2) = bf.signs.as_ref().expect("fwht sign tables");
+                // v_mode 8 = Q8_0 V (`V_MODE_Q8`): the only mode the twin covers.
+                if c.kv == VerifyKv::Fwht4 {
+                    gpu.attention_flash_fwht4_batched_masked(
+                        &bf.q,
+                        &bf.k,
+                        &bf.v,
+                        &bf.out,
+                        &bf.pos,
+                        s1,
+                        s2,
+                        nh(),
+                        NKV,
+                        hd(),
+                        c.cap,
+                        c.max_ctx_len(),
+                        c.b,
+                        &bf.part,
+                        None,
+                        0,
+                        0,
+                        8,
+                    )
+                } else {
+                    gpu.attention_flash_fwht3_batched_masked(
+                        &bf.q,
+                        &bf.k,
+                        &bf.v,
+                        &bf.out,
+                        &bf.pos,
+                        s1,
+                        s2,
+                        nh(),
+                        NKV,
+                        hd(),
+                        c.cap,
+                        c.max_ctx_len(),
+                        c.b,
+                        &bf.part,
+                        None,
+                        0,
+                        0,
+                        8,
+                    )
+                }
+                .expect("reference fwht")
+            }
         }
     }
 }
@@ -508,7 +659,7 @@ fn as_f32(b: &[u8]) -> Vec<f32> {
 }
 
 fn out_view(c: &Case, full: &[u8]) -> Vec<f32> {
-    as_f32(&full[GUARD * 4..(GUARD + c.b * QDIM) * 4])
+    as_f32(&full[GUARD * 4..(GUARD + c.b * qdim()) * 4])
 }
 
 /// Byte ranges of the partials the reference writes (tiles below each row's
@@ -533,9 +684,9 @@ fn written_ranges(c: &Case) -> Vec<(usize, usize)> {
             };
             let seq = c.start() + off + last + 1;
             let nt = seq.div_ceil(TILE).min(mt);
-            for h in 0..NH {
-                let base = ((lr * NH + h) * mt) * STRIDE * 4;
-                r.push((base, base + nt * STRIDE * 4));
+            for h in 0..nh() {
+                let base = ((lr * nh() + h) * mt) * stride() * 4;
+                r.push((base, base + nt * stride() * 4));
             }
         }
         off += chunk;
@@ -547,6 +698,8 @@ fn kv_name(kv: VerifyKv) -> &'static str {
     match kv {
         VerifyKv::Fp8 => "fp8",
         VerifyKv::Q8 => "q8",
+        VerifyKv::Fwht4 => "fwht4",
+        VerifyKv::Fwht3 => "fwht3",
     }
 }
 
@@ -711,6 +864,8 @@ fn parse_kvs(arg: Option<&str>) -> Vec<VerifyKv> {
     match arg.unwrap_or("both") {
         "fp8" => vec![VerifyKv::Fp8],
         "q8" => vec![VerifyKv::Q8],
+        "fwht4" => vec![VerifyKv::Fwht4],
+        "fwht3" => vec![VerifyKv::Fwht3],
         _ => vec![VerifyKv::Fp8, VerifyKv::Q8],
     }
 }
@@ -774,7 +929,7 @@ fn wmma_live_s(c: &Case) -> Vec<(usize, usize)> {
     for rg in 0..c.b.div_ceil(16) {
         let rows = (c.b - 16 * rg).min(16);
         let pack = if geom.packed { rows } else { 16 };
-        let nf = (6 * pack).div_ceil(16);
+        let nf = (nh() / NKV * pack).div_ceil(16);
         let n_tiles = (c.start() + 16 * rg + rows).div_ceil(16).min(t_stride);
         for kv in 0..NKV {
             for f in 0..nf {
@@ -793,13 +948,13 @@ fn describe_out(what: &str, a: &[u8], b: &[u8]) -> String {
         None => format!("{what}=0"),
         Some(i) => {
             let e = i / 4;
-            let (row, rem) = (e / QDIM, e % QDIM);
+            let (row, rem) = (e / qdim(), e % qdim());
             let got = f32::from_ne_bytes(a[e * 4..e * 4 + 4].try_into().unwrap());
             let want = f32::from_ne_bytes(b[e * 4..e * 4 + 4].try_into().unwrap());
             format!(
                 "{what}={n}B first(row={row} head={} dim={} got={got:e} want={want:e})",
-                rem / HD,
-                rem % HD
+                rem / hd(),
+                rem % hd()
             )
         }
     }
@@ -934,7 +1089,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                     .all(|(a, b)| a.to_bits() == b.to_bits());
                 // Guards keep this launch's poison byte.
                 let guard_ok = co[..GUARD * 4].iter().all(|&x| x == byte)
-                    && co[(GUARD + c.b * QDIM) * 4..].iter().all(|&x| x == byte);
+                    && co[(GUARD + c.b * qdim()) * 4..].iter().all(|&x| x == byte);
                 // Written partials equal the reference's (gfx1151: the S-tile
                 // scratch may hold anything); the rest keeps the poison.
                 let part_ok = c.wmma.is_some() || ranges.iter().all(|&(s, e)| cp[s..e] == rp[s..e]);
@@ -943,7 +1098,7 @@ fn stress(gpu: &mut Gpu, reps: usize, kvs: &[VerifyKv]) -> bool {
                     .zip(&covered)
                     .filter(|&(&x, &cov)| !cov && x != byte)
                     .count();
-                let outb = co[GUARD * 4..(GUARD + c.b * QDIM) * 4].to_vec();
+                let outb = co[GUARD * 4..(GUARD + c.b * qdim()) * 4].to_vec();
                 let (first_ok, s_ok) = match &first {
                     None => {
                         first = Some((
@@ -1175,6 +1330,248 @@ fn bench(gpu: &mut Gpu, kvs: &[VerifyKv]) {
     }
 }
 
+/// Serve-shaped candidate timing: graph-capture max_ctx_len = cap = 131072,
+/// B {8,16}, live ctx {32K, 64K, 128K}; the reference only with VA_REF=1.
+fn bench_serve(gpu: &mut Gpu, kvs: &[VerifyKv]) {
+    let with_ref = std::env::var_os("VA_REF").is_some();
+    // `VA_SERVE_CTXS=4096,16384` overrides the live-context list (default
+    // 32K/64K/128K) to time the short-context side of the split threshold.
+    let ctxs: Vec<usize> = std::env::var("VA_SERVE_CTXS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|c| c.trim().parse().ok()).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![32768, 65536, 130048]);
+    // `VA_SERVE_CAPTURE=0` times the eager (non-graph) shape: max_ctx_len =
+    // live ctx instead of the 131072 graph-capture grid.
+    let capture = std::env::var("VA_SERVE_CAPTURE").map_or(true, |v| v != "0");
+    for &kv in kvs {
+        if !matches!(kv, VerifyKv::Fp8 | VerifyKv::Q8) {
+            continue; // the FA2 split verifier is fp8/q8 only
+        }
+        for &b in &[8usize, 16] {
+            for &ctx in &ctxs {
+                let mut c = Case {
+                    kv,
+                    b,
+                    ctx,
+                    capture,
+                    cap: if capture { 131072 } else { ctx + 64 },
+                    partial_rows: 16,
+                    rows: false,
+                    wmma: None,
+                };
+                // Eager short contexts: serve sizes the partials for the full
+                // context window, so give the split's records the room they
+                // need (`partial_rows` only grows the scratch).
+                let fa2_need = Gpu::fa2_gqa_split_gfx1201_partials_len(
+                    std::env::var("VA_FA2_S")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(16),
+                    b,
+                    nh(),
+                    hd(),
+                );
+                while c.partials_len() < fa2_need {
+                    c.partial_rows += 16;
+                }
+                let bf = Bufs::new(gpu, &c, 0xBE4C);
+                let cand = time_ms(gpu, &c, &bf, true, 20);
+                let refm = if with_ref {
+                    time_ms(gpu, &c, &bf, false, 5)
+                } else {
+                    f64::NAN
+                };
+                // FA2 split-KV verifier (gfx1201): S = 16 splits on the same buffers.
+                let fa2_s: usize = std::env::var("VA_FA2_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let fa2 = if gpu.arch == "gfx1201" {
+                    let run = |gpu: &mut Gpu| match kv {
+                        VerifyKv::Fp8 => gpu.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            fa2_s,
+                        ),
+                        VerifyKv::Q8 => gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            fa2_s,
+                        ),
+                        VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                    };
+                    for _ in 0..3 {
+                        run(gpu).expect("fa2 split");
+                    }
+                    gpu.hip.device_synchronize().expect("sync");
+                    let t = Instant::now();
+                    for _ in 0..20 {
+                        run(gpu).expect("fa2 split");
+                    }
+                    gpu.hip.device_synchronize().expect("sync");
+                    t.elapsed().as_secs_f64() * 1e3 / 20.0
+                } else {
+                    f64::NAN
+                };
+                println!(
+                    "SERVE_FA2 kv={} B={} ctx={} S={} fa2_ms={:.4}",
+                    kv_name(kv),
+                    b,
+                    ctx,
+                    fa2_s,
+                    fa2
+                );
+                // K+V bytes of the live context (fp8: 1 B/elem + per-head scale; q8: 34/32 B/elem)
+                let elem = match kv {
+                    VerifyKv::Fp8 => 1.0,
+                    VerifyKv::Q8 => 34.0 / 32.0,
+                    VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                };
+                let gb = (ctx * NKV * hd() * 2) as f64 * elem / 1e9;
+                println!(
+                    "SERVE kv={} B={} ctx={} cand_ms={:.4} ref_ms={:.4} kv_GB={:.3} eff_GBps={:.0}",
+                    kv_name(kv),
+                    b,
+                    ctx,
+                    cand,
+                    refm,
+                    gb,
+                    gb / (cand / 1e3)
+                );
+                bf.free(gpu);
+            }
+        }
+    }
+}
+
+/// Tolerance check of the gfx1201 FA2 split-KV verifier (S splits) against
+/// VerifyAttn on the same buffers. Not a byte oracle: the FA2 body rounds
+/// Q, K, V and P to f16. Reports max |diff|, relative RMS error and
+/// non-finite counts per shape; FAIL on any non-finite candidate value or a
+/// relative RMS error above 5e-3. The bound was set after a first run on the
+/// R9700 (fp8 max 4.2e-3, q8 max 2.1e-3 over these shapes): it guards
+/// against gross breakage, it is not a quality claim.
+fn fa2_check(gpu: &mut Gpu, kvs: &[VerifyKv], splits: usize) -> bool {
+    let mut ok = true;
+    let mut worst = 0f64;
+    for &kv in kvs {
+        if !matches!(kv, VerifyKv::Fp8 | VerifyKv::Q8) {
+            continue; // the FA2 split verifier is fp8/q8 only
+        }
+        for &b in &[2usize, 4, 8, 16] {
+            for &ctx in &[1usize, 127, 128, 129, 2048, 4097, 32768, 130048] {
+                for &capture in &[false, true] {
+                    let cap = if capture { 131072 } else { ctx + 64 };
+                    let c = Case {
+                        kv,
+                        b,
+                        ctx,
+                        capture,
+                        cap,
+                        partial_rows: 16,
+                        rows: false,
+                        wmma: None,
+                    };
+                    let bf = Bufs::new(gpu, &c, 0xFA2C ^ (ctx as u64) ^ ((b as u64) << 20));
+                    if bf.part.numel()
+                        < Gpu::fa2_gqa_split_gfx1201_partials_len(splits, b, nh(), hd())
+                    {
+                        // The production arm falls back to VerifyAttn here too.
+                        println!("FA2_CHECK kv={} S={splits} B={b} ctx={ctx} capture={capture} SKIP (partials too small)", kv_name(kv));
+                        bf.free(gpu);
+                        continue;
+                    }
+                    launch(gpu, &c, &bf, true);
+                    let r = bytes_of(gpu, &bf.out);
+                    match kv {
+                        VerifyKv::Fp8 => gpu.attention_fp8_e4m3_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            splits,
+                        ),
+                        VerifyKv::Q8 => gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                            &bf.q,
+                            &bf.k,
+                            &bf.v,
+                            &bf.out,
+                            &bf.pos,
+                            &bf.part,
+                            nh(),
+                            NKV,
+                            hd(),
+                            b,
+                            splits,
+                        ),
+                        VerifyKv::Fwht4 | VerifyKv::Fwht3 => unreachable!("skipped above"),
+                    }
+                    .expect("fa2 split");
+                    let k = bytes_of(gpu, &bf.out);
+                    let n = b * qdim();
+                    let f = |v: &[u8], i: usize| {
+                        f32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap()) as f64
+                    };
+                    let (mut max_abs, mut se, mut sr, mut bad_ref, mut bad_cand) =
+                        (0f64, 0f64, 0f64, 0usize, 0usize);
+                    for i in 0..n {
+                        let (x, y) = (f(&r, i), f(&k, i));
+                        if !x.is_finite() {
+                            bad_ref += 1;
+                            continue;
+                        }
+                        if !y.is_finite() {
+                            bad_cand += 1;
+                            continue;
+                        }
+                        max_abs = max_abs.max((x - y).abs());
+                        se += (x - y) * (x - y);
+                        sr += x * x;
+                    }
+                    let rel_rms = (se / sr.max(1e-30)).sqrt();
+                    let pass = bad_cand == 0 && bad_ref == 0 && rel_rms <= 5e-3;
+                    ok &= pass;
+                    worst = worst.max(rel_rms);
+                    println!(
+                        "FA2_CHECK kv={} S={splits} B={b} ctx={ctx} capture={capture} max_abs={max_abs:.3e} rel_rms={rel_rms:.3e} nonfinite_ref={bad_ref} nonfinite_cand={bad_cand} {}",
+                        kv_name(kv),
+                        if pass { "PASS" } else { "FAIL" }
+                    );
+                    bf.free(gpu);
+                }
+            }
+        }
+    }
+    println!(
+        "FA2_CHECK_SUMMARY worst_rel_rms={worst:.3e} {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
+}
+
 fn time_ms(gpu: &mut Gpu, c: &Case, bf: &Bufs, cand: bool, iters: usize) -> f64 {
     for _ in 0..3 {
         launch(gpu, c, bf, cand);
@@ -1263,9 +1660,9 @@ fn bench_rows(gpu: &mut Gpu) {
                                 &bf.v,
                                 &bf.out,
                                 &bf.pos,
-                                NH,
+                                nh(),
                                 NKV,
-                                HD,
+                                hd(),
                                 c.max_ctx_len(),
                                 c.b,
                                 &bf.part,
@@ -1302,8 +1699,20 @@ fn bench_rows(gpu: &mut Gpu) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // `--kv <kind>` (fp8|q8|fwht4|fwht3|both) is the named form of the
+    // positional kv argument.
+    let kv_flag = args.iter().position(|a| a == "--kv").map(|i| {
+        let v = args.get(i + 1).cloned().expect("--kv needs a value");
+        args.drain(i..=i + 1);
+        v
+    });
     let mode = args.get(1).map(String::as_str).unwrap_or("oracle");
+    // The fp8 reference is the VerifyAttn tile + reduce. The native-fp8
+    // split-KV verifier (default on from 8,192 tokens on gfx1201) would
+    // replace it at long contexts, so pin it off before the process config
+    // snapshot is first read.
+    std::env::set_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8", "0");
     let mut gpu = Gpu::init().expect("gpu init");
     assert!(
         matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100" | "gfx1151"),
@@ -1311,11 +1720,14 @@ fn main() {
         gpu.arch
     );
     println!("VERIFY_ATTN_ORACLE arch={} mode={mode}", gpu.arch);
-    // fp8 KV (and its VerifyAttn twin) is gfx1201-only.
+    // fp8 KV (and its VerifyAttn twin) is gfx1201-only; the fwht twins are
+    // gfx1201 and gfx1100; gfx1151 is the Q8 WMMA twin only.
     let kvs = |arg: Option<&String>, gpu: &Gpu| -> Vec<VerifyKv> {
-        let mut v = parse_kvs(arg.map(String::as_str));
-        if gpu.arch != "gfx1201" {
-            v.retain(|&k| k == VerifyKv::Q8);
+        let mut v = parse_kvs(kv_flag.as_deref().or(arg.map(String::as_str)));
+        match gpu.arch.as_str() {
+            "gfx1201" => {}
+            "gfx1100" => v.retain(|&k| k != VerifyKv::Fp8),
+            _ => v.retain(|&k| k == VerifyKv::Q8),
         }
         v
     };
@@ -1336,6 +1748,16 @@ fn main() {
         "bench" => {
             let k = kvs(args.get(2), &gpu);
             bench(&mut gpu, &k);
+            true
+        }
+        "fa2_check" if gpu.arch == "gfx1201" => {
+            let k = kvs(args.get(2), &gpu);
+            let s = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
+            fa2_check(&mut gpu, &k, s)
+        }
+        "bench_serve" => {
+            let k = kvs(args.get(2), &gpu);
+            bench_serve(&mut gpu, &k);
             true
         }
         "sweep" if gpu.arch == "gfx1151" => {

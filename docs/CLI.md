@@ -15,7 +15,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag>` (on a terminal) | Asks only what the registry leaves open, then confirms: (1) the **tier**, when the registry has other tags `<tag>-<suffix>` of the same `arch_id` (aliases resolve first, so `qwen3.8:flash` offers the `qwen3.8:flash-next` tiers; same-artifact tags, a split entry's monolithic sibling, drafts and local-only entries are not tiers), each with its size, the first sentence of its `desc` and whether `min_vram_gb` fits the detected VRAM or VRAM+RAM; (2) the **PLE rows** of a split entry (published q4/q8, both, or none; preselected: what `--ple auto` fetches, or q4 when host RAM cannot hold the base plus the q8 rows); (3) the registry's **draft/MTP sidecars** (MTP, DSpark, DFlash; default yes); (4) a **summary** with every file, the total download and the free disk space (default no when it does not fit). Enter takes the default. A flag skips its question: name the tier's tag, `--ple`, `--draft` / `--no-draft`. A single-variant model with nothing to ask pulls without a prompt. `-y` / `--yes`, or a stdin that is not a terminal, asks nothing and takes the registry defaults (the tag as given, `--ple auto`, every declared sidecar), so scripts and CI are unchanged. |
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
-| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
+| `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client, only on a host with a gfx1151 GPU (or no detected GPU); a gfx1100/gfx1201 host skips it. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
@@ -150,7 +150,14 @@ weights and `=1` applies the overlay on any architecture.
 
 - **Pull.** `hipfire pull <tag>` downloads and SHA-256 verifies the pinned
   overlay with the other sidecars; a valid file already on disk is not
-  downloaded again, a stale one is refreshed. As for other sidecars, a failed
+  downloaded again, a stale one is refreshed. The loader applies the overlay
+  only on gfx1151, so the pull fetches it only when a detected GPU is a gfx1151
+  (a mixed host with one counts) or none is detected (the pull cannot know where
+  the model will run); on a host whose GPUs are all other architectures it
+  prints `Skipping Trunk overlay sidecar` and downloads nothing for it, and the
+  interactive summary does not list it. `HIPFIRE_QWEN4_TRUNK_OVERLAY=1` (apply
+  on any architecture) keeps the download everywhere. After adding a gfx1151
+  card, run `hipfire pull <tag>` again to fetch it. As for other sidecars, a failed
   overlay download prints a warning and the pull still succeeds (the base loads
   unchanged). Any other registry entry (e.g. the RTN-asym file) has no
   overlay.
@@ -221,7 +228,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--dspark-conf-threshold <f>` | DSpark confidence cutoff in `[0,1]` (qwen3 + deepseek4). |
 | `--system <text>` | System prompt. |
 | `--image <path>` | Vision input (when the model supports it). |
-| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also accepted by `serve` (where `serve -d` does not forward it to the detached child). |
+| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off`; required when `on`; used under the default `auto` and under `resident`. Also accepted by `serve` (where `serve -d` does not forward it to the detached child). |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
 | `--stats` | Emit one statistics footer on stderr after successful generation (local or HTTP, streaming or `--no-stream`); generated stdout is unchanged. Suppressed with `--json` and on failed/aborted generation. |
@@ -287,7 +294,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--continuous-batch-size N` | Number of eligible concurrent batched lanes, `1..=256` (`1` preserves sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits. Forwarded by `serve -d`. |
 | `--ui` | Serve the embedded chat UI at `/ui` on the serve listener. |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui`. With `-d` the browser launch happens in the launching process and the detached child only enables the route. |
-| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). **Foreground serve only:** `serve -d` does not forward it to the detached child, so set `HIPFIRE_VISION_SIDECAR` or the registry `vision` slot for a detached service. |
+| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off`. **Foreground serve only:** `serve -d` does not forward it to the detached child, so set `HIPFIRE_VISION_SIDECAR` or the registry `vision` slot for a detached service. |
 
 ### `hipfire img` flags
 
@@ -434,7 +441,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 
 | Command | Purpose |
 |---|---|
-| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
+| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. Every bench load is text-only (`vision_mode=off` is pinned whatever `vision.mode` resolves to: bench has no media input, and the default `auto` would otherwise add the ~0.9 GiB tower and shrink the load's measured capacity). `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields and the loaded `topology` (`{pp,tp,ep,cards[]}`, [below](#bench-matrix-topology)), and each row carries a `power` entry per run. |
 | `hipfire bench <model> --spec <m> ...` | Every bench generate sends greedy sampling with the neutral `repeat_penalty 1.0` (any other value routes the daemon to the plain AR decoder), so `--spec mtp\|dflash\|ngram\|dspark\|auto` measures the speculative decoder and `--spec off` the AR decoder on the same workload. JSON records `spec_requested`, a per-run `spec_route` (`"mtp"`, `"mtp+ngram"`, `"dflash"`, a daemon `spec` name, or `null` when AR ran) and per-run `spec_tau`; when `--spec` is not `off` but no run speculated, the bench prints a `warning:` and adds it to `warnings`. The `load_speculation` block records `mtp_mode` as requested beside `mtp_effective`, the daemon's `loaded` ack `mtp_mode_effective`: `auto` on a producer without a measured AR floor (Qwen3.5-class, DeepSeek V4) is effective `off`, so a `null` `spec_route` there is the capability gate rather than a failed attach, and `--spec mtp` measures the head (`mtp_effective` is `null` when the daemon or route reports none, as on EP loads). `spec_tau` averages over every window, including native MTP's AR floor tokens, which draft nothing, so a request the floor retired reads near zero whatever its drafts accepted. The per-run `spec_mtp` (`null` unless native MTP ran) splits the windows: `windows_mtp` (windows before retirement: native and n-gram windows plus the floor's timed AR tokens), `windows_floor_ar` (those timed AR tokens: the calibration token and any retirement probes), `windows_ar_retired` (head-free AR tokens after retirement), `retired_at` (index of the first retired window, `null` if the request never retired), `accepted` (the daemon's `done.accepted`) and `tau_mtp` = `accepted / (windows_mtp - windows_floor_ar)`, the acceptance of the windows that drafted (`null` from a daemon without `accepted` or `floor_ar_windows`). |
 | `hipfire bench <model> --concurrency 1,2,4,8 ...` | Closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). `--json` is not supported on this path. |
@@ -860,7 +867,7 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_SPECULATION=...` | Speculation selector from the environment: overrides per-model and global config; a CLI `--spec` still wins. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
 | `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |
-| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `off` (default) / `auto` / `on`. |
+| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `auto` (default) / `resident` / `on` / `off`. |
 | `HIPFIRE_DFLASH_MODE=...` | Daemon-side mode (CLI default config is still `off`). |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry. |
 | `HIPFIRE_REGISTRY_URL=...` | Alternate registry URL. |

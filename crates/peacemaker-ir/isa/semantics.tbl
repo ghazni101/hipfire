@@ -346,6 +346,7 @@ s_bcnt1_i32_b32	alu
 s_cmp_gt_i32	alu
 s_cmp_le_u32	alu
 s_max_i32	alu
+s_max_u32	alu
 v_cmp_eq_f32_e64	alu
 v_mbcnt_lo_u32_b32	alu
 v_readlane_b32	alu

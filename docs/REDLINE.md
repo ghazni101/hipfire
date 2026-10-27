@@ -158,7 +158,7 @@ After a successful model load, the daemon may request Auto via
 `ReplayController::configure_model_default` when `retained_redline_default`
 matches. **Current automatic runtime selection is only** the MQ4R predicate
 `mq4r_redline_default` (single-GPU `.mq4r` on the exact GPU-arch allowlist),
-the gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, and
+the gfx1201 A3B `.mq4rs` (`qwen3_5_moe`, no drafter, pp=tp=1; extension-selected, deprecated since 0.4.0, removal 0.5.0) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, and
 the gfx1151 DeepSeek4 `.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
 auto-selected because it is not `.mq4r` (not because LFM is categorically
 model-family exempt).

@@ -263,6 +263,13 @@ fn iu4_v2b_a4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
 /// `down_nt4rR` one expert-run down entry with R contiguous 64-row blocks per CTA.
 fn qwen4_moe_sym(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::qwen4_moe_sym::{self, Spec};
+    if epi == "gate_up_stream8" {
+        let e = qwen4_moe_sym::emit_gate_up_stream8(arch)?;
+        return Ok((
+            e.s_text,
+            serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+        ));
+    }
     if epi == "all" {
         let (_, text, proof) = qwen4_moe_sym::emit_module(arch)?;
         return Ok((
@@ -1812,6 +1819,16 @@ fn run() -> Result<(), String> {
                     serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
                 )
             }
+            "railgun_guard" => {
+                if arch != Arch::Gfx1151 {
+                    return Err("railgun_guard is gfx1151 only".into());
+                }
+                let (_, text, proof) = peacemaker_isa::railgun_guard::emit_module()?;
+                (
+                    text,
+                    serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+                )
+            }
             "qwen4_lane_rows" => qwen4_lane_rows(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_mq4_x4_gfx11" => qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"), arch)?,
             "mq6_i8_gemm" => mq6_i8_gemm(epi.as_deref().unwrap_or("all"), tile.as_deref(), arch)?,
@@ -1853,7 +1870,8 @@ fn run() -> Result<(), String> {
     let mrot = kernel == "moe_rotate_i4_pm";
     let lane_rows = (kernel == "qwen4_lane_rows" && row_image.is_none())
         || kernel == "npu_trunk"
-        || kernel == "npu_trunk_arena";
+        || kernel == "npu_trunk_arena"
+        || kernel == "railgun_guard";
     let spec_pm = kernel == "spec_sampling_rows_pm"
         || kernel == "spec_accept_pm"
         || kernel == "qwen4_ep_owner_assign_pm"
@@ -2098,6 +2116,8 @@ fn run() -> Result<(), String> {
             &peacemaker_isa::npu_trunk::SYMBOLS
         } else if kernel == "npu_trunk_arena" {
             &peacemaker_isa::npu_trunk_arena::SYMBOLS
+        } else if kernel == "railgun_guard" {
+            &peacemaker_isa::railgun_guard::SYMBOLS
         } else {
             &peacemaker_isa::kernels::qwen4_lane_rows::SYMBOLS
         };

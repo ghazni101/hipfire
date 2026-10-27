@@ -270,6 +270,7 @@ impl Model {
             Qwen4KvBackend::Legacy => 1,
         };
         let shared = Qwen4RankShared {
+            continuous_batch: false,
             path: model_str.to_string(),
             max_seq: n_ctx,
             sequence: None,

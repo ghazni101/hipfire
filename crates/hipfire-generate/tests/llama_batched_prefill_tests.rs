@@ -17,25 +17,26 @@ use hipfire_generate::ar::*;
 use hipfire_generate::batch::*;
 use hipfire_generate::common::*;
 
-use hipfire_runtime::llama::ModelArch;
+use hipfire_runtime::llama::llama_batched_prefill_eligible;
 
 #[test]
-fn route_stays_inside_validated_qwen3_q8_envelope() {
+fn route_stays_inside_validated_q8_envelope() {
     let cases = [
-        ("gfx1100", ModelArch::Qwen3, true, true, false, 256, true),
-        ("gfx1201", ModelArch::Qwen3, true, true, false, 4, true),
-        ("gfx1200", ModelArch::Qwen3, true, true, false, 256, false),
-        ("gfx1100", ModelArch::Llama, true, true, false, 256, false),
-        ("gfx1100", ModelArch::Qwen3, true, false, false, 256, false),
-        ("gfx1100", ModelArch::Qwen3, true, true, true, 256, false),
-        ("gfx1100", ModelArch::Qwen3, true, true, false, 3, false),
-        ("gfx1100", ModelArch::Qwen3, false, true, false, 256, false),
+        ("gfx1100", true, true, false, 256, true),
+        ("gfx1151", true, true, false, 256, true),
+        ("gfx1201", true, true, false, 4, true),
+        ("gfx1200", true, true, false, 256, false),
+        ("gfx1030", true, true, false, 256, false),
+        ("gfx1100", true, false, false, 256, false),
+        ("gfx1100", true, true, true, 256, false),
+        ("gfx1100", true, true, false, 3, false),
+        ("gfx1100", false, true, false, 256, false),
     ];
-    for (arch, model, enabled, q8, eviction, tokens, expected) in cases {
+    for (arch, enabled, q8, eviction, tokens, expected) in cases {
         assert_eq!(
-            llama_qwen3_batched_prefill_eligible(arch, model, enabled, q8, eviction, tokens,),
+            llama_batched_prefill_eligible(arch, enabled, q8, eviction, tokens),
             expected,
-            "arch={arch} model={model:?}",
+            "arch={arch}",
         );
     }
 }

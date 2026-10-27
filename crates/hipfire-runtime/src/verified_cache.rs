@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_VERSION: u32 = 1;
@@ -158,8 +159,21 @@ impl VerifiedCache {
     /// Record that `path`, whose stat at hashing time was `stat`, hashed to
     /// `sha256`. Written atomically; any failure leaves the cache as it was.
     pub fn remember(&self, path: &Path, stat: StatKey, sha256: &str) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        self.remember_warning_once(path, stat, sha256, &WARNED);
+    }
+
+    /// [`Self::remember`] with the once-per-process warning latch injected;
+    /// returns true when this call emitted the warning.
+    fn remember_warning_once(
+        &self,
+        path: &Path,
+        stat: StatKey,
+        sha256: &str,
+        warned: &AtomicBool,
+    ) -> bool {
         let Some(file) = &self.file else {
-            return;
+            return false;
         };
         let mut records = self.load();
         records.insert(
@@ -172,13 +186,24 @@ impl VerifiedCache {
                     .map_or(0, |elapsed| elapsed.as_secs()),
             },
         );
-        let _ = write_json_atomically(
+        let Err(err) = write_json_atomically(
             file,
             &CacheFile {
                 version: CACHE_VERSION,
                 records,
             },
+        ) else {
+            return false;
+        };
+        if warned.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        eprintln!(
+            "warning: cannot write verified-artifact cache {}: {err}; \
+             artifact verification will repeat on every load or request until it is writable",
+            file.display()
         );
+        true
     }
 }
 
@@ -327,6 +352,21 @@ mod tests {
         let disabled = VerifiedCache::disabled();
         disabled.remember(Path::new("/m/x"), stat(1), SHA);
         assert!(!disabled.satisfies(Path::new("/m/x"), &stat(1), SHA));
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_failing_cache_write_warns_once_and_leaves_the_result_unaffected() {
+        let home = scratch("warn-once");
+        let blocker = home.join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let cache = VerifiedCache::in_home(&blocker);
+        let warned = AtomicBool::new(false);
+        let model = Path::new("/m/x");
+        assert!(cache.remember_warning_once(model, stat(1), SHA, &warned));
+        assert!(!cache.remember_warning_once(model, stat(1), SHA, &warned));
+        // The caller's verified result stands; the cache just never hits.
+        assert!(!cache.satisfies(model, &stat(1), SHA));
         fs::remove_dir_all(&home).unwrap();
     }
 

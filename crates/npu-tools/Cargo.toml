@@ -7,6 +7,7 @@ description = "XDNA2 NPU binaries: npu-tools diagnostics, npu-gemm, npu-hello, n
 publish = false
 
 [dependencies]
+hip-bridge = { path = "../hip-bridge" }
 peacemaker-npu = { path = "../peacemaker-npu" }
 railgun = { path = "../railgun", features = ["npu"] }
 regex.workspace = true

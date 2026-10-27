@@ -74,10 +74,15 @@
 //! float-reciprocal semantics, so the banded raster is refused with the
 //! emulator's own message: use `--raster linear`.
 
-use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
+use crate::common::{contains, dev_err, sha256_hex};
 use crate::iu4::{abi_signature, max_diff, sample_rows};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec, Tile};
+use hipfire_kernel_abi::families::{find_export, mq6_i8 as mq6_abi};
+use hipfire_kernel_abi::{
+    check_export, eval, validate_invocation, Arch as AbiArch, ArgEvidence, Axis, Drift,
+    EvidenceSource, ExportEvidence, HiddenKind, InvocationV1, KernelAbiV1, OperandBinding,
+};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, Spec, Tile};
 use peacemaker_isa::Arch;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
@@ -342,17 +347,129 @@ fn reference(
     out
 }
 
-/// Explicit kernarg: `A Xq Y` at 0/8/16, `M K N` at 24/28/32 and the PM image's
-/// seventh word `unused = 0` at 36 (`gemm_mq6g256v2_i8_prequant`).
-fn pack(a: u64, xq: u64, y: u64, m: usize, k: usize, n: usize) -> Vec<u8> {
-    let mut b = Vec::with_capacity(40);
-    for p in [a, xq, y] {
-        put_ptr(&mut b, p);
+/// The explicit kernarg of `spec`'s launch, encoded by the `hipfire-kernel-abi` contract of the
+/// PM entry with the same epilogue (`families::mq6_i8`), plus that contract.
+///
+/// `ops` is `(address, allocation bytes)` of `A, Xq, Y`; `geom` the launch's real
+/// `(grid, threads, dynamic LDS)`. A spec whose symbol is a contract export (the shipped
+/// `128x128` / `t128x256` entries) is validated with its own geometry. Any other spec
+/// (another tile or the linear raster) encodes through the same-epilogue product export, and its
+/// generator kernarg layout must agree with the contract on every argument and the segment;
+/// threads, LDS and symbol legitimately differ, anything else is an error before launch.
+fn contract_kernarg(
+    spec: Spec,
+    (m, k, n): (usize, usize, usize),
+    ops: [(u64, u64); 3],
+    geom: ([u32; 3], u32, u32),
+) -> Result<(Vec<u8>, &'static KernelAbiV1)> {
+    let exact = if spec.epi == Epi::SetNr {
+        None
+    } else {
+        find_export(AbiArch::Gfx1201, &spec.symbol())
+    };
+    let (abi, export) = match exact {
+        Some(found) => found,
+        None => {
+            let product = Spec::product(if spec.epi == Epi::SetBf16 {
+                Epi::SetBf16
+            } else {
+                Epi::Set
+            });
+            find_export(AbiArch::Gfx1201, &product.symbol())
+                .ok_or_else(|| format!("no kernel-abi contract export for {}", product.symbol()))?
+        }
+    };
+    let layout = spec.kernargs();
+    let evidence = ExportEvidence {
+        source: EvidenceSource::Generator,
+        arch: Some(AbiArch::Gfx1201),
+        symbol: export.symbol.to_owned(),
+        args: layout
+            .args
+            .iter()
+            .map(|a| ArgEvidence {
+                name: a.name.clone(),
+                offset: a.offset,
+                size: a.size,
+                value_kind: a.value_kind.clone(),
+                access: a.actual_access.clone(),
+            })
+            .collect(),
+        segment_bytes: Some(layout.size),
+        segment_align: None,
+        max_flat_workgroup_size: None,
+        threads: None,
+        dynamic_lds: None,
+        group_segment_fixed: None,
+        wave: None,
+        object_sha256: None,
+    };
+    let drift: Vec<String> = check_export(abi, export, &evidence)
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Drift::MissingArg { .. }
+                    | Drift::ExtraArg { .. }
+                    | Drift::ArgName { .. }
+                    | Drift::ArgWidth { .. }
+                    | Drift::ArgKind { .. }
+                    | Drift::ArgAccess { .. }
+                    | Drift::Segment { .. }
+                    | Drift::SegmentAlign { .. }
+            )
+        })
+        .map(|d| d.to_string())
+        .collect();
+    if !drift.is_empty() {
+        return Err(format!(
+            "{}: kernarg layout differs from contract {} ({}): {}",
+            spec.variant_name(),
+            abi.id,
+            export.symbol,
+            drift.join("; ")
+        ));
     }
-    for v in [m, k, n, 0] {
-        put_i32(&mut b, v as i32);
-    }
-    b
+    let params = [m as u64, k as u64, n as u64];
+    let y_format = if spec.epi == Epi::SetBf16 {
+        mq6_abi::FORMAT_BF16_N_M
+    } else {
+        mq6_abi::FORMAT_F32_N_M
+    };
+    let binds: [OperandBinding; 3] = [
+        (mq6_abi::FORMAT_MQ6G256V2_WEIGHTS, ops[0]),
+        (mq6_abi::FORMAT_BLOCK_I8_128_KB_N, ops[1]),
+        (y_format, ops[2]),
+    ]
+    .map(|(format, (address, bytes))| OperandBinding {
+        address,
+        bytes: Some(bytes),
+        format,
+    });
+    let (grid, block, dynamic_lds) = if exact.is_some() {
+        (geom.0, [geom.1, 1, 1], geom.2)
+    } else {
+        let mut grid = [0u32; 3];
+        for (g, e) in grid.iter_mut().zip(&export.grid) {
+            let v = eval(e, abi, export, &params).map_err(|e| format!("{}: {e}", abi.id))?;
+            *g = u32::try_from(v).map_err(|_| format!("{}: grid {v} exceeds u32", abi.id))?;
+        }
+        (grid, export.block, export.dynamic_lds)
+    };
+    let v = validate_invocation(
+        abi,
+        &InvocationV1 {
+            arch: AbiArch::Gfx1201,
+            symbol: export.symbol,
+            params: &params,
+            operands: &binds,
+            grid,
+            block,
+            dynamic_lds,
+        },
+    )
+    .map_err(|e| format!("{}: {e}", spec.variant_name()))?;
+    Ok((v.explicit().to_vec(), abi))
 }
 
 /// `full` or `sample:<n>` indices over `0..dim`.
@@ -513,6 +630,36 @@ impl Mq6 {
         self.cand.epi == Epi::SetBf16
     }
 
+    /// The spec `arm` launches: the shipped `128x128` product entry of the candidate's epilogue,
+    /// or the emitted `--base-tile` / `--base-rip` spec.
+    fn arm_spec(&self, arm: Arm) -> Spec {
+        match arm {
+            Arm::Baseline => self
+                .base
+                .as_ref()
+                .map_or_else(|| Spec::product(self.cand.epi), |(s, _)| *s),
+            Arm::Candidate => self.cand,
+        }
+    }
+
+    /// `arm`'s explicit kernarg, from the contract, over the workload's live allocations.
+    fn kernarg(&self, arm: Arm) -> Result<Vec<u8>> {
+        let dev = self.dev.as_ref().ok_or("kernarg before setup")?;
+        let y = match arm {
+            Arm::Baseline => &dev.y[0],
+            Arm::Candidate => &dev.y[1],
+        };
+        let spec = self.arm_spec(arm);
+        let op = |b: &hip_bridge::DeviceBuffer| (b.as_ptr() as u64, b.size() as u64);
+        contract_kernarg(
+            spec,
+            (self.m, self.k, self.n),
+            [op(&dev.w), op(&dev.x), op(y)],
+            geometry(self.m, self.n, spec.tile),
+        )
+        .map(|(k, _)| k)
+    }
+
     fn width(&self) -> usize {
         if self.bf16() {
             2
@@ -591,10 +738,27 @@ impl Mq6 {
             m.div_ceil(tile.rows() as usize),
             n.div_ceil(tile.tokens() as usize),
         );
-        let mut kern = pack(ava, xva, yva, m, k, n);
+        let (mut kern, abi) = contract_kernarg(
+            self.cand,
+            (m, k, n),
+            [
+                (ava, host.w.len() as u64),
+                (xva, host.x.len() as u64),
+                (yva, (n * m * self.width()) as u64),
+            ],
+            geometry(m, n, tile),
+        )?;
         kern.resize(self.cand.kernargs().size as usize, 0);
-        for (off, v) in [(40, gx as u32), (44, gy as u32), (48, 1)] {
-            kern[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        for h in abi.hidden {
+            if let HiddenKind::BlockCount(axis) = h.kind {
+                let v = match axis {
+                    Axis::X => gx as u32,
+                    Axis::Y => gy as u32,
+                    Axis::Z => 1,
+                };
+                let off = h.offset as usize;
+                kern[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
         }
         let mut mem = Memory::default();
         mem.map("kernarg".into(), kva, kern)?;
@@ -754,6 +918,10 @@ impl Workload for Mq6 {
         };
         self.host = Some(host);
         self.dev = Some(dev);
+        // Refuse a wrong layout / extent / alignment before any launch.
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            self.kernarg(arm)?;
+        }
         for arm in [Arm::Baseline, Arm::Candidate] {
             self.reset(gpu, arm)?;
         }
@@ -761,21 +929,12 @@ impl Workload for Mq6 {
     }
 
     fn launch(&self, arm: Arm) -> Launch {
-        let dev = self.dev.as_ref().expect("launch before setup");
-        let ptr = |b: &hip_bridge::DeviceBuffer| b.as_ptr() as u64;
-        let y = match arm {
-            Arm::Baseline => &dev.y[0],
-            Arm::Candidate => &dev.y[1],
-        };
-        // The baseline is the shipped 128x128 kernel whatever the candidate's tile is; each
-        // arm's grid, block and LDS follow its own tile.
-        let tile = match arm {
-            Arm::Baseline => self.base.as_ref().map_or(Tile::T128x128, |(s, _)| s.tile),
-            Arm::Candidate => self.cand.tile,
-        };
-        let (grid, threads, lds) = geometry(self.m, self.n, tile);
+        // Each arm's grid, block and LDS follow its own tile (see `arm_spec`).
+        let (grid, threads, lds) = geometry(self.m, self.n, self.arm_spec(arm).tile);
         Launch {
-            kernarg: pack(ptr(&dev.w), ptr(&dev.x), ptr(y), self.m, self.k, self.n),
+            kernarg: self
+                .kernarg(arm)
+                .expect("kernarg contract is validated in setup"),
             grid,
             block: [threads, 1, 1],
             lds,
@@ -1010,14 +1169,129 @@ mod tests {
 
     #[test]
     fn launch_is_the_runtime_geometry() {
-        let mut w = new("M=260,N=130,K=256", &mut knobs(&[]), None).unwrap();
-        let _ = &mut w;
-        let b = pack(1, 2, 3, 260, 256, 130);
+        let (b, abi) = contract_kernarg(
+            Spec::product(Epi::Set),
+            (260, 256, 130),
+            [(0x1000, 52000), (0x2000, 35360), (0x3000, 135200)],
+            geometry(260, 130, Tile::T128x128),
+        )
+        .unwrap();
+        assert_eq!(abi.id, "mq6_i8_gemm.pm.set_f32");
         assert_eq!(b.len(), 40);
-        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 3);
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 0x3000);
         for (off, v) in [(24, 260), (28, 256), (32, 130), (36, 0)] {
             assert_eq!(i32::from_le_bytes(b[off..off + 4].try_into().unwrap()), v);
         }
+    }
+
+    /// An independent contract encoding (the explicit statics, `validate_invocation` +
+    /// `encode_into`) equals the workload's kernarg for canonical shapes, tiles and epilogues.
+    #[test]
+    fn mq6_kernarg_is_contract_encoding() {
+        use hipfire_kernel_abi::families::mq6_i8 as f;
+        use hipfire_kernel_abi::{encode_into, validate_invocation};
+        for (epi, abi, y_fmt, y_bytes_per) in [
+            (Epi::Set, &f::MQ6_I8_PM_SET_F32, f::FORMAT_F32_N_M, 4u64),
+            (
+                Epi::SetBf16,
+                &f::MQ6_I8_PM_SET_BF16,
+                f::FORMAT_BF16_N_M,
+                2u64,
+            ),
+        ] {
+            for (m, n, k) in [(260usize, 130usize, 256usize), (128, 128, 512), (4, 1, 256)] {
+                let ops = [
+                    (0x1000u64, (m * (k / 256) * 200) as u64),
+                    (0x2000, (n * (k / 128) * 136) as u64),
+                    (0x3000, n as u64 * m as u64 * y_bytes_per),
+                ];
+                let spec = Spec::product(epi);
+                let (got, got_abi) =
+                    contract_kernarg(spec, (m, k, n), ops, geometry(m, n, Tile::T128x128)).unwrap();
+                assert_eq!(got_abi.id, abi.id);
+                let formats = [
+                    f::FORMAT_MQ6G256V2_WEIGHTS,
+                    f::FORMAT_BLOCK_I8_128_KB_N,
+                    y_fmt,
+                ];
+                let binds: Vec<OperandBinding> = ops
+                    .iter()
+                    .zip(formats)
+                    .map(|(&(address, bytes), format)| OperandBinding {
+                        address,
+                        bytes: Some(bytes),
+                        format,
+                    })
+                    .collect();
+                let (grid, threads, lds) = geometry(m, n, Tile::T128x128);
+                let v = validate_invocation(
+                    abi,
+                    &InvocationV1 {
+                        arch: AbiArch::Gfx1201,
+                        symbol: &spec.symbol(),
+                        params: &[m as u64, k as u64, n as u64],
+                        operands: &binds,
+                        grid,
+                        block: [threads, 1, 1],
+                        dynamic_lds: lds,
+                    },
+                )
+                .unwrap();
+                let mut want = vec![0u8; abi.explicit_bytes as usize];
+                encode_into(&v, &mut want).unwrap();
+                assert_eq!(got, want, "{} M={m} N={n} K={k}", epi.name());
+                // Non-product tiles/rasters of the same epilogue share the product's image.
+                for (tile, raster) in [
+                    (Tile::T128x256, Raster::Banded),
+                    (Tile::T256x128, Raster::Banded),
+                    (Tile::T128x128, Raster::Linear),
+                ] {
+                    let s = Spec {
+                        epi,
+                        raster,
+                        tile,
+                        arch: Arch::Gfx1201,
+                    };
+                    let (g, _) = contract_kernarg(s, (m, k, n), ops, geometry(m, n, tile)).unwrap();
+                    assert_eq!(g, want, "{} M={m} N={n} K={k}", s.variant_name());
+                }
+            }
+        }
+    }
+
+    /// A candidate whose generator kernarg layout differs from the contract (set_nr appends the
+    /// norm/RoPE pointers, renames word 36 and grows the segment) is refused before launch.
+    #[test]
+    fn mq6_wrong_candidate_layout_is_rejected_before_launch() {
+        let nr = Spec {
+            epi: Epi::SetNr,
+            raster: Raster::Banded,
+            tile: Tile::T256x128,
+            arch: Arch::Gfx1201,
+        };
+        let e = contract_kernarg(
+            nr,
+            (256, 256, 128),
+            [(0x1000, 51200), (0x2000, 34816), (0x3000, 131072)],
+            geometry(256, 128, Tile::T256x128),
+        )
+        .unwrap_err();
+        assert!(e.contains("kernarg layout"), "{e}");
+        assert!(e.contains("head_mask"), "{e}");
+    }
+
+    #[test]
+    fn mq6_contract_refuses_short_extent_and_misalignment() {
+        let g = geometry(260, 130, Tile::T128x128);
+        let s = Spec::product(Epi::Set);
+        let good = [(0x1000u64, 52000u64), (0x2000, 35360), (0x3000, 135200)];
+        assert!(contract_kernarg(s, (260, 256, 130), good, g).is_ok());
+        let mut short = good;
+        short[2].1 -= 4;
+        assert!(contract_kernarg(s, (260, 256, 130), short, g).is_err());
+        let mut odd = good;
+        odd[0].0 = 0x1001;
+        assert!(contract_kernarg(s, (260, 256, 130), odd, g).is_err());
     }
 
     #[test]

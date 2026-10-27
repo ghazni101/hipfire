@@ -638,6 +638,7 @@ const KV_MODES: &[&str] = &[
 // (`q4`/`int4` are Qwen3.5-only).
 const STATE_QUANT_MODES: &[&str] = &["auto", "q8", "int8", "q8_ef", "fp32", "f32", "q4", "int4"];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
+const VISION_MODES: &[&str] = &["auto", "resident", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
 const IMAGE_DECODE_MODES: &[&str] = &["cpu", "vcn", "auto"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's
@@ -1724,12 +1725,12 @@ pub static FIELDS: &[ConfigField] = &[
         "vision_mode",
         Vision,
         ModelLoad,
-        DefaultValue::String("off"),
-        ValueRule::Enum(AUTO_ON_OFF),
+        DefaultValue::String("auto"),
+        ValueRule::Enum(VISION_MODES),
         true,
         false,
         Some("HIPFIRE_VISION_MODE"),
-        "Vision-tower sidecar policy."
+        "Vision-tower policy: auto (default; Qwen3.5/3.8-VL tower streamed from host/disk per block, no resident tower VRAM; text-only without a sidecar), resident (whole tower in VRAM at load), on (like auto, but the load fails without a tower), off (text-only)."
     ),
     field!(
         "image.decode",
@@ -4074,6 +4075,17 @@ pub fn field(key: &str) -> Option<&'static ConfigField> {
     FIELDS
         .iter()
         .find(|candidate| candidate.key == key || candidate.legacy_key == key)
+}
+
+/// The schema default of `vision.mode` (`auto`/`resident`/`on`/`off`), for a load
+/// request that carries no `params.vision_mode` (a daemon-protocol client that
+/// does not project the config ladder). Every consumer that needs a fallback
+/// reads it here so no caller hardcodes a mode of its own.
+pub fn vision_mode_default() -> &'static str {
+    match field("vision.mode").map(|schema| schema.default) {
+        Some(DefaultValue::String(mode)) => mode,
+        _ => unreachable!("vision.mode is a string-valued schema field"),
+    }
 }
 
 const DEVELOPER_PREFIX: &str = "developer.";
@@ -8469,18 +8481,21 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(field.parse_cli("7").is_err());
     }
     #[test]
-    fn vision_mode_defaults_off_with_auto_on_off_values() {
+    fn vision_mode_defaults_auto_with_resident_value() {
         let field = field("vision.mode").expect("vision.mode schema field");
         assert_eq!(field.legacy_key, "vision_mode");
         assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
-        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
-        for mode in ["off", "auto", "on"] {
+        assert_eq!(field.default.to_value(), ConfigValue::String("auto".into()));
+        for mode in ["off", "auto", "resident", "on"] {
             assert_eq!(
                 field.parse_cli(mode).unwrap(),
                 ConfigValue::String(mode.into())
             );
         }
-        assert!(field.parse_cli("sometimes").is_err());
+        for bad in ["sometimes", "text-only", "vram-resident"] {
+            assert!(field.parse_cli(bad).is_err(), "{bad}");
+        }
+        assert_eq!(vision_mode_default(), "auto");
     }
     #[test]
     fn npu_trunk_calibration_schema_and_snapshot() {

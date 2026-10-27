@@ -180,7 +180,7 @@ pub fn decode_step_sampled(
     .map_err(|e| format!("glimmer: sample: {e:?}"))
 }
 
-fn embed_lookup(
+pub(crate) fn embed_lookup(
     _cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
     state: &mut GlimmerState,
@@ -276,7 +276,7 @@ fn decode_step_body(
 /// Stage `position` for the layer programs: the device position scalar, the
 /// tiled-attention position copy and partials once the context reaches
 /// [`WINDOWED_Q8_TILED_MIN_SEQ`], and the KV pages up to `position`.
-fn stage_decode_position(
+pub(crate) fn stage_decode_position(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
     state: &mut GlimmerState,
@@ -315,6 +315,18 @@ fn stage_decode_position(
     Ok(())
 }
 
+/// The tiled decode attention's staging, once [`stage_decode_position`] has
+/// allocated it (from [`WINDOWED_Q8_TILED_MIN_SEQ`] on).
+pub(crate) fn decode_tiled(state: &GlimmerState) -> Option<WindowedQ8Tiled<'_>> {
+    match (&state.decode_pos, &state.prefill_flash_partials) {
+        (Some(positions), Some(partials)) => Some(WindowedQ8Tiled {
+            positions,
+            partials,
+        }),
+        _ => None,
+    }
+}
+
 /// Run decoder layer `layer`'s step program at the staged position.
 fn run_layer(
     gpu: &mut Gpu,
@@ -325,14 +337,7 @@ fn run_layer(
     layer: usize,
 ) -> Result<(), String> {
     let lw = &weights.layers[layer];
-    let tiled = match (&state.decode_pos, &state.prefill_flash_partials) {
-        (Some(positions), Some(partials)) => Some(WindowedQ8Tiled {
-            positions,
-            partials,
-        }),
-        _ => None,
-    };
-    let io = program::LayerIo::decode(state, tiled);
+    let io = program::LayerIo::decode(state, decode_tiled(state));
     let steps = program::layer_steps(cfg, layer, lw, state, &io);
     execute_steps(gpu, ctx, &steps).map_err(|e| format!("glimmer L{layer}: {e:?}"))
 }
@@ -1102,10 +1107,10 @@ fn verify_block_capture_impl(
 
 /// Activation scratch of one batched forward over `rows` rows, allocated per
 /// call (prefill chunks and verify blocks are not the per-kernel hot loop).
-struct RowsScratch {
-    x: GpuTensor,
+pub(crate) struct RowsScratch {
+    pub(crate) x: GpuTensor,
     residual: GpuTensor,
-    normed: GpuTensor,
+    pub(crate) normed: GpuTensor,
     q: GpuTensor,
     k: GpuTensor,
     v: GpuTensor,
@@ -1114,7 +1119,7 @@ struct RowsScratch {
     gate_ffn: GpuTensor,
     up_ffn: GpuTensor,
     ffn_hidden: GpuTensor,
-    ffn_out: GpuTensor,
+    pub(crate) ffn_out: GpuTensor,
     rotation: GpuTensor,
     positions: GpuTensor,
     shifted_positions: GpuTensor,
@@ -1122,15 +1127,20 @@ struct RowsScratch {
 }
 
 impl RowsScratch {
-    /// Every tensor or none: a failure part-way frees what it already holds,
-    /// so a retried request cannot leak it.
-    fn alloc(gpu: &mut Gpu, cfg: &GlimmerConfig, b: usize) -> Result<Self, String> {
+    /// Per-row elements of each tensor, in field order.
+    fn widths(cfg: &GlimmerConfig) -> [usize; 16] {
         let (dim, q_dim, kv_dim, hidden) = (cfg.dim, cfg.q_dim(), cfg.kv_dim(), cfg.hidden_dim);
         let widest = dim.max(q_dim).max(hidden);
-        let sizes = [
+        [
             dim, dim, dim, q_dim, kv_dim, kv_dim, q_dim, q_dim, hidden, hidden, hidden, dim,
             widest, 1, 1, 1,
-        ];
+        ]
+    }
+
+    /// Every tensor or none: a failure part-way frees what it already holds,
+    /// so a retried request cannot leak it.
+    pub(crate) fn alloc(gpu: &mut Gpu, cfg: &GlimmerConfig, b: usize) -> Result<Self, String> {
+        let sizes = Self::widths(cfg);
         let mut taken = Vec::with_capacity(sizes.len());
         for n in sizes {
             match gpu.alloc_tensor(&[b * n], DType::F32) {
@@ -1165,7 +1175,33 @@ impl RowsScratch {
         })
     }
 
-    fn free(self, gpu: &mut Gpu) {
+    /// Views of the first `b` rows of every tensor, so kernels that size
+    /// themselves from a tensor's length see exactly `b` rows, as with a
+    /// scratch allocated for `b` rows. `b` must not exceed the allocation.
+    pub(crate) fn rows(&self, cfg: &GlimmerConfig, b: usize) -> Self {
+        let [x, residual, normed, q, k, v, attn_gate, attn_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, rotation, positions, shifted_positions, token_ids] =
+            Self::widths(cfg).map(|w| b * w);
+        Self {
+            x: self.x.sub_offset(0, x),
+            residual: self.residual.sub_offset(0, residual),
+            normed: self.normed.sub_offset(0, normed),
+            q: self.q.sub_offset(0, q),
+            k: self.k.sub_offset(0, k),
+            v: self.v.sub_offset(0, v),
+            attn_gate: self.attn_gate.sub_offset(0, attn_gate),
+            attn_out: self.attn_out.sub_offset(0, attn_out),
+            gate_ffn: self.gate_ffn.sub_offset(0, gate_ffn),
+            up_ffn: self.up_ffn.sub_offset(0, up_ffn),
+            ffn_hidden: self.ffn_hidden.sub_offset(0, ffn_hidden),
+            ffn_out: self.ffn_out.sub_offset(0, ffn_out),
+            rotation: self.rotation.sub_offset(0, rotation),
+            positions: self.positions.sub_offset(0, positions),
+            shifted_positions: self.shifted_positions.sub_offset(0, shifted_positions),
+            token_ids: self.token_ids.sub_offset(0, token_ids),
+        }
+    }
+
+    pub(crate) fn free(self, gpu: &mut Gpu) {
         for t in [
             self.x,
             self.residual,
@@ -1269,7 +1305,7 @@ impl RowsCapture {
 
 /// The layer-program buffers of a batched forward over `rows` rows at
 /// `position`.
-fn rows_io<'a>(
+pub(crate) fn rows_io<'a>(
     state: &'a GlimmerState,
     s: &'a RowsScratch,
     rows: usize,
@@ -1317,7 +1353,7 @@ fn htod_i32(gpu: &mut Gpu, t: &GpuTensor, values: impl Iterator<Item = i32>) -> 
 /// Stage a batched forward of `tokens` at `position`: row positions and token
 /// ids; past the window, the shifted positions and the flash partials of the
 /// prefill attention; the KV pages the rows write.
-fn stage_rows(
+pub(crate) fn stage_rows(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
     state: &mut GlimmerState,
@@ -1358,7 +1394,7 @@ fn stage_rows(
 }
 
 /// Embedding + scale-less embed_norm of the staged token ids into `s.x`.
-fn embed_rows(
+pub(crate) fn embed_rows(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,

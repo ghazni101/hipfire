@@ -49,7 +49,28 @@
 // pairs for the whole tile (scores, softmax and PV), so every dequantized K/V
 // slice serves 6 pairs and the tile loop has no workgroup barrier; the waves
 // of a workgroup read the same K/V bytes through L0.
+//
+// fwht4 / fwht3 K (Q8 V only): `attention_verify_gqa_{fwht4,fwht3}_gfx1100`
+// (TILE mode, the 10-argument q8 entry ABI followed by `signs1`, `signs2`)
+// write the same partials as `attention_flash_{fwht4,fwht3}_tile_batched` at
+// v_mode 8. Q arrives un-rotated f32; every wave rotates its 6 pairs with the
+// references' own `fwht_shfl_forward` / `fwht_shfl_forward_256` (turbo_common.h)
+// on the reference lane layout (lane = reference lane), then redistributes
+// the rotated values to the 16-lane-row layout with ds_bpermute (exact moves).
+// Reference arithmetic (hipcc -O3 gfx1100 ISA of the two references):
+//   * kq = cnorm * C[nibble] (one f32 product, table = TURBO_C4 / TURBO_C3_256);
+//   * fwht4 reference lane l: dims 4l..4l+3 (half 0) and 128+4l..+3 (half 1);
+//     X_h = fma(m3,k3, fma(m2,k2, fma(m0,k0, m1*k1))), leaf = (0 + X_0) + X_1;
+//   * fwht3 reference lane l: dims 8l..8l+7, leaf =
+//     fma(m7,k7, ... fma(m2,k2, fma(m0,k0, m1*k1))...);
+//   * score = (xor-16, 8, 4, 2, 1 butterfly sum of the 32 leaves) * scale,
+//     then the TILE softmax and PV exactly as for Q8 (V is Q8_0 in both).
+// The table lookup is a ds_bpermute from a per-lane register table (lane L
+// holds C[L & 15] / C[L & 7]); it returns the exact table float.
 #include <hip/hip_runtime.h>
+#ifndef VA_TURBO_COMMON_INLINED
+#include "turbo_common.h"
+#endif
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
 #error "attention_verify_gqa_gfx1100 requires --offload-arch=gfx1100"
@@ -133,6 +154,174 @@ __device__ __forceinline__ void va_dequant(const VaSlice& s, float (&out)[8]) {
     va_dequant_q8(s.lo, s.hi, __builtin_bit_cast(_Float16, s.sc), out);
 }
 
+// ── fwht K kinds ─────────────────────────────────────────────────────────
+enum { VA_K_Q8 = 0, VA_K_F4 = 1, VA_K_F3 = 2 };
+// K bytes per kv head: f32 cnorm + 4-bit nibbles (fwht4) / 3-bit (fwht3).
+#define VA_K4_HEAD 132
+#define VA_K3_HEAD 100
+
+template <int KIND>
+struct VaKRegs;
+template <>
+struct VaKRegs<VA_K_Q8> {
+    VaSlice a, b;  // reference lanes rl and rl + 16 (dims 8rl.., 128 + 8rl..)
+};
+template <>
+struct VaKRegs<VA_K_F4> {
+    float cn;
+    // 16 packed nibbles per reference lane: p[0] = lane rl half 0, p[1] = lane
+    // rl + 16 half 0, p[2] = lane rl half 1, p[3] = lane rl + 16 half 1.
+    unsigned short p[4];
+};
+template <>
+struct VaKRegs<VA_K_F3> {
+    float cn;
+    unsigned int a, b;  // 24-bit packed indices of reference lanes rl, rl + 16
+};
+
+// Exact table float: lane `idx` of `tab` (the per-lane register table).
+__device__ __forceinline__ float va_lut(float tab, unsigned int idx) {
+    return __builtin_bit_cast(
+        float, __builtin_amdgcn_ds_bpermute((int)(idx << 2), __builtin_bit_cast(int, tab)));
+}
+
+// The K bytes one 16-lane row lane needs of key row `row_off` (bytes from the
+// tile's first row) of kv head `kv_h`, for reference lanes rl and rl + 16.
+template <int KIND>
+__device__ __forceinline__ VaKRegs<KIND> va_k_load(__amdgpu_buffer_rsrc_t rsrc, unsigned row_off, int kv_h, int rl) {
+    VaKRegs<KIND> r;
+    if constexpr (KIND == VA_K_Q8) {
+        r.a = va_load_slice(rsrc, row_off, kv_h, 8 * rl);
+        r.b = va_load_slice(rsrc, row_off, kv_h, 128 + 8 * rl);
+    } else if constexpr (KIND == VA_K_F4) {
+        const unsigned kb = row_off + (unsigned)(kv_h * VA_K4_HEAD);
+        r.cn = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(rsrc, kb, 0, 0));
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            r.p[j] = __builtin_amdgcn_raw_buffer_load_b16(rsrc, kb + 4u + 32u * (unsigned)j + 2u * (unsigned)rl, 0, 0);
+    } else {
+        const unsigned kb = row_off + (unsigned)(kv_h * VA_K3_HEAD);
+        r.cn = __builtin_bit_cast(float, __builtin_amdgcn_raw_buffer_load_b32(rsrc, kb, 0, 0));
+        const unsigned oa = kb + 4u + 3u * (unsigned)rl;
+        const unsigned ob = oa + 48u;
+        r.a = (unsigned)__builtin_amdgcn_raw_buffer_load_b16(rsrc, oa, 0, 0) |
+              ((unsigned)__builtin_amdgcn_raw_buffer_load_b8(rsrc, oa + 2u, 0, 0) << 16);
+        r.b = (unsigned)__builtin_amdgcn_raw_buffer_load_b16(rsrc, ob, 0, 0) |
+              ((unsigned)__builtin_amdgcn_raw_buffer_load_b8(rsrc, ob + 2u, 0, 0) << 16);
+    }
+    return r;
+}
+
+// Four fwht4 centroids of one packed u16: cnorm * C[nibble i], i = 0..3.
+__device__ __forceinline__ void va_dec4(float cn, float tab, unsigned int pk, float* out) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) out[i] = cn * va_lut(tab, (pk >> (4 * i)) & 0xFu);
+}
+
+// The reference's 4-term dot: ((m0*k0 + m1*k1) + m2*k2) + m3*k3 contracted as
+// fma(m3,k3, fma(m2,k2, fma(m0,k0, m1*k1))).
+__device__ __forceinline__ float va_dot4(const float* m, const float* k) {
+    float x = m[1] * k[1];
+    x = __builtin_fmaf(m[0], k[0], x);
+    x = __builtin_fmaf(m[2], k[2], x);
+    return __builtin_fmaf(m[3], k[3], x);
+}
+
+// fwht4 reference-lane leaf: partial = 0; partial += X_half0; partial += X_half1.
+__device__ __forceinline__ float va_leaf_f4(const float (&q)[8], const float* k) {
+    float p = 0.0f;
+    p += va_dot4(q, k);
+    p += va_dot4(q + 4, k + 4);
+    return p;
+}
+
+// fwht3 reference-lane leaf (8-term dot, same contraction shape as va_dot4).
+__device__ __forceinline__ float va_leaf_f3(const float (&q)[8], const float (&k)[8]) {
+    float x = q[1] * k[1];
+    x = __builtin_fmaf(q[0], k[0], x);
+#pragma unroll
+    for (int i = 2; i < 8; ++i) x = __builtin_fmaf(q[i], k[i], x);
+    return x;
+}
+
+// Pre-butterfly sum (leaf(rl) + leaf(rl + 16)) of one key for the first NP pairs.
+template <int KIND, int NP>
+__device__ __forceinline__ void va_k_score(const VaKRegs<KIND>& c, float tab, const float (&qa)[VA_PPW][8],
+                                           const float (&qb)[VA_PPW][8], float (&v)[NP]) {
+    if constexpr (KIND == VA_K_Q8) {
+        float ka[8], kb[8];
+        va_dequant(c.a, ka);
+        va_dequant(c.b, kb);
+#pragma unroll
+        for (int j = 0; j < NP; ++j) v[j] = va_leaf(qa[j], ka) + va_leaf(qb[j], kb);
+    } else if constexpr (KIND == VA_K_F4) {
+        float ka[8], kb[8];
+        va_dec4(c.cn, tab, c.p[0], ka);
+        va_dec4(c.cn, tab, c.p[2], ka + 4);
+        va_dec4(c.cn, tab, c.p[1], kb);
+        va_dec4(c.cn, tab, c.p[3], kb + 4);
+#pragma unroll
+        for (int j = 0; j < NP; ++j) v[j] = va_leaf_f4(qa[j], ka) + va_leaf_f4(qb[j], kb);
+    } else {
+        float ka[8], kb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            ka[i] = c.cn * va_lut(tab, (c.a >> (3 * i)) & 7u);
+            kb[i] = c.cn * va_lut(tab, (c.b >> (3 * i)) & 7u);
+        }
+#pragma unroll
+        for (int j = 0; j < NP; ++j) v[j] = va_leaf_f3(qa[j], ka) + va_leaf_f3(qb[j], kb);
+    }
+}
+
+// One pair's q8-layout Q registers: qa = reference lane rl, qb = rl + 16.
+// fwht kinds rotate on the reference lane layout (lane = reference lane) and
+// redistribute with exact lane moves.
+template <int KIND>
+__device__ __forceinline__ void va_load_q(const float* qr, const float* signs1, const float* signs2, int lane,
+                                          int rl, float (&qa)[8], float (&qb)[8]) {
+    if constexpr (KIND == VA_K_Q8) {
+        const float4 a0 = *(const float4*)(qr + 8 * rl);
+        const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
+        const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
+        const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
+        qa[0] = a0.x; qa[1] = a0.y; qa[2] = a0.z; qa[3] = a0.w;
+        qa[4] = a1.x; qa[5] = a1.y; qa[6] = a1.z; qa[7] = a1.w;
+        qb[0] = b0.x; qb[1] = b0.y; qb[2] = b0.z; qb[3] = b0.w;
+        qb[4] = b1.x; qb[5] = b1.y; qb[6] = b1.z; qb[7] = b1.w;
+    } else {
+        float mq[8];
+        if constexpr (KIND == VA_K_F4) {
+            for (int half = 0; half < 2; half++) {
+                const int d0 = half * 128 + lane * 4;
+                float a = qr[d0 + 0];
+                float b = qr[d0 + 1];
+                float c = qr[d0 + 2];
+                float d = qr[d0 + 3];
+                fwht_shfl_forward(a, b, c, d, signs1, signs2, lane);
+                mq[half * 4 + 0] = a;
+                mq[half * 4 + 1] = b;
+                mq[half * 4 + 2] = c;
+                mq[half * 4 + 3] = d;
+            }
+        } else {
+            const int d0 = lane * 8;
+            float mq0 = qr[d0 + 0], mq1 = qr[d0 + 1];
+            float mq2 = qr[d0 + 2], mq3 = qr[d0 + 3];
+            float mq4 = qr[d0 + 4], mq5 = qr[d0 + 5];
+            float mq6 = qr[d0 + 6], mq7 = qr[d0 + 7];
+            fwht_shfl_forward_256(mq0, mq1, mq2, mq3, mq4, mq5, mq6, mq7, signs1, signs2, lane);
+            mq[0] = mq0; mq[1] = mq1; mq[2] = mq2; mq[3] = mq3;
+            mq[4] = mq4; mq[5] = mq5; mq[6] = mq6; mq[7] = mq7;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qa[i] = __shfl(mq[i], rl);
+            qb[i] = __shfl(mq[i], rl + 16);
+        }
+    }
+}
+
 // ROWS mode: out = fma(w, vq, out) and sum += w for one key of one pair,
 // after the reference's rescale when this key raises the running max
 // (`raise`; `w` then holds the raw score, else the precomputed e).
@@ -164,13 +353,13 @@ __device__ __forceinline__ bool va_raised(const unsigned int (&r)[4], int t) {
 // Every tile of one wave's workgroup range, for the wave's first NP pairs
 // (the valid pairs of a wave are always a prefix j < NP, so the pair loops
 // are straight-line and interleave across pairs).
-template <int MODE, int NP>
+template <int MODE, int NP, int KIND>
 __device__ __forceinline__ void va_tiles(
     const unsigned char* __restrict__ k_cache, const unsigned char* __restrict__ v_cache,
     float* __restrict__ partials, float (&sc)[VA_PPW][VA_TILE], const float (&qa)[VA_PPW][8],
     const float (&qb)[VA_PPW][8], const int (&pair_len)[VA_PPW], const int (&pair_tiles)[VA_PPW],
-    const size_t (&pair_base)[VA_PPW], int group_len, int n_tiles, int kv_h, unsigned per_pos,
-    float scale_attn) {
+    const size_t (&pair_base)[VA_PPW], int group_len, int n_tiles, int kv_h, unsigned per_pos_k,
+    unsigned per_pos, float tab, float scale_attn) {
     const int lane = (int)threadIdx.x & 31;
     const int half = lane >> 4;
     const int rl = lane & 15;
@@ -186,29 +375,24 @@ __device__ __forceinline__ void va_tiles(
             full = full && (tl[j] == 0 || tl[j] == tl_max);
         }
 
+        const size_t k_tile_base = (size_t)tile_start * per_pos_k;
         const size_t tile_base = (size_t)tile_start * per_pos;
         const auto k_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-            (void*)(k_cache + tile_base), 0, (int)((unsigned)tl_max * per_pos), VA_RSRC_FLAGS);
+            (void*)(k_cache + k_tile_base), 0, (int)((unsigned)tl_max * per_pos_k), VA_RSRC_FLAGS);
         const auto v_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)(v_cache + tile_base), 0, (int)((unsigned)tl_max * per_pos), VA_RSRC_FLAGS);
 
         // ── Phase A: scores. Pass k: row `half` scores key 32(k>>4) + (k&15) + 16*half.
         {
             auto key_of = [&](int k) { return 32 * (k >> 4) + (k & 15) + 16 * half; };
-            unsigned off = (unsigned)min(key_of(0), tl_max - 1) * per_pos;
-            VaSlice ca = va_load_slice(k_rsrc, off, kv_h, 8 * rl);
-            VaSlice cb = va_load_slice(k_rsrc, off, kv_h, 128 + 8 * rl);
+            unsigned off = (unsigned)min(key_of(0), tl_max - 1) * per_pos_k;
+            VaKRegs<KIND> ck = va_k_load<KIND>(k_rsrc, off, kv_h, rl);
             for (int k = 0; 32 * (k >> 4) + (k & 15) < tl_max; ++k) {
                 const int t = key_of(k);
-                const unsigned noff = (unsigned)min(key_of(k + 1), tl_max - 1) * per_pos;
-                const VaSlice na = va_load_slice(k_rsrc, noff, kv_h, 8 * rl);
-                const VaSlice nb = va_load_slice(k_rsrc, noff, kv_h, 128 + 8 * rl);
-                float ka[8], kb[8];
-                va_dequant(ca, ka);
-                va_dequant(cb, kb);
+                const unsigned noff = (unsigned)min(key_of(k + 1), tl_max - 1) * per_pos_k;
+                const VaKRegs<KIND> nk = va_k_load<KIND>(k_rsrc, noff, kv_h, rl);
                 float v[NP];
-#pragma unroll
-                for (int j = 0; j < NP; ++j) v[j] = va_leaf(qa[j], ka) + va_leaf(qb[j], kb);
+                va_k_score<KIND, NP>(ck, tab, qa, qb, v);
 #pragma unroll
                 for (int j = 0; j < NP; ++j) v[j] = va_row_xmask_add<0x168>(v[j]);
 #pragma unroll
@@ -221,8 +405,7 @@ __device__ __forceinline__ void va_tiles(
 #pragma unroll
                     for (int j = 0; j < NP; ++j) sc[j][t] = v[j] * scale_attn;
                 }
-                ca = na;
-                cb = nb;
+                ck = nk;
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "wavefront");
@@ -423,12 +606,13 @@ __device__ __forceinline__ void va_tiles(
 
 // group_rows (ROWS only): the reference's row-group size (8 or 4); a pair
 // writes the tiles its row group's bound reaches.
-template <int MODE>
+template <int MODE, int KIND>
 __device__ __forceinline__ void va_verify_gqa(
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
     const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
-    int batch_offset, float scale_attn, int group_rows) {
+    int batch_offset, float scale_attn, int group_rows, const float* __restrict__ signs1,
+    const float* __restrict__ signs2) {
     __shared__ __attribute__((aligned(16))) float sc_lds[VA_WAVES][VA_PPW][VA_TILE];
 
     const int n_heads = n_kv_heads * VA_GROUP;
@@ -448,6 +632,14 @@ __device__ __forceinline__ void va_verify_gqa(
     if (wave >= n_waves) return;
 
     const unsigned per_pos = (unsigned)n_kv_heads * (VA_HD / 32) * 34u;
+    const unsigned per_pos_k = KIND == VA_K_Q8   ? per_pos
+                               : KIND == VA_K_F4 ? (unsigned)n_kv_heads * VA_K4_HEAD
+                                                 : (unsigned)n_kv_heads * VA_K3_HEAD;
+    const int lane = (int)threadIdx.x & 31;
+    // Per-lane register table for va_lut: lane L holds C[L & 15] / C[L & 7].
+    float tab = 0.0f;
+    if (KIND == VA_K_F4) tab = TURBO_C4[lane & 15];
+    if (KIND == VA_K_F3) tab = TURBO_C3_256[lane & 7];
 
     // Live key range of this row group, from the device positions.
     int group_len = 0;
@@ -477,17 +669,10 @@ __device__ __forceinline__ void va_verify_gqa(
             pair_tiles[j] = min((len + VA_TILE - 1) / VA_TILE, max_tiles);
         }
         const float* qr = q + ((size_t)(row0 + r) * n_heads + head) * VA_HD;
-        const float4 a0 = *(const float4*)(qr + 8 * rl);
-        const float4 a1 = *(const float4*)(qr + 8 * rl + 4);
-        const float4 b0 = *(const float4*)(qr + 128 + 8 * rl);
-        const float4 b1 = *(const float4*)(qr + 128 + 8 * rl + 4);
-        qa[j][0] = a0.x; qa[j][1] = a0.y; qa[j][2] = a0.z; qa[j][3] = a0.w;
-        qa[j][4] = a1.x; qa[j][5] = a1.y; qa[j][6] = a1.z; qa[j][7] = a1.w;
-        qb[j][0] = b0.x; qb[j][1] = b0.y; qb[j][2] = b0.z; qb[j][3] = b0.w;
-        qb[j][4] = b1.x; qb[j][5] = b1.y; qb[j][6] = b1.z; qb[j][7] = b1.w;
+        va_load_q<KIND>(qr, signs1, signs2, lane, rl, qa[j], qb[j]);
     }
-    va_tiles<MODE, VA_PPW>(k_cache, v_cache, partials, sc_lds[wave], qa, qb, pair_len, pair_tiles, pair_base,
-                           group_len, n_tiles, kv_h, per_pos, scale_attn);
+    va_tiles<MODE, VA_PPW, KIND>(k_cache, v_cache, partials, sc_lds[wave], qa, qb, pair_len, pair_tiles,
+                                 pair_base, group_len, n_tiles, kv_h, per_pos_k, per_pos, tab, scale_attn);
 }
 
 // Grid: [ceil(n_rows/8) * n_kv_heads, S], block 256. Workgroup x = kv_h *
@@ -500,8 +685,36 @@ __global__ void attention_verify_gqa_q8_gfx1100(
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
     const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
     int batch_offset, float scale_attn) {
-    va_verify_gqa<VA_MODE_TILE>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
-                                batch_offset, scale_attn, VA_ROWS);
+    va_verify_gqa<VA_MODE_TILE, VA_K_Q8>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
+                                         batch_offset, scale_attn, VA_ROWS, nullptr, nullptr);
+}
+
+// fwht4 K (132 B/head: f32 cnorm + 4-bit FWHT-rotated nibbles), Q8_0 V: TILE
+// twin of attention_flash_fwht4_tile_batched at v_mode 8. Same grid as q8;
+// `signs1`/`signs2` are the reference's 128-entry sign tables, Q is un-rotated.
+extern "C" __launch_bounds__(VA_THREADS, 1)
+__global__ void attention_verify_gqa_fwht4_gfx1100(
+    const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
+    const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
+    int batch_offset, float scale_attn, const float* __restrict__ signs1,
+    const float* __restrict__ signs2) {
+    va_verify_gqa<VA_MODE_TILE, VA_K_F4>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
+                                         batch_offset, scale_attn, VA_ROWS, signs1, signs2);
+}
+
+// fwht3 K (100 B/head: f32 cnorm + 3-bit, 256-wide rotation), Q8_0 V: TILE
+// twin of attention_flash_fwht3_tile_batched at v_mode 8. `signs1`/`signs2`
+// are the reference's 256-entry sign tables.
+extern "C" __launch_bounds__(VA_THREADS, 1)
+__global__ void attention_verify_gqa_fwht3_gfx1100(
+    const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
+    const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
+    int batch_offset, float scale_attn, const float* __restrict__ signs1,
+    const float* __restrict__ signs2) {
+    va_verify_gqa<VA_MODE_TILE, VA_K_F3>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
+                                         batch_offset, scale_attn, VA_ROWS, signs1, signs2);
 }
 
 // ROWS twin of attention_flash_q8_0_rows{8,4}_d8: same grid and arguments
@@ -513,8 +726,8 @@ __global__ void attention_verify_gqa_q8_rows_gfx1100(
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
     const int* __restrict__ positions, int n_rows, int n_kv_heads, int max_tiles,
     int batch_offset, float scale_attn, int group_rows) {
-    va_verify_gqa<VA_MODE_ROWS>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
-                                batch_offset, scale_attn, group_rows);
+    va_verify_gqa<VA_MODE_ROWS, VA_K_Q8>(q, k_cache, v_cache, partials, positions, n_rows, n_kv_heads, max_tiles,
+                                         batch_offset, scale_attn, group_rows, nullptr, nullptr);
 }
 
 // Byte-identical parallel twin of attention_flash_asym_reduce_batched at

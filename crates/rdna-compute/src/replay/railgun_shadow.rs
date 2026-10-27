@@ -39,6 +39,7 @@ use railgun::Binding;
 use railgun_corpus::{sha256_hex, ArtifactKey, JitCorpus, Lookup, ProgramNode};
 use serde::Serialize;
 
+use super::railgun_lower::{emit_segment, paced_commands};
 use super::{
     Gfx11EntryAcquirePolicy, Gfx12DispatchPacing, KernargBuffer, KernargPool, Kernel,
     LaunchGeometry, Pm4Commands, RecordedHipLaunch, ReplayGridBinding, ReplayKernargBinding,
@@ -236,27 +237,7 @@ impl RailgunShadow {
                 .toolchain_pin
                 .as_deref()
                 .ok_or("no compiler toolchain was observed")?;
-            match corpus.lookup(&ArtifactKey {
-                arch,
-                toolchain_pin: pin,
-                artifact_sha256: sha,
-            }) {
-                Ok(Lookup::Hit(hit)) => {
-                    NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new)
-                }
-                Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
-                    Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
-                    None if pin != corpus.toolchain_pin() => {
-                        format!(
-                            "toolchain pin {} is not the corpus pin {}",
-                            &pin[..16],
-                            &corpus.toolchain_pin()[..16]
-                        )
-                    }
-                    None => format!("no record for {arch} object {}", &sha[..16]),
-                }),
-                Err(e) => Err(e.to_string()),
-            }
+            lookup_facts(&corpus, arch, pin, sha, symbol)
         })();
         self.facts.insert(key, result.clone());
         result
@@ -553,7 +534,40 @@ impl RailgunShadow {
     }
 }
 
-fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
+/// The receipt-corpus lookup of one `(artifact, symbol)` under `arch` and
+/// `pin`, with the refusal messages both the M1 shadow and the window corpus
+/// report. `sha` is a full SHA-256 hex digest.
+pub(crate) fn lookup_facts(
+    corpus: &JitCorpus,
+    arch: &str,
+    pin: &str,
+    sha: &str,
+    symbol: &str,
+) -> Result<Arc<NodeFacts>, String> {
+    match corpus.lookup(&ArtifactKey {
+        arch,
+        toolchain_pin: pin,
+        artifact_sha256: sha,
+    }) {
+        Ok(Lookup::Hit(hit)) => {
+            NodeFacts::from_hit(&hit.record, &hit.receipt, symbol).map(Arc::new)
+        }
+        Ok(Lookup::Missing) => Err(match corpus.rejection(arch, sha) {
+            Some(r) => format!("railgun-cert rejected {}: {}", &sha[..16], r.reason),
+            None if pin != corpus.toolchain_pin() => {
+                format!(
+                    "toolchain pin {} is not the corpus pin {}",
+                    &pin[..16],
+                    &corpus.toolchain_pin()[..16]
+                )
+            }
+            None => format!("no record for {arch} object {}", &sha[..16]),
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub(crate) fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
     hip.mem_get_address_range(value as usize as *mut std::ffi::c_void)
         .map(|(base, bytes)| Binding {
             base: base as usize as u64,
@@ -565,7 +579,7 @@ fn probe(hip: &HipRuntime, value: u64) -> Result<Binding, String> {
 /// railgun's per-arch lowering parameters for `arch`. On gfx1201 an explicit
 /// `HIPFIRE_GFX1201_PM4_PACING` (`off` / `nop:N`, the documented knob of the
 /// gfx1201 tape pacing) replaces the arch default; unset or `auto` keeps it.
-fn arch_lowering(arch: &str) -> rp::ArchLowering {
+pub(crate) fn arch_lowering(arch: &str) -> rp::ArchLowering {
     let mut lowering = rp::ArchLowering::for_arch(arch);
     if arch == "gfx1201" {
         if let Some(pacing) = super::gfx1201_pm4_pacing_override() {
@@ -576,18 +590,6 @@ fn arch_lowering(arch: &str) -> rp::ArchLowering {
         }
     }
     lowering
-}
-
-/// A fresh command buffer from Redline's builder, paced per `lowering`.
-fn paced_commands(transport: &Transport<'_>, lowering: rp::ArchLowering) -> Pm4Commands {
-    let mut commands = (transport.new_commands)();
-    if let Pm4Commands::Gfx12(gfx12) = &mut commands {
-        gfx12.set_dispatch_pacing(match lowering.post_dispatch_nop {
-            0 => Gfx12DispatchPacing::None,
-            n => Gfx12DispatchPacing::PostDispatchNop(n),
-        });
-    }
-    commands
 }
 
 /// Lower every segment through Redline's command builder with the arch's
@@ -605,54 +607,34 @@ fn lower(
     let mut kernargs = vec![None; program.nodes.len()];
     let mut segments = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
-        let mut commands = paced_commands(transport, arch_lowering);
-        for op in plan.segment_ops(segment) {
-            match op {
-                Pm4Op::Entry => {
-                    commands.emit_entry_sentinel_reset()?;
-                    commands.acquire_entry(transport.gcr_trim, transport.entry_policy);
-                }
-                Pm4Op::Boundary(v) => {
-                    if v.wait_idle {
-                        commands.wait_compute_idle()?;
-                    }
-                    match v.acquire {
-                        Rung::None => {}
-                        Rung::InterNode => commands.acquire_inter_node(transport.gcr_trim, false),
-                        Rung::System => commands.gfx12_system_acquire()?,
-                    }
-                }
-                Pm4Op::Dispatch(i) => {
-                    let node = &program.nodes[i];
-                    let kernel = kernels
-                        .get(i)
-                        .ok_or_else(|| format!("no loaded kernel for node {i}"))?;
-                    let metadata = kernel.metadata();
-                    let image =
-                        program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
-                    let mut buffer = transport
-                        .pool
-                        .allocate_for(metadata)
-                        .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
-                    buffer
-                        .write_exact(&image)
-                        .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
-                    let mut workgroup = [0u16; 3];
-                    for axis in 0..3 {
-                        workgroup[axis] = u16::try_from(node.block[axis])
-                            .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
-                    }
-                    let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
-                        .map_err(|e| format!("{}: {e}", node.symbol))?;
-                    commands
-                        .dispatch(kernel, geometry, node.dynamic_lds, buffer.address())
-                        .map_err(|e| format!("{}: {e}", node.symbol))?;
-                    kernargs[i] = Some((image, buffer.address() as usize as u64));
-                    buffers.push(buffer);
-                }
-                Pm4Op::Exit => commands.trailing_release()?,
+        let commands = emit_segment(plan, segment, arch_lowering, transport, |commands, i| {
+            let node = &program.nodes[i];
+            let kernel = kernels
+                .get(i)
+                .ok_or_else(|| format!("no loaded kernel for node {i}"))?;
+            let metadata = kernel.metadata();
+            let image = program.kernarg_image(i, metadata.kernarg_segment_size as usize, &words)?;
+            let mut buffer = transport
+                .pool
+                .allocate_for(metadata)
+                .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+            buffer
+                .write_exact(&image)
+                .map_err(|e| format!("{}: kernarg: {e}", node.symbol))?;
+            let mut workgroup = [0u16; 3];
+            for axis in 0..3 {
+                workgroup[axis] = u16::try_from(node.block[axis])
+                    .map_err(|_| format!("{}: block exceeds u16", node.symbol))?;
             }
-        }
+            let geometry = LaunchGeometry::from_hip_workgroups(node.grid, workgroup)
+                .map_err(|e| format!("{}: {e}", node.symbol))?;
+            commands
+                .dispatch(kernel, geometry, node.dynamic_lds, buffer.address())
+                .map_err(|e| format!("{}: {e}", node.symbol))?;
+            kernargs[i] = Some((image, buffer.address() as usize as u64));
+            buffers.push(buffer);
+            Ok(())
+        })?;
         let ib = commands
             .gfx12_dwords()
             .ok_or("railgun M1 lowers gfx12 command buffers only")?
@@ -763,6 +745,9 @@ fn lower_executable(
                     .map_err(|e| format!("{}: {e}", node.symbol))?;
             }
             Pm4Op::Exit => commands.trailing_release()?,
+            Pm4Op::SkipBegin(_) | Pm4Op::SkipEnd => {
+                return Err("railgun M1 lowers no CP-skip conditionals".into())
+            }
         }
     }
     let ours = commands
@@ -885,6 +870,7 @@ fn facts_summary(program: &rk::KernelProgram) -> FactsSummary {
             Lowering::Pm4 => ("pm4", None),
             Lowering::Graph { reason } => ("graph", Some(reason.clone())),
             Lowering::HipDirect { reason } => ("hip_direct", Some(reason.clone())),
+            Lowering::Conditional { reason } => ("conditional", Some(reason.clone())),
         };
         if let Some(reason) = &reason {
             not_pm4.push(format!("{k} {}: {reason}", node.symbol));

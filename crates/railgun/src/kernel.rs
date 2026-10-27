@@ -109,11 +109,68 @@ pub struct ArgFact {
     pub role: ArgRole,
 }
 
+/// Witness kind the receipt names for the loaded-index case (§A9.2).
+pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
+
+/// `IndexLoad` (§A9.2): an immutable `I32` index loaded from a pointer
+/// argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexLoad {
+    pub pc: u32,
+    pub source_arg_offset: u32,
+    pub element: String,
+    pub offset_expr: String,
+    pub extension: String,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+}
+
+/// `IndexedArgEffect` (§A9.2): one access whose address is `direct base +
+/// bounded integer expression`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedArgEffect {
+    pub pc: u32,
+    pub base_arg_offset: u32,
+    pub mode: String,
+    pub class: MemClass,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+    pub address_expr: String,
+    pub index_loads: Vec<IndexLoad>,
+    pub guards: Vec<String>,
+}
+
+/// One launch/argument guard of the guarded case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArgGuard {
+    pub kind: String,
+    pub arg_offset: u32,
+    pub size: u32,
+    pub value: String,
+}
+
+/// The guarded case of a `Conditional` kernel: valid only while every guard
+/// holds and every `witnesses` kind has a matching runtime bind witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConditionalFacts {
+    pub guards: Vec<ArgGuard>,
+    pub indexed: Vec<IndexedArgEffect>,
+    pub witnesses: Vec<String>,
+    pub case_digest: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FactStatus {
     Proven,
     /// Rules of the accesses A1 could not attribute.
     Unknown(Vec<String>),
+    /// `KernelStatus::Conditional`: neither `Proven` nor `Unknown`. Not
+    /// PM4-eligible until a matching [`crate::index_bind::IndexedBindWitness`]
+    /// is consumed by the window; the cached fact is never mutated.
+    Conditional(ConditionalFacts),
 }
 
 /// A hidden (implicit) argument the code object's metadata declares.
@@ -181,6 +238,71 @@ pub struct KernelFacts {
     pub hidden_grid_live: Vec<String>,
     /// G8: A1 ⊆ metadata-conservative (`pass`, `fail`, `not_applicable`).
     pub differential: String,
+    /// #867: kernarg offset of the ControlWord pointer whose clear flag makes
+    /// the launch a certified no-op (`railgun_cert::guard_flag`).
+    pub guard_flag: Option<u32>,
+}
+
+fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, String> {
+    let sym = &record.symbol;
+    if record.guards.is_empty()
+        || record.indexed_effects.is_empty()
+        || record.required_witnesses.is_empty()
+        || record.case_digest.is_empty()
+    {
+        return Err(format!(
+            "{sym}: conditional record lacks guards, indexed effects, witnesses or case digest"
+        ));
+    }
+    for w in &record.required_witnesses {
+        if w != WITNESS_INDEXED_BIND {
+            return Err(format!("{sym}: unknown required witness kind {w:?}"));
+        }
+    }
+    let mut indexed = Vec::with_capacity(record.indexed_effects.len());
+    for e in &record.indexed_effects {
+        let mut loads = Vec::with_capacity(e.index_loads.len());
+        for l in &e.index_loads {
+            loads.push(IndexLoad {
+                pc: l.pc,
+                source_arg_offset: l.source_arg_offset,
+                element: l.element.clone(),
+                offset_expr: l.offset_expr.clone(),
+                extension: l.extension.clone(),
+                class: MemClass::parse(&l.class).map_err(|m| format!("{sym}: {m}"))?,
+                path: l.path.clone(),
+                cache: l.cache.clone(),
+                width: l.width,
+            });
+        }
+        indexed.push(IndexedArgEffect {
+            pc: e.pc,
+            base_arg_offset: e.base_arg_offset,
+            mode: e.mode.clone(),
+            class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: e.path.clone(),
+            cache: e.cache.clone(),
+            width: e.width,
+            address_expr: e.address_expr.clone(),
+            index_loads: loads,
+            guards: e.guards.clone(),
+        });
+    }
+    Ok(ConditionalFacts {
+        guards: record
+            .guards
+            .iter()
+            .map(|g| ArgGuard {
+                kind: g.kind.clone(),
+                arg_offset: g.arg_offset,
+                size: g.size,
+                value: g.value.clone(),
+            })
+            .collect(),
+        indexed,
+        witnesses: record.required_witnesses.clone(),
+        case_digest: record.case_digest.clone(),
+    })
 }
 
 impl KernelFacts {
@@ -193,6 +315,9 @@ impl KernelFacts {
                 rules.sort();
                 rules.dedup();
                 FactStatus::Unknown(rules)
+            }
+            railgun_corpus::receipt::STATUS_CONDITIONAL => {
+                FactStatus::Conditional(conditional_from_record(record)?)
             }
             other => return Err(format!("{}: unknown A1 status {other:?}", record.symbol)),
         };
@@ -270,6 +395,7 @@ impl KernelFacts {
             hidden,
             hidden_grid_live: record.implicit.hidden_grid_live.clone(),
             differential: record.differential.status.clone(),
+            guard_flag: record.guard_flag,
         })
     }
 
@@ -355,6 +481,216 @@ pub enum WordRole {
     /// `frames` per submit (design I6 wants a device counter; M1 keeps
     /// today's host patch at submit).
     GdnFrame { frames: u32 },
+    /// A loaded 4-byte integer argument the window plan patches per window
+    /// ([`PatchKind::Scalar32`], design A §3). The value and its domain live
+    /// in the plan's patch site, not in the program.
+    Window,
+}
+
+/// Typed overrides [`KernelProgram::encode_kernarg_into`] applies on top of
+/// the authored program: the only ways a window changes a kernarg image
+/// (design A §3: no untyped byte patches). `Default` reproduces
+/// [`KernelProgram::kernarg_image`] exactly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImageOverrides<'a> {
+    /// [`PatchKind::GridAxis`]: the node's bound HIP grid; every hidden grid
+    /// word (block counts, grid dims) is rebuilt from it.
+    pub grid: Option<[u32; 3]>,
+    /// The live allocation of every resource, indexed by `ResourceId`
+    /// (replaces the authoring-time bindings).
+    pub resources: Option<&'a [Binding]>,
+    /// [`PatchKind::Interior64`]: `(explicit argument offset, interior byte
+    /// offset)` replacing the authored interior of that pointer.
+    pub interiors: &'a [(u32, u64)],
+}
+
+/// An input name an [`Expr`] resolved no value for, or an arithmetic fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExprError {
+    UnknownInput(String),
+    Overflow,
+}
+
+impl std::fmt::Display for ExprError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownInput(name) => write!(f, "unknown window input {name:?}"),
+            Self::Overflow => f.write_str("checked arithmetic overflow"),
+        }
+    }
+}
+
+/// The small pure expression AST of design A §3: constant, named input,
+/// checked add/multiply, saturating subtraction, min/max, division/modulo by
+/// a nonzero load-time constant, ceil-div. All arithmetic is `u64`; the
+/// conversion to a kernel `u32`/`i32` is a separate checked step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expr {
+    Const(u64),
+    /// A named window input (a `WindowShape` field or a `WindowInputs`
+    /// scalar).
+    Input(String),
+    /// Checked `a + b`.
+    Add(Box<Expr>, Box<Expr>),
+    /// Checked `a * b`.
+    Mul(Box<Expr>, Box<Expr>),
+    /// `a.saturating_sub(b)`, only where the source does.
+    SubSat(Box<Expr>, Box<Expr>),
+    Min(Box<Expr>, Box<Expr>),
+    Max(Box<Expr>, Box<Expr>),
+    /// `a / c`, `c` a nonzero load-time constant.
+    Div(Box<Expr>, std::num::NonZeroU64),
+    /// `a % c`, `c` a nonzero load-time constant.
+    Rem(Box<Expr>, std::num::NonZeroU64),
+    /// `ceil(a / c)`, `c` a nonzero load-time constant (checked: no
+    /// `a + c - 1` wrap).
+    CeilDiv(Box<Expr>, std::num::NonZeroU64),
+}
+
+impl Expr {
+    pub fn input(name: &str) -> Self {
+        Self::Input(name.to_owned())
+    }
+
+    pub fn add(a: Expr, b: Expr) -> Self {
+        Self::Add(Box::new(a), Box::new(b))
+    }
+
+    pub fn mul(a: Expr, b: Expr) -> Self {
+        Self::Mul(Box::new(a), Box::new(b))
+    }
+
+    pub fn sub_sat(a: Expr, b: Expr) -> Self {
+        Self::SubSat(Box::new(a), Box::new(b))
+    }
+
+    pub fn min(a: Expr, b: Expr) -> Self {
+        Self::Min(Box::new(a), Box::new(b))
+    }
+
+    pub fn max(a: Expr, b: Expr) -> Self {
+        Self::Max(Box::new(a), Box::new(b))
+    }
+
+    /// `None` for a zero divisor: it cannot be expressed.
+    pub fn div(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::Div(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    pub fn rem(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::Rem(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    pub fn ceil_div(a: Expr, c: u64) -> Option<Self> {
+        Some(Self::CeilDiv(Box::new(a), std::num::NonZeroU64::new(c)?))
+    }
+
+    /// Evaluate with `input` resolving the named inputs.
+    pub fn eval(&self, input: &dyn Fn(&str) -> Option<u64>) -> Result<u64, ExprError> {
+        Ok(match self {
+            Self::Const(c) => *c,
+            Self::Input(name) => {
+                input(name).ok_or_else(|| ExprError::UnknownInput(name.clone()))?
+            }
+            Self::Add(a, b) => a
+                .eval(input)?
+                .checked_add(b.eval(input)?)
+                .ok_or(ExprError::Overflow)?,
+            Self::Mul(a, b) => a
+                .eval(input)?
+                .checked_mul(b.eval(input)?)
+                .ok_or(ExprError::Overflow)?,
+            Self::SubSat(a, b) => a.eval(input)?.saturating_sub(b.eval(input)?),
+            Self::Min(a, b) => a.eval(input)?.min(b.eval(input)?),
+            Self::Max(a, b) => a.eval(input)?.max(b.eval(input)?),
+            Self::Div(a, c) => a.eval(input)? / c.get(),
+            Self::Rem(a, c) => a.eval(input)? % c.get(),
+            Self::CeilDiv(a, c) => a.eval(input)?.div_ceil(c.get()),
+        })
+    }
+
+    /// Every input name the expression reads, in first-use order.
+    pub fn inputs<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Const(_) => {}
+            Self::Input(name) => {
+                if !out.contains(&name.as_str()) {
+                    out.push(name);
+                }
+            }
+            Self::Add(a, b)
+            | Self::Mul(a, b)
+            | Self::SubSat(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => {
+                a.inputs(out);
+                b.inputs(out);
+            }
+            Self::Div(a, _) | Self::Rem(a, _) | Self::CeilDiv(a, _) => a.inputs(out),
+        }
+    }
+}
+
+/// A grid axis of a [`PatchKind::GridAxis`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    pub fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+}
+
+/// One loaded 4-byte integer argument of a program node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScalarField {
+    pub node: usize,
+    /// Explicit-argument byte offset.
+    pub offset: u32,
+}
+
+/// The declared patch kinds of design A §3 (the only ones; `GdnFrame` stays
+/// a [`WordRole`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatchKind {
+    /// `Scalar32 {field, checked expression, domain}`: a loaded scalar
+    /// argument (declared in the program as a [`WordRole::Window`] word).
+    /// The value must lie in `domain` and fit `u32`.
+    Scalar32 {
+        field: ScalarField,
+        expr: Expr,
+        domain: std::ops::RangeInclusive<u64>,
+    },
+    /// `Interior64 {resource, checked byte_offset expression,
+    /// required_extent}`: the pointer argument at `arg_offset` (authored as
+    /// an `Arg::Resource` of `resource`) becomes `base(resource) +
+    /// byte_offset`; `byte_offset + required_extent` must lie inside the
+    /// bound allocation.
+    Interior64 {
+        node: usize,
+        arg_offset: u32,
+        resource: ResourceId,
+        byte_offset: Expr,
+        required_extent: Expr,
+    },
+    /// `GridAxis {axis, checked expression, domain}`: the HIP grid of `node`
+    /// on `axis` (in workgroups; the value must be nonzero, in `domain`, and
+    /// fit `u32`). Every live implicit grid word is rebuilt from the
+    /// resulting geometry.
+    GridAxis {
+        node: usize,
+        axis: Axis,
+        expr: Expr,
+        domain: std::ops::RangeInclusive<u64>,
+    },
 }
 
 /// A dynamic kernarg dword declared by the composer at the launch site
@@ -433,6 +769,11 @@ pub enum Lowering {
     HipDirect {
         reason: String,
     },
+    /// A `Conditional` kernel (§A9.2) whose bind witness has not been
+    /// consumed: PM4-ineligible, a full barrier like `HipDirect`.
+    Conditional {
+        reason: String,
+    },
 }
 
 impl Lowering {
@@ -464,6 +805,26 @@ pub struct KernelNode {
     pub effects: Vec<RegionEffect>,
     pub read_cache: ReadCache,
     pub lowering: Lowering,
+    /// The guarded case of a `Conditional` kernel (a copy of the receipt's
+    /// facts, not a mutation of them). A node carrying it is admitted to a
+    /// window only while the window holds a matching
+    /// [`crate::index_bind::IndexedBindWitness`].
+    pub indexed: Option<IndexedNode>,
+    /// #867: the ControlWord resource whose clear flag makes this launch a
+    /// no-op, from the object's guard certificate (`KernelFacts::guard_flag`)
+    /// with its pointer bound to the start of that resource.
+    pub guard: Option<ResourceId>,
+}
+
+/// What a window needs to bind a `Conditional` node: the explicit arguments
+/// of the loaded object, the guarded case and its receipt identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedNode {
+    pub args: Vec<ArgFact>,
+    pub effects: Vec<IndexedArgEffect>,
+    pub guards: Vec<ArgGuard>,
+    pub witnesses: Vec<String>,
+    pub case_digest: String,
 }
 
 /// A word of the program and where it is patched.
@@ -484,6 +845,33 @@ pub struct KernelProgram {
     pub resources: Vec<Binding>,
     pub words: Vec<ProgramWord>,
     pub nodes: Vec<KernelNode>,
+    /// #867 IF bodies, disjoint and in node order
+    /// ([`KernelProgram::add_conditional`]).
+    pub conditionals: Vec<Conditional>,
+}
+
+/// #867: how a [`Conditional`] body is skipped when its flag is clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CondLowering {
+    /// The tape is unchanged: every body node is a guarded kernel whose
+    /// certified no-op path the clear flag takes (hot path).
+    KernelGuard,
+    /// `COND_EXEC` discards the body's command dwords, behind a
+    /// `RELEASE_MEM`/`WAIT_REG_MEM` fence that makes the flag fresh (coarse
+    /// segments only: the fence drains the queue).
+    CpSkip,
+}
+
+/// #867 IF on a device-written ControlWord: nodes `body` take effect only
+/// when the first `u32` of `flag` is nonzero when the body starts. A clear
+/// flag leaves every byte the body would write unchanged. The planner
+/// treats the body as executed either way (its effects stay in every edge).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Conditional {
+    pub flag: ResourceId,
+    pub body: std::ops::Range<usize>,
+    pub lowering: CondLowering,
 }
 
 /// Author the program for `launches`, in order (§1.1, §2.1).
@@ -509,6 +897,20 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         if let FactStatus::Unknown(rules) = &f.status {
             refusals.push(format!("A1 Unknown ({})", rules.join(", ")));
         }
+        let conditional = match &f.status {
+            FactStatus::Conditional(c) => {
+                for g in &c.guards {
+                    if let Err(why) = guard_holds(g, launch) {
+                        refusals.push(format!(
+                            "conditional guard {}@{} fails: {why}",
+                            g.kind, g.arg_offset
+                        ));
+                    }
+                }
+                Some(c)
+            }
+            _ => None,
+        };
         if f.differential == "fail" {
             refusals.push("G8 differential fails".to_owned());
         }
@@ -577,6 +979,22 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             };
+            // A conditional kernel's indexed effects add their base access
+            // and index-source reads to the argument's classes (still
+            // allocation-wide; no narrower hazard region).
+            let mut classes = classes.clone();
+            if let Some(c) = conditional {
+                for e in &c.indexed {
+                    if e.base_arg_offset == arg.offset && !classes.contains(&e.class) {
+                        classes.push(e.class);
+                    }
+                    for l in &e.index_loads {
+                        if l.source_arg_offset == arg.offset && !classes.contains(&l.class) {
+                            classes.push(l.class);
+                        }
+                    }
+                }
+            }
             if arg.size != 8 {
                 refusals.push(format!(
                     "pointer argument +{} is {} bytes",
@@ -645,7 +1063,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 effects.push(RegionEffect {
                     arg_offset: arg.offset,
                     resource,
-                    classes: classes.clone(),
+                    classes,
                 });
             }
         }
@@ -665,6 +1083,10 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             Lowering::HipDirect {
                 reason: refusals.join("; "),
             }
+        } else if conditional.is_some() {
+            Lowering::Conditional {
+                reason: "indexed_bind witness not consumed".to_owned(),
+            }
         } else if non_commutative_atomic {
             Lowering::Graph {
                 reason: "atomic without a commutativity certificate".to_owned(),
@@ -672,6 +1094,15 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         } else {
             Lowering::Pm4
         };
+        let guard = f.guard_flag.and_then(|at| {
+            args.iter().find_map(|(offset, arg)| match arg {
+                Arg::Resource {
+                    resource,
+                    interior: 0,
+                } if *offset == at => Some(*resource),
+                _ => None,
+            })
+        });
         nodes.push(KernelNode {
             symbol: launch.symbol.clone(),
             kref: Some(facts.kref.clone()),
@@ -685,6 +1116,14 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             effects,
             read_cache: f.read_cache,
             lowering,
+            indexed: conditional.map(|c| IndexedNode {
+                args: f.args.clone(),
+                effects: c.indexed.clone(),
+                guards: c.guards.clone(),
+                witnesses: c.witnesses.clone(),
+                case_digest: c.case_digest.clone(),
+            }),
+            guard,
         });
     }
     KernelProgram {
@@ -692,6 +1131,90 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         resources,
         words,
         nodes,
+        conditionals: Vec::new(),
+    }
+}
+
+/// Evaluate one receipt guard against the recorded launch. `grid`/`block`
+/// guards whose value is symbolic (not `x,y,z` integers) are enforced by the
+/// window bind, which recomputes them from the bound arguments.
+fn guard_holds(g: &ArgGuard, launch: &LaunchRecord) -> Result<(), String> {
+    let at = g.arg_offset as usize;
+    let size = g.size as usize;
+    match g.kind.as_str() {
+        "ptr_null" => {
+            let bytes = launch
+                .kernarg
+                .get(at..at + size)
+                .ok_or("outside the kernarg")?;
+            if bytes.iter().all(|b| *b == 0) {
+                Ok(())
+            } else {
+                Err("pointer is not null".into())
+            }
+        }
+        // `kernarg_eq` is railgun-cert's serialization of the analyzer's
+        // `Guard::KernargEq` (a null optional pointer is `size 8, value 0`).
+        "scalar_eq" | "kernarg_eq" => {
+            let want: u64 = g
+                .value
+                .parse()
+                .map_err(|_| format!("bad value {:?}", g.value))?;
+            if size == 0 || size > 8 {
+                return Err(format!("bad size {size}"));
+            }
+            let bytes = launch
+                .kernarg
+                .get(at..at + size)
+                .ok_or("outside the kernarg")?;
+            let mut le = [0u8; 8];
+            le[..size].copy_from_slice(bytes);
+            let got = u64::from_le_bytes(le);
+            if got == want {
+                Ok(())
+            } else {
+                Err(format!("kernarg is {got}, guard {want}"))
+            }
+        }
+        kind @ ("grid" | "block") => {
+            let dims: Option<Vec<u32>> =
+                g.value.split(',').map(|v| v.trim().parse().ok()).collect();
+            match dims.as_deref() {
+                Some(&[x, y, z]) => {
+                    let have = if kind == "grid" {
+                        launch.grid
+                    } else {
+                        launch.block
+                    };
+                    if have == [x, y, z] {
+                        Ok(())
+                    } else {
+                        Err(format!("{have:?} != [{x}, {y}, {z}]"))
+                    }
+                }
+                _ => Ok(()),
+            }
+        }
+        // railgun-cert's `Guard::GridDim` / `Guard::BlockDim`: `arg_offset`
+        // carries the axis, `value` the workgroup count / block extent.
+        kind @ ("grid_dim" | "block_dim") => {
+            let axis = g.arg_offset as usize;
+            let want: u32 = g
+                .value
+                .parse()
+                .map_err(|_| format!("bad value {:?}", g.value))?;
+            let have = if kind == "grid_dim" {
+                launch.grid
+            } else {
+                launch.block
+            };
+            match have.get(axis) {
+                Some(&v) if v == want => Ok(()),
+                Some(&v) => Err(format!("{kind}[{axis}] is {v}, guard {want}")),
+                None => Err(format!("bad axis {axis}")),
+            }
+        }
+        other => Err(format!("unknown guard kind {other:?}")),
     }
 }
 
@@ -709,10 +1232,125 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         effects: Vec::new(),
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
+        indexed: None,
+        guard: None,
     }
 }
 
 impl KernelProgram {
+    /// Make `c.body` an IF on `c.flag` (#867). Refused unless: the body is
+    /// non-empty, in range and disjoint from every other conditional (no
+    /// nesting); `flag` is a resource of at least 4 bytes; every body node
+    /// is PM4. `KernelGuard` also needs every body node's certified guard on
+    /// `flag`, and a node writing `flag` must be the body's last and a single
+    /// wave (`grid × block ≤ 32`): the guard runs once per wave, so an earlier
+    /// node's write, or a later wave of the writer, would split the decision.
+    /// `CpSkip` needs [`crate::plan::cp_skip_admitted`] for the arch.
+    pub fn add_conditional(&mut self, c: Conditional) -> Result<(), String> {
+        let Conditional {
+            flag,
+            ref body,
+            lowering,
+        } = c;
+        if body.is_empty() || body.end > self.nodes.len() {
+            return Err(format!(
+                "conditional body {body:?} is empty or past {} nodes",
+                self.nodes.len()
+            ));
+        }
+        if let Some(other) = self
+            .conditionals
+            .iter()
+            .find(|o| o.body.start < body.end && body.start < o.body.end)
+        {
+            return Err(format!(
+                "conditional body {body:?} overlaps {:?} (nesting is not supported)",
+                other.body
+            ));
+        }
+        if self
+            .resources
+            .get(flag.0 as usize)
+            .is_none_or(|b| b.bytes < 4)
+        {
+            return Err(format!(
+                "flag resource {} is not a 4-byte ControlWord",
+                flag.0
+            ));
+        }
+        for (i, node) in self.nodes[body.clone()].iter().enumerate() {
+            let j = body.start + i;
+            if !node.lowering.is_pm4() {
+                return Err(format!(
+                    "node {j} ({}) in a conditional body is not PM4",
+                    node.symbol
+                ));
+            }
+            if lowering == CondLowering::KernelGuard {
+                if node.guard != Some(flag) {
+                    return Err(format!(
+                        "node {j} ({}) has no certified guard on flag resource {}",
+                        node.symbol, flag.0
+                    ));
+                }
+                let threads: u64 = node
+                    .grid
+                    .iter()
+                    .chain(&node.block)
+                    .map(|&d| d as u64)
+                    .product();
+                if (j + 1 < body.end || threads > 32)
+                    && node
+                        .effects
+                        .iter()
+                        .any(|e| e.resource == flag && e.writes())
+                {
+                    return Err(format!(
+                        "node {j} ({}) writes the flag but is not the body's last \
+                         single-wave node ({threads} threads)",
+                        node.symbol
+                    ));
+                }
+            }
+        }
+        if lowering == CondLowering::CpSkip && !crate::plan::cp_skip_admitted(&self.arch) {
+            return Err(format!("COND_EXEC skip is not verified on {}", self.arch));
+        }
+        let at = self
+            .conditionals
+            .partition_point(|o| o.body.start < body.start);
+        self.conditionals.insert(at, c);
+        Ok(())
+    }
+
+    /// #867 bounded WHILE: `iterations` copies of a `len`-node body laid out
+    /// back to back from node `first`, each an IF on `flag`. The body's last
+    /// node writes the continue decision into `flag`; once it is clear every
+    /// later copy is skipped, so the copies run while the flag stays set, at
+    /// most `iterations` times.
+    pub fn bounded_while(
+        &mut self,
+        flag: ResourceId,
+        first: usize,
+        len: usize,
+        iterations: usize,
+        lowering: CondLowering,
+    ) -> Result<(), String> {
+        let before = self.conditionals.clone();
+        for k in 0..iterations {
+            let start = first + k * len;
+            if let Err(e) = self.add_conditional(Conditional {
+                flag,
+                body: start..start + len,
+                lowering,
+            }) {
+                self.conditionals = before;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// The node's full kernarg segment as the loaded object lays it out
     /// (`loader_bytes`, which must equal the certified segment): explicit
     /// arguments re-encoded from the program (resources from their bindings,
@@ -723,6 +1361,27 @@ impl KernelProgram {
         loader_bytes: usize,
         words: &[u32],
     ) -> Result<Vec<u8>, String> {
+        let mut image = vec![0u8; loader_bytes];
+        self.encode_kernarg_into(node, words, &ImageOverrides::default(), &mut image)?;
+        Ok(image)
+    }
+
+    /// The single full-image encoder behind [`Self::kernarg_image`] (design A
+    /// §3: "`KernelProgram::kernarg_image` remains the only full-image
+    /// encoder"). `out` is the loaded object's kernarg segment (`out.len()`
+    /// is the loader's size and must equal the certified one); it is zeroed
+    /// and rewritten in place, so a retired buffer is re-encoded without an
+    /// allocation. `overrides` supplies the typed window patches of §3:
+    /// resource bindings, `Interior64` offsets and the `GridAxis` geometry,
+    /// from which every hidden grid word is rebuilt. Scalar words arrive in
+    /// `words`. Nothing else is writable.
+    pub fn encode_kernarg_into(
+        &self,
+        node: usize,
+        words: &[u32],
+        overrides: &ImageOverrides<'_>,
+        out: &mut [u8],
+    ) -> Result<(), String> {
         let n = self
             .nodes
             .get(node)
@@ -731,22 +1390,33 @@ impl KernelProgram {
             .segment_bytes
             .ok_or_else(|| format!("{}: no certified kernarg segment", n.symbol))?
             as usize;
+        let loader_bytes = out.len();
         if loader_bytes != segment {
             return Err(format!("{}: the loaded object's kernarg segment is {loader_bytes} B, the certified one {segment} B", n.symbol));
         }
-        let mut image = vec![0u8; loader_bytes];
+        let resources = overrides.resources.unwrap_or(&self.resources);
+        let grid = overrides.grid.unwrap_or(n.grid);
+        if overrides.grid.is_some() && grid.contains(&0) {
+            return Err(format!("{}: grid {grid:?} has an empty axis", n.symbol));
+        }
+        let image = out;
+        image.fill(0);
         for (offset, arg) in &n.args {
             let at = *offset as usize;
             match arg {
                 Arg::Const(bytes) => image[at..at + bytes.len()].copy_from_slice(bytes),
                 Arg::Resource { resource, interior } => {
-                    let binding = self
-                        .resources
+                    let binding = resources
                         .get(resource.0 as usize)
                         .ok_or_else(|| format!("unknown resource {}", resource.0))?;
+                    let interior = overrides
+                        .interiors
+                        .iter()
+                        .find(|(arg_offset, _)| arg_offset == offset)
+                        .map_or(*interior, |(_, interior)| *interior);
                     let address = binding
                         .base
-                        .checked_add(*interior)
+                        .checked_add(interior)
                         .ok_or_else(|| "pointer overflows".to_owned())?;
                     image[at..at + 8].copy_from_slice(&address.to_le_bytes());
                 }
@@ -758,16 +1428,16 @@ impl KernelProgram {
                 }
             }
         }
-        let dims: u64 = if n.grid[2] != 1 || n.block[2] != 1 {
+        let dims: u64 = if grid[2] != 1 || n.block[2] != 1 {
             3
-        } else if n.grid[1] != 1 || n.block[1] != 1 {
+        } else if grid[1] != 1 || n.block[1] != 1 {
             2
         } else {
             1
         };
         for h in &n.hidden {
             let value: u64 = match h.kind {
-                HiddenKind::BlockCount(axis) => u64::from(n.grid[axis as usize]),
+                HiddenKind::BlockCount(axis) => u64::from(grid[axis as usize]),
                 HiddenKind::GroupSize(axis) => u64::from(n.block[axis as usize]),
                 // HIP grids count workgroups: no partial groups, no offset.
                 HiddenKind::Remainder(_) | HiddenKind::GlobalOffset(_) | HiddenKind::Other => 0,
@@ -784,12 +1454,39 @@ impl KernelProgram {
             let at = h.offset as usize;
             image[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
         }
-        Ok(image)
+        Ok(())
     }
 
     /// Authored value of every word, indexed by `WordId`.
     pub fn authored_words(&self) -> Vec<u32> {
         self.words.iter().map(|w| w.authored).collect()
+    }
+
+    /// Indices of the nodes that need an
+    /// [`crate::index_bind::IndexedBindWitness`] (receipt `Conditional`).
+    pub fn conditional_nodes(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.indexed.is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The program a window plan is laid out against *assuming* its bind
+    /// witness: every `Conditional` node that carries its guarded case is
+    /// lowered as PM4. This is a derived value; the cached node facts and
+    /// this program are never promoted to `Proven`. The resulting plan keeps
+    /// the node's `indexed` case, and `PreparedWindow` refuses to submit
+    /// without a witness for every such node.
+    pub fn assume_indexed_witness(&self) -> KernelProgram {
+        let mut p = self.clone();
+        for n in &mut p.nodes {
+            if n.indexed.is_some() && matches!(n.lowering, Lowering::Conditional { .. }) {
+                n.lowering = Lowering::Pm4;
+            }
+        }
+        p
     }
 }
 
@@ -819,6 +1516,7 @@ pub(crate) mod tests {
                 hidden: Vec::new(),
                 hidden_grid_live: Vec::new(),
                 differential: "pass".into(),
+                guard_flag: None,
             },
         })
     }
@@ -982,5 +1680,83 @@ pub(crate) mod tests {
         assert!(
             matches!(&program.nodes[0].lowering, Lowering::HipDirect { reason } if reason.contains("hidden_queue_ptr"))
         );
+    }
+
+    /// `l` with a guard certificate on its pointer at +0.
+    pub(crate) fn guarded(mut l: LaunchRecord) -> LaunchRecord {
+        let mut f = (*l.facts.clone().unwrap()).clone();
+        f.facts.guard_flag = Some(0);
+        l.facts = Ok(Arc::new(f));
+        l
+    }
+
+    #[test]
+    fn kernel_guard_needs_the_certificate_on_the_flag_and_a_single_wave_last_writer() {
+        let (flag, x, y) = (0x7000_0000u64, 0x7100_0000u64, 0x7200_0000u64);
+        let body = vec![
+            ptr(0, &[MemClass::SmemLoad]),
+            ptr(8, &[MemClass::VmemStore]),
+        ];
+        let step = vec![ptr(0, &[MemClass::SmemLoad, MemClass::VmemStore])];
+        let mut writer = guarded(launch(&[(0, flag)], 8, step.clone()));
+        (writer.grid, writer.block) = ([1, 1, 1], [32, 1, 1]);
+        let launches = vec![
+            guarded(launch(&[(0, flag), (8, y)], 16, body.clone())),
+            writer,
+            launch(&[(0, flag), (8, x)], 16, body.clone()),
+            guarded(launch(&[(0, x), (8, y)], 16, body)),
+            // The guard runs per wave: a 4-wave writer's later waves could
+            // read the flag after its first wave cleared it.
+            guarded(launch(&[(0, flag)], 8, step.clone())),
+        ];
+        let mut p = author("gfx1151", &launches);
+        let f = p.nodes[0].guard.unwrap();
+        assert_eq!(p.nodes[1].guard, Some(f));
+        assert_eq!(p.nodes[2].guard, None, "no certificate");
+        assert_ne!(p.nodes[3].guard, Some(f), "certified on another resource");
+        let c = |body: std::ops::Range<usize>, lowering| Conditional {
+            flag: f,
+            body,
+            lowering,
+        };
+        for refused in [2..3, 3..4, 1..3, 0..0, 3..6, 4..5] {
+            assert!(
+                p.add_conditional(c(refused.clone(), CondLowering::KernelGuard))
+                    .is_err(),
+                "{refused:?}"
+            );
+        }
+        // The flag writer may end the body, not open it.
+        let mut swapped = author("gfx1151", &[launches[1].clone(), launches[0].clone()]);
+        assert!(swapped
+            .add_conditional(c(0..2, CondLowering::KernelGuard))
+            .is_err());
+        p.add_conditional(c(0..2, CondLowering::KernelGuard))
+            .unwrap();
+        assert!(
+            p.add_conditional(c(1..3, CondLowering::CpSkip)).is_err(),
+            "overlap"
+        );
+        p.add_conditional(c(2..4, CondLowering::CpSkip)).unwrap();
+        assert_eq!(p.conditionals.len(), 2);
+        // A refused copy leaves no earlier copy behind.
+        let mut w = author(
+            "gfx1151",
+            &[
+                launches[0].clone(),
+                launches[1].clone(),
+                launches[0].clone(),
+                launches[4].clone(),
+            ],
+        );
+        assert!(w
+            .bounded_while(f, 0, 2, 2, CondLowering::KernelGuard)
+            .is_err());
+        assert!(w.conditionals.is_empty(), "{:?}", w.conditionals);
+
+        let mut gfx12 = author("gfx1201", &launches);
+        assert!(gfx12
+            .add_conditional(c(2..4, CondLowering::CpSkip))
+            .is_err());
     }
 }

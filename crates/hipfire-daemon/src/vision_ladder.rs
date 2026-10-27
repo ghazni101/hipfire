@@ -8,9 +8,9 @@ use hipfire_config::developer_var;
 
 /// Daemon-side `vision_mode` gate for the tower sidecar path.
 ///
-/// `off` (the default) is a hard override that drops even an explicit
+/// `off` is a hard override that drops even an explicit
 /// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
-/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
+/// Every other mode (`auto`, `resident`, `on`) passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
 /// ladder result through untouched. Pure string plumbing — no arch or
 /// tensor knowledge; admission still validates the surviving path.
 pub(crate) fn apply_vision_mode_gate(
@@ -27,7 +27,7 @@ pub(crate) fn apply_vision_mode_gate(
 /// Resolve the vision-tower ladder for a load request.
 ///
 /// Returns `(vision_mode, gated_sidecar, suppressed_sidecar)`:
-/// `vision_mode` is `params.vision_mode` (default `off`); `gated_sidecar` is
+/// `vision_mode` is `params.vision_mode` (default: the `vision.mode` schema default); `gated_sidecar` is
 /// the `HIPFIRE_VISION_SIDECAR` (non-empty wins, empty opts out) →
 /// `params.vision` ladder result with `apply_vision_mode_gate` applied; and
 /// `suppressed_sidecar` is the explicit sidecar that `off` dropped, so the
@@ -44,7 +44,7 @@ pub(crate) fn resolve_vision_ladder(
         .get("params")
         .and_then(|p| p.get("vision_mode"))
         .and_then(|v| v.as_str())
-        .unwrap_or("off")
+        .unwrap_or(hipfire_config::vision_mode_default())
         .to_string();
     let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
     let raw_vision: Option<String> = match env_vision.as_deref() {

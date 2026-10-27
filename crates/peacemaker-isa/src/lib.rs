@@ -30,6 +30,8 @@ pub mod npu_trunk;
 pub mod npu_trunk_arena;
 pub mod plan;
 pub mod profile;
+#[path = "kernels/railgun_guard.rs"]
+pub mod railgun_guard;
 pub mod reg;
 pub mod vopd;
 pub mod kernels {

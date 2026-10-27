@@ -2451,6 +2451,7 @@ fn run_case(
         "twin_selfcheck": {"slots_checked_gate": gate.expected.twin_slots_checked,
             "slots_checked_down": down.expected.twin_slots_checked,
             "mismatch_count": gate.twin_mismatches + down.twin_mismatches},
+        "pass": gate.mismatches + down.mismatches + gate.twin_mismatches + down.twin_mismatches == 0,
     });
     if ctx.old_parity && case.old_parity && case.tight() {
         if ctx.gpu.is_none() {
@@ -2460,6 +2461,9 @@ fn run_case(
         let r = old_kernel_parity(gpu, case, &gate.expected, &down.expected)?;
         t.old_kernel_cases += 1;
         t.old_kernel_mismatches += r["mismatch_count"].as_u64().unwrap_or(1);
+        if r["mismatch_count"].as_u64() != Some(0) {
+            row["pass"] = json!(false);
+        }
         row["old_kernel_parity"] = r;
     }
     let mut samples = gate.timing;

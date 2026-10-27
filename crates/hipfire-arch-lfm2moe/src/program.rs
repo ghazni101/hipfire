@@ -8,6 +8,11 @@
 //! LM head. This module only binds resident weights, KV/convolution state and
 //! scratch to typed `hipfire_dispatch` steps; route selection, fusion and the
 //! executor bodies live in dispatch.
+//!
+//! One program serves the single-lane decode and the continuous-batching
+//! lanes ([`Lanes`]); the lanes differ only in the routes they bind: the
+//! `Gemm` projection ladder with a separate residual add, per-row RoPE
+//! positions and lane-isolated Q8 KV.
 
 use crate::config::Lfm2MoeConfig;
 use crate::lfm2moe::{Ffn, Lfm2MoeLayerWeights, Lfm2MoeState, Lfm2MoeWeights, Mixer};
@@ -16,13 +21,152 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::moe::{
-    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSelectionBias,
+    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeScores, MoeSelectionBias,
 };
 use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
-use hipfire_dispatch::pipeline::{seal_decode, BoundMoeExperts, GatedShortConvOp, GemvInput, Step};
+use hipfire_dispatch::pipeline::{
+    seal_decode, BoundMoeExperts, GatedShortConvOp, GemvInput, LaneAttentionOp, ProjectLadder,
+    ProjectOp, Step,
+};
 use hipfire_dispatch::types::RotationPlan;
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{KvCache, KvCacheExt};
 use rdna_compute::{DType, GpuTensor};
+
+/// Which decode a program runs.
+pub(crate) enum Lanes<'a> {
+    /// One decode row at `position`: fused GEMV ladder, tiered KV attention,
+    /// MoE scratch.
+    Single {
+        position: usize,
+        state: &'a Lfm2MoeState,
+    },
+    /// `rows` independent lanes (row `r` is lane `r`): the `Gemm` projection
+    /// ladder, lane-isolated Q8 KV.
+    Batch {
+        rows: usize,
+        /// `rows` I32 positions.
+        positions: &'a GpuTensor,
+        kv: &'a KvCache,
+        lane_capacity: usize,
+        /// FWHT scratch, `[rows, max(hidden, intermediate)]`.
+        rotation: &'a GpuTensor,
+        /// FWHT scratch of the LM head, `[rows, hidden]`.
+        lm_rotation: &'a GpuTensor,
+    },
+}
+
+/// Activations, convolution state and route of one program, each `[rows, ·]`.
+pub(crate) struct Bufs<'a> {
+    pub h: &'a GpuTensor,
+    /// Mixer-norm output; the lanes' residual-projection scratch once dead.
+    pub tmp: &'a GpuTensor,
+    pub ffn_in: &'a GpuTensor,
+    pub head_in: &'a GpuTensor,
+    pub conv_bcx: &'a GpuTensor,
+    pub conv_y: &'a GpuTensor,
+    pub fa_q: &'a GpuTensor,
+    pub fa_k: &'a GpuTensor,
+    pub fa_v: &'a GpuTensor,
+    pub fa_attn_out: &'a GpuTensor,
+    pub dense_gate: &'a GpuTensor,
+    pub dense_up: &'a GpuTensor,
+    pub dense_act: &'a GpuTensor,
+    pub logits: &'a GpuTensor,
+    /// Indexed by `ConvWeights::conv_state_idx`, `[rows, hidden, K - 1]` each.
+    pub conv_states: &'a [GpuTensor],
+    pub lanes: Lanes<'a>,
+}
+
+impl<'a> Bufs<'a> {
+    /// The single-lane decode state at `position`.
+    pub fn single(state: &'a Lfm2MoeState, position: usize) -> Self {
+        Self {
+            h: &state.h,
+            tmp: &state.tmp,
+            ffn_in: &state.tmp,
+            head_in: &state.tmp,
+            conv_bcx: &state.conv_bcx,
+            conv_y: &state.conv_y,
+            fa_q: &state.fa_q,
+            fa_k: &state.fa_k,
+            fa_v: &state.fa_v,
+            fa_attn_out: &state.fa_attn_out,
+            dense_gate: &state.dense_gate,
+            dense_up: &state.dense_up,
+            dense_act: &state.dense_act,
+            logits: &state.logits,
+            conv_states: &state.conv_states,
+            lanes: Lanes::Single { position, state },
+        }
+    }
+
+    fn rows(&self) -> usize {
+        match self.lanes {
+            Lanes::Single { .. } => 1,
+            Lanes::Batch { rows, .. } => rows,
+        }
+    }
+
+    /// `out = w · input`.
+    fn project(&self, w: &'a WeightRef<'a>, input: &'a GpuTensor, out: &'a GpuTensor) -> Step<'a> {
+        match self.lanes {
+            Lanes::Single { .. } => Step::Gemv {
+                w,
+                input: GemvInput::Raw(input),
+                out,
+            },
+            Lanes::Batch { rows, rotation, .. } => Step::Project(ProjectOp {
+                weight: *w,
+                input,
+                output: out,
+                rows,
+                rotation: Some(rotation),
+                ladder: ProjectLadder::Gemm,
+                residual: None,
+            }),
+        }
+    }
+
+    /// `h += w · input`: the fused residual GEMV on one lane; on the lanes the
+    /// projection lands in the dead `tmp` and is added.
+    fn project_residual(&self, w: &'a WeightRef<'a>, input: &'a GpuTensor) -> Step<'a> {
+        match self.lanes {
+            Lanes::Single { .. } => Step::GemvResidual {
+                w,
+                input: GemvInput::Raw(input),
+                residual: self.h,
+                out: self.h,
+            },
+            Lanes::Batch { rows, rotation, .. } => Step::Project(ProjectOp {
+                weight: *w,
+                input,
+                output: self.tmp,
+                rows,
+                rotation: Some(rotation),
+                ladder: ProjectLadder::Gemm,
+                residual: Some(self.h),
+            }),
+        }
+    }
+
+    /// RMS norm of every row of `h` into `out`, read raw by every projection.
+    /// Each projection rotates its own input for its format, which keeps the
+    /// per-projection kernels and reduction order of the pre-port route
+    /// (prerotated inputs would admit the cross-projection fusion table).
+    fn norm(&self, weight: &'a GpuTensor, out: &'a GpuTensor, cfg: &Lfm2MoeConfig) -> Step<'a> {
+        Step::RmsnormAutomatic {
+            x: self.h,
+            norm_weight: weight,
+            x_plain: out,
+            out,
+            awq_scale: None,
+            k: cfg.hidden_size,
+            eps: cfg.rms_norm_eps,
+            rotation: RotationPlan::None,
+            rows: self.rows(),
+        }
+    }
+}
 
 /// Resident weight refs of one layer, borrowed by its steps.
 pub(crate) struct LayerRefs<'a> {
@@ -62,175 +206,173 @@ impl<'a> LayerRefs<'a> {
     pub fn mixer_steps(
         &'a self,
         cfg: &Lfm2MoeConfig,
-        state: &'a Lfm2MoeState,
-        position: usize,
+        b: &'a Bufs<'a>,
     ) -> Result<Vec<Step<'a>>, String> {
         let r = |i: usize| self.mixer[i].as_ref().expect("bound mixer weight");
-        let eps = cfg.rms_norm_eps;
+        let rows = b.rows();
+        let norm = b.norm(&self.layer.operator_norm, b.tmp, cfg);
         Ok(match &self.layer.mixer {
-            Mixer::Conv(c) => {
-                let (norm, input) = norm_into(state, &self.layer.operator_norm, eps);
-                vec![
-                    norm,
-                    Step::Gemv {
-                        w: r(0),
-                        input,
-                        out: &state.conv_bcx,
-                    },
-                    Step::GatedShortConv(GatedShortConvOp {
-                        bcx: &state.conv_bcx,
-                        state: &state.conv_states[c.conv_state_idx],
-                        weight: &c.conv_weight,
-                        output: &state.conv_y,
-                        rows: 1,
-                        channels: cfg.hidden_size,
-                        kernel_size: cfg.conv_kernel_size,
-                    }),
-                    Step::GemvResidual {
-                        w: r(1),
-                        input: GemvInput::Raw(&state.conv_y),
-                        residual: &state.h,
-                        out: &state.h,
-                    },
-                ]
-            }
+            Mixer::Conv(c) => vec![
+                norm,
+                b.project(r(0), b.tmp, b.conv_bcx),
+                Step::GatedShortConv(GatedShortConvOp {
+                    bcx: b.conv_bcx,
+                    state: &b.conv_states[c.conv_state_idx],
+                    weight: &c.conv_weight,
+                    output: b.conv_y,
+                    rows,
+                    channels: cfg.hidden_size,
+                    kernel_size: cfg.conv_kernel_size,
+                }),
+                b.project_residual(r(1), b.conv_y),
+            ],
             Mixer::Attention(a) => {
                 let (n_heads, n_kv, head_dim) = (
                     cfg.num_attention_heads,
                     cfg.num_key_value_heads,
                     cfg.head_dim,
                 );
-                let (norm, input) = norm_into(state, &self.layer.operator_norm, eps);
-                let plan = KvTierPlan::derive(KvTierInputs {
-                    pos: position,
-                    ..state.kv.tier_inputs()
-                })
-                .map_err(|e| format!("kv tier: {e}"))?;
+                let rope = Rope {
+                    kind: RopeKind::RotateHalf,
+                    theta: cfg.rope_theta,
+                };
                 let kv = a.kv_idx;
-                vec![
+                let mut steps = vec![
                     norm,
-                    Step::Gemv {
-                        w: r(0),
-                        input,
-                        out: &state.fa_q,
-                    },
-                    Step::Gemv {
-                        w: r(1),
-                        input,
-                        out: &state.fa_k,
-                    },
-                    Step::Gemv {
-                        w: r(2),
-                        input,
-                        out: &state.fa_v,
-                    },
+                    b.project(r(0), b.tmp, b.fa_q),
+                    b.project(r(1), b.tmp, b.fa_k),
+                    b.project(r(2), b.tmp, b.fa_v),
                     Step::QkNorm {
-                        x: &state.fa_q,
+                        x: b.fa_q,
                         weight: &a.q_norm,
-                        n_groups: n_heads,
+                        n_groups: rows * n_heads,
                         head_dim,
-                        eps,
+                        eps: cfg.rms_norm_eps,
                     },
                     Step::QkNorm {
-                        x: &state.fa_k,
+                        x: b.fa_k,
                         weight: &a.k_norm,
-                        n_groups: n_kv,
+                        n_groups: rows * n_kv,
                         head_dim,
-                        eps,
+                        eps: cfg.rms_norm_eps,
                     },
-                    Step::Rope {
-                        q: &state.fa_q,
-                        k: &state.fa_k,
-                        pos_buf: &state.pos_buf,
-                        n_heads,
-                        n_kv_heads: n_kv,
-                        head_dim,
-                        rope: Rope {
-                            kind: RopeKind::RotateHalf,
-                            theta: cfg.rope_theta,
-                        },
-                    },
-                    Step::Attend {
-                        plan,
-                        io: AttnParams {
-                            q: &state.fa_q,
-                            k: &state.fa_k,
-                            v: &state.fa_v,
-                            k_cache: &state.kv.k_gpu[kv],
-                            v_cache: &state.kv.v_gpu[kv],
-                            k_scales: None,
-                            v_scales: None,
-                            pos_buf: &state.pos_buf,
+                ];
+                match b.lanes {
+                    Lanes::Single { position, state } => {
+                        let plan = KvTierPlan::derive(KvTierInputs {
                             pos: position,
+                            ..state.kv.tier_inputs()
+                        })
+                        .map_err(|e| format!("kv tier: {e}"))?;
+                        steps.push(Step::Rope {
+                            q: b.fa_q,
+                            k: b.fa_k,
+                            pos_buf: &state.pos_buf,
                             positions: None,
                             n_heads,
                             n_kv_heads: n_kv,
                             head_dim,
-                            physical_cap: state.kv.physical_cap,
-                            batch_size: 1,
-                            max_ctx_len: 0,
-                            flash_partials: None,
-                            givens_cos: None,
-                            givens_sin: None,
-                            tree_bias: None,
-                            block_start: 0,
-                            block_cols: 0,
-                            output_gate: None,
-                            output_awq_scale: None,
-                            output: &state.fa_attn_out,
-                        },
-                    },
-                    Step::GemvResidual {
-                        w: r(3),
-                        input: GemvInput::Raw(&state.fa_attn_out),
-                        residual: &state.h,
-                        out: &state.h,
-                    },
-                ]
+                            rope,
+                        });
+                        steps.push(Step::Attend {
+                            plan,
+                            io: AttnParams {
+                                q: b.fa_q,
+                                k: b.fa_k,
+                                v: b.fa_v,
+                                k_cache: &state.kv.k_gpu[kv],
+                                v_cache: &state.kv.v_gpu[kv],
+                                k_scales: None,
+                                v_scales: None,
+                                pos_buf: &state.pos_buf,
+                                pos: position,
+                                positions: None,
+                                n_heads,
+                                n_kv_heads: n_kv,
+                                head_dim,
+                                physical_cap: state.kv.physical_cap,
+                                batch_size: 1,
+                                max_ctx_len: 0,
+                                flash_partials: None,
+                                givens_cos: None,
+                                givens_sin: None,
+                                tree_bias: None,
+                                block_start: 0,
+                                block_cols: 0,
+                                output_gate: None,
+                                output_awq_scale: None,
+                                output: b.fa_attn_out,
+                            },
+                        });
+                    }
+                    Lanes::Batch {
+                        positions,
+                        kv: cache,
+                        lane_capacity,
+                        ..
+                    } => {
+                        steps.push(Step::Rope {
+                            q: b.fa_q,
+                            k: b.fa_k,
+                            pos_buf: &positions.buf,
+                            positions: Some(positions),
+                            n_heads,
+                            n_kv_heads: n_kv,
+                            head_dim,
+                            rope,
+                        });
+                        steps.push(Step::LaneAttention(LaneAttentionOp {
+                            q: b.fa_q,
+                            k: b.fa_k,
+                            v: b.fa_v,
+                            k_cache: &cache.k_gpu[kv],
+                            v_cache: &cache.v_gpu[kv],
+                            positions,
+                            output: b.fa_attn_out,
+                            rows,
+                            n_heads,
+                            n_kv_heads: n_kv,
+                            head_dim,
+                            lane_capacity,
+                            max_ctx_len: lane_capacity,
+                        }));
+                    }
+                }
+                steps.push(b.project_residual(r(3), b.fa_attn_out));
+                steps
             }
         })
     }
 
     /// FFN block. Dense: `h += w2(silu(w1·x) ⊙ w3·x)`, `x = ffn_norm(h)`.
-    /// MoE: one sealed call (norm, sigmoid router with the expert selection
-    /// bias, top-k routed experts, combine into `h`).
+    /// MoE (single lane only): one sealed call (norm, sigmoid router with the
+    /// expert selection bias, top-k routed experts, combine into `h`).
     pub fn ffn_steps(
         &'a self,
         cfg: &Lfm2MoeConfig,
         ctx: &'a DispatchCtx,
-        state: &'a Lfm2MoeState,
+        b: &'a Bufs<'a>,
         layer_idx: usize,
     ) -> Result<Vec<Step<'a>>, String> {
         let m = match (&self.layer.ffn, &self.ffn) {
             (Ffn::Dense(_), [Some(w1), Some(w3), Some(w2)]) => {
-                let (norm, input) = norm_into(state, &self.layer.ffn_norm, cfg.rms_norm_eps);
                 return Ok(vec![
-                    norm,
-                    Step::Gemv {
-                        w: w1,
-                        input,
-                        out: &state.dense_gate,
-                    },
-                    Step::Gemv {
-                        w: w3,
-                        input,
-                        out: &state.dense_up,
-                    },
+                    b.norm(&self.layer.ffn_norm, b.ffn_in, cfg),
+                    b.project(w1, b.ffn_in, b.dense_gate),
+                    b.project(w3, b.ffn_in, b.dense_up),
                     Step::SiluMul {
-                        gate: &state.dense_gate,
-                        up: &state.dense_up,
-                        out: &state.dense_act,
+                        gate: b.dense_gate,
+                        up: b.dense_up,
+                        out: b.dense_act,
                     },
-                    Step::GemvResidual {
-                        w: w2,
-                        input: GemvInput::Raw(&state.dense_act),
-                        residual: &state.h,
-                        out: &state.h,
-                    },
+                    b.project_residual(w2, b.dense_act),
                 ]);
             }
             (Ffn::Moe(m), _) => m,
             (Ffn::Dense(_), _) => unreachable!("dense FFN refs are bound in LayerRefs::new"),
+        };
+        let Lanes::Single { state, .. } = b.lanes else {
+            return Err("MoE FFN has no continuous-batching route".into());
         };
         let (gate_up, down) = (&m.experts[0].gate_up, &m.experts[0].down);
         let params = MoeParams {
@@ -246,6 +388,7 @@ impl<'a> LayerRefs<'a> {
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
+            mq2_lloyd: None,
             recipe: MoeRecipe::SigmoidRoutedNoShared,
             route_policy: None,
             normalization: MoeNormalization::RmsNorm {
@@ -262,6 +405,7 @@ impl<'a> LayerRefs<'a> {
             selection_bias: Some(MoeSelectionBias {
                 bias: &m.expert_bias,
                 route_scale: cfg.routed_scaling_factor,
+                scores: MoeScores::Sigmoid,
             }),
             x_rot_prerotated: false,
             defer_routed_combine: false,
@@ -307,45 +451,26 @@ impl<'a> LayerRefs<'a> {
     }
 }
 
-/// Final norm + tied LM head into `state.logits`.
+/// Final norm + tied LM head into `logits`.
 pub(crate) fn head_steps<'a>(
     cfg: &Lfm2MoeConfig,
     weights: &'a Lfm2MoeWeights,
     lm_head: &'a WeightRef<'a>,
-    state: &'a Lfm2MoeState,
+    b: &'a Bufs<'a>,
 ) -> Vec<Step<'a>> {
-    let (norm, input) = norm_into(state, &weights.embedding_norm, cfg.rms_norm_eps);
-    vec![
-        norm,
-        Step::Gemv {
-            w: lm_head,
-            input,
-            out: &state.logits,
-        },
-    ]
-}
-
-/// RMS norm of `state.h` into `state.tmp`, read raw by every projection.
-/// Each projection rotates its own input for its format, which keeps the
-/// per-projection kernels and reduction order of the pre-port route
-/// (prerotated inputs would admit the cross-projection fusion table).
-fn norm_into<'a>(
-    state: &'a Lfm2MoeState,
-    weight: &'a GpuTensor,
-    eps: f32,
-) -> (Step<'a>, GemvInput<'a>) {
-    (
-        Step::RmsnormAutomatic {
-            x: &state.h,
-            norm_weight: weight,
-            x_plain: &state.tmp,
-            out: &state.tmp,
-            awq_scale: None,
-            k: state.h.numel(),
-            eps,
-            rotation: RotationPlan::None,
-            rows: 1,
-        },
-        GemvInput::Raw(&state.tmp),
-    )
+    let head = match b.lanes {
+        Lanes::Single { .. } => b.project(lm_head, b.head_in, b.logits),
+        Lanes::Batch {
+            rows, lm_rotation, ..
+        } => Step::Project(ProjectOp {
+            weight: *lm_head,
+            input: b.head_in,
+            output: b.logits,
+            rows,
+            rotation: Some(lm_rotation),
+            ladder: ProjectLadder::GemmLmHead,
+            residual: None,
+        }),
+    };
+    vec![b.norm(&weights.embedding_norm, b.head_in, cfg), head]
 }

@@ -566,6 +566,21 @@ fn dispatch_full_attention(
         // ── Non-causal, F32 K/V ──
         TileImpl::DflashN64 => {
             debug_assert_eq!(key, AttnFullF32);
+            // gfx1151: key-split twin (the N64 grid is one 2-wave workgroup
+            // per head there, ~5x slower at a 2K context).
+            if hip!(gpu.try_attention_dflash_wmma_kvsplit(
+                io.q,
+                io.k,
+                io.v,
+                io.out,
+                io.n,
+                io.seq_len,
+                io.n_heads,
+                io.n_kv_heads,
+                io.head_dim,
+            ))? {
+                return Ok(());
+            }
             hip!(gpu.attention_dflash_wmma_n64_f32(
                 io.q,
                 io.k,
@@ -1419,22 +1434,24 @@ fn dispatch_attend(
                         fp,
                     )),
                     // The flash tile walks head_dim in 128-wide halves (32
-                    // lanes x 4): a 64-wide head (SmolLM2, Llama-3.2-1B) would
-                    // read the next head's Q/K and write past its partials row.
+                    // lanes x 4); head_dim 64 (SmolLM2, Llama-3.2-1B) has its
+                    // own tile, other non-multiples would read the next head's
+                    // Q/K and write past their partials row.
                     // attention_q8_0_kv reads the position from pos_buf on a
                     // fixed grid, so it is graph/replay-safe as well.
-                    (None, None) if io.head_dim % 128 != 0 => hip!(gpu.attention_q8_0_kv(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.pos_buf,
-                        seq_len,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.physical_cap,
-                    )),
+                    (None, None) if io.head_dim % 128 != 0 && io.head_dim != 64 => hip!(gpu
+                        .attention_q8_0_kv(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.pos_buf,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                        )),
                     (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
                         io.k_cache,
@@ -2002,6 +2019,71 @@ fn dispatch_attend(
                 let ct = io.givens_cos.unwrap();
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
+                // gfx1201 fwht4 FA2 arm
+                // fwht4 K (132 B/head, per-128-half rotation) dequantized into
+                // the FA2 K plane; V stays Q8_0 (v_mode 8). Replay-idempotent and
+                // capture-safe like the fwht3 arm. No tree-verify (FA2 has no
+                // tree path). Falls through to the incumbent otherwise.
+                if gpu.flags.gfx12_fa2_prefill
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=512).contains(&io.batch_size)
+                    && (64..=rdna_compute::attention::GFX12_Q8_FA2_MAX_CTX)
+                        .contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                    && plan.v_mode_bits == 8
+                {
+                    hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        ct,
+                        st,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
+                // gfx11 fwht4 FA2 arm
+                // Same gates as the fwht3 gfx11 arm below; the launcher
+                // pre-rotates/pre-converts Q into f16 scratch (replay-idempotent,
+                // capture-safe). Falls through to the incumbent otherwise.
+                if gpu.flags.gfx11_fa2_prefill
+                    && matches!(
+                        gpu.arch.as_str(),
+                        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+                    )
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && gpu.fa2_gfx11_batch_admitted(io.batch_size)
+                    && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                    && plan.v_mode_bits == 8
+                {
+                    hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_gfx11(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        ct,
+                        st,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
                 #[cfg(feature = "flash-attn-ck")]
                 let contiguous_prefix =
                     is_contiguous_prefill_prefix(io.pos, io.batch_size, io.max_ctx_len);
@@ -2129,8 +2211,9 @@ fn dispatch_attend(
                 // scratch (rotation fused, Q never mutated) and dequantizes
                 // fwht3 K into its K plane, V unchanged Q8 — replay-idempotent
                 // and capture-safe, so no recorder/capture gates (like the
-                // Q8 FA2 ingress). Same shape predicates as before, plus:
-                // no tree-verify (FA2 has no tree path) and V must be Q8_0
+                // Q8 FA2 ingress). Context up to GFX12_Q8_FA2_MAX_CTX and any
+                // batch (the body walks 64-bit K/V offsets to max(positions)+1
+                // and guards partial 8-row query tiles), plus: no tree-verify (FA2 has no tree path) and V must be Q8_0
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
                 //
@@ -2142,8 +2225,8 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && (64..=512).contains(&io.batch_size)
-                    && io.batch_size % 16 == 0
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && (64..=rdna_compute::attention::GFX12_Q8_FA2_MAX_CTX)
+                        .contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
                 {
@@ -2950,6 +3033,13 @@ fn dispatch_attend(
                     ))
                 } else {
                     let fp = io.flash_partials.unwrap();
+                    // Eagerly `max_ctx_len` is the live context. A DFlash
+                    // verify-graph capture sizes it by `physical_cap`; there
+                    // the window's live context is `pos + batch_size`, which
+                    // the native-fp8 split-KV route's floor and the graph's
+                    // route class are keyed on.
+                    let live_ctx = (ctx.verify_tile_attend && gpu.graphs.capture_mode)
+                        .then(|| io.pos + io.batch_size);
                     hip!(gpu.attention_flash_fp8_e4m3_tile_batched(
                         io.q,
                         io.k_cache,
@@ -2966,6 +3056,7 @@ fn dispatch_attend(
                         io.tree_bias,
                         io.block_start,
                         io.block_cols,
+                        live_ctx,
                     ))
                 }
             }

@@ -2,21 +2,28 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Exact-gfx1151 MQ4G256V2 WMMA GEMMs for small batches (the 16-row DFlash
-// verify): one module, four symbols with the base kernels' ABIs.
+// Exact-gfx1151 G256 4-bit WMMA GEMMs for small batches (the 16-row DFlash
+// verify): one module, eight symbols with the base kernels' ABIs.
+//   MQ4G256V2 (dual-half (s0,z0 | s1,z1) header):
 //   gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds      (= gemm_gate_up_mq4g256v2_wmma)
 //   gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds        (= gemm_qkvza_mq4g256v2_wmma)
 //   gemm_qkv_mq4g256v2_wmma_gfx1151_xlds          (= gemm_qkv_mq4g256v2_wmma)
 //   gemm_mq4g256v2_residual_wmma_gfx1151_xlds     (= gemm_mq4g256v2_residual_wmma, Y += W@X)
+//   HFQ4G256 / MQ4G256 v1 (one f32 (scale, zero) header per group):
+//   gemm_gate_up_hfq4g256_wmma_gfx1151_xlds       (= gemm_gate_up_hfq4g256_wmma{,_ldscoop_nosync})
+//   gemm_qkvza_hfq4g256_wmma_gfx1151_xlds         (= gemm_qkvza_hfq4g256_wmma)
+//   gemm_qkv_hfq4g256_wmma_gfx1151_xlds           (= gemm_qkv_hfq4g256_wmma)
+//   gemm_hfq4g256_residual_wmma_gfx1151_xlds      (= gemm_hfq4g256_residual_wmma_k2, Y += W@X)
 //
 // Per output the arithmetic is the base gfx11 kernels' exactly, so outputs are
 // byte-identical to them:
 //   - one wave owns 16 weight rows x 16 batch rows and runs the whole K chain
 //     acc = wmma_f32_16x16x16_f16(A_t, B_t, acc) for t = 0..K/16-1 in order,
 //     from acc = 0 (no split-K, no reduction across waves);
-//   - A_t[i] = fma_f16(scale, (f16)nibble_i, zero) with the group's half-select
-//     (tiles 0..7 use (s0, z0), 8..15 use (s1, z1)), the value the base
-//     kernels' scalar `sc * (f16)(float)q + zp` (contracted to v_fma_f16)
+//   - A_t[i] = fma_f16(scale, (f16)nibble_i, zero) with the group's header:
+//     V2 tiles 0..7 use (s0, z0), 8..15 use (s1, z1); V1 uses the group's
+//     ((f16)scale_f32, (f16)zero_f32) for all 16 tiles. That is the value the
+//     base kernels' scalar `sc * (f16)(float)q + zp` (contracted to v_fma_f16)
 //     produces; here one v_pk_fma_f16 per pair, with the nibble made exact by
 //     the 0x6400 | q magic (1024 + q) minus 1024;
 //   - B_t is the same 16 x 16 fp16 X tile; the epilogue is the base one
@@ -91,6 +98,8 @@ __device__ __forceinline__ half16_t xlds_dq16(unsigned int pk0, unsigned int pk1
 
 // The whole K chain of this wave's 16 rows x 16 batch rows.
 // row_base: this lane's (clamped) weight row. xs_lds: 2 X slabs.
+// V1: the 8 B header is f32 (scale, zero), converted to f16 like the base kernels.
+template <bool V1>
 __device__ __forceinline__ float8_t xlds_mainloop(const char* row_base, const _Float16* X,
                                                   int batch_start, int N, int K,
                                                   _Float16* xs_lds) {
@@ -123,20 +132,29 @@ __device__ __forceinline__ float8_t xlds_mainloop(const char* row_base, const _F
     __syncthreads();
     for (int g = 0; g < G; ++g) {
         const char* gp = row_base + (long long)g * 136;
-        const u2a_t h = *(const u2a_t*)gp;
+        const u2a_t hv = *(const u2a_t*)gp;
+        unsigned int h0 = hv.x, h1 = hv.y;
+        if (V1) {
+            // Bit-cast the scalars, not hv.y: clang lowers __builtin_bit_cast of an
+            // ext-vector element lvalue as a load from the vector's base (lane 0).
+            half2_t sz;
+            sz.x = (_Float16)__builtin_bit_cast(float, h0);
+            sz.y = (_Float16)__builtin_bit_cast(float, h1);
+            h0 = h1 = xlds_u(sz);
+        }
         const u4a_t* p = (const u4a_t*)(gp + 8);
         const u4_t w0 = p[0], w1 = p[1], w2 = p[2], w3 = p[3];
         const u4_t w4 = p[4], w5 = p[5], w6 = p[6], w7 = p[7];
         if (g + 1 < G) x_fetch(g + 1);
         const _Float16* xs = xs_lds + (g & 1) * XLDS_SLAB;
-        XLDS_TILE(0,  w0.x, w0.y, h.x); XLDS_TILE(1,  w0.z, w0.w, h.x);
-        XLDS_TILE(2,  w1.x, w1.y, h.x); XLDS_TILE(3,  w1.z, w1.w, h.x);
-        XLDS_TILE(4,  w2.x, w2.y, h.x); XLDS_TILE(5,  w2.z, w2.w, h.x);
-        XLDS_TILE(6,  w3.x, w3.y, h.x); XLDS_TILE(7,  w3.z, w3.w, h.x);
-        XLDS_TILE(8,  w4.x, w4.y, h.y); XLDS_TILE(9,  w4.z, w4.w, h.y);
-        XLDS_TILE(10, w5.x, w5.y, h.y); XLDS_TILE(11, w5.z, w5.w, h.y);
-        XLDS_TILE(12, w6.x, w6.y, h.y); XLDS_TILE(13, w6.z, w6.w, h.y);
-        XLDS_TILE(14, w7.x, w7.y, h.y); XLDS_TILE(15, w7.z, w7.w, h.y);
+        XLDS_TILE(0,  w0.x, w0.y, h0); XLDS_TILE(1,  w0.z, w0.w, h0);
+        XLDS_TILE(2,  w1.x, w1.y, h0); XLDS_TILE(3,  w1.z, w1.w, h0);
+        XLDS_TILE(4,  w2.x, w2.y, h0); XLDS_TILE(5,  w2.z, w2.w, h0);
+        XLDS_TILE(6,  w3.x, w3.y, h0); XLDS_TILE(7,  w3.z, w3.w, h0);
+        XLDS_TILE(8,  w4.x, w4.y, h1); XLDS_TILE(9,  w4.z, w4.w, h1);
+        XLDS_TILE(10, w5.x, w5.y, h1); XLDS_TILE(11, w5.z, w5.w, h1);
+        XLDS_TILE(12, w6.x, w6.y, h1); XLDS_TILE(13, w6.z, w6.w, h1);
+        XLDS_TILE(14, w7.x, w7.y, h1); XLDS_TILE(15, w7.z, w7.w, h1);
         // Slab (g + 1) & 1 was last read in group g - 1, before that group's barrier.
         if (g + 1 < G) x_store((g + 1) & 1);
         __syncthreads();
@@ -156,8 +174,13 @@ __device__ __forceinline__ float8_t xlds_mainloop(const char* row_base, const _F
     const int out_col = batch_start + (lane & 15);                                      \
     const bool store = row_start < total_m && out_col < N;
 
-__launch_bounds__(XLDS_THREADS)
-extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
+// One symbol per header format (V2 = MQ4G256V2, V1 = HFQ4G256/MQ4G256) for each body.
+#define XLDS_ENTRIES(BODY, V2_NAME, V1_NAME, PARAMS, ARGS)                                  \
+    __launch_bounds__(XLDS_THREADS) extern "C" __global__ void V2_NAME PARAMS { BODY<false> ARGS; } \
+    __launch_bounds__(XLDS_THREADS) extern "C" __global__ void V1_NAME PARAMS { BODY<true> ARGS; }
+
+template <bool V1>
+__device__ __forceinline__ void xlds_gate_up(
     const char* __restrict__ A_gate, const char* __restrict__ A_up,
     const _Float16* __restrict__ X,
     float* __restrict__ Y_gate, float* __restrict__ Y_up,
@@ -166,7 +189,7 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
     const char* A; int local_row;
     if (safe_row < gate_m) { A = A_gate; local_row = safe_row; }
     else { A = A_up; local_row = safe_row - gate_m; }
-    const float8_t acc = xlds_mainloop(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
+    const float8_t acc = xlds_mainloop<V1>(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
     if (store) {
 #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -181,8 +204,13 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
     }
 }
 
-__launch_bounds__(XLDS_THREADS)
-extern "C" __global__ void gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
+XLDS_ENTRIES(xlds_gate_up, gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds, gemm_gate_up_hfq4g256_wmma_gfx1151_xlds,
+    (const char* __restrict__ A_gate, const char* __restrict__ A_up, const _Float16* __restrict__ X,
+     float* __restrict__ Y_gate, float* __restrict__ Y_up, int gate_m, int up_m, int K, int N),
+    (A_gate, A_up, X, Y_gate, Y_up, gate_m, up_m, K, N))
+
+template <bool V1>
+__device__ __forceinline__ void xlds_qkvza(
     const char* __restrict__ A_qkv, const char* __restrict__ A_z,
     const char* __restrict__ A_beta, const char* __restrict__ A_alpha,
     const _Float16* __restrict__ X,
@@ -195,7 +223,7 @@ extern "C" __global__ void gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
     else if (safe_row < qkv_m + z_m) { A = A_z; local_row = safe_row - qkv_m; }
     else if (safe_row < qkv_m + z_m + beta_m) { A = A_beta; local_row = safe_row - (qkv_m + z_m); }
     else { A = A_alpha; local_row = safe_row - (qkv_m + z_m + beta_m); }
-    const float8_t acc = xlds_mainloop(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
+    const float8_t acc = xlds_mainloop<V1>(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
     if (store) {
 #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -212,8 +240,15 @@ extern "C" __global__ void gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
     }
 }
 
-__launch_bounds__(XLDS_THREADS)
-extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
+XLDS_ENTRIES(xlds_qkvza, gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds, gemm_qkvza_hfq4g256_wmma_gfx1151_xlds,
+    (const char* __restrict__ A_qkv, const char* __restrict__ A_z, const char* __restrict__ A_beta,
+     const char* __restrict__ A_alpha, const _Float16* __restrict__ X, float* __restrict__ Y_qkv,
+     float* __restrict__ Y_z, float* __restrict__ Y_beta, float* __restrict__ Y_alpha,
+     int qkv_m, int z_m, int beta_m, int alpha_m, int K, int N),
+    (A_qkv, A_z, A_beta, A_alpha, X, Y_qkv, Y_z, Y_beta, Y_alpha, qkv_m, z_m, beta_m, alpha_m, K, N))
+
+template <bool V1>
+__device__ __forceinline__ void xlds_qkv(
     const char* __restrict__ A_q, const char* __restrict__ A_k, const char* __restrict__ A_v,
     const _Float16* __restrict__ X,
     float* __restrict__ Y_q, float* __restrict__ Y_k, float* __restrict__ Y_v,
@@ -223,7 +258,7 @@ extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
     if (safe_row < q_m) { A = A_q; local_row = safe_row; }
     else if (safe_row < q_m + k_m) { A = A_k; local_row = safe_row - q_m; }
     else { A = A_v; local_row = safe_row - q_m - k_m; }
-    const float8_t acc = xlds_mainloop(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
+    const float8_t acc = xlds_mainloop<V1>(A + local_row * row_stride, X, batch_start, N, K, xs_lds);
     if (store) {
 #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -239,13 +274,19 @@ extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
     }
 }
 
-__launch_bounds__(XLDS_THREADS)
-extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1151_xlds(
+XLDS_ENTRIES(xlds_qkv, gemm_qkv_mq4g256v2_wmma_gfx1151_xlds, gemm_qkv_hfq4g256_wmma_gfx1151_xlds,
+    (const char* __restrict__ A_q, const char* __restrict__ A_k, const char* __restrict__ A_v,
+     const _Float16* __restrict__ X, float* __restrict__ Y_q, float* __restrict__ Y_k,
+     float* __restrict__ Y_v, int q_m, int k_m, int v_m, int K, int N),
+    (A_q, A_k, A_v, X, Y_q, Y_k, Y_v, q_m, k_m, v_m, K, N))
+
+template <bool V1>
+__device__ __forceinline__ void xlds_residual(
     const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y,
     int M, int K, int batch_size) {
     const int N = batch_size;
     XLDS_PROLOGUE(M)
-    const float8_t acc = xlds_mainloop(A + (long long)safe_row * row_stride, X, batch_start, N, K, xs_lds);
+    const float8_t acc = xlds_mainloop<V1>(A + (long long)safe_row * row_stride, X, batch_start, N, K, xs_lds);
     if (store) {
 #pragma unroll
         for (int j = 0; j < 8; j++) {
@@ -254,3 +295,8 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1151_xlds(
         }
     }
 }
+
+XLDS_ENTRIES(xlds_residual, gemm_mq4g256v2_residual_wmma_gfx1151_xlds, gemm_hfq4g256_residual_wmma_gfx1151_xlds,
+    (const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y,
+     int M, int K, int batch_size),
+    (A, X, Y, M, K, batch_size))

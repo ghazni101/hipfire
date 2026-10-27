@@ -17,6 +17,7 @@ flash-attn-ck = ["dep:libloading"]
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
 redline-dispatch = { path = "../redline-dispatch" }
 radiowave = { path = "../radiowave" }
 railgun = { path = "../railgun" }
@@ -175,6 +176,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_flash_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_verify_attn_wmma"
 required-features = ["lab"]
 
 [[example]]
@@ -982,6 +987,10 @@ name = "vit_qtiled_parity_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "vit_attention_hd72_probe"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_vit_attention_shapes"
 required-features = ["lab"]
 
@@ -1031,6 +1040,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "mq6_lm_head_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_rows_split_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -1156,4 +1169,21 @@ required-features = ["lab"]
 
 [[example]]
 name = "vmm_paged_reclaim_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "gate_up_tiles_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_railgun_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_gemm_shapes"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "railgun_copy_fill_oracle"
 required-features = ["lab"]

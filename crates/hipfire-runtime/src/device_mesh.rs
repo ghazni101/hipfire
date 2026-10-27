@@ -57,6 +57,11 @@ pub enum CollectiveHint {
     /// per-operation reduction hint per row- or expert-sharded declaration
     /// (removed in 90b2cc7aa as unreferenced while no producer existed).
     AllReduce { kind: DimKind },
+    /// Copy-only owner-routed row gather across the named axis group: every
+    /// rank copies its owned rows to every other rank (no arithmetic), then
+    /// runs the unchanged slot-order combine replicated on every rank. This is
+    /// the Flash-Next EP exchange, not a reduction.
+    OwnerRowGather { kind: DimKind },
     /// Transfer the residual from one pipeline stage to the next.
     ///
     /// `src` and `dst` are stage coordinates (not physical device IDs). Use

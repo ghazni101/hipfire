@@ -5,6 +5,7 @@
 buffer_load_b64	buffer	0x15	VDATA:64,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Load:1	buffer_load_b64 v[0:1], v2, s[4:7], s8 offen	C4054008 40800800 00000002	w0_extra:ignored:0x3803f00:0x0,w1_extra:ignored:0x100:0x0,vbuffer_format:honored:0x3f800000:0x800000,vbuffer_offen:honored:0x40000000:0x0/0x40000000,vbuffer_idxen:honored:0x80000000:0x0,vbuffer_tfe:honored:0x400000:0x0,vbuffer_scope:honored:0xc0000:0x0/0x40000/0x80000/0xc0000,vbuffer_th:honored:0x700000:0x0/0x100000/0x200000/0x300000/0x400000/0x500000/0x600000/0x700000,vbuffer_nv:honored:0x80:0x0
 ds_min_i32	ds	0x5	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Ds:1	ds_min_i32 v1, v2 offset:49924	D814C304 00000201	w0_extra:ignored:0x30000:0x0
 ds_max_i32	ds	0x6	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Ds:1	ds_max_i32 v2, v3 offset:49920	D818C300 00000302	w0_extra:ignored:0x30000:0x0
+ds_max_u32	ds	0x8	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Ds:1	ds_max_u32 v7, v1 offset:64	D8200040 00000107	w0_extra:ignored:0x30000:0x0
 ds_store_2addr_b32	ds	0xe	ADDR:32,DATA0:32,DATA1:32	-	ADDR,DATA0,DATA1	-	Ds:1	ds_store_2addr_b32 v1, v2, v3 offset1:1	D8380100 00030201	w0_extra:ignored:0x30000:0x0
 ds_load_2addr_b32	ds	0x37	VDST:64,ADDR:32	VDST	ADDR	-	Ds:1	ds_load_2addr_b32 v[8:9], v3 offset1:1	D8DC0100 08000003	w0_extra:ignored:0x30000:0x0
 ds_store_2addr_b64	ds	0x4e	ADDR:32,DATA0:64,DATA1:64	-	ADDR,DATA0,DATA1	-	Ds:1	ds_store_2addr_b64 v18, v[9:10], v[11:12] offset1:1	D9380100 000B0912	w0_extra:ignored:0x30000:0x0
@@ -23,6 +24,7 @@ s_load_b256	smem	0x3	SDATA:256,SBASE:64,SOFFSET:32	SDATA	SBASE,SOFFSET	-	Km:2	s_
 s_mov_b32	sop1	0x0	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_mov_b32 s4, exec_lo	BE84007E	-
 s_brev_b32	sop1	0x4	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_brev_b32 s1, 1	BE810481	-
 s_ctz_i32_b32	sop1	0x8	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_ctz_i32_b32 s21, s20	BE950814	-
+s_clz_i32_u32	sop1	0xa	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_clz_i32_u32 s47, s50	BEAF0A32	-
 s_not_b32	sop1	0x1e	SDST:32,SSRC0:32	SDST	SSRC0	scc:w	-	s_not_b32 s4, s4	BE841E04	-
 s_and_saveexec_b32	sop1	0x20	SDST:32,SSRC0:32	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_saveexec_b32 s0, vcc_lo	BE80206A	-
 s_or_saveexec_b32	sop1	0x22	SDST:32,SSRC0:32	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b32 s3, s3	BE832203	-
@@ -34,6 +36,7 @@ s_lshl_b32	sop2	0x8	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_lshl_b3
 s_lshr_b32	sop2	0xa	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_lshr_b32 s4, ttmp7, 16	85049073	-
 s_min_i32	sop2	0x12	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1	scc:w	-	s_min_i32 s20, s5, 0x200	8914FF05 00000200	-
 s_max_i32	sop2	0x14	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_max_i32 s1, s1, s22	8A011601	-
+s_max_u32	sop2	0x15	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_max_u32 s30, s30, s35	8A9E231E	-
 s_and_b32	sop2	0x16	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_and_b32 vcc_lo, exec_lo, s2	8B6A027E	-
 s_or_b32	sop2	0x18	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_or_b32 s2, s2, s3	8C020302	-
 s_xor_b32	sop2	0x1a	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_xor_b32 s20, exec_lo, s20	8D14147E	-
@@ -289,6 +292,7 @@ scratch_store_b32	scratch	0x1a	VADDR:64,VSRC:32,SADDR:64	-	VADDR,VSRC,SADDR	-	St
 v_add_co_ci_u32_e32	vop2	0x20	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1,implicit	vcc:r,vcc:w	-	v_add_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo	40020B02	-
 v_add_nc_u16	vop3	0x303	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_add_nc_u16 v5.l, v5.l, s15	D7030005 02001F05	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_alignbit_b32	vop3	0x216	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_alignbit_b32 v8, v5, v6, 30	D6160008 027A0D05	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_alignbyte_b32	vop3	0x217	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_alignbyte_b32 v6, v2, v3, v161.l	D6170006 06860702	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_and_b16	vop3	0x362	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_and_b16 v2.l, v2.l, 1	D7620002 02010302	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_ashrrev_i16	vop3	0x33a	VDST:16,SRC0:16,SRC1:16	VDST	SRC0,SRC1	-	-	v_ashrrev_i16 v30.l, 8, v24.l	D73A001E 02023088	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_bfe_i32	vop3	0x211	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_bfe_i32 v26, v18, 0, 8	D611001A 02210112	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
@@ -520,4 +524,5 @@ v_cmpx_ge_i32_e32	vopc	0xc6	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_ge_u32_e32	vopc	0xce	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ge_u32_e32 s15, v13	7D9C1A0F	-
 v_cmpx_lt_i64_e32	vopc	0xd1	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_lt_i64_e32 s[2:3], v[3:4]	7DA20602	-
 v_cmpx_eq_u64_e32	vopc	0xda	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u64_e32 0, v[7:8]	7DB40E80	-
+v_cmpx_le_u64_e32	vopc	0xdb	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u64_e32 s[22:23], v[2:3]	7DB60416	-
 v_cmpx_gt_u64_e32	vopc	0xdc	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u64_e32 s[2:3], v[3:4]	7DB80602	-

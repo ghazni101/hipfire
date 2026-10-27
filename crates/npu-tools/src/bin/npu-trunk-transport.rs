@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
+#[path = "npu-trunk-transport/gpu.rs"]
+mod gpu;
 use npu_tools::coop_gpu;
 use peacemaker_npu::kernels::{gemm_g80, gemm_g80_n512, w8a8_epi::bf16_direct};
 use railgun::npu::{
@@ -16,14 +18,6 @@ const ROWS: usize = 8192;
 const CLASSES: usize = 16;
 const DEFAULT_ROUNDS: usize = 20;
 const POISON: u8 = 0xa5;
-/// Reduction dimension of the shape's program: 2560 (input shapes) or 6144 (out shapes).
-fn shape_k(shape: Shape) -> usize {
-    if shape.is_out() {
-        OUT_PANEL_K
-    } else {
-        PANEL_K
-    }
-}
 fn a_code(row: usize, k: usize, round: usize) -> i8 {
     ((k * 5 + (row % CLASSES) * 7 + round * 11) % 23) as i8 - 11
 }
@@ -60,12 +54,16 @@ fn at<T>(round: Option<usize>, stage: &str, result: Result<T, String>) -> Result
 fn resume_latency_ns(anchor_ns: u64, elapsed_ms: f32, done_ns: u64) -> i128 {
     i128::from(anchor_ns) + (f64::from(elapsed_ms) * 1e6) as i128 - i128::from(done_ns)
 }
-fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
+fn consumer_columns(shape: Shape) -> Vec<std::ops::Range<usize>> {
     match shape {
-        Shape::GdnIn => [0..10240, 10240..16384, 16384..16432, 16432..16480],
-        Shape::QsaIn => [0..12288, 12288..12800, 12800..13312, 13312..13952],
+        Shape::GdnIn | Shape::DenseGdnIn => {
+            vec![0..10240, 10240..16384, 16384..16432, 16432..16480]
+        }
+        Shape::QsaIn => vec![0..12288, 12288..12800, 12800..13312, 13312..13952],
         // The out projection feeds the whole 2560-wide residual: quarters stand in for the consumer windows.
-        Shape::GdnOut | Shape::QsaO => [0..640, 640..1280, 1280..1920, 1920..2560],
+        Shape::GdnOut | Shape::QsaO => vec![0..640, 640..1280, 1280..1920, 1920..2560],
+        // 27B gated q, k, v: 28 panels exactly, no padding.
+        Shape::DenseFaIn => vec![0..12288, 12288..13312, 13312..14336],
     }
 }
 
@@ -74,19 +72,28 @@ fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
 const CORUN_BYTES: usize = 256 << 20;
 const CORUN_COPIES: usize = 64;
 
-fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String> {
-    let (kdim, pn) = (shape_k(shape), shape.panel_n());
+fn run(
+    pci: &str,
+    shape: Shape,
+    rounds: usize,
+    corun: bool,
+    backend: gpu::Backend,
+) -> Result<(), String> {
+    // Match serving's load order: hip-bridge first, then the NPU relay. Keep
+    // the serving owner alive until checked NPU teardown and its watchdog test.
+    let serving = at(None, "open-serving-GPU", backend.load(pci))?;
+    let (kdim, pn) = (shape.k(), shape.panel_n());
     let panels_count = shape.panels();
     let columns = consumer_columns(shape);
-    let live = columns[3].end;
+    let live = columns.last().unwrap().end;
     // The consumer launch geometry uses precisely these live windows, not a
     // panel-rounded width. Diagnostic full-C downloads below also check padding.
-    // (The out shapes have no padding: five 512-column panels exactly fill the 2560-column residual.)
+    // (The N512 shapes need no padding: out = five 512-column panels, dense FA = 28; dense GDN pads 16480 to 16896.)
     if columns[0].start != 0
         || columns.windows(2).any(|w| w[0].end != w[1].start)
         || columns.iter().any(|r| r.is_empty() || r.end > live)
         || live > shape.pitch()
-        || (live == shape.pitch() && !shape.is_out())
+        || (live == shape.pitch() && !shape.is_n512())
     {
         return at(
             None,
@@ -97,8 +104,8 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
     let design = at(
         None,
         "build-panel",
-        if shape.is_out() {
-            gemm_g80_n512::build_panel_program_out(ROWS, shape.pitch(), 0)
+        if shape.is_n512() {
+            gemm_g80_n512::build_panel_program_n512(ROWS, shape.pitch(), 0, kdim)
         } else {
             gemm_g80::build_panel_program_rowmajor(ROWS, shape.pitch(), 0)
         },
@@ -154,7 +161,11 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         ),
     )?;
     let outcome = (|| {
-        let hip = runtime.hip();
+        let hip = at(
+            None,
+            "GPU-runtime-identity",
+            gpu::Gpu::new(runtime.hip(), serving.as_ref()),
+        )?;
         let layout = runtime.layout();
         let a_bytes = layout.a_bytes_for(shape);
         let c_bytes = layout.c_bytes(shape);
@@ -169,8 +180,8 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         let load_end = at(None, "create-load-event", hip.event())?;
         let load = if corun {
             Some((
-                at(None, "allocate-load-src", hip.allocate(CORUN_BYTES, None))?,
-                at(None, "allocate-load-dst", hip.allocate(CORUN_BYTES, None))?,
+                at(None, "allocate-load-src", hip.allocate(CORUN_BYTES))?,
+                at(None, "allocate-load-dst", hip.allocate(CORUN_BYTES))?,
             ))
         } else {
             None
@@ -180,14 +191,14 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         let resumed = at(None, "create-resume-event", hip.event())?;
         // Map the HIP event clock into the relay's CLOCK_MONOTONIC domain.
         // Report the bracket width rather than pretending these are exact clocks.
-        at(None, "warm-anchor", hip.record_on(&anchor, Some(&stream)))?;
+        at(None, "warm-anchor", hip.record_on(&anchor, &stream))?;
         at(
             None,
             "warm-anchor-completion",
             hip.wait_event_timeout(&anchor, WAIT_TIMEOUT),
         )?;
         let anchor_before = monotonic_ns();
-        at(None, "record-anchor", hip.record_on(&anchor, Some(&stream)))?;
+        at(None, "record-anchor", hip.record_on(&anchor, &stream))?;
         at(
             None,
             "anchor-completion",
@@ -196,9 +207,9 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         let anchor_after = monotonic_ns();
         let anchor_ns = anchor_before + (anchor_after - anchor_before) / 2;
         let anchor_uncertainty_ns = anchor_after - anchor_before;
-        let input = at(None, "allocate-input", hip.allocate(a_bytes, None))?;
-        let output = at(None, "allocate-output", hip.allocate(c_bytes, None))?;
-        let poison = at(None, "allocate-poison", hip.allocate(c_bytes, None))?;
+        let input = at(None, "allocate-input", hip.allocate(a_bytes))?;
+        let output = at(None, "allocate-output", hip.allocate(c_bytes))?;
+        let poison = at(None, "allocate-poison", hip.allocate(c_bytes))?;
         at(None, "initialize-poison", hip.memset(&poison, POISON))?;
         let blocks = at(None, "query-compute-units", hip.compute_units())? * 8;
         let gpu_copy = |dst: u64, src: u64, bytes: usize| -> Result<(), String> {
@@ -211,16 +222,10 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
                 (bytes / 16) as u64,
                 u64::from(blocks * coop_gpu::COPY_BLOCK),
             );
-            hip.launch_on(
-                Some(&stream),
-                &copy,
-                blocks,
-                coop_gpu::COPY_BLOCK,
-                &mut args,
-            )
+            hip.launch_on(&stream, &copy, blocks, coop_gpu::COPY_BLOCK, &mut args)
         };
         let drain = || -> Result<(), String> {
-            hip.record_on(&end, Some(&stream))?;
+            hip.record_on(&end, &stream)?;
             hip.wait_event_timeout(&end, WAIT_TIMEOUT)
         };
         let mut observed = vec![0u8; c_bytes];
@@ -228,6 +233,7 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
         let mut scales = vec![(0u16, 0i16); ROWS];
         let mut reference = vec![0u16; panels_count * CLASSES * CLASSES * 3];
         let mut latencies = Vec::with_capacity(rounds);
+        let mut busies = Vec::with_capacity(rounds);
         let mut resumes = Vec::with_capacity(rounds);
         let mut busy = Duration::ZERO;
         let mut last_seq = [None; 2];
@@ -269,7 +275,7 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             let av = at(
                 Some(round),
                 "A-arena",
-                if shape.is_out() {
+                if shape.is_n512() {
                     runtime.a_out_arena(bank)
                 } else {
                     runtime.a_arena(bank)
@@ -300,19 +306,13 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
                     at(
                         Some(round),
                         "queue-load",
-                        hip.launch_on(
-                            Some(&load_stream),
-                            &copy,
-                            blocks,
-                            coop_gpu::COPY_BLOCK,
-                            &mut args,
-                        ),
+                        hip.launch_on(&load_stream, &copy, blocks, coop_gpu::COPY_BLOCK, &mut args),
                     )?;
                 }
                 at(
                     Some(round),
                     "record-load-end",
-                    hip.record_on(&load_end, Some(&load_stream)),
+                    hip.record_on(&load_end, &load_stream),
                 )?;
             }
             let seq = at(Some(round), "kick", unsafe {
@@ -325,7 +325,7 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             at(
                 Some(round),
                 "record-GPU-resume",
-                hip.record_on(&resumed, Some(&stream)),
+                hip.record_on(&resumed, &stream),
             )?;
             at(
                 Some(round),
@@ -414,13 +414,19 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             let ms = completion.kick_to_done.as_secs_f64() * 1000.0;
             busy += completion.npu_busy;
             latencies.push(ms);
+            busies.push(completion.npu_busy.as_secs_f64() * 1000.0);
             println!("round={round:02} bank={bank} seq={} exact enqueue_ahead=true gpu_wait_enqueue_ns={wait_enqueue_ns} npu_done_ns={} kick->done={ms:.3} ms npu_submit_wait={:.3} ms npu_done->gpu_resume={:.3} us", seq.value, completion.done_ns, completion.npu_busy.as_secs_f64() * 1000.0, resume_ns as f64 / 1000.0);
         }
         latencies.sort_by(f64::total_cmp);
+        busies.sort_by(f64::total_cmp);
         println!("EXACT rounds={rounds} p50={:.3} p99={:.3} max={:.3} ms npu_busy_envelope={:.3} ms wall={:.3} ms (busy=submit-to-timeline host envelope, wall includes CPU oracle/copies)",
             percentile(&latencies, 0.5), percentile(&latencies, 0.99), latencies[rounds - 1], busy.as_secs_f64() * 1000.0, wall.elapsed().as_secs_f64() * 1000.0);
-        resumes.sort_by(f64::total_cmp);
-        println!("RESUME npu_done->GPU_event p50={:.3} p99={:.3} max={:.3} us anchor_uncertainty_ns={anchor_uncertainty_ns}", percentile(&resumes, 0.5), percentile(&resumes, 0.99), resumes[rounds-1]);
+        // Useful work counts the live columns only (padding columns are computed but not useful).
+        let ops = 2.0 * (ROWS * live * kdim) as f64;
+        let tops = |ms: f64| ops / (ms * 1e-3) / 1e12;
+        let (busy50, wall50) = (percentile(&busies, 0.5), percentile(&latencies, 0.5));
+        println!("RATE shape={shape:?} m={ROWS} n_live={live} n_padded={} k={kdim} corun={corun} busy_p50={busy50:.3} ms busy_TOPS={:.2} kick->done_p50={wall50:.3} ms wall_TOPS={:.2} (measured, live columns)",
+            shape.pitch(), tops(busy50), tops(wall50));
         // Negative controls run only AFTER every exact round has reported.
         // This generation was never submitted; Shared::wait rejects it in
         // process, without a DRM wait, relay request or GPU wait.
@@ -493,17 +499,31 @@ fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String
             "negative missing-wait: detected poisoned C without replacement submission (all bytes)"
         );
         println!("EXACT_CONTROLS shape={shape:?} rounds={rounds} negatives=2 consumer_padding_bounds=checked");
+        // Every round drained the producer/consumer and optional co-run stream;
+        // the poison control drained the final consumer as well.
+        hip.allow_cleanup();
         Ok(())
     })();
     let teardown = at(None, "teardown", runtime.close());
-    outcome.and(teardown)?;
+    let cleanup = at(
+        None,
+        "GPU-resource-teardown",
+        serving.as_ref().map_or(Ok(()), gpu::Serving::check_cleanup),
+    );
+    outcome.and(teardown).and(cleanup)?;
     // A separate runtime is intentional: a real timeout permanently poisons the
     // relay, and can never be followed by success on that same transport.
-    watchdog_negative(pci, shape, design.pdi, design.insts)?;
+    watchdog_negative(pci, shape, design.pdi, design.insts, serving.as_ref())?;
     println!("PASS shape={shape:?} rounds={rounds} negatives=3 consumer_padding_bounds=checked");
     Ok(())
 }
-fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Result<(), String> {
+fn watchdog_negative(
+    pci: &str,
+    shape: Shape,
+    pdi: Vec<u8>,
+    txn: Vec<u8>,
+    serving: Option<&gpu::Serving>,
+) -> Result<(), String> {
     let layout = railgun::npu::trunk::ArenaLayout::new(ROWS)?;
     // Valid zero operands/program, but a deliberately impossible chain budget:
     // EXEC_CMD must return before its 1 ns deadline can be checked. This exercises
@@ -538,7 +558,11 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
         ),
     )?;
     let outcome = (|| {
-        let hip = runtime.hip();
+        let hip = at(
+            None,
+            "negative-timeout-GPU-runtime-identity",
+            gpu::Gpu::new(runtime.hip(), serving),
+        )?;
         let stream = at(None, "negative-timeout-stream", hip.stream())?;
         let resumed = at(None, "negative-timeout-resume-event", hip.system_event())?;
         let start = Instant::now();
@@ -551,7 +575,7 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
         at(
             None,
             "negative-timeout-resume-record",
-            hip.record_on(&resumed, Some(&stream)),
+            hip.record_on(&resumed, &stream),
         )?;
         // Record retirement even when a very fast timeout is already visible.
         let retirement = unsafe { runtime.retire_bank(seq, stream.raw()) };
@@ -591,12 +615,30 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
         if !retire_error.contains("watchdog") {
             return Err(format!("missing retirement watchdog error: {retire_error}"));
         }
+        // Cover the retirement event too, which follows the earlier resume
+        // marker. Uncertain completion quarantines serving handles on exit.
+        at(
+            None,
+            "negative-timeout-final-record",
+            hip.record_on(&resumed, &stream),
+        )?;
+        at(
+            None,
+            "negative-timeout-final-drain",
+            hip.wait_event_timeout(&resumed, CHAIN_WATCHDOG),
+        )?;
+        hip.allow_cleanup();
         println!("negative forced-NPU-watchdog: GPU resumed in {:.3} ms (limit {:.3} ms); surfaced error ({error}); failed C never read", elapsed.as_secs_f64()*1000.0, CHAIN_WATCHDOG.as_secs_f64()*1000.0);
         Ok(())
     })();
     // A failed runtime reports the sticky job error at checked teardown, too.
     let teardown = runtime.close();
-    outcome?;
+    let cleanup = at(
+        None,
+        "negative-timeout-GPU-resource-teardown",
+        serving.map_or(Ok(()), gpu::Serving::check_cleanup),
+    );
+    outcome.and(cleanup)?;
     match teardown {
         Err(e) if e.contains("watchdog") => Ok(()),
         Err(e) => Err(format!("negative-timeout teardown: {e}")),
@@ -752,7 +794,7 @@ fn coexistence(reps: usize) -> Result<(), String> {
     let d_out = at(
         None,
         "build-out",
-        gemm_g80_n512::build_panel_program_out(rows, OUT_PANEL_N, 0),
+        gemm_g80_n512::build_panel_program_n512(rows, OUT_PANEL_N, 0, OUT_PANEL_K),
     )?;
     let (mut a, create_in, config_in) = at(
         None,
@@ -805,10 +847,11 @@ fn coexistence(reps: usize) -> Result<(), String> {
     Ok(())
 }
 
-const USAGE: &str = "npu-trunk-transport [--pci 0000:c0:00.0] [--shape gdn_in|qsa_in|gdn_out|qsa_o]... [--rounds N] [--corun] [--coexist [--reps N]]\n\
+const USAGE: &str = "npu-trunk-transport [--pci 0000:c0:00.0] [--shape gdn_in|qsa_in|gdn_out|qsa_o|dense_gdn_in|dense_fa_in]... [--rounds N] [--corun] [--gpu-runtime relay|serving] [--coexist [--reps N]]\n\
 Default (no --shape/--coexist): 8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 enqueue-ahead exact rounds/shape FIRST; negatives AFTER include forced chain timeout and bounded GPU release. Prints npu_done->GPU resume event latency; 3 s ready waits, 300 ms chain watchdog, default shim AXI.\n\
---shape selects shapes (repeatable): gdn_out / qsa_o are the K=6144 out-projection programs (N512 panels, 5 panels/chain, own PDI), oracle = whole-K int32 sum + bf16_direct, exact on both banks every round.\n\
+--shape selects shapes (repeatable): gdn_out / qsa_o are the K=6144 out-projection programs (N512 panels, 5 panels/chain, own PDI); dense_gdn_in / dense_fa_in are the qwen3.8-27b K=5120 in-projections (N512 panels, 33 / 28 panels/chain, own PDI). Oracle = whole-K int32 sum + bf16_direct, exact on both banks every round.\n\
 --corun: queue 16 GiB of GPU copies per round concurrently with every NPU chain (co-run rate).\n\
+--gpu-runtime: relay (default) uses railgun's GPU resources; serving loads hip-bridge first and uses its streams, kernels, allocations and events for producers/consumers, including co-run and watchdog controls. Different HIP implementations refuse before any cross-runtime work.\n\
 --coexist: second-HwCtx probe (create + config_cu cost, context-switch cost, no transport/HIP).";
 fn usage(why: &str) -> ! {
     eprintln!("FAIL: stage=arguments round=none: {why}\n{USAGE}");
@@ -816,6 +859,7 @@ fn usage(why: &str) -> ! {
 }
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut backend = gpu::Backend::default();
     let (mut pci, mut shapes, mut rounds, mut coexist, mut reps, mut corun) = (
         "0000:c0:00.0".to_string(),
         Vec::new(),
@@ -837,6 +881,9 @@ fn main() {
                 return;
             }
             "--pci" => pci = value("--pci"),
+            "--gpu-runtime" => {
+                backend = gpu::Backend::parse(&value("--gpu-runtime")).unwrap_or_else(|e| usage(&e))
+            }
             "--rounds" => {
                 rounds = value("--rounds")
                     .parse()
@@ -858,6 +905,8 @@ fn main() {
                 "qsa_in" => Shape::QsaIn,
                 "gdn_out" => Shape::GdnOut,
                 "qsa_o" => Shape::QsaO,
+                "dense_gdn_in" => Shape::DenseGdnIn,
+                "dense_fa_in" => Shape::DenseFaIn,
                 other => usage(&format!("unknown shape {other:?}")),
             }),
             other => usage(&format!("unknown argument {other:?}")),
@@ -866,8 +915,11 @@ fn main() {
     if shapes.is_empty() && !coexist {
         shapes = vec![Shape::GdnIn, Shape::QsaIn];
     }
+    if shapes.is_empty() && backend == gpu::Backend::Serving {
+        usage("--gpu-runtime serving requires transport shapes; --coexist alone does not exercise HIP");
+    }
     for shape in shapes {
-        if let Err(e) = run(&pci, shape, rounds, corun) {
+        if let Err(e) = run(&pci, shape, rounds, corun, backend) {
             eprintln!("FAIL shape={shape:?}: {e}");
             std::process::exit(1);
         }
@@ -916,18 +968,22 @@ mod tests {
             for pair in columns.windows(2) {
                 assert_eq!(pair[0].end, pair[1].start);
             }
+            assert_eq!((shape.k(), shape.panel_n(), shape.panels()), (6144, 512, 5));
+        }
+        assert_eq!((Shape::GdnIn.k(), Shape::QsaIn.k()), (2560, 2560));
+        // 27B dense in-projections: K5120, 16480 live of 16896 (GDN) and 14336 of 14336 (FA).
+        for (shape, live) in [(Shape::DenseGdnIn, 16480), (Shape::DenseFaIn, 14336)] {
             assert_eq!(
-                (shape_k(shape), shape.panel_n(), shape.panels()),
-                (6144, 512, 5)
+                (shape.k(), consumer_columns(shape).last().unwrap().end),
+                (5120, live)
             );
         }
-        assert_eq!((shape_k(Shape::GdnIn), shape_k(Shape::QsaIn)), (2560, 2560));
     }
 
     #[test]
     fn class_reference_is_the_whole_k_twin_of_one_class_pair() {
         // Whole-K dot of class (r, n), twin per row % 3 exponent: recompute one entry independently.
-        for kdim in [2560usize, 6144] {
+        for kdim in [2560usize, 5120, 6144] {
             let reference = class_reference(kdim, 2, 3);
             let (r, n, rem) = (5usize, 9usize, 1usize);
             let mut dot = 0i32;

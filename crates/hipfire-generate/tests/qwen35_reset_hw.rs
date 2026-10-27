@@ -665,12 +665,12 @@ fn pp_qwen35_reset_rolls_back_and_recovers() {
     };
     let model = model.display().to_string();
     // Two uniform-VRAM devices (preflight rejects imbalanced pairs). Default
-    // 0,1; override when a sibling run occupies a device, e.g. 1,2.
+    // 0,1; override when a sibling run occupies a device, e.g. 1,2. These are
+    // HIP indices within whatever ROCr reservation the fabric imposed; the
+    // child inherits ROCR_VISIBLE_DEVICES so the reserved pair is not replaced
+    // by numeric ordinals that would name a different physical pair.
     let devices = std::env::var("HIPFIRE_PP_DEVICES").unwrap_or_else(|_| "0,1".to_string());
-    let extra_env = [
-        ("HIP_VISIBLE_DEVICES", devices.as_str()),
-        ("ROCR_VISIBLE_DEVICES", devices.as_str()),
-    ];
+    let extra_env = [("HIP_VISIBLE_DEVICES", devices.as_str())];
     for round in 0..rounds() {
         let ctx = format!("pp round {round}");
         // pp:2 load routes every generate through generate_multi

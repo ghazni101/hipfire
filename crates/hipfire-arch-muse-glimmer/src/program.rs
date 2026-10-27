@@ -199,6 +199,7 @@ pub(crate) fn layer_steps<'a>(
                 },
             },
             pos_buf: io.pos_buf,
+            attend_through: None,
             positions: io.positions,
             gate: Some(AttnGate {
                 w: lw.attn_gate_proj.dispatch_ref(),

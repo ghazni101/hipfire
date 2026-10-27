@@ -20,6 +20,7 @@ use hipfire_registry::{
     FLASH_NEXT_XTS_LEGACY_FILE, PLE_EXACT_FORMAT,
 };
 use hipfire_runtime::ple_convert::{self, DeriveReport, PleProgress, SplitReport};
+use hipfire_runtime::verified_cache::VerifiedCache;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -819,6 +820,7 @@ pub(crate) fn is_shared_slot(entry: &ModelEntry, key: &str, sidecar: &Sidecar) -
 /// verifies against the same pin; any other file is somebody else's sidecar
 /// (e.g. a private `hipfire ple split` output) and is never touched.
 fn install_shared_alias(
+    cache: &VerifiedCache,
     canonical: &Path,
     alias: &Path,
     sidecar: &Sidecar,
@@ -832,6 +834,7 @@ fn install_shared_alias(
             let dangling = link.file_type().is_symlink() && fs::metadata(alias).is_err();
             if !dangling
                 && !crate::existing_artifact_valid(
+                    cache,
                     alias,
                     sidecar.sha256.as_deref(),
                     sidecar.size_bytes,
@@ -883,6 +886,7 @@ fn install_shared_alias(
 /// Download `destination` unless a verified copy exists (`force` re-downloads).
 /// On `Ok` the file matches the registry pin.
 fn fetch_verified_slot(
+    cache: &VerifiedCache,
     entry: &ModelEntry,
     format: PleFormat,
     sidecar: &Sidecar,
@@ -891,6 +895,7 @@ fn fetch_verified_slot(
 ) -> Result<()> {
     if destination.exists() && !force {
         if crate::existing_artifact_valid(
+            cache,
             destination,
             sidecar.sha256.as_deref(),
             sidecar.size_bytes,
@@ -915,6 +920,7 @@ fn fetch_verified_slot(
         format_size(sidecar.size_bytes)
     );
     crate::download_verified(
+        cache,
         &crate::artifact_url(entry, &sidecar.file),
         destination,
         sidecar.sha256.as_deref(),
@@ -930,6 +936,7 @@ fn fetch_verified_slot(
 /// slot, or a served grandfathered monolithic), linked there once the
 /// canonical file has verified.
 pub(crate) fn fetch_ple_sidecar(
+    cache: &VerifiedCache,
     entry: &ModelEntry,
     format: PleFormat,
     sidecar: &Sidecar,
@@ -938,10 +945,10 @@ pub(crate) fn fetch_ple_sidecar(
     force: bool,
 ) -> Result<()> {
     let canonical = models.join(&sidecar.file);
-    fetch_verified_slot(entry, format, sidecar, &canonical, force)?;
+    fetch_verified_slot(cache, entry, format, sidecar, &canonical, force)?;
     let alias = ple_sidecar_path(model_path, format);
     if alias != canonical {
-        install_shared_alias(&canonical, &alias, sidecar, format)?;
+        install_shared_alias(cache, &canonical, &alias, sidecar, format)?;
     }
     Ok(())
 }
@@ -1017,14 +1024,18 @@ pub(crate) fn ensure_ple_sidecar(
             format_size(sidecar.size_bytes)
         );
     }
+    // The on-demand path runs inside a load with no hipfire home in scope and
+    // only links or fetches a sidecar: `hipfire pull` is what records proofs.
+    let cache = VerifiedCache::disabled();
     if local_shared {
         eprintln!("ple: verifying shared {}", sidecar.file);
         if crate::existing_artifact_valid(
+            &cache,
             &destination,
             sidecar.sha256.as_deref(),
             sidecar.size_bytes,
         ) {
-            return install_shared_alias(&destination, &alias, sidecar, format);
+            return install_shared_alias(&cache, &destination, &alias, sidecar, format);
         }
         if !allow_download {
             bail!(
@@ -1044,6 +1055,7 @@ pub(crate) fn ensure_ple_sidecar(
         request.name()
     );
     crate::download_verified(
+        &cache,
         &crate::artifact_url(entry, &sidecar.file),
         &destination,
         sidecar.sha256.as_deref(),
@@ -1052,7 +1064,7 @@ pub(crate) fn ensure_ple_sidecar(
     )
     .with_context(|| format!("downloading {}", sidecar.file))?;
     if shared {
-        install_shared_alias(&destination, &alias, sidecar, format)?;
+        install_shared_alias(&cache, &destination, &alias, sidecar, format)?;
     }
     Ok(())
 }

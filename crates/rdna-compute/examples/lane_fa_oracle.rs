@@ -20,12 +20,19 @@
 //!   (`deinterleave_q_rmsnorm_f32_batched`, in-place K `rmsnorm_batched`,
 //!   `rope_partial_interleaved_f32_batched`), `kv_cache_write_fp8_e4m3_batched`
 //!   for K then V, and `attention_flash_fp8_e4m3_tile_batched` (the VerifyAttn
-//!   tile + reduce) with that lane's own partials buffer;
+//!   tile + reduce, or the native-fp8 split-KV verifier for a lane at or past
+//!   its 8,192-token default floor) with that lane's own partials buffer;
 //! - arm B (lane-batched): the three prep launches once over all rows, two
-//!   `Gpu::kv_cache_write_fp8_e4m3_lanes`, one
-//!   `Gpu::attention_verify_gqa_fp8_lanes` and one
+//!   `Gpu::kv_cache_write_fp8_e4m3_lanes`, then
+//!   `Gpu::attention_verify_fp8_lanes_routed`: one
+//!   `Gpu::attention_verify_gqa_fp8_lanes` + one
 //!   `Gpu::attention_verify_reduce_lanes` over one shared partials buffer
-//!   holding every lane's disjoint region.
+//!   holding the disjoint region of every lane the singleton serves with
+//!   VerifyAttn, and that lane's own singleton launch for every lane the
+//!   singleton serves with the split-KV verifier (the lane-batched CB verify
+//!   takes the same route as the singleton, so batched == singleton above
+//!   the floor too; run it with the default route, unset
+//!   `HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8`, and with `=0`).
 //!
 //! Compared as bytes: the prep outputs (Q, gate, K, V rows), the attention
 //! output rows (pre-filled with a sentinel so a missed store shows), every
@@ -199,6 +206,7 @@ fn main() {
 
     let mut failures = 0usize;
     let mut cases = 0usize;
+    let mut split_cases = 0usize;
     for &lanes in &[1usize, 3, 8] {
         for &n in &[2usize, 8, 16] {
             for shift in 0..2usize {
@@ -213,9 +221,28 @@ fn main() {
                     .iter()
                     .map(|&l| Gpu::lane_fa_partials_len(NH, &[l]))
                     .collect();
+                // Arm B: the lane-table partials (lane layout over the lanes
+                // that stay on the VerifyAttn lane kernels) and the model
+                // scratch's own singleton partials (`flash_partials`).
                 let b_floats = Gpu::lane_fa_partials_len(NH, &lane_shape);
+                let single_floats = lane_floats.iter().copied().max().unwrap_or(0);
                 let a = make_arm(&mut gpu, &host, total, &lane_floats);
-                let b = make_arm(&mut gpu, &host, total, &[b_floats]);
+                let b = make_arm(&mut gpu, &host, total, &[b_floats, single_floats]);
+                // The singleton route class of each lane in arm A (the
+                // lane's own partials buffer is its singleton's scratch).
+                let split_a: Vec<bool> = (0..lanes)
+                    .map(|i| {
+                        gpu.fp8_fa2_split_verify_admitted(
+                            starts[i] + n,
+                            NH,
+                            NKV,
+                            HD,
+                            n,
+                            lane_floats[i],
+                        )
+                        .is_some()
+                    })
+                    .collect();
                 gpu.hip.device_synchronize().expect("sync");
 
                 // Arm A: today's per-lane launches on that lane's row views.
@@ -289,6 +316,7 @@ fn main() {
                         None,
                         0,
                         0,
+                        None,
                     )
                     .expect("A attend");
                 }
@@ -347,10 +375,16 @@ fn main() {
                         physical_cap: starts[i] + n,
                     })
                     .collect();
-                gpu.attention_verify_gqa_fp8_lanes(&attends, &b.partials[0], NH, NKV, HD)
-                    .expect("B verify");
-                gpu.attention_verify_reduce_lanes(&attends, &b.partials[0], NH)
-                    .expect("B reduce");
+                let split_b = gpu.lane_fa_split_lanes(&attends, &b.partials[1], NH, NKV, HD);
+                gpu.attention_verify_fp8_lanes_routed(
+                    &attends,
+                    &b.partials[0],
+                    &b.partials[1],
+                    NH,
+                    NKV,
+                    HD,
+                )
+                .expect("B attend");
                 gpu.hip.device_synchronize().expect("sync B");
 
                 // Compare.
@@ -382,9 +416,18 @@ fn main() {
                         bytes(&gpu, &b.v_cache[i]),
                     );
                 }
+                // Lanes the singleton serves with the native-fp8 split-KV
+                // verifier run that singleton launch in arm B too, so their
+                // partials are the split scratch (not comparable with the
+                // VerifyAttn layout; the attention output rows are). Every
+                // other lane's partials sit in lane order over the non-split
+                // lanes only.
                 let b_partials = bytes(&gpu, &b.partials[0]);
                 let mut base = 0usize;
                 for i in 0..lanes {
+                    if split_b[i] {
+                        continue;
+                    }
                     let len = lane_floats[i] * 4;
                     cmp(
                         format!("partials[{i}]"),
@@ -393,12 +436,17 @@ fn main() {
                     );
                     base += len;
                 }
+                if split_a != split_b {
+                    bad.push(format!("route_class a={split_a:?} b={split_b:?}"));
+                }
                 let ok = bad.is_empty();
                 if !ok {
                     failures += 1;
                 }
+                let n_split = split_b.iter().filter(|&&s| s).count();
+                split_cases += usize::from(n_split > 0);
                 println!(
-                    "{} lanes={lanes} n={n:<2} ctx={starts:?} partials_stride={LANE_FA_PARTIALS_STRIDE} mismatching_buffers=[{}]",
+                    "{} lanes={lanes} n={n:<2} ctx={starts:?} split_lanes={n_split} partials_stride={LANE_FA_PARTIALS_STRIDE} mismatching_buffers=[{}]",
                     if ok { "PASS" } else { "FAIL" },
                     bad.join(", "),
                 );
@@ -424,7 +472,7 @@ fn main() {
         }
     }
 
-    println!("cases={cases} failures={failures}");
+    println!("cases={cases} failures={failures} cases_with_split_lanes={split_cases}");
     if failures != 0 {
         std::process::exit(1);
     }

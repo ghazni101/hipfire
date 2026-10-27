@@ -618,6 +618,17 @@ fn decode_image_bytes(b64: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed to decode base64 image data: {e}"))
 }
 
+/// Why the batched VL prefill loop in [`generate_vl`] stopped early.
+enum VlBatchedStop {
+    /// Client abort polled between chunks.
+    Abort,
+    /// A chunk (or the chunk plan) failed: phase label + message.
+    Forward(&'static str, String),
+    /// `vl_adaptive_downshift_fail_closed` already rolled back and emitted
+    /// the terminal error.
+    Reported,
+}
+
 pub fn generate_vl(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1255,13 +1266,213 @@ pub fn generate_vl(
         _ => None,
     };
 
-    // Prefill with vision token embedding for image_pad positions. VL
-    // prefill is per-token (forward_scratch_embed isn't batched), so we
-    // advance m.seq_pos in-loop and call maybe_evict / maybe_downshift after
-    // every committed write. Lazy VMM map/growth failures and adaptive
-    // transition errors are request-scoped (no panic, no later token emit).
+    // ── Prefill route: batched (default) vs per-token ───────────────────────
+    // Chosen BEFORE any prefill work. The batched route runs the prompt through
+    // `forward_prefill_batch` chunks with the vision embeddings spliced over the
+    // `<|image_pad|>` rows and the SAME absolute mrope phases the per-token arm
+    // uses (`qwen35::vl_prefill`); it needs a dense, batch-admissible model and
+    // no eviction. Anything else (and `HIPFIRE_VL_PREFILL=token`) keeps the
+    // per-token loop below. Decode is unchanged either way.
+    let vl_token_forced = hipfire_config::developer_var("HIPFIRE_VL_PREFILL")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("token"));
+    let vl_batched_why: Result<(), String> = if vl_token_forced {
+        Err("HIPFIRE_VL_PREFILL=token".to_string())
+    } else if m.eviction.is_some() {
+        Err("eviction armed".to_string())
+    } else if m.ep.is_some() || m.pp > 1 {
+        Err("multi-GPU topology".to_string())
+    } else if prompt_tokens.len() < 2 {
+        Err("prompt below the 2-row batch minimum".to_string())
+    } else {
+        qwen35::vl_prefill::vl_batched_prefill_admitted(gpu, weights, config, kv, dn)
+    };
+    let vl_batched = vl_batched_why.is_ok();
+    match &vl_batched_why {
+        Ok(()) => eprintln!("[daemon/vl] prefill: batched"),
+        Err(why) => eprintln!("[daemon/vl] prefill: per-token ({why})"),
+    }
+    if vl_batched {
+        let spans = qwen35::vl_prefill::image_spans(
+            &prompt_tokens,
+            image_pad_id,
+            m.seq_pos,
+            n_visual_tokens,
+        );
+        let guard = match qwen35::vl_prefill::install(
+            gpu,
+            qwen35::vl_prefill::VlPrefillInputs {
+                spans,
+                prompt_start: m.seq_pos,
+                prompt_len: prompt_tokens.len(),
+                embeds: &visual_tokens,
+                dim: config.dim,
+                mrope,
+            },
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "vl_prefill install",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
+        };
+        // Outer chunking follows the ar.rs no-eviction branch: the admitted
+        // ordinary ceiling, or the hard `PREFILL_MAX_BATCH` under adaptive KV
+        // so the controller's downshift boundaries stay exact.
+        let chunk_max = if m.kv_adaptive.is_some() {
+            qwen35::PREFILL_MAX_BATCH
+        } else {
+            match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+                Ok(limit) => limit,
+                Err(e) => {
+                    eprintln!("[daemon/vl] chunk-limit query failed ({e}); keeping legacy ceiling");
+                    qwen35::prefill_max_batch(gpu)
+                }
+            }
+        };
+        let mut stop: Option<VlBatchedStop> = None;
+        let mut start = 0usize;
+        while start < prompt_tokens.len() {
+            // Client-cancel poll between chunks (the encoder phase cannot be
+            // interrupted; the first iteration picks up an abort sent during it).
+            if check_abort(id) {
+                stop = Some(VlBatchedStop::Abort);
+                break;
+            }
+            let remaining = prompt_tokens.len() - start;
+            // Exact chunk planner: never leaves a singleton tail, which the
+            // batched entry would hand to the per-token fallback (refused
+            // for VL rows).
+            let Some(outer) = qwen35::prefill::next_exact_prefill_chunk_len(remaining, chunk_max)
+            else {
+                stop = Some(VlBatchedStop::Forward(
+                    "forward_prefill_batch (vl)",
+                    format!("chunk plan cannot split {remaining} rows under ceiling {chunk_max}"),
+                ));
+                break;
+            };
+            let end = start + outer;
+            if let Err(e) = qwen35::forward_prefill_batch(
+                gpu,
+                weights,
+                config,
+                &prompt_tokens[start..end],
+                m.seq_pos,
+                kv,
+                dn,
+                scratch,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                stop = Some(VlBatchedStop::Forward(
+                    "forward_prefill_batch (vl)",
+                    e.to_string(),
+                ));
+                break;
+            }
+            m.seq_pos += outer;
+            // Adaptive KV: downshift BETWEEN chunks the moment the start-tier
+            // buffer fills (same boundary the per-token loop and the text path use).
+            if vl_adaptive_downshift_fail_closed(
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                gpu,
+                kv,
+                dn,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                stdout,
+                id,
+                "vl-prefill",
+            ) {
+                stop = Some(VlBatchedStop::Reported);
+                break;
+            }
+            start = end;
+        }
+        // Drop the scope before decode (and before any terminal below).
+        let released = guard.release(gpu);
+        match stop {
+            Some(VlBatchedStop::Abort) => {
+                // Same canonical rollback + cancelled pair as the per-token loop.
+                vl_cancel_after_rollback(
+                    stdout,
+                    id,
+                    0,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    &mut m.speculator,
+                );
+                return;
+            }
+            Some(VlBatchedStop::Forward(phase, msg)) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    phase,
+                    msg,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
+            // `vl_adaptive_downshift_fail_closed` already rolled back and
+            // emitted the terminal error.
+            Some(VlBatchedStop::Reported) => return,
+            None => {}
+        }
+        if let Err(e) = released {
+            vl_forward_fail(
+                stdout,
+                id,
+                "vl_prefill release",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
+    }
+
+    // Per-token prefill with vision token embedding for image_pad positions
+    // (`HIPFIRE_VL_PREFILL=token`, eviction, MoE / non-batch-admissible
+    // models). We advance m.seq_pos in-loop and call maybe_evict /
+    // maybe_downshift after every committed write. Lazy VMM map/growth
+    // failures and adaptive transition errors are request-scoped (no panic,
+    // no later token emit). Empty when the batched route above already ran.
+    let per_token_prompt: &[u32] = if vl_batched { &[] } else { &prompt_tokens };
     let mut visual_idx = 0usize;
-    for &token in prompt_tokens.iter() {
+    for &token in per_token_prompt.iter() {
         // Client-cancel poll. The encoder phase before this loop cannot be
         // interrupted mid-kernel, so prefill's first iteration is where an
         // abort signalled during vision_forward takes effect. The terminal

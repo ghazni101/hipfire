@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use crate::kernel::{KernelProgram, MemClass};
+use crate::kernel::{CondLowering, Conditional, KernelProgram, MemClass};
 use crate::ResourceId;
 
 /// gfx12 `ACQUIRE_MEM` cache rungs railgun lowers to, ordered by what they
@@ -250,6 +250,14 @@ impl ArchLowering {
     }
 }
 
+/// #867: arches whose compute queue is verified on silicon to honour
+/// `COND_EXEC` (PM4 0x22) for both a set and a clear flag. gfx1151 (GFX11.5)
+/// only: other gfx11 parts are unverified and gfx12 compute `COND_EXEC` has
+/// no hardware receipt, so their conditionals must use the kernel guard.
+pub fn cp_skip_admitted(arch: &str) -> bool {
+    arch == "gfx1151"
+}
+
 /// The parts of a G4 probe cache table (`cache-table.<arch>.json`) the
 /// receipts use.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -322,6 +330,8 @@ pub struct Pm4Plan {
     pub boundaries: Vec<Boundary>,
     /// Boundaries whose visibility each row decided.
     pub rows_used: BTreeMap<Hazard, usize>,
+    /// #867 `CpSkip` conditionals, in node order.
+    pub skips: Vec<Conditional>,
 }
 
 /// One PM4 command of a segment, before packet encoding.
@@ -333,6 +343,14 @@ pub enum Pm4Op {
     Dispatch(usize),
     /// Terminal wait + system acquire (GL2 writeback for the next consumer).
     Exit,
+    /// #867 CP skip opens: `RELEASE_MEM` + `WAIT_REG_MEM` on a lowering-owned
+    /// fence word (every earlier dispatch done, the flag fresh), then
+    /// `COND_EXEC` on the flag resource's first dword. Every command up to
+    /// the matching [`Pm4Op::SkipEnd`] is discarded when it is zero; the
+    /// lowering patches the count there and keeps no register state across
+    /// either edge.
+    SkipBegin(ResourceId),
+    SkipEnd,
 }
 
 /// The HIP→PM4 ownership acquire before a segment's first dispatch.
@@ -371,7 +389,36 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
     // segment: readers before it are covered for WarPreWriter.
     let mut last_system = 0usize;
     let mut segment_start: Option<usize> = None;
+    let skips: Vec<Conditional> = program
+        .conditionals
+        .iter()
+        .filter(|c| c.lowering == CondLowering::CpSkip)
+        .cloned()
+        .collect();
+    // #867: a skipped body emits none of its boundaries, so coverage they
+    // provide must not outlive the body. The epoch state at the body's
+    // entry is kept and joined back at its end (a skipped body is treated as
+    // executed: its own effects stay open).
+    let mut entry_state: Option<(Vec<usize>, HashMap<ResourceId, usize>, usize)> = None;
     for (j, node) in program.nodes.iter().enumerate() {
+        if skips.iter().any(|c| c.body.end == j) {
+            if let Some((was_open, loads, system)) = entry_state.take() {
+                open.extend(was_open);
+                open.sort_unstable();
+                open.dedup();
+                for (resource, i) in loads {
+                    last_vmem_load.entry(resource).or_insert(i);
+                }
+                last_system = last_system.min(system);
+            }
+        }
+        if skips.iter().any(|c| c.body.start == j) {
+            entry_state = Some(if segment_start.is_some() {
+                (open.clone(), last_vmem_load.clone(), last_system)
+            } else {
+                (Vec::new(), HashMap::new(), j)
+            });
+        }
         if !node.lowering.is_pm4() {
             if let Some(first) = segment_start.take() {
                 segments.push(Segment { first, end: j });
@@ -474,6 +521,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
         segments,
         boundaries,
         rows_used,
+        skips,
     }
 }
 
@@ -490,16 +538,24 @@ fn note_loads(
 }
 
 impl Pm4Plan {
-    /// The command sequence of one segment.
+    /// The command sequence of one segment. A `CpSkip` body (all PM4, so
+    /// inside one segment) is bracketed by `SkipBegin`/`SkipEnd`, with its
+    /// first node's boundary inside the skipped range.
     pub fn segment_ops(&self, segment: &Segment) -> Vec<Pm4Op> {
         let mut ops = Vec::with_capacity(2 * (segment.end - segment.first) + 2);
         ops.push(Pm4Op::Entry);
         for node in segment.first..segment.end {
+            if let Some(c) = self.skips.iter().find(|c| c.body.start == node) {
+                ops.push(Pm4Op::SkipBegin(c.flag));
+            }
             let b = &self.boundaries[node];
             if node != segment.first && !b.visibility.is_empty() {
                 ops.push(Pm4Op::Boundary(b.visibility));
             }
             ops.push(Pm4Op::Dispatch(node));
+            if self.skips.iter().any(|c| c.body.end == node + 1) {
+                ops.push(Pm4Op::SkipEnd);
+            }
         }
         ops.push(Pm4Op::Exit);
         ops
@@ -517,6 +573,15 @@ impl Pm4Plan {
         }
         c.segments = self.segments.len();
         c
+    }
+
+    /// True when one segment spans nodes `0..nodes` and nothing else: the
+    /// "one segment" shape of a `Whole16` window (design A §2, slice A1).
+    pub fn is_single_segment(&self, nodes: usize) -> bool {
+        matches!(
+            self.segments.as_slice(),
+            [only] if only.first == 0 && only.end == nodes
+        )
     }
 }
 
@@ -741,6 +806,69 @@ mod tests {
         assert_eq!(
             p.segment_ops(&p.segments[1]),
             [Pm4Op::Entry, Pm4Op::Dispatch(2), Pm4Op::Exit]
+        );
+    }
+
+    /// n0 stores A; n1 (the body, flag C) loads A, so its boundary waits and
+    /// closes n0's epoch, and stores B; n2 stores A. Executed, n2 orders only
+    /// against n1's load (WAR). Skipped, n1's boundary never ran: n2 must
+    /// still order against n0 (WAW).
+    #[test]
+    fn a_cp_skipped_body_covers_no_edge_that_crosses_it() {
+        let (a, b, c) = (0x7000_0000u64, 0x7100_0000u64, 0x7200_0000u64);
+        let launches = vec![
+            launch(&[(8, a)], 16, vec![ptr(8, &[VmemStore])]),
+            launch(
+                &[(0, a), (8, b), (16, c)],
+                24,
+                vec![
+                    ptr(0, &[VmemLoad]),
+                    ptr(8, &[VmemStore]),
+                    ptr(16, &[VmemLoad]),
+                ],
+            ),
+            launch(&[(8, a)], 16, vec![ptr(8, &[VmemStore])]),
+        ];
+        let table = CacheTable::for_arch("gfx1201").unwrap();
+        let mut program = author("gfx1151", &launches);
+        let plain = plan(&program, &table, RowPolicy::TierD);
+        let flag = program.nodes[1].effects[2].resource;
+        program
+            .add_conditional(Conditional {
+                flag,
+                body: 1..2,
+                lowering: CondLowering::CpSkip,
+            })
+            .unwrap();
+        let skipped = plan(&program, &table, RowPolicy::TierD);
+        let producers = |p: &Pm4Plan| {
+            let mut v: Vec<_> = p.boundaries[2]
+                .edges
+                .iter()
+                .map(|e| (e.hazard, e.producer))
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(!producers(&plain).contains(&(Hazard::Waw, 0)));
+        assert!(producers(&skipped).contains(&(Hazard::Waw, 0)));
+        assert!(
+            producers(&skipped).contains(&(Hazard::War, 1)),
+            "the body stays executed"
+        );
+        assert_eq!(
+            skipped.segment_ops(&skipped.segments[0]),
+            [
+                Pm4Op::Entry,
+                Pm4Op::Dispatch(0),
+                Pm4Op::SkipBegin(flag),
+                Pm4Op::Boundary(skipped.boundaries[1].visibility),
+                Pm4Op::Dispatch(1),
+                Pm4Op::SkipEnd,
+                Pm4Op::Boundary(skipped.boundaries[2].visibility),
+                Pm4Op::Dispatch(2),
+                Pm4Op::Exit,
+            ]
         );
     }
 }

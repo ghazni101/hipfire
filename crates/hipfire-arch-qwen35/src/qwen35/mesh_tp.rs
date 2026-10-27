@@ -9,7 +9,8 @@
 //! DeltaNet key and value heads) and of the FFN intermediate
 //! ([`tp_rank_layouts`], the hand route's `dense_tp_rank_layouts` restricted
 //! to even splits). The split plan ([`qwen35_tp_plan`]) runs the embedding
-//! and the head replicated. Per layer the mixer (`SplitRule::HeadMixer`)
+//! replicated and the head on rank 0 only (`Pin(Output)`). Per layer the
+//! mixer (`SplitRule::HeadMixer`)
 //! writes this rank's output-projection partial into
 //! [`QWEN35_MIX_OUT_RESOURCE`] and the FFN (`SplitRule::GatedMlp`, `Product`
 //! ladder) into [`QWEN35_FFN_OUT_RESOURCE`]; the residual `Accumulate` after
@@ -22,6 +23,19 @@
 //! the decode scratch, a prefill epoch over up to `max_batch` tokens on the
 //! rank's batch scratch (the logits are the last row's). Sessions,
 //! checkpoints and prefix repair are refused until they are implemented.
+//!
+//! Decode and prefill epochs run plain launches through the executor. TP2
+//! decode on an exact gfx1201 or gfx1100 pair, where the runtime admits the
+//! hand route's whole-token graph (`HIPFIRE_TP_FULL_GRAPH`, peer access and
+//! the load-time signal tape of `Gpus::prepare_tp2_whole_token_graph`), runs
+//! one graph per rank ([`Qwen35TpProgram::run_epoch`]): the embeds run
+//! eagerly first, the executor submission of the rest is captured on both
+//! ranks (collectives included, as signal-barrier reductions: the decode
+//! partials alternate two slots, `BoundaryIo::partial_slot`) or run direct
+//! on the warmup token, and every later token replays the graphs and does
+//! only the epoch's host bookkeeping. There are no per-segment graphs:
+//! they measured slower than eager at TP4 on gfx1201 (45.99 vs 51.13 tok/s,
+//! Qwen3.8-27B), so TP>2 decodes eager.
 
 use super::batch::PrefillBatchScratch;
 use super::config::{dense_tp_rank_layouts, DenseTpRankLayout, LayerType, Qwen35Config};
@@ -49,10 +63,12 @@ use hipfire_runtime::mesh_split::{
 };
 use hipfire_runtime::multi_gpu::executor::{
     BoundaryIo, ForwardEpoch, MeshCheckpointId, MeshCheckpointKey, MeshRoute, MeshStepBindings,
+    MeshTicket,
 };
 use hipfire_runtime::multi_gpu::transport::EdgeDescriptor;
+use hipfire_runtime::multi_gpu::{Gpus, TpGraphStep};
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
-use hipfire_runtime::weight_manifest::{plan_manifest, ShardPolicy, WeightEntry};
+use hipfire_runtime::weight_manifest::{plan_manifest, PinTarget, ShardPolicy, WeightEntry};
 use rdna_compute::{DType, Gpu};
 
 type Result<T, E = String> = std::result::Result<T, E>;
@@ -81,7 +97,7 @@ enum TpOp {
     /// `x += mix_out` or `x += ffn_out`; replaced by the `AllReduceAdd` on a
     /// TP mesh.
     Residual,
-    /// Final norm and LM head into the logits.
+    /// Final norm and LM head into the logits, on rank 0 (`Pin(Output)`) only.
     Head,
 }
 
@@ -312,6 +328,28 @@ fn tp_program(
             &[x],
         )?;
     }
+    // The head runs on the rank that owns `Pin(Output)` (rank 0 of a pure TP
+    // mesh) and nowhere else: the serve loop reads rank 0's logits only, and
+    // the hand route also runs the head on rank 0 alone. The model-level
+    // weights are declared for placement only (the ranks load them whole);
+    // the plan never consults their dtype.
+    let mut head_weights = [
+        ("output_norm", vec![dim]),
+        ("lm_head", vec![config.vocab_size, dim]),
+    ]
+    .into_iter()
+    .map(|(name, shape)| {
+        let class = ResourceClass::Weight {
+            name: name.to_string(),
+            layer: None,
+            group: 1,
+        };
+        let id = resource(&mut graph, class, &shape)?;
+        let policy = ShardPolicy::Pin(PinTarget::Output);
+        entries.push(WeightEntry::model(name, shape, DType::F16, policy));
+        Ok::<_, String>(id)
+    });
+    let (norm_w, head_w) = (head_weights.next().unwrap()?, head_weights.next().unwrap()?);
     op(
         &mut graph,
         &mut ops,
@@ -319,7 +357,7 @@ fn tp_program(
         OpKind::Gemv,
         None,
         SplitRule::RowComplete,
-        &[x],
+        &[x, norm_w, head_w],
         &[logits],
     )?;
     Ok((graph, ops, entries))
@@ -371,6 +409,18 @@ pub fn qwen35_tp_plan(
     split_program(&graph, &plan, mesh).map_err(|error| format!("Qwen3.5 TP split: {error}"))
 }
 
+/// [`qwen35_tp_plan`] of the shards `ranks` hold on the pure TP `mesh`.
+pub fn qwen35_tp_plan_for_ranks(
+    config: &Qwen35Config,
+    ranks: &[Qwen35TpRank],
+    mesh: &DeviceMesh,
+) -> Result<SplitPlan> {
+    let first = ranks
+        .first()
+        .ok_or("Qwen3.5 TP plan needs at least one rank")?;
+    qwen35_tp_plan(config, &layer_dtypes(&first.weights)?, mesh)
+}
+
 /// Per layer, the payload dtypes of the declared weights in [`tp_program`]
 /// order: the mixer projections, then gate/up/down.
 pub fn layer_dtypes(weights: &Qwen35Weights) -> Result<Vec<Vec<DType>>> {
@@ -415,6 +465,8 @@ pub struct Qwen35TpRank {
     partial: rdna_compute::GpuTensor,
     /// Tokens committed so far.
     position: usize,
+    /// Decode epochs by graph mode.
+    graph_steps: GraphSteps,
 }
 
 impl Qwen35TpRank {
@@ -431,6 +483,7 @@ impl Qwen35TpRank {
         rank: usize,
         parts: usize,
         kv_mode: hipfire_runtime::kv_mode::KvMode,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend,
         state: super::weights::StateQuant,
         max_seq: usize,
         max_batch: usize,
@@ -469,8 +522,9 @@ impl Qwen35TpRank {
                 max_seq,
                 physical_cap: Some(max_seq),
             };
-            kv = Some(<llama::KvCache as KvCacheExt>::from_mode(
+            kv = Some(<llama::KvCache as KvCacheExt>::from_mode_with_backend(
                 kv_mode,
+                kv_backend,
                 KvTarget::Single(gpu),
                 &dims,
             )?);
@@ -487,6 +541,7 @@ impl Qwen35TpRank {
                 pbs: pbs.take().expect("allocated"),
                 partial: partial.take().expect("allocated"),
                 position: 0,
+                graph_steps: GraphSteps::default(),
             }),
             Err(error) => {
                 if let Some(kv) = kv {
@@ -519,6 +574,27 @@ impl Qwen35TpRank {
         self.position
     }
 
+    /// The most rows one prefill epoch may carry (the batch scratch).
+    pub fn max_batch(&self) -> usize {
+        self.pbs.max_batch
+    }
+
+    /// Forget every committed token: DeltaNet state, KV offset and position
+    /// back to zero. The KV contents stay (positions are rewritten).
+    pub fn reset(&mut self, gpu: &mut Gpu) -> Result<()> {
+        gpu.bind_thread().map_err(|e| e.to_string())?;
+        self.dn.reset(gpu).map_err(|error| error.to_string())?;
+        self.kv.compact_offset = 0;
+        self.position = 0;
+        Ok(())
+    }
+
+    /// Zero the KV cache on the device.
+    pub fn clear_kv(&mut self, gpu: &mut Gpu) -> Result<()> {
+        gpu.bind_thread().map_err(|e| e.to_string())?;
+        self.kv.clear_gpu(gpu).map_err(|e| e.to_string())
+    }
+
     /// Free everything the rank holds on `gpu`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.bind_thread();
@@ -532,22 +608,19 @@ impl Qwen35TpRank {
     }
 }
 
-/// One epoch adapter over the TP ranks (rank `i` on device `i`): borrows the
-/// ranks and the plan they were validated against, never a GPU.
-pub struct Qwen35TpBindings<'a> {
-    ranks: &'a mut [Qwen35TpRank],
-    plan: &'a SplitPlan,
+/// The validated, per-load part of the TP program: the op list, each rank's
+/// segments between collectives and the TP group epoch. Built once by
+/// [`Self::new`] (which derives and compares the split plan) so binding it to
+/// the ranks each epoch ([`Qwen35TpBindings::new`]) costs one cursor
+/// allocation.
+pub struct Qwen35TpProgram {
     ops: Vec<TpOp>,
     /// Per rank, the op ranges of its program between collectives.
     segments: Vec<Vec<std::ops::Range<u32>>>,
-    /// Per rank, the next segment to run.
-    cursor: Vec<usize>,
-    tokens: &'a [u32],
     tp_epoch: u64,
-    prepared: Option<ForwardEpoch>,
 }
 
-impl<'a> Qwen35TpBindings<'a> {
+impl Qwen35TpProgram {
     /// Validate before any submission: two or more ranks of one global config,
     /// rank `i` loaded (by [`Qwen35TpRank::load`]) as the `i`-th even head
     /// and FFN block ([`tp_rank_layouts`]), one weight dtype set, and `plan`
@@ -555,8 +628,8 @@ impl<'a> Qwen35TpBindings<'a> {
     /// `Gpus::mesh_tp_epoch()`.
     pub fn new(
         global: &Qwen35Config,
-        ranks: &'a mut [Qwen35TpRank],
-        plan: &'a SplitPlan,
+        ranks: &[Qwen35TpRank],
+        plan: &SplitPlan,
         tp_epoch: u64,
     ) -> Result<Self> {
         let parts = ranks.len();
@@ -579,7 +652,7 @@ impl<'a> Qwen35TpBindings<'a> {
         if expected.ranks != plan.ranks || expected.collectives != plan.collectives {
             return Err("Qwen3.5 TP plan is not the plan of these shards".into());
         }
-        let segments = plan
+        let segments: Vec<Vec<std::ops::Range<u32>>> = plan
             .ranks
             .iter()
             .map(|rank| {
@@ -603,21 +676,295 @@ impl<'a> Qwen35TpBindings<'a> {
             })
             .collect();
         Ok(Self {
-            ranks,
-            plan,
             ops,
             segments,
-            cursor: vec![0; parts],
-            tokens: &[],
             tp_epoch,
-            prepared: None,
         })
+    }
+
+    /// Run `epoch` (`tokens` as its route's rows) on `ranks` and ENQUEUE it:
+    /// nothing waits on a device. Returns the executor ticket of every
+    /// submitted epoch (eager, and whole-token direct/captured) and `None` for
+    /// a replayed whole-token graph (no submission, nothing outstanding). The
+    /// caller owns the tickets and must drain them together with
+    /// `Gpus::drain_mesh_epochs` (oldest first) before another request. The
+    /// one entry point of the serve loop and the hardware test.
+    ///
+    /// A decode epoch on exactly two ranks takes the whole-token graph of the
+    /// hand route (`Gpus::tp2_whole_token_graph_forward`) when the runtime
+    /// admits it (`Gpus::tp2_whole_token_graph_ready`) and every rank may use
+    /// graphs ([`graphs_enabled`]). Any other epoch is submitted through the
+    /// executor as plain launches ([`Qwen35TpBindings::run_ops`]).
+    pub fn run_epoch(
+        &self,
+        gpus: &mut Gpus,
+        ranks: &mut [Qwen35TpRank],
+        plan: &SplitPlan,
+        epoch: &ForwardEpoch,
+        tokens: &[u32],
+    ) -> Result<Option<MeshTicket>> {
+        if Self::whole_token_admitted(gpus, ranks, plan, epoch) {
+            return self.run_whole_token_epoch(gpus, ranks, plan, epoch, tokens);
+        }
+        let mut bindings = Qwen35TpBindings::new(self, ranks, plan);
+        bindings.set_tokens(tokens);
+        let ticket = gpus.submit_mesh_epoch(plan, epoch, &mut bindings)?;
+        drop(bindings);
+        Ok(Some(ticket))
+    }
+
+    /// Whether `epoch` runs on the TP2 whole-token graph: decode on two ranks
+    /// on two devices that may use graphs, with the runtime's load-time
+    /// preparation for one barrier per collective of `plan`.
+    fn whole_token_admitted(
+        gpus: &Gpus,
+        ranks: &[Qwen35TpRank],
+        plan: &SplitPlan,
+        epoch: &ForwardEpoch,
+    ) -> bool {
+        epoch.route == MeshRoute::Decode
+            && ranks.len() == 2
+            && gpus.devices.len() == 2
+            && ranks
+                .iter()
+                .zip(&gpus.devices)
+                .all(|(rank, gpu)| graphs_enabled(rank, gpu))
+            && gpus.tp2_whole_token_graph_ready(plan.collectives.len())
+    }
+
+    /// One decode epoch on the TP2 whole-token graph. The embeds run
+    /// eagerly first (they upload host data, which never enters a graph).
+    /// `tp2_whole_token_graph_forward` then runs the epoch's executor
+    /// submission without the embeds and without per-segment graphs, as a
+    /// direct warmup token or captured on both ranks, and launches the
+    /// graphs; a captured or direct epoch returns its ticket undrained, a replayed one (whose
+    /// submission never ran) does its epoch bookkeeping by hand.
+    fn run_whole_token_epoch(
+        &self,
+        gpus: &mut Gpus,
+        ranks: &mut [Qwen35TpRank],
+        plan: &SplitPlan,
+        epoch: &ForwardEpoch,
+        tokens: &[u32],
+    ) -> Result<Option<MeshTicket>> {
+        // Everything a submission refuses before its first enqueue is refused
+        // here, before any device work: a replay never reaches the executor's
+        // admission or `prepare_epoch`, and the embeds cannot be taken back.
+        validate_epoch(ranks, self.segments.len(), epoch, tokens)?;
+        gpus.admit_mesh_epoch(epoch)?;
+        for (owner, rank) in ranks.iter_mut().enumerate() {
+            let gpu = &mut gpus.devices[owner];
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            Qwen35TpBindings::run_op(rank, gpu, TpOp::Embed, epoch, tokens)?;
+        }
+        let barriers = plan.collectives.len();
+        let mut ticket = None;
+        let mut refusal = None;
+        let step = gpus.tp2_whole_token_graph_forward(barriers, |gpus| {
+            let mut bindings = Qwen35TpBindings::new(self, &mut *ranks, plan);
+            bindings.embedded_whole_token();
+            bindings.set_tokens(tokens);
+            match gpus.submit_mesh_epoch(plan, epoch, &mut bindings) {
+                Ok(issued) => {
+                    ticket = Some(issued);
+                    Ok(())
+                }
+                Err(error) => {
+                    let failure = hip_bridge::HipError::new(0, &error);
+                    refusal = Some(error);
+                    Err(failure)
+                }
+            }
+        });
+        let step = match step {
+            Ok(step) => step,
+            Err(error) => {
+                gpus.abort_rank_graph_captures();
+                if let Some(ticket) = ticket {
+                    // Retire the epoch the failed step issued; the error below
+                    // is the step's.
+                    let _ = gpus.drain_mesh_epoch(ticket);
+                }
+                return Err(refusal
+                    .unwrap_or_else(|| format!("Qwen3.5 TP whole-token graph step: {error}")));
+            }
+        };
+        let issued = match (step, ticket) {
+            (TpGraphStep::Direct | TpGraphStep::Captured, Some(ticket)) => Some(ticket),
+            // The closure did not run: nothing was submitted, so the ranks'
+            // `apply_rank_marks` bookkeeping is done here.
+            (TpGraphStep::Replayed, None) => {
+                for rank in ranks.iter_mut() {
+                    commit_rank_epoch(rank, epoch)?;
+                }
+                None
+            }
+            _ => {
+                gpus.abort_rank_graph_captures();
+                return Err(
+                    "Qwen3.5 TP whole-token graph step disagrees with its submission".into(),
+                );
+            }
+        };
+        for rank in ranks.iter_mut() {
+            let steps = &mut rank.graph_steps;
+            match step {
+                TpGraphStep::Direct => steps.whole_direct += 1,
+                TpGraphStep::Captured => steps.whole_capture += 1,
+                TpGraphStep::Replayed => steps.whole_replay += 1,
+            }
+        }
+        if ar_graph_trace_enabled() {
+            match step {
+                TpGraphStep::Captured => eprintln!(
+                    "[qwen-mesh-tp-graph] whole-token tp=2 captured barriers={barriers} pos={}",
+                    epoch.start_position
+                ),
+                TpGraphStep::Replayed => eprintln!(
+                    "[qwen-mesh-tp-graph] whole-token tp=2 replay barriers={barriers} pos={}",
+                    epoch.start_position
+                ),
+                TpGraphStep::Direct => {}
+            }
+        }
+        Ok(issued)
+    }
+}
+
+/// Per-rank counts of TP2 whole-token graph decode epochs, for the hardware
+/// test: direct warmup, capture and replay.
+#[derive(Clone, Copy, Debug, Default)]
+struct GraphSteps {
+    whole_direct: u64,
+    whole_capture: u64,
+    whole_replay: u64,
+}
+
+/// `HIPFIRE_AR_GRAPH_TRACE=1`, as the hand route's graph trace.
+fn ar_graph_trace_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_AR_GRAPH_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    *ENABLED
+}
+
+/// Whether a decode epoch of `rank` on `gpu` may use graphs: the hand
+/// route's `dense_tp_graph_enabled` for one rank (no KV eviction offset, AR
+/// graphs and forward graphs on, gfx11/gfx12 by default) with a launch
+/// stream.
+fn graphs_enabled(rank: &Qwen35TpRank, gpu: &Gpu) -> bool {
+    let arch_default = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+    rank.kv.compact_offset == 0
+        && gpu.active_stream.is_some()
+        && gpu.flags.graph_ar
+        && gpu.flags.graph_forward.unwrap_or(arch_default)
+}
+
+/// The host-side admission of `epoch` over `tokens` on `ranks` of a program
+/// built for `program_ranks` ranks: single-token decode or a prefill chunk
+/// within every rank's batch scratch, `tokens` as long as the rows, and every
+/// rank at the epoch's start position with KV room for the rows. Shared by
+/// `prepare_epoch` and the whole-token path, which must refuse before its
+/// embeds and its replay.
+fn validate_epoch(
+    ranks: &[Qwen35TpRank],
+    program_ranks: usize,
+    epoch: &ForwardEpoch,
+    tokens: &[u32],
+) -> Result<()> {
+    let rows = epoch.actual_rows;
+    if ranks.len() != program_ranks {
+        return Err("Qwen3.5 TP program was built for another number of ranks".into());
+    }
+    let admitted = match epoch.route {
+        MeshRoute::Decode => rows == 1,
+        MeshRoute::Prefill => rows >= 1 && ranks.iter().all(|rank| rows <= rank.pbs.max_batch),
+        _ => false,
+    };
+    if !admitted || epoch.route_rows != rows {
+        return Err(format!(
+            "Qwen3.5 TP admits single-token decode and prefill epochs within the batch \
+             scratch only, got {:?} over {rows} rows",
+            epoch.route
+        ));
+    }
+    if tokens.len() != rows {
+        return Err("Qwen3.5 TP epoch tokens disagree with its rows".into());
+    }
+    for rank in ranks {
+        let end = rank.position.checked_add(rows);
+        if rank.position != epoch.start_position || end.is_none_or(|end| end > rank.kv.physical_cap)
+        {
+            return Err("Qwen3.5 TP rank position or KV capacity disagrees".into());
+        }
+    }
+    Ok(())
+}
+
+/// A rank's epoch bookkeeping once its program ran (`apply_rank_marks`) or,
+/// for a replayed whole-token graph, was launched.
+fn commit_rank_epoch(rank: &mut Qwen35TpRank, epoch: &ForwardEpoch) -> Result<()> {
+    if rank.position != epoch.start_position {
+        return Err("Qwen3.5 TP rank position moved during the epoch".into());
+    }
+    rank.position += epoch.actual_rows;
+    Ok(())
+}
+
+/// One epoch adapter over the TP ranks (rank `i` on device `i`): borrows the
+/// ranks, the validated program and the plan it was validated against, never
+/// a GPU.
+pub struct Qwen35TpBindings<'a> {
+    ranks: &'a mut [Qwen35TpRank],
+    plan: &'a SplitPlan,
+    ops: &'a [TpOp],
+    segments: &'a [Vec<std::ops::Range<u32>>],
+    /// Per rank, the next segment to run.
+    cursor: Vec<usize>,
+    tokens: &'a [u32],
+    tp_epoch: u64,
+    prepared: Option<ForwardEpoch>,
+    /// The embeds already ran outside the whole-token graph this epoch runs
+    /// in ([`Self::embedded_whole_token`]).
+    embedded: bool,
+}
+
+impl<'a> Qwen35TpBindings<'a> {
+    /// Bind `program` (built by [`Qwen35TpProgram::new`] from these `ranks`
+    /// and this `plan`) to the ranks for one epoch.
+    pub fn new(
+        program: &'a Qwen35TpProgram,
+        ranks: &'a mut [Qwen35TpRank],
+        plan: &'a SplitPlan,
+    ) -> Self {
+        Self {
+            cursor: vec![0; ranks.len()],
+            ranks,
+            plan,
+            ops: &program.ops,
+            segments: &program.segments,
+            tokens: &[],
+            tp_epoch: program.tp_epoch,
+            prepared: None,
+            embedded: false,
+        }
     }
 
     /// The tokens of the next epoch: one for decode, the prompt chunk for
     /// prefill.
     pub fn set_tokens(&mut self, tokens: &'a [u32]) {
         self.tokens = tokens;
+        self.prepared = None;
+    }
+
+    /// The next epoch runs inside the TP2 whole-token graph
+    /// ([`Qwen35TpProgram::run_epoch`]), whose caller already ran every rank's
+    /// embeds: each rank's segments run as plain launches that skip them.
+    fn embedded_whole_token(&mut self) {
+        self.embedded = true;
         self.prepared = None;
     }
 
@@ -810,32 +1157,7 @@ impl<'a> Qwen35TpBindings<'a> {
 impl MeshStepBindings for Qwen35TpBindings<'_> {
     fn prepare_epoch(&mut self, epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
-        let rows = epoch.actual_rows;
-        let admitted = match epoch.route {
-            MeshRoute::Decode => rows == 1,
-            MeshRoute::Prefill => {
-                rows >= 1 && self.ranks.iter().all(|rank| rows <= rank.pbs.max_batch)
-            }
-            _ => false,
-        };
-        if !admitted || epoch.route_rows != rows {
-            return Err(format!(
-                "Qwen3.5 TP admits single-token decode and prefill epochs within the batch \
-                 scratch only, got {:?} over {rows} rows",
-                epoch.route
-            ));
-        }
-        if self.tokens.len() != rows {
-            return Err("Qwen3.5 TP epoch tokens disagree with its rows".into());
-        }
-        for rank in self.ranks.iter() {
-            let end = rank.position.checked_add(rows);
-            if rank.position != epoch.start_position
-                || end.is_none_or(|end| end > rank.kv.physical_cap)
-            {
-                return Err("Qwen3.5 TP rank position or KV capacity disagrees".into());
-            }
-        }
+        validate_epoch(self.ranks, self.segments.len(), epoch, self.tokens)?;
         self.cursor.fill(0);
         self.prepared = Some(*epoch);
         Ok(())
@@ -849,19 +1171,28 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
         ops: &[OpId],
     ) -> Result<()> {
         self.require_prepared(epoch)?;
+        let index = *self
+            .cursor
+            .get(owner)
+            .ok_or("Qwen3.5 TP rank ran past its program")?;
         let segment = self
             .segments
             .get(owner)
-            .and_then(|segments| segments.get(self.cursor[owner]))
+            .and_then(|segments| segments.get(index))
             .ok_or("Qwen3.5 TP rank ran past its program")?;
         if !ops.iter().map(|op| op.0).eq(segment.clone()) {
             return Err("Qwen3.5 TP segment does not continue its rank program in order".into());
         }
+        let rank = &mut self.ranks[owner];
+        let (table, tokens) = (self.ops, self.tokens);
         for op in ops {
-            let op = self.ops[op.0 as usize];
-            Self::run_op(&mut self.ranks[owner], gpu, op, epoch, self.tokens)?;
+            let op = table[op.0 as usize];
+            // Inside the whole-token graph the embeds already ran.
+            if !(self.embedded && op == TpOp::Embed) {
+                Self::run_op(rank, gpu, op, epoch, tokens)?;
+            }
         }
-        self.cursor[owner] += 1;
+        self.cursor[owner] = index + 1;
         Ok(())
     }
 
@@ -881,11 +1212,15 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
         let rows = epoch.actual_rows;
         let bytes = rows * rank.config.dim * std::mem::size_of::<f32>();
         let s = &rank.scratch;
-        let (view, into) = match (epoch.route, collective.operand) {
-            (MeshRoute::Decode, QWEN35_MIX_OUT_RESOURCE) => (&s.o, &s.x),
-            (MeshRoute::Decode, QWEN35_FFN_OUT_RESOURCE) => (&s.ffn_out, &s.x),
+        // Decode alternates two distinct partial buffers, the hand route's
+        // slots 0 (mixer) and 1 (FFN): the TP2 reduction takes the alternating
+        // direct-peer protocol, which the whole-token graph captures. Prefill
+        // reuses one partial buffer for every collective.
+        let (view, into, partial_slot) = match (epoch.route, collective.operand) {
+            (MeshRoute::Decode, QWEN35_MIX_OUT_RESOURCE) => (&s.o, &s.x, Some(0)),
+            (MeshRoute::Decode, QWEN35_FFN_OUT_RESOURCE) => (&s.ffn_out, &s.x, Some(1)),
             (MeshRoute::Prefill, QWEN35_MIX_OUT_RESOURCE | QWEN35_FFN_OUT_RESOURCE) => {
-                (&rank.partial, &rank.pbs.x_batch)
+                (&rank.partial, &rank.pbs.x_batch, None)
             }
             _ => return Err("Qwen3.5 TP collective operand is not a mixer or FFN partial".into()),
         };
@@ -899,6 +1234,7 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
                 dtype_bytes: 4,
                 bytes,
             },
+            partial_slot,
         })
     }
 
@@ -907,21 +1243,13 @@ impl MeshStepBindings for Qwen35TpBindings<'_> {
         if self.cursor.get(owner) != self.segments.get(owner).map(Vec::len).as_ref() {
             return Err("Qwen3.5 TP rank did not run its whole program".into());
         }
-        let rank = &mut self.ranks[owner];
-        if rank.position != epoch.start_position {
-            return Err("Qwen3.5 TP rank position moved during the epoch".into());
-        }
-        rank.position += epoch.actual_rows;
-        Ok(())
+        commit_rank_epoch(&mut self.ranks[owner], epoch)
     }
 
     fn reset_rank(&mut self, owner: usize, gpu: &mut Gpu, _epoch: &ForwardEpoch) -> Result<()> {
         self.prepared = None;
         let rank = self.ranks.get_mut(owner).ok_or("unknown Qwen3.5 TP rank")?;
-        rank.dn.reset(gpu).map_err(|error| error.to_string())?;
-        rank.kv.compact_offset = 0;
-        rank.position = 0;
-        Ok(())
+        rank.reset(gpu)
     }
 
     /// Refused before the first callback, so the mesh stays healthy.
@@ -1038,10 +1366,10 @@ mod tests {
             .collect()
     }
 
-    /// Every rank runs the whole program except the residual adds; each
-    /// layer's mixer partial and then its FFN partial are added into `x` by
-    /// one rank-ordered `AllReduceAdd` each, replacing the residual op that
-    /// follows the producer.
+    /// Every rank runs the whole program except the residual adds and the
+    /// head, which only rank 0 runs; each layer's mixer partial and then its
+    /// FFN partial are added into `x` by one rank-ordered `AllReduceAdd`
+    /// each, replacing the residual op that follows the producer.
     #[test]
     fn tp_plan_adds_each_mixer_and_ffn_partial_into_the_residual() {
         let config = dense_config(0);
@@ -1080,8 +1408,17 @@ mod tests {
                 expected.push(RankItem::Collective(c.id));
                 next += 1;
             }
+            // The head is pinned to rank 0 (`Pin(Output)`): the last op runs
+            // there and on no other rank.
+            let head = expected.pop().unwrap();
+            assert_eq!(head, RankItem::Op(OpId(ops.len() as u32 - 1)));
+            assert_eq!(ops.last(), Some(&TpOp::Head));
             for rank in &plan.ranks {
-                assert_eq!(rank.items, expected, "rank {}", rank.device);
+                let mut want = expected.clone();
+                if rank.device == 0 {
+                    want.push(head.clone());
+                }
+                assert_eq!(rank.items, want, "rank {}", rank.device);
             }
             for (rank, layout) in tp_rank_layouts(&config, parts).unwrap().iter().enumerate() {
                 let block = |n: usize| rank * n / parts..(rank + 1) * n / parts;
@@ -1180,7 +1517,11 @@ mod hw_tests {
     ) -> Qwen35TpRank {
         let (kv, state) = (KvMode::Q8, StateQuant::Q8);
         let (max_seq, chunk) = (shape.max_seq, shape.chunk);
-        Qwen35TpRank::load(hfq, global, gpu, rank, parts, kv, state, max_seq, chunk).unwrap()
+        let backend = hipfire_runtime::kv_backend::KvBackend::Legacy;
+        Qwen35TpRank::load(
+            hfq, global, gpu, rank, parts, kv, backend, state, max_seq, chunk,
+        )
+        .unwrap()
     }
 
     fn free_rank(rank: Qwen35TpRank, gpu: &mut Gpu) {
@@ -1352,6 +1693,11 @@ mod hw_tests {
                 dns.push(DeltaNetState::new_with_quant(gpu, config, StateQuant::Q8).unwrap());
             }
             if gpus.can_access_peer_all().unwrap() {
+                // As the hand loader: the TP2 whole-token graph's signal tape
+                // and payload exchange before peer access is enabled (a no-op
+                // unless the runtime admits the graph).
+                gpus.prepare_tp2_whole_token_graph(global.n_layers * 2, dim * 4)
+                    .unwrap();
                 assert!(gpus.enable_peer_all().unwrap());
             }
             let (w, c, sc) = (&weights, &configs, &scratches);
@@ -1378,6 +1724,11 @@ mod hw_tests {
                 w.free_gpu(gpu);
                 gpu.drain_pool();
             }
+            for gpu in &mut gpus.devices {
+                gpu.bind_thread().unwrap();
+                gpu.invalidate_graph_state();
+            }
+            gpus.free_tp_graph_signals().unwrap();
             rows
         };
 
@@ -1406,22 +1757,43 @@ mod hw_tests {
         };
         let max_bytes = (chunk * dim * std::mem::size_of::<f32>()).next_multiple_of(16);
         let placement = BandPlacement::uniform(&tp_mesh, 1).unwrap();
+        // As the loader: the TP2 whole-token graph preparation before the
+        // provisioning enables peer access.
+        if gpus.can_access_peer_all().unwrap() {
+            gpus.prepare_tp2_whole_token_graph(global.n_layers * 2, dim * 4)
+                .unwrap();
+        }
         gpus.provision_mesh_edges(&admitted, &placement, max_bytes)
             .unwrap();
         let mut ranks: Vec<_> = (0..parts)
             .map(|r| load_rank(&mut hfq, &global, &mut gpus.devices[r], r, parts, shape))
             .collect();
-        let dtypes = layer_dtypes(&ranks[0].weights).unwrap();
-        let tp_plan = qwen35_tp_plan(&global, &dtypes, &tp_mesh).unwrap();
+        // And peer access once the ranks' buffers exist (idempotent after the
+        // provisioning's qualification); the TP2 reduction needs the flag.
+        if gpus.mesh_tp_transport() == Some("peer") {
+            gpus.enable_peer_all().unwrap();
+        }
+        let tp_plan = qwen35_tp_plan_for_ranks(&global, &ranks, &tp_mesh).unwrap();
         let tp_epoch = gpus.mesh_tp_epoch().unwrap();
+        // A rank set out of order is refused by the program, before any epoch.
+        ranks.swap(0, 1);
+        let error = Qwen35TpProgram::new(&global, &ranks, &tp_plan, tp_epoch)
+            .err()
+            .expect("ranks out of order");
+        assert!(error.contains("was not loaded as rank"), "{error}");
+        ranks.swap(0, 1);
+        let error = Qwen35TpProgram::new(&global, &ranks, &tp_plan, 0)
+            .err()
+            .expect("no TP group epoch");
+        assert!(error.contains("provisioned TP group"), "{error}");
+        let program = Qwen35TpProgram::new(&global, &ranks, &tp_plan, tp_epoch).unwrap();
         // Refusals before any launch, leaving every rank at position 0 and
         // the mesh healthy: a prefill epoch past the batch scratch, an epoch
         // whose tokens disagree with its rows, session capture and prefix
         // repair.
         {
             let long = vec![prompt[0]; chunk + 1];
-            let mut bindings =
-                Qwen35TpBindings::new(&global, &mut ranks, &tp_plan, tp_epoch).unwrap();
+            let mut bindings = Qwen35TpBindings::new(&program, &mut ranks, &tp_plan);
             bindings.set_tokens(&long);
             let e = epoch(&tp_mesh, 1, MeshRoute::Prefill, 0, chunk + 1);
             let error = gpus
@@ -1450,30 +1822,58 @@ mod hw_tests {
             "a refusal quarantined the mesh"
         );
         assert!(ranks.iter().all(|rank| rank.position == 0));
+        let decode = epoch(&tp_mesh, 0, MeshRoute::Decode, 0, 1);
+        let whole_token = Qwen35TpProgram::whole_token_admitted(&gpus, &ranks, &tp_plan, &decode);
+        eprintln!("TP{parts} whole-token graph admitted: {whole_token}");
         let mut op_id = 1;
         let tp_rows = rows_of(&prompt, chunk, &forced, |tokens, route, start| {
             op_id += 1;
-            let mut bindings =
-                Qwen35TpBindings::new(&global, &mut ranks, &tp_plan, tp_epoch).unwrap();
-            bindings.set_tokens(tokens);
             let e = epoch(&tp_mesh, op_id, route, start, tokens.len());
-            let ticket = gpus.submit_mesh_epoch(&tp_plan, &e, &mut bindings).unwrap();
-            drop(bindings);
-            gpus.drain_mesh_epoch(ticket).unwrap();
-            let rows: Vec<_> = gpus
-                .devices
-                .iter()
-                .zip(&ranks)
-                .map(|(gpu, r)| download(gpu, &r.scratch.logits, vocab))
-                .collect();
-            assert!(rows.iter().all(|row| row == &rows[0]), "TP ranks disagree");
-            rows[0].clone()
+            let ticket = program
+                .run_epoch(&mut gpus, &mut ranks, &tp_plan, &e, tokens)
+                .unwrap();
+            if let Some(ticket) = ticket {
+                gpus.drain_mesh_epoch(ticket).unwrap();
+            }
+            // Only rank 0 runs the head; the serve loop reads its logits.
+            download(&gpus.devices[0], ranks[0].logits(), vocab)
         });
         assert!(ranks.iter().all(|rank| rank.position == rows + GREEDY));
+        for (index, (rank, gpu)) in ranks.iter().zip(&gpus.devices).enumerate() {
+            let steps = rank.graph_steps;
+            eprintln!("TP{parts} rank {index} whole-token graph epochs: {steps:?}");
+            if whole_token {
+                // 14 decode epochs: one whole-token graph per rank.
+                assert_eq!(
+                    steps.whole_direct + steps.whole_capture + steps.whole_replay,
+                    14,
+                    "{steps:?}"
+                );
+                assert!(
+                    steps.whole_capture >= 1 && steps.whole_replay >= 2,
+                    "{steps:?}"
+                );
+                assert!(gpu.graphs.graph_exec.is_some());
+            } else {
+                // Eager decode (TP>2, or graphs off) runs no graphs.
+                assert_eq!(
+                    steps.whole_direct + steps.whole_capture + steps.whole_replay,
+                    0,
+                    "{steps:?}"
+                );
+                assert!(gpu.graphs.graph_exec.is_none());
+            }
+            assert_eq!(gpu.graphs.graph_segment_count(), 0);
+        }
         gpus.drain_mesh_edges().unwrap();
         for (rank, gpu) in ranks.into_iter().zip(&mut gpus.devices) {
             free_rank(rank, gpu);
         }
+        for gpu in &mut gpus.devices {
+            gpu.bind_thread().unwrap();
+            gpu.invalidate_graph_state();
+        }
+        gpus.free_tp_graph_signals().unwrap();
 
         let ids = |rows: &[Vec<f32>]| rows.iter().map(|row| argmax(row)).collect::<Vec<_>>();
         let max_diff = tp_rows

@@ -273,8 +273,9 @@ matches. Index of currently-available skills:
   `hipfire serve`. **Reach for this when:** serve "Failed to start
   (port in use)", a stale daemon holds VRAM, a pre-warm JSON-parse /
   os-error-2 crash left a zombie `daemon.pid` singleton, or you need a
-  guaranteed-fresh daemon. Kills the native serve + spawned daemon, fuser-frees
-  the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
+  guaranteed-fresh daemon. Runs `hipfire stop --force`, which stops only this
+  install's serve and daemons (never other worktrees' or agents'), then waits
+  for the port. `scripts/serve-restart.sh [port]`.
 
 - **`agent-memory`** — git-tracked cross-session project memory as in-repo markdown
   notes (`.agent-memory/notes/*.md`, YAML frontmatter) with **lexical (ripgrep)

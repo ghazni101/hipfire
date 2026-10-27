@@ -51,7 +51,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
     const int q_off = head * head_dim;
     const int k_off = hidden + head * head_dim;
     const int v_off = 2 * hidden + head * head_dim;
-    const int A = head_dim / LANES;   // out elements owned per lane
+    const int A = (head_dim + LANES - 1) / LANES;   // out elements owned per lane; tail guarded by d < head_dim
 
     extern __shared__ float smem[];
     float* k_tile  = smem;                       // [K_TILE * head_dim]
@@ -146,6 +146,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
             const float* vrow_base = qkv + v_off;
             for (int a = 0; a < A; a++) {
                 int d = lane + a * LANES;
+                if (d >= head_dim) continue;
                 float acc = out_run[qid * head_dim + d] * r;
                 const float* prow = s_tile + qid * K_TILE;
                 #pragma unroll 8
@@ -166,6 +167,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
         const float l = m_l[qid * 2 + 1];
         for (int a = 0; a < A; a++) {
             int d = lane + a * LANES;
+            if (d >= head_dim) continue;
             out[qi * hidden + head * head_dim + d] =
                 out_run[qid * head_dim + d] / l;
         }

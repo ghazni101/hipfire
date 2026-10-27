@@ -19,9 +19,8 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use super::project::project_pair_b3;
 use super::{project_prepared, project_prepared_rows, E8SoaKernel, RowsProjection};
-use crate::families::moe::{
-    MoeBiasAwareMq2Backend, MoeBiasAwareParams, MoeBiasAwarePrefillParams, MoeFamily,
-};
+use crate::families::moe::{MoeBiasAwareMq2Backend, MoeBiasAwarePrefillParams, MoeFamily};
+use crate::pipeline::sealed_moe::{execute_sealed, SealedMoeCall};
 use crate::types::{dtype_needs_rotation, DispatchError};
 
 static MOE: LazyLock<MoeFamily> = LazyLock::new(MoeFamily::new);
@@ -480,9 +479,9 @@ pub fn execute_hash_routed_experts(
 
 /// Routed experts of one row.
 pub enum RoutedExpertsOp<'a> {
-    /// Bias-aware top-k through the shared MoE family.
-    BiasAware {
-        params: MoeBiasAwareParams<'a>,
+    /// Biased top-k over the model's router scores through sealed MoE.
+    Sealed {
+        call: SealedMoeCall<'a>,
         layer: usize,
     },
     /// Per-token hash table.
@@ -492,14 +491,7 @@ pub enum RoutedExpertsOp<'a> {
 impl RoutedExpertsOp<'_> {
     pub fn validate_for_gpu(&self, gpu: &Gpu) -> Result<(), DispatchError> {
         match self {
-            Self::BiasAware { params, .. } => {
-                if params.k_top == 0 || params.n_exp == 0 || params.batch_size != 1 {
-                    return Err(DispatchError::Hip(
-                        "bias-aware routed experts need one row and k > 0".into(),
-                    ));
-                }
-                Ok(())
-            }
+            Self::Sealed { call, .. } => call.validate_for_gpu(gpu),
             Self::Hash(op) => op.validate_for_gpu(gpu),
         }
     }
@@ -508,10 +500,9 @@ impl RoutedExpertsOp<'_> {
 pub fn execute_routed_experts(gpu: &mut Gpu, op: &ExpertFfnOp<'_>) -> Result<(), DispatchError> {
     match &op.route {
         ExpertFfnRoute::Decode {
-            routed: Some(RoutedExpertsOp::BiasAware { params, layer }),
+            routed: Some(RoutedExpertsOp::Sealed { call, layer }),
             ..
-        } => MOE
-            .run_bias_aware(gpu, params)
+        } => execute_sealed(gpu, call)
             .map_err(|e| DispatchError::Hip(format!("ffn_routed l{layer} dispatch: {e}"))),
         ExpertFfnRoute::Decode {
             routed: Some(RoutedExpertsOp::Hash(hash)),

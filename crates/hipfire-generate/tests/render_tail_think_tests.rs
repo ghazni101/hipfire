@@ -17,9 +17,8 @@ use hipfire_generate::ar::*;
 use hipfire_generate::batch::*;
 use hipfire_generate::common::*;
 
-use hipfire_generate::{
-    common::asst_turn_fingerprint, common::normalize_asst_turn_for_fingerprint,
-};
+use hipfire_engine::turn_cache::asst_turn_fingerprint;
+use hipfire_generate::common::normalize_asst_turn_for_fingerprint;
 use hipfire_runtime::prompt_frame::AssistantPrefix;
 
 #[test]
@@ -133,7 +132,7 @@ fn assistant_cache_fingerprint_matches_client_visible_content() {
     let normalized = hipfire_generate::common::normalize_asst_turn_for_fingerprint(raw);
     assert_eq!(normalized, "visible answer");
     assert_eq!(
-        hipfire_generate::common::asst_turn_fingerprint(&normalized, &[]),
-        hipfire_generate::common::asst_turn_fingerprint("visible answer", &[])
+        hipfire_engine::turn_cache::asst_turn_fingerprint(&normalized, &[]),
+        hipfire_engine::turn_cache::asst_turn_fingerprint("visible answer", &[])
     );
 }

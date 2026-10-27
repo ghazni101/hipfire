@@ -334,6 +334,7 @@ impl PrefillBatchScratch {
             fa_attn_out_rot_f16_batch: &self.fa_attn_out_rot_f16_batch,
             positions: &self.positions,
             rope_positions: &self.rope_positions,
+            mrope: None,
         }
     }
 }

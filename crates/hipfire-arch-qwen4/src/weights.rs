@@ -2773,11 +2773,23 @@ impl Qwen4Weights {
         self.expert_tiers.as_ref()
     }
 
+    /// One tier layer through the canonical (`Resident`) read view.
     pub fn expert_tier_layer(
         &self,
         layer: usize,
     ) -> Option<crate::expert_tier_owners::LayerExpertTierView<'_>> {
-        self.expert_tiers.as_ref()?.layer(layer)
+        self.expert_tier_layer_view(layer, crate::expert_tier_owners::ExpertReadView::Resident)
+    }
+
+    /// One tier layer through the chosen read view; `None` without a tier
+    /// lease, for an out-of-range layer, or for `BorrowPrefill` on a lease
+    /// that does not share.
+    pub fn expert_tier_layer_view(
+        &self,
+        layer: usize,
+        view: crate::expert_tier_owners::ExpertReadView,
+    ) -> Option<crate::expert_tier_owners::LayerExpertTierView<'_>> {
+        self.expert_tiers.as_ref()?.layer_view(layer, view)
     }
 
     /// The expert-parallel placement these weights were assembled for, or
@@ -2793,6 +2805,16 @@ impl Qwen4Weights {
     /// own handle. Neither path performs I/O or allocation.
     pub fn resident(&self, reference: &TensorRef) -> Result<&GpuTensor, WeightError> {
         self.resident_named(&reference.name, reference.layer, self.device, 0)
+    }
+
+    /// [`Self::resident`] by manifest name and layer (the decode-share
+    /// weight-shadow region plan names its sources, not typed references).
+    pub fn resident_by_name(
+        &self,
+        name: &str,
+        layer: Option<usize>,
+    ) -> Result<&GpuTensor, WeightError> {
+        self.resident_named(name, layer, self.device, 0)
     }
 
     fn resident_named(

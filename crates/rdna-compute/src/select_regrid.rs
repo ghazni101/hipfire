@@ -77,7 +77,6 @@ impl Gpu {
         let mut vs = vocab as i32;
         let mut kk = k as i32;
         let mut raw = 1i32;
-        let func = &self.functions[TOPK_VALUES_REGRID_SYMBOL];
         let mut params: Vec<*mut c_void> = vec![
             &mut lp as *mut _ as *mut c_void,
             &mut ti as *mut _ as *mut c_void,
@@ -85,21 +84,26 @@ impl Gpu {
             &mut vs as *mut _ as *mut c_void,
             &mut kk as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [b as u32, 1, 1],
-                [SELECT_REGRID_BLOCK, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
+        self.launch_params_or_plan(
+            TOPK_VALUES_REGRID_SYMBOL,
+            [b as u32, 1, 1],
+            [SELECT_REGRID_BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bl = KernargBlob::new();
+                bl.push_ptr(lp);
+                bl.push_ptr(ti);
+                bl.push_ptr(to);
+                bl.push_i32(vs);
+                bl.push_i32(kk);
+                bl
+            },
+        )?;
         // Shipping launch geometry and LDS for the fixup body.
         const MAX_K: u32 = 16;
         let nth: u32 = 256;
         let lds = (32 + nth * MAX_K * 2) * 4;
-        let func = &self.functions[TOPK_VALUES_FIXUP_SYMBOL];
         let mut params: Vec<*mut c_void> = vec![
             &mut lp as *mut _ as *mut c_void,
             &mut ti as *mut _ as *mut c_void,
@@ -108,16 +112,23 @@ impl Gpu {
             &mut kk as *mut _ as *mut c_void,
             &mut raw as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [b as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_params_or_plan(
+            TOPK_VALUES_FIXUP_SYMBOL,
+            [b as u32, 1, 1],
+            [nth, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut bl = KernargBlob::new();
+                bl.push_ptr(lp);
+                bl.push_ptr(ti);
+                bl.push_ptr(to);
+                bl.push_i32(vs);
+                bl.push_i32(kk);
+                bl.push_i32(raw);
+                bl
+            },
+        )
     }
 
     /// Batched argmax over `[batch x n]` rows with the shipping kernel's

@@ -107,6 +107,10 @@ pub struct EngineConfig {
     /// trunk HFQ. When `None`, falls back to inline vision tensors in the
     /// trunk (backward compat with pre-separation artifacts).
     pub vl_path: Option<PathBuf>,
+    /// Whether the vision tower is uploaded whole at load
+    /// (`TowerResidency::Resident`, `vision.mode=resident`) or streamed
+    /// block-by-block through staging slots during the image encode.
+    pub vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency,
     /// MTP speculative decode depth (K candidates per cycle). 0 = MTP off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
@@ -1590,7 +1594,7 @@ impl Rig {
                     "  loading vision weights from .vl sidecar: {}",
                     vl.display()
                 );
-                let mut vl_hfq = HfqFile::open(vl)
+                let vl_hfq = HfqFile::open(vl)
                     .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                 let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
                     .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?;
@@ -1615,18 +1619,23 @@ impl Rig {
                     ));
                 }
                 let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
-                    &mut vl_hfq,
+                    &vl_hfq,
                     &vc,
                     &mut gpu,
+                    cfg.vision_residency,
                 )
                 .map_err(|e| format!("load vision weights from .vl: {e}"))?;
                 (Some(vc), Some(vw))
             } else {
                 let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
                     .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?;
-                let vw =
-                    hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, &vc, &mut gpu)
-                        .map_err(|e| format!("load vision weights: {e}"))?;
+                let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
+                    &hfq,
+                    &vc,
+                    &mut gpu,
+                    cfg.vision_residency,
+                )
+                .map_err(|e| format!("load vision weights: {e}"))?;
                 (Some(vc), Some(vw))
             }
         } else {

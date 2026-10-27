@@ -30,10 +30,15 @@ use crate::deepseek4::{
 };
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::program::{self, LayerProgram, Mix};
+use crate::routed_seal::RoutedSeal;
 use crate::rows_program::{self, Observed, RowSlots, RowsWindow};
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::moe::MoeBiasAwareParams;
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::{
+    MoeDtypes, MoeEpMode, MoeMq2Lloyd, MoeNormalization, MoeParams, MoeRecipe, MoeScores,
+    MoeSelectionBias,
+};
 use hipfire_dispatch::pipeline::mla::attention::{
     execute_sparse_index, CompressedCache, IdentityGatherOp, IdentityGatherRoute, IndexTopK,
     OLoraOp, OLoraRoute, OloraA, SparseAttentionOp, SparseAttentionRoute, SparseIndexOp,
@@ -65,6 +70,7 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
 use hipfire_dispatch::pipeline::{execute_steps, ClearOp, Step};
+use hipfire_dispatch::pipeline::{seal_decode, BoundMoeExperts};
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::replay::ReplayController;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -2904,7 +2910,7 @@ pub(crate) fn ensure_expert_ffn(
     ensure_ffn_prepare(cfg, state, gpu)?;
     if routed_experts_present(cfg, weights, layer_idx) {
         ensure_moe_route(cfg, state, gpu)?;
-        ensure_routed_experts(cfg, state, gpu, layer_idx < cfg.num_hash_layers)?;
+        ensure_routed_experts(cfg, weights, state, gpu, layer_idx)?;
     }
     Ok(())
 }
@@ -3580,10 +3586,12 @@ fn routed_experts_present(
 
 fn ensure_routed_experts(
     cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    hash: bool,
+    layer_idx: usize,
 ) -> Result<(), String> {
+    let hash = layer_idx < cfg.num_hash_layers;
     let k_top = cfg.num_experts_per_tok;
     let im = cfg.moe_intermediate_size;
     let tag = if hash { " hash" } else { "" };
@@ -3615,12 +3623,25 @@ fn ensure_routed_experts(
             "moe_down_expert_outputs",
         )?);
     }
+    if !hash {
+        if state.routed_ctx.is_none() {
+            state.routed_ctx = Some(DispatchCtx::new(gpu));
+        }
+        RoutedSeal::ensure(
+            &mut state.routed_seals,
+            gpu,
+            weights.resolve_layer(layer_idx),
+            layer_idx,
+            cfg.hidden_size,
+            im,
+        )?;
+    }
     Ok(())
 }
 
 /// The routed experts of one row accumulating into `out` (`ffn_out`, an EP
 /// partial or the overlap partial). Hash layers select `tid2eid[token]`;
-/// score layers select bias-aware top-k on device.
+/// score layers run sealed MoE over the model-produced router scores.
 fn routed_experts_op<'a>(
     cfg: &DeepseekV4Config,
     weights: &'a DeepseekV4Weights,
@@ -3634,35 +3655,113 @@ fn routed_experts_op<'a>(
     let k = cfg.num_experts_per_tok;
     let route_scale = config_cache::route_scale(cfg.routed_scaling_factor, cfg.mq2r);
     if layer_idx >= cfg.num_hash_layers {
+        let missing = |what: &str| format!("ffn_routed l{layer_idx}: {what} missing");
         let gate_bias = layer
             .gate_bias
             .as_ref()
-            .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
-        return Ok(RoutedExpertsOp::BiasAware {
-            params: MoeBiasAwareParams {
-                hidden: cfg.hidden_size,
-                mi: cfg.moe_intermediate_size,
-                k_top: k,
-                n_exp: cfg.n_routed_experts,
-                route_scale,
-                swiglu_limit: cfg.swiglu_limit,
-                uses_atomic_moe_down: weights.mq2r_backend.uses_atomic_moe_down(),
-                native_mq2_backend: weights.mq2r_backend.bias_aware_native_backend(),
-                nonowned_gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
-                batch_size: 1,
-                x_rot: state.ffn_x_rot.as_ref().unwrap(),
-                ffn_out: out,
-                scores: state.router_scores.as_ref().unwrap(),
-                gate_bias,
-                expert_gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
-                expert_down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
-                topk_indices: state.moe_topk_indices.as_ref().unwrap(),
-                topk_weights: state.moe_topk_weights.as_ref().unwrap(),
-                gate_batch: state.moe_gate_batch.as_ref().unwrap(),
-                up_batch: state.moe_up_batch.as_ref().unwrap(),
-                rot_batch: state.moe_rot_batch.as_ref().unwrap(),
-                down_expanded: state.moe_down_expert_outputs.as_ref().unwrap(),
+            .ok_or_else(|| missing("gate_bias"))?;
+        let gate = layer
+            .gate_weight
+            .as_ref()
+            .ok_or_else(|| missing("gate.weight"))?;
+        let seal = RoutedSeal::find(&state.routed_seals, layer)
+            .ok_or_else(|| missing("sealed expert binding (ensure_routed_experts)"))?;
+        let ctx = state
+            .routed_ctx
+            .as_ref()
+            .ok_or_else(|| missing("dispatch context"))?;
+        let (hidden, mi) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        let x_rot = state.ffn_x_rot.as_ref().unwrap();
+        let gate_batch = state.moe_gate_batch.as_ref().unwrap();
+        let up_batch = state.moe_up_batch.as_ref().unwrap();
+        let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
+        let params = MoeParams {
+            dtypes: MoeDtypes {
+                router: gate.dtype,
+                shared: None,
+                experts_all_gate_up_mq4: false,
+                routed_gate_up: DType::MQ2G256Lloyd,
+                routed_down: DType::MQ2G256Lloyd,
+                routed_has_mixed_experts: false,
+                has_paro_shared: false,
+                per_expert_gate_up: None,
+                per_expert_down: None,
             },
+            mq2_lloyd: Some(MoeMq2Lloyd {
+                swiglu_limit: cfg.swiglu_limit,
+                uses_atomic_down: weights.mq2r_backend.uses_atomic_moe_down(),
+                native: weights.mq2r_backend.bias_aware_native_backend(),
+                nonowned_gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
+            }),
+            recipe: MoeRecipe::SigmoidRoutedNoShared,
+            route_policy: None,
+            normalization: MoeNormalization::Provided,
+            batch_size: 1,
+            hidden,
+            mi,
+            k,
+            n_exp: cfg.n_routed_experts,
+            norm_topk_prob: true,
+            selection_bias: Some(MoeSelectionBias {
+                bias: gate_bias,
+                route_scale,
+                scores: MoeScores::Precomputed,
+            }),
+            x_rot_prerotated: true,
+            defer_routed_combine: false,
+            cpu_deferred_experts: false,
+            ep_mode: MoeEpMode::None,
+            layer_idx: layer_idx as u16,
+            x_norm: x_rot,
+            x_residual: out,
+            routed_out: None,
+            skip_shared: false,
+            // Never read: the scores are precomputed.
+            router: WeightRef {
+                buf: gate,
+                dtype: gate.dtype,
+                m: cfg.n_routed_experts,
+                k: hidden,
+                row_stride: 0,
+                rotation: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            },
+            shared: None,
+            expert_gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
+            expert_down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
+            expert_ptrs_host: None,
+            expert_down_awq_ptrs: None,
+            expert_dtype_tags: None,
+            routed_gate_up_k: hidden,
+            routed_down_m: hidden,
+            routed_down_k: mi,
+            routed_experts: &seal.experts,
+            routed_gate_up_paro: None,
+            routed_down_paro: None,
+            router_logits: state.router_scores.as_ref().unwrap(),
+            x_rot_local: x_rot,
+            // Host-routed fallback scratch: the biased selector always routes
+            // on the GPU, so these alias the GPU-route buffers and stay unread.
+            gate_up_buf: gate_batch,
+            ffn_hidden: up_batch,
+            ffn_out: down_expanded,
+            gate_batch,
+            up_batch,
+            rot_batch: state.moe_rot_batch.as_ref().unwrap(),
+            topk_indices: state.moe_topk_indices.as_ref().unwrap(),
+            topk_weights: state.moe_topk_weights.as_ref().unwrap(),
+            down_expanded,
+            ep_row_gather: None,
+        };
+        let bound = BoundMoeExperts::from_cache(&seal.table, &seal.cache)
+            .map_err(|e| format!("ffn_routed l{layer_idx}: bind experts: {e:?}"))?;
+        let call = seal_decode(bound, ctx, params)
+            .map_err(|e| format!("ffn_routed l{layer_idx}: seal MoE: {e:?}"))?;
+        return Ok(RoutedExpertsOp::Sealed {
+            call,
             layer: layer_idx,
         });
     }
@@ -4080,7 +4179,7 @@ fn routed_experts(
         return Ok(());
     }
     ensure_moe_route(cfg, state, gpu)?;
-    ensure_routed_experts(cfg, state, gpu, layer_idx < cfg.num_hash_layers)?;
+    ensure_routed_experts(cfg, weights, state, gpu, layer_idx)?;
     let out = routed_out.unwrap_or(state.ffn_out.as_ref().unwrap());
     let routed = routed_experts_op(cfg, weights, state, gpu, layer_idx, token_id, out)?;
     let op = expert_ffn_op(

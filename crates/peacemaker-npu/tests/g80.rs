@@ -4230,7 +4230,7 @@ fn g80_bf16_rowmajor_batch_descriptor_budget_and_instruction_counts() {
 use peacemaker_npu::kernels::{
     gemm_g80::Bf16Layout as OutLayout,
     gemm_g80_n512::{
-        build_panel_program_out, design_g80_n512_layout, pack_a_bf16 as out_pack_a,
+        build_panel_program_n512, design_g80_n512_layout, pack_a_bf16 as out_pack_a,
         pack_b_bf16 as out_pack_b,
     },
     w8a8_epi::bf16_direct as out_twin,
@@ -4520,9 +4520,9 @@ fn g80_n512_smoke_native_k128_one_wave() {
     );
 }
 
-fn out_limb_case(m: usize, layout: OutLayout, seed: usize, what: &str) -> usize {
-    let d = out_design(m, OUT_K, layout);
-    let (a, b, raw) = out_limb_fixture(m, OUT_K);
+fn out_limb_case(m: usize, k: usize, layout: OutLayout, seed: usize, what: &str) -> usize {
+    let d = out_design(m, k, layout);
+    let (a, b, raw) = out_limb_fixture(m, k);
     let (ds, ss) = (out_token_scales(m, seed), out_feature_scales(ON, seed + 3));
     out_submit(
         &mut fresh(&d),
@@ -4540,12 +4540,19 @@ fn out_limb_case(m: usize, layout: OutLayout, seed: usize, what: &str) -> usize 
 }
 #[test]
 fn g80_n512_k6144_limb_fixture_one_wave_native() {
-    out_limb_case(512, OutLayout::NativeTiles, 0, "N512 limb K6144 W1 native");
+    out_limb_case(
+        512,
+        OUT_K,
+        OutLayout::NativeTiles,
+        0,
+        "N512 limb K6144 W1 native",
+    );
 }
 #[test]
 fn g80_n512_k6144_limb_fixture_one_wave_rowmajor_panel4() {
     out_limb_case(
         512,
+        OUT_K,
         out_rowmajor(2560, 2048),
         1,
         "N512 limb K6144 W1 rowmajor pitch 2560 col0 2048",
@@ -4567,6 +4574,7 @@ fn g80_n512_k6144_random_one_wave_rowmajor() {
 fn g80_n512_k6144_limb_fixture_two_waves_rowmajor() {
     out_limb_case(
         1024,
+        OUT_K,
         out_rowmajor(2560, 0),
         3,
         "N512 limb K6144 W2 rowmajor col0 0",
@@ -4574,12 +4582,19 @@ fn g80_n512_k6144_limb_fixture_two_waves_rowmajor() {
 }
 #[test]
 fn g80_n512_k6144_limb_fixture_two_waves_native() {
-    out_limb_case(1024, OutLayout::NativeTiles, 4, "N512 limb K6144 W2 native");
+    out_limb_case(
+        1024,
+        OUT_K,
+        OutLayout::NativeTiles,
+        4,
+        "N512 limb K6144 W2 native",
+    );
 }
 #[test]
 fn g80_n512_k6144_limb_fixture_many_waves_rowmajor_8192() {
     out_limb_case(
         8192,
+        OUT_K,
         out_rowmajor(2560, 1536),
         5,
         "N512 limb K6144 W16 rowmajor col0 1536",
@@ -4611,6 +4626,87 @@ fn g80_n512_k6144_random_padded_rows_native() {
         OutLayout::NativeTiles,
         8,
         "N512 random K6144 M700 native",
+    );
+}
+/// qwen3.8-27b dense in-projections: K = 5120 (kc 80: two B groups of 40, credit window 63) at the dense arena pitches.
+/// GDN = 33 panels at pitch 16896 (last panel col0 16384), FA = 28 panels at pitch 14336.
+const DENSE_K: usize = 5120;
+#[test]
+fn g80_n512_k5120_limb_fixture_two_waves_dense_gdn_last_panel() {
+    out_limb_case(
+        1024,
+        DENSE_K,
+        out_rowmajor(16896, 16384),
+        9,
+        "N512 limb K5120 W2 rowmajor pitch 16896 col0 16384",
+    );
+}
+#[test]
+fn g80_n512_k5120_random_padded_rows_dense_fa() {
+    out_case(
+        700,
+        DENSE_K,
+        out_rowmajor(14336, 13824),
+        10,
+        "N512 random K5120 M700 rowmajor pitch 14336 col0 13824",
+    );
+}
+/// Real qwen3.8-27b tiles (W8 codes of 512 fused in-projection columns, A8 activation rows, grid15-up scales) dumped by the
+/// HIPF-161 kit into `$N512_REAL_TILE` (`meta` = "m k pitch col0", `a.i8` [m][k], `b.i8` [k][512], `ds.bin` / `ss.bin`
+/// LE u16 Dm/Sm + i16 De/Se pairs). The complete arena must equal the `bf16_direct` twin of the whole-K int32 sums.
+#[test]
+#[ignore = "needs a real-tile dump in $N512_REAL_TILE"]
+fn g80_n512_real_27b_tile() {
+    let dir = std::path::PathBuf::from(std::env::var("N512_REAL_TILE").expect("N512_REAL_TILE"));
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let meta: Vec<usize> = String::from_utf8(read("meta"))
+        .unwrap()
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let [m, k, pitch, col0] = meta[..] else {
+        panic!("meta must be `m k pitch col0`")
+    };
+    let codes = |name: &str| read(name).into_iter().map(|b| b as i8).collect::<Vec<_>>();
+    let pairs = |name: &str| {
+        read(name)
+            .chunks_exact(4)
+            .map(|c| {
+                (
+                    u16::from_le_bytes([c[0], c[1]]),
+                    i16::from_le_bytes([c[2], c[3]]),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (a, b, ds, ss) = (
+        codes("a.i8"),
+        codes("b.i8"),
+        pairs("ds.bin"),
+        pairs("ss.bin"),
+    );
+    assert_eq!(
+        (a.len(), b.len(), ds.len(), ss.len()),
+        (m * k, k * ON, m, ON)
+    );
+    let layout = out_rowmajor(pitch, col0);
+    let d = out_design(m, k, layout);
+    let raw = cpu_reference(&a, &b, m, ON, k);
+    out_submit(
+        &mut fresh(&d),
+        &d,
+        &d.insts,
+        &a,
+        &b,
+        &raw,
+        &ds,
+        &ss,
+        m,
+        layout,
+        &format!(
+            "N512 real 27B tile {} K{k} M{m} pitch {pitch} col0 {col0}",
+            dir.display()
+        ),
     );
 }
 /// Short K (kc 1, 2, 3, 63, 64, 65): the B credit window and the two-group B split at every boundary.
@@ -4762,11 +4858,11 @@ fn g80_n512_layout_ranges_and_builder_bounds() {
         (512, 2560, 2049),
     ] {
         assert!(
-            build_panel_program_out(rows, pitch, col0).is_err(),
+            build_panel_program_n512(rows, pitch, col0, OUT_K).is_err(),
             "rows {rows} pitch {pitch} col0 {col0}"
         );
     }
-    let p = build_panel_program_out(8192, 2560, 0).unwrap();
+    let p = build_panel_program_n512(8192, 2560, 0, OUT_K).unwrap();
     assert_eq!(
         (p.args[0].bytes, p.args[1].bytes, p.args[2].bytes),
         (

@@ -2,6 +2,9 @@
 # Interleaved 2x2 A/B: {old,new} binaries x {pcie,cpu} exec, 3 rounds.
 # old = /tmp/cpu_exec_pin (pre-change tree), new = target/release (HEAD + qt49 AVX2).
 # Scratch during the measurement; committed here so the numbers have a recipe.
+# WARNING: run_arm kills with `pkill -f 'release/daemon'`, which matches every
+# worktree's release daemon on the host, not just this A/B's. Run it only on a
+# box where no other hipfire daemon is running.
 set -u
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"

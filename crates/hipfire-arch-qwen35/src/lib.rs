@@ -52,6 +52,15 @@ pub mod checkpoint;
 /// `dflash_spec`.
 #[cfg(feature = "deltanet")]
 pub mod dflash_cb;
+/// Design A slice A4: the planned (railgun) DFlash draft emitter over the
+/// frozen plan sink, its shape family / patch table, and the oracle binder.
+pub mod dflash_draft_emit;
+/// Railgun design A slice A6: the certified-window owner, admission
+/// (`HIPFIRE_DFLASH_RAILGUN_WINDOW`), and the §6 window transaction.
+pub mod dflash_railgun;
+/// Railgun design A slice A8: the GPU-facing `WindowBuilder` (plan, author,
+/// lower, stage, read back) the owner installs for `HIPFIRE_DFLASH_RAILGUN_WINDOW=1`.
+pub mod dflash_railgun_builder;
 /// DFlash2 speculative decode for the multi-slot serve engine: shared draft
 /// state, per-slot draft context, and the draft/verify-accept steps that
 /// plug into `serve_engine`'s batched forward. Deltanet-gated like
@@ -64,11 +73,21 @@ pub mod dflash_slot;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
+/// Railgun design A slice A5: the DFlash verify-window emitter
+/// (`plan_dflash_verify`) and its patch-table proof. Not deltanet-gated,
+/// matching `speculative`, which it consumes.
+pub mod dflash_verify_emit;
 /// Retained-PM4 route state for the fixed B=16 DFlash2 target-verify forward
 /// (`DflashVerifyPm4`). Owns the phase machine, admission binding, and
 /// route-proof counters; `speculative` owns the GPU half.
 /// Not deltanet-gated, matching `speculative`, which consumes it.
 pub mod dflash_verify_pm4;
+/// Railgun design A slice A8: the pure half of the window builder (A4 draft +
+/// A5 verify emissions -> authored `WindowPlanParts` with rebased patches,
+/// copy/fill nodes and exact-artifact facts).
+pub mod dflash_window_build;
+/// Compressed MTP draft vocabulary sliced from the trunk lm_head (exact gfx1100 default).
+pub mod draft_vocab;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention

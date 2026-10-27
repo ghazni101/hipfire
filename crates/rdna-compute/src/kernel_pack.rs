@@ -192,6 +192,13 @@ impl PackManifest {
     /// Admission checks that need no object bytes: schema, identity and the
     /// ROCm range. `local_rocm` is `<rocm root>/.info/version`, if known.
     pub fn check(&self, arch: &str, commit: &str, local_rocm: Option<&str>) -> Result<(), String> {
+        self.check_identity(arch, commit)?;
+        self.check_rocm_range(local_rocm)
+    }
+
+    /// The identity half of [`Self::check`]: schema, arch, source commit and
+    /// kernel cache ABI. Independent of the local ROCm install.
+    pub fn check_identity(&self, arch: &str, commit: &str) -> Result<(), String> {
         if self.format != PACK_FORMAT {
             return Err(format!(
                 "manifest format {} (installer reads {PACK_FORMAT})",
@@ -213,6 +220,12 @@ impl PackManifest {
                 self.kernel_cache_abi
             ));
         }
+        Ok(())
+    }
+
+    /// The ROCm-range half of [`Self::check`]: the machine's ROCm root
+    /// (`<root>/.info/version`) must lie inside the pack's supported range.
+    pub fn check_rocm_range(&self, local_rocm: Option<&str>) -> Result<(), String> {
         let local = local_rocm.ok_or("local ROCm version unknown (no <root>/.info/version)")?;
         if !rocm_admitted(local, &self.rocm_min, &self.rocm_max_exclusive) {
             return Err(format!(
@@ -530,6 +543,26 @@ mod tests {
             rocm_min: "7.2".into(),
             rocm_max_exclusive: "8.0".into(),
         }
+    }
+
+    #[test]
+    fn identity_check_is_independent_of_the_rocm_range() {
+        let m = manifest("gfx1100");
+        let commit = "0".repeat(40);
+        // Identity alone ignores the local ROCm entirely.
+        assert!(m.check_identity("gfx1100", &commit).is_ok());
+        assert!(m.check_identity("gfx1201", &commit).is_err());
+        assert!(m.check_identity("gfx1100", &"1".repeat(40)).is_err());
+        // The range half rejects out-of-range and unknown ROCm roots.
+        assert!(m.check_rocm_range(Some("7.2.1")).is_ok());
+        assert!(m.check_rocm_range(Some("6.4.2")).is_err());
+        assert!(m.check_rocm_range(Some("8.0.0")).is_err());
+        assert!(m.check_rocm_range(None).is_err());
+        // `check` is exactly identity + range.
+        assert!(m.check("gfx1100", &commit, Some("7.2.1")).is_ok());
+        assert!(m.check("gfx1100", &commit, Some("6.4.2")).is_err());
+        assert!(m.check("gfx1100", &commit, None).is_err());
+        assert!(m.check("gfx1201", &commit, Some("7.2.1")).is_err());
     }
 
     #[test]

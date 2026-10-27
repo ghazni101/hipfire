@@ -70,7 +70,7 @@
 
 use super::*;
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
-use crate::expert_tier_owners::ExpertTierLease;
+use crate::expert_tier_owners::{ExpertReadView, ExpertTierLease};
 use crate::expert_tier_plan::Placement;
 
 /// Host sources of the staged layers.
@@ -938,6 +938,16 @@ impl Qwen4ExpertStage {
             ));
         }
         let config = &bundle.config;
+        // A decode-share lease stages from its largest BorrowPrefill class view
+        // (every donor at its mirror, a superset of any smaller class's host
+        // entries): the stage is only used by tiles of at least `min_rows`
+        // (>= 512) rows, which always read a BorrowPrefill runtime, and a
+        // staged donor is a copy of its mirror, correct whether or not the
+        // tile's own class dirtied it.
+        let read_view = match lease.borrow_classes() {
+            0 => ExpertReadView::Resident,
+            classes => ExpertReadView::BorrowPrefill(classes - 1),
+        };
         let mut slots = Vec::with_capacity(moe.len());
         let mut layouts: Vec<(usize, TierStageLayout)> = Vec::new();
         for (layer, runtime) in moe.iter().enumerate() {
@@ -946,7 +956,7 @@ impl Qwen4ExpertStage {
                 continue;
             };
             let view = lease
-                .layer(layer)
+                .layer_view(layer, read_view)
                 .ok_or_else(|| invalid(format!("tier stage: layer {layer} has no tier view")))?;
             // The forward's stage selection and `before_moe` wait use the
             // runtime's layer bit; it must be the view's `any_host`.
@@ -1105,7 +1115,7 @@ impl Qwen4ExpertStage {
             }
             // `mirrors` already owns the stage buffers (see `Self { .. }`).
             for (layer, layout) in &layouts {
-                let view = lease.layer(*layer).expect("checked above");
+                let view = lease.layer_view(*layer, read_view).expect("checked above");
                 let stage_base = stage.mirrors[layer % 2].buf.as_ptr() as usize;
                 for (entries, offsets) in [
                     (view.gate_up_ptrs(), &layout.gate_up),
@@ -1133,8 +1143,31 @@ impl Qwen4ExpertStage {
             .iter()
             .map(|(_, layout)| layout.gate_up.iter().flatten().count())
             .sum::<usize>();
+        // Under decode-share the stage tables come from the BorrowPrefill view:
+        // the lease's donors are staged copies of their pinned mirror, so the
+        // stage never points at a donor's canonical (scratch-borrowed) address.
+        let view_note = if matches!(read_view, ExpertReadView::BorrowPrefill(_)) {
+            let donors = layouts
+                .iter()
+                .map(|(layer, layout)| {
+                    let resident = lease.layer(*layer).expect("checked above");
+                    (0..config.num_experts)
+                        .filter(|&eid| {
+                            layout.gate_up[eid].is_some()
+                                && resident.placement(eid) == Some(Placement::Device)
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            format!(
+                " [BorrowPrefill view: {} resident-view host + {donors} donor experts; valid for both views]",
+                host_experts - donors
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){view_note}",
             stage.min_rows,
             layouts.len(),
             sizes[0] >> 20,
@@ -1592,6 +1625,56 @@ mod tests {
             table,
             vec![device, stage, device + GU + DN, stage + GU + DN]
         );
+    }
+
+    /// A BorrowPrefill layer view: the donors (device-resident in the
+    /// Resident view, cold) point at the pinned mirror, so they stage as host
+    /// entries beside the layer's own host experts, while the non-donor device
+    /// experts keep their owner addresses (valid for both views).
+    #[test]
+    fn tier_layout_from_the_borrow_view_stages_donors_and_keeps_resident_non_donors() {
+        let device = 0x2_0000_0000usize;
+        let stride = GU + DN;
+        // Resident view: 0 and 2 device, 1 host. Experts 2 and 3 are donors:
+        // device in the Resident view, at the mirror in the BorrowPrefill view.
+        let resident = [
+            expert(false, device),
+            expert(true, HOST + 4096),
+            expert(false, device + 2 * stride),
+            expert(false, device + 3 * stride),
+        ];
+        let mirror = HOST + (8 << 20);
+        let borrow = [
+            resident[0],
+            resident[1],
+            expert(true, mirror),
+            expert(true, mirror + stride),
+        ];
+        let res_layout = tier_stage_layout(&resident, HOST, 64 << 20).unwrap();
+        let layout = tier_stage_layout(&borrow, HOST, 64 << 20).unwrap();
+        assert_eq!(res_layout.gate_up, vec![None, Some(0), None, None]);
+        // The donors are staged copies of the mirror; the adjacent mirror
+        // slots coalesce into one run.
+        assert_eq!(layout.copies.len(), 2);
+        assert!(layout
+            .copies
+            .contains(&(mirror, layout.gate_up[2].unwrap(), 2 * stride)));
+        assert!(layout.gate_up[2].is_some() && layout.gate_up[3].is_some());
+        assert_eq!(layout.gate_up[0], None);
+        // Non-donor device experts keep their owner address in the stage table.
+        let entries: Vec<usize> = borrow.iter().map(|e| e.gate_up).collect();
+        let stage = 0x3_0000_0000usize;
+        let table = decode(&tier_stage_table(&entries, &layout.gate_up, stage).unwrap());
+        assert_eq!(table[0], device);
+        assert!(table[1] >= stage && table[2] >= stage && table[3] >= stage);
+        // No staged entry or copy source is a donor's canonical device address.
+        assert!(layout
+            .copies
+            .iter()
+            .all(|&(src, _, _)| src >= HOST && src < HOST + (64 << 20)));
+        assert!(table
+            .iter()
+            .all(|&entry| entry != device + 2 * stride && entry != device + 3 * stride));
     }
 
     #[test]

@@ -26,6 +26,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
 use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
 use crate::expert_tier_plan::{ExpertTierEntry, ExpertTierPlan, Placement};
+use sha2::{Digest, Sha256};
 
 const EXPERTS: usize = EXPERTS_PER_LAYER as usize;
 const TOTAL_EXPERTS: usize = TRUNK_LAYERS as usize * EXPERTS;
@@ -56,6 +57,8 @@ pub enum ExpertTierOwnerError {
         tier: Placement,
     },
     GenerationExhausted,
+    /// A decode-share view invariant of the plan does not hold.
+    DecodeShare(String),
 }
 
 impl fmt::Display for ExpertTierOwnerError {
@@ -85,6 +88,7 @@ impl fmt::Display for ExpertTierOwnerError {
                 write!(f, "{tier:?} owner has insufficient readable tail padding")
             }
             Self::GenerationExhausted => write!(f, "expert tier generation exhausted"),
+            Self::DecodeShare(message) => write!(f, "expert tier decode-share: {message}"),
         }
     }
 }
@@ -149,14 +153,29 @@ fn tail_pad_bytes() -> u64 {
     ((ARENA_TAIL_PAD_BYTES as u64).max(align) + align - 1) & !(align - 1)
 }
 
-/// Pure construction of the exact CPU mirrors uploaded to the device tables.
+/// Pure construction of the exact CPU mirrors uploaded to the device tables
+/// for the canonical (Resident) view.
 fn build_tables(
     plan: &ExpertTierPlan,
     device_base: Option<u64>,
     host_device_alias: Option<u64>,
 ) -> Result<Tables, ExpertTierOwnerError> {
+    build_tables_for(plan, plan.entries(), device_base, host_device_alias)
+}
+
+/// [`build_tables`] over an explicit entry list (the plan's own entries for
+/// the Resident view, `DecodeShareTail::borrow_entries` for BorrowPrefill).
+fn build_tables_for(
+    plan: &ExpertTierPlan,
+    entries: &[ExpertTierEntry],
+    device_base: Option<u64>,
+    host_device_alias: Option<u64>,
+) -> Result<Tables, ExpertTierOwnerError> {
     // The HIP pointer-table ABI is 64-bit, not a dtype/quantization tag table.
     if std::mem::size_of::<usize>() != 8 {
+        return Err(ExpertTierOwnerError::Overflow);
+    }
+    if entries.len() != TOTAL_EXPERTS {
         return Err(ExpertTierOwnerError::Overflow);
     }
     let bases = [device_base, host_device_alias];
@@ -179,8 +198,8 @@ fn build_tables(
     let mut used = [0u64; 2];
     for layer in 0..TRUNK_LAYERS as usize {
         for eid in 0..EXPERTS {
-            let entry = plan
-                .entry(layer, eid)
+            let entry = entries
+                .get(layer * EXPERTS + eid)
                 .ok_or(ExpertTierOwnerError::Overflow)?;
             let t = tier_index(entry.tier);
             let bytes = plan.owner_bytes(entry.tier);
@@ -222,6 +241,282 @@ fn build_tables(
     Ok(tables)
 }
 
+/// Domain of the BorrowPrefill view digest.
+const BORROW_DIGEST_DOMAIN: &[u8] = b"hipfire.expert_tier_plan.borrow_prefill";
+
+/// SHA-256 over the borrow domain, the plan's logical digest, the class index
+/// and its dirtied-donor count, and every entry's `(tier, offsets, lens)` in
+/// id order (the class view's entries).
+fn borrow_view_digest(
+    logical_digest: [u8; 32],
+    class: usize,
+    donors: usize,
+    entries: &[ExpertTierEntry],
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(BORROW_DIGEST_DOMAIN);
+    hash.update(logical_digest);
+    hash.update((class as u64).to_le_bytes());
+    hash.update((donors as u64).to_le_bytes());
+    for entry in entries {
+        hash.update([tier_index(entry.tier) as u8]);
+        hash.update(entry.gate_up_offset.to_le_bytes());
+        hash.update(entry.gate_up_len.to_le_bytes());
+        hash.update(entry.down_offset.to_le_bytes());
+        hash.update(entry.down_len.to_le_bytes());
+    }
+    hash.finalize().into()
+}
+
+/// Immutable device-visible and CPU ranges of a decode-share lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeShareRanges {
+    /// `(device address, bytes)` of the contiguous donor tail.
+    pub donor_device: (usize, usize),
+    /// `(CPU address, bytes)` of the pinned mirror window.
+    pub mirror_cpu: (usize, usize),
+    /// Device alias address of the mirror window start.
+    pub mirror_alias: usize,
+    /// Number of donor experts.
+    pub donors: usize,
+    /// Bytes at the start of the donor tail that hold the borrowed weight
+    /// shadows ([`crate::expert_tier_plan::DecodeShareTail::shadow_bytes`]);
+    /// the scratch backing starts right after them. 0 without borrowed shadows.
+    pub shadow_bytes: usize,
+}
+
+/// CPU-built state of one BorrowPrefill class view, before its tables are
+/// uploaded: the Resident entries except donors `[0, donors)` (physical
+/// order), which point at their mirror.
+struct BorrowViewCpu {
+    entries: Vec<ExpertTierEntry>,
+    tables: Tables,
+    donors: usize,
+    digest: [u8; 32],
+}
+
+/// CPU-built state of the BorrowPrefill views, before their tables are uploaded.
+struct DecodeShareCpu {
+    views: Vec<BorrowViewCpu>,
+    ranges: DecodeShareRanges,
+    donor_offset: u64,
+    class_spans: Vec<u64>,
+}
+
+/// One published BorrowPrefill class view. Its device pointer tables are owned
+/// (and freed once) by `ExpertTierOwners`; only their base addresses live here.
+struct BorrowView {
+    entries: Vec<ExpertTierEntry>,
+    tables: Tables,
+    gate_up_table_base: usize,
+    down_table_base: usize,
+    donors: usize,
+    digest: [u8; 32],
+}
+
+/// The published BorrowPrefill views, one per prefill capacity class (nested:
+/// a larger class reads more donors from the mirror).
+struct DecodeShareBinding {
+    views: Vec<BorrowView>,
+    ranges: DecodeShareRanges,
+    /// Device-owner offset of the first donor byte.
+    donor_offset: u64,
+    /// Dirty byte prefix of each prefill class (`views[c]` reads the mirror for
+    /// the donors that prefix overlaps).
+    class_spans: Vec<u64>,
+}
+
+fn decode_share_error(message: String) -> ExpertTierOwnerError {
+    ExpertTierOwnerError::DecodeShare(message)
+}
+
+/// Pure CPU construction of the BorrowPrefill view and its ranges. `None` for
+/// a plan without donors. Verifies the plan's own promises (donor offsets map
+/// one-to-one onto the mirror, non-donors are untouched, codecs are shared).
+fn build_decode_share(
+    plan: &ExpertTierPlan,
+    resident: &Tables,
+    device_base: Option<u64>,
+    host_cpu: Option<usize>,
+    host_device_alias: Option<u64>,
+) -> Result<Option<DecodeShareCpu>, ExpertTierOwnerError> {
+    let Some(tail) = plan.decode_share_tail() else {
+        return Ok(None);
+    };
+    if tail.donors.is_empty() {
+        return Ok(None);
+    }
+    let device_base = device_base.ok_or(ExpertTierOwnerError::MissingBase(Placement::Device))?;
+    let host_alias =
+        host_device_alias.ok_or(ExpertTierOwnerError::MissingBase(Placement::HostMapped))?;
+    let host_cpu = host_cpu.ok_or(ExpertTierOwnerError::MissingBase(Placement::HostMapped))?;
+    if tail.borrow_entries.len() != TOTAL_EXPERTS {
+        return Err(decode_share_error(format!(
+            "borrow view has {} entries, expected {TOTAL_EXPERTS}",
+            tail.borrow_entries.len()
+        )));
+    }
+    let donor_end = tail
+        .donor_offset
+        .checked_add(tail.donor_bytes)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
+    let mirror_end = tail
+        .mirror_offset
+        .checked_add(tail.donor_bytes)
+        .ok_or(ExpertTierOwnerError::Overflow)?;
+    checked_extent(
+        Placement::Device,
+        tail.donor_offset,
+        tail.donor_bytes,
+        plan.owner_bytes(Placement::Device),
+    )?;
+    checked_extent(
+        Placement::HostMapped,
+        tail.mirror_offset,
+        tail.donor_bytes,
+        plan.owner_bytes(Placement::HostMapped),
+    )?;
+    for (id, borrow) in tail.borrow_entries.iter().enumerate() {
+        let resident_entry = plan
+            .entry(id / EXPERTS, id % EXPERTS)
+            .ok_or(ExpertTierOwnerError::Overflow)?;
+        if tail.donors.binary_search(&(id as u32)).is_err() {
+            if borrow != resident_entry {
+                return Err(decode_share_error(format!(
+                    "non-donor expert {id} differs between the resident and borrow views"
+                )));
+            }
+            continue;
+        }
+        if resident_entry.tier != Placement::Device || borrow.tier != Placement::HostMapped {
+            return Err(decode_share_error(format!(
+                "donor {id} is not Device in the resident view and HostMapped in the borrow view"
+            )));
+        }
+        for (device_offset, host_offset, len, borrow_len) in [
+            (
+                resident_entry.gate_up_offset,
+                borrow.gate_up_offset,
+                resident_entry.gate_up_len,
+                borrow.gate_up_len,
+            ),
+            (
+                resident_entry.down_offset,
+                borrow.down_offset,
+                resident_entry.down_len,
+                borrow.down_len,
+            ),
+        ] {
+            let device_rel = device_offset.checked_sub(tail.donor_offset);
+            let host_rel = host_offset.checked_sub(tail.mirror_offset);
+            let end_ok = device_offset
+                .checked_add(len)
+                .is_some_and(|end| end <= donor_end)
+                && host_offset
+                    .checked_add(len)
+                    .is_some_and(|end| end <= mirror_end);
+            if len != borrow_len || device_rel.is_none() || device_rel != host_rel || !end_ok {
+                return Err(decode_share_error(format!(
+                    "donor {id} does not map one-to-one onto the mirror window"
+                )));
+            }
+        }
+    }
+    let classes = &tail.class_donors;
+    if classes.is_empty()
+        || tail.class_spans.len() != classes.len()
+        || classes.windows(2).any(|pair| pair[0] > pair[1])
+        || classes.last() != Some(&tail.donors.len())
+    {
+        return Err(decode_share_error(format!(
+            "class donor counts {classes:?} are not nested and ending at the {} donors",
+            tail.donors.len()
+        )));
+    }
+    let mut views = Vec::with_capacity(classes.len());
+    for (class, &donors) in classes.iter().enumerate() {
+        // Class view: the Resident entries except donors `[0, donors)`
+        // (physical order), which read their mirror.
+        let mut entries = plan.entries().to_vec();
+        for &id in &tail.donors[..donors] {
+            entries[id as usize] = tail.borrow_entries[id as usize].clone();
+        }
+        let tables = build_tables_for(plan, &entries, Some(device_base), Some(host_alias))?;
+        if tables.codecs != resident.codecs {
+            return Err(decode_share_error(
+                "borrow and resident codec tables differ".to_string(),
+            ));
+        }
+        views.push(BorrowViewCpu {
+            digest: borrow_view_digest(plan.logical_digest(), class, donors, &entries),
+            entries,
+            tables,
+            donors,
+        });
+    }
+    let donor_bytes =
+        usize::try_from(tail.donor_bytes).map_err(|_| ExpertTierOwnerError::Overflow)?;
+    let ranges = DecodeShareRanges {
+        donor_device: (
+            checked_address(device_base, tail.donor_offset)?,
+            donor_bytes,
+        ),
+        mirror_cpu: (
+            host_cpu
+                .checked_add(
+                    usize::try_from(tail.mirror_offset)
+                        .map_err(|_| ExpertTierOwnerError::Overflow)?,
+                )
+                .ok_or(ExpertTierOwnerError::Overflow)?,
+            donor_bytes,
+        ),
+        mirror_alias: checked_address(host_alias, tail.mirror_offset)?,
+        donors: tail.donors.len(),
+        shadow_bytes: usize::try_from(tail.shadow_bytes)
+            .map_err(|_| ExpertTierOwnerError::Overflow)?,
+    };
+    Ok(Some(DecodeShareCpu {
+        views,
+        ranges,
+        donor_offset: tail.donor_offset,
+        class_spans: tail.class_spans.clone(),
+    }))
+}
+
+/// Compare the device donor bytes with `mirror` (whose length is the verified
+/// prefix) in bounded chunks. `read_device(chunk, offset)` fills `chunk` with
+/// the device donor bytes starting `offset` bytes into the donor tail.
+fn verify_tail_bytes(
+    mirror: &[u8],
+    mut read_device: impl FnMut(&mut [u8], usize) -> Result<(), String>,
+) -> Result<[u8; 32], String> {
+    let mut hash = Sha256::new();
+    let mut scratch = Vec::new();
+    let mut done = 0usize;
+    while done < mirror.len() {
+        let n = (mirror.len() - done).min(COPY_CHUNK_BYTES as usize);
+        scratch.resize(n, 0u8);
+        read_device(&mut scratch, done)?;
+        let expected = &mirror[done..done + n];
+        if scratch != expected {
+            let at = scratch
+                .iter()
+                .zip(expected)
+                .position(|(device, host)| device != host)
+                .unwrap_or(0);
+            return Err(format!(
+                "donor tail differs from its mirror at tail byte {}: device {:#04x}, mirror {:#04x}",
+                done + at,
+                scratch[at],
+                expected[at]
+            ));
+        }
+        hash.update(&scratch);
+        done += n;
+    }
+    Ok(hash.finalize().into())
+}
+
 /// The pinned host address is retained only for CPU copies and `hipHostFree`.
 /// Storing opaque addresses as integers follows Gpu's host-mapped registry and
 /// leaves ownership Send without adding an unsafe auto-trait implementation.
@@ -239,6 +534,9 @@ pub struct ExpertTierOwners {
     gate_up_table: Option<GpuTensor>,
     down_table: Option<GpuTensor>,
     codec_table: Option<GpuTensor>,
+    /// Device pointer tables of every BorrowPrefill class view: gate/up then
+    /// down, class by class.
+    borrow_tables: Vec<GpuTensor>,
     binding: Option<Arc<ExpertTierBinding>>,
     plan: Arc<ExpertTierPlan>,
     hip: Arc<HipRuntime>,
@@ -261,10 +559,15 @@ pub struct ExpertTierBinding {
     /// staging; `None` when no host payload exists.
     host_cpu_range: Option<(usize, usize)>,
     generation: u64,
+    /// The BorrowPrefill view, present when the plan carries donors.
+    decode_share: Option<DecodeShareBinding>,
     /// Raw SHA-256 (hex) of the hot-set sidecar, identity metadata bound once
     /// by the loader after materialization.
     hotset_sidecar_sha256: std::sync::OnceLock<String>,
     logical_digest: [u8; 32],
+    /// Set while one forward owns the donor tail's borrow protocol
+    /// ([`ExpertTierLease::claim_decode_share`]).
+    decode_share_claimed: std::sync::atomic::AtomicBool,
 }
 
 /// Cheap shared retention of a frozen materialized model binding.
@@ -284,7 +587,20 @@ const _: fn() = || {
 
 impl ExpertTierLease {
     pub fn layer(&self, layer: usize) -> Option<LayerExpertTierView<'_>> {
-        (layer < TRUNK_LAYERS as usize).then_some(LayerExpertTierView { lease: self, layer })
+        self.layer_view(layer, ExpertReadView::Resident)
+    }
+
+    /// One layer through a chosen read view; `None` for an out-of-range layer
+    /// or for `BorrowPrefill` on a lease that does not share.
+    pub fn layer_view(
+        &self,
+        layer: usize,
+        view: ExpertReadView,
+    ) -> Option<LayerExpertTierView<'_>> {
+        Some(LayerExpertTierView {
+            lease: self,
+            core: self.binding.layer_view(layer, view)?,
+        })
     }
 
     pub fn owner_bytes(&self, tier: Placement) -> u64 {
@@ -349,22 +665,299 @@ impl ExpertTierLease {
     pub fn hotset_sidecar_sha256(&self) -> Option<&str> {
         self.binding.hotset_sidecar_sha256.get().map(String::as_str)
     }
+
+    /// Donors each BorrowPrefill class view reads from the mirror (nested,
+    /// ascending; the last is the donor count); empty without donors.
+    pub fn borrow_class_donors(&self) -> Vec<usize> {
+        self.binding
+            .decode_share
+            .as_ref()
+            .map(|share| share.views.iter().map(|view| view.donors).collect())
+            .unwrap_or_default()
+    }
+
+    /// Number of BorrowPrefill class views (0 without donors).
+    pub fn borrow_classes(&self) -> usize {
+        self.binding
+            .decode_share
+            .as_ref()
+            .map_or(0, |share| share.views.len())
+    }
+
+    /// Dirty byte prefix of each BorrowPrefill class view (ascending; empty
+    /// without donors).
+    pub fn borrow_class_spans(&self) -> Vec<u64> {
+        self.binding
+            .decode_share
+            .as_ref()
+            .map(|share| share.class_spans.clone())
+            .unwrap_or_default()
+    }
+
+    /// The decode-share donor/mirror ranges, read without locking; `None`
+    /// unless the plan carries a donor tail with at least one donor.
+    pub fn decode_share(&self) -> Option<DecodeShareRanges> {
+        self.binding.decode_share.as_ref().map(|share| share.ranges)
+    }
+
+    /// Digest of one read view: the plan's logical digest for `Resident`, the
+    /// BorrowPrefill digest for `BorrowPrefill` (`None` on a non-sharing lease).
+    pub fn view_digest(&self, view: ExpertReadView) -> Option<[u8; 32]> {
+        self.binding.view_digest(view)
+    }
+
+    /// Claim the donor tail for one forward: while the claim lives, no other
+    /// forward may borrow it (two forwards would dirty the same bytes under
+    /// each other's loan state). `Err` when the lease carries no donor tail or
+    /// is already claimed. Dropping the claim releases it and retains the
+    /// lease, so the owners outlive every GPU use the claimant made.
+    pub fn claim_decode_share(&self) -> Result<DecodeShareClaim, String> {
+        if self.binding.decode_share.is_none() {
+            return Err("the tier lease carries no decode-share donor tail".to_string());
+        }
+        if !self.binding.try_claim_decode_share() {
+            return Err(
+                "the decode-share donor tail is already claimed by another forward".to_string(),
+            );
+        }
+        Ok(DecodeShareClaim {
+            lease: self.clone(),
+        })
+    }
+
+    /// Debug/gate oracle: synchronize the device, copy the first
+    /// `prefix_bytes` of the donor tail back in bounded chunks and compare
+    /// them byte-for-byte with the pinned mirror. Returns the SHA-256 of the
+    /// donor bytes, or an error naming the first differing offset.
+    pub fn verify_donor_tail(
+        &self,
+        gpu: &mut Gpu,
+        prefix_bytes: usize,
+    ) -> Result<[u8; 32], String> {
+        let share = self
+            .binding
+            .decode_share
+            .as_ref()
+            .ok_or_else(|| "lease carries no decode-share donor tail".to_string())?;
+        let (mirror_cpu, donor_bytes) = share.ranges.mirror_cpu;
+        if prefix_bytes > donor_bytes {
+            return Err(format!(
+                "donor tail prefix {prefix_bytes} exceeds the {donor_bytes}-byte donor extent"
+            ));
+        }
+        gpu.bind_thread().map_err(|error| error.to_string())?;
+        let owners = self
+            .owners
+            .lock()
+            .map_err(|_| "expert tier owners lock poisoned".to_string())?;
+        owners
+            .hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let device = owners
+            .device
+            .as_ref()
+            .ok_or_else(|| "decode-share lease has no device owner".to_string())?;
+        let donor_offset =
+            usize::try_from(share.donor_offset).map_err(|_| "donor offset overflow".to_string())?;
+        // SAFETY: `mirror_cpu` designates `donor_bytes` bytes of the pinned
+        // host owner kept alive by `owners` (locked above); nothing writes the
+        // mirror after materialization.
+        let mirror = unsafe { std::slice::from_raw_parts(mirror_cpu as *const u8, prefix_bytes) };
+        verify_tail_bytes(mirror, |chunk, offset| {
+            owners
+                .hip
+                .memcpy_dtoh_at(chunk, device, donor_offset + offset)
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+/// Exclusive ownership of a lease's donor tail ([`ExpertTierLease::claim_decode_share`]).
+pub struct DecodeShareClaim {
+    lease: ExpertTierLease,
+}
+
+impl DecodeShareClaim {
+    pub fn lease(&self) -> &ExpertTierLease {
+        &self.lease
+    }
+}
+
+impl Drop for DecodeShareClaim {
+    fn drop(&mut self) {
+        self.lease.binding.release_decode_share_claim();
+    }
+}
+
+/// Which expert table set a read goes through.
+///
+/// `Resident` is the canonical placement: every table entry points at the
+/// expert's own tier owner. `BorrowPrefill(class)` exists only on a
+/// decode-share lease: the first `n_class` donors (physical order; the donors
+/// that prefill capacity class `class` can overwrite) point at the pinned host
+/// mirror, every other entry is identical to `Resident`. Class views are
+/// nested; the last class is the all-donors view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertReadView {
+    Resident,
+    BorrowPrefill(usize),
+}
+
+impl ExpertTierBinding {
+    /// Take the donor-tail claim; `false` when it is already held.
+    fn try_claim_decode_share(&self) -> bool {
+        self.decode_share_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn release_decode_share_claim(&self) {
+        self.decode_share_claimed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Digest of one read view; `None` for `BorrowPrefill` without donors or
+    /// past the last class.
+    fn view_digest(&self, view: ExpertReadView) -> Option<[u8; 32]> {
+        match view {
+            ExpertReadView::Resident => Some(self.logical_digest),
+            ExpertReadView::BorrowPrefill(class) => self
+                .decode_share
+                .as_ref()
+                .and_then(|share| share.views.get(class))
+                .map(|view| view.digest),
+        }
+    }
+
+    /// One layer of one view; `None` for an out-of-range layer or for
+    /// `BorrowPrefill(class)` on a binding without donors or past its classes.
+    fn layer_view(&self, layer: usize, view: ExpertReadView) -> Option<BindingLayerView<'_>> {
+        if layer >= TRUNK_LAYERS as usize {
+            return None;
+        }
+        if let ExpertReadView::BorrowPrefill(class) = view {
+            if self.decode_share.as_ref()?.views.get(class).is_none() {
+                return None;
+            }
+        }
+        Some(BindingLayerView {
+            binding: self,
+            layer,
+            view,
+        })
+    }
+}
+
+/// The CPU-only core of a layer view: every table read goes through the
+/// selected view's data. [`LayerExpertTierView`] adds the lease retention.
+#[derive(Clone, Copy)]
+struct BindingLayerView<'a> {
+    binding: &'a ExpertTierBinding,
+    layer: usize,
+    view: ExpertReadView,
+}
+
+impl<'a> BindingLayerView<'a> {
+    fn entry(&self, eid: usize) -> Option<&'a ExpertTierEntry> {
+        match self.view {
+            ExpertReadView::Resident => self.binding.plan.entry(self.layer, eid),
+            ExpertReadView::BorrowPrefill(_) => {
+                if eid >= EXPERTS {
+                    return None;
+                }
+                self.borrow().entries.get(self.layer * EXPERTS + eid)
+            }
+        }
+    }
+
+    /// The class view a `BorrowPrefill(class)` layer reads.
+    fn borrow(&self) -> &'a BorrowView {
+        let ExpertReadView::BorrowPrefill(class) = self.view else {
+            unreachable!("borrow() is only called on a BorrowPrefill view");
+        };
+        self.binding
+            .decode_share
+            .as_ref()
+            .and_then(|share| share.views.get(class))
+            .expect("a BorrowPrefill class view exists only on a decode-share binding")
+    }
+
+    fn tables(&self) -> &'a Tables {
+        match self.view {
+            ExpertReadView::Resident => &self.binding.tables,
+            ExpertReadView::BorrowPrefill(_) => &self.borrow().tables,
+        }
+    }
+
+    fn gate_up_table_base(&self) -> usize {
+        match self.view {
+            ExpertReadView::Resident => self.binding.gate_up_table_base,
+            ExpertReadView::BorrowPrefill(_) => self.borrow().gate_up_table_base,
+        }
+    }
+
+    fn down_table_base(&self) -> usize {
+        match self.view {
+            ExpertReadView::Resident => self.binding.down_table_base,
+            ExpertReadView::BorrowPrefill(_) => self.borrow().down_table_base,
+        }
+    }
+
+    fn gate_up_ptrs(&self) -> &'a [usize] {
+        let start = self.layer * EXPERTS;
+        &self.tables().gate_up[start..start + EXPERTS]
+    }
+
+    fn down_ptrs(&self) -> &'a [usize] {
+        let start = self.layer * EXPERTS;
+        &self.tables().down[start..start + EXPERTS]
+    }
+
+    fn codec_table(&self) -> &'a [u8] {
+        // Codecs are identical in both views (asserted at materialization).
+        let start = self.layer * EXPERTS;
+        &self.binding.tables.codecs[start..start + EXPERTS]
+    }
+
+    fn any_host(&self) -> bool {
+        (0..EXPERTS)
+            .any(|eid| self.entry(eid).map(|entry| entry.tier) == Some(Placement::HostMapped))
+    }
 }
 
 /// Borrowed frozen tables for one layer, in original eid order. GPU sub-views
 /// are non-owning: never free them, and retain `lease()` across pending GPU work.
 pub struct LayerExpertTierView<'a> {
     lease: &'a ExpertTierLease,
-    layer: usize,
+    core: BindingLayerView<'a>,
 }
 
 impl<'a> LayerExpertTierView<'a> {
     pub fn layer(&self) -> usize {
-        self.layer
+        self.core.layer
+    }
+
+    pub fn view(&self) -> ExpertReadView {
+        self.core.view
+    }
+
+    /// Digest of this view: the plan's logical digest for `Resident`, the
+    /// BorrowPrefill digest for `BorrowPrefill`.
+    pub fn view_digest(&self) -> [u8; 32] {
+        self.lease
+            .binding
+            .view_digest(self.core.view)
+            .expect("a layer view exists only for a view its lease carries")
     }
 
     pub fn entry(&self, eid: usize) -> Option<&'a ExpertTierEntry> {
-        self.lease.binding.plan.entry(self.layer, eid)
+        self.core.entry(eid)
     }
 
     pub fn placement(&self, eid: usize) -> Option<Placement> {
@@ -372,30 +965,27 @@ impl<'a> LayerExpertTierView<'a> {
     }
 
     pub fn any_host(&self) -> bool {
-        (0..EXPERTS).any(|eid| self.placement(eid) == Some(Placement::HostMapped))
+        self.core.any_host()
     }
 
     pub fn gate_up_ptrs(&self) -> &'a [usize] {
-        let start = self.layer * EXPERTS;
-        &self.lease.binding.tables.gate_up[start..start + EXPERTS]
+        self.core.gate_up_ptrs()
     }
 
     pub fn down_ptrs(&self) -> &'a [usize] {
-        let start = self.layer * EXPERTS;
-        &self.lease.binding.tables.down[start..start + EXPERTS]
+        self.core.down_ptrs()
     }
 
     pub fn codec_table(&self) -> &'a [u8] {
-        let start = self.layer * EXPERTS;
-        &self.lease.binding.tables.codecs[start..start + EXPERTS]
+        self.core.codec_table()
     }
 
     pub fn gate_up_ptrs_device(&self) -> GpuTensor {
-        self.pointer_table_view(self.lease.binding.gate_up_table_base)
+        self.pointer_table_view(self.core.gate_up_table_base())
     }
 
     pub fn down_ptrs_device(&self) -> GpuTensor {
-        self.pointer_table_view(self.lease.binding.down_table_base)
+        self.pointer_table_view(self.core.down_table_base())
     }
 
     pub fn codec_table_device(&self) -> GpuTensor {
@@ -404,7 +994,7 @@ impl<'a> LayerExpertTierView<'a> {
             TOTAL_EXPERTS,
             DType::Raw,
         )
-        .sub_offset(self.layer * EXPERTS, EXPERTS)
+        .sub_offset(self.core.layer * EXPERTS, EXPERTS)
     }
 
     pub fn lease(&self) -> ExpertTierLease {
@@ -425,7 +1015,7 @@ impl<'a> LayerExpertTierView<'a> {
         // Existing MoE pointer tensors use two F32 storage elements per u64
         // address. F32 is metadata only: kernels read absolute 64-bit pointers.
         borrowed_table(base, 2 * TOTAL_EXPERTS, DType::F32)
-            .sub_offset(2 * self.layer * EXPERTS, 2 * EXPERTS)
+            .sub_offset(2 * self.core.layer * EXPERTS, 2 * EXPERTS)
     }
 }
 
@@ -925,6 +1515,9 @@ impl Drop for ExpertTierOwners {
                 let _ = self.hip.free(table.buf);
             }
         }
+        for table in self.borrow_tables.drain(..) {
+            let _ = self.hip.free(table.buf);
+        }
         if let Some(owner) = self.device.take() {
             let _ = self.hip.free(owner);
         }
@@ -986,6 +1579,7 @@ fn materialize_impl<'src>(
         down_table: None,
         codec_table: None,
         binding: None,
+        borrow_tables: Vec::new(),
         plan,
         hip,
         device_id: gpu.device_id,
@@ -999,6 +1593,16 @@ fn materialize_impl<'src>(
             .device
             .as_ref()
             .map(|owner| owner.as_ptr() as usize as u64),
+        owners.host.as_ref().map(|owner| owner.device_alias),
+    )?;
+    let decode_share_cpu = build_decode_share(
+        &owners.plan,
+        &tables,
+        owners
+            .device
+            .as_ref()
+            .map(|owner| owner.as_ptr() as usize as u64),
+        owners.host.as_ref().map(|owner| owner.cpu_address),
         owners.host.as_ref().map(|owner| owner.device_alias),
     )?;
     if let Some(source) = direct_source {
@@ -1103,8 +1707,54 @@ fn materialize_impl<'src>(
             ));
         }
     }
+    let decode_share = match decode_share_cpu {
+        Some(cpu) => {
+            let mut views = Vec::with_capacity(cpu.views.len());
+            for view in cpu.views {
+                // Each table is owned by `owners` as soon as it is allocated: an
+                // error below frees every table with the owners.
+                let mut bases = [0usize; 2];
+                for (base, pointers) in bases
+                    .iter_mut()
+                    .zip([&view.tables.gate_up, &view.tables.down])
+                {
+                    owners.borrow_tables.push(GpuTensor {
+                        buf: owners
+                            .hip
+                            .malloc(TOTAL_EXPERTS * 8)
+                            .map_err(runtime_error)?,
+                        shape: vec![2 * TOTAL_EXPERTS],
+                        dtype: DType::F32,
+                    });
+                    let table = owners.borrow_tables.last().expect("pushed above");
+                    owners
+                        .hip
+                        .memcpy_htod(&table.buf, pointer_bytes(pointers))
+                        .map_err(runtime_error)?;
+                    *base = table.buf.as_ptr() as usize;
+                }
+                views.push(BorrowView {
+                    entries: view.entries,
+                    tables: view.tables,
+                    gate_up_table_base: bases[0],
+                    down_table_base: bases[1],
+                    donors: view.donors,
+                    digest: view.digest,
+                });
+            }
+            owners.hip.device_synchronize().map_err(runtime_error)?;
+            Some(DecodeShareBinding {
+                views,
+                ranges: cpu.ranges,
+                donor_offset: cpu.donor_offset,
+                class_spans: cpu.class_spans,
+            })
+        }
+        None => None,
+    };
     let binding = Arc::new(ExpertTierBinding {
         hotset_sidecar_sha256: std::sync::OnceLock::new(),
+        decode_share_claimed: std::sync::atomic::AtomicBool::new(false),
         owner_ranges,
         host_cpu_range: owners
             .host
@@ -1113,6 +1763,7 @@ fn materialize_impl<'src>(
         logical_digest: owners.plan.logical_digest(),
         plan: owners.plan.clone(),
         tables,
+        decode_share,
         gate_up_table_base: owners
             .gate_up_table
             .as_ref()
@@ -2074,5 +2725,580 @@ mod tests {
         drop(source);
         drop(hfq);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod decode_share_tests {
+    use super::*;
+    use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+    use crate::expert_tier_plan::plan_expert_tiers_from_slabs;
+
+    const TOTAL: usize = 48 * 512;
+    const GU: usize = 1000; // pads to 1024
+    const DN: usize = 500; // pads to 512
+    const PADDED: u64 = 1024 + 512;
+    const DEV_BASE: u64 = 0x0000_7000_0000_0000;
+    const HOST_ALIAS: u64 = 0x0000_5000_1000_0100;
+    const HOST_CPU: usize = 0x0000_6000_0000_0000;
+
+    fn tail() -> u64 {
+        ((ARENA_TAIL_PAD_BYTES as u64).max(256) + 255) & !255
+    }
+
+    fn format_cycle() -> Vec<ExpertSlab> {
+        let mut cursor = 0usize;
+        (0..TOTAL)
+            .map(|i| {
+                let format = match i % 3 {
+                    0 => ExpertFormat::Mq4Xts,
+                    1 => ExpertFormat::Mq3I4,
+                    _ => ExpertFormat::Mq2I4,
+                };
+                let gate_up = ExpertSlabSpan {
+                    offset: cursor,
+                    len: GU,
+                };
+                cursor += GU;
+                let down = ExpertSlabSpan {
+                    offset: cursor,
+                    len: DN,
+                };
+                cursor += DN;
+                ExpertSlab {
+                    format,
+                    gate_up,
+                    down,
+                }
+            })
+            .collect()
+    }
+
+    /// Four resident experts of different layers (all layers keep host experts).
+    fn plain_plan() -> (ExpertTierPlan, Vec<u32>) {
+        let rank = vec![0u32, 5, 600, 24_575];
+        let budget = rank.len() as u64 * PADDED + tail();
+        let plan = plan_expert_tiers_from_slabs(&format_cycle(), &rank, budget).unwrap();
+        assert_eq!(plan.device_experts(), 4);
+        (plan, rank)
+    }
+
+    fn shared_plan() -> ExpertTierPlan {
+        let (plan, rank) = plain_plan();
+        let (shared, tail_info) = plan.with_decode_share(&rank, 2 * PADDED).unwrap();
+        assert_eq!(tail_info.donors, vec![600, 24_575]);
+        shared
+    }
+
+    fn cpu_share(plan: &ExpertTierPlan) -> DecodeShareCpu {
+        let resident = build_tables(plan, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        build_decode_share(
+            plan,
+            &resident,
+            Some(DEV_BASE),
+            Some(HOST_CPU),
+            Some(HOST_ALIAS),
+        )
+        .unwrap()
+        .expect("sharing plan")
+    }
+
+    #[test]
+    fn decode_share_borrow_tables_map_donors_to_the_mirror_and_nothing_else() {
+        let plan = shared_plan();
+        let tail_info = plan.decode_share_tail().unwrap().clone();
+        let resident = build_tables(&plan, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        let share = cpu_share(&plan);
+        assert_eq!(share.views[0].tables.codecs, resident.codecs);
+        for id in 0..TOTAL {
+            let is_donor = tail_info.donors.contains(&(id as u32));
+            if is_donor {
+                let b = &tail_info.borrow_entries[id];
+                assert_eq!(b.tier, Placement::HostMapped);
+                assert_eq!(
+                    share.views[0].tables.gate_up[id] as u64,
+                    HOST_ALIAS + b.gate_up_offset
+                );
+                assert_eq!(
+                    share.views[0].tables.down[id] as u64,
+                    HOST_ALIAS + b.down_offset
+                );
+                // Mirror offsets equal the device offsets shifted by the window.
+                let r = plan.entry(id / 512, id % 512).unwrap();
+                assert_eq!(
+                    b.gate_up_offset - tail_info.mirror_offset,
+                    r.gate_up_offset - tail_info.donor_offset
+                );
+                assert_eq!(
+                    b.down_offset - tail_info.mirror_offset,
+                    r.down_offset - tail_info.donor_offset
+                );
+                assert_ne!(share.views[0].tables.gate_up[id], resident.gate_up[id]);
+            } else {
+                assert_eq!(
+                    share.views[0].tables.gate_up[id], resident.gate_up[id],
+                    "{id}"
+                );
+                assert_eq!(share.views[0].tables.down[id], resident.down[id], "{id}");
+            }
+        }
+        // Layers with a host expert keep their `any_host` bit in both views.
+        for layer in 0..48usize {
+            let any = |entries: &dyn Fn(usize) -> Placement| {
+                (0..512).any(|e| entries(layer * 512 + e) == Placement::HostMapped)
+            };
+            let resident_any = any(&|i| plan.entry(i / 512, i % 512).unwrap().tier);
+            let borrow_any = any(&|i| tail_info.borrow_entries[i].tier);
+            assert_eq!(resident_any, borrow_any, "layer {layer}");
+        }
+        // Mirror alias / donor range arithmetic.
+        let ranges = share.ranges;
+        assert_eq!(ranges.donors, 2);
+        assert_eq!(
+            ranges.donor_device,
+            (
+                (DEV_BASE + tail_info.donor_offset) as usize,
+                tail_info.donor_bytes as usize
+            )
+        );
+        assert_eq!(
+            ranges.mirror_cpu,
+            (
+                HOST_CPU + tail_info.mirror_offset as usize,
+                tail_info.donor_bytes as usize
+            )
+        );
+        assert_eq!(
+            ranges.mirror_alias,
+            (HOST_ALIAS + tail_info.mirror_offset) as usize
+        );
+        assert_eq!(share.donor_offset, tail_info.donor_offset);
+    }
+
+    #[test]
+    fn decode_share_borrow_digest_differs_from_resident_and_is_stable() {
+        let plan = shared_plan();
+        let a = cpu_share(&plan).views[0].digest;
+        let b = cpu_share(&plan).views[0].digest;
+        assert_eq!(a, b);
+        assert_ne!(a, plan.logical_digest());
+        // A different donor set changes the digest.
+        let (base, rank) = plain_plan();
+        let (other, _) = base.with_decode_share(&rank, PADDED).unwrap();
+        assert_ne!(cpu_share(&other).views[0].digest, a);
+        // The digest covers the entries, so it is a function of them.
+        let tail_info = plan.decode_share_tail().unwrap();
+        assert_eq!(
+            a,
+            borrow_view_digest(plan.logical_digest(), 0, 2, &tail_info.borrow_entries)
+        );
+        assert_ne!(
+            a,
+            borrow_view_digest(plan.logical_digest(), 0, 2, plan.entries()),
+            "the resident entries must not reproduce the borrow digest"
+        );
+    }
+
+    #[test]
+    fn decode_share_non_sharing_plan_has_no_borrow_view() {
+        let (plan, _) = plain_plan();
+        let resident = build_tables(&plan, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        assert!(build_decode_share(
+            &plan,
+            &resident,
+            Some(DEV_BASE),
+            Some(HOST_CPU),
+            Some(HOST_ALIAS)
+        )
+        .unwrap()
+        .is_none());
+        // Resident build over the plan's own entries is the same call.
+        let again =
+            build_tables_for(&plan, plan.entries(), Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        assert_eq!(again.gate_up, resident.gate_up);
+        assert_eq!(again.down, resident.down);
+        assert_eq!(again.codecs, resident.codecs);
+        // A need-0 share is an empty tail: still no borrow view.
+        let (plan, rank) = plain_plan();
+        let (zero, _) = plan.with_decode_share(&rank, 0).unwrap();
+        let resident = build_tables(&zero, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        assert!(build_decode_share(
+            &zero,
+            &resident,
+            Some(DEV_BASE),
+            Some(HOST_CPU),
+            Some(HOST_ALIAS)
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn decode_share_build_requires_bases_and_rejects_short_entry_lists() {
+        let plan = shared_plan();
+        let resident = build_tables(&plan, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        for (device, cpu, alias, tier) in [
+            (None, Some(HOST_CPU), Some(HOST_ALIAS), Placement::Device),
+            (
+                Some(DEV_BASE),
+                None,
+                Some(HOST_ALIAS),
+                Placement::HostMapped,
+            ),
+            (Some(DEV_BASE), Some(HOST_CPU), None, Placement::HostMapped),
+        ] {
+            match build_decode_share(&plan, &resident, device, cpu, alias) {
+                Err(ExpertTierOwnerError::MissingBase(t)) => assert_eq!(t, tier),
+                other => panic!("expected MissingBase({tier:?}), got {:?}", other.err()),
+            }
+        }
+        assert!(matches!(
+            build_tables_for(
+                &plan,
+                &plan.entries()[1..],
+                Some(DEV_BASE),
+                Some(HOST_ALIAS)
+            ),
+            Err(ExpertTierOwnerError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn decode_share_verify_tail_bytes_compares_hashes_and_names_the_first_difference() {
+        let n = (COPY_CHUNK_BYTES as usize) * 2 + 4097;
+        let mirror: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+        let device = mirror.clone();
+        let read = |data: &Vec<u8>| {
+            let data = data.clone();
+            move |chunk: &mut [u8], offset: usize| {
+                chunk.copy_from_slice(&data[offset..offset + chunk.len()]);
+                Ok(())
+            }
+        };
+        let digest = verify_tail_bytes(&mirror, read(&device)).unwrap();
+        let want: [u8; 32] = Sha256::digest(&mirror).into();
+        assert_eq!(digest, want);
+        // Prefix verification hashes only the prefix.
+        let prefix = &mirror[..1000];
+        let want: [u8; 32] = Sha256::digest(prefix).into();
+        assert_eq!(verify_tail_bytes(prefix, read(&device)).unwrap(), want);
+        assert_eq!(
+            verify_tail_bytes(&[], read(&device)).unwrap(),
+            <[u8; 32]>::from(Sha256::digest([]))
+        );
+        // A corrupted byte in the second chunk is reported by its tail offset.
+        let bad_at = COPY_CHUNK_BYTES as usize + 123;
+        let mut bad = device.clone();
+        bad[bad_at] ^= 0xff;
+        let error = verify_tail_bytes(&mirror, read(&bad)).unwrap_err();
+        assert!(error.contains(&format!("tail byte {bad_at}:")), "{error}");
+        // A read failure propagates.
+        let error =
+            verify_tail_bytes(&mirror, |_: &mut [u8], _| Err("boom".to_string())).unwrap_err();
+        assert_eq!(error, "boom");
+    }
+
+    /// A frozen binding over fake (never dereferenced) table addresses: the
+    /// view logic is GPU-free, so no lease or HIP runtime is needed.
+    fn fake_binding(plan: ExpertTierPlan) -> ExpertTierBinding {
+        let plan = Arc::new(plan);
+        let tables = build_tables(&plan, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        let decode_share = build_decode_share(
+            &plan,
+            &tables,
+            Some(DEV_BASE),
+            Some(HOST_CPU),
+            Some(HOST_ALIAS),
+        )
+        .unwrap()
+        .map(|cpu| {
+            let views = cpu
+                .views
+                .into_iter()
+                .enumerate()
+                .map(|(class, view)| {
+                    // Class 0 keeps the single-view addresses; each class owns its own pair.
+                    let bases = (
+                        0x1000_0000usize + class * 0x0010_0000,
+                        0x2000_0000usize + class * 0x0010_0000,
+                    );
+                    BorrowView {
+                        entries: view.entries,
+                        tables: view.tables,
+                        gate_up_table_base: bases.0,
+                        down_table_base: bases.1,
+                        donors: view.donors,
+                        digest: view.digest,
+                    }
+                })
+                .collect();
+            DecodeShareBinding {
+                views,
+                ranges: cpu.ranges,
+                donor_offset: cpu.donor_offset,
+                class_spans: cpu.class_spans,
+            }
+        });
+        ExpertTierBinding {
+            logical_digest: plan.logical_digest(),
+            plan,
+            tables,
+            decode_share,
+            gate_up_table_base: 0x3000_0000,
+            down_table_base: 0x4000_0000,
+            codec_table_base: 0x5000_0000,
+            owner_ranges: [None; 2],
+            host_cpu_range: None,
+            generation: 1,
+            hotset_sidecar_sha256: std::sync::OnceLock::new(),
+            decode_share_claimed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn decode_share_claim_is_exclusive_and_released() {
+        let binding = fake_binding(shared_plan());
+        assert!(binding.try_claim_decode_share());
+        assert!(!binding.try_claim_decode_share(), "a second claim refuses");
+        binding.release_decode_share_claim();
+        assert!(
+            binding.try_claim_decode_share(),
+            "released claims can be retaken"
+        );
+    }
+
+    #[test]
+    fn decode_share_layer_views_select_their_own_tables() {
+        let plan = shared_plan();
+        let tail_info = plan.decode_share_tail().unwrap().clone();
+        let binding = fake_binding(plan.clone());
+        assert!(binding.decode_share.is_some());
+        assert_eq!(
+            binding.view_digest(ExpertReadView::Resident),
+            Some(plan.logical_digest())
+        );
+        let borrow_digest = binding
+            .view_digest(ExpertReadView::BorrowPrefill(0))
+            .unwrap();
+        assert_ne!(borrow_digest, plan.logical_digest());
+        assert!(binding.layer_view(48, ExpertReadView::Resident).is_none());
+        assert!(binding
+            .layer_view(48, ExpertReadView::BorrowPrefill(0))
+            .is_none());
+        let donor = 24_575usize; // layer 47, expert 511
+        let (layer, expert) = (donor / 512, donor % 512);
+        let resident = binding.layer_view(layer, ExpertReadView::Resident).unwrap();
+        let borrow = binding
+            .layer_view(layer, ExpertReadView::BorrowPrefill(0))
+            .unwrap();
+        assert_eq!(resident.view, ExpertReadView::Resident);
+        assert_eq!(borrow.view, ExpertReadView::BorrowPrefill(0));
+        assert_eq!(
+            resident.entry(expert).map(|entry| entry.tier),
+            Some(Placement::Device)
+        );
+        assert_eq!(
+            borrow.entry(expert).map(|entry| entry.tier),
+            Some(Placement::HostMapped)
+        );
+        assert_eq!(borrow.entry(expert), Some(&tail_info.borrow_entries[donor]));
+        assert_eq!(resident.entry(expert), plan.entry(layer, expert));
+        assert!(borrow.entry(512).is_none());
+        assert_eq!(resident.any_host(), borrow.any_host());
+        assert_eq!(resident.codec_table(), borrow.codec_table());
+        assert_ne!(
+            resident.gate_up_ptrs()[expert],
+            borrow.gate_up_ptrs()[expert]
+        );
+        assert_eq!(
+            borrow.gate_up_ptrs()[expert] as u64,
+            HOST_ALIAS + tail_info.borrow_entries[donor].gate_up_offset
+        );
+        assert_eq!(
+            borrow.down_ptrs()[expert] as u64,
+            HOST_ALIAS + tail_info.borrow_entries[donor].down_offset
+        );
+        // A non-donor expert reads the same bytes in both views.
+        assert_eq!(resident.gate_up_ptrs()[0], borrow.gate_up_ptrs()[0]);
+        assert_eq!(resident.down_ptrs()[0], borrow.down_ptrs()[0]);
+        assert_eq!(resident.entry(0), borrow.entry(0));
+        // Each view owns its own device pointer tables; codecs are shared.
+        assert_eq!(resident.gate_up_table_base(), 0x3000_0000);
+        assert_eq!(borrow.gate_up_table_base(), 0x1000_0000);
+        assert_eq!(resident.down_table_base(), 0x4000_0000);
+        assert_eq!(borrow.down_table_base(), 0x2000_0000);
+        // The `any_host` bit of every layer is identical between the views.
+        for layer in 0..48 {
+            let r = binding.layer_view(layer, ExpertReadView::Resident).unwrap();
+            let b = binding
+                .layer_view(layer, ExpertReadView::BorrowPrefill(0))
+                .unwrap();
+            assert_eq!(r.any_host(), b.any_host(), "layer {layer}");
+        }
+    }
+
+    /// The n_c table: donors whose device extent starts below the class span,
+    /// nested, ending at every donor, a partial overlap counting its donor.
+    #[test]
+    fn decode_share_class_donor_counts_are_nested_and_count_a_partial_overlap() {
+        let (plan, rank) = plain_plan();
+        let (shared, tail_info) = plan.with_decode_share(&rank, 2 * PADDED).unwrap();
+        // Without classes: one all-donors view.
+        assert_eq!(tail_info.class_spans, vec![2 * PADDED]);
+        assert_eq!(tail_info.class_donors, vec![2]);
+        // Donor k starts at k * PADDED in the tail.
+        for (span, want) in [
+            (0, 0),
+            (1, 1),
+            (PADDED, 1),
+            (PADDED + 1, 2),
+            (2 * PADDED, 2),
+        ] {
+            assert_eq!(tail_info.donors_dirtied_by(span), want, "span {span}");
+        }
+        let classed = shared
+            .clone()
+            .with_decode_share_classes(&[PADDED / 2, PADDED, PADDED + 1, 2 * PADDED])
+            .unwrap();
+        let tail_info = classed.decode_share_tail().unwrap();
+        assert_eq!(tail_info.class_donors, vec![1, 1, 2, 2]);
+        assert_eq!(
+            tail_info.class_spans,
+            vec![PADDED / 2, PADDED, PADDED + 1, 2 * PADDED]
+        );
+        // The class set never changes the plan itself.
+        assert_eq!(classed.logical_digest(), shared.logical_digest());
+        for bad in [&[][..], &[PADDED, 1][..], &[3 * PADDED][..], &[PADDED][..]] {
+            assert!(
+                matches!(
+                    shared.clone().with_decode_share_classes(bad),
+                    Err(crate::expert_tier_plan::DecodeShareError::BadClasses(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // A plan without donors ignores classes.
+        let (plain, _) = plain_plan();
+        assert!(plain
+            .with_decode_share_classes(&[PADDED])
+            .unwrap()
+            .decode_share_tail()
+            .is_none());
+    }
+
+    /// Class views differ from the Resident view exactly at donors `[0, n_c)`;
+    /// the largest is the all-donors borrow view; digests are distinct; every
+    /// layer's host bit is identical in all of them.
+    #[test]
+    fn decode_share_class_views_differ_from_resident_exactly_at_their_donors() {
+        let (plan, rank) = plain_plan();
+        let (shared, _) = plan.with_decode_share(&rank, 2 * PADDED).unwrap();
+        let classed = shared
+            .with_decode_share_classes(&[PADDED, 2 * PADDED])
+            .unwrap();
+        let tail_info = classed.decode_share_tail().unwrap().clone();
+        assert_eq!(tail_info.donors, vec![600, 24_575]);
+        assert_eq!(tail_info.class_donors, vec![1, 2]);
+        let resident = build_tables(&classed, Some(DEV_BASE), Some(HOST_ALIAS)).unwrap();
+        let share = cpu_share(&classed);
+        assert_eq!(share.views.len(), 2);
+        assert_eq!(share.class_spans, vec![PADDED, 2 * PADDED]);
+        for (class, view) in share.views.iter().enumerate() {
+            assert_eq!(view.donors, tail_info.class_donors[class]);
+            for id in 0..TOTAL {
+                let dirty = tail_info.donors[..view.donors].contains(&(id as u32));
+                let want = if dirty {
+                    &tail_info.borrow_entries[id]
+                } else {
+                    &classed.entries()[id]
+                };
+                assert_eq!(&view.entries[id], want, "class {class} expert {id}");
+                assert_eq!(
+                    view.tables.gate_up[id] != resident.gate_up[id],
+                    dirty,
+                    "class {class} expert {id}"
+                );
+                assert_eq!(view.tables.down[id] != resident.down[id], dirty);
+            }
+            assert_eq!(view.tables.codecs, resident.codecs);
+        }
+        // The largest class is today's all-donors view.
+        assert_eq!(share.views[1].entries, tail_info.borrow_entries);
+        // Digests differ per class and from the resident digest.
+        let (d0, d1) = (share.views[0].digest, share.views[1].digest);
+        assert_ne!(d0, d1);
+        assert_ne!(d0, classed.logical_digest());
+        assert_ne!(d1, classed.logical_digest());
+        assert_eq!(
+            d1,
+            borrow_view_digest(classed.logical_digest(), 1, 2, &tail_info.borrow_entries)
+        );
+
+        // Through the binding: layer views select their class and share the host bit.
+        let binding = fake_binding(classed.clone());
+        assert_eq!(
+            binding.view_digest(ExpertReadView::BorrowPrefill(0)),
+            Some(d0)
+        );
+        assert_eq!(
+            binding.view_digest(ExpertReadView::BorrowPrefill(1)),
+            Some(d1)
+        );
+        assert!(binding
+            .view_digest(ExpertReadView::BorrowPrefill(2))
+            .is_none());
+        assert!(binding
+            .layer_view(0, ExpertReadView::BorrowPrefill(2))
+            .is_none());
+        // Donor 600 (layer 1, expert 88) is dirty in both; donor 24,575 only in class 1.
+        let c0 = binding
+            .layer_view(47, ExpertReadView::BorrowPrefill(0))
+            .unwrap();
+        let c1 = binding
+            .layer_view(47, ExpertReadView::BorrowPrefill(1))
+            .unwrap();
+        assert_eq!(c0.entry(511).map(|e| e.tier), Some(Placement::Device));
+        assert_eq!(c1.entry(511).map(|e| e.tier), Some(Placement::HostMapped));
+        assert_ne!(c0.gate_up_table_base(), c1.gate_up_table_base());
+        assert_ne!(c0.down_table_base(), c1.down_table_base());
+        for layer in 0..48 {
+            let r = binding.layer_view(layer, ExpertReadView::Resident).unwrap();
+            for class in 0..2 {
+                let b = binding
+                    .layer_view(layer, ExpertReadView::BorrowPrefill(class))
+                    .unwrap();
+                assert_eq!(r.any_host(), b.any_host(), "layer {layer} class {class}");
+                assert_eq!(r.codec_table(), b.codec_table());
+            }
+        }
+    }
+
+    #[test]
+    fn decode_share_borrow_view_is_none_on_a_non_sharing_binding() {
+        let (plan, _) = plain_plan();
+        let binding = fake_binding(plan.clone());
+        assert!(binding.decode_share.is_none());
+        assert!(binding
+            .view_digest(ExpertReadView::BorrowPrefill(0))
+            .is_none());
+        assert!(binding
+            .layer_view(0, ExpertReadView::BorrowPrefill(0))
+            .is_none());
+        assert_eq!(
+            binding.view_digest(ExpertReadView::Resident),
+            Some(plan.logical_digest())
+        );
+        // The Resident view is exactly the plan.
+        let resident = binding.layer_view(3, ExpertReadView::Resident).unwrap();
+        assert_eq!(resident.view, ExpertReadView::Resident);
+        assert_eq!(
+            resident.gate_up_ptrs(),
+            &binding.tables.gate_up[3 * 512..4 * 512]
+        );
+        assert_eq!(resident.down_ptrs(), &binding.tables.down[3 * 512..4 * 512]);
+        for expert in 0..512 {
+            assert_eq!(resident.entry(expert), plan.entry(3, expert));
+        }
+        assert!(binding.layer_view(48, ExpertReadView::Resident).is_none());
     }
 }

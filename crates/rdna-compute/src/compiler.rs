@@ -248,6 +248,41 @@ fn publish_pair(
     Ok(())
 }
 
+/// Ordered candidates for the read-only pre-compiled kernel directory:
+/// beside the running executable, then `kernels/compiled` under the CWD, then
+/// `bin/kernels/compiled` under the hipfire home.
+///
+/// The home candidate goes through [`hipfire_config::hipfire_home`], so an
+/// explicit `HIPFIRE_HOME` is honored. The previous hard-coded `$HOME/.hipfire`
+/// fallback ignored it and could silently serve another install's kernels:
+/// with `HIPFIRE_HOME` pointed at a test install whose kernel dir was absent,
+/// the loader fell back across homes to objects packaged against a different
+/// source tree and every load died in `packaged object rejected (index
+/// mismatch)` naming the other home's paths.
+fn precompiled_dir_for(arch: &str) -> Option<PathBuf> {
+    precompiled_dir_choice(
+        std::env::current_exe().ok().and_then(|exe| {
+            exe.parent()
+                .map(|p| crate::kernel_pack::pack_arch_dir(p, arch))
+        }),
+        Some(PathBuf::from("kernels/compiled").join(arch)),
+        hipfire_config::hipfire_home()
+            .ok()
+            .map(|home| home.join("bin").join("kernels").join("compiled").join(arch)),
+    )
+}
+
+/// First candidate that exists as a directory, in probe order.
+fn precompiled_dir_choice(
+    exe: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    exe.filter(|p| p.is_dir())
+        .or_else(|| cwd.filter(|p| p.is_dir()))
+        .or_else(|| home.filter(|p| p.is_dir()))
+}
+
 /// Publish only a nonempty blob into `dest_dir`, removing any orphan hash so
 /// it cannot certify the copied content. Used for hashless cold seed fallback.
 fn publish_blob_only(dest_dir: &Path, name: &str, src_blob: &Path) -> Result<(), String> {
@@ -557,30 +592,9 @@ impl KernelCompiler {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
 
-        // Probe for pre-compiled kernels: exe-relative → CWD-relative → ~/.hipfire/bin/
-        let precompiled_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-            .map(|dir| crate::kernel_pack::pack_arch_dir(&dir, arch))
-            .filter(|p| p.is_dir())
-            .or_else(|| {
-                let cwd_path = PathBuf::from("kernels/compiled").join(arch);
-                if cwd_path.is_dir() {
-                    Some(cwd_path)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| {
-                        PathBuf::from(h)
-                            .join(".hipfire/bin/kernels/compiled")
-                            .join(arch)
-                    })
-                    .filter(|p| p.is_dir())
-            });
+        // Probe for pre-compiled kernels: exe-relative → CWD-relative → the
+        // hipfire home (HIPFIRE_HOME, else ~/.hipfire).
+        let precompiled_dir = precompiled_dir_for(arch);
 
         // Seed the hot path from the installed pack (read-only to the runtime).
         // Cold survives reboots / process restarts; hot may not (or may be
@@ -983,6 +997,10 @@ impl KernelCompiler {
         source: &str,
         symbol: &str,
     ) -> Result<Option<PathBuf>, String> {
+        #[cfg(windows)]
+        let local_toolchain = "";
+        #[cfg(not(windows))]
+        let local_toolchain = self.toolchain_id.as_str();
         Self::check_indexed_object(
             dir,
             &self.arch,
@@ -991,7 +1009,10 @@ impl KernelCompiler {
             &[symbol],
             &self.extra_flags,
             &self.packaging_hash(module, source),
-            &self.toolchain_id,
+            // Windows: installed pack objects come from the Linux release
+            // build and are loaded by the HIP runtime, so a differing local
+            // hipcc identity must not reject them ("" skips the comparison).
+            local_toolchain,
         )
         .map(|found| found.map(|(object, _)| object))
     }
@@ -2190,6 +2211,49 @@ mod tests {
             Path::new("/tmp/hipfire_hot/gfx1201"),
             Path::new("/home/user/.hipfire/bin/kernels/compiled/gfx1201"),
         ));
+    }
+
+    /// The pre-compiled dir probe must fall through in order (exe, CWD, home)
+    /// and must never skip an absent candidate into a directory from a
+    /// different install. The regression this pins: the home fallback used to
+    /// read `$HOME/.hipfire` directly, ignoring `HIPFIRE_HOME`, so a
+    /// test home without kernels silently served the default home's objects
+    /// packaged against another source tree.
+    #[test]
+    fn precompiled_dir_choice_falls_through_in_order_and_skips_absent() {
+        let root = temp_root("precompiled_choice");
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = root.join("exe-kernels");
+        let cwd = root.join("cwd-kernels");
+        let home = root.join("home-kernels");
+        for dir in [&exe, &cwd, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        // All present: exe wins.
+        assert_eq!(
+            precompiled_dir_choice(Some(exe.clone()), Some(cwd.clone()), Some(home.clone())),
+            Some(exe.clone())
+        );
+        // Exe absent: CWD wins, not the home.
+        assert_eq!(
+            precompiled_dir_choice(None, Some(cwd.clone()), Some(home.clone())),
+            Some(cwd.clone())
+        );
+        // Only the home exists: the home wins (this is the HIPFIRE_HOME case
+        // once precompiled_dir_for routes it through hipfire_home()).
+        assert_eq!(
+            precompiled_dir_choice(None, None, Some(home.clone())),
+            Some(home.clone())
+        );
+        // Nothing exists: no silent fallback to any candidate path.
+        let absent = root.join("absent-kernels");
+        assert_eq!(
+            precompiled_dir_choice(Some(absent.clone()), Some(absent.clone()), Some(absent)),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -3446,8 +3510,8 @@ mod tests {
                 .filter(|s| !REPAIRED.contains(s))
                 .collect();
             if arch == "gfx1100" {
-                // Keep the sealed inventory unchanged; beta later added the
-                // HC-write widening to the shared source on every arch.
+                // Keep the sealed inventory unchanged. The later HC x8
+                // export is gfx1201-only and does not alter gfx11 exports.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3455,10 +3519,7 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain([
-                            "hyper_write_bf16x8_gfx1201",
-                            "indexed_attention_rope_table_f32"
-                        ])
+                        .chain(["indexed_attention_rope_table_f32"])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod attention_wmma_verify;
 pub mod byte_arena;
 pub mod cdna;
 pub mod code_object;
@@ -17,6 +18,7 @@ pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
 pub mod dflash_hidden_scatter;
 pub mod dflash_sampled_accept;
+pub mod dflash_selector;
 pub mod dflash_state_copy;
 mod dispatch;
 pub mod draft_lane_conv;
@@ -47,12 +49,14 @@ mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
+mod gemv_q8x;
 #[cfg(test)]
 mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;
 pub mod iu4_c8_pm;
+mod kernel_abi;
 pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;
@@ -63,6 +67,7 @@ pub mod lane_rows_pm;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
+mod moe_few;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
 pub mod slab_admission;
@@ -70,14 +75,17 @@ pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
     SlabLayerCodecError,
 };
+pub mod mq6_railgun;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;
 pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
+pub mod plan_sink;
 pub mod pm_decode_twins;
 pub mod pm_mtp_gemm;
+pub mod pm_tune;
 pub mod pm_xbatch;
 pub mod pool;
 pub mod prefill_invariant;
@@ -88,6 +96,7 @@ pub mod profiler;
 pub mod qsa_pooled_mirror;
 pub mod qwen35_fa_batch;
 pub mod railgun_check;
+pub mod railgun_window;
 pub mod rdna;
 pub mod replay;
 pub mod rope;
@@ -96,6 +105,7 @@ pub mod sampled_rows_compact;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
+pub mod shadow_borrow;
 pub mod shared_i8;
 pub mod slab_moe;
 pub mod spec_sampling_cpu_ar;
@@ -149,6 +159,7 @@ pub use dispatch::{LabLaunchWitness, LabProjectionLaunch};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;
+pub use plan_sink::{PlanSink, PlannedKernel, PlannedOp};
 
 /// Calibration-only override that forces native-BF16 teachers to stay BF16.
 ///

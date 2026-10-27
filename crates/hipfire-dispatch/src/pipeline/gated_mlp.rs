@@ -92,6 +92,10 @@ pub enum MlpLadder {
     /// rows, fused post-norm residual on one row; greedy-EAGLE strict kernels
     /// inside. Gemma 4.
     SandwichWide,
+    /// The sandwich steps ladder of [`super::sandwich::SandwichMlpOp`]
+    /// (Glimmer). Named here only so a split rule can declare it; a
+    /// [`GatedMlpOp`] refuses it.
+    SandwichSteps,
     /// The hybrid-decoder ladder (Qwen3.5/3.6/3.8 dense layers).
     /// One row: norm + gate/up through the fusion table (`normed_projection`),
     /// then the fused SiLU·mul + rotation and the SwiGLU-residual GEMV
@@ -105,18 +109,15 @@ pub enum MlpLadder {
 impl MlpLadder {
     /// Whether the ladder runs unchanged on an intermediate shard of its
     /// weights (gate/up rows, down columns) and writes a partial sum, which
-    /// its consumer reduces: `Trunk` and `Product` through the `Write`
-    /// output. The split rule does not record the output form: `Trunk` admits
-    /// only `Write`, and a TP route must bind `Product`'s `Write`, never its
-    /// `Residual`. `SandwichWide` is refused: its standalone use
-    /// (Gemma 4 dense layers) is the `PostNorm` epilogue, which norms the
-    /// output before the residual add, so a partial sum cannot pass it (its
-    /// `Write` form is refused too, conservatively). A new ladder is refused
-    /// until it opts in here.
+    /// its consumer reduces: every ladder through its `Write` form. The split
+    /// rule does not record the output form, so a TP route must bind the
+    /// `Write` (`Product`: never its `Residual`; the sandwich ladders: never
+    /// the `PostNorm`, whose norm cannot take a partial sum, but the reduced
+    /// output's separate epilogue). A new ladder is refused until it opts in
+    /// here.
     pub fn tp_shardable(self) -> bool {
         match self {
-            Self::Trunk => true,
-            Self::SandwichWide => false,
+            Self::Trunk | Self::SandwichWide | Self::SandwichSteps => true,
             #[cfg(feature = "deltanet")]
             Self::Product => true,
         }
@@ -181,6 +182,7 @@ impl GatedMlpOp<'_> {
                     && self.storage == MlpStorage::F32
                     && !matches!(self.output, MlpOutput::Residual)
             }
+            MlpLadder::SandwichSteps => false,
             #[cfg(feature = "deltanet")]
             MlpLadder::Product => {
                 self.rows >= 1
@@ -271,6 +273,7 @@ impl GatedMlpOp<'_> {
                 .then_some(widest),
             MlpLadder::SandwichWide if rows == 1 => Some(hidden),
             MlpLadder::SandwichWide => Some(widest),
+            MlpLadder::SandwichSteps => None,
             // The pre-norm writes its (rotated) gate/up input here.
             #[cfg(feature = "deltanet")]
             MlpLadder::Product => Some(rows * hidden),

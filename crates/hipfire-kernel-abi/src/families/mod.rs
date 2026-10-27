@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Contract data, one module per kernel family. Each module exports its
+//! contracts as `pub static` [`KernelAbiV1`] values, its storage formats and
+//! numeric contracts as `pub const`, and the list `ABIS`.
+
+pub mod mq6_i8;
+pub mod qwen4_moe_sym;
+
+use crate::{Arch, ExportV1, KernelAbiV1};
+
+/// Every contract this crate defines, in a stable order (the identity
+/// registry R2 census/corpus records and the drift tests iterate).
+pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
+    mq6_i8::ABIS
+        .iter()
+        .chain(qwen4_moe_sym::ABIS.iter())
+        .copied()
+}
+
+/// The contract and export that own `symbol` on `arch` (export symbols are
+/// unique per arch across all contracts). Allocation-free: launchers may call
+/// it per launch.
+pub fn find_export(arch: Arch, symbol: &str) -> Option<(&'static KernelAbiV1, &'static ExportV1)> {
+    all().find_map(|abi| {
+        abi.exports
+            .iter()
+            .find(|e| e.arch == arch && e.symbol == symbol)
+            .map(|e| (abi, e))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all;
+
+    #[test]
+    fn every_family_contract_is_self_consistent() {
+        let mut ids = std::collections::BTreeSet::new();
+        for abi in all() {
+            if let Err(errors) = abi.self_check() {
+                panic!("{}: {errors:#?}", abi.id);
+            }
+            assert!(ids.insert(abi.id), "duplicate contract id {}", abi.id);
+        }
+        assert_eq!(ids.len(), 18);
+    }
+
+    #[test]
+    fn export_symbols_are_unique_per_arch_across_contracts() {
+        let mut seen = std::collections::BTreeMap::new();
+        for abi in all() {
+            for e in abi.exports {
+                if let Some(prev) = seen.insert((e.arch, e.symbol), abi.id) {
+                    panic!(
+                        "{} {} in both {prev} and {}",
+                        e.arch.name(),
+                        e.symbol,
+                        abi.id
+                    );
+                }
+            }
+        }
+    }
+}

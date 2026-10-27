@@ -92,6 +92,7 @@ impl Intent {
                 "memory.offload_passback_share",
                 "memory.oom_guard",
                 "memory.prompt_cache_capacity",
+                "vision.mode",
             ],
             Intent::Speculation => &[
                 "speculation.mode",
@@ -319,6 +320,7 @@ mod tests {
         assert_eq!(intent_of("developer.qwen4_moe_sym_iu4"), Intent::Quality);
         assert_eq!(intent_of("experimental.graph.forward"), Intent::Speed);
         assert_eq!(intent_of("serve.multi_slot"), Intent::Speed);
+        assert_eq!(intent_of("vision.mode"), Intent::MemoryContext);
         assert_eq!(intent_of("attention.flash"), Intent::Speed);
     }
 

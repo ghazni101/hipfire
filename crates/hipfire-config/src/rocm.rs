@@ -1227,11 +1227,12 @@ pub fn version() -> Option<String> {
 /// `["amdhip64.dll", "amdhip64_7.dll"]`.
 ///
 /// When a root is selected or explicitly configured, candidates stay inside
-/// that root family — never bare loader names and never the user cache. On
-/// Windows only, with no configured/selected/ambiguous root, the hipfire
-/// runtime cache and bare DLL names remain available so a cache-only install
-/// still loads. Unix never falls back to bare sonames (ldconfig would mix
-/// installs).
+/// that root family — never bare loader names, the executable directory, or
+/// the user cache. On Windows only, with no configured/selected/ambiguous
+/// root, the running executable's directory, the hipfire runtime cache and bare
+/// DLL names remain available (in that order) so a runtime shipped beside
+/// hipfire or a cache-only install still loads. Unix never falls back to bare
+/// sonames (ldconfig would mix installs).
 pub fn library_candidates(sonames: &[&str]) -> Vec<String> {
     let ambiguous = !ambiguous_roots().is_empty();
     let selected = if ambiguous {
@@ -1247,27 +1248,35 @@ pub fn library_candidates(sonames: &[&str]) -> Vec<String> {
     let profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
     #[cfg(not(windows))]
     let profile: Option<PathBuf> = None;
+    #[cfg(windows)]
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    #[cfg(not(windows))]
+    let exe_dir: Option<PathBuf> = None;
     library_load_candidates(
         selected.as_deref(),
         ambiguous,
         sonames,
         cfg!(windows),
         profile.as_deref(),
+        exe_dir.as_deref(),
     )
 }
 
 /// Pure library-candidate policy for [`library_candidates`] and unit tests.
 ///
 /// `selected` is either a discovered root or an explicit configured root that
-/// must stay authoritative even when empty/invalid. Legacy Windows cache/PATH
-/// candidates are emitted only when `windows` is set, nothing is selected, and
-/// the install set is not ambiguous.
+/// must stay authoritative even when empty/invalid. Legacy Windows candidates
+/// (executable directory, user cache, bare names) are emitted only when
+/// `windows` is set, nothing is selected, and the install set is not ambiguous.
 fn library_load_candidates(
     selected: Option<&Path>,
     ambiguous: bool,
     sonames: &[&str],
     windows: bool,
     legacy_user_profile: Option<&Path>,
+    exe_dir: Option<&Path>,
 ) -> Vec<String> {
     if ambiguous {
         return Vec::new();
@@ -1276,15 +1285,26 @@ fn library_load_candidates(
         return selected_library_candidates(root, sonames);
     }
     if windows {
-        return windows_legacy_library_candidates(legacy_user_profile, sonames);
+        return windows_legacy_library_candidates(legacy_user_profile, exe_dir, sonames);
     }
     Vec::new()
 }
 
 /// Windows-only fallback when no ROCm/HIP root is configured or selected:
-/// `{USERPROFILE}\.hipfire\runtime\<dll>` then bare DLL names for PATH search.
-fn windows_legacy_library_candidates(user_profile: Option<&Path>, sonames: &[&str]) -> Vec<String> {
+/// `<directory of the running executable>\<dll>` (a runtime shipped beside
+/// hipfire, loaded before anything System32 could shadow), then
+/// `{USERPROFILE}\.hipfire\runtime\<dll>`, then bare DLL names for PATH search.
+fn windows_legacy_library_candidates(
+    user_profile: Option<&Path>,
+    exe_dir: Option<&Path>,
+    sonames: &[&str],
+) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some(dir) = exe_dir {
+        for soname in sonames {
+            out.push(dir.join(soname).to_string_lossy().into_owned());
+        }
+    }
     if let Some(profile) = user_profile {
         let cache = profile.join(".hipfire").join("runtime");
         for soname in sonames {
@@ -1925,7 +1945,15 @@ mod tests {
             b"",
         )
         .unwrap();
-        let candidates = library_load_candidates(Some(&root), false, &dlls, true, Some(&profile));
+        let exe_dir = base.join("hipfire-install");
+        let candidates = library_load_candidates(
+            Some(&root),
+            false,
+            &dlls,
+            true,
+            Some(&profile),
+            Some(&exe_dir),
+        );
         assert_eq!(candidates, vec![dll.to_string_lossy().into_owned()]);
         assert!(
             candidates.iter().all(|c| {
@@ -1959,7 +1987,7 @@ mod tests {
 
         let dlls = ["amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll"];
         let candidates =
-            library_load_candidates(Some(&bad_root), false, &dlls, true, Some(&profile));
+            library_load_candidates(Some(&bad_root), false, &dlls, true, Some(&profile), None);
         assert!(
             !candidates.is_empty(),
             "invalid override must still report expected absolute paths"
@@ -1975,8 +2003,10 @@ mod tests {
             assert!(!c.contains(".hipfire"), "cache leak: {c}");
         }
 
-        // Legacy cache/PATH only when no root is configured/selected/ambiguous.
-        let legacy = library_load_candidates(None, false, &dlls, true, Some(&profile));
+        // Legacy executable-dir/cache/PATH only when no root is configured/selected/ambiguous.
+        let exe_dir = base.join("hipfire-install");
+        let legacy =
+            library_load_candidates(None, false, &dlls, true, Some(&profile), Some(&exe_dir));
         assert!(
             legacy
                 .iter()
@@ -1987,13 +2017,39 @@ mod tests {
             legacy.iter().any(|c| c == "amdhip64.dll"),
             "no-root Windows path must keep bare PATH names: {legacy:?}"
         );
+        // Order: executable directory, then user cache, then bare names, so a
+        // runtime beside hipfire beats anything System32 could shadow.
+        let pos = |needle: &str| legacy.iter().position(|c| c == needle).unwrap();
+        let exe_first = exe_dir.join("amdhip64.dll").to_string_lossy().into_owned();
+        let cache_first = profile
+            .join(".hipfire")
+            .join("runtime")
+            .join("amdhip64.dll")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(legacy[0], exe_first, "{legacy:?}");
+        assert!(pos(&exe_first) < pos(&cache_first), "{legacy:?}");
+        assert!(pos(&cache_first) < pos("amdhip64.dll"), "{legacy:?}");
+        let no_exe = library_load_candidates(None, false, &dlls, true, Some(&profile), None);
+        assert!(
+            no_exe.iter().all(|c| !c.contains("hipfire-install")),
+            "{no_exe:?}"
+        );
 
         // Ambiguity refuses everything — including legacy fallbacks.
-        let refused = library_load_candidates(None, true, &dlls, true, Some(&profile));
+        let refused =
+            library_load_candidates(None, true, &dlls, true, Some(&profile), Some(&exe_dir));
         assert!(refused.is_empty(), "{refused:?}");
 
         // Unix never invents bare sonames or a Windows cache path.
-        let unix = library_load_candidates(None, false, &["libamdhip64.so"], false, Some(&profile));
+        let unix = library_load_candidates(
+            None,
+            false,
+            &["libamdhip64.so"],
+            false,
+            Some(&profile),
+            Some(&exe_dir),
+        );
         assert!(unix.is_empty(), "{unix:?}");
 
         std::fs::remove_dir_all(&base).unwrap();

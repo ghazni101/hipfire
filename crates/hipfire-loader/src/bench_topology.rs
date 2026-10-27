@@ -242,7 +242,7 @@ impl LoadedModel {
                 EpArch::Ds4 { .. } => EpKind::Ds4,
                 EpArch::Minimax { .. } => EpKind::Minimax,
                 EpArch::Qwen35 { .. } => EpKind::Qwen35Moe,
-                EpArch::Qwen35DenseTp { .. } => EpKind::Qwen35DenseTp,
+                EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. } => EpKind::Qwen35DenseTp,
             };
             (kind, MeshFacts::from_gpus(&state.gpus))
         });

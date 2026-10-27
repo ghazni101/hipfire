@@ -22,17 +22,17 @@ use hipfire_arch_deepseek4::dsml::{
 };
 use hipfire_engine::emit::emit_visible_token;
 use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
+use hipfire_engine::turn_cache::{apply_turn_cache_action, asst_turn_fingerprint};
 use hipfire_generate::common::{ds4_spec_finish_route, emit_ds4_malformed_terminal};
 use hipfire_generate::{
-    common::asst_turn_fingerprint, common::ds4_apply_cache_action, common::ds4_ar_ep_cache_action,
-    common::ds4_ar_ep_finish_route, common::ds4_client_commit_effects,
-    common::ds4_ep_abort_wire_events, common::ds4_gen_start_contract_version,
-    common::ds4_malformed_terminal_action, common::ds4_stream_event_wireable,
-    common::emit_ds4_malformed_action, common::gen_start_contract_version_for_arch,
-    common::normalize_asst_turn_for_fingerprint, common::Ds4ArEpRouteTerminal,
-    common::Ds4ClientCommitEffects, dense::ds4_cache_action, dense::ds4_spec_wire_terminal,
-    dense::Ds4SpecWireTerminal, qwen::emit_ds4_ep_gen_start, qwen::spec_outcome_seed_committable,
-    qwen::spec_should_flush_pending_seed,
+    common::ds4_ar_ep_cache_action, common::ds4_ar_ep_finish_route,
+    common::ds4_client_commit_effects, common::ds4_ep_abort_wire_events,
+    common::ds4_gen_start_contract_version, common::ds4_malformed_terminal_action,
+    common::ds4_stream_event_wireable, common::emit_ds4_malformed_action,
+    common::gen_start_contract_version_for_arch, common::normalize_asst_turn_for_fingerprint,
+    common::Ds4ArEpRouteTerminal, common::Ds4ClientCommitEffects, dense::ds4_cache_action,
+    dense::ds4_spec_wire_terminal, dense::Ds4SpecWireTerminal, qwen::emit_ds4_ep_gen_start,
+    qwen::spec_outcome_seed_committable, qwen::spec_should_flush_pending_seed,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use hipfire_runtime::spec::{ClientEvent, FinishSummary, SpecEmit};
@@ -430,7 +430,7 @@ fn ds4_ep_opens_wire_contract_before_first_token() {
 // ── Task 4 definitive terminal-edge blockers (DS4 cache + empty EOS) ──
 
 /// Safe DS4 speculative terminal stores the verbatim raw streamed_tokens
-/// body through hipfire_generate::dense::ds4_cache_action + hipfire_generate::common::ds4_apply_cache_action (same seam as
+/// body through hipfire_generate::dense::ds4_cache_action + hipfire_engine::turn_cache::apply_turn_cache_action (same seam as
 /// hipfire_generate::dense::generate_deepseek4_spec Done branch).
 #[test]
 fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
@@ -477,7 +477,7 @@ fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
     // Verbatim raw body — no surround EOS/Assistant markers (DSML replay).
     let streamed = vec![11u32, 22, 33, 44];
     let mut sink: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
-    let fp = hipfire_generate::common::ds4_apply_cache_action(
+    let fp = hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -491,14 +491,14 @@ fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
         "cache body must be verbatim run.streamed_tokens"
     );
     // Fingerprint key matches hipfire_generate::common::build_deepseek4_dsml_prompt lookup shape.
-    let expected_fp = hipfire_generate::common::asst_turn_fingerprint(
+    let expected_fp = hipfire_engine::turn_cache::asst_turn_fingerprint(
         &action.fingerprint_text,
         &action.tool_calls,
     );
     assert_eq!(fp, Some(expected_fp));
 }
 
-/// Length and fail-closed/malformed never store via hipfire_generate::common::ds4_apply_cache_action
+/// Length and fail-closed/malformed never store via hipfire_engine::turn_cache::apply_turn_cache_action
 /// even when a non-empty raw body is offered.
 #[test]
 fn ds4_length_and_fail_closed_skip_cache_store() {
@@ -542,7 +542,7 @@ fn ds4_length_and_fail_closed_skip_cache_store() {
         "length suppresses held calls"
     );
     let mut sink_len = std::collections::HashMap::new();
-    assert!(hipfire_generate::common::ds4_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink_len.insert(k, v);
         },
@@ -576,7 +576,7 @@ fn ds4_length_and_fail_closed_skip_cache_store() {
     );
     assert!(!action_mal.store);
     let mut sink_mal = std::collections::HashMap::new();
-    assert!(hipfire_generate::common::ds4_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink_mal.insert(k, v);
         },
@@ -601,10 +601,10 @@ fn ds4_length_and_fail_closed_skip_cache_store() {
         &finish_empty,
         finish_empty.visible_text.as_str(),
     );
-    assert!(action_empty.store, "wire authorizes stop");
+    assert!(!action_empty.store, "empty payload never stores");
     let mut sink_empty = std::collections::HashMap::new();
     assert!(
-        hipfire_generate::common::ds4_apply_cache_action(
+        hipfire_engine::turn_cache::apply_turn_cache_action(
             |k, v| {
                 sink_empty.insert(k, v);
             },
@@ -859,7 +859,7 @@ fn ds4_ar_ep_safe_commit_gate_retains_calls_cache_done() {
     }
     assert!(action.store);
     let mut sink = std::collections::HashMap::new();
-    assert!(hipfire_generate::common::ds4_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },
@@ -909,7 +909,7 @@ fn ds4_ar_ep_safe_abort_gate_suppresses_calls_cache_done() {
     }
     assert!(!action.store);
     let mut sink = std::collections::HashMap::new();
-    assert!(hipfire_generate::common::ds4_apply_cache_action(
+    assert!(hipfire_engine::turn_cache::apply_turn_cache_action(
         |k, v| {
             sink.insert(k, v);
         },

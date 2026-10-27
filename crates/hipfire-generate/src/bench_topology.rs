@@ -21,8 +21,9 @@
 //! then spans completed work on every rank.
 
 use crate::qwen::{
-    dense_tp_decode_forward, dense_tp_prefill_chunk, dense_tp_prefill_chunk_len, ds4_ep_prefill,
-    qwen35_moe_ep_decode_forward, qwen35_moe_ep_prefill_window, qwen4_bundle_and_mesh,
+    dense_tp_decode_forward, dense_tp_mesh_drain_inner, dense_tp_prefill_chunk,
+    dense_tp_prefill_chunk_len, ds4_ep_prefill, qwen35_moe_ep_decode_forward,
+    qwen35_moe_ep_prefill_window, qwen4_bundle_and_mesh,
 };
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_minimax as minimax;
@@ -90,7 +91,15 @@ pub fn quiesce_mesh(route: BenchRoute, m: &mut LoadedModel) -> Result<(), String
             None => Err("pipeline-parallel model has no Gpus".to_string()),
         },
         BenchRoute::Qwen35DenseTp => match m.ep.as_mut() {
-            Some(ep) => sync_gpus(&mut ep.gpus, true),
+            Some(ep) => {
+                // The mesh route only enqueues: retire its epochs (a device
+                // sync of every rank) so the timer covers completed work,
+                // then run the common sync and wait check whatever happened.
+                let drained = dense_tp_mesh_drain_inner(&mut ep.gpus, &mut ep.inner)
+                    .map_err(|e| format!("mesh epoch drain: {e}"));
+                let synced = sync_gpus(&mut ep.gpus, true);
+                drained.and(synced)
+            }
             None => Err("dense TP model has no EP state".to_string()),
         },
         BenchRoute::Qwen35MoeEp | BenchRoute::Ds4Ep | BenchRoute::MinimaxEp => {

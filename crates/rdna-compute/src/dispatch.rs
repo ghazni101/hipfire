@@ -1772,6 +1772,10 @@ pub struct Gpu {
     /// views are always cleared from the cache before their roots are released.
     f16_shadow_arena: crate::byte_arena::ShadowRootSet<DeviceBuffer>,
 
+    /// Decode-share shadow borrow (`shadow_borrow.rs`): when installed, every F16 / INT8
+    /// shadow lives in a caller-provided, non-owned region and is never allocated here.
+    pub(crate) shadow_borrow: Option<crate::shadow_borrow::ShadowBorrowState>,
+
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms resolve their weight buffer pointer
     /// to a tensor name via `capture_names` and invoke `capture()` with the
@@ -2085,6 +2089,27 @@ impl Gpu {
             Ok(v) => v != 0,
             Err(_) => true,
         }
+    }
+
+    /// Whether this device is a unified-memory APU whose device allocations
+    /// come from GTT (host RAM through TTM) rather than a carve-out: the device
+    /// pool is larger than the carve-out ([`crate::uma_memory::gtt_backed`]).
+    /// Every allocation of such a device, not only host-mapped memory, takes
+    /// pages from TTM's page pool first. `false` for a discrete GPU, a
+    /// carve-out APU, or when the device pool cannot be read.
+    pub fn is_gtt_backed_apu(&self) -> bool {
+        if !self.is_uma() || self.bind_thread().is_err() {
+            return false;
+        }
+        let Ok((_, total)) = self.hip.get_vram_info() else {
+            return false;
+        };
+        let carveout_total = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| crate::uma_memory::carveout_total_bytes(&bdf));
+        crate::uma_memory::gtt_backed(total as u64, carveout_total)
     }
 
     /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
@@ -2766,6 +2791,21 @@ impl Gpu {
             hip_major,
             hip_minor
         );
+        // Windows only: System32 can shadow an SDK's amdhip64/comgr, so log which
+        // DLL actually loaded alongside the raw runtime/driver versions.
+        #[cfg(windows)]
+        {
+            let raw = |v: hip_bridge::HipResult<i32>| {
+                v.map(|n| n.to_string())
+                    .unwrap_or_else(|_| "unknown".into())
+            };
+            eprintln!(
+                "HIP runtime: {} (runtime {}, driver {})",
+                hip.mapped_hip_library().as_deref().unwrap_or("unknown"),
+                raw(hip.runtime_version_raw()),
+                raw(hip.driver_version()),
+            );
+        }
 
         let flags = Arc::new(FeatureFlags::from_active_config(&arch));
         crate::scratch::enable_qsa_code_check(&flags);
@@ -2877,6 +2917,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
@@ -2976,18 +3017,21 @@ impl Gpu {
                     warmed_up: std::collections::HashSet::new(),
                     capturing: None,
                     lmhead_argmax: std::collections::HashSet::new(),
+                    fp8_split: std::collections::HashSet::new(),
                 },
                 replay: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),
                     capturing: None,
                     lmhead_argmax: std::collections::HashSet::new(),
+                    fp8_split: std::collections::HashSet::new(),
                 },
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             shared_i8_shadows: HashMap::new(),
             f16_shadow_arena: crate::byte_arena::ShadowRootSet::new(),
+            shadow_borrow: None,
             active_capture: None,
             capture_names: HashMap::new(),
             hessian_capture: None,
@@ -4130,6 +4174,7 @@ impl Gpu {
             .validate_launch_grid(grid)
             .map_err(|e| e.with_kernel(func_name))?;
         let record = self.replay.is_recording();
+        let plan = self.hip.plan_active();
         let observe = self.replay.is_g0_observing();
         // Slice 1: drain a post-scratch-growth binding refresh before the
         // first launch that follows the growth. Growth always completes
@@ -4151,9 +4196,15 @@ impl Gpu {
             || observe
             || self.graphs.capture_mode
             || self.flags.force_blob_path
+            // Plan mode records the exact blob: the params path cannot be
+            // reconstructed from `kernelParams` pointers.
+            || plan
         {
             let mut blob = blob_builder();
             blob.pad_to(16);
+            if plan {
+                crate::plan_sink::note_declared(self.hip.plan_event_count(), railgun_words);
+            }
             if observe {
                 self.replay
                     .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
@@ -4568,7 +4619,7 @@ impl Gpu {
     }
 
     /// Shared loaded-symbol/Arc-owner proof, borrowing the registry's owner.
-    fn loaded_owner(
+    pub(crate) fn loaded_owner(
         &self,
         symbol: &str,
     ) -> HipResult<(String, &crate::code_object::RecordedArtifact)> {
@@ -5875,18 +5926,42 @@ impl Gpu {
         k: usize,
     ) -> HipResult<*mut c_void> {
         let key = weight.buf.as_ptr() as usize;
+        if let Some(state) = self.shadow_borrow.as_ref() {
+            let need = m
+                .checked_mul(k)
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(|| HipError::new(0, "ensure_bf16_f16_shadow: shadow too large"))?;
+            let dst = state
+                .f16_lookup(key, need)
+                .map_err(|e| HipError::new(0, &format!("ensure_bf16_f16_shadow: {e}")))?;
+            return Ok(dst as *mut c_void);
+        }
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(shadow.buf.as_ptr());
         }
         let n = m * k;
         let fp16 = self.alloc_f16_shadow_dest(key, n, "ensure_bf16_f16_shadow")?;
+        self.launch_bf16_to_f16(weight.buf.as_ptr(), fp16.buf.as_ptr(), n)?;
+        let ptr = fp16.buf.as_ptr();
+        self.fp16_shadow_cache.insert(key, fp16);
+        Ok(ptr)
+    }
+
+    /// Launch `convert_bf16_to_f16` over `n` elements from `src` into `dst` on the current
+    /// stream (the lazy shadow builder and the borrowed-region rebuild share it).
+    fn launch_bf16_to_f16(
+        &mut self,
+        src: *mut c_void,
+        dst: *mut c_void,
+        n: usize,
+    ) -> HipResult<()> {
         self.ensure_kernel(
             "gemm_bf16_xf32_multirow",
             kernels::GEMM_BF16_XF32_MULTIROW_SRC,
             "convert_bf16_to_f16",
         )?;
-        let ip = weight.buf.as_ptr();
-        let op = fp16.buf.as_ptr();
+        let ip = src;
+        let op = dst;
         let nv =
             i32::try_from(n).map_err(|_| hip_bridge::HipError::new(0, "BF16 shadow too large"))?;
         let mut params = [
@@ -5907,10 +5982,7 @@ impl Gpu {
                 b.push_i32(nv);
                 b
             },
-        )?;
-        let ptr = fp16.buf.as_ptr();
-        self.fp16_shadow_cache.insert(key, fp16);
-        Ok(ptr)
+        )
     }
 
     /// Model-lifetime F16 shadow of a Q8_0 `[M × K]` weight for the MTP append DET dense GEMM
@@ -6184,6 +6256,175 @@ impl Gpu {
         .map_err(|msg| HipError::new(0, &format!("clear_f16_shadow_arena: {msg}")))
     }
 
+    /// Install a decode-share shadow borrow: every F16 / INT8 shadow then resolves into
+    /// `plan`'s non-owned region (never allocated, never cached) and is valid only while
+    /// the state is `ready`. Errors if one is already installed, the plan is invalid, or a
+    /// planned source already has a cached shadow. Stores `ready = false`; no GPU work.
+    pub fn install_shadow_borrow(
+        &mut self,
+        plan: crate::shadow_borrow::ShadowBorrowPlan,
+    ) -> HipResult<()> {
+        let err = |msg: String| HipError::new(0, &format!("install_shadow_borrow: {msg}"));
+        if self.shadow_borrow.is_some() {
+            return Err(err("a shadow borrow is already installed".into()));
+        }
+        plan.validate().map_err(err)?;
+        for s in &plan.f16 {
+            if self.fp16_shadow_cache.contains_key(&s.src_ptr) {
+                return Err(err(format!(
+                    "{}: source 0x{:x} already has a cached F16 shadow",
+                    s.name, s.src_ptr
+                )));
+            }
+        }
+        for s in &plan.shared_i8 {
+            if self.shared_i8_shadows.contains_key(&s.gate_ptr) {
+                return Err(err(format!(
+                    "layer {}: gate 0x{:x} already has a cached INT8 shadow",
+                    s.layer, s.gate_ptr
+                )));
+            }
+        }
+        self.shadow_borrow = Some(crate::shadow_borrow::ShadowBorrowState::new(plan));
+        Ok(())
+    }
+
+    /// Whether a shadow borrow is installed.
+    pub fn shadow_borrow_active(&self) -> bool {
+        self.shadow_borrow.is_some()
+    }
+
+    /// Whether a shadow borrow is installed and its shadows are built (inside an epoch).
+    pub fn shadow_borrow_ready(&self) -> bool {
+        self.shadow_borrow.as_ref().is_some_and(|s| s.ready)
+    }
+
+    /// Set the borrow-epoch gate; a no-op without a borrow.
+    pub fn shadow_borrow_set_ready(&mut self, ready: bool) {
+        if let Some(s) = self.shadow_borrow.as_mut() {
+            s.set_ready(ready);
+        }
+    }
+
+    /// Rebuild every borrowed shadow in place (F16 conversions and INT8 planes) on the
+    /// current stream, without a sync, then mark the borrow ready. On error the borrow is
+    /// marked not ready. The caller guarantees the region is not in use.
+    pub fn rebuild_borrowed_shadows(&mut self) -> HipResult<()> {
+        let result = self.rebuild_borrowed_shadows_inner();
+        if result.is_err() {
+            self.shadow_borrow_set_ready(false);
+        }
+        result
+    }
+
+    fn rebuild_borrowed_shadows_inner(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        let Some(state) = self.shadow_borrow.as_ref() else {
+            return Err(HipError::new(
+                0,
+                "rebuild_borrowed_shadows: no shadow borrow installed",
+            ));
+        };
+        let plan = state.plan.clone();
+        self.shadow_borrow_set_ready(false);
+        self.build_shadow_plan_at(&plan, 0, false)?;
+        self.shadow_borrow_set_ready(true);
+        Ok(())
+    }
+
+    /// Build every span of `plan` with destination `dst - region_ptr + base` when
+    /// `relocate` (reference build into a temporary), else in place.
+    fn build_shadow_plan_at(
+        &mut self,
+        plan: &crate::shadow_borrow::ShadowBorrowPlan,
+        base: usize,
+        relocate: bool,
+    ) -> HipResult<()> {
+        let map = |dst: usize| -> *mut c_void {
+            if relocate {
+                (base + (dst - plan.region_ptr)) as *mut c_void
+            } else {
+                dst as *mut c_void
+            }
+        };
+        for s in &plan.f16 {
+            self.launch_bf16_to_f16(s.src_ptr as *mut c_void, map(s.dst_ptr), s.rows * s.cols)?;
+        }
+        for s in &plan.shared_i8 {
+            self.shared_i8_build_planes(
+                s.gate_ptr as *mut c_void,
+                s.up_ptr as *mut c_void,
+                s.down_ptr as *mut c_void,
+                s.intermediate,
+                s.hidden,
+                s.down_rows,
+                map(s.gate_up_dst),
+                map(s.down_dst),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Byte oracle: rebuild every shadow into a temporary allocation with the same builders
+    /// and compare it with the live region, span bytes only (padding is unspecified).
+    /// Returns `Ok(Err(..))` naming the first differing member/offset. Requires `ready`.
+    pub fn verify_borrowed_shadows(&mut self) -> HipResult<Result<(), String>> {
+        const CHUNK: usize = 64 << 20;
+        self.bind_thread()?;
+        let err = |m: &str| HipError::new(0, &format!("verify_borrowed_shadows: {m}"));
+        let Some(state) = self.shadow_borrow.as_ref() else {
+            return Err(err("no shadow borrow installed"));
+        };
+        if !state.ready {
+            return Err(err("borrowed shadows are not ready"));
+        }
+        let state = state.clone();
+        let plan = &state.plan;
+        self.hip.device_synchronize()?;
+        let temp = self.hip.malloc(plan.region_bytes.max(256))?;
+        let result = (|| -> HipResult<Result<(), String>> {
+            let base = temp.as_ptr() as usize;
+            self.build_shadow_plan_at(plan, base, true)?;
+            self.hip.device_synchronize()?;
+            // SAFETY: the region is caller-guaranteed live device memory of
+            // `region_bytes` for the borrow's lifetime; the view is non-owning.
+            let live = unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    plan.region_ptr as *mut c_void,
+                    plan.region_bytes,
+                )
+            };
+            let mut a = vec![0u8; CHUNK];
+            let mut b = vec![0u8; CHUNK];
+            for (off, bytes) in state.covered_ranges() {
+                let mut done = 0usize;
+                while done < bytes {
+                    let n = (bytes - done).min(CHUNK);
+                    self.hip.memcpy_dtoh_at(&mut a[..n], &live, off + done)?;
+                    self.hip.memcpy_dtoh_at(&mut b[..n], &temp, off + done)?;
+                    if let Some(i) = crate::shadow_borrow::first_difference(&a[..n], &b[..n]) {
+                        let at = off + done + i;
+                        return Ok(Err(format!(
+                            "borrowed shadow mismatch at region offset {at}: {}",
+                            state.locate(at)
+                        )));
+                    }
+                    done += n;
+                }
+            }
+            Ok(Ok(()))
+        })();
+        let freed = self.hip.free(temp);
+        let verdict = result?;
+        freed?;
+        Ok(verdict)
+    }
+
+    /// Drop the shadow borrow state. Never frees the region (it is not owned here).
+    pub fn clear_shadow_borrow(&mut self) {
+        self.shadow_borrow = None;
+    }
+
     /// Prepare an in-place rewrite (bytes and/or format, same pointer) of one weight
     /// owned by the S1 arena. With an active arena the device is quiesced ONCE —
     /// even when the weight has no cached F16 shadow or only direct readers — and
@@ -6240,6 +6481,14 @@ impl Gpu {
         n: usize,
         context: &str,
     ) -> HipResult<GpuTensor> {
+        if self.shadow_borrow.is_some() {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "{context}: a decode-share load never allocates a shadow outside the donor region"
+                ),
+            ));
+        }
         let Some(member) = self.f16_shadow_arena.lookup(key) else {
             return self.alloc_tensor(&[n], DType::F16);
         };
@@ -8708,6 +8957,7 @@ impl Gpu {
     ///     tape that outlived the unload fails loudly at its next replay.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
+        self.clear_shadow_borrow();
         self.mmq_screen.cache.clear();
         // S1 arena (no-op without one): borrowed shadow views are dropped from the
         // cache BEFORE their roots are quiesced and released, so the loop below only
@@ -9310,6 +9560,9 @@ impl Gpu {
     /// Growth inside a capture keeps the historical behaviour (warmup-first
     /// flows size scratch before capturing, so this is not expected).
     pub fn invalidate_for_scratch_growth(&mut self) {
+        // Every growth is announced here first: cached railgun skeletons key on
+        // this epoch (pointers into a replaced scratch buffer go stale).
+        crate::scratch::note_scratch_growth();
         if !crate::scratch::scratch_growth_invalidates(
             crate::graph::any_graph_captured(),
             self.graphs.capture_mode,
