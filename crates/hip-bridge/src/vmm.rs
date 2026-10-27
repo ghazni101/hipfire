@@ -758,6 +758,13 @@ impl VmmArena {
         self.base.is_null()
     }
 
+    /// True when this arena can never be mapped again: it is being released
+    /// (or already was), including the case where a failed `map_at` could not
+    /// clean up its own retained segment and set `releasing` itself.
+    pub fn unmappable(&self) -> bool {
+        self.releasing || self.is_released()
+    }
+
     pub fn map_next(
         &mut self,
         hip: &HipRuntime,

@@ -987,12 +987,21 @@ impl VmmSlotKv {
         let per_pos_v = stamp.per_pos_v_bytes as usize;
         let span_k = seq_len * per_pos_k;
         let span_v = seq_len * per_pos_v;
-        if span_k + span_v > owner.k_gpu[self.kv_layer_ids[0]].buf.size()
-            || span_k + span_v > owner.v_gpu[self.kv_layer_ids[0]].buf.size()
-        {
-            return Err(SwapError::Corrupt(format!(
-                "VMM capture: seq_len {seq_len} is past the mapped prefix"
-            )));
+        // K and V are separate owners/arenas: each span is bounded by its own
+        // mapped extent. Comparing their SUM against one buffer refused every
+        // session past half its mapped prefix (seq_len <= mapped_tokens / 2),
+        // so long conversations were never parked and re-prefilled cold.
+        // Every KV layer maps the same extent; check them all so a shorter
+        // later layer cannot be over-read.
+        for &layer in &self.kv_layer_ids {
+            let k_bytes = owner.k_gpu[layer].buf.size();
+            let v_bytes = owner.v_gpu[layer].buf.size();
+            if span_k > k_bytes || span_v > v_bytes {
+                return Err(SwapError::Corrupt(format!(
+                    "VMM capture: layer {layer} seq_len {seq_len} is past the \
+                     mapped prefix (K {span_k}>{k_bytes}, V {span_v}>{v_bytes})"
+                )));
+            }
         }
         let dn_total: usize = dn_extras.iter().map(|t| t.buf.size()).sum();
         let mut payload = vec![0u8; self.n_layers * (span_k + span_v) + dn_total];

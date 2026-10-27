@@ -516,6 +516,18 @@ impl VmmPageMapper {
                 if let Some(err) = staged_err {
                     return Err(err);
                 }
+                // A map that failed because the arena can no longer be mapped
+                // (its own cleanup also failed) is not a capacity refusal: no
+                // later map can succeed, so poison the mapper and let the
+                // engine fail the route instead of answering "retry later"
+                // forever.
+                if gpu.vmm_arena_unmappable(&arena) {
+                    self.poisoned = true;
+                    return Err(format!(
+                        "VmmPageMapper: map granule {granule} arena {arena_idx}: {e}; \
+                         the arena is unmappable and the mapper is poisoned"
+                    ));
+                }
                 return Err(format!(
                     "VmmPageMapper: map granule {granule} arena {arena_idx}: {e}"
                 ));

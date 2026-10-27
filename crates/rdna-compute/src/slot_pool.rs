@@ -217,6 +217,11 @@ impl SlotPool {
 
     /// Select VMM-paged descriptors for this paged pool. Reserved for q8/fp8
     /// equal-stride pools; the caller builds the matching `VmmPageMapper`.
+    ///
+    /// Every field here ends up in the 48-byte device descriptor and drives
+    /// `kv_vmm_paged_offset`, so a layout that disagrees with this pool's
+    /// strides is refused rather than silently translating one logical page
+    /// two different ways.
     pub fn set_vmm_layout(&mut self, layout: VmmPageLayout) -> Result<(), String> {
         if self.page_pool.is_none() {
             return Err("SlotPool: VMM layout requires a paged pool".into());
@@ -225,6 +230,37 @@ impl SlotPool {
             return Err(format!(
                 "SlotPool: VMM page_tokens {} does not match paged PAGE_TOKENS {PAGE_TOKENS}",
                 layout.page_tokens
+            ));
+        }
+        if self.k_per_pos_bytes != self.v_per_pos_bytes {
+            return Err(format!(
+                "SlotPool: VMM layout requires equal K/V strides (K {}, V {})",
+                self.k_per_pos_bytes, self.v_per_pos_bytes
+            ));
+        }
+        let want_page_bytes = PAGE_TOKENS
+            .checked_mul(self.k_per_pos_bytes)
+            .ok_or_else(|| "SlotPool: VMM page size overflow".to_string())?;
+        if layout.page_bytes != want_page_bytes {
+            return Err(format!(
+                "SlotPool: VMM page_bytes {} does not match PAGE_TOKENS {PAGE_TOKENS} x \
+                 stride {} = {want_page_bytes}",
+                layout.page_bytes, self.k_per_pos_bytes
+            ));
+        }
+        if layout.pages_per_granule == 0 || layout.granule_bytes == 0 {
+            return Err(format!(
+                "SlotPool: VMM layout granule_bytes={} pages_per_granule={} must be non-zero",
+                layout.granule_bytes, layout.pages_per_granule
+            ));
+        }
+        let packed = (layout.pages_per_granule as usize)
+            .checked_mul(layout.page_bytes)
+            .ok_or_else(|| "SlotPool: VMM granule packing overflow".to_string())?;
+        if packed > layout.granule_bytes {
+            return Err(format!(
+                "SlotPool: VMM layout packs {packed} bytes into a {} byte granule",
+                layout.granule_bytes
             ));
         }
         self.vmm_descs = self

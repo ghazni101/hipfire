@@ -6921,6 +6921,17 @@ impl Gpu {
         arena.map_at(&self.hip, offset, size, access_devices)
     }
 
+    /// True when the arena registered at this tensor's base can never be
+    /// mapped again (a failed `map_at` left it `releasing`). The shared paged
+    /// mapper poisons itself on this so a permanently unmappable pool reports
+    /// a mapping fault instead of a retryable capacity refusal forever.
+    pub fn vmm_arena_unmappable(&self, tensor: &GpuTensor) -> bool {
+        let key = tensor.buf.as_ptr() as usize;
+        self.vmm_arenas
+            .get(&key)
+            .is_some_and(|arena| arena.unmappable())
+    }
+
     /// Unmap and release one pool page previously mapped with
     /// [`Self::vmm_map_at`]. Synchronizes every access device first.
     pub fn vmm_unmap_at(
