@@ -3224,13 +3224,22 @@ fn q8_attend_slots(
     // simply on the wrong side for this path. At ~1086 tokens the two arms
     // were within run-to-run noise, hence 2048 rather than 0.
     //
-    // Left at 8192 for other non-gfx120x parts: the measurement is gfx1151's
-    // and does not transfer. gfx1200/gfx1201 keep 4096, which already puts a
-    // 4096-token context on the flash side.
+    // gfx1100 uses the same 2048. Its paged PM4 tape bakes `max_ctx_len` to
+    // the 8192-token bucket, so a crossover of 8192 keeps that whole bucket
+    // on the scalar kernel: one workgroup per head scans the live KV
+    // serially. rocprofv3 on a 1024-token Nex N2.5 mini decode records
+    // `attention_q8_0_kv_batched_vmm_paged` only at capture (20 calls, 0.2%
+    // of visible GPU time); the retained tape itself is not a HIP dispatch.
+    // Wall rate on that tape fell 215 → 113 tok/s by 1.4k tokens. 2048
+    // selects the tiled flash kernel for the bucket. Same model, one
+    // gfx1100: 198 tok/s at 512 tokens and 185 tok/s at 4096. Other
+    // non-gfx120x parts stay at 8192; that measurement does not transfer.
+    // gfx1200/gfx1201 keep 4096, which already puts a 4096-token context
+    // on the flash side.
     let crossover = gpu.slots_attn_crossover().unwrap_or({
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
             4096
-        } else if gpu.arch_caps.is_gfx1151() {
+        } else if gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1100() {
             2048
         } else {
             8192
@@ -4136,9 +4145,10 @@ pub fn forward_batch_slots(
 /// bound is rounded up to a bucket that covers the LDS-backed scalar
 /// attention kernel (scores[max_ctx] lives in shared memory). The kernel
 /// still loops to positions[b]+1, so a larger bucket does not over-scan;
-/// it only sizes LDS. gfx1100's scalar/flash crossover is 8192, which is
-/// also the LDS ceiling we can bake without overflowing 64 KB. One tape
-/// then serves the whole scalar regime instead of re-arming every 256 tokens.
+/// it only sizes LDS. 8192 is also the scalar kernel's LDS ceiling (64 KB).
+/// gfx1100's crossover is 2048, so that bucket's tape runs the tiled flash
+/// kernel instead of the serial scan; the bucket still keeps one tape for
+/// the whole window instead of re-arming every 256 tokens.
 ///
 /// `positions[]` is the authoritative causal bound (SP1). The bucket only
 /// sizes LDS; the kernel loops to `positions[b] + 1`, not to the bucket.
