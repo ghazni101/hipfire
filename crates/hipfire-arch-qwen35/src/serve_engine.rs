@@ -1210,31 +1210,25 @@ impl Rig {
             .iter()
             .filter(|t| **t == LayerType::FullAttention)
             .count();
-        // Slot KV storage: `legacy` = fixed `SlotPool` arenas, `vmm` =
-        // per-slot VMM owners. Every combination the VMM route cannot serve is
-        // refused BEFORE any GPU allocation (the daemon capability gate
-        // normally refuses these first; this is the fail-closed inner check).
+        // Slot KV storage. `legacy` keeps the slab or arena page pool.
+        // `vmm` is the shared VMM page pool, the same cache as
+        // `serve.multi_slot_paged_backend=vmm`. Tiers that pool cannot
+        // serve are refused before any GPU allocation.
         let kv_backend: hipfire_runtime::kv_backend::KvBackend = cfg
             .kv_backend
             .parse()
             .map_err(|e| format!("kv_backend {:?}: {e}", cfg.kv_backend))?;
-        let use_vmm = kv_backend == hipfire_runtime::kv_backend::KvBackend::Vmm;
+        // On this engine `kv_backend=vmm` is the shared VMM page pool (the
+        // same cache as `serve.multi_slot_paged_backend=vmm`). It does not
+        // build a per-slot owner. `use_vmm` stays false so the owner path,
+        // which maps `prompt + max_tokens` and never returns those pages,
+        // cannot be selected by the flag.
+        let kv_backend_vmm = kv_backend == hipfire_runtime::kv_backend::KvBackend::Vmm;
+        let use_vmm = false;
         let vl_env = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
             .ok()
             .is_some_and(|v| v == "1" || v == "on" || v == "true");
-        // VMM + vision: image requests run the sequential per-token VL path
-        // against the slot's own VMM owner (`VmmSlotKv::slot_view`). That path
-        // already owns the whole request (M-RoPE + visual embeddings) and the
-        // scheduler keeps VL slots out of the batched body, so no M-RoPE
-        // support is needed in the `_vmm` kernels. Text requests stay batched.
-        let vl_sequential = vl_env || (use_vmm && (cfg.is_vl || cfg.vl_path.is_some()));
-        if use_vmm {
-            if vl_sequential && (cfg.is_vl || cfg.vl_path.is_some()) {
-                eprintln!(
-                    "[hipfire] kv_backend=vmm + vision: image requests use the sequential VL path on their own slot owner; text requests stay batched"
-                );
-            }
-        }
+        let vl_sequential = vl_env;
         // Resolve the KV tier through the slots site policy — same config
         // source and alias table as the sequential carrier, but with q8 as
         // the slots engine's own default (the longest-validated slots path;
@@ -1367,59 +1361,37 @@ impl Rig {
         // it is set. An unknown spelling is a refusal, not a silent fall
         // through to the arena pool: that pool has a different descriptor
         // ABI and would hide a misconfigured VMM run.
-        let paged_vmm = select_paged_vmm_backend(
+        let paged_backend_vmm = select_paged_vmm_backend(
             hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
                 .ok()
                 .as_deref(),
             &cfg.multi_slot_paged_backend,
         )?;
-        let paged_requested = !use_vmm
-            && (cfg.multi_slot_paged
-                || cfg.multi_slot_paged_pages > 0
-                || env_paged == Some(true)
-                || env_pages.is_some_and(|p| p > 0)
-                || prefix_cache
-                || paged_vmm);
+        let pool_requested = cfg.multi_slot_paged
+            || cfg.multi_slot_paged_pages > 0
+            || env_paged == Some(true)
+            || env_pages.is_some_and(|p| p > 0)
+            || prefix_cache
+            || paged_backend_vmm;
         let paged_explicit = if cfg.multi_slot_paged_pages > 0 {
             Some(cfg.multi_slot_paged_pages)
         } else {
             env_pages
         };
-        let paged_pages = if use_vmm {
-            if paged_requested || env_paged == Some(true) {
-                eprintln!(
-                    "  [hipfire] multi-slot paged pool ignored: kv_backend=vmm uses \
-                     per-slot VMM owners"
-                );
-            }
-            None
-        } else if paged_requested {
-            // The legacy sequential VL path writes through a flat contiguous
-            // slab view that aliases every slot onto the arena prefix in
-            // paged mode; batched VL is paged-capable.
-            let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-                .ok()
-                .is_some_and(|v| v == "1" || v == "on" || v == "true");
-            if cfg.is_vl && sequential_vl {
-                eprintln!(
-                    "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
-                     requires contiguous KV slots"
-                );
-                None
-            } else {
-                Some(paged_explicit.unwrap_or(0))
-            }
-        } else {
-            None
-        };
+        // The legacy sequential VL path writes through a flat contiguous
+        // slab view that aliases every slot onto the arena prefix in paged
+        // mode; batched VL is paged-capable.
+        let storage = resolve_slot_kv_storage(
+            kv_backend_vmm,
+            paged_backend_vmm,
+            pool_requested,
+            paged_explicit,
+            cfg.is_vl && vl_sequential,
+            env_paged == Some(false),
+        )?;
+        let paged_vmm = storage.paged_vmm;
+        let paged_pages = storage.paged_pages;
         if paged_vmm {
-            if use_vmm {
-                return Err(
-                    "HIPFIRE_SLOTS_PAGED_BACKEND=vmm cannot combine with kv_backend=vmm"
-                        .to_string(),
-                );
-            }
-
             if paged_pages.is_none() {
                 return Err("VMM-paged backend requires the shared paged pool".to_string());
             }
@@ -3914,6 +3886,81 @@ pub fn select_paged_vmm_backend(
     configured: &str,
 ) -> Result<bool, String> {
     hipfire_config::select_paged_vmm_backend(env_backend, configured)
+}
+
+/// Resolved multi-slot KV storage.
+///
+/// `paged_pages` is the shared pool (`Some(0)` auto-sizes from free VRAM).
+/// `None` is the fixed per-slot slab. `paged_vmm` maps that pool with VMM
+/// granules instead of a preallocated arena.
+#[derive(Debug)]
+struct SlotKvStorage {
+    paged_pages: Option<usize>,
+    paged_vmm: bool,
+}
+
+/// One VMM cache on this engine: the shared page pool.
+///
+/// `kv_backend=vmm` and `serve.multi_slot_paged_backend=vmm` name that pool.
+/// They do not select two caches, and they do not build a per-slot owner
+/// that keeps `prompt + max_tokens` mapped until process exit. An explicit
+/// arena spelling next to `kv_backend=vmm` is the same pool; the caller logs
+/// that once.
+fn resolve_slot_kv_storage(
+    kv_backend_vmm: bool,
+    paged_backend_vmm: bool,
+    pool_requested: bool,
+    explicit_pages: Option<usize>,
+    sequential_vl: bool,
+    pool_forced_off: bool,
+) -> Result<SlotKvStorage, String> {
+    if kv_backend_vmm || paged_backend_vmm {
+        if pool_forced_off {
+            return Err(
+                "the multi-slot VMM cache is the shared page pool; \
+                 HIPFIRE_SLOTS_PAGED=0 turns that pool off"
+                    .to_string(),
+            );
+        }
+        if sequential_vl {
+            return Err(
+                "the multi-slot VMM cache is the shared page pool; \
+                 HIPFIRE_VL_SEQUENTIAL=1 needs contiguous slots and cannot use it"
+                    .to_string(),
+            );
+        }
+        if kv_backend_vmm && !paged_backend_vmm {
+            eprintln!(
+                "[hipfire] kv_backend=vmm on the multi-slot engine is the shared VMM page pool \
+                 (the same cache as serve.multi_slot_paged_backend=vmm). \
+                 Per-slot VMM owners are not a separate mode."
+            );
+        }
+        return Ok(SlotKvStorage {
+            paged_pages: Some(explicit_pages.unwrap_or(0)),
+            paged_vmm: true,
+        });
+    }
+    if pool_requested {
+        if sequential_vl {
+            eprintln!(
+                "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
+                 requires contiguous KV slots"
+            );
+            return Ok(SlotKvStorage {
+                paged_pages: None,
+                paged_vmm: false,
+            });
+        }
+        return Ok(SlotKvStorage {
+            paged_pages: Some(explicit_pages.unwrap_or(0)),
+            paged_vmm: false,
+        });
+    }
+    Ok(SlotKvStorage {
+        paged_pages: None,
+        paged_vmm: false,
+    })
 }
 
 fn cow_offset(phys: u32, page_bytes: usize, layout: Option<VmmPageLayout>) -> Option<usize> {
@@ -9044,6 +9091,36 @@ mod tests {
         let err = select_paged_vmm_backend(Some("vm"), "vmm").unwrap_err();
         assert!(err.contains("vm"), "{err}");
         assert!(select_paged_vmm_backend(None, "paged").is_err());
+    }
+
+    #[test]
+    fn kv_backend_vmm_is_the_shared_page_pool() {
+        let both = resolve_slot_kv_storage(true, true, true, None, false, false).unwrap();
+        assert!(both.paged_vmm);
+        assert_eq!(both.paged_pages, Some(0));
+
+        // `--kv-backend vmm` alone is that pool, not a per-slot owner.
+        let from_kv = resolve_slot_kv_storage(true, false, false, None, false, false).unwrap();
+        assert!(from_kv.paged_vmm);
+        assert_eq!(from_kv.paged_pages, Some(0));
+
+        // The paged-backend spelling is the same pool.
+        let from_paged = resolve_slot_kv_storage(false, true, true, Some(64), false, false).unwrap();
+        assert!(from_paged.paged_vmm);
+        assert_eq!(from_paged.paged_pages, Some(64));
+
+        // Legacy KV still has the slab route and the preallocated page pool.
+        let slabs = resolve_slot_kv_storage(false, false, false, None, false, false).unwrap();
+        assert!(!slabs.paged_vmm);
+        assert_eq!(slabs.paged_pages, None);
+        let arena = resolve_slot_kv_storage(false, false, true, Some(32), false, false).unwrap();
+        assert!(!arena.paged_vmm);
+        assert_eq!(arena.paged_pages, Some(32));
+
+        let off = resolve_slot_kv_storage(true, true, true, None, false, true).unwrap_err();
+        assert!(off.contains("HIPFIRE_SLOTS_PAGED=0"), "{off}");
+        let vl = resolve_slot_kv_storage(true, false, true, None, true, false).unwrap_err();
+        assert!(vl.contains("HIPFIRE_VL_SEQUENTIAL=1"), "{vl}");
     }
 
     #[test]

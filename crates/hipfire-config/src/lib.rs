@@ -1040,11 +1040,12 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND"),
-        "Physical backend for the shared paged KV pool: `arena` (default; zeroed full-size K/V \
-         arenas) or `vmm` (VA-only reservations, 2 MiB granule groups mapped as pages become \
-         resident). `vmm` is experimental; it admits q8 equal-stride pools only. MoE \
-         prompt chunks are isolated single-slot steps; lockstep decode can take retained \
-         PM4 when the slots Gpu is armed. Not a production default."
+        "Physical backend for the shared paged KV pool. `vmm` is the multi-slot VMM cache: \
+         one shared pool, VA-only at load, 2 MiB granule groups mapped as pages become \
+         resident and unmapped when the request releases them. `memory.kv_backend=vmm` selects \
+         this same pool; it is not a second, per-slot VMM cache. `arena` (default) preallocates \
+         the pool and is used only with `memory.kv_backend=legacy`. `vmm` admits q8 equal-stride \
+         pools only. MoE prompt chunks are isolated single-slot steps. Not a production default."
     ),
     field!(
         "generation.temperature",

@@ -2443,9 +2443,9 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         match v.parse::<KvBackend>() {
             // Arena route: the fixed `SlotPool` slabs.
             Ok(KvBackend::Legacy) => {}
-            // VMM route: per-slot owners, q8/fp8 KV only (the `_vmm`
-            // descriptor kernels). The engine re-checks every gate
-            // (vision/prefix-cache/speculation, arch) before allocating.
+            // VMM on this engine is the shared q8 page pool
+            // (`serve.multi_slot_paged_backend=vmm`), not a per-slot owner.
+            // That pool has no fp8 kernels.
             Ok(KvBackend::Vmm) => {
                 let raw = params
                     .and_then(|p| p.get("kv_mode"))
@@ -2454,15 +2454,11 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
                 let tier_ok = matches!(
                     hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch),
                     Ok(r) if r.warning.is_none()
-                        && matches!(
-                            r.mode,
-                            hipfire_runtime::kv_mode::KvMode::Q8
-                                | hipfire_runtime::kv_mode::KvMode::Fp8
-                        )
+                        && matches!(r.mode, hipfire_runtime::kv_mode::KvMode::Q8)
                 );
                 if !tier_ok {
                     return Some(format!(
-                        "experimental multi-slot kv_backend=vmm supports kv_mode=q8 (and fp8 on gfx1201) only; got kv_mode={raw:?}"
+                        "multi-slot kv_backend=vmm is the shared VMM page pool and supports kv_mode=q8 only; got kv_mode={raw:?}"
                     ));
                 }
             }
@@ -4158,6 +4154,14 @@ mod tests {
             )
             .is_some(),
             "vmm + rotated KV must be refused"
+        );
+        assert!(
+            validate_load_caps(
+                &json!({"params": {"kv_backend": "vmm", "kv_mode": "fp8"}}),
+                "gfx1201"
+            )
+            .is_some(),
+            "the shared VMM page pool has no fp8 kernels"
         );
         // MTP is now accepted in multi-slot (sequential per-slot path).
         assert_eq!(
