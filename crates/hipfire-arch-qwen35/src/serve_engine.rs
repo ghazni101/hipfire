@@ -595,6 +595,23 @@ impl ModelRig {
                         moe_prefills.len()
                     );
                 }
+                // No slot may appear in both an isolated prefill and the
+                // decode remainder: each writes that slot's DeltaNet state,
+                // KV frontier and logit row, and the remainder may replay a
+                // retained tape recorded without the prefill's rows.
+                for pref in &moe_prefills {
+                    for (slot, &m) in pref.m_per_slot.iter().enumerate() {
+                        if m > 0 && rest.m_per_slot.get(slot).copied().unwrap_or(0) > 0 {
+                            return Err(rdna_compute::HipError::new(
+                                0,
+                                &format!(
+                                    "MoE prefill isolation split slot {slot} into both \
+                                     the prefill and the decode step"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 for pref in &moe_prefills {
                     self.forward_paged_batch(
                         gpu,
@@ -610,6 +627,14 @@ impl ModelRig {
                 if rest.is_empty() {
                     return Ok(());
                 }
+                // The prefills ran eagerly on the HIP stream and the
+                // remainder may replay on the PM4 queue. Both use the same
+                // step scratch (pbs, Qwen35Scratch, MoE routing buffers) and
+                // the PM4 queue is not ordered after the HIP stream. Today
+                // the remainder's synchronous hipMemcpy uploads happen to
+                // drain the stream first; make the ordering explicit so the
+                // scratch is never shared across queues in flight.
+                gpu.hip.device_synchronize()?;
                 return self.forward_paged_batch(
                     gpu,
                     &rest,
