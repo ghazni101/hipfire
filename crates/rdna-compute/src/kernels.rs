@@ -2779,6 +2779,11 @@ pub const GEMV_IU4G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.h
 /// See `kernels/src/gemv_iu8g32.hip`.
 pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32.hip");
 
+/// IU8G256 (qt 58) decode GEMV: the MQ4V2 grid with one byte per code.
+/// `gemv_iu8g256` (SET) and `gemv_iu8g256_residual` (fused `y += W·x`).
+/// See `kernels/src/gemv_iu8g256.hip`.
+pub const GEMV_IU8G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g256.hip");
+
 /// IU8G32 (qt 59) embedding lookup: one row dequantized to F32 from the
 /// planar Q8 grid. See `kernels/src/embedding_iu8g32.hip`.
 pub const EMBEDDING_IU8G32_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g32.hip");

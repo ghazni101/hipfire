@@ -10,12 +10,16 @@
 // (`d = max(|x|) / 7`), packed in the same nibble order. The fold per eight
 // weights is the q8x identity, on this operand:
 //
-//   acc += (d * scale) * dot(q, xq) + zero * (d * sum(xq))
+//   acc += (d * scale) * dot(q, xq) + zero * (d * sumq)
 //
 // `x` is already FWHT-256 rotated. The integer dot is exact. The activation
 // quant is the approximation. The CPU contract is
 // `hipfire_runtime::iu_quant::gemv_iu4_dot8`. Prefill does not use this kernel.
 // qt 58 and qt 59 are a different operand and are not read here.
+//
+// `gemv_iu4g256_residual` is the fused `y += W·x` twin (`y` is both in and
+// out), used by a body-dtype `ssm_out` decode step. With `y` pre-zeroed it is
+// the SET kernel plus one f32 add at the store.
 //
 // RDNA3 and RDNA4 only (`v_dot8_i32_iu4`). Wave32, block 32.
 
@@ -42,20 +46,14 @@ __device__ __forceinline__ int iu4_sum_i4(int act) {
     return __builtin_amdgcn_sudot8(false, 0x11111111, true, act, 0, false);
 }
 
-extern "C" __global__ void gemv_iu4g256(
+__device__ __forceinline__ float iu4_row_dot(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
-    float* __restrict__ y,
-    int M,
     int K) {
-    const int row = (int)blockIdx.x;
-    const int t = (int)threadIdx.x;
-    if (row >= M) return;
-
     const int groups = K >> 8;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
-    const unsigned char* codes = A + (long long)row * row_bytes;
+    const unsigned char* codes = A;
     const unsigned char* scales = codes + (K >> 1);
+    const int t = (int)threadIdx.x;
 
     float acc = 0.0f;
     for (int g = 0; g < groups; ++g) {
@@ -82,5 +80,31 @@ extern "C" __global__ void gemv_iu4g256(
 
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
-    if (t == 0) y[row] = acc;
+    return acc;
+}
+
+extern "C" __global__ void gemv_iu4g256(
+    const unsigned char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const float acc = iu4_row_dot(A + (long long)row * row_bytes, x, K);
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
+extern "C" __global__ void gemv_iu4g256_residual(
+    const unsigned char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M,
+    int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const float acc = iu4_row_dot(A + (long long)row * row_bytes, x, K);
+    if (threadIdx.x == 0) y[row] = y[row] + acc;
 }

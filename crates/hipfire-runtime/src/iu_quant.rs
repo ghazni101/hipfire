@@ -363,6 +363,40 @@ pub fn gemv_q8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, 
     Ok(y)
 }
 
+/// GEMV contract for an IU8 tensor (qt 58): the dot of the dequantized
+/// MQ4V2-grid row with the already-FWHT-256-rotated activation.
+///
+/// The byte plane changes storage, not numerics: this is
+/// [`dequant`]`(Layout::Iu8)` · `x`, with `w = f32(scale) * code + f32(zero)`
+/// on each 128-wide half. The device kernel (`gemv_iu8g256`) folds the same
+/// product in f32, so a GPU result differs only in reduction order.
+pub fn gemv_iu8_dot(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, String> {
+    validate(bytes, m, k, Layout::Iu8)?;
+    if x.len() != k {
+        return Err(format!(
+            "IU8 GEMV activation length {}, expected K={k}",
+            x.len()
+        ));
+    }
+    let row_b = row_bytes(k, Layout::Iu8).expect("validate checked the shape");
+    let mut y = vec![0.0f32; m];
+    for row in 0..m {
+        let raw = &bytes[row * row_b..(row + 1) * row_b];
+        let codes = &raw[..k];
+        let scales = &raw[k..];
+        let mut acc = 0.0f32;
+        for col in 0..k {
+            let pair = (col / HALF) * SCALE_PAIR_BYTES;
+            let scale = load_f16(&scales[pair..]);
+            let zero = load_f16(&scales[pair + 2..]);
+            let w = scale * f32::from(codes[col]) + zero;
+            acc += w * x[col];
+        }
+        y[row] = acc;
+    }
+    Ok(y)
+}
+
 fn load_f16(bytes: &[u8]) -> f32 {
     f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
 }
@@ -599,6 +633,32 @@ mod tests {
         // qt 58 stores MQ4 nibbles. A signed Q8 code does not fit that range.
         assert!(packed[0] > 15);
         assert!(repack_q8f16(&src, m, 48).is_err());
+    }
+
+    #[test]
+    fn iu8_gemv_dots_the_byte_plane_with_the_rotated_activation() {
+        // One row, K=256: two 128-wide halves, each with its own scale/zero.
+        // Half 0 (scale 1, zero 0) code 3 on x[0]=2 -> 6; half 1 (scale 0.5,
+        // zero -1) code 4 on x[128]=2 -> (0.5*4 - 1) * 2 = 2. Sum 8.
+        let k = 256usize;
+        let row_b = row_bytes(k, Layout::Iu8).unwrap();
+        let mut tensor = vec![0u8; row_b];
+        tensor[0] = 3;
+        tensor[128] = 4;
+        let put = |buf: &mut [u8], at: usize, v: f32| {
+            buf[at..at + 2].copy_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+        };
+        put(&mut tensor, k, 1.0);
+        put(&mut tensor, k + 2, 0.0);
+        put(&mut tensor, k + 4, 0.5);
+        put(&mut tensor, k + 6, -1.0);
+        let mut x = vec![0.0f32; k];
+        x[0] = 2.0;
+        x[128] = 2.0;
+        assert_eq!(gemv_iu8_dot(&tensor, &x, 1, k).unwrap(), vec![8.0f32]);
+        // The byte plane must hold nibbles, not the qt 59 signed grid.
+        tensor[0] = 200;
+        assert!(gemv_iu8_dot(&tensor, &x, 1, k).is_err());
     }
 
     #[test]

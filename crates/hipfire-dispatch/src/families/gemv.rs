@@ -154,15 +154,6 @@ impl Default for RotateInputs<'_> {
 
 // ── Family ─────────────────────────────────────────────
 
-/// Pure selection of the RotationFamily variant from the sign-domain plan
-/// and the caller's fusion intent. AWQ/batched are NOT part of this — they
-/// are derived inside RotationFamily from awq_scale/batch_size.
-/// qt 58 still has no GEMV. qt 57 is `gemv_iu4g256` (prerotated) and qt 59 is
-/// `gemv_iu8g32` / `gemv_iu8g32_residual` (natural basis).
-fn iu_without_gemv(dtype: DType) -> bool {
-    dtype == DType::IU8G256
-}
-
 pub fn select_rotation_variant(
     plan: RotationPlan,
     has_norm: bool,
@@ -281,9 +272,6 @@ impl GemvFamily {
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
         }
-        if iu_without_gemv(w.dtype) {
-            return Err(crate::types::reject_iu(w.dtype, "gemv"));
-        }
         let x_buf = match input {
             RotInput::Raw(x) => {
                 let plan = crate::types::dtype_rotation_plan(w.dtype);
@@ -352,9 +340,6 @@ impl GemvFamily {
         if params.w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(params.w.dtype, "gemv"));
         }
-        if iu_without_gemv(params.w.dtype) {
-            return Err(crate::types::reject_iu(params.w.dtype, "gemv"));
-        }
         let shape = ShapeInfo {
             batch_size: 1,
             head_dim: 0,
@@ -409,9 +394,6 @@ impl GemvFamily {
         }
         if w.dtype.is_mq_i4() {
             return Err(reject_mq_i4(w.dtype, "gemv"));
-        }
-        if iu_without_gemv(w.dtype) {
-            return Err(crate::types::reject_iu(w.dtype, "gemv"));
         }
         let plan = crate::types::dtype_rotation_plan(w.dtype);
         if plan == RotationPlan::None {
@@ -560,6 +542,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
         K::GemvIu4G256Prerotated => hip!(gpu.gemv_iu4g256(w.buf, x, y, m, k)),
+        K::GemvIu8G256Prerotated => hip!(gpu.gemv_iu8g256(w.buf, x, y, m, k)),
         K::GemvMq4G256V2Prerotated => {
             // qt=52 shares the qt=44 dispatch key: branch on the WEIGHT dtype,
             // never the key. LUT None fails closed (a Lloyd tensor without its
@@ -639,7 +622,10 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         HFQ6G256 | MQ6G256 => Plain(Gpu::gemv_hfq6g256_residual),
         MQ5G256 => Plain(Gpu::gemv_hfq5g256_residual),
         MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
-        // qt 59: planar Q8 grid, natural-basis input, fused `y += W·x`.
+        // IU body rows consume the rotated activation; qt 59 the natural-basis
+        // one. All three are fused `y += W·x`.
+        IU4G256 => Plain(Gpu::gemv_iu4g256_residual),
+        IU8G256 => Plain(Gpu::gemv_iu8g256_residual),
         IU8G32 => Plain(Gpu::gemv_iu8g32_residual),
         MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
         MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),

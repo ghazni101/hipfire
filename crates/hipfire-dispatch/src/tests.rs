@@ -1490,15 +1490,33 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
             None
         )
         .is_err());
+    // qt 58 is the same grid with one byte per code: no integer dot, so it
+    // resolves on every arch.
+    for ctx in [ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4()] {
+        assert!(
+            fam.resolve(DType::IU8G256, GemvVariant::Prerotated, false, &ctx, None)
+                .is_ok(),
+            "IU8G256 Prerotated must resolve"
+        );
+        assert!(
+            fam.resolve(DType::IU8G256, GemvVariant::WithResidual, false, &ctx, None)
+                .is_ok(),
+            "IU8G256 WithResidual must resolve"
+        );
+    }
+    // A body-dtype `ssm_out` takes the fused residual arm.
+    assert!(KernelKey::for_gemv_residual(DType::IU4G256).is_ok());
+    assert!(KernelKey::for_gemv_residual(DType::IU8G256).is_ok());
     assert!(fam
         .resolve(
-            DType::IU8G256,
-            GemvVariant::Prerotated,
+            DType::IU4G256,
+            GemvVariant::WithResidual,
             false,
             &ctx_rdna3(),
             None
         )
-        .is_err());
+        .is_ok());
+    // qt 59 has no prerotated variant: it is rotation-free, admitted Plain.
     assert!(fam
         .resolve(
             DType::IU8G32,

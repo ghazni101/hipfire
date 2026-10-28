@@ -20,7 +20,7 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 |---|---|---|---|---|
 | **`mq4`** *(alias)* / `mq4v2` | **qt 44 `MQ4G256V2`** | 4 | FWHT | Qwen 3.5+ default body. **`--format mq4` means V2, not qt 13.** |
 | `iu4` / `iu4g256` | qt 57 `IU4G256` | 4 | FWHT | Same MQ4V2 codes, stored as an unsigned-nibble row. Decode GEMV is `v_dot8_i32_iu4` on RDNA3/RDNA4. **`hipfire-quantize` direct. Prefill GEMM has no kernel yet.** |
-| `iu8` / `iu8g256` | qt 58 `IU8G256` | 4 (byte operand) | FWHT | Same codes, one byte `0..=15` each, for the IU8 matrix unit. **Not an 8-bit grid. No GPU kernel yet.** |
+| `iu8` / `iu8g256` | qt 58 `IU8G256` | 4 (byte operand) | FWHT | Same codes, one byte `0..=15` each, for the IU8 matrix unit. **Not an 8-bit grid.** Decode GEMV + fused residual (`gemv_iu8g256`) run on every arch; prefill has no GEMM and takes the per-token decode loop. |
 | `iu4` / `iu8` lifted roles | qt 59 `IU8G32` | 8 | none | Embeddings on every rung, `lm_head` on the bare name and `pro`, `ssm_out` on `pro`: the Q8 grid with scales at the row tail, a signed IU8 operand. **Not qt 58.** Decode GEMV + fused residual (`gemv_iu8g32`) and the embedding gather (`embedding_iu8g32`) run on every arch; prefill has no GEMM and takes the per-token decode loop. |
 | `mq4v1` / `mq4g256` / `magnum` | qt 13 `MQ4G256` | 4 | FWHT | Legacy Magnum v1 only (explicit opt-in) |
 | `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |

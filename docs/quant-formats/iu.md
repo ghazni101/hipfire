@@ -127,15 +127,17 @@ and DFlash refuse qt 57, 58, and 59.
 
 | reader | qt 57 IU4 | qt 58 IU8 | qt 59 IU8G32 |
 |---|---|---|---|
-| decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | — | `gemv_iu8g32` (f16 scale × int8 × f32 x, every arch) |
-| fused `y += W·x` | per-token `weight_gemv` + add | — | `gemv_iu8g32_residual` |
+| decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` (f16 scale × int8 × f32 x, every arch) |
+| fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g256_residual` | `gemv_iu8g32_residual` |
 | embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
 | prefill GEMM | — | — | — |
 | DFlash verify | — | — | — |
 
-`hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57 and
-`gemv_q8` (`dequant_q8` · `x`) for qt 59. The loaders admit all three dtypes
+`hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57,
+`gemv_iu8_dot` (`dequant(Layout::Iu8)` · `x`) for qt 58, and `gemv_q8`
+(`dequant_q8` · `x`) for qt 59. The loaders admit all three dtypes
 (`RAW_CODECS`), and qt 59 embedding tables are admitted raw (one contiguous
 plane + tail scales), so an `iu4` / `iu8` artifact loads and decodes on the
 per-token path. Batched prefill, DFlash and the generic GEMMs still refuse the
-dtypes; there is no `_batched` gather.
+dtypes. A rung's `ssm_out` is a body row on `xt`/base, so that rung takes the
+fused residual twin; there is no `_batched` gather.

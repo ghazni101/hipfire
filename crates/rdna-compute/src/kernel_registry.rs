@@ -364,6 +364,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ["gemv_iu8g32", "gemv_iu8g32_residual"]
     );
     add!(
+        "gemv_iu8g256",
+        kernels::GEMV_IU8G256_SRC,
+        ["gemv_iu8g256", "gemv_iu8g256_residual"]
+    );
+    add!(
+        "gemv_iu4g256",
+        kernels::GEMV_IU4G256_SRC,
+        ["gemv_iu4g256", "gemv_iu4g256_residual"]
+    );
+    add!(
         "gemv_mq4g256",
         kernels::GEMV_MQ4G256_SRC,
         ["gemv_mq4g256", "mq_rotate_x"]
@@ -10305,10 +10315,17 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The IU4/IU8 quant family readers: qt 59 (IU8G32) decode GEMV with its
-        // fused residual twin, and the qt 59 embedding gather. Both are
-        // arch-agnostic (f16-scale x int8 x f32), so every pack carries them.
-        const IU_QUANT_ADDED_MODULES: [&str; 2] = ["embedding_iu8g32", "gemv_iu8g32"];
+        // The IU4/IU8 quant family readers: qt 57 (IU4G256) and qt 58
+        // (IU8G256) decode GEMVs with their fused residual twins, the qt 59
+        // (IU8G32) pair, and the qt 59 embedding gather. All are
+        // arch-agnostic (integer-dot / f16-scale x f32 math), so every pack
+        // carries them.
+        const IU_QUANT_ADDED_MODULES: [&str; 4] = [
+            "embedding_iu8g32",
+            "gemv_iu4g256",
+            "gemv_iu8g256",
+            "gemv_iu8g32",
+        ];
         for module in IU_QUANT_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
