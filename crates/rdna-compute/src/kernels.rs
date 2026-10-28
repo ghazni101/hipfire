@@ -9531,12 +9531,15 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
 /// advances up to four live slots. The scalar prefix (nt @64, frame @76) is
 /// kept so retained PM4 can patch the requant frame; lanes 1..3 are nine
 /// explicit pointer args each after that prefix so Resource wait sees every
-/// slot (312 B total; gfx11 s_loads the 56 B past the 256 B preload).
+/// slot (312 B total). The entry lives in its own copy,
+/// `gated_delta_net_q8_fast_slots.hip` (the shipping file verbatim plus the
+/// macro-isolated slots entry): `gated_delta_net_q8_fast.hip` is a sha-pinned
+/// flagship source (tests/flagship_pack_coverage.rs) and stays byte-identical.
 pub const GATED_DELTA_NET_Q8_FAST_SLOTS_SRC: &str = concat!(
     "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
     "#define HIPFIRE_GDN_SLOTS_BYVAL 1\n",
     "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast_slots\n",
-    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast_slots.hip")
 );
 
 /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
