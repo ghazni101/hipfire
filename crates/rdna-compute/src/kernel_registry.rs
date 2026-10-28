@@ -10533,6 +10533,27 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Multi-slot serving (gfx1201 subset): the slot-batched GDN decode
+        // module and the VMM-paged KV descriptor twins of the arena `_paged`
+        // modules (shared paged KV over hipMemCreate granules).
+        const MULTI_SLOT_ADDED_MODULES: [&str; 4] = [
+            "gated_delta_net_q8_fast_slots",
+            "kv_cache_write_q8_0_batched_vmm_paged",
+            "attention_q8_0_kv_batched_vmm_paged",
+            "attention_flash_q8_0_tile_batched_vmm_paged",
+        ];
+        for module in MULTI_SLOT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing multi-slot module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10550,7 +10571,8 @@ mod tests {
                 + HD64_FLASH_TILE_ADDED_MODULES.len()
                 + FP8_SPLIT_LSE_ADDED_MODULES.len()
                 + SHARED_LAUNCHER_ADDED_MODULES.len()
-                + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len(),
+                + VMM_EXACT_MTP_SEGS_ADDED_MODULES.len()
+                + MULTI_SLOT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
