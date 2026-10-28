@@ -4337,6 +4337,93 @@ fn decode_ctx_bucket(batch: &SlotBatch, physical_cap: usize) -> usize {
         .max(1)
 }
 
+/// Why this step must not run the prepared paged tape, or `None`.
+///
+/// The tape bakes `max_ctx_len` (= `ctx_bucket`) and each live slot's state
+/// pointers, and reads tokens, positions, descriptors and block tables from
+/// device buffers uploaded outside it. Those uploads are only as good as the
+/// host state they copy, so this re-checks, before any GPU work, the facts a
+/// replay relies on and nothing re-validates on the device:
+///
+/// - every row is a single-token row of a live slot inside the pool;
+/// - every position is inside the tape's context bucket, so the baked
+///   `max_ctx_len` covers it (a row past it would attend a truncated window);
+/// - in paged mode, the row's block table covers `pos` (the KV write resolves
+///   `block_table[pos / PAGE_TOKENS]`; a short table reads stale staging) and
+///   every entry names a real page (an out-of-range entry addresses past the
+///   arena).
+///
+/// The run loop provisions the frontier before the forward, so a failure here
+/// is a host-state bug. It fails closed instead of corrupting another slot.
+fn paged_replay_input_error<'a, F>(
+    batch: &SlotBatch,
+    ctx_bucket: usize,
+    n_slots: usize,
+    n_pages: Option<usize>,
+    table: F,
+) -> Option<String>
+where
+    F: Fn(usize) -> Option<&'a [u32]>,
+{
+    let rows = batch.positions.len();
+    if batch.row_slot.len() != rows || batch.tokens.len() != rows {
+        return Some(format!(
+            "row arrays disagree: tokens={} positions={} row_slot={}",
+            batch.tokens.len(),
+            rows,
+            batch.row_slot.len()
+        ));
+    }
+    if batch.m_per_slot.len() > n_slots {
+        return Some(format!(
+            "batch names {} slots but the pool has {n_slots}",
+            batch.m_per_slot.len()
+        ));
+    }
+    let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+    for row in 0..rows {
+        let slot = batch.row_slot[row];
+        let pos = batch.positions[row];
+        if slot < 0 || slot as usize >= batch.m_per_slot.len() {
+            return Some(format!("row {row} names slot {slot} outside the batch"));
+        }
+        let slot = slot as usize;
+        if batch.m_per_slot[slot] != 1 {
+            return Some(format!(
+                "row {row} is in slot {slot} with {} rows; a paged tape replays only \
+                 single-token rows",
+                batch.m_per_slot[slot]
+            ));
+        }
+        if pos < 0 || pos as usize >= ctx_bucket {
+            return Some(format!(
+                "row {row} (slot {slot}) position {pos} is outside the tape's ctx_bucket \
+                 {ctx_bucket}"
+            ));
+        }
+        let Some(n_pages) = n_pages else {
+            continue;
+        };
+        let Some(pages) = table(slot) else {
+            return Some(format!("slot {slot} has no block table"));
+        };
+        if pages.len() * page_tokens <= pos as usize {
+            return Some(format!(
+                "slot {slot} block table holds {} pages ({} tokens) but row {row} writes \
+                 position {pos}",
+                pages.len(),
+                pages.len() * page_tokens
+            ));
+        }
+        if let Some(bad) = pages.iter().find(|&&p| p as usize >= n_pages) {
+            return Some(format!(
+                "slot {slot} block table names page {bad} of a {n_pages}-page pool"
+            ));
+        }
+    }
+    None
+}
+
 /// Retained-PM4 body for a paged decode step.
 ///
 /// Uploads (tokens, positions, descriptors, block tables) stay outside the
@@ -4375,6 +4462,26 @@ fn forward_batch_slots_redline(
         cache.redline_tape = None;
     }
     upload_step_inputs(gpu, batch, pool, desc_staging, pbs)?;
+    let input_error = {
+        let n_pages = pool.page_pool().map(|pp| pp.n_pages());
+        paged_replay_input_error(
+            batch,
+            tape_key.ctx_bucket,
+            pool.descriptors().len(),
+            n_pages,
+            |slot| pool.block_table(SlotId(slot)).map(|bt| bt.page_indices()),
+        )
+    };
+    if let Some(reason) = input_error {
+        // Fail closed before any kernel reads the uploaded inputs: drop the
+        // tape so nothing replays it, and refuse the step.
+        gpu.replay.rearm_after_layout_growth();
+        cache.redline_tape = None;
+        return Err(HipError::new(
+            0,
+            &format!("slots paged PM4 step refused: {reason}"),
+        ));
+    }
     gpu.replay.set_forward_eligible(true);
     gpu.replay
         .begin_auto_capture_if_armed()
@@ -5536,6 +5643,75 @@ mod tests {
         let mut vision = slot0.clone();
         vision.pos3 = vec![[9, 0, 0]];
         assert_ne!(key0, paged_pm4_tape_key(&vision, &skip, 32768));
+    }
+
+    fn replay_batch(m: Vec<usize>, positions: Vec<i32>, row_slot: Vec<i32>) -> SlotBatch {
+        SlotBatch {
+            m_per_slot: m,
+            tokens: vec![1; positions.len()],
+            positions,
+            row_slot,
+            ..SlotBatch::default()
+        }
+    }
+
+    #[test]
+    fn paged_replay_inputs_accept_rows_inside_the_bucket_and_tables() {
+        let tables: Vec<Vec<u32>> = vec![vec![0, 1], vec![], vec![5]];
+        let batch = replay_batch(vec![1, 0, 1], vec![255, 127], vec![0, 2]);
+        let got = paged_replay_input_error(&batch, 256, 3, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert_eq!(got, None);
+        // Arena (unpaged) pools have no tables to check.
+        assert_eq!(paged_replay_input_error(&batch, 256, 3, None, |_| None), None);
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_a_position_outside_the_bucket() {
+        let batch = replay_batch(vec![1], vec![256], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, None, |_| None);
+        assert!(got.unwrap().contains("ctx_bucket"));
+        let neg = replay_batch(vec![1], vec![-1], vec![0]);
+        assert!(paged_replay_input_error(&neg, 256, 1, None, |_| None).is_some());
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_a_table_short_of_the_write_position() {
+        // Position 128 is the first token of logical page 1; one page is short.
+        let tables: Vec<Vec<u32>> = vec![vec![3]];
+        let batch = replay_batch(vec![1], vec![128], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert!(got.unwrap().contains("writes position 128"));
+        // 127 is still inside page 0.
+        let ok = replay_batch(vec![1], vec![127], vec![0]);
+        assert_eq!(
+            paged_replay_input_error(&ok, 256, 1, Some(8), |s| tables.get(s).map(|t| t.as_slice())),
+            None
+        );
+    }
+
+    #[test]
+    fn paged_replay_inputs_refuse_out_of_range_pages_and_bad_rows() {
+        let tables: Vec<Vec<u32>> = vec![vec![8]];
+        let batch = replay_batch(vec![1], vec![0], vec![0]);
+        let got = paged_replay_input_error(&batch, 256, 1, Some(8), |s| {
+            tables.get(s).map(|t| t.as_slice())
+        });
+        assert!(got.unwrap().contains("names page 8"));
+        // Missing table.
+        assert!(paged_replay_input_error(&batch, 256, 1, Some(8), |_| None).is_some());
+        // A multi-row slot never replays a decode tape.
+        let wide = replay_batch(vec![2], vec![0, 1], vec![0, 0]);
+        assert!(paged_replay_input_error(&wide, 256, 1, None, |_| None).is_some());
+        // Row naming a slot outside the batch.
+        let stray = replay_batch(vec![1], vec![0], vec![3]);
+        assert!(paged_replay_input_error(&stray, 256, 1, None, |_| None).is_some());
+        // Batch wider than the pool.
+        let over = replay_batch(vec![1, 1], vec![0, 0], vec![0, 1]);
+        assert!(paged_replay_input_error(&over, 256, 1, None, |_| None).is_some());
     }
 
     #[test]
