@@ -438,6 +438,9 @@ fn embed_lookup_to_scratch(
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, out, token, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, out, token, dim)
+        }
         // Q4K is not currently produced by qwen35.rs embedding-format assignment;
         // kept defensively in case it lands later — verify call convention then.
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),

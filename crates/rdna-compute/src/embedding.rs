@@ -117,6 +117,59 @@ impl Gpu {
         })
     }
 
+    /// IU8G32 (qt 59) embedding lookup: dequantize one row on GPU, output
+    /// F32. The table is the planar Q8 grid: `[K signed codes][f16 scale] *
+    /// (K / 32)`, no FWHT. Same math and launch shape as `embedding_q8`.
+    pub fn embedding_lookup_iu8g32(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_iu8g32",
+            kernels::EMBEDDING_IU8G32_SRC,
+            "embedding_iu8g32",
+        )?;
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        if !self.hip.plan_active() {
+            let func = &self.functions["embedding_iu8g32"];
+            // SAFETY: params match the kernel signature; null stream as before.
+            return unsafe {
+                self.hip
+                    .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+            };
+        }
+        self.launch_maybe_blob(
+            "embedding_iu8g32",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_i32(tid);
+                b.push_i32(d);
+                b
+            },
+        )
+    }
+
     /// Q4_K embedding lookup: dequantize one row on GPU, output F32.
     /// table is raw Q4_K bytes on GPU, output is [dim] F32.
     pub fn embedding_lookup_q4k(

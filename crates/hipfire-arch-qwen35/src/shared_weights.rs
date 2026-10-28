@@ -199,6 +199,7 @@ fn embd_tag(f: EmbeddingFormat) -> u8 {
         EmbeddingFormat::HFQ4G256 => 3,
         EmbeddingFormat::HFQ4G128 => 4,
         EmbeddingFormat::Q8_0 => 5,
+        EmbeddingFormat::IU8G32 => 6,
     }
 }
 
@@ -209,6 +210,7 @@ fn embd_from_tag(tag: u8) -> Option<EmbeddingFormat> {
         3 => EmbeddingFormat::HFQ4G256,
         4 => EmbeddingFormat::HFQ4G128,
         5 => EmbeddingFormat::Q8_0,
+        6 => EmbeddingFormat::IU8G32,
         _ => return None,
     })
 }

@@ -4139,6 +4139,14 @@ fn validate_embedding_info(
             }
             Some(vocab * (dim / 32) * 34)
         }
+        // qt 59 (IU8G32): the same Q8 grid, planar — one code byte per weight
+        // and one f16 scale per 32 at the row tail.
+        59 => {
+            if dim % 32 != 0 {
+                return Err(format!("{name}: IU8G32 dim {dim} not multiple of 32"));
+            }
+            Some(vocab * (dim + (dim / 32) * 2))
+        }
         6 => expected_mq4_bytes(vocab, dim),
         13 => expected_mq4_bytes(vocab, dim),
         44 => expected_mq4_bytes(vocab, dim),

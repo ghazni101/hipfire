@@ -157,9 +157,10 @@ impl Default for RotateInputs<'_> {
 /// Pure selection of the RotationFamily variant from the sign-domain plan
 /// and the caller's fusion intent. AWQ/batched are NOT part of this — they
 /// are derived inside RotationFamily from awq_scale/batch_size.
-/// qt 58 and qt 59 still have no GEMV. qt 57 is `gemv_iu4g256`.
+/// qt 58 still has no GEMV. qt 57 is `gemv_iu4g256` (prerotated) and qt 59 is
+/// `gemv_iu8g32` / `gemv_iu8g32_residual` (natural basis).
 fn iu_without_gemv(dtype: DType) -> bool {
-    dtype.is_iu_quant() && dtype != DType::IU4G256
+    dtype == DType::IU8G256
 }
 
 pub fn select_rotation_variant(
@@ -539,6 +540,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
         K::GemvBf16 => hip!(gpu.gemv_bf16_xf32(w.buf, x, y, m, k)),
         K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
+        K::GemvIu8G32 => hip!(gpu.gemv_iu8g32(w.buf, x, y, m, k)),
         K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
         K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
         K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
@@ -637,6 +639,8 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         HFQ6G256 | MQ6G256 => Plain(Gpu::gemv_hfq6g256_residual),
         MQ5G256 => Plain(Gpu::gemv_hfq5g256_residual),
         MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
+        // qt 59: planar Q8 grid, natural-basis input, fused `y += W·x`.
+        IU8G32 => Plain(Gpu::gemv_iu8g32_residual),
         MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
         MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),
         MQ6G256V2 => Plain(Gpu::gemv_mq6g256v2_residual),

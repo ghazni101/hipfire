@@ -279,6 +279,9 @@ pub enum KernelKey {
     GemvF16,
     GemvBf16,
     GemvQ8_0,
+    /// qt 59 decode GEMV: the Q8 grid with the scales at the row tail. Not
+    /// rotated (`IU8G32`'s rotation plan is `None`).
+    GemvIu8G32,
     GemvQ4K,
     GemvQ6K,
     GemvHfq4G256,
@@ -356,6 +359,8 @@ pub enum KernelKey {
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
+    /// qt 59 fused `y += W·x` (DeltaNet out_proj / ssm_out decode step).
+    GemvIu8G32Residual,
     // GEMV SwiGLU + residual
     GemvHfq4G256SwiGLUResidual,
     GemvHfq3G256SwiGLUResidual,
@@ -870,7 +875,10 @@ impl KernelKey {
                 | E8PI4G128R128,
                 _,
             ) => Err(reject_mq_i4(dtype, "gemv")),
-            (IU8G256 | IU8G32, _) => Err(reject_iu(dtype, "gemv")),
+            (IU8G256, _) => Err(reject_iu(dtype, "gemv")),
+            // qt 59 is the Q8 grid in the natural basis; its planar-tail GEMV
+            // (`gemv_iu8g32`) is the same math as `gemv_q8_0`.
+            (IU8G32, Plain) => Ok(Self::GemvIu8G32),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -977,7 +985,9 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
+            // qt 59 fused residual (`gemv_iu8g32_residual`).
+            IU8G32 => Ok(Self::GemvIu8G32Residual),
+            IU4G256 | IU8G256 => Err(reject_iu(dtype, "gemv")),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -1226,6 +1236,15 @@ mod tests {
         assert!(!dtype_needs_rotation(DType::IU8G32));
         assert!(KernelKey::for_gemv_prerotated(DType::IU8G256).is_err());
         assert!(KernelKey::for_gemv_residual(DType::IU4G256).is_err());
+        assert_eq!(
+            KernelKey::for_gemv(DType::IU8G32, GemvVariant::Plain, false).unwrap(),
+            KernelKey::GemvIu8G32
+        );
+        assert_eq!(
+            KernelKey::for_gemv_residual(DType::IU8G32).unwrap(),
+            KernelKey::GemvIu8G32Residual
+        );
+        assert!(KernelKey::for_gemv(DType::IU8G256, GemvVariant::Plain, false).is_err());
         assert!(
             KernelKey::gemv_steps(DType::MQ4G256V2Lloyd, GemvVariant::WithResidual)
                 .contains(&PipelineOp::RotateFwht)

@@ -629,7 +629,7 @@ fn swiglu_down_residual(
     use crate::types::{dtype_needs_rotation, GemvVariant};
     static GEMV: std::sync::LazyLock<GemvFamily> = std::sync::LazyLock::new(GemvFamily::new);
 
-    super::reject_mq4g128v2(w_down.dtype, "swiglu_down_residual")?;
+    super::reject_typed_only(w_down.dtype, "swiglu_down_residual")?;
     // Calibration tap: down_proj input is `hidden` (post-SiLU), K = w_down.k.
     // For MQ4 this will be rotated inside; we capture PRE-rotation.
     gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);

@@ -302,6 +302,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ["embedding_hfq4g256"]
     );
     add!(
+        "embedding_iu8g32",
+        kernels::EMBEDDING_IU8G32_SRC,
+        ["embedding_iu8g32"]
+    );
+    add!(
         "embedding_hfq4g256_batched",
         kernels::EMBEDDING_HFQ4G256_BATCHED_SRC,
         ["embedding_hfq4g256_batched"]
@@ -353,6 +358,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC, ["gemv_mq6g256"]);
     add!("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC, ["gemm_mq6g256"]);
     add!("gemv_q8_0", kernels::GEMV_Q8_0_SRC, ["gemv_q8_0"]);
+    add!(
+        "gemv_iu8g32",
+        kernels::GEMV_IU8G32_SRC,
+        ["gemv_iu8g32", "gemv_iu8g32_residual"]
+    );
     add!(
         "gemv_mq4g256",
         kernels::GEMV_MQ4G256_SRC,
@@ -10295,6 +10305,22 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The IU4/IU8 quant family readers: qt 59 (IU8G32) decode GEMV with its
+        // fused residual twin, and the qt 59 embedding gather. Both are
+        // arch-agnostic (f16-scale x int8 x f32), so every pack carries them.
+        const IU_QUANT_ADDED_MODULES: [&str; 2] = ["embedding_iu8g32", "gemv_iu8g32"];
+        for module in IU_QUANT_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing IU quant reader module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -10310,7 +10336,8 @@ mod tests {
                 + MOE_FRONT_ADDED_MODULES.len()
                 + MQ4RS_DECODE_ADDED_MODULES.len()
                 + HD64_FLASH_TILE_ADDED_MODULES.len()
-                + FP8_SPLIT_LSE_ADDED_MODULES.len(),
+                + FP8_SPLIT_LSE_ADDED_MODULES.len()
+                + IU_QUANT_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

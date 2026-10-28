@@ -1511,6 +1511,28 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
 }
 
 #[test]
+fn iu8g32_gemv_resolves_plain_and_residual_on_every_arch() {
+    // qt 59 is the Q8 grid with the scales at the row tail: f16-scale x int8 x
+    // f32 x, no integer matrix unit, no rotation. Plain (lm_head / ssm_out) and
+    // the fused residual (DeltaNet out_proj) must resolve everywhere.
+    let fam = GemvFamily::new();
+    for ctx in [ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4()] {
+        assert!(
+            fam.resolve(DType::IU8G32, GemvVariant::Plain, false, &ctx, None)
+                .is_ok(),
+            "IU8G32 Plain must resolve"
+        );
+        assert!(
+            fam.resolve(DType::IU8G32, GemvVariant::WithResidual, false, &ctx, None)
+                .is_ok(),
+            "IU8G32 WithResidual must resolve"
+        );
+    }
+    // No fused SwiGLU-residual: a lifted role is never a gate/up projection.
+    assert!(KernelKey::for_gemv_swiglu_residual(DType::IU8G32).is_err());
+}
+
+#[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
     assert!(fam

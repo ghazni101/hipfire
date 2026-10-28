@@ -101,7 +101,23 @@ pub mod superop;
 
 /// Generic-pipeline refusal for the typed-only formats: MQ4G128V2 (qt=53) and
 /// the planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134).
+///
+/// This is the MoE/pipeline guard, so an IU operand is refused here too: no
+/// MoE projection has an IU reader. The **decode** sites that reach a plain
+/// projection use [`reject_typed_only`] instead, which leaves the IU family to
+/// the readers (qt 57 GEMV, qt 59 GEMV/residual/gather; qt 58 is refused where
+/// it is consumed, at GEMV/GEMM resolution).
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
+    reject_typed_only(dtype, family)?;
+    if dtype.is_iu_quant() {
+        return Err(crate::types::reject_iu(dtype, family));
+    }
+    Ok(())
+}
+
+/// qt=53 / MQ-I4 refusal without the IU arm — for generic decode paths whose
+/// projections have an IU reader.
+fn reject_typed_only(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
     if dtype == DType::MQ4G128V2 {
         return Err(DispatchError::UnsupportedVariant {
             family,
@@ -112,9 +128,6 @@ fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchEr
     }
     if dtype.is_mq_i4() {
         return Err(reject_mq_i4(dtype, family));
-    }
-    if dtype.is_iu_quant() {
-        return Err(crate::types::reject_iu(dtype, family));
     }
     Ok(())
 }
@@ -1851,7 +1864,7 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
-    reject_mq4g128v2(dtype, "pipeline")?;
+    reject_typed_only(dtype, "pipeline")?;
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(ctx, gpu, key, params);
     }

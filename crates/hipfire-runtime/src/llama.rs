@@ -664,6 +664,7 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
+    IU8G32,   // raw qt 59 planar Q8 rows (codes then f16 scales per 32)
 }
 
 /// Single-token embedding lookup, dispatched on the table's storage format.
@@ -681,6 +682,7 @@ pub fn embedding_lookup_dispatch(
     match format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(table, output, token, dim),
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
+        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32(table, output, token, dim),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
@@ -2802,6 +2804,9 @@ fn forward_prefill_chunk(
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::IU8G32 => {
+                    gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {
                     unreachable!()

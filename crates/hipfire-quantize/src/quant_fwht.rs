@@ -1100,7 +1100,10 @@ mod tests {
                     let expect = scale * f32::from(code);
                     let actual = got[row * k + g * 32 + i];
                     assert!((actual - expect).abs() < 1e-6, "{actual} vs {expect}");
-                    assert_eq!(packed[row * q8_row_bytes(k).unwrap() + g * 32 + i], code as u8);
+                    assert_eq!(
+                        packed[row * q8_row_bytes(k).unwrap() + g * 32 + i],
+                        code as u8
+                    );
                 }
             }
         }

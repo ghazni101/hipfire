@@ -108,6 +108,10 @@ pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
+        // qt 59 (IU8G32): the lifted-role tier of an iu4/iu8 file. The grid is
+        // Q8F16's; only the scale position moved to the row tail, so the table
+        // uploads verbatim and `embedding_iu8g32` dequantizes a row.
+        59 => Ok(EmbedPlan::Raw(EmbeddingFormat::IU8G32)),
         1 | 2 | 16 | 40 | 41 | 44 | 45 | 47 | 48 | 49 | 50 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
@@ -153,6 +157,7 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
         EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
         EmbeddingFormat::Q8_0 => DType::Q8_0,
+        EmbeddingFormat::IU8G32 => DType::IU8G32,
         EmbeddingFormat::F32 => DType::F32,
         EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
     }

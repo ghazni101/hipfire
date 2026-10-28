@@ -90,8 +90,9 @@ acc += (d * scale) * dot(q, xq) + zero * (d * sum(xq))
 ```
 
 `x` is the FWHT-256 activation. The integer dot is exact. The activation
-quant is the approximation. Prefill GEMM, DFlash, qt 58, and qt 59 still
-refuse the dtype.
+quant is the approximation. Prefill GEMM, DFlash, and qt 58 still refuse the
+dtype; a prefill over an `iu4` body takes the per-token decode loop
+(`is_batchable_la` has no IU arm), so no GEMM is reached.
 
 ## Lifted roles (qt 59)
 
@@ -119,4 +120,22 @@ IU8G32, one row, K = 256                         272 B/row = 8.5 bpw
 
 Norms stay F16. The embedding table is a gather, not a matrix instruction. On the normal rung it is stored this way so a tied `lm_head` is the same buffer the int8 unit can load. Attention and the router are not rungs; on a MoE model the Q8 pin still holds them.
 
-Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. Generic GEMM and DFlash refuse qt 57, 58, and 59. Decode GEMV runs qt 57 only.
+Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. Generic GEMM
+and DFlash refuse qt 57, 58, and 59.
+
+## What runs
+
+| reader | qt 57 IU4 | qt 58 IU8 | qt 59 IU8G32 |
+|---|---|---|---|
+| decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | — | `gemv_iu8g32` (f16 scale × int8 × f32 x, every arch) |
+| fused `y += W·x` | per-token `weight_gemv` + add | — | `gemv_iu8g32_residual` |
+| embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
+| prefill GEMM | — | — | — |
+| DFlash verify | — | — | — |
+
+`hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57 and
+`gemv_q8` (`dequant_q8` · `x`) for qt 59. The loaders admit all three dtypes
+(`RAW_CODECS`), and qt 59 embedding tables are admitted raw (one contiguous
+plane + tail scales), so an `iu4` / `iu8` artifact loads and decodes on the
+per-token path. Batched prefill, DFlash and the generic GEMMs still refuse the
+dtypes; there is no `_batched` gather.

@@ -306,8 +306,7 @@ pub fn repack_q8f16(src: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
             let base = (row * gpr + g) * Q8_BLOCK_BYTES;
             dst[k + g * 2..k + g * 2 + 2].copy_from_slice(&src[base..base + 2]);
             let code_at = g * Q8_GROUP;
-            dst[code_at..code_at + Q8_GROUP]
-                .copy_from_slice(&src[base + 2..base + Q8_BLOCK_BYTES]);
+            dst[code_at..code_at + Q8_GROUP].copy_from_slice(&src[base + 2..base + Q8_BLOCK_BYTES]);
         }
     }
     Ok(out)
@@ -330,6 +329,38 @@ pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> 
         }
     }
     Ok(out)
+}
+
+/// GEMV contract for an IU8G32 tensor (qt 59): `y = W x` with
+/// `w = f32(scale) * f32(i8(code))` on the natural-basis `x`.
+///
+/// This is the dot of the dequantized row with `x`; the device kernel
+/// (`gemv_iu8g32`) folds the same product per 32-block and reduces with a warp
+/// tree, so a GPU result can differ in the last bits while a wrong byte
+/// layout, sign, or scale position is orders of magnitude outside tolerance.
+pub fn gemv_q8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, String> {
+    validate_q8(bytes, m, k)?;
+    if x.len() != k {
+        return Err(format!(
+            "IU8G32 GEMV activation length {}, expected K={k}",
+            x.len()
+        ));
+    }
+    let row_b = q8_row_bytes(k).expect("validate checked the shape");
+    let mut y = vec![0.0f32; m];
+    for row in 0..m {
+        let raw = &bytes[row * row_b..(row + 1) * row_b];
+        let codes = &raw[..k];
+        let scales = &raw[k..];
+        let mut acc = 0.0f32;
+        for col in 0..k {
+            let scale = load_f16(&scales[(col / Q8_GROUP) * 2..]);
+            let q = f32::from(codes[col] as i8);
+            acc += (scale * q) * x[col];
+        }
+        y[row] = acc;
+    }
+    Ok(y)
 }
 
 fn load_f16(bytes: &[u8]) -> f32 {
@@ -532,7 +563,10 @@ mod tests {
     fn q8_repack_keeps_signed_codes_and_moves_scales_to_the_tail() {
         let m = 2usize;
         let k = 64usize;
-        let scales = [f16::from_f32(0.125).to_bits(), f16::from_f32(-0.5).to_bits()];
+        let scales = [
+            f16::from_f32(0.125).to_bits(),
+            f16::from_f32(-0.5).to_bits(),
+        ];
         let mut src = vec![0u8; m * (k / Q8_GROUP) * Q8_BLOCK_BYTES];
         for row in 0..m {
             for g in 0..(k / Q8_GROUP) {
@@ -540,7 +574,11 @@ mod tests {
                 src[base..base + 2].copy_from_slice(&scales[g].to_le_bytes());
                 for i in 0..Q8_GROUP {
                     // 200 is i8 -56, which qt 58 would reject as a nibble.
-                    let code: i8 = if i == 0 { -56 } else { ((row + g + i) as i8) % 20 };
+                    let code: i8 = if i == 0 {
+                        -56
+                    } else {
+                        ((row + g + i) as i8) % 20
+                    };
                     src[base + 2 + i] = code as u8;
                 }
             }
@@ -561,6 +599,29 @@ mod tests {
         // qt 58 stores MQ4 nibbles. A signed Q8 code does not fit that range.
         assert!(packed[0] > 15);
         assert!(repack_q8f16(&src, m, 48).is_err());
+    }
+
+    #[test]
+    fn q8_gemv_dots_the_planar_codes_with_the_natural_basis_activation() {
+        // One row, one 32-block: scale 0.5, codes -4 and 6 on x = 2 and 3.
+        // y = 0.5*(-4*2) + 0.5*(6*3) = -4 + 9 = 5.
+        let k = 32usize;
+        let mut src = vec![0u8; Q8_BLOCK_BYTES];
+        src[0..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
+        src[2] = (-4i8) as u8;
+        src[3] = 6;
+        let packed = repack_q8f16(&src, 1, k).unwrap();
+        let mut x = vec![0.0f32; k];
+        x[0] = 2.0;
+        x[1] = 3.0;
+        assert_eq!(gemv_q8(&packed, &x, 1, k).unwrap(), vec![5.0f32]);
+        // The interleaved Q8F16 blob has the SAME length (34 == 32 + 2), so a
+        // length check cannot tell the layouts apart — the dtype tag does. Read
+        // as planar, its first code byte (-4, i.e. 0xFC) is charged to x[0] and
+        // its scale word to x[1], so the result is not 5.
+        assert!(gemv_q8(&src, &x, 1, k).is_ok());
+        assert_ne!(gemv_q8(&src, &x, 1, k).unwrap(), vec![5.0f32]);
+        assert!(gemv_q8(&packed, &x[..k - 1], 1, k).is_err());
     }
 
     #[test]

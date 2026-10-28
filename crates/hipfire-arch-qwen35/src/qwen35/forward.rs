@@ -980,6 +980,9 @@ pub fn forward(
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &x, token, dim)?
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
     }
@@ -1954,6 +1957,9 @@ pub fn forward_scratch(
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
         }
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &scratch.x, token, dim)?
+        }
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
         }
@@ -2181,6 +2187,9 @@ pub fn forward_scratch_with_hidden(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &scratch.x, token, dim)?
         }
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
@@ -5619,6 +5628,9 @@ pub fn forward_gpu(
             gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &x, token, dim)?
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
         _ => panic!("unsupported embedding format"),
     }

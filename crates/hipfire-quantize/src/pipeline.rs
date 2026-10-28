@@ -225,10 +225,7 @@ fn iu_integer_body_latched() -> bool {
 
 /// Developer levers that would write a non-IU expert grid into an IU file.
 /// The integer units cannot mix those bytes with the body operand.
-fn check_iu_integer_body(
-    format: &str,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), String> {
+fn check_iu_integer_body(format: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
     if hipfire_runtime::iu_quant::Layout::from_format(format).is_none() {
         return Ok(());
     }
@@ -2209,9 +2206,9 @@ pub(crate) fn run() {
         eprintln!("error: {message}");
         std::process::exit(2);
     }
-    if let Err(message) = check_iu_integer_body(&args.format, &|var| {
-        hipfire_config::developer_var(var).ok()
-    }) {
+    if let Err(message) =
+        check_iu_integer_body(&args.format, &|var| hipfire_config::developer_var(var).ok())
+    {
         eprintln!("error: {message}");
         std::process::exit(2);
     }
@@ -3875,7 +3872,10 @@ pub(crate) fn run() {
             );
             let q = quantize_q8f16(&f32_data);
             let (q, qt, group, label) = emit_q8_or_iu8(q, &meta.shape);
-            eprintln!("  {:>8}: {} {:?} (router {label})", "Q8-MM", name, meta.shape);
+            eprintln!(
+                "  {:>8}: {} {:?} (router {label})",
+                "Q8-MM", name, meta.shape
+            );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
@@ -9997,11 +9997,26 @@ mod pipeline_tests {
 
     #[test]
     fn iu_products_are_the_three_ladder_rungs() {
-        assert_eq!(iu_product_name("iu4", ProductTier::Xt).as_deref(), Some("iu4-xt"));
-        assert_eq!(iu_product_name("iu4g256", ProductTier::Base).as_deref(), Some("iu4"));
-        assert_eq!(iu_product_name("iu4", ProductTier::Pro).as_deref(), Some("iu4 pro"));
-        assert_eq!(iu_product_name("iu8", ProductTier::Xt).as_deref(), Some("iu8-xt"));
-        assert_eq!(iu_product_name("iu8", ProductTier::Base).as_deref(), Some("iu8"));
+        assert_eq!(
+            iu_product_name("iu4", ProductTier::Xt).as_deref(),
+            Some("iu4-xt")
+        );
+        assert_eq!(
+            iu_product_name("iu4g256", ProductTier::Base).as_deref(),
+            Some("iu4")
+        );
+        assert_eq!(
+            iu_product_name("iu4", ProductTier::Pro).as_deref(),
+            Some("iu4 pro")
+        );
+        assert_eq!(
+            iu_product_name("iu8", ProductTier::Xt).as_deref(),
+            Some("iu8-xt")
+        );
+        assert_eq!(
+            iu_product_name("iu8", ProductTier::Base).as_deref(),
+            Some("iu8")
+        );
         assert_eq!(
             iu_product_name("iu8g256", ProductTier::Pro).as_deref(),
             Some("iu8 pro")
@@ -10038,7 +10053,6 @@ mod pipeline_tests {
         .unwrap();
         check_iu_integer_body("mq4", &|_| Some("1".to_string())).unwrap();
     }
-
 
     /// Regression pin for `d1d172e9c`, which extracted `handle_moe_expert_3d`
     /// and dropped its `shape.len() == 3` precondition at the call site. A 2-D

@@ -2774,6 +2774,15 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
 /// nibble row. See `kernels/src/gemv_iu4.hip`.
 pub const GEMV_IU4G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.hip");
 
+/// IU8G32 (qt 59) decode GEMV: the Q8 grid with the scales at the row tail.
+/// `gemv_iu8g32` (SET) and `gemv_iu8g32_residual` (fused `y += W·x`).
+/// See `kernels/src/gemv_iu8g32.hip`.
+pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32.hip");
+
+/// IU8G32 (qt 59) embedding lookup: one row dequantized to F32 from the
+/// planar Q8 grid. See `kernels/src/embedding_iu8g32.hip`.
+pub const EMBEDDING_IU8G32_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g32.hip");
+
 pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
     "#define Q8X_QUANT 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2_q8x.hip")

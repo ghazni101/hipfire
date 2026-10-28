@@ -280,6 +280,9 @@ fn embed_lookup(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("gemma4: embed q8: {e:?}"))?,
+        EmbeddingFormat::IU8G32 => gpu
+            .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
+            .map_err(|e| format!("gemma4: embed iu8g32: {e:?}"))?,
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("gemma4: embed f32: {e:?}"))?,
@@ -310,6 +313,9 @@ fn embedding_lookup_to(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(table, dst, token_id, dim)
             .map_err(|e| format!("gemma4: {label} q8: {e:?}")),
+        EmbeddingFormat::IU8G32 => gpu
+            .embedding_lookup_iu8g32(table, dst, token_id, dim)
+            .map_err(|e| format!("gemma4: {label} iu8g32: {e:?}")),
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(table, dst, token_id, dim)
             .map_err(|e| format!("gemma4: {label} f32: {e:?}")),
@@ -336,7 +342,7 @@ fn embedding_lookup_batched_to(
             gpu.embedding_lookup_hfq4g128_batched(table, dst, token_ids, batch, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim),
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G32 => return Ok(false),
     };
     result
         .map(|_| true)
@@ -1174,6 +1180,9 @@ fn embed_lookup_row(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.embed_tokens, dst, token_id, dim)
             .map_err(|e| format!("gemma4 forward_batch embed q8: {e:?}")),
+        EmbeddingFormat::IU8G32 => gpu
+            .embedding_lookup_iu8g32(&weights.embed_tokens, dst, token_id, dim)
+            .map_err(|e| format!("gemma4 forward_batch embed iu8g32: {e:?}")),
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, dst, token_id, dim)
             .map_err(|e| format!("gemma4 forward_batch embed f32: {e:?}")),

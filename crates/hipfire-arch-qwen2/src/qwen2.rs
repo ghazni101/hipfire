@@ -1064,6 +1064,9 @@ pub fn forward_step(
         EmbeddingFormat::Q4K => {
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }
 
@@ -1126,6 +1129,9 @@ pub fn embed_token_row(
         }
         EmbeddingFormat::Q4K => {
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
     }

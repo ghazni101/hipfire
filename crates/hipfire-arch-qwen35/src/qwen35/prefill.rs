@@ -5504,6 +5504,9 @@ pub(crate) fn batch_chunk_embed_tokens(
                 EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
                 }
+                EmbeddingFormat::IU8G32 => {
+                    gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
+                }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
