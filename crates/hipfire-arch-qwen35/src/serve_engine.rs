@@ -33,7 +33,9 @@ use hipfire_runtime::swap::{SwapError, SwapManager};
 use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
-use rdna_compute::vmm_page_pool::{VmmGranuleGeometry, VmmPageLayout, VmmPageMapper};
+use rdna_compute::vmm_page_pool::{
+    check_table_ownership, VmmGranuleGeometry, VmmPageLayout, VmmPageMapper,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, CheckpointPool};
@@ -493,9 +495,10 @@ impl ModelRig {
     /// `any_verify`/`any_dflash_rows` so the engine loop never names model
     /// buffers. `gpu`/`pool`/`graph`/`batch`/`lm_head_skip` are the
     /// family-neutral engine pieces passed in by the caller.
-    /// Reconcile VMM-page mappings with the logical page pool immediately
-    /// before a forward. Mapping and unmapping are admission/provisioning
-    /// boundaries, never inside a kernel step.
+    /// Map the granules of newly allocated pages immediately before a
+    /// forward, and check that no two slots share a writable page. Mapping is
+    /// an admission/provisioning boundary, never inside a kernel step. The
+    /// mapper never unmaps while serving (see `VmmPageMapper::sync`).
     fn sync_paged_vmm(&mut self, gpu: &mut Gpu, pool: &SlotPool) -> rdna_compute::HipResult<()> {
         let Some(mapper) = self.paged_vmm.as_mut() else {
             return Ok(());
@@ -507,12 +510,23 @@ impl ModelRig {
         mapper
             .sync(gpu, &states)
             .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+        let mut live = Vec::new();
         for slot in 0..pool.descriptors().len() {
             if let Some(bt) = pool.block_table(SlotId(slot)) {
                 mapper
                     .check_table(bt.page_indices(), bt.num_pages())
                     .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+                live.push((slot, &bt.page_indices()[..bt.num_pages()]));
             }
+        }
+        if let Err(e) = check_table_ownership(&states, live) {
+            // Two requests sharing writable KV is a page-pool logic bug, not
+            // a capacity refusal: poison so the engine fails closed.
+            mapper.mark_poisoned();
+            return Err(rdna_compute::HipError::new(
+                0,
+                &format!("VMM-paged block tables are inconsistent: {e}"),
+            ));
         }
         for tensor in self.k_arenas.iter_mut().chain(self.v_arenas.iter_mut()) {
             gpu.refresh_vmm_owner_size(tensor)?;
@@ -5000,16 +5014,9 @@ fn run_loop(
         'serve: loop {
             let idle = slots.iter().all(|s| s.is_none());
             if idle && rig.wait_queue.queued_count() == 0 {
-                // Nothing in flight. Return physical granules whose pages
-                // were freed by the step that just finished. Prefix-cache
-                // pages stay non-Free, so their granules stay mapped. A
-                // failed unmap poisons the mapper; keep serving only if the
-                // mapping state is still trustworthy.
-                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
-                    let reason = format!("VMM-paged reclaim failed: {e}");
-                    poison = Some(reason);
-                    break 'serve;
-                }
+                // VMM-paged granules are not returned at idle: a used VA
+                // keeps its physical allocation until teardown (see
+                // `VmmPageMapper::sync`), so freed pages are reused in place.
                 // Nothing in flight and nothing queued: block rather than spin.
                 // With an idle TTL configured, wake periodically to close
                 // abandoned parked sessions instead of waiting for the next

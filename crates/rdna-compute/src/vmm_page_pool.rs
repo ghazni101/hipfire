@@ -178,11 +178,21 @@ impl VmmPageArenas {
 /// One VMM arena per full-attention layer for K and V, with page-granular
 /// mapping. Physical memory is committed only when `sync` sees the first
 /// resident page in a granule.
+///
+/// A granule's VA keeps the physical allocation it was first committed with
+/// for the mapper's whole life (a stable binding). Freed pages stay mapped
+/// and are reused in place; the physical bytes return only when the caller
+/// frees the [`VmmPageArenas`] owners at teardown. See [`Self::sync`] for why
+/// a VA is never recycled onto a new allocation.
 pub struct VmmPageMapper {
     layout: VmmPageLayout,
     k_bases: Vec<(usize, usize)>,
     v_bases: Vec<(usize, usize)>,
     mapped_granules: Vec<bool>,
+    /// Granules whose mapping was committed by a successful `sync`, after
+    /// which kernels may have used the VA. Such a VA must never be mapped
+    /// onto a different allocation while the mapper lives.
+    bound_granules: Vec<bool>,
     mapped_bytes: usize,
     budget_bytes: usize,
     poisoned: bool,
@@ -313,6 +323,7 @@ impl VmmPageMapper {
                 k_bases,
                 v_bases,
                 mapped_granules: vec![false; n_granules],
+                bound_granules: vec![false; n_granules],
                 mapped_bytes: 0,
                 budget_bytes,
                 poisoned: false,
@@ -403,19 +414,32 @@ impl VmmPageMapper {
         Ok(())
     }
 
-    /// Reconcile the mapped granules with the page pool's current states.
-    /// `states[phys]` is authoritative: every state except `Free` keeps the
+    /// Map every granule that holds a non-`Free` page and is not mapped yet.
+    /// `states[phys]` is authoritative: every state except `Free` needs the
     /// page's granule mapped (`ReclaimPending` may still have device reads).
     ///
-    /// Free granules are unmapped before any new granule is mapped. Doing it
-    /// the other way charges soon-to-be-freed physical memory against the
-    /// budget and can refuse a map that would have fit, the same failure
-    /// mode as freeing a block only after the next allocation in a paged
-    /// pool. On a mapping failure the granules mapped by this call are
-    /// rolled back. An unmap that cannot be undone poisons the mapper: the
-    /// bitmap must not claim a VA range is free while a segment is still
-    /// mapped, or the next `map_at` fails closed with "overlaps" and the
-    /// range is stuck.
+    /// `sync` never unmaps. A granule whose pages are all `Free` stays mapped
+    /// and its pages are reused in place by the next allocation, so the
+    /// committed bytes are the pool's high-water mark, bounded by the budget
+    /// (the serve engine sizes the budget to the whole pool, so it never
+    /// refuses there).
+    ///
+    /// Never unmapping is a correctness rule. On gfx1100 (ROCm 7.x, amdgpu
+    /// on Linux 7.3), `hipMemUnmap` + `hipMemRelease` of a granule, then
+    /// `hipMemCreate` + `hipMemMap` of a new allocation at the same VA, lets
+    /// the first kernel writes through that VA land in the old physical
+    /// memory: a fresh alias of the new allocation reads them back as zeros.
+    /// Device synchronization, re-setting access, or a dma-buf fence wait do
+    /// not stop it; only wall-clock time does, so no fence can order it. In
+    /// the server it showed up as wrong greedy output and cross-request KV
+    /// aliasing (one request answering with another's prompt). A fresh VA,
+    /// or the same VA kept on its original allocation, is not affected, so
+    /// the binding of a used VA is permanent. `bound_granules` enforces it:
+    /// mapping a bound granule's VA again fails closed.
+    ///
+    /// On a mapping failure the granules mapped by this call are rolled back
+    /// (no kernel has seen them yet). An unmap that cannot be undone poisons
+    /// the mapper.
     pub fn sync(&mut self, gpu: &mut Gpu, states: &[PageState]) -> Result<(), String> {
         if self.released {
             return Err("VmmPageMapper: sync after release".into());
@@ -430,13 +454,11 @@ impl VmmPageMapper {
                 self.layout.n_pages
             ));
         }
-        let p = self.layout.pages_per_granule as usize;
-        let mut used = vec![false; self.layout.n_granules];
-        for (phys, &state) in states.iter().enumerate() {
-            if state != PageState::Free {
-                used[phys / p] = true;
-            }
-        }
+        let used = used_granules(
+            states,
+            self.layout.pages_per_granule as usize,
+            self.layout.n_granules,
+        );
         let arena_count = self.k_bases.len() + self.v_bases.len();
         let granule_cost = self
             .layout
@@ -444,27 +466,20 @@ impl VmmPageMapper {
             .checked_mul(arena_count)
             .ok_or_else(|| "VmmPageMapper: granule cost overflowed".to_string())?;
 
-        let needs_unmap = (0..self.layout.n_granules)
-            .any(|granule| self.mapped_granules[granule] && !used[granule]);
-        if needs_unmap {
-            // Paged kernels run on the default stream. Wait for that stream
-            // once, then unmap. `vmm_unmap_at` also device-synchronizes, so
-            // a kernel that was not on the default stream still cannot race
-            // the unmap.
-            gpu.hip
-                .stream_synchronize_default()
-                .map_err(|e| format!("VmmPageMapper: stream sync before unmap: {e}"))?;
-            for granule in 0..self.layout.n_granules {
-                if self.mapped_granules[granule] && !used[granule] {
-                    self.unmap_granule(gpu, granule, granule_cost)?;
-                }
-            }
-        }
-
         let mut newly_mapped = Vec::new();
         for granule in 0..self.layout.n_granules {
             if !used[granule] || self.mapped_granules[granule] {
                 continue;
+            }
+            if self.bound_granules[granule] {
+                // Unreachable while nothing unmaps a bound granule. Refuse
+                // rather than recycle the VA onto a new allocation.
+                self.rollback_mapped(gpu, &newly_mapped)?;
+                self.poisoned = true;
+                return Err(format!(
+                    "VmmPageMapper: granule {granule} lost its stable binding; \
+                     remapping a used VA is unsafe and the mapper is poisoned"
+                ));
             }
             if self.budget_bytes != 0
                 && self.mapped_bytes.saturating_add(granule_cost) > self.budget_bytes
@@ -481,7 +496,22 @@ impl VmmPageMapper {
             }
             newly_mapped.push(granule);
         }
+        // Commit: from here on kernels may use these VAs.
+        for &granule in &newly_mapped {
+            self.bound_granules[granule] = true;
+        }
         Ok(())
+    }
+
+    /// Stop all further mapping: the caller found the pages this mapper
+    /// backs in an inconsistent state.
+    pub fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
+
+    /// Number of granules currently mapped (committed or not).
+    pub fn mapped_granule_count(&self) -> usize {
+        self.mapped_granules.iter().filter(|&&m| m).count()
     }
 
     fn map_granule(
@@ -554,36 +584,15 @@ impl VmmPageMapper {
         Ok(())
     }
 
-    fn unmap_granule(
-        &mut self,
-        gpu: &mut Gpu,
-        granule: usize,
-        granule_cost: usize,
-    ) -> Result<(), String> {
-        let offset = granule * self.layout.granule_bytes;
-        for &(base, size) in self.k_bases.iter().chain(self.v_bases.iter()) {
-            let arena = alias(base, size);
-            if let Err(e) = gpu.vmm_unmap_at(&arena, offset, self.layout.granule_bytes) {
-                // Leave the bit set. Some arenas in this granule may already
-                // be unmapped; a cleared bit would let the next map overlap
-                // the ones that survived.
-                self.poisoned = true;
-                return Err(format!(
-                    "VmmPageMapper: unmap granule {granule} failed after partial teardown: {e}"
-                ));
-            }
-        }
-        self.mapped_granules[granule] = false;
-        self.mapped_bytes = self.mapped_bytes.saturating_sub(granule_cost);
-        Ok(())
-    }
-
+    /// Unmap granules mapped by the current `sync` call before it commits.
+    /// They are not bound yet: no kernel has seen their VA.
     fn rollback_mapped(&mut self, gpu: &mut Gpu, granules: &[usize]) -> Result<(), String> {
         let cost = self.layout.granule_bytes * (self.k_bases.len() + self.v_bases.len());
         for &granule in granules.iter().rev() {
             if !self.mapped_granules[granule] {
                 continue;
             }
+            debug_assert!(!self.bound_granules[granule], "rollback of a bound granule");
             let offset = granule * self.layout.granule_bytes;
             for &(base, size) in self.k_bases.iter().chain(self.v_bases.iter()) {
                 let arena = alias(base, size);
@@ -625,9 +634,99 @@ impl Drop for VmmPageMapper {
 /// cannot drift.
 pub const VMM_PAGE_TOKENS: usize = PAGE_TOKENS;
 
+/// Granules holding at least one non-`Free` page.
+fn used_granules(states: &[PageState], pages_per_granule: usize, n_granules: usize) -> Vec<bool> {
+    let mut used = vec![false; n_granules];
+    for (phys, &state) in states.iter().enumerate() {
+        if state != PageState::Free {
+            used[phys / pages_per_granule] = true;
+        }
+    }
+    used
+}
+
+/// Check the live block tables against the page states before a forward:
+/// every live entry names a resident page, and a `Private` page appears in
+/// exactly one table at exactly one position. A violation is a page-pool
+/// logic bug (two requests sharing writable KV) that a stable VMM binding
+/// would otherwise hide, so the engine fails the step instead of running.
+pub fn check_table_ownership<'a>(
+    states: &[PageState],
+    tables: impl IntoIterator<Item = (usize, &'a [u32])>,
+) -> Result<(), String> {
+    let mut owner: Vec<Option<(usize, usize)>> = vec![None; states.len()];
+    for (slot, table) in tables {
+        for (lp, &phys) in table.iter().enumerate() {
+            let Some(&state) = states.get(phys as usize) else {
+                return Err(format!(
+                    "slot {slot} logical page {lp} names phys {phys} >= {} pages",
+                    states.len()
+                ));
+            };
+            match state {
+                PageState::Free | PageState::ReclaimPending => {
+                    return Err(format!(
+                        "slot {slot} logical page {lp} names phys {phys} in state {state:?}"
+                    ));
+                }
+                PageState::Private => {
+                    if let Some((s0, lp0)) = owner[phys as usize] {
+                        return Err(format!(
+                            "Private phys {phys} is in slot {s0} page {lp0} and slot {slot} page {lp}"
+                        ));
+                    }
+                    owner[phys as usize] = Some((slot, lp));
+                }
+                PageState::Sealed | PageState::CacheOnly => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::VmmGranuleGeometry;
+    use super::{check_table_ownership, used_granules, VmmGranuleGeometry};
+    use crate::page_pool::PageState;
+
+    #[test]
+    fn used_granules_marks_any_granule_with_a_non_free_page() {
+        let mut states = vec![PageState::Free; 9];
+        states[4] = PageState::ReclaimPending;
+        states[8] = PageState::Private;
+        assert_eq!(used_granules(&states, 3, 3), vec![false, true, true]);
+        assert_eq!(used_granules(&[PageState::Free; 9], 3, 3), vec![false; 3]);
+    }
+
+    #[test]
+    fn table_ownership_accepts_private_once_and_shared_sealed() {
+        use PageState::*;
+        let states = [Private, Private, Sealed, Free, CacheOnly];
+        let a: &[u32] = &[0, 2];
+        let b: &[u32] = &[1, 2, 4];
+        check_table_ownership(&states, [(0, a), (1, b)]).unwrap();
+    }
+
+    #[test]
+    fn table_ownership_rejects_a_private_page_in_two_slots() {
+        let states = [PageState::Private, PageState::Private];
+        let a: &[u32] = &[0, 1];
+        let b: &[u32] = &[1];
+        let err = check_table_ownership(&states, [(0, a), (3, b)]).unwrap_err();
+        assert!(err.contains("phys 1") && err.contains("slot 3"), "{err}");
+        let dup: &[u32] = &[0, 0];
+        assert!(check_table_ownership(&states, [(0, dup)]).is_err());
+    }
+
+    #[test]
+    fn table_ownership_rejects_free_reclaiming_and_out_of_range_pages() {
+        use PageState::*;
+        let states = [Free, ReclaimPending, Private];
+        for bad in [0u32, 1, 3] {
+            let t: &[u32] = &[2, bad];
+            assert!(check_table_ownership(&states, [(0, t)]).is_err(), "phys {bad}");
+        }
+    }
 
     /// Qwen3.5-27B q8: 16 full-attention layers, 4 KV heads, D=256, 1088 B/token.
     /// A 2 MiB granule holds 15 pages and wastes 8 KiB. Sizing by the logical

@@ -8,8 +8,9 @@
 //! - the mapper commits only their two granule groups (pages 0..14 and 15);
 //! - q8 writes and LDS attention through the `_vmm_paged` kernels are
 //!   bit-identical to the arena-paged twin;
-//! - releasing the table unmaps every granule;
-//! - a fresh sequence reuses the logical pages and re-maps physical granules.
+//! - releasing the table unmaps nothing: granules keep their physical
+//!   allocation for the mapper's life (stable binding);
+//! - a fresh sequence reuses the logical pages in place, with no new map.
 //!
 //! Run:
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_paged_pool_smoke
@@ -440,14 +441,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
     pool.check_invariants();
 
-    // Release returns every physical granule; a fresh table remaps them.
+    // Release keeps every granule bound; a fresh table reuses them.
+    let mapped_hwm = mapper.mapped_bytes();
     pool.release_table(&mut table).expect("release table");
     mapper.sync(&mut gpu, &pool.page_states())?;
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
     assert_eq!(
         mapper.mapped_bytes(),
-        0,
-        "released pool must unmap granules"
+        mapped_hwm,
+        "sync must never unmap a used granule"
     );
     let mut table2 = BlockTable::new();
     pool.ensure_capacity(&mut table2, 8 * PAGE_TOKENS)
@@ -456,9 +458,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
     // The free list hands back pages 8..15, which straddle the granule
     // boundary (pages 0..14 / 15..19), so both groups are resident.
-    assert!(
-        mapper.mapped_bytes() > 0,
-        "reused pages must remap physical memory"
+    assert_eq!(
+        mapper.mapped_bytes(),
+        mapped_hwm,
+        "reused pages must reuse the bound granules"
     );
     mapper
         .check_table(table2.page_indices(), table2.num_pages())
@@ -466,7 +469,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pool.release_table(&mut table2).expect("release table2");
     mapper.sync(&mut gpu, &pool.page_states())?;
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
-    assert_eq!(mapper.mapped_bytes(), 0);
+    assert_eq!(mapper.mapped_bytes(), mapped_hwm);
 
     for t in [
         block_table,

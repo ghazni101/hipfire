@@ -2,14 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Physical reclaim for the shared VMM page pool.
+//! Physical reclaim for the shared VMM page pool under a stable binding.
 //!
 //! One granule group is the budget. The pool first resides on the high
-//! granule, then one sync moves residency to the low granule. Mapping the
-//! new granule before releasing the old one exceeds the budget and must
-//! not: free granules are unmapped first, matching a block allocator that
-//! returns memory before the next reservation. Releasing every page then
-//! returns the physical bytes.
+//! granule. Freeing it does not unmap: a used VA keeps its physical
+//! allocation for the mapper's life, because remapping a used VA onto a new
+//! allocation loses GPU writes on gfx1100 (see `VmmPageMapper::sync`). So
+//! moving residency to the low granule is a capacity refusal, not an
+//! unmap-then-map, and the high granule still holds what was written to it.
+//! The physical bytes return at teardown, when the arena owners are freed.
 //!
 //! Run:
 //!   cargo run -p rdna-compute --example vmm_paged_reclaim_smoke --features lab
@@ -58,47 +59,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "the low granule is not mapped yet"
     );
 
-    // Same budget, opposite residency. The low granule maps only because
-    // the high one is released first.
-    let low = vec![PageState::Private, PageState::Free];
-    mapper.sync(&mut gpu, &low)?;
-    mapper.refresh_owners(&mut gpu, &mut arenas)?;
-    assert_eq!(
-        mapper.mapped_bytes(),
-        group,
-        "residency moved, it did not double"
-    );
-    mapper.check_table(&[0], 1)?;
-    assert!(
-        mapper.check_table(&[1], 1).is_err(),
-        "the high granule must be unmapped once its page is Free"
-    );
-
-    let offset = mapper.page_offset(0).expect("page 0");
+    let offset = mapper.page_offset(1).expect("page 1");
     let pattern = vec![0x5Au8; 4096];
     gpu.hip
         .memcpy_htod_offset(&arenas.k[0].buf, offset, &pattern)?;
-    let mut got = vec![0u8; 4096];
-    gpu.hip.memcpy_dtoh_at(&mut got, &arenas.k[0].buf, offset)?;
-    assert_eq!(
-        got, pattern,
-        "page 0 is not readable after the granule move"
+
+    // Same budget, opposite residency: the high granule stays bound, so the
+    // low one does not fit. A refusal, not a poison.
+    let low = vec![PageState::Private, PageState::Free];
+    let err = mapper
+        .sync(&mut gpu, &low)
+        .expect_err("a bound granule must not be unmapped to make room");
+    assert!(err.contains("budget"), "unexpected error: {err}");
+    assert!(!mapper.is_poisoned());
+    assert_eq!(mapper.mapped_bytes(), group, "residency did not move");
+    assert!(
+        mapper.check_table(&[0], 1).is_err(),
+        "the low granule was never mapped"
     );
 
+    // Every page Free: nothing unmaps, and the bound page kept its bytes.
     let none = vec![PageState::Free, PageState::Free];
     mapper.sync(&mut gpu, &none)?;
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
-    assert_eq!(
-        mapper.mapped_bytes(),
-        0,
-        "a released pool must return its physical granules"
-    );
+    assert_eq!(mapper.mapped_bytes(), group, "sync must never unmap");
+    mapper.check_table(&[1], 1)?;
+    let mut got = vec![0u8; 4096];
+    gpu.hip.memcpy_dtoh_at(&mut got, &arenas.k[0].buf, offset)?;
+    assert_eq!(got, pattern, "a bound page lost its contents");
 
     mapper.release();
     for tensor in arenas.k.drain(..).chain(arenas.v.drain(..)) {
         gpu.free_tensor(tensor)?;
     }
-    assert_eq!(gpu.vmm_allocation_count(), 0);
+    assert_eq!(
+        gpu.vmm_allocation_count(),
+        0,
+        "teardown must return every physical granule"
+    );
     println!("vmm_paged_reclaim_smoke: PASS");
     Ok(())
 }

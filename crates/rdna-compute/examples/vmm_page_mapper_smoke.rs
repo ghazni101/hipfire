@@ -8,9 +8,11 @@
 //! - initial load commits no physical KV (VA-only)
 //! - a resident page maps its whole granule in every K/V arena
 //! - pages at non-adjacent granule offsets read/write at the expected offsets
-//! - freeing the last page in a granule unmaps it and reclaims the bytes
-//! - remapping a freed page commits fresh memory
-//! - a budget refusal is an error, not a silent over-commit
+//! - freeing pages never unmaps: a used granule keeps its physical
+//!   allocation (stable binding) and a reused page reads back what was
+//!   written through it
+//! - a budget refusal is an error, not a silent over-commit, and rolls back
+//!   only granules no kernel has seen
 //!
 //! Run:
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_page_mapper_smoke
@@ -107,25 +109,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_read(&mut gpu, &mapper, &arenas, 0, 0x11);
     write_read(&mut gpu, &mapper, &arenas, other, 0x99);
 
-    // Release one page: its granule stays resident for the other page.
+    // Free one page, then both: nothing unmaps. Freed pages keep their
+    // granule's physical allocation for reuse in place.
     mapper.sync(&mut gpu, &states(&[other]))?;
-    mapper.refresh_owners(&mut gpu, &mut arenas)?;
-    assert_eq!(mapper.mapped_bytes(), granule_cost);
-    assert!(mapper.check_table(&[0], 1).is_err());
-    // Release the last page: all physical KV is reclaimed.
+    assert_eq!(mapper.mapped_bytes(), 2 * granule_cost);
     mapper.sync(&mut gpu, &states(&[]))?;
     mapper.refresh_owners(&mut gpu, &mut arenas)?;
     assert_eq!(
         mapper.mapped_bytes(),
-        0,
-        "released granules must be unmapped"
+        2 * granule_cost,
+        "sync must never unmap a used granule"
     );
+    assert_eq!(mapper.mapped_granule_count(), 2);
+    mapper.check_table(&table, 2)?;
 
-    // Re-map a freed page and write through the fresh physical allocation.
-    mapper.sync(&mut gpu, &states(&[other]))?;
-    mapper.refresh_owners(&mut gpu, &mut arenas)?;
-    write_read(&mut gpu, &mapper, &arenas, other, 0x42);
-    assert_eq!(mapper.mapped_bytes(), granule_cost);
+    // Reuse the freed pages: same VA, same physical memory. Write new
+    // values and read them straight back, many times, with no settle.
+    for round in 0..64u8 {
+        mapper.sync(&mut gpu, &states(&[0, other]))?;
+        write_read(&mut gpu, &mapper, &arenas, 0, 0x20u8.wrapping_add(round));
+        write_read(&mut gpu, &mapper, &arenas, other, 0x80u8.wrapping_add(round));
+        mapper.sync(&mut gpu, &states(&[]))?;
+    }
+    assert_eq!(mapper.mapped_bytes(), 2 * granule_cost);
     mapper.release();
     for t in arenas.k.drain(..).chain(arenas.v.drain(..)) {
         gpu.free_tensor(t)?;
@@ -148,6 +154,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sync(&mut gpu, &states(&[0, other]))
         .expect_err("two granule groups must exceed a one-group budget");
     assert!(err.contains("budget"), "unexpected budget error: {err}");
+    assert_eq!(tight.mapped_bytes(), 0, "refused sync must roll back");
+    assert!(!tight.is_poisoned());
+    // The rolled-back granule was never committed, so it may map again.
+    tight.sync(&mut gpu, &states(&[0]))?;
+    tight.refresh_owners(&mut gpu, &mut tight_arenas)?;
+    write_read(&mut gpu, &tight, &tight_arenas, 0, 0x5a);
+    assert_eq!(tight.mapped_bytes(), granule_cost);
+    // With granule 0 bound, the other granule still does not fit, and
+    // freeing page 0 does not make room: memory returns only at teardown.
+    tight.sync(&mut gpu, &states(&[]))?;
+    assert_eq!(tight.mapped_bytes(), granule_cost);
+    assert!(tight.sync(&mut gpu, &states(&[other])).is_err());
+    tight.sync(&mut gpu, &states(&[0]))?;
+    write_read(&mut gpu, &tight, &tight_arenas, 0, 0xa5);
     tight.release();
     for t in tight_arenas.k.drain(..).chain(tight_arenas.v.drain(..)) {
         gpu.free_tensor(t)?;
