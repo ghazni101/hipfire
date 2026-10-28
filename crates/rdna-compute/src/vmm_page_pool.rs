@@ -687,7 +687,111 @@ pub fn check_table_ownership<'a>(
 #[cfg(test)]
 mod tests {
     use super::{check_table_ownership, used_granules, VmmGranuleGeometry};
-    use crate::page_pool::PageState;
+    use crate::page_pool::{BlockTable, PagePool, PageState, PAGE_TOKENS};
+
+    fn ownership(pool: &PagePool, tables: &[&BlockTable]) -> Result<(), String> {
+        check_table_ownership(
+            &pool.page_states(),
+            tables
+                .iter()
+                .enumerate()
+                .map(|(slot, t)| (slot, &t.page_indices()[..t.live_tokens().div_ceil(PAGE_TOKENS)])),
+        )
+    }
+
+    /// Two slots growing in lockstep through every page edge (127/128/129
+    /// and page multiples +-1): each holds exactly ceil(n/128) pages, a
+    /// new page appears exactly at n = 128k+1, and no Private page is in
+    /// two tables.
+    #[test]
+    fn page_edges_allocate_exactly_and_slots_never_share_private_pages() {
+        let mut pool = PagePool::new(64, 64).unwrap();
+        let (mut a, mut b) = (BlockTable::new(), BlockTable::new());
+        let mut prev = 0;
+        for n in 1..=(16 * PAGE_TOKENS + 1) {
+            let new_a = pool.ensure_capacity(&mut a, n).unwrap();
+            let new_b = pool.ensure_capacity(&mut b, n).unwrap();
+            let pages = n.div_ceil(PAGE_TOKENS);
+            assert_eq!((a.num_pages(), b.num_pages()), (pages, pages), "n={n}");
+            let grew = usize::from(pages != prev);
+            assert_eq!((new_a, new_b), (grew, grew), "n={n}");
+            assert_eq!(grew == 1, n % PAGE_TOKENS == 1, "n={n}");
+            prev = pages;
+            if matches!(n % PAGE_TOKENS, 0 | 1 | 127) {
+                ownership(&pool, &[&a, &b]).unwrap();
+                pool.check_invariants();
+            }
+        }
+        assert_eq!(pool.free_pages(), 64 - 2 * 17);
+    }
+
+    /// A full pool refuses growth without a partial allocation, leaves the
+    /// requesting slot exactly as it was, and recovers once another slot
+    /// releases.
+    #[test]
+    fn saturated_pool_refuses_atomically_and_recovers_after_release() {
+        let mut pool = PagePool::new(8, 64).unwrap();
+        let (mut a, mut b) = (BlockTable::new(), BlockTable::new());
+        pool.ensure_capacity(&mut a, 4 * PAGE_TOKENS).unwrap();
+        pool.ensure_capacity(&mut b, 3 * PAGE_TOKENS + 1).unwrap();
+        assert_eq!(pool.free_pages(), 0);
+        let before = a.page_indices().to_vec();
+        for n in [4 * PAGE_TOKENS + 1, 6 * PAGE_TOKENS, 100 * PAGE_TOKENS] {
+            assert!(pool.ensure_capacity(&mut a, n).is_err(), "n={n}");
+            assert_eq!(a.page_indices(), &before[..]);
+            assert_eq!(a.live_tokens(), 4 * PAGE_TOKENS);
+            assert_eq!(pool.free_pages(), 0);
+            pool.check_invariants();
+        }
+        // Growth inside the last page never needs the pool.
+        pool.ensure_capacity(&mut b, 4 * PAGE_TOKENS).unwrap();
+        pool.release_table(&mut b).unwrap();
+        assert_eq!(pool.free_pages(), 4);
+        assert_eq!(pool.ensure_capacity(&mut a, 8 * PAGE_TOKENS).unwrap(), 4);
+        ownership(&pool, &[&a]).unwrap();
+        pool.check_invariants();
+    }
+
+    /// Teardown after a failed step: with a shared prefix and in-flight
+    /// leases still held, releasing every slot parks leased pages as
+    /// ReclaimPending (their granules stay mapped), and draining after the
+    /// leases end returns every page and leaves no granule in use.
+    #[test]
+    fn teardown_after_failed_step_returns_every_page_and_granule() {
+        const PAGES: usize = 12;
+        const PER_GRANULE: usize = 4;
+        let mut pool = PagePool::new(PAGES, 64).unwrap();
+        let (mut a, mut b) = (BlockTable::new(), BlockTable::new());
+        pool.ensure_capacity(&mut a, 2 * PAGE_TOKENS + 44).unwrap();
+        pool.share_prefix(&a, &mut b, 2).unwrap();
+        b.set_live_tokens(2 * PAGE_TOKENS);
+        pool.ensure_capacity(&mut b, 2 * PAGE_TOKENS + 1).unwrap();
+        ownership(&pool, &[&a, &b]).unwrap();
+        let leased: Vec<u32> = a.page_indices().to_vec();
+        for &p in &leased {
+            pool.add_inflight_ref(p).unwrap();
+        }
+        // The step fails: the next growth does not fit.
+        assert!(pool.ensure_capacity(&mut a, PAGES * PAGE_TOKENS).is_err());
+        pool.release_table(&mut a).unwrap();
+        pool.release_table(&mut b).unwrap();
+        pool.check_invariants();
+        let states = pool.page_states();
+        for &p in &leased {
+            assert_eq!(states[p as usize], PageState::ReclaimPending, "phys {p}");
+            assert!(used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE)[p as usize / PER_GRANULE]);
+        }
+        assert!(pool.drain_completed().is_empty(), "leases still held");
+        for &p in &leased {
+            pool.release_inflight_ref(p).unwrap();
+        }
+        assert_eq!(pool.drain_completed().len(), leased.len());
+        assert_eq!(pool.free_pages(), PAGES);
+        let states = pool.page_states();
+        assert!(states.iter().all(|&s| s == PageState::Free));
+        assert_eq!(used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE), vec![false; 3]);
+        pool.check_invariants();
+    }
 
     #[test]
     fn used_granules_marks_any_granule_with_a_non_free_page() {
