@@ -591,7 +591,7 @@ family `lightonocr3`/`lightonocr` maps to arch 5 in `scripts/registry_gen.py`.
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.53 GiB); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB, F16 tower) declared in the `vision` slot |
+| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.58 | 2 | MQ4G256V2 trunk (0.54 GiB); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB, F16 tower) declared in the `vision` slot |
 | `lightonocr3:0.8b-q8` | `lightonocr3-0.8b.q8` | 0.82 | 2 | Q8 trunk (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) — the high-fidelity tier; same shared `lightonocr3-0.8b.vl` tower pack (byte-identical F16 bytes) |
 
 Build from the HF snapshot (the safetensors sits at the directory root, the
