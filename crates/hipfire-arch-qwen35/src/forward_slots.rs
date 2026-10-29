@@ -5355,9 +5355,19 @@ pub fn forward_batch_slots_opts(
     // are layer-invariant config, and re-uploading per layer would repeat
     // identical work), mirroring row_slot_dev's "every step, not every
     // layer" upload policy.
+    //
+    // `active_slots >= 1`, not `> 1`: a paged pool never takes the
+    // single-slot reduction above, so a step with one prefilling slot (every
+    // MoE prefill, which `split_isolated_prefill` runs alone, and every solo
+    // prompt) must still reach a WMMA prefill kernel. With `> 1` it fell to
+    // the per-row decode attend (scalar below the crossover, flash above),
+    // which costs O(rows x ctx) without WMMA: the 16-49% paged prefill
+    // regression, growing with prompt length. For a non-paged q8 pool
+    // `single_slot` is `Some` whenever one slot is active, so this changes
+    // nothing there.
     let n_tiles: Option<usize> = if kv.is_q8()
         && single_slot.is_none()
-        && active_slots > 1
+        && active_slots >= 1
         && n > active_slots
         && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
     {
