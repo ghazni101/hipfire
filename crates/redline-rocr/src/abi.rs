@@ -37,6 +37,8 @@ pub const AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
 pub const AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
 pub const AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT: u32 = 0xA014;
 pub const AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: u32 = 0xA016;
+/// `HSA_AMD_AGENT_INFO_HDP_FLUSH`: output is [`HdpFlush`].
+pub const AMD_AGENT_INFO_HDP_FLUSH: u32 = 0xA00E;
 
 pub const PROFILE_BASE: u32 = 0;
 pub const PROFILE_FULL: u32 = 1;
@@ -120,6 +122,15 @@ pub struct LoadedCodeObject(pub u64);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExecutableSymbol(pub u64);
+
+/// Public `hsa_amd_hdp_flush_t` layout: MMIO-mapped HDP flush control
+/// registers of a GPU agent (null when the runtime exposes none).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HdpFlush {
+    pub mem_flush_cntl: *mut u32,
+    pub reg_flush_cntl: *mut u32,
+}
 
 /// Public `hsa_queue_t` layout for the 64-bit HSA machine model.
 #[repr(C)]

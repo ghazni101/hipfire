@@ -3580,12 +3580,19 @@ fn gfx1151_entry_acquire_policy_from_value(
 
 /// Pool for retained PM4 kernarg segments.
 ///
-/// Default `vram`: a host-writable GPU-agent pool. Kernels whose prologue
-/// chains dependent kernarg `s_load`s otherwise pay host-memory latency on
-/// every round (gfx1100 H2: 1.4-1.6 ms/token of in-IB span).
-/// `HIPFIRE_PM4_KERNARG_POOL=host` keeps the CPU-agent fine-grained pool, as
-/// do small-BAR systems. The host patches these segments between replays, so
-/// VRAM placement relies on the IB entry ACQUIRE_MEM invalidating GL2 and the
+/// Default `host`: the CPU-agent fine-grained pool. On gfx1100 the VRAM pool
+/// faulted in two long soaks (SQC scalar load at VA 0x0, MES wedge: ~1 per
+/// ~95k two-slot replays, with and without the HDP flush below) while the
+/// host pool ran clean, so VRAM placement is opt-in until it is proven safe.
+/// `vram`: a host-writable GPU-agent pool (small-BAR systems still fall back
+/// to host). Kernels whose prologue chains dependent kernarg `s_load`s pay
+/// host-memory latency on every round in the host pool (gfx1100 H2: 1.4-1.6
+/// ms/token of in-IB span). `vram-recycle`: `vram` whose segments are never
+/// freed back to ROCr, so a kernarg VA is never re-bound to new physical
+/// memory across tape re-prepares (experimental). The host patches these segments between replays, so
+/// VRAM placement relies on (a) [`KernargBuffer::publish_host_writes`]
+/// flushing the HDP after the BAR stores (pools without an HDP flush register
+/// fall back to host) and (b) the IB entry ACQUIRE_MEM invalidating GL2 and the
 /// scalar cache; a gfx1151 non-system entry acquire keeps the host pool.
 fn retained_kernarg_pool(
     device: &GpuDevice,
@@ -3593,15 +3600,27 @@ fn retained_kernarg_pool(
     entry_acquire: Gfx11EntryAcquirePolicy,
 ) -> KernargPool {
     let requested = hipfire_config::process_value("HIPFIRE_PM4_KERNARG_POOL")
-        .unwrap_or_else(|| "vram".to_owned());
-    let fallback = if requested.eq_ignore_ascii_case("host") {
-        "HIPFIRE_PM4_KERNARG_POOL=host".to_owned()
+        .unwrap_or_else(|| "host".to_owned());
+    let recycle = requested.eq_ignore_ascii_case("vram-recycle");
+    let fallback = if !recycle && !requested.eq_ignore_ascii_case("vram") {
+        format!("HIPFIRE_PM4_KERNARG_POOL={requested}")
     } else if entry_acquire != Gfx11EntryAcquirePolicy::System {
         format!("entry acquire {entry_acquire:?} does not invalidate GL2")
     } else {
-        match KernargPool::discover_host_writable_device_local(device) {
+        let discovered =
+            KernargPool::discover_host_writable_device_local(device).and_then(|pool| {
+                if recycle {
+                    pool.with_device_local_recycling()
+                } else {
+                    Ok(pool)
+                }
+            });
+        match discovered {
             Ok(pool) => {
-                eprintln!("[redline] retained PM4 kernargs: pool=vram");
+                eprintln!(
+                    "[redline] retained PM4 kernargs: pool=vram \
+                     (publish: BAR readback + HDP flush; recycle={recycle})"
+                );
                 return pool;
             }
             Err(error) => format!("fallback: {error}"),

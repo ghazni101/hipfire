@@ -3928,10 +3928,10 @@ pub static FIELDS: &[ConfigField] = &[
     diagnostic_field!(
         "diagnostic.replay.pm4_kernarg_pool",
         "replay_pm4_kernarg_pool",
-        DefaultValue::String("vram"),
-        ValueRule::Enum(&["vram", "host"]),
+        DefaultValue::String("host"),
+        ValueRule::Enum(&["host", "vram", "vram-recycle"]),
         "HIPFIRE_PM4_KERNARG_POOL",
-        "Retained PM4 kernarg placement: vram (host-writable GPU-agent pool; host pool on small-BAR systems) or host (CPU-agent fine-grained pool)."
+        "Retained PM4 kernarg placement: host (CPU-agent fine-grained pool, default), vram (host-writable GPU-agent pool; host pool on small-BAR systems; faulted in gfx1100 soaks) or vram-recycle (vram whose segments are never freed; experimental)."
     ),
     diagnostic_field!(
         "diagnostic.replay.pm4_wait_policy",
