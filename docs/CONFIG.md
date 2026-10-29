@@ -1770,7 +1770,7 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.pm4_native_phases` | `false` | bool |
 | `diagnostic.replay.pm4_queues` | `"1"` | `"1"`, `"2"`, `"4"`, `"auto"` |
 | `diagnostic.replay.pm4_register_policy` | `"static"` | `legacy` \| `static` \| `stateful` |
-| `diagnostic.replay.pm4_kernarg_pool` | `"host"` | `host` \| `vram` \| `vram-recycle` |
+| `diagnostic.replay.pm4_kernarg_pool` | `"vram"` | `vram` \| `host` |
 | `diagnostic.replay.pm4_wait_policy` | `"resource"` | `allowlist` \| `resource-audit` \| `resource` |
 | `diagnostic.replay.pm4_acquire_policy` | `"required-only"` | `conservative`, `entry-only`, `required-only`, `without-repeat-interleave`, `without-fused-silu-rotate`, `without-mq-rotate`, `without-rope` |
 | `diagnostic.replay.pm4_gcr_trim` | `true` | bool |

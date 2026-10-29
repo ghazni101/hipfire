@@ -67,19 +67,6 @@ pub struct Runtime {
 
 struct RuntimeInner {
     symbols: Arc<abi::Symbols>,
-    /// Device-local kernarg allocations retired by recycling pools
-    /// ([`KernargPool::with_device_local_recycling`]). They stay allocated
-    /// (and therefore keep their GPU VA -> physical binding) until runtime
-    /// shutdown instead of being freed and re-created at a reused VA.
-    kernarg_recycle: std::sync::Mutex<Vec<RecycledKernarg>>,
-}
-
-/// One retired device-local kernarg allocation awaiting reuse.
-struct RecycledKernarg {
-    pool: u64,
-    allocation_size: usize,
-    address: usize,
-    budget_token: Option<emu_budget::AllocationToken>,
 }
 
 impl Runtime {
@@ -90,10 +77,7 @@ impl Runtime {
         let status = unsafe { (symbols.init)() };
         check_status(&symbols, "hsa_init", status)?;
         Ok(Self {
-            inner: Arc::new(RuntimeInner {
-                symbols,
-                kernarg_recycle: std::sync::Mutex::new(Vec::new()),
-            }),
+            inner: Arc::new(RuntimeInner { symbols }),
         })
     }
 
@@ -363,22 +347,6 @@ impl Drop for RuntimeInner {
         // SAFETY: this is the matching final shutdown for this initialized
         // RuntimeInner. Every RAII child retains this Arc and therefore drops
         // before it.
-        let recycled = std::mem::take(
-            self.kernarg_recycle
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        for entry in recycled {
-            // SAFETY: every entry came from `hsa_amd_memory_pool_allocate` on
-            // this runtime and is owned only by the recycle list; no queue can
-            // still reference it once the last RAII child has dropped.
-            let status = unsafe { (self.symbols.memory_pool_free)(entry.address as *mut c_void) };
-            release_after_free(
-                entry.budget_token,
-                status == abi::STATUS_SUCCESS,
-                emu_budget::release,
-            );
-        }
         let _ = unsafe { (self.symbols.shut_down)() };
     }
 }
@@ -1989,18 +1957,6 @@ struct KernargPoolInner {
     /// The CPU agent must be granted access per allocation
     /// (`HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT`).
     grant_host_access: bool,
-    /// Address of the agent's MMIO `HDP_MEM_FLUSH_CNTL` register (0 = none).
-    /// Required for host-patched device-local kernargs on PCIe dGPUs:
-    /// BAR stores land in the Host Data Path, and only an HDP flush makes
-    /// them visible to the shader/scalar caches. A BAR readback alone is
-    /// AMD's workaround for MI200/MI300 only (strict store ordering); ROCclr
-    /// uses the HDP flush for every PCIe agent that exposes it.
-    hdp_mem_flush_cntl: usize,
-    /// Device-local only: retire dropped buffers to the runtime recycle list
-    /// instead of freeing them, so a kernarg VA is never re-bound to new
-    /// physical memory (gfx1100 stale-translation hazard, see
-    /// [`KernargPool::with_device_local_recycling`]).
-    recycle: bool,
 }
 
 impl KernargPool {
@@ -2124,8 +2080,6 @@ impl KernargPool {
                     alignment,
                     device_local: false,
                     grant_host_access: false,
-                    hdp_mem_flush_cntl: 0,
-                    recycle: false,
                 }),
             });
         }
@@ -2231,8 +2185,6 @@ impl KernargPool {
                         alignment,
                         device_local: true,
                         grant_host_access: false,
-                        hdp_mem_flush_cntl: 0,
-                        recycle: false,
                     }),
                 });
             }
@@ -2255,8 +2207,6 @@ impl KernargPool {
                     alignment,
                     device_local: true,
                     grant_host_access: false,
-                    hdp_mem_flush_cntl: 0,
-                    recycle: false,
                 }),
             });
         }
@@ -2313,60 +2263,12 @@ impl KernargPool {
                 pool.inner.pool.0, pool.inner.granule, pool.inner.alignment,
             );
         }
-        // Host stores to this pool travel through the BAR into the HDP. Fail
-        // closed (callers fall back to the host pool) when the runtime does
-        // not expose the HDP flush register, matching ROCclr's policy: the
-        // readback-only publish is not a visibility guarantee on gfx10+/gfx11
-        // PCIe parts.
-        let mut hdp = abi::HdpFlush {
-            mem_flush_cntl: ptr::null_mut(),
-            reg_flush_cntl: ptr::null_mut(),
-        };
-        query_agent(
-            &device.runtime.symbols,
-            device.gpu_agent(),
-            abi::AMD_AGENT_INFO_HDP_FLUSH,
-            (&mut hdp as *mut abi::HdpFlush).cast(),
-        )
-        .map_err(|_| {
-            RuntimeError::DeviceLocalPoolNotHostWritable(
-                "HSA_AMD_AGENT_INFO_HDP_FLUSH is unavailable",
-            )
-        })?;
-        if hdp.mem_flush_cntl.is_null() {
-            return Err(RuntimeError::DeviceLocalPoolNotHostWritable(
-                "the GPU agent exposes no HDP flush register",
-            ));
-        }
-        let inner = Arc::get_mut(&mut pool.inner).ok_or(RuntimeError::InvalidRuntimeObject(
-            "freshly discovered kernarg pool is shared",
-        ))?;
-        inner.grant_host_access = grant_host_access;
-        inner.hdp_mem_flush_cntl = hdp.mem_flush_cntl as usize;
-        Ok(pool)
-    }
-
-    /// Keep every device-local allocation of this pool bound for the runtime
-    /// lifetime: dropped buffers go to a runtime-wide recycle list (exact
-    /// rounded size match) instead of `hsa_amd_memory_pool_free`.
-    ///
-    /// Motivation: on gfx1100 a VRAM VA that is unmapped and re-mapped onto a
-    /// new allocation can keep translating to the old physical page for an
-    /// unbounded time (see the VMM KV fix). Retained PM4 tapes are re-prepared
-    /// per request, so their VRAM kernarg segments churn through
-    /// free/allocate. Recycling removes the VA re-bind from that path.
-    pub fn with_device_local_recycling(mut self) -> Result<Self, RuntimeError> {
-        if !self.inner.device_local {
-            return Err(RuntimeError::InvalidRuntimeObject(
-                "kernarg recycling applies only to device-local pools",
-            ));
-        }
-        Arc::get_mut(&mut self.inner)
+        Arc::get_mut(&mut pool.inner)
             .ok_or(RuntimeError::InvalidRuntimeObject(
-                "recycling must be enabled before the pool is shared",
+                "freshly discovered kernarg pool is shared",
             ))?
-            .recycle = true;
-        Ok(self)
+            .grant_host_access = grant_host_access;
+        Ok(pool)
     }
 
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
@@ -2432,42 +2334,6 @@ impl KernargPool {
             .checked_add(self.inner.granule - 1)
             .map(|value| value / self.inner.granule * self.inner.granule)
             .ok_or(RuntimeError::KernargSizeOverflow(length))?;
-        if self.inner.recycle {
-            let reused = {
-                let mut list = self
-                    .inner
-                    .runtime
-                    .kernarg_recycle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                list.iter()
-                    .position(|entry| {
-                        entry.pool == self.inner.pool.0
-                            && entry.allocation_size == allocation_size
-                            && entry.address % required_alignment == 0
-                            && entry.address % self.inner.alignment == 0
-                    })
-                    .map(|index| list.swap_remove(index))
-            };
-            if let Some(entry) = reused {
-                let pointer = NonNull::new(entry.address as *mut u8).ok_or(
-                    RuntimeError::InvalidRuntimeObject("recycled kernarg address is null"),
-                )?;
-                // SAFETY: the recycled allocation owns allocation_size bytes,
-                // still carries the CPU/GPU access granted at first allocation,
-                // and no queue references it (its previous owner was dropped
-                // only after quiescence).
-                unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
-                return Ok(KernargBuffer {
-                    pool: self.inner.clone(),
-                    device_local: self.inner.device_local,
-                    pointer: Some(pointer),
-                    length,
-                    allocation_size,
-                    budget_token: entry.budget_token,
-                });
-            }
-        }
         // Emu capacity gate: reserve the rounded size before the raw pool
         // allocation; no-op (one `active()` check) when emu is off.
         let (reservation, pointer) = reserve_then_allocate(
@@ -2835,22 +2701,12 @@ impl KernargBuffer {
 
     /// Publish host stores to a device-local segment before the next doorbell.
     ///
-    /// Stores through the BAR are write-combined and posted, and land in the
-    /// Host Data Path (HDP) rather than directly in memory the shader caches
-    /// observe. The sequence is:
-    ///
-    /// 1. a full fence drains the CPU write-combining buffers;
-    /// 2. a one-byte BAR readback cannot complete before every earlier
-    ///    posted write to the device has reached the HDP;
-    /// 3. writing 1 to `HDP_MEM_FLUSH_CNTL` and reading it back flushes the
-    ///    HDP so the stores are visible to GPU memory clients (ROCclr's
-    ///    `DeviceKernelArgsHDP` path). The flush is global, so one call
-    ///    covers every device-local buffer written before it.
-    ///
-    /// Without step 3 a replay can read a stale/zero kernarg pointer
-    /// (observed on gfx1100: SQC data fault at VA 0x0, then MES hang).
-    /// Pools discovered without an HDP register (UMA/IB pools) still get
-    /// steps 1-2. Host-pool buffers need nothing and return immediately.
+    /// Stores through the BAR are write-combined and posted. A full fence
+    /// drains the CPU write-combining buffers, and reading one byte back
+    /// through the BAR cannot complete before every earlier posted write to
+    /// the device has landed (ROCclr's readback rule for device kernargs). One
+    /// call therefore covers every device-local buffer written before it.
+    /// Host-pool buffers need nothing and return immediately.
     pub fn publish_host_writes(&self) {
         if !self.device_local {
             return;
@@ -2861,22 +2717,7 @@ impl KernargBuffer {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         // SAFETY: a non-null pointer owns `length >= 1` readable bytes.
         let _ = unsafe { ptr::read_volatile(pointer.as_ptr().add(self.length - 1)) };
-        let hdp = self.pool.hdp_mem_flush_cntl as *mut u32;
-        if !hdp.is_null() {
-            // SAFETY: the runtime-provided MMIO mapping of the agent's HDP
-            // flush register stays valid for the runtime's lifetime, which
-            // `self.pool.runtime` keeps alive.
-            unsafe {
-                ptr::write_volatile(hdp, 1);
-                let _ = ptr::read_volatile(hdp);
-            }
-        }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// True when [`Self::publish_host_writes`] flushes the agent's HDP.
-    pub fn publishes_with_hdp_flush(&self) -> bool {
-        self.device_local && self.pool.hdp_mem_flush_cntl != 0
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
@@ -2915,22 +2756,6 @@ impl KernargBuffer {
 impl Drop for KernargBuffer {
     fn drop(&mut self) {
         if let Some(pointer) = self.pointer {
-            if self.pool.recycle {
-                // The owning graph guarantees all dispatches have completed;
-                // keep the backing bound and hand it to the next allocation.
-                self.pool
-                    .runtime
-                    .kernarg_recycle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(RecycledKernarg {
-                        pool: self.pool.pool.0,
-                        allocation_size: self.allocation_size,
-                        address: pointer.as_ptr() as usize,
-                        budget_token: self.budget_token.take(),
-                    });
-                return;
-            }
             // The owning graph guarantees all dispatches have completed.
             // SAFETY: pointer was allocated from this runtime memory pool and
             // is uniquely owned here.

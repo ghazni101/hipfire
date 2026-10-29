@@ -429,20 +429,13 @@ A retained route is valid only when all of the following hold.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.
-- Retained PM4 kernarg segments live in the CPU-agent fine-grained (host) pool
-  by default. `HIPFIRE_PM4_KERNARG_POOL=vram` opts into a host-writable
-  GPU-agent (VRAM) pool: kernels whose prologue chains dependent kernarg
-  `s_load`s otherwise pay host-memory latency on every round. VRAM is opt-in
-  because on gfx1100 it faulted in two long multi-slot soaks (SQC scalar load
-  at VA 0x0, then an MES wedge and MODE1 reset; about one fault per ~95k
-  two-slot replays, with and without the HDP flush) while the host pool ran
-  clean. With `vram` the per-replay binding patches stay plain host stores
-  through the BAR, published before the doorbell by a fence, a one-byte
-  readback and an HDP flush (pools without the HDP flush register fall back to
-  host). `vram-recycle` is `vram` whose segments are never freed back to ROCr,
-  so a kernarg VA is never re-bound to new physical memory across tape
-  re-prepares (experimental). Small-BAR systems (CPU access never allowed) and
-  a gfx1151 non-system entry acquire always keep the host pool. The daemon log
+- Retained PM4 kernarg segments live in a host-writable GPU-agent (VRAM) pool
+  by default: kernels whose prologue chains dependent kernarg `s_load`s
+  otherwise pay host-memory latency on every round. The per-replay binding
+  patches stay plain host stores through the BAR, and one fence plus a one-byte
+  readback publishes them before the doorbell. Small-BAR systems (CPU access
+  never allowed) and a gfx1151 non-system entry acquire keep the CPU-agent
+  fine-grained pool; `HIPFIRE_PM4_KERNARG_POOL=host` forces it. The daemon log
   records the choice as `[redline] retained PM4 kernargs: pool=…`. The indirect
   buffer, timestamps and completion words stay in the host pool.
 
