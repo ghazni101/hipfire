@@ -2054,7 +2054,7 @@
         "sha256": "708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079",
         "size_bytes": 227722240
       },
-      "size_gb": 0.56,
+      "size_gb": 0.58,
       "min_vram_gb": 2,
       "desc": "LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) — Apache-2.0 document-OCR VLM on the Qwen3.5-VL architecture (arch 5): 24 hybrid layers (18 DeltaNet `linear_attention` + 6 `full_attention` every 4th), 1024d, tied 248320 vocab, plus the `model.visual.*` patch-16 ViT tower on the `<trunk>.vl` sidecar (F16). Prompt modes per the model card: empty prompt = transcription, `grounding` = labelled bounding boxes. Trained/evaluated with thinking disabled — the card's `enable_thinking=false`, temp 0.2, top_p 0.9 are the lowered recommended_settings. Tower VRAM is opt-in: `vision_mode` defaults to `off` (text-only), set `hipfire config lightonocr3:0.8b set vision.mode auto` for image turns. LOCAL-ONLY until an HF pack ships — `hipfire pull` refuses by design (place the trunk + `.vl` in the models dir, or catalog them via models.toml).",
       "recommended_settings": {
@@ -2062,8 +2062,8 @@
         "top_p": 0.9,
         "reasoning_effort": "none"
       },
-      "sha256": "578bc68062822f960823d5fe987ea1e5125d3e56b81f489ef27e2e877a1189c0",
-      "size_bytes": 557869696
+      "sha256": "8e14f0dddfaa0041bc57eeb5b28c18379e69bb7640b04771cb5bf4cd57bf13fb",
+      "size_bytes": 577923712
     }
 ,
     "lightonocr3:0.8b-q8": {
