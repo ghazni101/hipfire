@@ -619,9 +619,15 @@ coordinates. Image turns need the tower; `vision_mode` defaults to `auto`, so a
 `<stem>.vl` beside the trunk loads with no configuration:
 
 ```bash
-hipfire config lightonocr3:0.8b set vision.mode auto        # and/or the q8 tag
-hipfire run lightonocr3:0.8b "" --image page.png
-hipfire run lightonocr3:0.8b grounding --image page.png
+hipfire config lightonocr3:0.8b set vision.mode auto        # auto is the default
+# Transcription is an empty prompt (add "grounding" as a text part for boxes).
+# Current beta's `run` frames thinking on for this tag, so send the request
+# through serve with `reasoning_effort: none` to get the page text in `content`:
+hipfire serve lightonocr3:0.8b-q8 127.0.0.1:9425
+curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"lightonocr3:0.8b-q8","reasoning_effort":"none","temperature":0,
+       "messages":[{"role":"user","content":[{"type":"image_url",
+       "image_url":{"url":"data:image/png;base64,<page bytes>"}}]}]}'
 ```
 
 ---
