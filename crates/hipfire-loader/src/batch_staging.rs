@@ -684,6 +684,13 @@ fn stage_qwen4_lanes(
     if let Err(e) = staged {
         return refuse(&format!("{topology} staging failed: {e}"));
     }
+    // serve.batch_sampled: the lane stores take sampled requests (per-lane
+    // host draws); recorded on every store of the topology (every EP rank,
+    // every PP band). Greedy lanes are unaffected either way.
+    match m.qwen4_mut() {
+        Some(bundle) => bundle.set_lanes_sampled(req.sampled),
+        None => return refuse("model state not Qwen4"),
+    }
     let Some(store) = m.qwen4().and_then(|bundle| bundle.lanes()) else {
         return refuse("lane store missing after staging");
     };
@@ -693,8 +700,9 @@ fn stage_qwen4_lanes(
         (None, None) => "off".to_string(),
     };
     eprintln!(
-        "[daemon] qwen4 fn-lanes staged: topology={topology_log} lanes={requested} row_budget={} spec={spec_log} policy={}",
+        "[daemon] qwen4 fn-lanes staged: topology={topology_log} lanes={requested} row_budget={} spec={spec_log} sampled={} policy={}",
         store.row_budget(),
+        store.sampled(),
         store.stage_policy().describe()
     );
     BatchStaging {

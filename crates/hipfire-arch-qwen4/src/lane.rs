@@ -20,6 +20,18 @@
 //! across releases: a later admission into that slot resets the state in
 //! place instead of allocating again.
 //!
+//! A store staged `sampled` (`serve.batch_sampled`) also admits sampled
+//! requests: [`LaneSampling`] set on a lane after admission makes every token
+//! the lane commits one host draw of the AR singleton's sampler
+//! (`llama::sample_top_k_p` with neutral penalties) from the lane's own F32
+//! logits row, against the lane's own xorshift32 state (the stream
+//! `reset_cpu_sampler_rng(seed)` starts), in emission order. An MTP lane
+//! verifies a sampled window with the naive rule (drafts stay the head's
+//! argmax; each verify row is one AR draw; a draft is accepted iff it equals
+//! its row's draw), so every emitted token is exactly one AR draw. Lanes
+//! without a [`LaneSampling`] run the greedy device-argmax path unchanged
+//! (no extra D2H, no extra host work).
+//!
 //! Under `q8_ef` each lane's [`Qwen4State`] also owns its live F16 GDN
 //! residual companions (`GdnGpuState::ef_residual`): allocated and freed
 //! with the lane state, zeroed by the state's own reset/restore/rollback
@@ -46,7 +58,7 @@ use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
 };
-use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat};
+use crate::state::{Qwen4State, Qwen4StateFormat};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
     Qwen4TierRecipe, Qwen4Weights, TensorRef,
@@ -57,6 +69,7 @@ use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+pub mod census;
 pub(crate) mod groups;
 use groups::GroupPlanner;
 
@@ -824,6 +837,43 @@ pub enum LaneStatus {
     Poisoned,
 }
 
+/// A sampled lane's request sampler: the AR singleton's `sample_cpu` policy
+/// with neutral penalties (`llama::sample_top_k_p`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaneSampling {
+    /// `> 0` and finite (greedy lanes carry no `LaneSampling`).
+    pub temperature: f32,
+    pub top_p: f32,
+    /// Passed through as sent, exactly as `sample_cpu` receives it.
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    /// The singleton's request seed (`request_seed_for`); the lane RNG starts
+    /// where `reset_cpu_sampler_rng(seed)` leaves the sampler state (0 -> 1).
+    pub seed: u32,
+}
+
+impl LaneSampling {
+    /// The lane RNG's initial xorshift32 state (never 0).
+    pub(crate) fn initial_rng(&self) -> u32 {
+        if self.seed == 0 {
+            1
+        } else {
+            self.seed
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.temperature.is_finite() && self.temperature > 0.0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "lane sampling: temperature {} is not positive and finite",
+                self.temperature
+            ))
+        }
+    }
+}
+
 /// Host bookkeeping of one admitted request.
 #[derive(Clone, Debug)]
 pub struct LaneHost {
@@ -840,6 +890,11 @@ pub struct LaneHost {
     pub status: LaneStatus,
     /// Admission order across the store's lifetime.
     pub stamp: u64,
+    /// `Some`: every token this lane commits is a host draw ([`LaneSampling`]);
+    /// `None`: greedy device argmax. Cleared by admission and release.
+    pub sampling: Option<LaneSampling>,
+    /// The lane's xorshift32 sampler state (`0` while `sampling` is `None`).
+    pub rng: u32,
 }
 
 /// Staging of the lanes' native MTP windows.
@@ -896,21 +951,17 @@ pub struct LaneSpec {
 }
 
 impl LaneSpec {
-    /// A fresh spec state: the trunk `state` gets its `k + 1`-row verify
-    /// ring, the head is built on the resident head's backend and context
-    /// bound.
+    /// A fresh spec state: the head is built on the resident head's backend
+    /// and context bound. The trunk state's verify ring is the payload's
+    /// ([`new_payload`]), owned by every band that owns target layers.
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         spec: LaneSpecConfig,
         head_max_seq: usize,
         backend: Qwen4KvBackend,
-        state: &mut Qwen4State,
     ) -> Result<Self, String> {
         let config = &bundle.config;
-        state
-            .ensure_row_capture(gpu, spec.k + 1, config.linear_conv_kernel_dim - 1)
-            .map_err(|e| format!("lane ring: {e}"))?;
         let head = MtpGpuState::new_with_backend(gpu, config, head_max_seq, backend)
             .map_err(|e| format!("lane head state: {e}"))?;
         let width = config
@@ -977,21 +1028,32 @@ impl LaneSpec {
     }
 }
 
-/// A fresh slot's payload: a lane trunk state and, with `spec_cfg`, its MTP
-/// state (a failure frees what was allocated).
+/// A fresh slot's payload: a lane trunk state with its `ring_rows`-row GDN
+/// capture ring (every band that owns target layers; `0`: AR lanes arm no
+/// ring) and, with `spec_cfg`, its MTP head state (a failure frees what was
+/// allocated).
 fn new_payload(
     gpu: &mut Gpu,
     bundle: &Qwen4Bundle,
     slot: usize,
+    ring_rows: usize,
     spec_cfg: Option<(LaneSpecConfig, usize, Qwen4KvBackend)>,
 ) -> Result<(Qwen4State, Option<LaneSpec>), String> {
     let mut state = bundle
         .new_lane_state(gpu)
         .map_err(|e| format!("admit: allocate lane {slot}: {e}"))?;
+    if ring_rows > 0 {
+        if let Err(error) =
+            state.ensure_row_capture(gpu, ring_rows, bundle.config.linear_conv_kernel_dim - 1)
+        {
+            let _ = state.free_gpu(gpu);
+            return Err(format!("admit: allocate lane {slot}: lane ring: {error}"));
+        }
+    }
     let spec = match spec_cfg {
         None => None,
         Some((config, head_max_seq, backend)) => {
-            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend, &mut state) {
+            match LaneSpec::new(gpu, bundle, config, head_max_seq, backend) {
                 Ok(spec) => Some(spec),
                 Err(error) => {
                     let _ = state.free_gpu(gpu);
@@ -1151,6 +1213,8 @@ impl<C: LaneCell> LaneTable<C> {
             pending_seed,
             status,
             stamp: self.next_stamp,
+            sampling: None,
+            rng: 0,
         };
         match self.cells[slot].as_mut() {
             Some(cell) => {
@@ -1184,6 +1248,8 @@ impl<C: LaneCell> LaneTable<C> {
         host.prompt = Vec::new();
         host.generated = Vec::new();
         host.pending_seed = None;
+        host.sampling = None;
+        host.rng = 0;
         Ok(())
     }
 
@@ -1232,6 +1298,150 @@ impl<C: LaneCell> LaneTable<C> {
 
     fn into_cells(self) -> Vec<C> {
         self.cells.into_iter().flatten().collect()
+    }
+}
+
+/// Download `rows` consecutive F32 logits rows of `logits` starting at row
+/// `first_row` into the front of `scratch` (grown only if shorter than
+/// `rows * vocab`, never shrunk): one synchronous D2H.
+pub(crate) fn download_lane_rows(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    vocab: usize,
+    scratch: &mut Vec<f32>,
+) -> Result<(), String> {
+    let n = rows
+        .checked_mul(vocab)
+        .ok_or_else(|| "lane logits rows overflow".to_string())?;
+    let begin = first_row
+        .checked_mul(vocab)
+        .ok_or_else(|| "lane logits row offset overflow".to_string())?;
+    if n == 0
+        || begin
+            .checked_add(n)
+            .map_or(true, |end| end > logits.numel())
+    {
+        return Err(format!(
+            "lane logits rows {first_row}..{} are outside the step logits",
+            first_row.saturating_add(rows)
+        ));
+    }
+    if scratch.len() < n {
+        scratch.resize(n, 0.0);
+    }
+    let view = logits.sub_offset(begin, n);
+    // SAFETY: `scratch` holds at least `n` initialized f32s; any byte pattern
+    // is a valid f32.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &view.buf)
+        .map_err(|e| format!("lane logits download: {e}"))?;
+    gpu.take_device_wait_error()
+        .map_err(|e| format!("lane logits download: {e}"))
+}
+
+/// One draw of a sampled lane: the AR singleton's `sample_cpu` (neutral
+/// penalties) over `row`, advancing the lane's `rng`.
+pub(crate) fn lane_draw(s: &LaneSampling, rng: &mut u32, row: &[f32]) -> u32 {
+    hipfire_runtime::llama::sample_top_k_p_with_state(
+        row,
+        s.temperature,
+        s.top_p,
+        s.top_k,
+        s.min_p,
+        rng,
+    )
+}
+
+/// Naive (SpecInfer) acceptance of one sampled verify window: `rows` holds
+/// the window's `drafts.len() + 1` consecutive F32 rows of `vocab` logits.
+/// Rows are drawn in order and only up to the verdict row
+/// ([`hipfire_runtime::spec_sampling::accept_naive_prefix`]), so each emitted
+/// token is exactly one draw of the AR sampler, in AR order.
+pub(crate) fn lane_sampled_commit(
+    drafts: &[u32],
+    rows: &[f32],
+    vocab: usize,
+    s: &LaneSampling,
+    rng: &mut u32,
+    eos: u32,
+) -> Result<hipfire_runtime::spec::GreedyAccept, String> {
+    if vocab == 0 || rows.len() != (drafts.len() + 1) * vocab {
+        return Err(format!(
+            "lane sampled commit: {} logits for {} drafts of vocab {vocab}",
+            rows.len(),
+            drafts.len()
+        ));
+    }
+    hipfire_runtime::spec_sampling::accept_naive_prefix(drafts, Some(eos), |row| {
+        Ok(lane_draw(s, rng, &rows[row * vocab..(row + 1) * vocab]))
+    })
+}
+
+/// What [`lane_sample_step`] did to a request's picks.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LaneSampleOutcome {
+    /// The lane has no sampler: `picks` are untouched, nothing was fetched.
+    Greedy,
+    /// An AR row: `picks[0]` is now the lane's draw.
+    Ar,
+    /// A verify window: `picks` now make the greedy rule commit exactly the
+    /// naive window (`picks[..committed.len()] == committed`); the naive
+    /// acceptance is returned for the caller to cross-check.
+    Naive(hipfire_runtime::spec::GreedyAccept),
+}
+
+/// The sampler step of one decode request. `picks` are the request's device
+/// argmax picks (one per row); `drafts` is `None` for an AR row and the
+/// window's drafts for a verify. A lane with no [`LaneSampling`] returns
+/// [`LaneSampleOutcome::Greedy`] without touching `picks` or calling `fetch`.
+/// Otherwise `fetch(scratch)` must fill the front of `scratch` with the
+/// request's `picks.len()` consecutive logits rows (one D2H); the lane's rows
+/// are then drawn in emission order against `host.rng`.
+pub(crate) fn lane_sample_step(
+    host: &mut LaneHost,
+    drafts: Option<&[u32]>,
+    picks: &mut [u32],
+    eos: u32,
+    vocab: usize,
+    scratch: &mut Vec<f32>,
+    fetch: impl FnOnce(&mut Vec<f32>) -> Result<(), String>,
+) -> Result<LaneSampleOutcome, String> {
+    let Some(s) = host.sampling else {
+        return Ok(LaneSampleOutcome::Greedy);
+    };
+    debug_assert_ne!(host.rng, 0, "a sampled lane's xorshift state is never 0");
+    let rows = picks.len();
+    let want = match drafts {
+        None => 1,
+        Some(drafts) => drafts.len() + 1,
+    };
+    if rows != want || vocab == 0 {
+        return Err(format!(
+            "lane sample step: {rows} picks for a {want}-row request (vocab {vocab})"
+        ));
+    }
+    fetch(&mut *scratch)?;
+    if scratch.len() < rows * vocab {
+        return Err(format!(
+            "lane sample step: fetched {} logits, need {}",
+            scratch.len(),
+            rows * vocab
+        ));
+    }
+    let logits = &scratch[..rows * vocab];
+    match drafts {
+        None => {
+            picks[0] = lane_draw(&s, &mut host.rng, logits);
+            Ok(LaneSampleOutcome::Ar)
+        }
+        Some(drafts) => {
+            let naive = lane_sampled_commit(drafts, logits, vocab, &s, &mut host.rng, eos)?;
+            picks[..naive.committed.len()].copy_from_slice(&naive.committed);
+            Ok(LaneSampleOutcome::Naive(naive))
+        }
     }
 }
 
@@ -1336,6 +1546,10 @@ pub(crate) struct StepParts<'a> {
     /// Decode rows the step buffers hold: `max_lanes * (k + 1)` with spec,
     /// else `max_lanes`.
     pub rows_cap: usize,
+    /// Reused host F32 scratch for the logits rows of sampled lanes (sized
+    /// once at [`Qwen4LaneStore::set_sampled`], grown only if a request needs
+    /// more rows; never allocated per step).
+    pub sample_host: &'a mut Vec<f32>,
     pub spec: Option<&'a mut SpecStore>,
 }
 
@@ -1368,6 +1582,11 @@ pub struct Qwen4LaneStore {
     /// Host mirror of `top1` (empty without step outputs).
     top1_host: Vec<u8>,
     spec: Option<SpecStore>,
+    /// `serve.batch_sampled`: lanes may carry a [`LaneSampling`].
+    sampled: bool,
+    /// Host scratch the sampled lanes' downloaded logits rows reuse (empty
+    /// unless staged `sampled` on a band with step outputs).
+    sample_host: Vec<f32>,
     /// The band this store's lane states are scoped to.
     scope: Qwen4BandScope,
     pub(crate) phase: LanePhase,
@@ -1440,9 +1659,9 @@ impl Qwen4LaneStore {
         // This band's ownership: the single scope allocates the historical
         // whole-model store.
         let scope = bundle.weights.band_scope().clone();
-        if spec.is_some() && !scope.output {
-            return Err("lane store: MTP lanes need the output band".to_string());
-        }
+        // A head owner (the single scope, every EP rank, the PP output band)
+        // holds the MTP head; any other band that owns target layers holds
+        // only its lanes' verify rings (target-only ownership).
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -1456,7 +1675,7 @@ impl Qwen4LaneStore {
                     verify_rows - 1
                 ));
             }
-            if bundle.mtp.is_none() {
+            if scope.output && bundle.mtp.is_none() {
                 return Err("lane store: MTP lanes need the attached MTP head".to_string());
             }
             if !native_mtp_row_capture(gpu, &bundle.config) {
@@ -1492,16 +1711,18 @@ impl Qwen4LaneStore {
             (None, None)
         };
         let spec_store = match spec {
-            Some(config) => match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
-                Ok(store) => Some(store),
-                Err(error) => {
-                    for tensor in [logits, top1].into_iter().flatten() {
-                        let _ = gpu.free_tensor(tensor);
+            Some(config) if scope.output => {
+                match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
+                    Ok(store) => Some(store),
+                    Err(error) => {
+                        for tensor in [logits, top1].into_iter().flatten() {
+                            let _ = gpu.free_tensor(tensor);
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
-            },
-            None => None,
+            }
+            _ => None,
         };
         Ok(Self {
             table: LaneTable::new(max_lanes),
@@ -1521,6 +1742,8 @@ impl Qwen4LaneStore {
                 Vec::new()
             },
             spec: spec_store,
+            sampled: false,
+            sample_host: Vec::new(),
             scope,
             phase: LanePhase::Idle,
             next_step_id: 0,
@@ -1559,12 +1782,14 @@ impl Qwen4LaneStore {
     }
 
     /// [`Self::device_bytes`] of the store one pipeline band holds: the
-    /// lane states cover only the band's layers
-    /// ([`Qwen4State::device_bytes_scoped`]; the verify ring only its GDN
-    /// layers), and the step logits/top-1 buffers and every MTP charge only
-    /// exist on the output band (`scope.output`, the band that holds the
-    /// head). `None` on overflow, or for MTP lanes off the output band,
-    /// which [`Self::new`] refuses.
+    /// census of [`census::ar_lane_census`] / [`census::lane_spec_census`]
+    /// under the legacy budget ([`census::LaneSpecBudget::legacy`]: copy not
+    /// armed, a `k + 1`-row ring). The lane states and rings cover only the
+    /// band's layers; the step logits/top-1 buffers exist only on a band
+    /// that runs the LM head (`scope.output`) and every MTP head charge only
+    /// on the head owner (the output band). A non-output band with `spec_k`
+    /// holds its lanes' target rings alone. `None` on overflow or a `spec_k`
+    /// outside the lane budget, which [`Self::new`] refuses.
     pub fn device_bytes_scoped(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
@@ -1574,47 +1799,28 @@ impl Qwen4LaneStore {
         spec_k: Option<usize>,
         scope: &Qwen4BandScope,
     ) -> Option<u64> {
-        let f32_bytes = std::mem::size_of::<f32>();
-        let mut per_lane = Qwen4State::device_bytes_scoped(config, format, context, scope)?;
-        let rows_cap = match spec_k {
-            Some(k) => max_lanes.checked_mul(k.checked_add(1)?)?,
-            None => max_lanes,
+        // The legacy wrapper has no rank: rank 0 owns the head iff its band
+        // runs the LM head (the single scope and the output band do).
+        let (rank, owner_mask) = if scope.output { (0, 1) } else { (0, 2) };
+        let append_scratch = (mtp_fill_scratch_requested()
+            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
+        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let inputs = census::CensusInputs {
+            config,
+            format,
+            scope,
+            rank,
+            append_scratch,
         };
-        let rows = rows_cap.checked_add(max_lanes)?;
-        let mut shared = if scope.output {
-            rows.checked_mul(config.vocab_size)?
-                .checked_mul(f32_bytes)?
-                .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?
-        } else {
-            0
-        };
-        if let Some(k) = spec_k {
-            if !scope.output {
-                return None;
+        let census = match spec_k {
+            None => census::ar_lane_census(max_lanes, context, &inputs).ok()?,
+            Some(k) => {
+                let budget =
+                    census::LaneSpecBudget::new(max_lanes, k, 0, 0, *context, owner_mask).ok()?;
+                census::lane_spec_census(&budget, &inputs).ok()?
             }
-            let wide = config.hc_count.checked_mul(config.hidden_size)?;
-            let (gdn_layers, _) = scope_layer_counts(config, scope);
-            let ring = Qwen4State::row_capture_bytes_scoped(
-                config,
-                format.gdn,
-                k.checked_add(1)?,
-                gdn_layers,
-            )?;
-            per_lane = per_lane
-                .checked_add(MtpGpuState::device_bytes(config, context)?)?
-                .checked_add(ring)?
-                .checked_add(wide.checked_mul(f32_bytes)?)?;
-            let append = if mtp_fill_scratch_requested() {
-                MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).unwrap_or(0)
-            } else {
-                0
-            };
-            shared = shared
-                .checked_add(rows_cap.checked_mul(wide)?.checked_mul(f32_bytes)?)?
-                .checked_add(max_lanes.checked_mul(Gpu::TOPK8_OUT_BYTES)?)?
-                .checked_add(append)?;
-        }
-        u64::try_from(max_lanes.checked_mul(per_lane)?.checked_add(shared)?).ok()
+        };
+        census.total()
     }
 
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
@@ -1628,6 +1834,7 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
+        let ring_rows = self.ring_rows;
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1652,7 +1859,7 @@ impl Qwen4LaneStore {
                     }
                     Ok(None)
                 }
-                None => new_payload(gpu, bundle, slot, spec_cfg).map(Some),
+                None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
             })
     }
 
@@ -1677,6 +1884,7 @@ impl Qwen4LaneStore {
         if self.phase != LanePhase::Idle {
             return Err("admit_promoted: a step is in flight".to_string());
         }
+        let ring_rows = self.ring_rows;
         let spec_cfg = self
             .spec
             .as_ref()
@@ -1715,7 +1923,8 @@ impl Qwen4LaneStore {
                         Ok(None)
                     }
                     None => {
-                        let (state, mut spec) = new_payload(gpu, bundle, slot, spec_cfg)?;
+                        let (state, mut spec) =
+                            new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
                         let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
                             (Some((config, _, _)), Some(spec), Some(parts)) => {
                                 spec.promote(gpu, config.k, parts)
@@ -1757,6 +1966,93 @@ impl Qwen4LaneStore {
     /// forced close tokens); `generated` is untouched.
     pub fn force_seed(&mut self, epoch: &RequestEpoch, token: u32) -> Result<(), String> {
         self.table.force_seed(epoch, token)
+    }
+
+    /// Whether this store was staged to admit sampled lanes
+    /// (`serve.batch_sampled`).
+    pub fn sampled(&self) -> bool {
+        self.sampled
+    }
+
+    /// Record `serve.batch_sampled`. Turning it on pre-sizes the host logits
+    /// scratch (bands with step outputs only) for the widest request, one AR
+    /// row or `k + 1` verify rows, once; turning it off clears every lane's
+    /// sampler. Staging-time call: no step may be in flight.
+    pub(crate) fn set_sampled(&mut self, on: bool, vocab: usize) {
+        self.sampled = on;
+        if on {
+            if self.logits.is_some() {
+                let rows = self.spec.as_ref().map_or(1, |spec| spec.config.k + 1);
+                let need = rows.saturating_mul(vocab);
+                if self.sample_host.len() < need {
+                    self.sample_host.resize(need, 0.0);
+                }
+            }
+        } else {
+            for cell in self.table.cells.iter_mut().flatten() {
+                cell.host.sampling = None;
+                cell.host.rng = 0;
+            }
+            self.sample_host = Vec::new();
+        }
+    }
+
+    /// What [`Self::set_lane_sampling`] checks, changing nothing (a PP mesh
+    /// checks every band before it sets any).
+    pub(crate) fn check_lane_sampling(
+        &self,
+        epoch: &RequestEpoch,
+        sampling: &LaneSampling,
+    ) -> Result<(), String> {
+        if !self.sampled {
+            return Err(
+                "set_lane_sampling: the lane store is not staged sampled (serve.batch_sampled)"
+                    .to_string(),
+            );
+        }
+        if self.phase != LanePhase::Idle {
+            return Err("set_lane_sampling: a step is in flight".to_string());
+        }
+        sampling.validate()?;
+        let host = &self
+            .table
+            .get(epoch)
+            .ok_or_else(|| format!("set_lane_sampling: unknown or stale epoch {epoch:?}"))?
+            .host;
+        if host.status != LaneStatus::Prefilling
+            || host.prefilled != 0
+            || !host.generated.is_empty()
+        {
+            return Err(format!(
+                "set_lane_sampling: lane {epoch:?} is {:?} with {} prefilled and {} committed; \
+                 sampling is set before the first step",
+                host.status,
+                host.prefilled,
+                host.generated.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Make `epoch`'s lane a sampled lane: host only, after admission and
+    /// before the lane's first step. Refused unless the store is staged
+    /// sampled, no step is in flight, and the lane is Prefilling with nothing
+    /// prefilled and committed. The lane RNG starts at
+    /// [`LaneSampling::initial_rng`].
+    pub fn set_lane_sampling(
+        &mut self,
+        epoch: &RequestEpoch,
+        sampling: LaneSampling,
+    ) -> Result<(), String> {
+        self.check_lane_sampling(epoch, &sampling)?;
+        let host = &mut self
+            .table
+            .get_mut(epoch)
+            .expect("checked by check_lane_sampling")
+            .host;
+        host.rng = sampling.initial_rng();
+        host.sampling = Some(sampling);
+        Ok(())
     }
 
     pub fn lane(&self, epoch: &RequestEpoch) -> Option<&Qwen4LaneState> {
@@ -1884,6 +2180,7 @@ impl Qwen4LaneStore {
             top1,
             top1_host,
             rows_cap,
+            sample_host,
             spec,
             scope,
             ..
@@ -1901,6 +2198,7 @@ impl Qwen4LaneStore {
             policy: *policy,
             top1_host,
             rows_cap: *rows_cap,
+            sample_host,
             spec: spec.as_mut(),
         })
     }
@@ -3003,6 +3301,7 @@ mod tests {
 mod band_accounting_tests {
     use super::*;
     use crate::config::compact_test_config;
+    use crate::state::scope_layer_counts;
 
     fn partition(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
         assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
@@ -3079,7 +3378,7 @@ mod band_accounting_tests {
     }
 
     #[test]
-    fn non_output_band_refuses_mtp_lane_bytes() {
+    fn non_output_band_spec_bytes_are_target_only() {
         let config = compact_test_config();
         let context = Qwen4ContextCommit::legacy(1024);
         let format = Qwen4StateFormat::F32;
@@ -3095,30 +3394,357 @@ mod band_accounting_tests {
         )
         .is_some());
         let scopes = partition(&config, &[24, 24]);
-        assert!(Qwen4LaneStore::device_bytes_scoped(
-            &config,
-            format,
-            &context,
-            2,
-            2,
-            Some(3),
-            &scopes[0]
-        )
-        .is_none());
-        let output = Qwen4LaneStore::device_bytes_scoped(
-            &config,
-            format,
-            &context,
-            2,
-            2,
-            Some(3),
-            &scopes[1],
-        )
-        .unwrap();
-        let ar_output =
-            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, None, &scopes[1])
+        let bytes = |spec_k, scope: &Qwen4BandScope| {
+            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, spec_k, scope)
+                .unwrap()
+        };
+        // The non-output band holds its lanes' capture rings and no head,
+        // logits or wide hidden: exactly the AR store plus the rings.
+        let (gdn_layers, _) = scope_layer_counts(&config, &scopes[0]);
+        let ring =
+            Qwen4State::row_capture_bytes_scoped(&config, format.gdn, 4, gdn_layers).unwrap();
+        assert_eq!(
+            bytes(Some(3), &scopes[0]),
+            bytes(None, &scopes[0]) + 2 * ring as u64
+        );
+        // The MTP head, ring and wide buffers add more on the output band.
+        assert!(bytes(Some(3), &scopes[1]) > bytes(None, &scopes[1]));
+    }
+}
+
+#[cfg(test)]
+mod lane_sampling_tests {
+    use super::*;
+    use crate::mtp_spec::accept_native_greedy;
+    use hipfire_runtime::llama::{
+        reset_cpu_sampler_rng, sample_top_k_p, sampler_rng_restore, sampler_rng_snapshot,
+    };
+
+    /// `llama::SAMPLER_STATE` is process-global; every test here that resets
+    /// or draws from it holds this lock for its whole reset-draw-assert span
+    /// (no other test of this crate touches the global sampler RNG).
+    static RNG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn rng_guard() -> std::sync::MutexGuard<'static, ()> {
+        RNG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    const VOCAB: usize = 300;
+
+    fn xorshift(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// `n` deterministic logits rows of `VOCAB`: a spread wide enough that the
+    /// 20/64-candidate pools carry real mass, every third row quantized to
+    /// half-integers (ties), every fifth row with a `-inf` entry.
+    fn logit_rows(seed: u32, n: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(2_654_435_761) | 1;
+        let mut out = Vec::with_capacity(n * VOCAB);
+        for r in 0..n {
+            for _ in 0..VOCAB {
+                let v = (xorshift(&mut s) % 4000) as f32 / 1000.0;
+                out.push(if r % 3 == 1 {
+                    (v * 2.0).round() / 2.0
+                } else {
+                    v
+                });
+            }
+            if r % 5 == 2 {
+                out[r * VOCAB + 7] = f32::NEG_INFINITY;
+            }
+        }
+        out
+    }
+
+    fn sampling_for(case: u32) -> LaneSampling {
+        LaneSampling {
+            temperature: [0.3f32, 0.7, 1.0][case as usize % 3],
+            top_p: if case % 2 == 0 { 0.95 } else { 1.0 },
+            top_k: [None, Some(20u32), Some(40)][(case as usize / 3) % 3],
+            min_p: [None, Some(0.05f32)][(case as usize / 9) % 2],
+            // Seed 0 is the `reset_cpu_sampler_rng` 0 -> 1 mapping.
+            seed: case.wrapping_mul(7919),
+        }
+    }
+
+    fn host_with(sampling: Option<LaneSampling>) -> LaneHost {
+        LaneHost {
+            epoch: RequestEpoch {
+                request_tag: 1,
+                owner_generation: 1,
+            },
+            slot: 0,
+            prompt: vec![1],
+            prefilled: 0,
+            generated: Vec::new(),
+            pending_seed: None,
+            status: LaneStatus::Prefilling,
+            stamp: 0,
+            sampling,
+            rng: sampling.map_or(0, |s| s.initial_rng()),
+        }
+    }
+
+    fn row(logits: &[f32], i: usize) -> &[f32] {
+        &logits[i * VOCAB..(i + 1) * VOCAB]
+    }
+
+    /// The singleton's draws over rows `0..count`: the global RNG reset to
+    /// the request seed, then sequential `sample_top_k_p` (what
+    /// `sample_cpu` calls with neutral penalties). Returns the tokens and the
+    /// global state after the last draw.
+    fn ar_draws(logits: &[f32], count: usize, s: &LaneSampling) -> (Vec<u32>, u32) {
+        reset_cpu_sampler_rng(s.seed);
+        let tokens = (0..count)
+            .map(|i| sample_top_k_p(row(logits, i), s.temperature, s.top_p, s.top_k, s.min_p))
+            .collect();
+        (tokens, sampler_rng_snapshot())
+    }
+
+    #[test]
+    fn sampled_verify_windows_reproduce_the_ar_stream() {
+        let _g = rng_guard();
+        let saved = sampler_rng_snapshot();
+        let target = 40usize;
+        let (mut windows, mut rejected, mut full_accepts, mut eos_stops) = (0, 0, 0, 0);
+        for case in 0..26u32 {
+            for depth in 1..=4usize {
+                let s = sampling_for(case + depth as u32);
+                let logits = logit_rows(case * 31 + depth as u32, target + 8);
+                let (ar, _) = ar_draws(&logits, target + 8, &s);
+                // Odd cases end at an EOS the stream actually draws.
+                let eos = if case % 2 == 1 {
+                    ar[9 + depth]
+                } else {
+                    u32::MAX
+                };
+                let mut host = host_with(Some(s));
+                let mut scratch: Vec<f32> = Vec::new();
+                let mut stream: Vec<u32> = Vec::new();
+                let mut step = 0usize;
+                while stream.len() < target && stream.last() != Some(&eos) {
+                    let pos = stream.len();
+                    // The window's drafts follow the AR stream, every third
+                    // one corrupted so rejections and bonus rows both occur.
+                    let drafts: Vec<u32> = (0..depth)
+                        .map(|j| {
+                            let t = ar[pos + j];
+                            if (case as usize + step + j) % 3 == 0 {
+                                (t + 1) % VOCAB as u32
+                            } else {
+                                t
+                            }
+                        })
+                        .collect();
+                    // Device argmax stand-ins: distinct from any draw.
+                    let mut picks = vec![u32::MAX - 1; depth + 1];
+                    let window = &logits[pos * VOCAB..(pos + depth + 1) * VOCAB];
+                    let outcome = lane_sample_step(
+                        &mut host,
+                        Some(&drafts),
+                        &mut picks,
+                        eos,
+                        VOCAB,
+                        &mut scratch,
+                        |scratch| {
+                            scratch.clear();
+                            scratch.extend_from_slice(window);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    let LaneSampleOutcome::Naive(naive) = outcome else {
+                        panic!("a verify window is a naive outcome: {outcome:?}");
+                    };
+                    // The picks make the lane's greedy accept commit exactly
+                    // the naive window.
+                    assert_eq!(
+                        accept_native_greedy(&drafts, &picks, Some(eos)).unwrap(),
+                        naive
+                    );
+                    assert_eq!(&picks[..naive.committed.len()], &naive.committed[..]);
+                    windows += 1;
+                    rejected += usize::from(naive.accepted < depth);
+                    full_accepts += usize::from(naive.accepted == depth);
+                    stream.extend_from_slice(&naive.committed);
+                    step += 1;
+                }
+                assert_eq!(
+                    &stream[..],
+                    &ar[..stream.len()],
+                    "case {case} depth {depth}"
+                );
+                if stream.last() == Some(&eos) {
+                    eos_stops += 1;
+                    let first = ar.iter().position(|&t| t == eos).unwrap();
+                    assert_eq!(first + 1, stream.len(), "stops at the first EOS draw");
+                } else {
+                    assert!(stream.len() >= target);
+                }
+                // Exactly one draw per emitted token: the lane RNG sits where
+                // the singleton's global RNG does after as many AR draws.
+                let (_, state) = ar_draws(&logits, stream.len(), &s);
+                assert_eq!(host.rng, state, "case {case} depth {depth}");
+            }
+        }
+        assert!(windows >= 26 * 4, "{windows} windows");
+        assert!(rejected > 0 && full_accepts > 0 && eos_stops > 0);
+        sampler_rng_restore(saved);
+    }
+
+    #[test]
+    fn sampled_ar_rows_reproduce_the_ar_stream() {
+        let _g = rng_guard();
+        let saved = sampler_rng_snapshot();
+        for case in 0..26u32 {
+            let s = sampling_for(case);
+            let count = 30;
+            let logits = logit_rows(case + 1000, count);
+            let (ar, state) = ar_draws(&logits, count, &s);
+            let mut host = host_with(Some(s));
+            let mut scratch: Vec<f32> = Vec::new();
+            let mut got = Vec::new();
+            for i in 0..count {
+                let mut picks = [u32::MAX - 1];
+                let outcome = lane_sample_step(
+                    &mut host,
+                    None,
+                    &mut picks,
+                    0,
+                    VOCAB,
+                    &mut scratch,
+                    |scratch| {
+                        scratch.clear();
+                        scratch.extend_from_slice(row(&logits, i));
+                        Ok(())
+                    },
+                )
                 .unwrap();
-        // The MTP head, ring and wide buffers add bytes on the output band only.
-        assert!(output > ar_output);
+                assert_eq!(outcome, LaneSampleOutcome::Ar);
+                got.push(picks[0]);
+            }
+            assert_eq!(got, ar, "case {case}");
+            assert_eq!(host.rng, state, "case {case}");
+        }
+        sampler_rng_restore(saved);
+    }
+
+    #[test]
+    fn a_lane_without_sampling_is_untouched() {
+        let mut host = host_with(None);
+        let mut scratch: Vec<f32> = Vec::new();
+        for drafts in [None, Some(&[4u32, 5][..])] {
+            let mut picks = vec![9u32, 8, 7][..drafts.map_or(1, |d| d.len() + 1)].to_vec();
+            let before = picks.clone();
+            let outcome = lane_sample_step(
+                &mut host,
+                drafts,
+                &mut picks,
+                3,
+                VOCAB,
+                &mut scratch,
+                |_| panic!("a greedy lane never fetches logits"),
+            )
+            .unwrap();
+            assert_eq!(outcome, LaneSampleOutcome::Greedy);
+            assert_eq!(picks, before);
+        }
+        assert_eq!((host.rng, scratch.len()), (0, 0));
+    }
+
+    #[test]
+    fn sample_step_refuses_a_row_count_mismatch() {
+        let s = sampling_for(1);
+        let mut host = host_with(Some(s));
+        let mut scratch: Vec<f32> = Vec::new();
+        let mut picks = [1u32, 2];
+        let error = lane_sample_step(&mut host, None, &mut picks, 0, VOCAB, &mut scratch, |_| {
+            panic!("refused before the fetch")
+        })
+        .unwrap_err();
+        assert!(error.contains("2 picks for a 1-row"), "{error}");
+        // Short logits are refused too.
+        let mut picks = [1u32, 2];
+        let error = lane_sample_step(
+            &mut host,
+            Some(&[5]),
+            &mut picks,
+            0,
+            VOCAB,
+            &mut scratch,
+            |scratch| {
+                scratch.clear();
+                scratch.resize(VOCAB, 0.0);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("need"), "{error}");
+    }
+
+    #[test]
+    fn sampling_validation_and_rng_seed() {
+        let ok = sampling_for(4);
+        assert!(ok.validate().is_ok());
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            let s = LaneSampling {
+                temperature: bad,
+                ..ok
+            };
+            assert!(s.validate().is_err(), "temperature {bad}");
+        }
+        assert_eq!(LaneSampling { seed: 0, ..ok }.initial_rng(), 1);
+        assert_eq!(LaneSampling { seed: 77, ..ok }.initial_rng(), 77);
+    }
+
+    struct Cell {
+        host: LaneHost,
+    }
+
+    impl LaneCell for Cell {
+        type Payload = ();
+
+        fn assemble(host: LaneHost, _: ()) -> Self {
+            Self { host }
+        }
+
+        fn host(&self) -> &LaneHost {
+            &self.host
+        }
+
+        fn host_mut(&mut self) -> &mut LaneHost {
+            &mut self.host
+        }
+    }
+
+    #[test]
+    fn a_reused_slot_never_inherits_the_sampler() {
+        let epoch = |tag| RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        };
+        let mut table = LaneTable::<Cell>::new(1);
+        let prepare = |_: usize, existing: Option<&mut Cell>| match existing {
+            Some(_) => Ok(None),
+            None => Ok(Some(())),
+        };
+        table.admit(epoch(1), vec![7], prepare).unwrap();
+        let host = table.get_mut(&epoch(1)).unwrap().host_mut();
+        assert_eq!((host.sampling, host.rng), (None, 0));
+        host.sampling = Some(sampling_for(5));
+        host.rng = 99;
+        table.release(&epoch(1)).unwrap();
+        let released = table.cells[0].as_ref().unwrap().host();
+        assert_eq!((released.sampling, released.rng), (None, 0));
+        // A promoted admission into the reused slot is greedy too.
+        table
+            .admit_decoding(epoch(2), vec![7], vec![4], 5, prepare)
+            .unwrap();
+        let host = table.get(&epoch(2)).unwrap().host();
+        assert_eq!((host.sampling, host.rng), (None, 0));
     }
 }

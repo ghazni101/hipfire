@@ -227,7 +227,13 @@ Config and env owners for bind, idle, queue, and body limits:
    `continuous_batch_sampled_modes`; each batched request's
    `continuous_batch` receipt carries `spec_mode`, `sampling` and
    `equivalence: "singleton_exact"`. With the flag off sampled requests stay
-   on the serialized singleton route.
+   on the serialized singleton route. Flash-Next (Qwen4) fn-lanes admit
+   sampled requests with neutral penalties the same way: AR lanes draw on the
+   host with the AR singleton's sampler and request seed; MTP lanes verify
+   sampled windows naively (drafts stay the head's argmax, each verify row is
+   one AR-sampler draw), so seeded output equals the AR singleton's wherever
+   the logits match. Sampled Qwen4 requests are never promoted from a running
+   singleton, and `false` keeps them on the singleton route.
    Greedy requests (and sampled ones under `serve.batch_sampled`) batch with
    penalties applied as on the singleton route; `serve.batch_spec`
    (`HIPFIRE_SERVE_BATCH_SPEC=0` disables it) lets lanes decode as

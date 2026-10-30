@@ -4618,6 +4618,56 @@ impl Qwen4Bundle {
         self.with_lanes(|store, _| store.force_seed(epoch, token))
     }
 
+    /// Record `serve.batch_sampled` on the staged lane store(s): lanes of a
+    /// sampled store may carry a [`crate::lane::LaneSampling`]. Call once,
+    /// right after [`Self::stage_lanes`] / `pp_stage_lanes` (a load with no
+    /// staged lanes is a no-op).
+    ///
+    /// - single: this bundle's store;
+    /// - EP: every rank's store (soft fan-out; a failure is logged);
+    /// - PP: every band's store, root (the output band `lanes()` reads)
+    ///   included. Host only, so no `gpus`.
+    pub fn set_lanes_sampled(&mut self, on: bool) {
+        if self.pp.is_some() {
+            self.pp_set_lanes_sampled(on);
+            return;
+        }
+        if self.ep.is_some() {
+            self.ep_set_lanes_sampled(on);
+            return;
+        }
+        self.set_lanes_sampled_local(on);
+    }
+
+    /// This bundle's store only (no mesh fan-out).
+    pub(crate) fn set_lanes_sampled_local(&mut self, on: bool) {
+        let vocab = self.lane_vocab();
+        if let Some(store) = self.lanes.as_mut() {
+            store.set_sampled(on, vocab);
+        }
+    }
+
+    /// Make `epoch`'s lane a sampled lane (host only; see
+    /// [`crate::lane::Qwen4LaneStore::set_lane_sampling`]): after
+    /// [`Self::admit_lane`] and before the lane's first step. Refused unless
+    /// the store is staged sampled and the lane is Prefilling with nothing
+    /// prefilled. Under EP the call fans out to every rank (each rank's lane
+    /// copy draws from its own RNG; ranks must agree, like the greedy picks).
+    /// Under PP use [`Self::pp_set_lane_sampling`].
+    pub fn set_lane_sampling(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+        sampling: crate::lane::LaneSampling,
+    ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
+        if self.ep.is_some() {
+            return self.ep_set_lane_sampling(epoch, sampling);
+        }
+        self.with_lanes(|store, _| store.set_lane_sampling(epoch, sampling))
+    }
+
     /// Developer / oracle entry (the serve path never calls it): replace the
     /// row-local stage share policy of EVERY lane store of this load, so a
     /// measurement can compare shared and per-lane stage execution on the

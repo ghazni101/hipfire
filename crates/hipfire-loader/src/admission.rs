@@ -13,8 +13,8 @@
 
 use crate::Carrier;
 pub use hipfire_arch_qwen4::admission::{
-    qwen4_pp_band_budget, qwen4_pp_edge_max_bytes, Qwen4PpBudgetInputs, Qwen4PpRankFit,
-    QWEN4_PP_RESERVE_BYTES,
+    qwen4_pp_auto_fit, qwen4_pp_edge_max_bytes, qwen4_pp_rank_lines, Qwen4PpAutoFit,
+    Qwen4PpBudgetInputs, Qwen4PpRankFit, QWEN4_PP_FIRST_BAND_MIN_LAYERS, QWEN4_PP_RESERVE_BYTES,
 };
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
@@ -2392,7 +2392,7 @@ pub(crate) fn admit_qwen4_pp_mesh(
         .map_err(|e| format!("{prefix}: {e}"))?;
     let placement = bands
         .placement
-        .with_first_band_min(2)
+        .with_first_band_min(QWEN4_PP_FIRST_BAND_MIN_LAYERS)
         .map_err(|e| format!("{prefix}: {e} (the PLE layer lives in the first band)"))?;
     Ok((
         mesh,

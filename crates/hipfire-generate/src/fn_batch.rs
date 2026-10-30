@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Flash-Next exact lanes: AR lanes, and per-lane native MTP lanes when the
+//! Flash-Next exact lanes (greedy, or sampled with host draws): AR lanes, and per-lane native MTP lanes when the
 //! staged store carries the MTP head (`serve.batch_spec`, default on;
 //! `serve.batch_spec = false` / `HIPFIRE_SERVE_BATCH_SPEC=0` stages AR lanes
 //! only). Prompt IDs come from `qwen::render_qwen4_prompt`,
@@ -41,6 +41,10 @@
 //! and steps through the `pp_*` lane APIs and `Qwen4PpLaneExecutor` over the
 //! mesh's `Gpus`. Promotion of a running singleton into a lane is single-only
 //! (PP and EP refuse it), so the promoted-adoption path only runs on single.
+//! Sampled requests (neutral penalties; the lane store's `serve.batch_sampled`)
+//! install a `LaneSampling` right after admission: the lane draws on the host
+//! with the AR singleton's sampler and the request seed, and MTP lanes verify
+//! sampled windows naively. Promoted lanes are greedy-only.
 
 use crate::ar::*;
 use crate::batch::{
@@ -49,7 +53,7 @@ use crate::batch::{
 };
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
-use hipfire_arch_qwen4::lane::LaneStatus;
+use hipfire_arch_qwen4::lane::{LaneSampling, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
@@ -182,6 +186,15 @@ impl<'a> Owner<'a> {
             None => self.bundle.admit_lane(&mut *self.gpu, epoch, prompt),
         };
         admitted.map_err(|e| e.to_string())
+    }
+
+    /// Install the request's sampler on a just-admitted lane (host-only).
+    fn set_sampling(&mut self, epoch: &RequestEpoch, sampling: LaneSampling) -> Result<(), String> {
+        let set = match self.gpus.as_deref_mut() {
+            Some(gpus) => self.bundle.pp_set_lane_sampling(gpus, epoch, sampling),
+            None => self.bundle.set_lane_sampling(epoch, sampling),
+        };
+        set.map_err(|e| e.to_string())
     }
 
     fn force_seed(&mut self, epoch: &RequestEpoch, token: u32) -> Result<(), String> {
@@ -895,7 +908,8 @@ fn finish_lane(
         .map_err(|e| e.to_string())
 }
 
-/// Serve concurrently admitted greedy Qwen4 requests using the exact lane
+/// Serve concurrently admitted Qwen4 requests (greedy, or sampled with
+/// neutral penalties when the lane store is sampled) using the exact lane
 /// executor. All terminal ownership remains in `ContinuousBatchScheduler`.
 /// `promoted` is a running singleton moved into a lane (`generate_spec`): it
 /// is adopted as a Running lane before the loop and continues from its
@@ -1154,6 +1168,29 @@ pub fn drive_qwen4_lane_batch(
                         continue;
                     }
                 };
+                if req.sampling.temp > 0.0 {
+                    let s = &req.sampling;
+                    let sampling = LaneSampling {
+                        temperature: s.temp,
+                        top_p: s.top_p,
+                        top_k: s.top_k,
+                        min_p: s.min_p,
+                        seed: request_seed_for(&key, req.client_seed),
+                    };
+                    if let Err(error) = Owner::of(m, gpu)?.set_sampling(&epoch, sampling) {
+                        release_epoch(m, &epoch)?;
+                        lane_error(
+                            sched,
+                            m,
+                            &mut controls,
+                            ticket.lane,
+                            stdout,
+                            &error,
+                            "validation",
+                        )?;
+                        continue;
+                    }
+                }
                 emit_generation_start(ROUTE, stdout, &key.id, started);
                 // The singleton tools parser maps an empty array to None.
                 let tools = req

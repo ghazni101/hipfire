@@ -946,7 +946,10 @@ Caveats that are part of the fixture, not trivia:
   greedy requests with penalties run AR
   (`crates/hipfire-generate/src/ar.rs:1715–1734`).
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
-  (`crates/hipfire-generate/src/batch.rs:2767–2789`).** Each MTP
+  (`crates/hipfire-generate/src/batch.rs`, `qwen4_lane_request_supported`), but
+  batch sampled neutral-penalty requests under `serve.batch_sampled`: AR lanes
+  draw with the AR singleton sampler and request seed, MTP lanes verify sampled
+  windows with naive acceptance.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` (up to the `mtp_k` cap; `auto` for native Qwen4 MTP =
   `min(GPU row-exact verify rows, CPU-owned-expert window) − 1` resolved after

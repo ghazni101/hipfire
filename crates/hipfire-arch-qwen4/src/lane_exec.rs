@@ -24,17 +24,37 @@
 //! 2. [`Qwen4LaneExecutor::forward_step`] runs the decode rows of all lanes
 //!    as one exact trunk step (`forward_lanes`; each Verify lane under its
 //!    armed ring and a target snapshot, the wide hidden captured), downloads
-//!    the greedy picks of every decode row once, finishes every Verify
-//!    window (greedy accept, ring rollback, head commit), runs the head
-//!    append of every `ArSynced` lane, then each prefill tile through the
-//!    singleton chunk program on the lane's own state (an MTP lane's tile
-//!    also fills its head). A pure-decode step's wall clock (draft start to
-//!    the final sync) feeds the store's cost model, then every MTP lane's
-//!    window policy observes its window.
+//!    the argmax picks of every decode row once, then, for each lane that
+//!    carries a [`crate::lane::LaneSampling`], replaces them with the lane's
+//!    sampler draws (below), finishes every Verify window (greedy accept
+//!    over the picks, ring rollback, head commit), runs the head append of
+//!    every `ArSynced` lane, then each prefill tile through the singleton
+//!    chunk program on the lane's own state (an MTP lane's tile also fills
+//!    its head). A pure-decode step's wall clock (draft start to the final
+//!    sync) feeds the store's cost model, then every MTP lane's window
+//!    policy observes its window.
 //! 3. [`Qwen4LaneExecutor::commit_step`] applies the lane bookkeeping. The
 //!    forwards publish the device and host trunk state (QSA lengths, PLE
 //!    history, `state.position`) themselves, exactly as the singleton route
 //!    does; commit never touches device state.
+//!
+//! Sampled lanes (`serve.batch_sampled`; [`crate::lane::LaneSampling`] set
+//! after admission) draw every token they commit on the host with the AR
+//! singleton's sampler (`llama::sample_top_k_p`, neutral penalties) from the
+//! lane's own F32 logits row against the lane's own xorshift32 state, in
+//! emission order: an AR row (`Ar`, `ArSynced`, `ArRetired`) is one draw, a
+//! prompt-completing tile is one draw from its final row, and a `Verify`
+//! window `[seed, d1..dk]` is the SpecInfer naive rule
+//! (`spec_sampling::accept_naive_prefix`: drafts stay the head's argmax, each
+//! verify row is one AR-sampler draw, a draft is accepted iff it equals its
+//! row's draw, EOS stops as in the greedy rule), so every emitted token is
+//! exactly one AR draw in AR order. The draws replace the lane's argmax
+//! picks before the window is finished (the greedy accept over them commits
+//! exactly the naive window; a disagreement is an error) and are the step
+//! output's picks. A sampled lane costs one extra synchronous D2H per step
+//! (its request's contiguous logits rows; the prompt-completing tile's row
+//! likewise); a step with no sampled lane issues exactly the greedy device
+//! work and downloads.
 //!
 //! Under an attached expert-parallel mesh every mutating entry below runs the
 //! identical call on every rank (rank 0 on the caller's thread, peers on
@@ -83,7 +103,8 @@ use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
 };
 use crate::lane::{
-    LaneHost, LaneSpecConfig, LaneStatus, Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
+    download_lane_rows, lane_sample_step, LaneHost, LaneSampleOutcome, LaneSpecConfig, LaneStatus,
+    Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
 };
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_lanes::{
@@ -934,6 +955,7 @@ fn forward_inner(
         policy,
         top1_host,
         rows_cap,
+        sample_host,
         spec,
     } = store.step_parts(&epochs)?;
     let mut hidden: Option<&GpuTensor> = None;
@@ -1086,14 +1108,43 @@ fn forward_inner(
         }
     }
 
-    // Verify windows, then the head appends of the ArSynced lanes.
+    // Verify windows, then the head appends of the ArSynced lanes. A sampled
+    // lane's argmax picks are replaced by its sampler's draws first
+    // (`lane_sample_step`: one D2H of the request's logits rows); a greedy lane
+    // takes the unchanged argmax path.
+    let lane_eos = spec_config
+        .and_then(|config| config.end_of_turn)
+        .unwrap_or(bundle.config.eos_token_id);
     for e in entries.iter_mut() {
         let Some(first) = e.dec else {
             continue;
         };
-        let lane_picks: Vec<u32> = (0..e.r.rows.len)
+        let mut lane_picks: Vec<u32> = (0..e.r.rows.len)
             .map(|j| pick_at(top1_host, first + j))
             .collect();
+        let mut naive = None;
+        if e.lane.host.sampling.is_some() {
+            let rows = e.r.rows.len;
+            let drafts = matches!(e.r.kind, RequestStepKind::Verify { .. })
+                .then(|| &plan.batch.tokens[e.r.rows.begin + 1..e.r.rows.end()]);
+            let gpu_ref: &Gpu = gpu;
+            let logits_ref: &GpuTensor = logits;
+            let sampled = lane_sample_step(
+                &mut e.lane.host,
+                drafts,
+                &mut lane_picks,
+                lane_eos,
+                vocab,
+                sample_host,
+                |scratch| download_lane_rows(gpu_ref, logits_ref, first, rows, vocab, scratch),
+            )
+            .map_err(|error| format!("lane {:?}: {error}", e.r.epoch))?;
+            if let LaneSampleOutcome::Naive(window) = sampled {
+                naive = Some(window);
+            }
+            // The step output's picks are the draws too.
+            picks[e.r.rows.begin..e.r.rows.end()].copy_from_slice(&lane_picks);
+        }
         let route = e
             .lane
             .spec
@@ -1106,7 +1157,7 @@ fn forward_inner(
                     .ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
                 let hidden =
                     hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
-                finish_lane_window(
+                let window = finish_lane_window(
                     bundle,
                     gpu,
                     &mut *e.lane,
@@ -1115,7 +1166,21 @@ fn forward_inner(
                     first,
                     &lane_picks,
                     skip_rollback,
-                )?
+                )?;
+                if let Some(naive) = &naive {
+                    if window.committed != naive.committed || window.accepted != naive.accepted {
+                        return Err(format!(
+                            "sampled Verify lane {:?}: the finish committed {:?} (accepted {}) \
+                             but the naive window is {:?} (accepted {})",
+                            e.r.epoch,
+                            window.committed,
+                            window.accepted,
+                            naive.committed,
+                            naive.accepted
+                        ));
+                    }
+                }
+                window
             }
             (RequestStepKind::Ar, Some(route)) => {
                 if route == LaneRoute::ArSynced {
@@ -1137,10 +1202,11 @@ fn forward_inner(
     }
 
     // Prefill tiles.
-    // (prefill ordinal, plan row of its pick) of AR-lane completing tiles.
-    let mut final_tiles: Vec<(usize, usize)> = Vec::new();
+    // (prefill ordinal, plan row of its pick, entry index) of AR-lane
+    // completing tiles.
+    let mut final_tiles: Vec<(usize, usize, usize)> = Vec::new();
     let mut ordinal = 0usize;
-    for e in entries.iter_mut() {
+    for (entry, e) in entries.iter_mut().enumerate() {
         if e.r.kind != RequestStepKind::Prefill {
             continue;
         }
@@ -1150,7 +1216,7 @@ fn forward_inner(
         let completes = wants_pick(&e.lane.host, e.r);
         if e.lane.spec.is_some() {
             let scratch = append.as_deref_mut().and_then(Option::as_mut);
-            let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch)?;
+            let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch, sample_host)?;
             if completes {
                 picks[e.r.rows.end() - 1] =
                     pick.ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
@@ -1174,7 +1240,7 @@ fn forward_inner(
                 },
             )
             .map_err(|e| e.to_string())?;
-            final_tiles.push((i, e.r.rows.end() - 1));
+            final_tiles.push((i, e.r.rows.end() - 1, entry));
         } else {
             bundle
                 .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
@@ -1188,8 +1254,30 @@ fn forward_inner(
             .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-        for &(i, row) in &final_tiles {
+        for &(i, row, entry) in &final_tiles {
             picks[row] = pick_at(top1_host, rows_cap + i);
+            // A sampled lane's prompt-completing pick is its first draw, from
+            // the tile's final logits row (one D2H); a greedy lane keeps the
+            // argmax.
+            let lane = &mut *entries[entry].lane;
+            if lane.host.sampling.is_some() {
+                let gpu_ref: &Gpu = gpu;
+                let logits_ref: &GpuTensor = logits;
+                let mut one = [picks[row]];
+                lane_sample_step(
+                    &mut lane.host,
+                    None,
+                    &mut one,
+                    lane_eos,
+                    vocab,
+                    sample_host,
+                    |scratch| {
+                        download_lane_rows(gpu_ref, logits_ref, rows_cap + i, 1, vocab, scratch)
+                    },
+                )
+                .map_err(|error| format!("lane {:?}: {error}", lane.host.epoch))?;
+                picks[row] = one[0];
+            }
         }
     }
 
@@ -1297,6 +1385,8 @@ mod tests {
             pending_seed: (status == LaneStatus::Decoding).then_some(77),
             status,
             stamp: tag,
+            sampling: None,
+            rng: 0,
         }
     }
 

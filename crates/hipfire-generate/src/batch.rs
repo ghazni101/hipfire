@@ -2838,7 +2838,10 @@ fn vmm_retire_free(
 /// budget alerts (mid-stream text injection), adaptive KV/eviction/PFlash
 /// (per-request KV rewriting), and PP/EP outside the Qwen4 fn-lanes route. A loaded
 /// speculator does not exclude a greedy request — batched rows are AR, and a
-/// lonely request keeps its singleton spec route.
+/// lonely request keeps its singleton spec route. Qwen4 fn-lanes also admit
+/// sampled requests with neutral penalties when the staged lane store is
+/// sampled (`serve.batch_sampled`): lanes draw with the AR singleton's
+/// sampler and request seed; MTP lanes verify sampled windows naively.
 pub fn is_vmm_batch_request_eligible(
     msg: &serde_json::Value,
     m: &LoadedModel,
@@ -2890,7 +2893,11 @@ pub fn is_vmm_batch_request_eligible(
     }
     let sampling = resolve_batch_sampling(msg, m);
     if m.qwen4().is_some() {
-        return sampling.temp <= 0.0 && qwen4_lane_request_supported(msg, &sampling);
+        let store_sampled = m
+            .qwen4()
+            .and_then(|b| b.lanes())
+            .is_some_and(|s| s.sampled());
+        return qwen4_lane_sampling_admits(msg, &sampling, store_sampled);
     }
     sampling.temp <= 0.0 || vmm_sampled_lane(msg, m, &sampling).is_some()
 }
@@ -2916,12 +2923,23 @@ fn qwen4_lane_promotion_supported(topology: &str) -> bool {
     topology == "single"
 }
 
-/// Qwen4 lane request gate beyond the shared greedy/text-chat predicate. A
-/// lane commits the greedy argmax only, so everything the singleton sampler
-/// or protocol layers add on top stays sequential: non-neutral resolved
-/// penalties, any tool field other than an absent/empty array (a non-array
-/// value is a validation error the singleton reports), images, and
-/// logprobs.
+/// Qwen4 lane admission: greedy requests, or sampled ones when the store is
+/// sampled (`serve.batch_sampled`) — lanes then draw on the host with the AR
+/// singleton's sampler and the request seed, and MTP lanes verify sampled
+/// windows with naive acceptance. Also requires `qwen4_lane_request_supported`.
+fn qwen4_lane_sampling_admits(
+    msg: &serde_json::Value,
+    sampling: &hipfire_engine::scheduler::BatchSampling,
+    store_sampled: bool,
+) -> bool {
+    (sampling.temp <= 0.0 || (sampling.temp.is_finite() && store_sampled))
+        && qwen4_lane_request_supported(msg, sampling)
+}
+
+/// Qwen4 lane request gate beyond the shared text-chat predicate: neutral
+/// resolved penalties (the lane sampler is the singleton's `sample_cpu` with
+/// neutral penalties), no tools (absent/empty array only; a non-array value
+/// is a validation error the singleton reports), images, or logprobs.
 fn qwen4_lane_request_supported(
     msg: &serde_json::Value,
     sampling: &hipfire_engine::scheduler::BatchSampling,
@@ -2941,9 +2959,10 @@ fn qwen4_lane_request_supported(
     tools_ok && images_ok && logprobs_ok
 }
 
-/// Qwen4 load-ack fields: `fn-lanes` route, exact greedy-only lanes (native
-/// MTP lanes when the staged receipt says `spec == "mtp"`, AR lanes
-/// otherwise), plus the staged `LaneStoreReceipt`.
+/// Qwen4 load-ack fields: `fn-lanes` route, exact lanes (native MTP lanes
+/// when the staged receipt says `spec == "mtp"`, AR lanes otherwise;
+/// `sampled` is the staged store's `serve.batch_sampled` flag), plus the
+/// staged `LaneStoreReceipt`.
 fn qwen4_lane_ack_fields(
     v: &mut serde_json::Value,
     r: &hipfire_arch_qwen4::lane::LaneStoreReceipt,
@@ -2952,6 +2971,7 @@ fn qwen4_lane_ack_fields(
     slots: usize,
     row_budget: usize,
     p: VmmBatchParams,
+    sampled: bool,
 ) {
     v["continuous_batch_route"] = serde_json::json!("fn-lanes");
     // Typed capability: exact lanes admit appended (multi-turn) text-chat
@@ -2969,7 +2989,17 @@ fn qwen4_lane_ack_fields(
     v["continuous_batch_spec_requested"] = serde_json::json!(p.spec);
     v["continuous_batch_nonexact"] = serde_json::json!(false);
     v["continuous_batch_exact"] = serde_json::json!(true);
-    v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+    if sampled {
+        v["continuous_batch_sampling"] = serde_json::json!("sampled");
+        v["continuous_batch_sampled_modes"] = if spec_on {
+            serde_json::json!(["ar", "mtp"])
+        } else {
+            serde_json::json!(["ar"])
+        };
+    } else {
+        v["continuous_batch_sampling"] = serde_json::json!("greedy_only");
+        v["continuous_batch_sampled_modes"] = serde_json::json!([]);
+    }
     v["continuous_batch_promotion"] = serde_json::json!(qwen4_lane_promotion_supported(topology));
     v["fn_lanes_topology"] = serde_json::json!(topology);
     v["fn_lanes_device_receipts"] = serde_json::Value::Array(
@@ -3092,7 +3122,13 @@ pub fn vmm_loaded_ack(
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&ack) else {
             return ack;
         };
-        qwen4_lane_ack_fields(&mut v, receipt, topology, &receipts, slots, row_budget, p);
+        let sampled = m
+            .qwen4()
+            .and_then(|b| b.lanes())
+            .is_some_and(|s| s.sampled());
+        qwen4_lane_ack_fields(
+            &mut v, receipt, topology, &receipts, slots, row_budget, p, sampled,
+        );
         return v.to_string();
     }
     let (receipt, spec_mode, dflash_receipt, sampling_ack) =
@@ -3234,8 +3270,9 @@ pub fn arm_promotion(
     let sampling = resolve_batch_sampling(msg, m);
     // A sampled request promotes only as an AR lane: the AR singleton
     // boundary moves its advanced rng/history/sampler. A sampled speculative
-    // singleton would be continued as AR (reseeded), never promoted. Qwen4
-    // lanes are greedy-only, so a sampled Qwen4 request never promotes.
+    // would be continued as AR (reseeded), never promoted. Sampled Qwen4
+    // requests never promote either: their lane draws with its own RNG from
+    // admission; a running singleton's RNG/sampler state is not imported.
     let permit = (armed
         && m.qwen4().is_none_or(|b| {
             b.lanes().is_some() && qwen4_lane_promotion_supported(b.lane_topology())
@@ -7932,6 +7969,7 @@ mod tests {
             4,
             32,
             params,
+            false,
         );
         assert_eq!(v["continuous_batch_route"], "fn-lanes");
         assert_eq!(v["continuous_batch_history_capable"], true);
@@ -7971,6 +8009,7 @@ mod tests {
             4,
             32,
             params,
+            false,
         );
         assert_eq!(w["continuous_batch_spec"], false);
         assert_eq!(w["continuous_batch_spec_mode"], "off");
@@ -7985,7 +8024,7 @@ mod tests {
                     ..off.clone()
                 },
             ];
-            qwen4_lane_ack_fields(&mut mesh, &off, topology, &receipts, 4, 32, params);
+            qwen4_lane_ack_fields(&mut mesh, &off, topology, &receipts, 4, 32, params, false);
             assert_eq!(mesh["fn_lanes_topology"], topology);
             assert_eq!(mesh["continuous_batch_promotion"], false);
             assert_eq!(mesh["continuous_batch_spec"], false);
@@ -7995,6 +8034,111 @@ mod tests {
             );
             assert_eq!(mesh["fn_lanes_device_receipts"][1]["mapped_bytes"], 654_321);
         }
+    }
+
+    #[test]
+    fn qwen4_lane_ack_reports_sampled_modes_when_store_sampled() {
+        let receipt = hipfire_arch_qwen4::lane::LaneStoreReceipt {
+            kv_backend: "vmm",
+            qsa_format: "q8",
+            gdn_format: "f32",
+            ring_rows: 16,
+            max_lanes: 4,
+            row_budget: 32,
+            mapped_bytes: 1,
+            stage_policy: String::new(),
+            stage_evidence: String::new(),
+            spec: "mtp",
+            spec_k: 3,
+        };
+        let params = VmmBatchParams {
+            spec: true,
+            nonexact: false,
+            max_batch_tokens: 4096,
+            prefill_min_tokens: 1,
+            sampled: true,
+        };
+        let mut v = serde_json::json!({});
+        qwen4_lane_ack_fields(
+            &mut v,
+            &receipt,
+            "single",
+            std::slice::from_ref(&receipt),
+            4,
+            32,
+            params,
+            true,
+        );
+        assert_eq!(v["continuous_batch_sampling"], "sampled");
+        assert_eq!(
+            v["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar", "mtp"])
+        );
+        let off = hipfire_arch_qwen4::lane::LaneStoreReceipt {
+            spec: "off",
+            spec_k: 0,
+            ..receipt
+        };
+        let mut w = serde_json::json!({});
+        qwen4_lane_ack_fields(
+            &mut w,
+            &off,
+            "single",
+            std::slice::from_ref(&off),
+            4,
+            32,
+            params,
+            true,
+        );
+        assert_eq!(
+            w["continuous_batch_sampled_modes"],
+            serde_json::json!(["ar"])
+        );
+        let mut g = serde_json::json!({});
+        qwen4_lane_ack_fields(
+            &mut g,
+            &off,
+            "single",
+            std::slice::from_ref(&off),
+            4,
+            32,
+            params,
+            false,
+        );
+        assert_eq!(g["continuous_batch_sampling"], "greedy_only");
+        assert_eq!(g["continuous_batch_sampled_modes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn qwen4_lane_sampling_admission_follows_store_flag_and_penalties() {
+        let msg = serde_json::json!({});
+        let base = qwen4_neutral_sampling();
+        let greedy = BatchSampling {
+            temp: 0.0,
+            ..base.clone()
+        };
+        let hot = BatchSampling {
+            temp: 0.7,
+            ..base.clone()
+        };
+        let penalized = BatchSampling {
+            temp: 0.7,
+            repeat_penalty: 1.1,
+            ..base.clone()
+        };
+        let nan = BatchSampling {
+            temp: f32::NAN,
+            ..base
+        };
+        // Greedy is unaffected by the store flag.
+        assert!(qwen4_lane_sampling_admits(&msg, &greedy, false));
+        assert!(qwen4_lane_sampling_admits(&msg, &greedy, true));
+        // Sampled iff the store is sampled.
+        assert!(!qwen4_lane_sampling_admits(&msg, &hot, false));
+        assert!(qwen4_lane_sampling_admits(&msg, &hot, true));
+        // Non-neutral penalties stay singleton either way.
+        assert!(!qwen4_lane_sampling_admits(&msg, &penalized, true));
+        assert!(!qwen4_lane_sampling_admits(&msg, &nan, true));
     }
 
     #[test]

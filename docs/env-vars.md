@@ -472,7 +472,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented) |
+| `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented). Raon-1-mini (arch 19) decode defaults to a captured graph (one per admitted context bucket, replayed per token; re-recorded when the latent mapping or K/V mirror grows); `HIPFIRE_GRAPH=0` is the per-launch eager control. A failed capture is an error, never a silent eager fallback. |
 | `HIPFIRE_GEMMA4_GRAPH` | Gemma4 per-model decode graph: `1` enables, `0` disables (kill switch). Hand carrier defaults on. Lowered carrier: this switch wins, then `HIPFIRE_GRAPH=0/1`, then the arch default, which is on for exact gfx1201 and off for every other arch (gfx1100, gfx1151, gfx1200, …). Lowered captures after one eager warm-up, stages position on-device before replay, and re-captures when KV/weight/scratch allocations or shapes change. Dense bodies and indexed MoE with HFQ4G128 expert down are admitted; CPU expert fallback and atomic Q8 expert down remain eager. |
 | `HIPFIRE_GRAPH_MOE` | MoE graph opt-in |
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
@@ -573,7 +573,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_TP_EXCHANGE` | **Developer-only A/B knob.** Format policy the dense Qwen3.5/3.6/3.8 TP row-parallel all-reduce exchanges between ranks (read once per process): unset or `auto` (default) takes `bf16` for every multi-row reduction (prefill, verify) at any TP degree and for single-row decode at TP>=3, and `f32` for single-row decode at TP2 (measured -1.4% with bf16 there); `bf16` forces bf16 everywhere and converts each rank's f32 partial to bf16 once, and every rank sums the rounded, rank-ordered partials in f32 into its f32 residual (`x + (r(p0) + r(p1) + …)`); `f16` does the same with IEEE half (a partial above 65,504 in magnitude becomes infinity: not guarded); `f32` forces the f32 exchange (`x + (p0 + p1 + …)`) everywhere. The residual stream stays f32. It covers the TP2 direct-peer read, the TP2 whole-token graph and the TP>2 rooted/all-pull folds of both the hand and the generic dense-TP routes (they stay byte-identical to each other), for peer-access transport between distinct devices with 2-4 ranks; host-staged transport, same-device emulation, EP and the no-target `AllReduce` stay f32. Numeric route, not byte-identical to `f32`: judged by KLD (see [multi-gpu.md](multi-gpu.md#dense-tp-partial-exchange-16-bit-developer)). An unrecognised value is reported and falls back to `f32`. The dense TP load log prints `[loader] dense qwen TP exchange=<mode>`. |
 | `HIPFIRE_DENSE_TP_ROUTE` | **Developer-only.** Which route `serve --tp N` loads for a dense Qwen3.5/3.6/3.8 model (`developer.dense_tp_route`; read at load): `auto` (default; also unset or empty) loads the generic mesh executor (`qwen35::mesh_tp`, every KV backend, AR decode and chunked prefill, peer or host-staged reduction chosen by byte qualification) whenever it admits the load, else the hand dense-TP route with the log line `[loader] dense qwen TP route=auto -> hand: <reason>` (`speculation.mtp = on`, or an uneven TP3/TP5 split); `mesh` forces the mesh route and refuses MTP and uneven splits; `hand` is the rollback to the hand route. Any other value is a load error. The mesh route builds no drafter and refuses sessions and prefix repair. See [multi-gpu.md](multi-gpu.md#generic-mesh-executor-tp-collectives-developer). |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
-| `HIPFIRE_PP_LAYERS` | Pipeline-parallel band layer counts: `a,b,…` lists the trunk layer count of each band in **logical band order** (the first count is band 0, the first layers; the last count is the last band; it is not the card order), `pp` entries, none zero, summing to the trunk layer count. Read once at admission; unset or empty gives the uniform split (remainder on the first bands). **Flash-Next/Qwen4** (`topology.pp` 2..=8) also needs band 0 to hold at least 2 layers (the PLE layer) and runs the last band on the output card, physical card 0; a bad list is refused naming `topology.pp` and `HIPFIRE_PP_LAYERS`. The generic Qwen3.5/3.6 route (`params.pp`) skips the uniform free-VRAM delta check when it is set. See [multi-gpu.md](multi-gpu.md#band-placement-hipfire_pp_layers). |
+| `HIPFIRE_PP_LAYERS` | Pipeline-parallel band layer counts: `a,b,…` lists the trunk layer count of each band in **logical band order** (the first count is band 0, the first layers; the last count is the last band; it is not the card order), `pp` entries, none zero, summing to the trunk layer count. Read once at admission; unset or empty gives the uniform split (remainder on the first bands). **Flash-Next/Qwen4** (`topology.pp` 2..=8) also needs band 0 to hold at least 2 layers (the PLE layer) and runs the last band on the output card, physical card 0; a bad list is refused naming `topology.pp` and `HIPFIRE_PP_LAYERS`. **Flash-Next/Qwen4 auto-fit:** with the list unset the load keeps the uniform split at the default prefill chunk whenever every card holds it; when a card is short it steps the chunk down (2048, 1024, 512, 256; only rungs below the default) to the largest chunk at which some split fits, takes the most balanced fitting split (lowest maximum required/free, ties to the split closest to uniform) and logs `qwen4 PP auto-fit: layers a,b chunk C (uniform u,v at chunk R short by X MiB on rank r)`. Setting the list pins the split and turns the search off entirely (a short card refuses exactly as before); an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` is never stepped down and only the split is searched. The chunk changes numerics, the split does not. The generic Qwen3.5/3.6 route (`params.pp`) skips the uniform free-VRAM delta check when it is set. See [multi-gpu.md](multi-gpu.md#band-placement-hipfire_pp_layers) and [Per-band memory budget](multi-gpu.md#per-band-memory-budget). |
 | `HIPFIRE_TOPOLOGY_PP` | Compat env for `topology.pp` (experimental; integer `1..=8`, default `1`): the pipeline degree `hipfire run`, `serve` and `bench` send as the load's `pp`. There is **no load-time `--pp` CLI flag** (`hipfire bench --pp` is the prompt-size list). An explicit `params.pp` above `1` on a daemon load wins and this value is not read; a request of `1` or none uses it. An invalid configured value is refused naming `1..=8` only when it is the value in effect. Flash-Next/Qwen4 admits `2..=8` with `tp = ep = 1` and host-staged edges; generic Qwen3.5/3.6 HFQ uses the same degree over peer memcpys. See [multi-gpu.md](multi-gpu.md#flash-next-pipeline-parallelism-host-staged). |
 | `HIPFIRE_MESH_TRANSPORT` | **Developer-only.** How the admitted pipeline mesh moves each band edge's HC streams; read once at admission, only for Flash-Next (Qwen4) `topology.pp` 2..=8: `auto` (default; also unset or empty), `host` or `peer`. `auto` and `host` are host-staged: two pinned host banks per edge, peer access is never enabled. The decision is per directed edge and made before any allocation or peer enable; there is no runtime fallback. `peer` needs pre-side-effect byte-qualification evidence for every edge; none exists yet, so `peer` is refused at admission naming `topology.pp`, and `auto` resolves to host-staged edges. Any other value is refused (`is not one of auto, peer, host`). The generic Qwen3.5/3.6 PP route does not read it: its band edges are peer memcpys. |
 | `HIPFIRE_PP_PFLASH` / `HIPFIRE_PP_DFLASH` | **Experimental, generic Qwen3.5/3.6 PP only** (`pp>1`; `HIPFIRE_PP_PFLASH` is deprecated with PFlash). `=1` makes the daemon accept a PFlash compose or a DFlash `draft` that it otherwise refuses with `pp>1` (DFlash: cross-card speculative generate is not fully implemented). Neither is an admission, and neither changes Flash-Next PP, which still refuses PFlash and DFlash. |
@@ -589,10 +589,17 @@ harness exports pending their cleanup.
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
 | `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
-Flash-Next/Qwen4 PP native MTP is greedy-only; sampled/penalized requests
-decode AR through the same PP mesh instead of failing the request. The route
-decision logs once per process. This does not change Single native-MTP
-sampling support or admit other speculative engines under PP.
+Flash-Next/Qwen4 PP native MTP serves greedy requests and sampled requests with
+the default Leviathan verify (`HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+and neutral penalties. Penalized requests (repeat/presence/frequency),
+sampled requests with `HIPFIRE_MTP_SAMPLED=0` (`speculation.mtp_sampled =
+false`, the kill switch) and sampled requests with
+`HIPFIRE_MTP_SAMPLED_MODE=naive` (draws from the process-wide AR sampler) decode
+AR through the same PP mesh instead of failing the request. The route decision
+logs once per process. The sampled-MTP chi-square oracle
+(`sampled_mtp_distribution_hw`) runs its short arms on a PP2 mesh with
+`HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` (test harness variable, with
+`HIPFIRE_PP_LAYERS`). This does not admit other speculative engines under PP.
 
 #### Logical GPU emulation (developer-only)
 
@@ -791,6 +798,20 @@ shapes before measurement.
 
 ---
 
+### Raon (Raon-1-mini-preview, developer)
+
+All developer-only, read once at load through the `[developer]` namespace (`hipfire_config::developer_var`); a malformed value is a named error, never a silent fallback.
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_RAON_PREFILL` | **`batched`**; `serial` | Prefill route (`crates/hipfire-arch-raon/src/bundle.rs`). `batched` is the product route (N rows per module call); `serial` (one `forward_token` per prompt token) is the explicit oracle/control. |
+| `HIPFIRE_RAON_PREFILL_PRECISION` | **`f16`**; `a8`, `a4` | Activation precision of batched qt44 projections (`bundle.rs`). `a8` admits only the int8-activation prefill GEMMs; `a4` the device's default symmetric IU4 route. Neither is bit-equivalent to `f16`; both stay opt-in. |
+| `HIPFIRE_RAON_ATTN_TILED` | **`1`**; `0` | MLA tiled causal prefill + split-KV decode kernels (`crates/hipfire-arch-raon/src/mla.rs`). `0` selects the serial reference kernel. |
+| `HIPFIRE_RAON_MLA_ABSORB` | **`1`**; `0` | Attend over the latent cache (absorbed algebra) once a context exceeds the expanded-mirror budget. Not bit-exact to the decompressed route (KLD matched). `0` refuses contexts past the budget. |
+| `HIPFIRE_RAON_MIRROR_Q8` | **`1`**; `0` | Allow the Q8 expanded MLA K_nope/V mirror (INT8 codes + one F16 scale per (row, head, plane): 72,800 B/token instead of 143,360). Capacity-based: the BF16 mirror is kept when its budget covers the whole reserved context (it is 1-2% faster); Q8 is used only when BF16 cannot cover it (a 20 GB card then keeps the fast route for about twice the rows before the absorbed route takes over). Tiled kernels only (forced off with `HIPFIRE_RAON_ATTN_TILED=0`). `0` always keeps the BF16 mirror (kill switch). |
+| `HIPFIRE_RAON_LM_HEAD` | **unset → Q8F16**; `qt44` | Quantizer only (`crates/hipfire-quantize/src/raon.rs`): `lm_head.weight` storage. `qt44` keeps the symmetric qt44 head (smaller artifact). |
+| `HIPFIRE_RAON_TOKENIZER` | unset → test skips | Test-only: HF `tokenizer.json` path (or its directory) for the `#[ignore]`d Raon tokenizer HF-parity check in `crates/hipfire-runtime/src/tokenizer.rs`; never read by runtime code. |
+
 ## Manual — tokenizer differential test (dev-only, not runtime)
 
 Read only by `crates/hipfire-runtime/tests/hf_tokenizer_differential.rs` (see [`CONTRIBUTING.md`](../CONTRIBUTING.md#tokenizer-differential-test-hf-oracle)); the pure-Rust HF `tokenizers` oracle is a `[dev-dependencies]` entry and never ships.
@@ -929,7 +950,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1835
+**Count:** 1843
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2158,7 +2179,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PP_GATE_TEST_NO_SYSFS` | scripts/pp-gate.sh | harness |
 | `HIPFIRE_PP_LANE_GROUPS` | crates/hipfire-arch-qwen4/src/bundle/pp_lanes.rs, crates/hipfire-arch-qwen4/src/lane/groups.rs | developer |
 | `HIPFIRE_PP_LANE_OVERLAP` | crates/hipfire-arch-qwen4/src/bundle/pp_lanes.rs | developer |
-| `HIPFIRE_PP_LAYERS` | crates/hipfire-arch-qwen4/src/admission.rs, crates/hipfire-loader/examples/fn_ep_oracle.rs | developer |
+| `HIPFIRE_PP_LAYERS` | crates/hipfire-arch-qwen4/src/admission.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | developer |
 | `HIPFIRE_PP_PARITY_MODEL` | crates/hipfire-arch-qwen35/tests/pp_parity.rs | harness |
 | `HIPFIRE_PP_PFLASH` | crates/hipfire-cli/src/fit/mod.rs, crates/hipfire-daemon/src/main.rs | deprecated |
 | `HIPFIRE_PP_RESET_MODEL` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
@@ -2212,7 +2233,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
 | `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/tests/fa_prep_parity.rs | developer |
-| `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernel_registry.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
+| `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernel_registry.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_QWEN35_FIXTURE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
 | `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-daemon/src/slots.rs, crates/hipfire-generate/src/ar.rs | developer |
@@ -2392,6 +2413,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | crates/rdna-compute/src/railgun_check.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_SHADOW` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/rdna-compute/src/railgun_check.rs | developer |
 | `HIPFIRE_RAILGUN_SHADOW_OUT` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
+| `HIPFIRE_RAON_ATTN_TILED` | crates/hipfire-arch-raon/src/mla.rs | developer |
+| `HIPFIRE_RAON_LM_HEAD` | crates/hipfire-quantize/src/raon.rs | developer |
+| `HIPFIRE_RAON_MIRROR_Q8` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-arch-raon/src/mla.rs | developer |
+| `HIPFIRE_RAON_MLA_ABSORB` | crates/hipfire-arch-raon/examples/raon_oracle/generate.rs, crates/hipfire-arch-raon/examples/raon_oracle/logits.rs | developer |
+| `HIPFIRE_RAON_PREFILL` | crates/hipfire-arch-raon/src/bundle.rs | developer |
+| `HIPFIRE_RAON_PREFILL_PRECISION` | crates/hipfire-arch-raon/src/bundle.rs | developer |
+| `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RDNA3` | crates/hipfire-runtime/examples/tmp_halo_iu4_calibrate.rs | harness |
@@ -2554,6 +2582,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_THINK_SEEDS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_THINK_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_TOPOLOGY` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_K` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TOP_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |

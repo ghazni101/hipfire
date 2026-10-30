@@ -32,7 +32,9 @@
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::lane::Qwen4LaneStore;
-use crate::lane::{LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState};
+use crate::lane::{
+    download_lane_rows, lane_sample_step, LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState,
+};
 use crate::lane_exec::{LaneDraft, LaneRoute};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
@@ -799,13 +801,20 @@ pub(crate) fn ar_synced_head(
 
 /// One prompt tile of a spec lane: the singleton `mtp_prefill` chunk body on
 /// the lane's own states. Returns the trunk pick when the tile asks for one
-/// (always on the prompt-completing tile).
+/// (always on the prompt-completing tile). On a sampled lane's
+/// prompt-completing tile the pick is the lane's first draw: one draw of its
+/// sampler (`LaneSampling`, the lane's own RNG) from the final-row logits the
+/// tile's forward left in row 0 of the bundle's spec logits, downloaded with
+/// one D2H into `sample_host`, exactly as the singleton draws its first
+/// token; the device argmax is returned for a greedy lane and for the tiles
+/// that do not complete the prompt.
 pub(crate) fn prefill_tile(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
     lane: &mut Qwen4LaneState,
     tokens: &[u32],
     append_scratch: Option<&mut MtpAppendScratch>,
+    sample_host: &mut Vec<f32>,
 ) -> Result<Option<u32>, String> {
     let Qwen4LaneState { host, state, spec } = lane;
     let spec = spec
@@ -830,7 +839,7 @@ pub(crate) fn prefill_tile(
         mtp_prefill_chunk_needs_pick(end, host.prompt.len(), mtp_skip_intermediate_pick_enabled());
     // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
-    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+    let pick = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
         b.poll_npu_trunk(gpu)?;
         let filled = mtp_prefill_chunk(
             b,
@@ -849,7 +858,25 @@ pub(crate) fn prefill_tile(
             std::ops::ControlFlow::Break(()) => unreachable!("a never-abort fill cannot break"),
         }
     }))
-    .map_err(|e| format!("prefill_tile: {e}"))
+    .map_err(|e| format!("prefill_tile: {e}"))?;
+    // A sampled lane's prompt-completing pick is a draw from the tile's final
+    // row (row 0 of the spec logits). Intermediate tiles' picks are never
+    // committed and must not advance the lane's RNG.
+    if let (Some(pick), true) = (pick, end == host.prompt.len()) {
+        let vocab = bundle.config.vocab_size;
+        let mut one = [pick];
+        let gpu_ref: &Gpu = gpu;
+        let bundle_ref: &Qwen4Bundle = bundle;
+        lane_sample_step(host, None, &mut one, 0, vocab, sample_host, |scratch| {
+            let row = bundle_ref
+                .spec_logits_rows(0, 1)
+                .map_err(|e| e.to_string())?;
+            download_lane_rows(gpu_ref, &row, 0, 1, vocab, scratch)
+        })
+        .map_err(|e| format!("prefill_tile: {e}"))?;
+        return Ok(Some(one[0]));
+    }
+    Ok(pick)
 }
 
 #[cfg(test)]

@@ -211,8 +211,10 @@ pub const QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201: usize = 4096;
 /// [`qwen4_prefill_chunk_requested`] for a pipeline-parallel band or mesh:
 /// an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins, else
 /// [`QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201`] on gfx1201, else the single-card
-/// default; never above `max_seq`. Every PP call site must use this so bands
-/// and the mesh agree on one chunk.
+/// default; never above `max_seq`. This is the REQUESTED chunk: the loader
+/// reads it once, the PP auto-fit (`admission::qwen4_pp_auto_fit`) may step it
+/// down to fit the cards, and the chosen chunk is what every band and the mesh
+/// then share (a band never re-derives it).
 pub fn qwen4_pp_prefill_chunk_requested(
     gpu: &Gpu,
     max_seq: usize,
@@ -227,6 +229,19 @@ pub fn qwen4_pp_prefill_chunk_requested(
         mode,
         || crate::host_link::host_link(gpu),
     )
+}
+
+/// Whether the operator pinned the prefill chunk (`HIPFIRE_PREFILL_CHUNK_ROWS`
+/// holds a value of at least one 256-row tile, the value
+/// [`qwen4_pp_prefill_chunk_requested`] returns first). The PP auto-fit never
+/// moves a pinned chunk, only the split.
+pub fn qwen4_prefill_chunk_rows_pinned() -> bool {
+    explicit_prefill_chunk_rows(
+        hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .is_some()
 }
 
 /// [`qwen4_pp_prefill_chunk_requested`] with the env value and host link supplied.

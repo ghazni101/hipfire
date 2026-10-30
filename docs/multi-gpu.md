@@ -748,7 +748,7 @@ string or a blanket “always refuse at load.”
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests, `HIPFIRE_MTP_SAMPLED=0` and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
@@ -816,6 +816,9 @@ cards and `HIPFIRE_EMULATE_GPUS` aliasing are refused.
   and a sum equal to the trunk's layer count (48 for Flash-Next).
 - Unset (or empty) gives the **uniform** split: `layers / N` per band, the
   remainder going to the first bands (`N = 5` on 48 layers: 10, 10, 10, 9, 9).
+  Flash-Next keeps it whenever every card holds it and otherwise
+  [auto-fits](#per-band-memory-budget) the split and the prefill chunk. A list
+  pins the split: it is never searched.
 - The PLE layer is layer 1, so **band 0 must hold at least 2 layers**; the same
   rule applies to a uniform split and to an explicit list.
 - Example for six 24 GB cards and the mq4-xts model: `9,8,8,8,8,7`, so card 0
@@ -890,9 +893,65 @@ that is short refuses the load, naming every failing rank and its shortfall:
 qwen4: pipeline parallelism (topology.pp = 6): band does not fit device memory: rank 3 (layers 25..33) needs … bytes (… weights + … F16 shadows + … QSA context + … state + … forward scratch + … native MTP + … reserve) but … bytes are free (short by …); rebalance HIPFIRE_PP_LAYERS or lower memory.max_seq (host-mapped band layers are not admitted)
 ```
 
-There is no spill to host-mapped experts: rebalance `HIPFIRE_PP_LAYERS` or lower
-`memory.max_seq`. The canonical prefill chunk is the same on every band; a band
-whose free VRAM cannot hold it refuses instead of shrinking it.
+There is no spill to host-mapped experts. The canonical prefill chunk is the
+same on every band, and a band whose free VRAM cannot hold it at attach
+refuses instead of shrinking it. What changes how a short card is handled is
+the auto-fit below.
+
+##### Auto-fit (`HIPFIRE_PP_LAYERS` and `HIPFIRE_PREFILL_CHUNK_ROWS` unset)
+
+With neither variable set, the load decides the split and the chunk once,
+before any allocation, with the same pure census as the refusal above:
+
+1. **The default wins when it fits.** The uniform split at the default chunk
+   (4096 rows on gfx1201) is taken whenever every card holds it; such a load
+   is unchanged and logs nothing extra.
+2. **Otherwise the chunk steps down.** The rungs are 2048, 1024, 512 and 256
+   rows, only those below the default chunk (and never above `memory.max_seq`).
+   The **largest** chunk at which some split fits wins. At each rung every
+   split with at least 2 layers in band 0 is tried for `pp = 2`; for `pp > 2` a
+   deterministic steepest-descent walk starts at the uniform split and moves
+   one layer at a time between any two bands.
+3. **The most balanced fitting split at that chunk is taken:** the lowest
+   maximum of `required / free` over the cards; a tie goes to the split closest
+   to uniform, then to larger earlier bands.
+4. **One log line** states the move, ahead of the usual per-rank
+   `need … MiB of … MiB free` lines:
+
+   ```text
+   qwen4 PP auto-fit: layers 25,23 chunk 1024 (uniform 24,24 at chunk 4096 short by 1754 MiB on rank 1)
+   ```
+
+5. **If nothing fits** the refusal above is raised for the nearest candidate
+   and ends its text with the search: `auto-fit searched chunk rows … none fits;
+   the nearest, layers … at chunk …, is short by … MiB on rank …`.
+
+**Pin it.** `HIPFIRE_PP_LAYERS=a,b,…` turns the search off entirely: the split
+and the default chunk are used as given and a short card refuses exactly as
+before. `HIPFIRE_PREFILL_CHUNK_ROWS=N` keeps the chunk (it is never stepped
+down) and only the split is searched.
+
+**What it changes in the output.** The chunk changes numerics: output equals a
+single-card run at the same chunk (see [What runs](#what-runs)), so a load the
+auto-fit stepped down to chunk 1024 equals a single card at
+`HIPFIRE_PREFILL_CHUNK_ROWS=1024`, not the 4096 default; pin the same chunk on
+both sides to compare. The split does not: a cut-safe band split is designed
+to equal one uncut card byte for byte and the PP gate checks it (the
+`--ref-ranks` row of the [`fn-ep-gate` options](#qualify-a-box-fn-ep-gate-mode-pp)).
+Both statements are the existing documented claims; this page records no
+measurement of the auto-fit's own output.
+
+**Worked example (arithmetic from measured loads, not a new measurement).**
+Flash-Next `mq3-xts` (59.25 GB) on 2× R9700 with 32,550 MiB free per card at
+`memory.max_seq` 16,384: uniform 24,24 at chunk 4096 needs 35.97 GB on rank 1
+(30.87 weights, 0.62 F16 shadows, 0.16 QSA context, 0.03 state, 1.18 forward
+scratch, 0.93 native MTP, 2.18 reserve), 1.84 GB short; rank 0 fits. No split
+fits at 4096 or 2048 rows; at 1024 rows exactly 25,23 fits (the hand-tuned
+split, rank 0 32,476 MiB, rank 1 32,377 MiB including 755 MiB of MTP). The
+auto-fit therefore picks `25,23` at chunk 1024 with no environment variables.
+A 64K context (`memory.max_seq` 66,048) needed chunk 256 in the measured
+hand-tuned load; the auto-fit walks the same ladder and, from that
+measurement, is expected to land on `25,23` at chunk 256.
 
 #### What runs
 
@@ -902,7 +961,10 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
   rows** (a single card stays at 16384 rows under the compact plan), so a 32K
   prompt is eight chunks in flight instead of two or three and the band pipeline
   fills. An explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins (`=16384` restores the
-  previous chunk); the bands and the mesh planner share one chunk. Output equals a
+  previous chunk); the bands and the mesh planner share one chunk, the default
+  chunk when every card holds it and otherwise the one the
+  [auto-fit](#auto-fit-hipfire_pp_layers-and-hipfire_prefill_chunk_rows-unset)
+  chose. Output equals a
   single-card run at the same chunk. Decode is unchanged (~54 tok/s). Measured
   2026-10-28, 4x R9700 (PP4), packed mq4-xts, beta c7c44097cc + explicit chunk
   env, greedy, one fresh process per arm:
@@ -923,17 +985,29 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
   reusable under PP. The single-card resident tail/lineage snapshot is not shared
   across bands, so a prompt shorter than 4,096 tokens is always prefilled cold and
   a longer one reuses at most its last 4,096-token boundary.
-- **Greedy native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
+- **Native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
   `auto` and `off` stay AR under PP. The output band drafts, samples and decides;
   every band runs the same verify block `[seed, drafts...]`, partial rejections
   are repaired per band, and the output band finishes the head. Its exactness
   contract is the single-card native-MTP result (tokens, window records, canonical
   state including the MTP head); qualify each hardware cell with `--mtp` in the gate below.
-- **Sampled or penalized requests decode AR** on the mesh, not MTP. MTP sessions
-  are not distributed: a native-MTP request on the mesh never reuses a session
-  snapshot and publishes none. A speculative request that still reaches the mesh
-  with DFlash/DSpark/n-gram/DDTree, a sampled temperature, KV eviction or a
-  checkpoint resume is refused before any state changes.
+- **Sampled native MTP (Leviathan) with neutral penalties** runs on the mesh with
+  the same route as greedy MTP: temperature > 0 requests (the default
+  `speculation.mtp_sampled`, `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+  draft from the head's re-scored candidates, verify through the same
+  `[seed, drafts...]` block and accept by speculative rejection sampling, so the
+  emitted stream equals PP AR in distribution (not bit-for-bit; the sampled-MTP
+  chi-square oracle `sampled_mtp_distribution_hw` runs it with
+  `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`). Every draft and target-row read goes
+  through the output band's device. **Penalized sampled requests**
+  (repeat/presence/frequency), `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
+  from the process-wide AR sampler) and `HIPFIRE_MTP_SAMPLED=0`
+  (`speculation.mtp_sampled = false`, the kill switch) decode **AR** on the mesh
+  instead of failing, as do penalized greedy requests. MTP sessions are not
+  distributed: a native-MTP request on the mesh never reuses a session snapshot
+  and publishes none. A speculative request that still reaches the mesh with
+  DFlash/DSpark/n-gram/DDTree, KV eviction or a checkpoint resume is refused
+  before any state changes.
 
 #### Refusals
 

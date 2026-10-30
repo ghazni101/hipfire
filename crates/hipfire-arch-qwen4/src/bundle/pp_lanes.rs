@@ -25,13 +25,22 @@
 //! tiles through [`Qwen4Bundle::pp_lane_prefill_tile_detached`]. On any
 //! failure every plan participant is poisoned on every band and the phase
 //! returns to idle; a device or transport failure quarantines the mesh.
+//!
+//! Sampled lanes ([`crate::lane::LaneSampling`], set on every band's host copy
+//! by [`Qwen4Bundle::pp_set_lane_sampling`]) draw on the output band only,
+//! where the logits are: after the decode wavefront's final sync (both the
+//! overlapped and the sequential walk) each sampled AR lane downloads its
+//! logits row (one D2H) and its pick becomes one draw of the AR singleton's
+//! sampler against the lane's own RNG; a sampled lane's prompt-completing
+//! tile likewise draws from its final row. Greedy lanes and greedy steps are
+//! unchanged (no extra D2H).
 
 use super::*;
 use crate::bundle::Qwen4Bundle;
 use crate::gpu_forward_lanes::{
     forward_lanes, forward_lanes_edge, lane_stream_bf16, LaneOutputs, LaneRowKind, LaneRows,
 };
-use crate::lane::{LaneStatus, Qwen4LaneStore};
+use crate::lane::{download_lane_rows, lane_sample_step, LaneStatus, Qwen4LaneStore};
 use crate::lane_exec::{
     commit_host, pick_at, validate_plan, view_of, wants_pick, LaneDraft, LanePhase, LaneRoute,
     PlanLimits, StepKey,
@@ -609,7 +618,7 @@ fn forward_inner(
     }
 
     // Prefill tiles on the singleton PP route, every store attached.
-    let mut final_tiles: Vec<(usize, usize)> = Vec::new();
+    let mut final_tiles: Vec<(usize, usize, RequestEpoch)> = Vec::new();
     for (ordinal, r) in plan
         .requests
         .iter()
@@ -653,7 +662,7 @@ fn forward_inner(
         // A fatal tile failure already quarantined the mesh itself.
         result.map_err(|e| StepFailure::new(e, false))?;
         if completes {
-            final_tiles.push((ordinal, r.rows.end() - 1));
+            final_tiles.push((ordinal, r.rows.end() - 1, r.epoch));
         }
     }
     if !final_tiles.is_empty() {
@@ -662,17 +671,55 @@ fn forward_inner(
         let fetched = (|| -> Result<(), String> {
             gpu.bind_thread().map_err(|e| e.to_string())?;
             let store = root.lanes.as_mut().ok_or_else(not_staged)?;
-            let parts = store.step_parts(&[])?;
-            let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
-            if used > parts.top1_host.len() {
-                return Err("the prompt-completing rows exceed the host mirror".to_string());
+            {
+                let parts = store.step_parts(&[])?;
+                let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
+                if used > parts.top1_host.len() {
+                    return Err("the prompt-completing rows exceed the host mirror".to_string());
+                }
+                gpu.hip
+                    .memcpy_dtoh(&mut parts.top1_host[..used], &parts.top1.buf)
+                    .map_err(|e| e.to_string())?;
+                gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+                for &(ordinal, row, _) in &final_tiles {
+                    picks[row] = pick_at(parts.top1_host, rows_cap + ordinal);
+                }
             }
-            gpu.hip
-                .memcpy_dtoh(&mut parts.top1_host[..used], &parts.top1.buf)
-                .map_err(|e| e.to_string())?;
-            gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-            for &(ordinal, row) in &final_tiles {
-                picks[row] = pick_at(parts.top1_host, rows_cap + ordinal);
+            // A sampled lane's prompt-completing pick is its first draw, from
+            // the tile's final logits row on the output band (one D2H per
+            // sampled lane); greedy lanes keep the argmax.
+            for &(ordinal, row, epoch) in &final_tiles {
+                if !store
+                    .lane(&epoch)
+                    .is_some_and(|lane| lane.host.sampling.is_some())
+                {
+                    continue;
+                }
+                let crate::lane::StepParts {
+                    lanes,
+                    logits,
+                    sample_host,
+                    ..
+                } = store.step_parts(&[epoch])?;
+                let lane = lanes
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("sampled lane {epoch:?} vanished"))?;
+                let mut one = [picks[row]];
+                let gpu_ref: &Gpu = gpu;
+                lane_sample_step(
+                    &mut lane.host,
+                    None,
+                    &mut one,
+                    0,
+                    vocab,
+                    sample_host,
+                    |scratch| {
+                        download_lane_rows(gpu_ref, logits, rows_cap + ordinal, 1, vocab, scratch)
+                    },
+                )
+                .map_err(|e| format!("lane {epoch:?}: {e}"))?;
+                picks[row] = one[0];
             }
             Ok(())
         })();
@@ -690,6 +737,53 @@ struct DecodeCall<'p> {
     vocab: usize,
     /// Live edge payload bytes (`n_dec` rows of HC streams).
     bytes: usize,
+}
+
+/// The sampled lanes of a PP decode step, on the output band's store: each
+/// sampled AR lane's pick becomes one draw of its sampler from its logits
+/// row (one D2H per sampled lane, after the step's own sync), in place of the
+/// device argmax. A step with no sampled lane returns before touching
+/// anything, so a greedy step issues exactly the work it did before.
+fn sample_decode_lanes(
+    gpu: &Gpu,
+    store: &mut Qwen4LaneStore,
+    call: &DecodeCall<'_>,
+    picks: &mut [u32],
+) -> Result<(), StepFailure> {
+    if !call.epochs.iter().any(|epoch| {
+        store
+            .lane(epoch)
+            .is_some_and(|lane| lane.host.sampling.is_some())
+    }) {
+        return Ok(());
+    }
+    let crate::lane::StepParts {
+        lanes,
+        logits,
+        sample_host,
+        ..
+    } = store
+        .step_parts(call.epochs)
+        .map_err(|e| StepFailure::new(e, true))?;
+    let mut first = 0usize;
+    for (lane, r) in lanes.into_iter().zip(call.decode) {
+        if lane.host.sampling.is_some() {
+            let mut one = [picks[r.rows.begin]];
+            lane_sample_step(
+                &mut lane.host,
+                None,
+                &mut one,
+                0,
+                call.vocab,
+                sample_host,
+                |scratch| download_lane_rows(gpu, logits, first, 1, call.vocab, scratch),
+            )
+            .map_err(|e| StepFailure::new(format!("lane {:?}: {e}", r.epoch), true))?;
+            picks[r.rows.begin] = one[0];
+        }
+        first += r.rows.len;
+    }
+    Ok(())
 }
 
 /// The sequential kill-switch route; errors after the first launch are fatal.
@@ -779,6 +873,7 @@ fn decode_run_sequential(
                 }
                 first += r.rows.len;
             }
+            sample_decode_lanes(&*gpu, &mut stores[index], call, picks)?;
         } else {
             let lanes = stores[index]
                 .band_lanes_mut(epochs)
@@ -1117,6 +1212,7 @@ fn decode_run_overlap(
         }
         first += r.rows.len;
     }
+    sample_decode_lanes(&gpus.devices[output], &mut stores[output], call, picks)?;
     stores[output].observe_decode_groups(stages, lane_rows(), batches.len(), wall_us);
     Ok(())
 }
@@ -1335,6 +1431,48 @@ impl Qwen4Bundle {
             }
         }
         if let Err(error) = self.pp_host_each_band(|band| band.force_lane_seed(epoch, token)) {
+            // A partial application cannot be trusted: poison the lane everywhere.
+            self.pp_poison_lane(gpus, epoch);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// [`Self::set_lanes_sampled`] on every band's store (root included).
+    /// Host only; an unattached or unstaged band is skipped by the store
+    /// call, a missing mesh is logged.
+    pub(crate) fn pp_set_lanes_sampled(&mut self, on: bool) {
+        let set = self.pp_host_each_band(|band| {
+            band.set_lanes_sampled_local(on);
+            Ok(())
+        });
+        if let Err(error) = set {
+            eprintln!("  qwen4 topology.pp: set_lanes_sampled: {error}");
+        }
+    }
+
+    /// Make `epoch`'s lane a sampled lane on every band (host only). Every
+    /// band is checked first (staged sampled, idle, lane Prefilling with
+    /// nothing prefilled), so a refusal changes nothing. Only the output band
+    /// draws (its lane's RNG advances; the picks are produced where the
+    /// logits are), but every band's host copy carries the sampler, so the
+    /// bands' lane hosts never diverge.
+    pub fn pp_set_lane_sampling(
+        &mut self,
+        gpus: &mut Gpus,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+        sampling: crate::lane::LaneSampling,
+    ) -> Result<(), BundleError> {
+        self.pp_require_ready(gpus)?;
+        let mesh = self.pp.as_ref().expect("checked by pp_require_ready");
+        for (index, band) in bands_ref(&*self, mesh).enumerate() {
+            band.lanes
+                .as_ref()
+                .ok_or_else(|| pp_error(format!("band {index}: lanes are not staged")))?
+                .check_lane_sampling(epoch, &sampling)
+                .map_err(|e| pp_error(format!("band {index}: {e}")))?;
+        }
+        if let Err(error) = self.pp_host_each_band(|band| band.set_lane_sampling(epoch, sampling)) {
             // A partial application cannot be trusted: poison the lane everywhere.
             self.pp_poison_lane(gpus, epoch);
             return Err(error);

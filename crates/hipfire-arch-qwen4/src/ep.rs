@@ -2031,6 +2031,52 @@ impl Qwen4Bundle {
         .map_err(BundleError::Forward)
     }
 
+    /// [`Self::set_lanes_sampled`] on every rank's store (host only). Returns
+    /// nothing: a mesh failure or disagreement is logged (the mesh is
+    /// poisoned and the next replicated call reports it).
+    pub(crate) fn ep_set_lanes_sampled(&mut self, on: bool) {
+        let set = self.ep_lane_soft(
+            "set_lanes_sampled",
+            |bundle| {
+                bundle.set_lanes_sampled(on);
+                Ok(())
+            },
+            &|bundle, _, _| {
+                bundle.set_lanes_sampled(on);
+                Ok(())
+            },
+        );
+        if let Err(error) = set {
+            eprintln!("  qwen4 EP: set_lanes_sampled: {error}");
+        }
+    }
+
+    /// [`Self::set_lane_sampling`] on every rank: each rank's lane copy gets
+    /// the same sampler and the same RNG seed, and draws from its own state
+    /// in lockstep, so the ranks' host results (picks, advances) agree as
+    /// greedy picks do (`ep_lane_strict` compares them at `forward_step`). A
+    /// refusal every rank reports identically leaves the mesh usable.
+    pub(crate) fn ep_set_lane_sampling(
+        &mut self,
+        epoch: &RequestEpoch,
+        sampling: crate::lane::LaneSampling,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "set_lane_sampling",
+            |bundle| {
+                bundle
+                    .set_lane_sampling(epoch, sampling)
+                    .map_err(bundle_text)
+            },
+            &|bundle, _, _| {
+                bundle
+                    .set_lane_sampling(epoch, sampling)
+                    .map_err(bundle_text)
+            },
+        )
+        .map_err(BundleError::Forward)
+    }
+
     pub(crate) fn ep_abort_promotion(&mut self, epoch: &RequestEpoch) -> Result<(), BundleError> {
         self.ep_lane_soft(
             "abort_promotion",

@@ -4327,6 +4327,8 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.active_stream.as_ref());
         let result: HipResult<()> = if record
             || observe
             || self.graphs.capture_mode
@@ -4407,6 +4409,9 @@ impl Gpu {
                 )
             }
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.active_stream.as_ref());
+        }
         if result.is_ok() {
             #[cfg(feature = "lab")]
             if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
@@ -4562,10 +4567,15 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.stream_ref());
         let result = unsafe {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.stream_ref());
+        }
         #[cfg(feature = "lab")]
         if result.is_ok() {
             self.lab_kernel_fault.launched_successfully();
@@ -4639,6 +4649,8 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.stream_ref());
         let result = if self.graphs.capture_mode {
             // Retain the exact bytes for graph instantiation: HIP records the
             // blob pointer, so graph-owned storage must outlive the capture.
@@ -4683,6 +4695,9 @@ impl Gpu {
                 )
             }
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.stream_ref());
+        }
         if result.is_ok() {
             #[cfg(feature = "lab")]
             if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {

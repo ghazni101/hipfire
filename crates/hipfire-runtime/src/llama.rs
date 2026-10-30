@@ -7930,6 +7930,32 @@ pub fn sample_top_k_p(
     top_k: Option<u32>,
     min_p: Option<f32>,
 ) -> u32 {
+    use std::sync::atomic::Ordering;
+    let mut state = SAMPLER_STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        state = time_seed_rng_state();
+    }
+    let token = sample_top_k_p_with_state(logits, temperature, top_p, top_k, min_p, &mut state);
+    SAMPLER_STATE.store(state, Ordering::Relaxed);
+    token
+}
+
+/// [`sample_top_k_p`] against an explicit xorshift32 `state` instead of the
+/// process-global `SAMPLER_STATE`. Identical arithmetic and identical RNG
+/// draw order, so with `*state` equal to the global state it returns the same
+/// token and leaves `*state` equal to the global state `sample_top_k_p` would
+/// have stored. `*state` must be nonzero (the global path's time-seed-on-0 is
+/// not applied here; a zero state is a fixed point of xorshift32). Lets
+/// concurrent per-lane / per-rank samplers reproduce the singleton's stream
+/// without touching the shared global.
+pub fn sample_top_k_p_with_state(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    state: &mut u32,
+) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
     }
@@ -7944,9 +7970,17 @@ pub fn sample_top_k_p(
             top_p,
             CPU_SAMPLE_LEGACY_POOL,
             min_p,
+            state,
         ),
         Some(k) if (1..=CPU_SAMPLE_LEGACY_POOL as u32).contains(&k) => {
-            sample_pool::<CPU_SAMPLE_LEGACY_POOL>(logits, temperature, top_p, k as usize, min_p)
+            sample_pool::<CPU_SAMPLE_LEGACY_POOL>(
+                logits,
+                temperature,
+                top_p,
+                k as usize,
+                min_p,
+                state,
+            )
         }
         Some(k) => {
             let cap = if k == 0 {
@@ -7954,7 +7988,7 @@ pub fn sample_top_k_p(
             } else {
                 (k as usize).min(CPU_SAMPLE_WIDE_POOL)
             };
-            sample_pool::<CPU_SAMPLE_WIDE_POOL>(logits, temperature, top_p, cap, min_p)
+            sample_pool::<CPU_SAMPLE_WIDE_POOL>(logits, temperature, top_p, cap, min_p, state)
         }
     }
 }
@@ -8027,6 +8061,7 @@ fn sample_pool<const N: usize>(
     top_p: f32,
     cap: usize,
     min_p: f32,
+    state: &mut u32,
 ) -> u32 {
     let top_p = top_p.clamp(0.0, 1.0);
     let inv_temp = 1.0 / temperature;
@@ -8097,7 +8132,7 @@ fn sample_pool<const N: usize>(
     let order = &order[..cap];
 
     // Top-p filtering + sampling in one pass
-    let r = simple_rand() * sum; // pre-scale by total sum
+    let r = xorshift32_unit(state) * sum; // pre-scale by total sum
     let mut cumulative = 0.0f32;
     let mut sample_acc = 0.0f32;
     let threshold = top_p * sum;
@@ -8109,7 +8144,7 @@ fn sample_pool<const N: usize>(
         }
         if cumulative >= threshold {
             // Past top_p — sample from what we have
-            let r2 = simple_rand() * cumulative;
+            let r2 = xorshift32_unit(state) * cumulative;
             let mut acc2 = 0.0f32;
             for &k2 in order {
                 acc2 += probs[k2];
@@ -8498,6 +8533,34 @@ pub(crate) fn sampler_rng_test_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// One xorshift32 step on `state`, mapped to `[0, 1]`. The single RNG
+/// definition shared by the global sampler ([`simple_rand`]) and the explicit-
+/// state sampler ([`sample_top_k_p_with_state`]).
+#[inline]
+fn xorshift32_unit(state: &mut u32) -> f32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    *state = s;
+    (s as f32) / (u32::MAX as f32)
+}
+
+/// Seed for a zero `SAMPLER_STATE`: sub-second nanoseconds of the wall clock
+/// (never 0). Only the global path time-seeds; explicit-state callers own a
+/// nonzero state.
+fn time_seed_rng_state() -> u32 {
+    let s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    if s == 0 {
+        1
+    } else {
+        s
+    }
+}
+
 /// Simple deterministic-seeded RNG (xorshift32). Not crypto-quality, fine for sampling.
 /// State lives in SAMPLER_STATE so that HIPFIRE_SAMPLE_COMPARE can snapshot/restore it.
 fn simple_rand() -> f32 {
@@ -8506,20 +8569,11 @@ fn simple_rand() -> f32 {
     // Seed from time on first call
     let mut s = SAMPLER_STATE.load(Ordering::Relaxed);
     if s == 0 {
-        s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        if s == 0 {
-            s = 1;
-        }
+        s = time_seed_rng_state();
     }
-    // xorshift32
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
+    let r = xorshift32_unit(&mut s);
     SAMPLER_STATE.store(s, Ordering::Relaxed);
-    (s as f32) / (u32::MAX as f32)
+    r
 }
 
 #[cfg(test)]
@@ -9541,5 +9595,97 @@ mod tests {
         assert_eq!(drawn(&logits, Some(1), Some(0.5), 64), vec![0]);
         // min_p=1 keeps only the peak.
         assert_eq!(drawn(&logits, None, Some(1.0), 64), vec![0]);
+    }
+
+    /// `sample_top_k_p_with_state` is the global-RNG `sample_top_k_p` with the
+    /// RNG made explicit: same token and same final xorshift state for every
+    /// row/seed/top_k/min_p/temperature, including ties, NaN and -inf logits.
+    #[test]
+    fn sample_top_k_p_with_state_matches_global_path() {
+        let _g = sampler_rng_test_guard();
+        let saved = sampler_rng_snapshot();
+
+        fn next(s: &mut u32) -> u32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        }
+        fn make_row(rg: &mut u32, vocab: usize, variant: usize) -> Vec<f32> {
+            let mut row: Vec<f32> = (0..vocab)
+                .map(|_| (next(rg) % 16_000) as f32 / 1000.0 - 8.0)
+                .collect();
+            if variant % 4 == 1 {
+                // Heavy ties: quantize to half-integers.
+                for v in row.iter_mut() {
+                    *v = (*v * 2.0).round() / 2.0;
+                }
+            }
+            if variant % 3 == 1 {
+                for _ in 0..(vocab / 50).max(3) {
+                    let i = next(rg) as usize % vocab;
+                    row[i] = f32::NEG_INFINITY;
+                }
+            }
+            if variant % 5 == 2 {
+                for _ in 0..(vocab / 100).max(2) {
+                    let i = next(rg) as usize % vocab;
+                    row[i] = f32::NAN;
+                }
+            }
+            row
+        }
+
+        let mut rg = 0x9e37_79b9u32;
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for v in 0..200 {
+            rows.push(make_row(&mut rg, 1000, v));
+        }
+        for v in 0..8 {
+            rows.push(make_row(&mut rg, 248_320, v));
+        }
+        assert!(rows.len() >= 200);
+
+        let mut cases = 0usize;
+        for row in &rows {
+            // The 248k-like rows take two seeds and one draw (their gather
+            // dominates the cost); the 1000-wide rows three seeds and two
+            // chained draws (the state must carry through).
+            let wide = row.len() > 1000;
+            let seeds: &[u32] = if wide {
+                &[1, 0xdead_beef]
+            } else {
+                &[1, 0x1234_5678, 0xdead_beef]
+            };
+            for &seed in seeds {
+                for top_k in [None, Some(20u32), Some(40), Some(0), Some(100)] {
+                    for min_p in [None, Some(0.05f32)] {
+                        for temp in [0.3f32, 0.7, 1.0] {
+                            reset_cpu_sampler_rng(seed);
+                            let mut state = seed;
+                            let draws = if wide { 1 } else { 2 };
+                            for _ in 0..draws {
+                                let g = sample_top_k_p(row, temp, 0.95, top_k, min_p);
+                                let w = sample_top_k_p_with_state(
+                                    row, temp, 0.95, top_k, min_p, &mut state,
+                                );
+                                assert_eq!(
+                                    g, w,
+                                    "token seed={seed} top_k={top_k:?} min_p={min_p:?} temp={temp}"
+                                );
+                                assert_eq!(
+                                    sampler_rng_snapshot(),
+                                    state,
+                                    "state seed={seed} top_k={top_k:?} min_p={min_p:?} temp={temp}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases >= 200 * 3 * 5 * 2 * 3 * 2);
+        sampler_rng_restore(saved);
     }
 }

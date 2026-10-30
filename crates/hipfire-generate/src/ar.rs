@@ -851,6 +851,7 @@ pub enum GenerationRoute {
     MiniMaxSpec,
     LfmAr,
     LfmSpec,
+    RaonAr,
     LlamaAr,
     LlamaSpec,
     GlimmerAr,
@@ -882,6 +883,7 @@ impl GenerationRoute {
         Self::MiniMaxSpec,
         Self::LfmAr,
         Self::LfmSpec,
+        Self::RaonAr,
         Self::LlamaAr,
         Self::LlamaSpec,
         Self::GlimmerAr,
@@ -893,7 +895,8 @@ impl GenerationRoute {
 
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
-    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4.
+    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4, Raon AR
+    /// (`generate_raon`: shared `QwenArSemanticProducer` XML tool router).
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -932,6 +935,7 @@ impl GenerationRoute {
                 | Self::GlimmerAr
                 | Self::GlimmerSpec
                 | Self::MapleAr
+                | Self::RaonAr
                 | Self::Gemma4Ar
         )
     }
@@ -941,12 +945,13 @@ impl GenerationRoute {
     /// DFlash/MTP via `Qwen35Emit`) and Qwen4 (AR via
     /// `generate_ar_with_forward`'s `QwenArSemanticProducer`, native MTP via
     /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
-    /// stop prefix back, and never emits the stop text. Every other route
+    /// stop prefix back, and never emits the stop text. `RaonAr` rides the
+    /// same `generate_ar_with_forward` producer as Qwen4 AR. Every other route
     /// would ignore `stop` or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
         matches!(
             self,
-            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash
+            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash | Self::RaonAr
         )
     }
 
@@ -982,6 +987,7 @@ impl GenerationRoute {
             Self::LfmAr => "lfm_ar",
             Self::LfmSpec => "lfm_spec",
             Self::LlamaAr => "llama_ar",
+            Self::RaonAr => "raon_ar",
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
@@ -1358,6 +1364,7 @@ define_route_start!(minimax_ep_route_start, 10);
 define_route_start!(minimax_spec_route_start, 10);
 define_route_start!(lfm_ar_route_start, 11);
 define_route_start!(lfm_spec_route_start, 11);
+define_route_start!(raon_ar_route_start, 19);
 define_route_start!(llama_ar_route_start, 0);
 define_route_start!(llama_spec_route_start, 0);
 define_route_start!(glimmer_ar_route_start, 14);
@@ -1388,6 +1395,7 @@ define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
 define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
 define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
 define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
+define_route_terminal!(raon_ar_route_terminal, GenerationRoute::RaonAr);
 define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
@@ -1493,6 +1501,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: lfm_spec_route_start,
             terminal: lfm_spec_route_terminal,
+        },
+        GenerationRoute::RaonAr => GenerationRouteAdapter {
+            route,
+            start: raon_ar_route_start,
+            terminal: raon_ar_route_terminal,
         },
         GenerationRoute::LlamaAr => GenerationRouteAdapter {
             route,
@@ -1745,11 +1758,16 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // penalized sampled request keeps the MTP route. A penalized
             // greedy request, adaptive KV, or a force-AR switch keeps the
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
-            // Qwen4 PP uses the same native driver for greedy, unpenalized
-            // requests. Sampled or penalized requests explicitly keep the PP
-            // AR producer; they never enter the Qwen3.5-only PP route.
-            let mtp_ok = (i.pp <= 1 || (i.temp <= 1e-6 && !i.nonneutral_penalties))
-                && i.speculator_is_mtp
+            // Qwen4 PP uses the same native driver for greedy requests and
+            // for unpenalized sampled Leviathan requests (distribution-exact;
+            // `supports_temp_swor` is false for `speculation.mtp_sampled = 0`
+            // and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws
+            // come from the process-wide sampler: those stay on the PP AR
+            // producer). Penalized requests stay on the PP AR producer too:
+            // the GPU penalty prepass refuses the mesh. Neither enters the
+            // Qwen3.5-only PP route.
+            let mtp_ok = i.speculator_is_mtp
+                && (i.pp <= 1 || !i.nonneutral_penalties)
                 && (i.temp <= 1e-6 || i.supports_temp_swor)
                 && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
             // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
@@ -1812,6 +1830,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
+        // Raon-1-mini (arch 19). Single-GPU AR only: the carrier declares no
+        // speculator, no PP/TP/EP and no continuous batching, so a speculator
+        // can never change this route.
+        19 => return GenerationRoute::RaonAr,
         // Gemma 4. One route: the EAGLE speculator is a developer opt-in
         // (`HIPFIRE_GEMMA4_EAGLE=1`) decided inside `generate_gemma4` after
         // tokenization, and it never takes a tools request, so a tool turn is
@@ -1930,7 +1952,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     route: GenerationRoute,
     prompt_tokens: &[u32],
     vocab_size: usize,
-    eos_token: u32,
+    // Ids that end the turn (`generation_config.eos_token_id`); any match
+    // stops decode like the filter's `<|im_end|>`/`<|endoftext|>` markers.
+    eos_tokens: &[u32],
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
@@ -1952,6 +1976,11 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // `m.conversation_tokens`, bit-identical to `sampler::sample_cpu`'s
     // penalty stage: a penalized greedy request keeps the GPU argmax route.
     decode_penalizes: bool,
+    // Presence/frequency/repeat penalties see only the tokens this request
+    // generated (`streamed_tokens`), not the rendered prompt carried in
+    // `m.conversation_tokens` (Raon's generation_config contract). `false`
+    // keeps the prompt-inclusive history every other AR route uses.
+    penalty_generated_only: bool,
     mut forward_chunk: Prefill,
     mut forward_token: Decode,
     // Runs once after the client committed the terminal, before `done`.
@@ -2083,7 +2112,11 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // forward takes it from the GPU argmax of `decode_logits`.
     let mut pending = Some(sampler::sample_cpu(
         &mut logits,
-        &m.conversation_tokens,
+        if penalty_generated_only {
+            &[][..]
+        } else {
+            &m.conversation_tokens[..]
+        },
         &sampler_config,
     ));
     // `sample_cpu` reduces to `llama::argmax` here (after its penalty stage,
@@ -2263,7 +2296,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         generated += 1;
         // `filter_stop` also latches on a user stop-sequence match.
         if filter_stop
-            || next_token == eos_token
+            || eos_tokens.contains(&next_token)
             || m.tokenizer
                 .as_ref()
                 .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))
@@ -2325,7 +2358,11 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         logits = next_logits;
         pending = Some(sampler::sample_cpu(
             &mut logits,
-            &m.conversation_tokens,
+            if penalty_generated_only {
+                &streamed_tokens[..]
+            } else {
+                &m.conversation_tokens[..]
+            },
             &sampler_config,
         ));
     }
@@ -2496,10 +2533,20 @@ pub fn generate(
         .as_ref()
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
-    let supports_temp_swor = m
-        .speculator
-        .as_ref()
-        .is_some_and(|s| s.supports_temp_verify());
+    // Under PP the native drafter's naive sampled mode (SpecInfer draws from the
+    // process-wide AR sampler RNG, not band-deterministic) is refused by the
+    // mesh driver, so it must not advertise sampled verification to the
+    // selector: such requests decode on the PP AR producer instead.
+    let pp_naive_sampled_mtp = m.pp > 1
+        && m.speculator
+            .as_mut()
+            .and_then(|s| s.drafter_any_mut())
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .is_some_and(|drafter| drafter.sampled_mode_is_naive());
+    let supports_temp_swor = !pp_naive_sampled_mtp
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_temp_verify());
     let supports_chain_nucleus_verify = m
         .speculator
         .as_ref()
@@ -2547,7 +2594,9 @@ pub fn generate(
             std::sync::atomic::AtomicBool::new(false);
         if !QWEN4_PP_MTP_AR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
-                "[hipfire] PP native MTP is greedy-only; sampled/penalized requests decode AR"
+                "[hipfire] PP native MTP: penalized requests, sampled requests with \
+                 HIPFIRE_MTP_SAMPLED=0 and sampled requests with HIPFIRE_MTP_SAMPLED_MODE=naive \
+                 decode AR (greedy and unpenalized sampled leviathan requests run MTP)"
             );
         }
     }
@@ -3037,6 +3086,51 @@ pub fn generate(
                 think_mode,
                 tools,
                 messages_history,
+            );
+            return;
+        }
+        GenerationRoute::RaonAr => {
+            // Arch 19 (Raon-1-mini). Single-GPU AR over the shared
+            // `generate_ar_with_forward` body (QwenArSemanticProducer: think
+            // router, XML tool router, stop matcher, gen_start/terminal
+            // lifecycle). No pflash/eviction/spec on this arch.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+                cactus_delta,
+                logprobs_top_k,
+                // The Raon template reads no `reasoning_effort`; thinking is the
+                // typed `enable_thinking` + explicit `max_think_tokens` only.
+                reasoning_effort,
+            );
+            crate::raon::generate_raon(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                tools,
+                crate::raon::RaonSampling {
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    user_explicit: user_explicit_sampling,
+                },
+                max_tokens,
+                max_think_tokens,
+                stop,
+                enable_thinking,
             );
             return;
         }
@@ -6543,6 +6637,7 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         12 => "cohere2moe",
         13 => "gemma4",
         14 => "muse_glimmer",
+        19 => "raon1_mini",
         _ => "unknown",
     }
 }
@@ -7092,7 +7187,7 @@ mod qwen4_pp_route_tests {
     }
 
     #[test]
-    fn qwen4_native_greedy_mtp_uses_the_same_route_under_pp() {
+    fn qwen4_native_mtp_uses_the_same_route_under_pp() {
         let mut single = inputs(16, 1);
         single.has_speculator = true;
         single.speculator_is_mtp = true;
@@ -7100,19 +7195,39 @@ mod qwen4_pp_route_tests {
         for pp in 2..=8 {
             let mut i = single;
             i.pp = pp;
+            // Greedy, unpenalized: native MTP.
             assert_eq!(
                 select_generation_route(&i),
                 GenerationRoute::Qwen4Spec,
                 "pp {pp}"
             );
-            // Sampling-capable Single support does not qualify PP sampling.
-            i.supports_temp_swor = true;
+            // Sampled without `supports_temp_verify` (`HIPFIRE_MTP_SAMPLED=0`,
+            // or PP + `HIPFIRE_MTP_SAMPLED_MODE=naive`): the PP AR producer.
             i.temp = 0.7;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-            i.temp = 0.0;
+            // Sampled, unpenalized, sampled verification available (leviathan):
+            // native MTP, exactly as on one card.
+            i.supports_temp_swor = true;
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}"
+            );
+            // Explicit top_p/top_k/min_p do not demote a sampled request.
+            i.user_explicit_sampling = true;
+            i.min_p = Some(0.05);
+            assert_eq!(
+                select_generation_route(&i),
+                GenerationRoute::Qwen4Spec,
+                "pp {pp}"
+            );
+            i.user_explicit_sampling = false;
+            i.min_p = None;
+            // Penalized requests stay on the PP AR producer (the GPU penalty
+            // prepass refuses the mesh), greedy or sampled.
             i.nonneutral_penalties = true;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
-            i.temp = 0.7;
+            i.temp = 0.0;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
         }
     }
