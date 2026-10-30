@@ -5918,7 +5918,10 @@ mod tests {
         });
         assert_eq!(got, None);
         // Arena (unpaged) pools have no tables to check.
-        assert_eq!(paged_replay_input_error(&batch, 256, 3, None, |_| None), None);
+        assert_eq!(
+            paged_replay_input_error(&batch, 256, 3, None, |_| None),
+            None
+        );
     }
 
     #[test]
@@ -5942,7 +5945,9 @@ mod tests {
         // 127 is still inside page 0.
         let ok = replay_batch(vec![1], vec![127], vec![0]);
         assert_eq!(
-            paged_replay_input_error(&ok, 256, 1, Some(8), |s| tables.get(s).map(|t| t.as_slice())),
+            paged_replay_input_error(&ok, 256, 1, Some(8), |s| tables
+                .get(s)
+                .map(|t| t.as_slice())),
             None
         );
     }

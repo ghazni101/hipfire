@@ -2987,6 +2987,10 @@ mod tests {
             created: 0,
             encoder: RefCell::new(encoding.stream("chatcmpl-1-1", 0, "m")),
             stall_timeout: None,
+            choices_total: 1,
+            usage_prompt: Cell::new(0),
+            usage_completion: Cell::new(0),
+            usage_details: RefCell::new(None),
         };
         (sink, commit, rx)
     }

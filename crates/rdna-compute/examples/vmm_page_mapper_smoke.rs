@@ -128,7 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..64u8 {
         mapper.sync(&mut gpu, &states(&[0, other]))?;
         write_read(&mut gpu, &mapper, &arenas, 0, 0x20u8.wrapping_add(round));
-        write_read(&mut gpu, &mapper, &arenas, other, 0x80u8.wrapping_add(round));
+        write_read(
+            &mut gpu,
+            &mapper,
+            &arenas,
+            other,
+            0x80u8.wrapping_add(round),
+        );
         mapper.sync(&mut gpu, &states(&[]))?;
     }
     assert_eq!(mapper.mapped_bytes(), 2 * granule_cost);

@@ -692,10 +692,12 @@ mod tests {
     fn ownership(pool: &PagePool, tables: &[&BlockTable]) -> Result<(), String> {
         check_table_ownership(
             &pool.page_states(),
-            tables
-                .iter()
-                .enumerate()
-                .map(|(slot, t)| (slot, &t.page_indices()[..t.live_tokens().div_ceil(PAGE_TOKENS)])),
+            tables.iter().enumerate().map(|(slot, t)| {
+                (
+                    slot,
+                    &t.page_indices()[..t.live_tokens().div_ceil(PAGE_TOKENS)],
+                )
+            }),
         )
     }
 
@@ -779,7 +781,9 @@ mod tests {
         let states = pool.page_states();
         for &p in &leased {
             assert_eq!(states[p as usize], PageState::ReclaimPending, "phys {p}");
-            assert!(used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE)[p as usize / PER_GRANULE]);
+            assert!(
+                used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE)[p as usize / PER_GRANULE]
+            );
         }
         assert!(pool.drain_completed().is_empty(), "leases still held");
         for &p in &leased {
@@ -789,7 +793,10 @@ mod tests {
         assert_eq!(pool.free_pages(), PAGES);
         let states = pool.page_states();
         assert!(states.iter().all(|&s| s == PageState::Free));
-        assert_eq!(used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE), vec![false; 3]);
+        assert_eq!(
+            used_granules(&states, PER_GRANULE, PAGES / PER_GRANULE),
+            vec![false; 3]
+        );
         pool.check_invariants();
     }
 
@@ -828,7 +835,10 @@ mod tests {
         let states = [Free, ReclaimPending, Private];
         for bad in [0u32, 1, 3] {
             let t: &[u32] = &[2, bad];
-            assert!(check_table_ownership(&states, [(0, t)]).is_err(), "phys {bad}");
+            assert!(
+                check_table_ownership(&states, [(0, t)]).is_err(),
+                "phys {bad}"
+            );
         }
     }
 
