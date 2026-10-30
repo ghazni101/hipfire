@@ -687,10 +687,13 @@ Both are answered by serve from the model's text, so a body with no block
 headers (a plain answer, or a prompt that never reached OCR) comes back
 unchanged rather than being rewritten. A
 serve started with `HIPFIRE_SERVE_OCR_FORMAT=html` (`serve.ocr_format`) applies
-that rendering to every non-streaming chat turn, so a client that cannot send
-the field still gets divs instead of tokens; a request's own `ocr_format`
-still wins, and streams stay raw. Streaming with `ocr_format` is a 400:
-deltas would carry the compact form first.
+that rendering to every chat turn, streamed or not, so a client that cannot
+send the field — the embedded UI always streams — still gets divs instead of
+tokens; a request's own `ocr_format` wins, and `"ocr_format": "raw"` opts a
+single turn back to the special tokens. A streamed turn decodes as it goes:
+`html` sends one delta per block (a block is final once the next header token
+arrives, so the concatenated deltas equal the non-streaming HTML), and
+`blocks` sends a single final delta because a JSON array has no prefix form.
 
 **Generation contract** (the card's vLLM client): greedy, `top_p: 0.1`, no
 repetition penalty, `max_tokens` ≈ 12288 for a dense page; thinking off

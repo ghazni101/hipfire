@@ -191,13 +191,11 @@ impl WireApi {
                     == Some(true);
                 // `ocr_format` is answered by this hop and never forwarded: it
                 // selects a rendering of the model's compact-block output, not
-                // a decoder setting. Refused on streams because a client that
-                // watches deltas would see the compact form arrive first. With
-                // no request field the serve-level default (`serve.ocr_format`
-                // / HIPFIRE_SERVE_OCR_FORMAT) applies, and only off-stream:
-                // a stream always carries the raw form.
+                // a decoder setting. With no request field the serve-level
+                // default (`serve.ocr_format` / HIPFIRE_SERVE_OCR_FORMAT)
+                // applies; `"raw"` opts a single request out of that default.
+                // Streams decode too (incrementally, at block granularity).
                 let ocr = match body.as_object_mut().and_then(|body| body.remove("ocr_format")) {
-                    None if stream => None,
                     None => ocr_default,
                     Some(value) => {
                         let Some(requested) = value.as_str() else {
@@ -207,19 +205,16 @@ impl WireApi {
                                 value
                             ));
                         };
-                        let Some(format) = OcrFormat::parse(requested) else {
-                            return Err(format!(
-                                "ocr_format must be {}, got {requested:?}",
-                                OcrFormat::wire_values()
-                            ));
-                        };
-                        if stream {
-                            return Err(
-                                "ocr_format requires a non-streaming request (stream must be false)"
-                                    .to_owned(),
-                            );
+                        if requested == "raw" {
+                            None
+                        } else {
+                            Some(OcrFormat::parse(requested).ok_or_else(|| {
+                                format!(
+                                    "ocr_format must be {}, got {requested:?}",
+                                    OcrFormat::wire_values()
+                                )
+                            })?)
                         }
-                        Some(format)
                     }
                 };
                 Ok(GenerationRequest {
@@ -292,11 +287,14 @@ impl ResponseEncoding {
 
     fn stream(self, id: &str, created: u64, model: &str) -> StreamEncoder {
         match self {
-            Self::Chat { include_usage, .. } => StreamEncoder::Chat {
+            Self::Chat { include_usage, ocr } => StreamEncoder::Chat {
                 id: id.to_owned(),
                 created,
                 model: model.to_owned(),
                 include_usage,
+                ocr,
+                block_stream: matches!(ocr, Some(OcrFormat::Html)).then(ocr::BlockStream::new),
+                buffered: String::new(),
             },
             Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
             Self::Responses(echo) => {
@@ -325,6 +323,17 @@ fn decode_ocr_content(body: &mut serde_json::Value, format: OcrFormat) {
     }
 }
 
+/// A `chat.completion.chunk` carrying one content delta.
+fn content_chunk(id: &str, created: u64, model: &str, text: String) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
+    })
+}
+
 /// SSE framing of one streamed response in the client's API.
 enum StreamEncoder {
     /// OpenAI `data: {chat.completion.chunk}` frames ending in `data: [DONE]`.
@@ -333,6 +342,14 @@ enum StreamEncoder {
         created: u64,
         model: String,
         include_usage: bool,
+        /// Decode compact-block deltas into block HTML (or one final blocks
+        /// JSON array) instead of forwarding the model's special tokens.
+        ocr: Option<OcrFormat>,
+        /// Incremental decoder for [`OcrFormat::Html`]; `None` otherwise.
+        block_stream: Option<ocr::BlockStream>,
+        /// Raw answer held back for [`OcrFormat::Blocks`], which can only be
+        /// rendered once the turn ends (a JSON array has no prefix form).
+        buffered: String,
     },
     Anthropic(anthropic::MessageStream),
     Responses(responses::ResponseStream),
@@ -361,9 +378,37 @@ impl StreamEncoder {
     fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
         match self {
             Self::Chat {
-                id, created, model, ..
+                id,
+                created,
+                model,
+                ocr,
+                block_stream,
+                buffered,
+                ..
             } => {
-                let delta = openai_stream_delta_for_event(event)?;
+                let mut delta = openai_stream_delta_for_event(event)?;
+                if let Some(format) = ocr {
+                    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                        let decoded = match format {
+                            OcrFormat::Html => {
+                                block_stream.as_mut().map(|stream| stream.push(text))
+                            }
+                            OcrFormat::Blocks => {
+                                buffered.push_str(text);
+                                None
+                            }
+                        };
+                        match decoded {
+                            // A block closed: send it as this event's delta.
+                            Some(decoded) if !decoded.is_empty() => {
+                                delta = serde_json::json!({ "content": decoded });
+                            }
+                            // Nothing finished yet (or the whole turn is held
+                            // back for a JSON array): emit no frame.
+                            _ => return None,
+                        }
+                    }
+                }
                 Some(sse_data(&serde_json::json!({
                     "id": id,
                     "object": "chat.completion.chunk",
@@ -380,8 +425,27 @@ impl StreamEncoder {
     /// The terminal frame: released tool calls, finish and usage.
     fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
         match self {
-            Self::Chat { include_usage, .. } => {
+            Self::Chat {
+                id,
+                created,
+                model,
+                include_usage,
+                ocr,
+                block_stream,
+                buffered,
+            } => {
                 let mut bytes = Vec::new();
+                let trailing = match ocr {
+                    Some(OcrFormat::Html) => block_stream
+                        .take()
+                        .map(|mut stream| stream.finish())
+                        .unwrap_or_default(),
+                    Some(OcrFormat::Blocks) => ocr::blocks_json(buffered),
+                    None => String::new(),
+                };
+                if !trailing.is_empty() {
+                    bytes.extend_from_slice(&sse_data(&content_chunk(id, *created, model, trailing)));
+                }
                 for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
                     bytes.extend_from_slice(&sse_data(&chunk));
                 }
@@ -2693,18 +2757,33 @@ mod tests {
     }
 
     #[test]
-    fn ocr_format_rejects_streaming_and_unknown_values() {
+    fn ocr_format_accepts_streaming_and_raw_and_rejects_unknown_values() {
         let streaming = serde_json::json!({
             "model": "m",
             "stream": true,
             "ocr_format": "html",
             "messages": [],
         });
-        let err = WireApi::ChatCompletions
+        let request = WireApi::ChatCompletions
             .lower(streaming, None)
-            .err()
-            .expect("streaming is refused");
-        assert!(err.contains("non-streaming"), "{err}");
+            .expect("streams decode incrementally");
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Html)),
+            _ => panic!("expected the chat encoding"),
+        }
+
+        let raw = serde_json::json!({
+            "model": "m",
+            "ocr_format": "raw",
+            "messages": [],
+        });
+        let request = WireApi::ChatCompletions
+            .lower(raw, Some(OcrFormat::Html))
+            .expect("raw opts out of the default");
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, None),
+            _ => panic!("expected the chat encoding"),
+        }
 
         let unknown = serde_json::json!({
             "model": "m",
@@ -2726,10 +2805,9 @@ mod tests {
     }
 
     /// The serve-level default (`serve.ocr_format` / HIPFIRE_SERVE_OCR_FORMAT)
-    /// renders non-streaming turns; a stream always carries the raw form, and
-    /// a request's own field wins over the default.
+    /// renders every chat turn, streamed or not; a request's own field wins.
     #[test]
-    fn serve_default_applies_only_off_stream_and_yields_to_the_request() {
+    fn serve_default_applies_to_turns_and_yields_to_the_request() {
         let body = serde_json::json!({"model": "m", "messages": []});
         let request = WireApi::ChatCompletions
             .lower(body, Some(OcrFormat::Html))
@@ -2742,9 +2820,9 @@ mod tests {
         let streaming = serde_json::json!({"model": "m", "stream": true, "messages": []});
         let request = WireApi::ChatCompletions
             .lower(streaming, Some(OcrFormat::Html))
-            .expect("streaming keeps the raw form");
+            .expect("streams take the default too");
         match request.encoding {
-            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, None),
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Html)),
             _ => panic!("expected the chat encoding"),
         }
 
@@ -2760,6 +2838,56 @@ mod tests {
             ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Blocks)),
             _ => panic!("expected the chat encoding"),
         }
+    }
+
+    /// A streamed chat turn decodes at block granularity: no raw token ever
+    /// reaches a delta, and the last block is flushed before the terminal
+    /// chunk.
+    #[test]
+    fn chat_stream_decodes_blocks_and_flushes_the_last_one() {
+        let mut encoder = ResponseEncoding::Chat {
+            include_usage: false,
+            ocr: Some(OcrFormat::Html),
+        }
+        .stream("chatcmpl-1", 0, "m");
+        let mut wire = String::new();
+        let first = encoder
+            .event(&token_event("<|Text|><|0|><|0|><|1|><|1|><p>one</p>"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        assert_eq!(first, "", "nothing is sent until a block closes");
+        let second = encoder
+            .event(&token_event("<|Text|><|2|><|2|><|3|><|3|>"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        wire.push_str(&second);
+        assert!(wire.contains("data-label"), "{wire}");
+        assert!(wire.contains("0 0 1 1"), "{wire}");
+        assert!(!wire.contains("<|Text|>"), "raw tokens must not reach the wire");
+        assert_eq!(
+            wire.matches("data: ").count(),
+            1,
+            "one frame per completed block"
+        );
+
+        let completion = Completion {
+            id: "chatcmpl-1".to_owned(),
+            created: 0,
+            model: "m".to_owned(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({ "finish_reason": "stop" }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let terminal = encoder.terminal(&completion);
+        let text = String::from_utf8_lossy(&terminal);
+        assert!(text.contains("2 2 3 3"), "{text}");
+        assert!(text.contains("data-label"), "{text}");
+        assert!(text.contains("[DONE]"), "{text}");
+        assert!(!text.contains("<|Text|>"), "{text}");
     }
 
     /// Decoded content replaces the compact form; a plain answer is untouched.

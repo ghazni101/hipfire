@@ -91,9 +91,9 @@ impl OcrFormat {
         }
     }
 
-    /// The value as accepted on the wire (for error text).
+    /// The values accepted on the wire (for error text).
     pub(crate) fn wire_values() -> &'static str {
-        "\"html\" or \"blocks\""
+        "\"html\", \"blocks\" or \"raw\""
     }
 
     /// Map the serve-level default (`serve.ocr_format` /
@@ -602,6 +602,210 @@ fn parse_attrs(raw: &str) -> Vec<(String, Option<String>)> {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental decode for streams
+// ---------------------------------------------------------------------------
+
+/// Decode compact blocks as they arrive, for SSE.
+///
+/// A block ends where the next header starts, so each completed block can be
+/// emitted the moment its successor's header token appears — the API streams
+/// decoded HTML at block granularity instead of buffering the whole page. The
+/// scanner holds back at any `<` that could still grow into a header (a token
+/// can be split across deltas), so a partial `<|Te` never leaks as content.
+pub(crate) struct BlockStream {
+    text: String,
+    /// Next index a header scan resumes from.
+    scan: usize,
+    /// Start of the current block's content (the end of its header).
+    content_start: usize,
+    current: Option<(String, [u16; 4])>,
+    /// Last character handed to the client, so the concatenated deltas equal
+    /// the non-streaming HTML (one newline between blocks).
+    last_char: Option<char>,
+}
+
+impl BlockStream {
+    pub(crate) fn new() -> Self {
+        Self {
+            text: String::new(),
+            scan: 0,
+            content_start: 0,
+            current: None,
+            last_char: None,
+        }
+    }
+
+    /// Append a content delta; returns the decoded HTML of every block the
+    /// delta completed (empty when nothing closed yet).
+    pub(crate) fn push(&mut self, delta: &str) -> String {
+        self.text.push_str(delta);
+        let mut out = String::new();
+        loop {
+            let Some(offset) = self.text[self.scan..].find('<') else {
+                self.scan = self.text.len();
+                break;
+            };
+            let at = self.scan + offset;
+            match probe_header(&self.text[at..]) {
+                HeaderProbe::Found { len, label, bbox } => {
+                    match self.current.take() {
+                        Some((label, bbox)) => {
+                            let div = decode_block(&label, bbox, &self.text[self.content_start..at]);
+                            self.append_block(&mut out, div);
+                        }
+                        // Text before the first block is not OCR content; it
+                        // is passed through the way the static decoder does.
+                        None => {
+                            let leading = self.text[..at].to_owned();
+                            self.append(&mut out, &leading);
+                        }
+                    }
+                    self.content_start = at + len;
+                    self.current = Some((label, bbox));
+                    self.scan = self.content_start;
+                }
+                HeaderProbe::Incomplete => {
+                    self.scan = at;
+                    break;
+                }
+                HeaderProbe::NotHeader => self.scan = at + 1,
+            }
+        }
+        out
+    }
+
+    /// Flush the block still open at end of generation.
+    pub(crate) fn finish(&mut self) -> String {
+        let mut out = String::new();
+        match self.current.take() {
+            Some((label, bbox)) => {
+                let div = decode_block(&label, bbox, &self.text[self.content_start..]);
+                self.append_block(&mut out, div);
+            }
+            // No header ever arrived: a plain answer, returned as it is.
+            None => {
+                let text = std::mem::take(&mut self.text);
+                self.append(&mut out, &text);
+            }
+        }
+        out
+    }
+
+    /// Hand `text` to the client, remembering where the stream ended.
+    fn append(&mut self, out: &mut String, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        out.push_str(text);
+        self.last_char = text.chars().last();
+    }
+
+    /// A block div, separated from the previous one exactly as the
+    /// non-streaming decoder separates them.
+    fn append_block(&mut self, out: &mut String, div: String) {
+        if matches!(self.last_char, Some(last) if last != '\n') {
+            out.push('\n');
+        }
+        self.append(out, &div);
+    }
+}
+
+enum HeaderProbe {
+    Found {
+        len: usize,
+        label: String,
+        bbox: [u16; 4],
+    },
+    /// The tail could still become a header once more text arrives.
+    Incomplete,
+    NotHeader,
+}
+
+/// Classify a suffix as a block header, a partial header, or ordinary text.
+fn probe_header(s: &str) -> HeaderProbe {
+    if !s.starts_with('<') {
+        return HeaderProbe::NotHeader;
+    }
+    let Some(rest) = s.strip_prefix("<|") else {
+        // A lone `<` may still become the start of a header token.
+        return if s.len() == 1 {
+            HeaderProbe::Incomplete
+        } else {
+            HeaderProbe::NotHeader
+        };
+    };
+    let Some(close) = rest.find("|>") else {
+        // No closing `|>` yet: a prefix of a known label (optionally already
+        // followed by the `|` of `|>`) is still in flight.
+        let label = rest.strip_suffix('|').unwrap_or(rest);
+        return if label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && BLOCK_LABELS.iter().any(|known| known.starts_with(label))
+        {
+            HeaderProbe::Incomplete
+        } else {
+            HeaderProbe::NotHeader
+        };
+    };
+    let label = &rest[..close];
+    if !BLOCK_LABELS.contains(&label) {
+        return HeaderProbe::NotHeader;
+    }
+    let mut pos = 2 + close + 2;
+    let mut bbox = [0u16; 4];
+    for slot in bbox.iter_mut() {
+        let tail = &s[pos..];
+        let Some(rest) = tail.strip_prefix("<|") else {
+            return if tail.is_empty() || tail == "<" {
+                HeaderProbe::Incomplete
+            } else {
+                HeaderProbe::NotHeader
+            };
+        };
+        let Some(coord_close) = rest.find("|>") else {
+            let digits = rest.strip_suffix('|').unwrap_or(rest);
+            return if digits.len() <= 4 && digits.bytes().all(|b| b.is_ascii_digit()) {
+                HeaderProbe::Incomplete
+            } else {
+                HeaderProbe::NotHeader
+            };
+        };
+        let digits = &rest[..coord_close];
+        if digits.is_empty() || digits.len() > 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return HeaderProbe::NotHeader;
+        }
+        *slot = match digits.parse() {
+            Ok(value) => value,
+            Err(_) => return HeaderProbe::NotHeader,
+        };
+        pos += 2 + coord_close + 2;
+    }
+    HeaderProbe::Found {
+        len: pos,
+        label: label.to_owned(),
+        bbox,
+    }
+}
+
+/// One block's div, decoded through the same path as a whole answer.
+fn decode_block(label: &str, bbox: [u16; 4], content: &str) -> String {
+    let mut raw = String::with_capacity(content.len() + 32);
+    raw.push_str("<|");
+    raw.push_str(label);
+    raw.push_str("|>");
+    for value in bbox {
+        raw.push_str(&format!("<|{value}|>"));
+    }
+    raw.push_str(content);
+    decode_blocks(&raw)
+        .into_iter()
+        .next()
+        .map(|block| block.div())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // Merged cells (data-kind parent/ghost → colspan/rowspan)
 // ---------------------------------------------------------------------------
 
@@ -946,6 +1150,67 @@ mod tests {
         assert_eq!(OcrFormat::parse("blocks"), Some(OcrFormat::Blocks));
         assert_eq!(OcrFormat::parse("HTML"), None);
         assert_eq!(OcrFormat::parse("json"), None);
+    }
+
+    #[test]
+    fn stream_decodes_blocks_across_arbitrary_chunk_splits() {
+        let raw = "<|Text|><|41|><|25|><|128|><|54|><p>hello</p>\
+                   <|Table|><|1|><|2|><|3|><|4|>\
+                   <table><tr><td data-kind=\"parent\" data-cs=\"2\">A<td data-kind=\"ghost\">B</table>";
+        // One delta per byte is the worst case: headers, coordinates and tags
+        // all arrive split.
+        let mut stream = BlockStream::new();
+        let mut decoded = String::new();
+        for piece in raw.as_bytes().chunks(1) {
+            decoded.push_str(&stream.push(std::str::from_utf8(piece).unwrap()));
+        }
+        decoded.push_str(&stream.finish());
+        assert_eq!(decoded, decode_html(raw));
+    }
+
+    #[test]
+    fn stream_emits_each_block_as_soon_as_the_next_header_arrives() {
+        let mut stream = BlockStream::new();
+        let raw = "<|Text|><|0|><|0|><|1|><|1|><p>one</p>\
+                   <|Text|><|2|><|2|><|3|><|3|><p>two</p>";
+        let first = stream.push("<|Text|><|0|><|0|><|1|><|1|><p>one</p>");
+        assert_eq!(first, "");
+        let second = stream.push("<|Text|><|2|><|2|><|3|><|3|>");
+        assert_eq!(
+            second,
+            "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><p>one</p></div>"
+        );
+        let rest = stream.push("<p>two</p>");
+        assert_eq!(rest, "");
+        // The concatenation of every delta is the non-streaming HTML; the
+        // separator newline therefore lands at the head of the next block.
+        let last = stream.finish();
+        assert_eq!(
+            format!("{second}{last}"),
+            decode_html(raw),
+            "streamed deltas must concatenate to the static decode"
+        );
+    }
+
+    #[test]
+    fn stream_passes_through_a_plain_answer() {
+        let mut stream = BlockStream::new();
+        assert_eq!(stream.push("no blocks"), "");
+        assert_eq!(stream.push(" here"), "");
+        assert_eq!(stream.finish(), "no blocks here");
+    }
+
+    #[test]
+    fn stream_holds_back_partial_tokens() {
+        let mut stream = BlockStream::new();
+        assert_eq!(stream.push("<|Te"), "");
+        assert_eq!(stream.push("xt|><|1|><|2|><|3|><|4|>"), "");
+        assert_eq!(stream.push("<p>a"), "");
+        assert_eq!(stream.push("</p>"), "");
+        assert_eq!(
+            stream.finish(),
+            "<div data-bbox=\"1 2 3 4\" data-label=\"Text\"><p>a</p></div>"
+        );
     }
 
     #[test]
