@@ -195,28 +195,7 @@ impl WireApi {
                 // default (`serve.ocr_format` / HIPFIRE_SERVE_OCR_FORMAT)
                 // applies; `"raw"` opts a single request out of that default.
                 // Streams decode too (incrementally, at block granularity).
-                let ocr = match body.as_object_mut().and_then(|body| body.remove("ocr_format")) {
-                    None => ocr_default,
-                    Some(value) => {
-                        let Some(requested) = value.as_str() else {
-                            return Err(format!(
-                                "ocr_format must be {}, got {}",
-                                OcrFormat::wire_values(),
-                                value
-                            ));
-                        };
-                        if requested == "raw" {
-                            None
-                        } else {
-                            Some(OcrFormat::parse(requested).ok_or_else(|| {
-                                format!(
-                                    "ocr_format must be {}, got {requested:?}",
-                                    OcrFormat::wire_values()
-                                )
-                            })?)
-                        }
-                    }
-                };
+                let ocr = take_ocr(&mut body, ocr_default)?;
                 Ok(GenerationRequest {
                     chat: body,
                     stream,
@@ -224,19 +203,26 @@ impl WireApi {
                 })
             }
             Self::AnthropicMessages => {
+                let mut body = body;
+                let ocr = take_ocr(&mut body, ocr_default)?;
                 let lowered = anthropic::lower_request(&body)?;
                 Ok(GenerationRequest {
                     chat: lowered.chat,
                     stream: lowered.stream,
-                    encoding: ResponseEncoding::Anthropic,
+                    encoding: ResponseEncoding::Anthropic { ocr },
                 })
             }
             Self::OpenAiResponses => {
+                let mut body = body;
+                let ocr = take_ocr(&mut body, ocr_default)?;
                 let lowered = responses::lower_request(&body)?;
                 Ok(GenerationRequest {
                     chat: lowered.chat,
                     stream: lowered.stream,
-                    encoding: ResponseEncoding::Responses(lowered.echo),
+                    encoding: ResponseEncoding::Responses {
+                        echo: lowered.echo,
+                        ocr,
+                    },
                 })
             }
         }
@@ -257,16 +243,29 @@ enum ResponseEncoding {
         /// Decode a compact-block (Surya-2.5) answer before returning it.
         ocr: Option<OcrFormat>,
     },
-    Anthropic,
-    Responses(responses::ResponseEcho),
+    Anthropic {
+        ocr: Option<OcrFormat>,
+    },
+    Responses {
+        echo: responses::ResponseEcho,
+        ocr: Option<OcrFormat>,
+    },
 }
 
 impl ResponseEncoding {
     fn api(&self) -> WireApi {
         match self {
             Self::Chat { .. } => WireApi::ChatCompletions,
-            Self::Anthropic => WireApi::AnthropicMessages,
-            Self::Responses(_) => WireApi::OpenAiResponses,
+            Self::Anthropic { .. } => WireApi::AnthropicMessages,
+            Self::Responses { .. } => WireApi::OpenAiResponses,
+        }
+    }
+
+    /// The compact-block rendering this response asks for, if any. Streams
+    /// decode at the sink, before the API's encoder frames a delta.
+    fn ocr(&self) -> Option<OcrFormat> {
+        match self {
+            Self::Chat { ocr, .. } | Self::Anthropic { ocr } | Self::Responses { ocr, .. } => *ocr,
         }
     }
 
@@ -280,26 +279,155 @@ impl ResponseEncoding {
                 }
                 body
             }
-            Self::Anthropic => anthropic::message_json(completion),
-            Self::Responses(echo) => responses::response_json(completion, echo),
+            Self::Anthropic { ocr } => {
+                let mut body = anthropic::message_json(completion);
+                if let Some(format) = ocr {
+                    decode_anthropic_content(&mut body, *format);
+                }
+                body
+            }
+            Self::Responses { echo, ocr } => {
+                let mut body = responses::response_json(completion, echo);
+                if let Some(format) = ocr {
+                    decode_responses_content(&mut body, *format);
+                }
+                body
+            }
         }
     }
 
     fn stream(self, id: &str, created: u64, model: &str) -> StreamEncoder {
         match self {
-            Self::Chat { include_usage, ocr } => StreamEncoder::Chat {
+            Self::Chat { include_usage, .. } => StreamEncoder::Chat {
                 id: id.to_owned(),
                 created,
                 model: model.to_owned(),
                 include_usage,
-                ocr,
-                block_stream: matches!(ocr, Some(OcrFormat::Html)).then(ocr::BlockStream::new),
-                buffered: String::new(),
             },
-            Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
-            Self::Responses(echo) => {
+            Self::Anthropic { .. } => {
+                StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model))
+            }
+            Self::Responses { echo, .. } => {
                 StreamEncoder::Responses(responses::ResponseStream::new(echo, id, created, model))
             }
+        }
+    }
+}
+
+/// Pull the request's `ocr_format` (an extension on every wire API) and fall
+/// back to the serve default. `"raw"` opts one request out of that default.
+fn take_ocr(
+    body: &mut serde_json::Value,
+    default: Option<OcrFormat>,
+) -> Result<Option<OcrFormat>, String> {
+    let Some(value) = body.as_object_mut().and_then(|body| body.remove("ocr_format")) else {
+        return Ok(default);
+    };
+    let Some(requested) = value.as_str() else {
+        return Err(format!(
+            "ocr_format must be {}, got {value}",
+            OcrFormat::wire_values()
+        ));
+    };
+    if requested == "raw" {
+        return Ok(None);
+    }
+    OcrFormat::parse(requested).map(Some).ok_or_else(|| {
+        format!(
+            "ocr_format must be {}, got {requested:?}",
+            OcrFormat::wire_values()
+        )
+    })
+}
+
+/// Decode one text slot in place; a plain answer is left alone.
+fn decode_text_slot(slot: &mut serde_json::Value, format: OcrFormat) {
+    let Some(text) = slot.as_str() else {
+        return;
+    };
+    let decoded = match format {
+        OcrFormat::Html => ocr::decode_html(text),
+        OcrFormat::Blocks => ocr::blocks_json(text),
+    };
+    if decoded != text {
+        *slot = serde_json::Value::String(decoded);
+    }
+}
+
+/// Anthropic `message.content[]` text blocks.
+fn decode_anthropic_content(body: &mut serde_json::Value, format: OcrFormat) {
+    let Some(items) = body.get_mut("content").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("text") {
+            if let Some(text) = item.get_mut("text") {
+                decode_text_slot(text, format);
+            }
+        }
+    }
+}
+
+/// Responses `output[].content[]` parts (and the flattened `output_text`).
+fn decode_responses_content(body: &mut serde_json::Value, format: OcrFormat) {
+    if let Some(items) = body.get_mut("output").and_then(serde_json::Value::as_array_mut) {
+        for item in items {
+            let Some(parts) = item.get_mut("content").and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for part in parts {
+                if matches!(
+                    part.get("type").and_then(serde_json::Value::as_str),
+                    Some("output_text" | "text")
+                ) {
+                    if let Some(text) = part.get_mut("text") {
+                        decode_text_slot(text, format);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(text) = body.get_mut("output_text") {
+        decode_text_slot(text, format);
+    }
+}
+
+/// Per-response stream decode state, owned by the sink so every wire API
+/// (chat, Anthropic, Responses) sees the same decoded text deltas.
+enum StreamOcr {
+    Html(ocr::BlockStream),
+    /// `blocks` has to buffer: a JSON array has no prefix form.
+    Blocks(String),
+}
+
+impl StreamOcr {
+    fn new(format: OcrFormat) -> Self {
+        match format {
+            OcrFormat::Html => Self::Html(ocr::BlockStream::new()),
+            OcrFormat::Blocks => Self::Blocks(String::new()),
+        }
+    }
+
+    /// Feed a token delta; `Some(text)` when the client should receive a frame.
+    fn push(&mut self, text: &str) -> Option<String> {
+        match self {
+            Self::Html(stream) => {
+                let chunk = stream.push(text);
+                (!chunk.is_empty()).then_some(chunk)
+            }
+            Self::Blocks(buffer) => {
+                buffer.push_str(text);
+                None
+            }
+        }
+    }
+
+    /// The remainder at end of generation.
+    fn finish(&mut self) -> String {
+        match self {
+            Self::Html(stream) => stream.finish(),
+            Self::Blocks(buffer) => ocr::blocks_json(buffer),
         }
     }
 }
@@ -323,17 +451,6 @@ fn decode_ocr_content(body: &mut serde_json::Value, format: OcrFormat) {
     }
 }
 
-/// A `chat.completion.chunk` carrying one content delta.
-fn content_chunk(id: &str, created: u64, model: &str, text: String) -> serde_json::Value {
-    serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
-    })
-}
-
 /// SSE framing of one streamed response in the client's API.
 enum StreamEncoder {
     /// OpenAI `data: {chat.completion.chunk}` frames ending in `data: [DONE]`.
@@ -342,14 +459,6 @@ enum StreamEncoder {
         created: u64,
         model: String,
         include_usage: bool,
-        /// Decode compact-block deltas into block HTML (or one final blocks
-        /// JSON array) instead of forwarding the model's special tokens.
-        ocr: Option<OcrFormat>,
-        /// Incremental decoder for [`OcrFormat::Html`]; `None` otherwise.
-        block_stream: Option<ocr::BlockStream>,
-        /// Raw answer held back for [`OcrFormat::Blocks`], which can only be
-        /// rendered once the turn ends (a JSON array has no prefix form).
-        buffered: String,
     },
     Anthropic(anthropic::MessageStream),
     Responses(responses::ResponseStream),
@@ -378,37 +487,9 @@ impl StreamEncoder {
     fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
         match self {
             Self::Chat {
-                id,
-                created,
-                model,
-                ocr,
-                block_stream,
-                buffered,
-                ..
+                id, created, model, ..
             } => {
-                let mut delta = openai_stream_delta_for_event(event)?;
-                if let Some(format) = ocr {
-                    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                        let decoded = match format {
-                            OcrFormat::Html => {
-                                block_stream.as_mut().map(|stream| stream.push(text))
-                            }
-                            OcrFormat::Blocks => {
-                                buffered.push_str(text);
-                                None
-                            }
-                        };
-                        match decoded {
-                            // A block closed: send it as this event's delta.
-                            Some(decoded) if !decoded.is_empty() => {
-                                delta = serde_json::json!({ "content": decoded });
-                            }
-                            // Nothing finished yet (or the whole turn is held
-                            // back for a JSON array): emit no frame.
-                            _ => return None,
-                        }
-                    }
-                }
+                let delta = openai_stream_delta_for_event(event)?;
                 Some(sse_data(&serde_json::json!({
                     "id": id,
                     "object": "chat.completion.chunk",
@@ -425,27 +506,8 @@ impl StreamEncoder {
     /// The terminal frame: released tool calls, finish and usage.
     fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
         match self {
-            Self::Chat {
-                id,
-                created,
-                model,
-                include_usage,
-                ocr,
-                block_stream,
-                buffered,
-            } => {
+            Self::Chat { include_usage, .. } => {
                 let mut bytes = Vec::new();
-                let trailing = match ocr {
-                    Some(OcrFormat::Html) => block_stream
-                        .take()
-                        .map(|mut stream| stream.finish())
-                        .unwrap_or_default(),
-                    Some(OcrFormat::Blocks) => ocr::blocks_json(buffered),
-                    None => String::new(),
-                };
-                if !trailing.is_empty() {
-                    bytes.extend_from_slice(&sse_data(&content_chunk(id, *created, model, trailing)));
-                }
                 for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
                     bytes.extend_from_slice(&sse_data(&chunk));
                 }
@@ -2220,6 +2282,7 @@ async fn handle_streaming(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
+    let ocr = encoding.ocr().map(|format| RefCell::new(StreamOcr::new(format)));
     let mut encoder = encoding.stream(&id, created, &model);
     let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
@@ -2230,6 +2293,7 @@ async fn handle_streaming(
         id,
         created,
         encoder: RefCell::new(encoder),
+        ocr,
         stall_timeout: shared.stream_stall_timeout,
     };
 
@@ -2560,6 +2624,10 @@ struct SseSink {
     created: u64,
     /// Frames the stream for the client's API; only the worker touches it.
     encoder: RefCell<StreamEncoder>,
+    /// Compact-block decode state (`ocr_format` / `serve.ocr_format`). Held
+    /// here, not in the encoder, so chat, Anthropic and Responses streams all
+    /// see decoded text deltas from one state machine.
+    ocr: Option<RefCell<StreamOcr>>,
     /// Multi-slot route only (`serve.stream_stall_timeout_ms`): how long a
     /// consumer may leave the response channel full, or the terminal frame
     /// unflushed, before the request is aborted and its permit released.
@@ -2638,7 +2706,24 @@ impl SseSink {
         if event.get("type").and_then(serde_json::Value::as_str) == Some("prefill_progress") {
             return self.forward_progress(event);
         }
-        let Some(bytes) = self.encoder.borrow_mut().event(event) else {
+        // Compact-block decoding happens before the API's encoder frames a
+        // delta, so chat/Anthropic/Responses stream decoded text alike. A
+        // delta that completes no block sends nothing.
+        let event = match (&self.ocr, event.get("type").and_then(serde_json::Value::as_str)) {
+            (Some(state), Some("token")) => {
+                let Some(text) = event.get("text").and_then(serde_json::Value::as_str) else {
+                    return Ok(());
+                };
+                let Some(decoded) = state.borrow_mut().push(text) else {
+                    return Ok(());
+                };
+                let mut rewritten = event.clone();
+                rewritten["text"] = serde_json::Value::String(decoded);
+                std::borrow::Cow::Owned(rewritten)
+            }
+            _ => std::borrow::Cow::Borrowed(event),
+        };
+        let Some(bytes) = self.encoder.borrow_mut().event(&event) else {
             return Ok(());
         };
         self.send(ResponseChunk::plain(bytes))
@@ -2678,6 +2763,15 @@ impl SseSink {
     /// Serialize the terminal (released tool calls, finish, usage; chat adds
     /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
     fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
+        if let Some(state) = &self.ocr {
+            let trailing = state.borrow_mut().finish();
+            if !trailing.is_empty() {
+                let event = serde_json::json!({ "type": "token", "text": trailing });
+                if let Some(bytes) = self.encoder.borrow_mut().event(&event) {
+                    self.send(ResponseChunk::plain(bytes))?;
+                }
+            }
+        }
         let bytes = self.encoder.borrow_mut().terminal(completion);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
@@ -2840,54 +2934,59 @@ mod tests {
         }
     }
 
-    /// A streamed chat turn decodes at block granularity: no raw token ever
-    /// reaches a delta, and the last block is flushed before the terminal
-    /// chunk.
+    /// A streamed turn decodes at the sink, before the API's encoder frames a
+    /// delta: one frame per completed block, never a raw token, and nothing
+    /// at all for a delta that closes no block (whatever wire API is used).
     #[test]
-    fn chat_stream_decodes_blocks_and_flushes_the_last_one() {
-        let mut encoder = ResponseEncoding::Chat {
-            include_usage: false,
-            ocr: Some(OcrFormat::Html),
+    fn stream_decodes_blocks_at_the_sink_for_every_wire_api() {
+        for encoding in [
+            ResponseEncoding::Chat {
+                include_usage: false,
+                ocr: Some(OcrFormat::Html),
+            },
+            ResponseEncoding::Anthropic {
+                ocr: Some(OcrFormat::Html),
+            },
+        ] {
+            let (sink, _commit, mut rx) = test_sink(encoding);
+            sink.forward_event(&token_event("<|Text|><|0|><|0|><|1|><|1|><p>one</p>"))
+                .unwrap();
+            assert!(rx.try_recv().is_err(), "nothing until a block closes");
+            sink.forward_event(&token_event("<|Text|><|2|><|2|><|3|><|3|>"))
+                .unwrap();
+            let frame = rx.try_recv().expect("block frame");
+            let text = String::from_utf8_lossy(&frame.bytes).into_owned();
+            assert!(text.contains("0 0 1 1"), "{text}");
+            assert!(text.contains("data-label"), "{text}");
+            assert!(!text.contains("<|Text|>"), "raw tokens must not reach the wire");
         }
-        .stream("chatcmpl-1", 0, "m");
-        let mut wire = String::new();
-        let first = encoder
-            .event(&token_event("<|Text|><|0|><|0|><|1|><|1|><p>one</p>"))
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        assert_eq!(first, "", "nothing is sent until a block closes");
-        let second = encoder
-            .event(&token_event("<|Text|><|2|><|2|><|3|><|3|>"))
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default();
-        wire.push_str(&second);
-        assert!(wire.contains("data-label"), "{wire}");
-        assert!(wire.contains("0 0 1 1"), "{wire}");
-        assert!(!wire.contains("<|Text|>"), "raw tokens must not reach the wire");
-        assert_eq!(
-            wire.matches("data: ").count(),
-            1,
-            "one frame per completed block"
-        );
+    }
 
-        let completion = Completion {
-            id: "chatcmpl-1".to_owned(),
-            created: 0,
-            model: "m".to_owned(),
-            content: String::new(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done: serde_json::json!({ "finish_reason": "stop" }),
-            logprobs: None,
-            reasoning: None,
-        };
-        let terminal = encoder.terminal(&completion);
-        let text = String::from_utf8_lossy(&terminal);
-        assert!(text.contains("2 2 3 3"), "{text}");
-        assert!(text.contains("data-label"), "{text}");
-        assert!(text.contains("[DONE]"), "{text}");
-        assert!(!text.contains("<|Text|>"), "{text}");
+    /// Non-stream adapter bodies decode too.
+    #[test]
+    fn adapter_bodies_decode_compact_blocks() {
+        let mut anthropic = serde_json::json!({
+            "content": [{ "type": "text", "text": "<|Text|><|0|><|0|><|1|><|1|><p>x</p>" }],
+        });
+        decode_anthropic_content(&mut anthropic, OcrFormat::Html);
+        assert!(anthropic["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<div data-bbox=\"0 0 1 1\"")));
+
+        let mut responses = serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "<|Text|><|0|><|0|><|1|><|1|><p>x</p>" }],
+            }],
+            "output_text": "<|Text|><|0|><|0|><|1|><|1|><p>x</p>",
+        });
+        decode_responses_content(&mut responses, OcrFormat::Html);
+        assert!(responses["output"][0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<div data-bbox=\"0 0 1 1\"")));
+        assert!(responses["output_text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<div data-bbox=\"0 0 1 1\"")));
     }
 
     /// Decoded content replaces the compact form; a plain answer is untouched.
@@ -3130,6 +3229,7 @@ mod tests {
     fn test_sink(encoding: ResponseEncoding) -> TestSink {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+        let ocr = encoding.ocr().map(|format| RefCell::new(StreamOcr::new(format)));
         let sink = SseSink {
             tx,
             commit: Arc::clone(&commit),
@@ -3138,6 +3238,7 @@ mod tests {
             id: "chatcmpl-1-1".to_owned(),
             created: 0,
             encoder: RefCell::new(encoding.stream("chatcmpl-1-1", 0, "m")),
+            ocr,
             stall_timeout: None,
         };
         (sink, commit, rx)
@@ -3178,8 +3279,8 @@ mod tests {
                 include_usage: false,
                 ocr: None,
             },
-            ResponseEncoding::Anthropic,
-            ResponseEncoding::Responses(responses),
+            ResponseEncoding::Anthropic { ocr: None },
+            ResponseEncoding::Responses { echo: responses, ocr: None },
         ] {
             let api = encoding.api();
             let (sink, commit, mut rx) = test_sink(encoding);

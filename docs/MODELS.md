@@ -683,7 +683,8 @@ it per request with `ocr_format` on a **non-streaming** turn:
 - `"ocr_format": "blocks"` — `content` becomes a JSON array of
   `{"label", "bbox", "html"}`.
 
-Both are answered by serve from the model's text, so a body with no block
+Both are answered by serve from the model's text on all three text wire APIs
+(chat completions, Anthropic messages, Responses), so a body with no block
 headers (a plain answer, or a prompt that never reached OCR) comes back
 unchanged rather than being rewritten. A
 serve started with `HIPFIRE_SERVE_OCR_FORMAT=html` (`serve.ocr_format`) applies
