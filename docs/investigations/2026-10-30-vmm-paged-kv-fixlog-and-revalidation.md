@@ -576,8 +576,15 @@ each returned one unique wrong answer. `[127,127,127,127]` and `[128,128,128,128
 
 So the engine keeps per-lane request state (the marker probe passes), and the failure is in the
 **batched prefill row/token accounting at page-edge lengths**: a lane's prompt is executed as a
-prefix of itself (one row short), which makes its decode continue from another length's prompt.
+prefix of itself, which makes its decode continue from another length's prompt.
 The marker probe's lengths were not page edges, which is why it stayed clean.
+
+Not confined to dense: the A3B `.mq4r` route (arch 6 `qwen3_5_moe`, retained PM4 armed by the
+loader — `[redline] slots: enabling fail-closed retained default on gfx1100 (...) transport=pm4`),
+where MoE prompt chunks run as isolated single-slot `_vmm_paged` steps, was byte-identical to solo
+for two equal-length lanes across 3 rounds, and matched again for a 360-token code prompt; but a
+mixed pair (360 + 25 tokens, `enable_thinking: false`, 160 greedy tokens) differed once in two
+rounds on the short lane. Coherent text throughout, 0 kernel faults.
 
 ### Status
 
