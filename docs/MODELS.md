@@ -615,10 +615,10 @@ paths — either tag resolves from there; placing the files in
 models dir.
 
 The model card's trained default is thinking **off**, and the registry's
-`recommended_settings` lower it (`reasoning_effort: none`, temperature 0.2,
-top_p 0.9). Serve requests must carry that field themselves
-(`"reasoning_effort": "none"`): without it the adapter's page text lands in
-the reasoning channel and `content` is empty.
+`recommended_settings` lower it on a tag load (`reasoning_effort: none`,
+temperature 0.2, top_p 0.9). Measured on gfx1101 against the ISA page, a tag
+load and a path load (built-in defaults) both answer on `content` with
+`reasoning_content` empty, so no per-request field is needed.
 The card's prompt modes work verbatim: an empty prompt transcribes the page,
 `grounding` returns `![label](x0,y0,x1,y1)` bounding boxes in 0–1000
 coordinates. Image turns need the tower; `vision_mode` defaults to `auto`, so a
@@ -713,13 +713,14 @@ KV cost is small (six full-attention layers, 2 KV heads): 24 576 tokens is
 
 **Generation contract** (the card's vLLM client): greedy, `top_p: 0.1`, no
 repetition penalty, `max_tokens` ≈ 12288 for a dense page; thinking off
-(`reasoning_effort: none`), which the registry's `recommended_settings` lower —
-**but only on a tag load** (`surya-ocr-2.5:q8`, `surya`): the registry layer
-supplies those defaults. A serve started with the artifact *path* instead gets
-the built-in defaults, thinking stays on, and the answer lands in
-`reasoning_content` with `content` empty (the Python client reads `content`);
-add `"reasoning_effort": "none"` to such requests. Generation stops on the
-checkpoint's end token (`<|im_end|>`, id 2), so no stop strings are needed. Two serve limits apply when attaching the Python client:
+(`reasoning_effort: none`), which the registry's `recommended_settings` lower on
+a tag load (`surya-ocr-2.5:q8`, `surya`). A serve started with the artifact
+*path* instead gets the built-in defaults, so send the card's settings with each
+request (`temperature: 0`, `top_p: 0.1`, `reasoning_effort: "none"`); measured on
+gfx1101 against the ISA page, both a tag load and a path load answer on
+`content` (`reasoning_content` empty). Generation stops on the
+checkpoint's end token (`<|im_end|>`, id 2), so no stop strings are needed. Two
+serve limits apply when attaching the Python client:
 `logprobs` are refused (400) — set `SURYA_INFERENCE_LOGPROBS=0`, per-block
 `confidence` then comes back null — and guided layout/table_rec
 (`SURYA_GUIDED_LAYOUT=1`) is refused because the schemas use `pattern`, outside

@@ -1349,7 +1349,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         Some("HIPFIRE_SERVE_OCR_FORMAT"),
-        "Decode compact-block (Surya-2.5) answers on non-streaming /v1/chat/completions: html = one <div data-bbox data-label> per block, blocks = JSON array, raw = the model's own special tokens (default). A request's own ocr_format wins over this default."
+        "Decode compact-block (Surya-2.5) answers: html = one <div data-bbox data-label> per block, blocks = a JSON array of {label, bbox, html, truncated}, raw = the model's own special tokens (default). Applies to /v1/chat/completions, /v1/messages and /v1/responses, streamed or not (a stream decodes per block); a request's own ocr_format wins over this default."
     ),
     field!(
         "serve.max_queue",
