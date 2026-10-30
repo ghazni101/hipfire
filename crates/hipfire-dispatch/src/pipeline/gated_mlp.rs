@@ -703,7 +703,7 @@ fn swiglu_down_residual(
         // SiLU*up+rotate producer, then the IU4 residual GEMV (bit-exact to the
         // MQ4V2 residual kernel). Replaces the generic arm's silu + rotate +
         // GEMV + per-token alloc + add + free.
-        DType::IU4G256 if w_down.awq_scale.is_none() && !rdna_compute::iu4_decode_dot8() => {
+        DType::IU4G256 if w_down.awq_scale.is_none() && !rdna_compute::iu4_decode_w4a4() => {
             gpu.ensure_mq_signs().map_err(hip)?;
             let xr = mq_rotation_scratch(gpu)?;
             gpu.fused_silu_mul_rotate_mq(gate, up, &xr, w_down.k)

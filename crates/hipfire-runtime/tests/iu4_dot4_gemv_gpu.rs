@@ -63,6 +63,7 @@ fn run(gpu: &mut Gpu, which: &str, w: &rdna_compute::GpuTensor, xd: &rdna_comput
     let res = seed.is_some();
     match (which, res) {
         ("dot4", r) => gpu.gemv_iu4g256_dot4(w, xd, &y, m, k, r).unwrap(),
+        ("dot4q", r) => gpu.gemv_iu4g256_dot4q(w, xd, &y, m, k, r).unwrap(),
         ("dot8", r) => gpu.gemv_iu4g256_dot8(w, xd, &y, m, k, r).unwrap(),
         ("f32", false) => gpu.gemv_iu4g256(w, xd, &y, m, k).unwrap(),
         ("f32", true) => gpu.gemv_iu4g256_residual(w, xd, &y, m, k).unwrap(),
@@ -85,6 +86,25 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
     let f = run(gpu, "f32", &wd, &xd, m, k, None);
     let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let d4r = run(gpu, "dot4", &wd, &xd, m, k, Some(&seed));
+    // v2 (x quantized once): bit-identical to v1, plain and residual, and
+    // the fused 3-matrix launch (third matrix = first ceil(m/2) rows) is
+    // bit-identical to the per-matrix kernel.
+    let q = run(gpu, "dot4q", &wd, &xd, m, k, None);
+    let qb = run(gpu, "dot4q", &wd, &xd, m, k, None);
+    let qr = run(gpu, "dot4q", &wd, &xd, m, k, Some(&seed));
+    let m2 = m.div_ceil(2);
+    let ys: Vec<_> = [m, m, m2].iter().map(|&mm| gpu.alloc_tensor(&[mm], DType::F32).unwrap()).collect();
+    gpu.fused_iu4g256_rows_impl(&[(&wd, &ys[0], m), (&wd, &ys[1], m), (&wd, &ys[2], m2)], &xd, k, true).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let fz: Vec<Vec<f32>> = ys.iter().map(|y| gpu.download_f32(y).unwrap()).collect();
+    for y in ys { gpu.free_tensor(y).ok(); }
+    let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    let q_v1 = bits(&q, &d4);
+    let qr_v1 = bits(&qr, &d4r);
+    let q_det = bits(&q, &qb);
+    let fused = bits(&fz[0], &q) + bits(&fz[1], &q) + bits(&fz[2], &q[..m2]);
+    eprintln!("{label:<28} m={m:<6} k={k:<5} dot4q!=dot4v1 {q_v1} resid {qr_v1} fused!=plain {fused} nondet {q_det}");
+    assert_eq!(q_v1 + qr_v1 + q_det + fused, 0, "{label}: dot4q parity");
 
     let cpu = gemv_iu4_dot4(iu, x, m, k).unwrap();
     let cpu64: Vec<f64> = cpu.iter().map(|&v| v as f64).collect();

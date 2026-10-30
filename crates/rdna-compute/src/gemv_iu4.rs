@@ -46,12 +46,21 @@ pub fn iu4_decode_mode() -> Iu4DecodeMode {
     })
 }
 
-/// True for either integer-activation mode. The dispatcher skips the IU4
-/// fused-row keys and the fused SwiGLU-down arm under it, so every IU4 GEMV
-/// runs the plain (integer) kernel.
+/// True for either integer-activation mode.
 pub fn iu4_decode_dot8() -> bool {
     iu4_decode_mode() != Iu4DecodeMode::F32
 }
+
+/// True only for `dot8`, the original W4A4 route: the dispatcher skips the
+/// IU4 fused-row keys and the fused SwiGLU-down arm and prefill runs per
+/// token, as on the branch before review. `dot4` keeps the fused keys (with
+/// the `_dot4q` kernels) and the MMQ prefill.
+pub fn iu4_decode_w4a4() -> bool {
+    iu4_decode_mode() == Iu4DecodeMode::Dot8
+}
+
+/// Fixed size of `scratch.iu4_a8_x_scratch` (2 B per K element: K <= 131072).
+const IU4_A8_SCRATCH_BYTES: usize = 256 * 1024;
 
 fn check_shape(what: &str, m: usize, k: usize) -> HipResult<()> {
     if m == 0 || k == 0 || k % 256 != 0 {
@@ -76,7 +85,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
             Iu4DecodeMode::Dot8 => "gemv_iu4g256_dot8",
-            Iu4DecodeMode::Dot4 => "gemv_iu4g256_dot4",
+            Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, false),
             Iu4DecodeMode::F32 => "gemv_iu4g256",
         };
         self.gemv_iu4g256_launch(func, a, x, y, m, k)
@@ -94,7 +103,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
             Iu4DecodeMode::Dot8 => "gemv_iu4g256_dot8_residual",
-            Iu4DecodeMode::Dot4 => "gemv_iu4g256_dot4_residual",
+            Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, true),
             Iu4DecodeMode::F32 => "gemv_iu4g256_residual",
         };
         self.gemv_iu4g256_launch(func, a, x, y, m, k)
@@ -113,6 +122,68 @@ impl Gpu {
     ) -> HipResult<()> {
         let func = if residual { "gemv_iu4g256_dot4_residual" } else { "gemv_iu4g256_dot4" };
         self.gemv_iu4g256_launch(func, a, x, y, m, k)
+    }
+
+    /// W4A8 v2: quantize `x` once (`iu4_quant_x_a8`) into the fixed scratch,
+    /// then `gemv_iu4g256_dot4q[_residual]`. Same per-group arithmetic as
+    /// [`Self::gemv_iu4g256_dot4`]. Used by `HIPFIRE_IU4_DECODE=dot4`.
+    pub fn gemv_iu4g256_dot4q(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        check_shape("gemv_iu4g256_dot4q", m, k)?;
+        let qp = self.iu4_quant_x_a8(x.buf.as_ptr(), k)?;
+        let func = if residual { "gemv_iu4g256_dot4q_residual" } else { "gemv_iu4g256_dot4q" };
+        self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), qp, y.buf.as_ptr(), m, k)
+    }
+
+    /// Quantize a length-`k` f32 `x` into `scratch.iu4_a8_x_scratch` and
+    /// return its pointer (valid until the next call on this stream).
+    fn iu4_quant_x_a8(&mut self, xp: *mut c_void, k: usize) -> HipResult<*mut c_void> {
+        if !self.arch_caps.has_iu4_wmma() {
+            return Err(hip_bridge::HipError::new(0, "iu4 dot4: RDNA3/RDNA4 integer dot only"));
+        }
+        if k * 2 > IU4_A8_SCRATCH_BYTES {
+            return Err(hip_bridge::HipError::new(0, "iu4 dot4: K exceeds the fixed x scratch"));
+        }
+        self.bind_thread()?;
+        if self.scratch.iu4_a8_x_scratch.is_none() {
+            let b = self.hip.malloc(IU4_A8_SCRATCH_BYTES)?;
+            self.scratch.iu4_a8_x_scratch = Some(b);
+        }
+        let qp = self.scratch.iu4_a8_x_scratch.as_ref().unwrap().as_ptr();
+        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, "iu4_quant_x_a8")?;
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "iu4_quant_x_a8", k * 6);
+        let result = self.launch_maybe_blob(
+            "iu4_quant_x_a8",
+            [(k / 256) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(qp);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(qp)
     }
 
     /// The W4A4 `v_dot8` kernel, regardless of `HIPFIRE_IU4_DECODE`
@@ -149,8 +220,28 @@ impl Gpu {
         if total > u32::MAX as usize {
             return Err(hip_bridge::HipError::new(0, "fused_iu4g256_rows: grid overflow"));
         }
+        let dot4 = iu4_decode_mode() == Iu4DecodeMode::Dot4;
+        self.fused_iu4g256_rows_impl(mats, x, k, dot4)
+    }
+
+    /// [`Self::fused_iu4g256_rows`] with the kernel chosen explicitly:
+    /// `dot4` = quantize x once, then `fused_iu4g256_dot4q_rows` (W4A8).
+    pub fn fused_iu4g256_rows_impl(
+        &mut self,
+        mats: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        dot4: bool,
+    ) -> HipResult<()> {
+        if mats.is_empty() || mats.len() > 4 {
+            return Err(hip_bridge::HipError::new(0, "fused_iu4g256_rows: 1..=4 matrices"));
+        }
+        let total: usize = mats.iter().map(|m| m.2).sum();
+        check_shape("fused_iu4g256_rows", total, k)?;
+        let fname: &'static str = if dot4 { "fused_iu4g256_dot4q_rows" } else { "fused_iu4g256_rows" };
+        let xp = if dot4 { self.iu4_quant_x_a8(x.buf.as_ptr(), k)? } else { x.buf.as_ptr() };
         self.bind_thread()?;
-        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, "fused_iu4g256_rows")?;
+        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, fname)?;
         let mut ap = [std::ptr::null_mut::<c_void>(); 4];
         let mut yp = [std::ptr::null_mut::<c_void>(); 4];
         let mut mv = [0i32; 4];
@@ -164,7 +255,6 @@ impl Gpu {
             ap[i] = ap[0];
             yp[i] = yp[0];
         }
-        let xp = x.buf.as_ptr();
         let kv = k as i32;
         let mut params: Vec<*mut c_void> = Vec::with_capacity(13);
         for p in &ap {
@@ -182,9 +272,9 @@ impl Gpu {
             .iter()
             .map(|m| crate::profile::gemv_hfq4g256_bytes(m.2, k))
             .sum();
-        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_iu4g256_rows", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", fname, bytes);
         let result = self.launch_maybe_blob(
-            "fused_iu4g256_rows",
+            fname,
             [total as u32, 1, 1],
             [32, 1, 1],
             0,

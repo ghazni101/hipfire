@@ -374,7 +374,7 @@ pub(crate) fn guard_qkv_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
 /// AWQ. Wave32 only (the kernel is a 32-lane block); `force_unfused` wins.
 fn iu4g256_fusion_ok(steps: &[Step], ctx: &DispatchCtx, n: usize) -> bool {
     !ctx.flags.force_unfused
-        && !rdna_compute::iu4_decode_dot8()
+        && !rdna_compute::iu4_decode_w4a4()
         && ctx.arch.is_wave32()
         && steps.len() == n
         && gemv_steps_uniform(steps, DType::IU4G256, true)

@@ -371,7 +371,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gemv_iu4g256",
         kernels::GEMV_IU4G256_SRC,
-        ["gemv_iu4g256", "gemv_iu4g256_residual", "fused_iu4g256_rows", "gemv_iu4g256_dot8", "gemv_iu4g256_dot8_residual", "gemv_iu4g256_dot4", "gemv_iu4g256_dot4_residual"]
+        ["gemv_iu4g256", "gemv_iu4g256_residual", "fused_iu4g256_rows", "gemv_iu4g256_dot8", "gemv_iu4g256_dot8_residual", "gemv_iu4g256_dot4", "gemv_iu4g256_dot4_residual", "iu4_quant_x_a8", "gemv_iu4g256_dot4q", "gemv_iu4g256_dot4q_residual", "fused_iu4g256_dot4q_rows"]
     );
     add!(
         "gemv_mq4g256",

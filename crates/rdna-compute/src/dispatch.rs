@@ -2983,6 +2983,7 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                iu4_a8_x_scratch: None,
                 int4_mmq_generation: 0,
                 int4_mmq_down_scratch: None,
                 int4_mmq_down_scratch_bytes: 0,

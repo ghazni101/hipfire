@@ -530,4 +530,108 @@ extern "C" __global__ void gemv_iu4g256_dot8_residual(
     const float acc = iu4_row_dot(A + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) y[row] = y[row] + acc;
 }
+// ── W4A8 v2 (HIPFIRE_IU4_DECODE=dot4): x quantized once per GEMV ─────────
+// `iu4_quant_x_a8` runs the exact per-lane quantization of iu4_row_dot_a8
+// once (grid K/256, block 32) and stores, per (group g, lane t), int4
+// {a_lo, a_hi, sumq, d_bits} at xq[g*32 + t] (16 B per 8 activations, 2K B
+// for a length-K x). The `_dot4q` kernels then read that instead of
+// requantizing x in every row's wave; the per-group expression is the same
+// as iu4_row_dot_a8, so the result matches the v1 dot4 kernel.
+extern "C" __global__ void iu4_quant_x_a8(
+    const float* __restrict__ x, int4* __restrict__ xq, int K) {
+    const int g = (int)blockIdx.x;
+    const int t = (int)threadIdx.x;
+    if (g >= (K >> 8)) return;
+    const float* xp = x + ((long long)g << 8) + (t << 3);
+    const float4 a = *(const float4*)xp;
+    const float4 b = *(const float4*)(xp + 4);
+    const float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(v[j]));
+    amax = fmaxf(amax, __shfl_xor(amax, 1));
+    amax = fmaxf(amax, __shfl_xor(amax, 2));
+    const float d = amax * (1.0f / 127.0f);
+    const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int q[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) q[j] = max(-127, min(127, (int)rintf(v[j] * id)));
+    const int a_lo = (q[0] & 0xFF) | ((q[2] & 0xFF) << 8) | ((q[4] & 0xFF) << 16) | ((q[6] & 0xFF) << 24);
+    const int a_hi = (q[1] & 0xFF) | ((q[3] & 0xFF) << 8) | ((q[5] & 0xFF) << 16) | ((q[7] & 0xFF) << 24);
+    const int sumq = iu4_dot4(0x01010101, a_hi, iu4_dot4(0x01010101, a_lo, 0));
+    xq[(g << 5) + t] = make_int4(a_lo, a_hi, sumq, __float_as_int(d));
+}
+
+__device__ __forceinline__ float iu4_row_dot_a8q(
+    const unsigned char* __restrict__ A,
+    const int4* __restrict__ xq,
+    int K) {
+    const int groups = K >> 8;
+    const unsigned char* codes = A;
+    const unsigned char* scales = codes + (K >> 1);
+    const int t = (int)threadIdx.x;
+    const int hoff = (t >> 4) << 2;
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int g = 0; g < groups; ++g) {
+        const int4 a = xq[(g << 5) + t];
+        const unsigned pk = *(const unsigned*)(codes + (g << 7) + (t << 2));
+        const unsigned h = *(const unsigned*)(scales + (g << 3) + hoff);
+        const int w_lo = (int)(pk & 0x0F0F0F0Fu);
+        const int w_hi = (int)((pk >> 4) & 0x0F0F0F0Fu);
+        const int dot = iu4_dot4(w_hi, a.y, iu4_dot4(w_lo, a.x, 0));
+        const float d = __int_as_float(a.w);
+        const float sc = __half2float(__ushort_as_half((unsigned short)h));
+        const float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
+        acc += (d * sc) * (float)dot + zp * (d * (float)a.z);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off);
+    return acc;
+}
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_iu4g256_dot4q(
+    const unsigned char* __restrict__ A, const int4* __restrict__ xq,
+    float* __restrict__ y, int M, int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_iu4g256_dot4q_residual(
+    const unsigned char* __restrict__ A, const int4* __restrict__ xq,
+    float* __restrict__ y, int M, int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
+    if (threadIdx.x == 0) y[row] = y[row] + acc;
+}
+
+// Up to four matrices sharing x (gate/up, q/k/v, qkv/z/beta/alpha) in one
+// launch; each output equals gemv_iu4g256_dot4q on that matrix.
+__launch_bounds__(32, 16)
+extern "C" __global__ void fused_iu4g256_dot4q_rows(
+    const unsigned char* __restrict__ A0, const unsigned char* __restrict__ A1,
+    const unsigned char* __restrict__ A2, const unsigned char* __restrict__ A3,
+    const int4* __restrict__ xq,
+    float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3,
+    int M0, int M1, int M2, int M3, int K) {
+    int row = (int)blockIdx.x;
+    const unsigned char* A;
+    float* y;
+    if (row < M0) { A = A0; y = y0; }
+    else if ((row -= M0) < M1) { A = A1; y = y1; }
+    else if ((row -= M1) < M2) { A = A2; y = y2; }
+    else if ((row -= M2) < M3) { A = A3; y = y3; }
+    else return;
+    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
+    if (threadIdx.x == 0) y[row] = acc;
+}
 #endif

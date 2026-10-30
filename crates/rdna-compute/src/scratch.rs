@@ -416,6 +416,11 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// IU4 W4A8 decode (`HIPFIRE_IU4_DECODE=dot4`) quantized-x buffer:
+    /// int4 {a_lo, a_hi, sumq, d} per (256-group, lane), 2 B per K element.
+    /// Allocated once at a fixed size and never regrown, so a captured
+    /// pointer stays valid.
+    pub iu4_a8_x_scratch: Option<DeviceBuffer>,
     /// Dedicated down-proj `block_i4_128` sidecar written by the A4-fused
     /// gate/up SiLU epilogue (`HIPFIRE_V2B_A4_EPI=1`). Never aliases
     /// `int4_mmq_x_scratch` and never bumps `int4_mmq_generation`.
