@@ -2341,10 +2341,142 @@ impl Gpu {
         )
     }
 
-    /// The one S1 count barrier: a stream-ordered D2H of the first `words` i32 of `tensor` on
-    /// the ACTIVE compute stream, then one wait on that stream alone (never the transport
-    /// owner's copy stream, never the legacy/null stream, never a device-wide sync).  Needs an
-    /// active stream.
+    /// Allocate (load time, never shrinking) the host-mapped coherent buffer the S1 count
+    /// barrier's copy kernel writes: two arrays of `words` i32.
+    pub fn reserve_slowlink_count_host(&mut self, words: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let bytes = words.checked_mul(8).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_slowlink_count_host: size overflows")
+        })?;
+        if self
+            .slowlink_count_host
+            .as_ref()
+            .is_some_and(|buf| buf.size() >= bytes)
+        {
+            return Ok(());
+        }
+        self.slowlink_count_host = Some(self.hip.mapped_host_buffer(bytes)?);
+        Ok(())
+    }
+
+    /// Shared body of the S1 count barrier: ONE `copy_regions_u32` kernel launch on the active
+    /// stream copying the first `words` i32 of each source into the host-mapped coherent count
+    /// buffer, one wait on that stream, then the words read out of the mapping.
+    fn slowlink_count_barrier(
+        &mut self,
+        name: &str,
+        sources: &[&GpuTensor],
+        words: usize,
+    ) -> HipResult<Vec<Vec<i32>>> {
+        if self.active_stream.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: the S1 count barrier needs the active compute stream"),
+            ));
+        }
+        let Some(mapped) = self.slowlink_count_host.take() else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: count buffer not reserved at load (reserve_slowlink_count_host)"),
+            ));
+        };
+        let result = self.slowlink_count_barrier_with(name, &mapped, sources, words);
+        self.slowlink_count_host = Some(mapped);
+        result
+    }
+
+    fn slowlink_count_barrier_with(
+        &mut self,
+        name: &str,
+        mapped: &hip_bridge::MappedHostBuffer,
+        sources: &[&GpuTensor],
+        words: usize,
+    ) -> HipResult<Vec<Vec<i32>>> {
+        let bytes = words * 4;
+        if mapped.size() < sources.len() * bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: count buffer not reserved at load (reserve_slowlink_count_host)"),
+            ));
+        }
+        if words == 0 {
+            return Ok(vec![Vec::new(); sources.len()]);
+        }
+        let words32 = u32::try_from(words)
+            .map_err(|_| hip_bridge::HipError::new(0, &format!("{name}: too many words")))?;
+        let base = mapped.device_buffer().as_ptr() as u64;
+        let mut table = [(0u64, 0u64, 0u32); 2];
+        for (index, source) in sources.iter().enumerate() {
+            let dst = base + (index * bytes) as u64;
+            let src = source.buf.as_ptr() as u64;
+            assert!(
+                (dst | src | bytes as u64) % 4 == 0,
+                "{name}: count copy is not 4-byte aligned"
+            );
+            table[index] = (dst, src, words32);
+        }
+        crate::tensor_ops::launch_copy_regions(self, &table[..sources.len()])?;
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()?;
+        // SAFETY: the active stream that ran the copy kernel was just synchronized and no
+        // other GPU write targets this Gpu-owned buffer.
+        let host = unsafe { mapped.host_bytes() };
+        Ok((0..sources.len())
+            .map(|index| {
+                host[index * bytes..(index + 1) * bytes]
+                    .chunks_exact(4)
+                    .map(|word| i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// The SP sorted readback: ONE `copy_regions_u32` kernel on the ACTIVE compute stream
+    /// copying the first `words` i32 of `tensor` into the caller's host-mapped coherent `dst`
+    /// (a kernel, so it never queues behind the transport's SDMA page copies, like the count
+    /// barrier).  No wait: the caller proves completion with a later wait on the same stream
+    /// (the S1 count barrier) before reading `dst`.
+    pub fn slowlink_copy_i32_to_mapped(
+        &mut self,
+        tensor: &GpuTensor,
+        dst: &hip_bridge::MappedHostBuffer,
+        words: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let name = "slowlink_copy_i32_to_mapped";
+        if self.active_stream.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: needs the active compute stream"),
+            ));
+        }
+        let bytes = words
+            .checked_mul(4)
+            .filter(|&bytes| bytes <= tensor.buf.size() && bytes <= dst.size())
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, &format!("{name}: the span exceeds a buffer"))
+            })?;
+        if words == 0 {
+            return Ok(());
+        }
+        let words32 = u32::try_from(words)
+            .map_err(|_| hip_bridge::HipError::new(0, &format!("{name}: too many words")))?;
+        let dst_ptr = dst.device_buffer().as_ptr() as u64;
+        let src_ptr = tensor.buf.as_ptr() as u64;
+        assert!(
+            (dst_ptr | src_ptr | bytes as u64) % 4 == 0,
+            "{name}: copy is not 4-byte aligned"
+        );
+        crate::tensor_ops::launch_copy_regions(self, &[(dst_ptr, src_ptr, words32)])
+    }
+
+    /// The one S1 count barrier: a kernel copy of the first `words` i32 of `tensor` into
+    /// host-mapped coherent memory on the ACTIVE compute stream (so it never queues behind
+    /// the transport's SDMA page copies), then one wait on that stream alone (never the
+    /// transport owner's copy stream, never the legacy/null stream, never a device-wide
+    /// sync).  Needs an active stream and the load-time `reserve_slowlink_count_host`.
     pub fn slowlink_sync_download_i32(
         &mut self,
         tensor: &GpuTensor,
@@ -2360,35 +2492,14 @@ impl Gpu {
                 "slowlink_sync_download_i32: the span exceeds the tensor",
             ));
         }
-        let Some(stream) = self.active_stream.as_ref() else {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "slowlink_sync_download_i32: the S1 count barrier needs the active compute stream",
-            ));
-        };
-        let hip = &self.hip;
-        let host = guarded_async_download(
-            vec![0i32; words],
-            |host, enqueued| {
-                // SAFETY: `host` owns `words * 4` initialized bytes, i32 has no padding, and
-                // the slice is used only for this copy, which the guard joins before `host`
-                // can be dropped (or leaks `host` when the join is unconfirmed).
-                let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, words * 4)
-                };
-                hip.memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
-                *enqueued = true;
-                Ok(())
-            },
-            || hip.stream_synchronize(stream),
-        )?;
-        self.take_device_wait_error()?;
-        Ok(host)
+        let mut out =
+            self.slowlink_count_barrier("slowlink_sync_download_i32", &[tensor], words)?;
+        Ok(out.remove(0))
     }
 
     /// [`Gpu::slowlink_sync_download_i32`] of the first `words` i32 of TWO tensors at the same
-    /// barrier: two stream-ordered D2H copies on the active compute stream, then one wait on
-    /// that stream alone.  Needs an active stream.
+    /// barrier: one kernel launch copying both into host-mapped coherent memory on the active
+    /// compute stream, then one wait on that stream alone.  Needs an active stream.
     pub fn slowlink_sync_download_i32_pair(
         &mut self,
         first: &GpuTensor,
@@ -2403,34 +2514,13 @@ impl Gpu {
                 "slowlink_sync_download_i32_pair: the span exceeds a tensor",
             ));
         }
-        let Some(stream) = self.active_stream.as_ref() else {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "slowlink_sync_download_i32_pair: the S1 count barrier needs the active compute stream",
-            ));
-        };
-        let hip = &self.hip;
-        let (a, b) = guarded_async_download(
-            (vec![0i32; words], vec![0i32; words]),
-            |host, enqueued| {
-                // SAFETY: each `Vec` owns `words * 4` initialized bytes, i32 has no padding,
-                // and each slice is used only for its own copy; the guard joins the stream
-                // (both copies, or the one that was accepted) before either `Vec` can be
-                // dropped, and leaks both when the join is unconfirmed.
-                let (ab, bb) = unsafe {
-                    (
-                        std::slice::from_raw_parts_mut(host.0.as_mut_ptr() as *mut u8, words * 4),
-                        std::slice::from_raw_parts_mut(host.1.as_mut_ptr() as *mut u8, words * 4),
-                    )
-                };
-                hip.memcpy_dtoh_async(ab, &first.buf, Some(stream))?;
-                *enqueued = true;
-                hip.memcpy_dtoh_async(bb, &second.buf, Some(stream))?;
-                Ok(())
-            },
-            || hip.stream_synchronize(stream),
+        let mut out = self.slowlink_count_barrier(
+            "slowlink_sync_download_i32_pair",
+            &[first, second],
+            words,
         )?;
-        self.take_device_wait_error()?;
+        let b = out.remove(1);
+        let a = out.remove(0);
         Ok((a, b))
     }
 }
@@ -2449,6 +2539,7 @@ impl Gpu {
 ///   there is one, else the join error).
 ///
 /// No retry and no suppression: a failure is reported as it occurred.
+#[cfg(test)]
 fn guarded_async_download<B>(
     mut host: B,
     enqueue: impl FnOnce(&mut B, &mut bool) -> HipResult<()>,
@@ -3998,6 +4089,74 @@ pub mod slowlink_selftest {
         }
     }
 
+    /// Row cuts of a sweep whose groups hold `per_group` consecutive experts of `members`
+    /// (ascending expert ids), each group's contiguous grouped-row run chunked at `max_rows`
+    /// (the scheduler's `max_grouped_rows`): the panels of one binding per group.
+    fn group_cuts(c: &Case, members: &[usize], per_group: usize, max_rows: usize) -> Vec<usize> {
+        let mut cuts = vec![0usize];
+        for group in members.chunks(per_group) {
+            let (first, last) = (group[0], group[group.len() - 1]);
+            let (lo, hi) = (c.start[first], c.start[last + 1]);
+            let mut base = lo;
+            while base < hi {
+                base = (base + max_rows).min(hi);
+                cuts.push(base);
+            }
+        }
+        cuts.push(c.g);
+        cuts.sort();
+        cuts.dedup();
+        cuts
+    }
+
+    /// TouchedOnly: S1's per-panel ordered combine over the TOUCHED experts' groups (only the
+    /// experts holding a grouped row are bound; the untouched ones between them hold no row, so
+    /// no panel spans anything but touched rows) equals the canonical combine, and so equals
+    /// the stream-all combine over 32-expert page-order groups, bit for bit.
+    #[test]
+    fn slowlink_combine_touched_only_panels_equal_stream_all_panels() {
+        for seed in [0x70c4_ed1u64, 0xC0B1, 7, 0xFACE] {
+            let case = make_case(seed, 6);
+            let want = canonical(&case);
+            let touched: Vec<usize> = (0..case.n_exp)
+                .filter(|&e| case.start[e + 1] > case.start[e])
+                .collect();
+            let all: Vec<usize> = (0..case.n_exp).collect();
+            assert!(
+                !touched.is_empty() && touched.len() < case.n_exp,
+                "the fixture must leave experts untouched ({} of {})",
+                touched.len(),
+                case.n_exp
+            );
+            for per_group in [1usize, 7, 32] {
+                for max_rows in [16usize, 2048, usize::MAX / 2] {
+                    let sparse = group_cuts(&case, &touched, per_group, max_rows);
+                    let dense = group_cuts(&case, &all, per_group, max_rows);
+                    let sparse_out = run(&case, &sparse, true, true);
+                    let dense_out = run(&case, &dense, true, true);
+                    assert_eq!(
+                        diffs(&sparse_out, &want),
+                        0,
+                        "seed {seed:#x} touched groups of {per_group}, rows <= {max_rows}"
+                    );
+                    assert_eq!(
+                        diffs(&sparse_out, &dense_out),
+                        0,
+                        "seed {seed:#x} touched vs stream-all groups of {per_group}"
+                    );
+                    // The ownership ranges still partition [0, n_exp) in panel order.
+                    let ps = panels(&case, &sparse);
+                    let mut next = 0;
+                    for &(_, _, (lo, hi)) in &ps {
+                        assert_eq!(lo, next);
+                        next = hi;
+                    }
+                    assert_eq!(next, case.n_exp);
+                }
+            }
+        }
+    }
+
     #[test]
     fn slowlink_combine_each_valid_slot_is_applied_exactly_once() {
         for seed in [3u64, 0xFEED] {
@@ -4147,6 +4306,279 @@ pub mod slowlink_selftest {
                 }
             }
         }
+    }
+
+    // ───────────── SP hybrid row table: one canonical combine over a permuted layout ─────────────
+
+    /// The SP layer's hybrid view of a combine case: the rows of the experts for which
+    /// `streamed(e)` holds are GPU-compacted first (each streamed expert's whole grouped extent,
+    /// pads included, in ascending expert order), then the REAL rows of the other experts are
+    /// CPU-compacted (pads never uploaded), with the matching inverse.  Valid-id slots that had
+    /// no valid grouped row and invalid-id slots get -1.  Returns the hybrid case (`g` = H,
+    /// `start` unused, all zero but the last word) and `G_gpu`.
+    #[cfg(test)]
+    fn hybrid_case(c: &Case, streamed: &dyn Fn(usize) -> bool) -> (Case, usize) {
+        let ne = c.n_exp as i32;
+        let mut used = vec![false; c.g];
+        for slot in 0..c.tokens * K {
+            let (id, row) = (c.topk[slot], c.inv[slot]);
+            if (0..ne).contains(&id) && row >= 0 && (row as usize) < c.g {
+                used[row as usize] = true;
+            }
+        }
+        let mut map = vec![-1i32; c.g];
+        let mut old_rows: Vec<usize> = Vec::new();
+        for e in 0..c.n_exp {
+            if streamed(e) {
+                for r in c.start[e]..c.start[e + 1] {
+                    map[r] = old_rows.len() as i32;
+                    old_rows.push(r);
+                }
+            }
+        }
+        let g_gpu = old_rows.len();
+        for e in 0..c.n_exp {
+            if !streamed(e) {
+                for r in c.start[e]..c.start[e + 1] {
+                    if used[r] {
+                        map[r] = old_rows.len() as i32;
+                        old_rows.push(r);
+                    }
+                }
+            }
+        }
+        let hg = old_rows.len();
+        let mut down = vec![0u16; hg * c.h];
+        for (i, &r) in old_rows.iter().enumerate() {
+            down[i * c.h..(i + 1) * c.h].copy_from_slice(&c.down[r * c.h..(r + 1) * c.h]);
+        }
+        let inv = (0..c.tokens * K)
+            .map(|slot| {
+                let (id, row) = (c.topk[slot], c.inv[slot]);
+                if (0..ne).contains(&id) && row >= 0 && (row as usize) < c.g {
+                    map[row as usize]
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        let mut start = vec![0usize; c.n_exp + 1];
+        start[c.n_exp] = hg;
+        let hybrid = Case {
+            tokens: c.tokens,
+            h: c.h,
+            n_exp: c.n_exp,
+            g: hg,
+            start,
+            down,
+            inv,
+            topk: c.topk.clone(),
+            w: c.w.clone(),
+            init: c.init.clone(),
+            class: c.class.clone(),
+        };
+        (hybrid, g_gpu)
+    }
+
+    /// SP's single launch: ONE panel over the whole hybrid table owning `[0, n_exp)`, then the
+    /// terminal products (`Gpu::sp_finish_combine`).
+    #[cfg(test)]
+    fn run_hybrid_single(hy: &Case) -> Vec<f32> {
+        let mut acc: Vec<f32> = hy.init.iter().map(|&v| rbf(v)).collect();
+        apply_panel(hy, &mut acc, 0, hy.g, (0, hy.n_exp));
+        apply_pad(hy, &mut acc);
+        acc
+    }
+
+    /// Expert placements the SP planner can produce: k = U (all streamed), k = 0 (all CPU),
+    /// interleaved, random, and the heavy experts of the fixture on either side.
+    #[cfg(test)]
+    fn placements(n_exp: usize, rng: &mut Rng) -> Vec<(&'static str, Vec<bool>)> {
+        let heavy: Vec<usize> = [7usize, 5, 9, 300, 511].iter().map(|e| e % n_exp).collect();
+        let random = |rng: &mut Rng, per_mille: usize| -> Vec<bool> {
+            (0..n_exp).map(|_| rng.below(1000) < per_mille).collect()
+        };
+        vec![
+            ("all-streamed", vec![true; n_exp]),
+            ("all-cpu", vec![false; n_exp]),
+            ("even-streamed", (0..n_exp).map(|e| e % 2 == 0).collect()),
+            ("odd-streamed", (0..n_exp).map(|e| e % 2 == 1).collect()),
+            (
+                "low-half-streamed",
+                (0..n_exp).map(|e| e < n_exp / 2).collect(),
+            ),
+            ("random-50", random(rng, 500)),
+            ("random-10", random(rng, 100)),
+            ("random-90", random(rng, 900)),
+            (
+                "heavy-on-cpu",
+                (0..n_exp).map(|e| !heavy.contains(&e)).collect(),
+            ),
+            (
+                "heavy-streamed",
+                (0..n_exp).map(|e| heavy.contains(&e)).collect(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn slowlink_sp_hybrid_single_launch_equals_canonical_and_the_ordered_s1_panels() {
+        for (hidden, n_exp, per_class, seeds) in [
+            (
+                DEFAULT_HIDDEN,
+                DEFAULT_EXPERTS,
+                6usize,
+                &[0x51_0e_1u64, 0xC0B1, 7][..],
+            ),
+            (8, 16, 6, &[0xD1A5][..]),
+            (64, 40, 5, &[0xBEEF][..]),
+            (2560, 512, 2, &[0x2560][..]),
+        ] {
+            for &seed in seeds {
+                let case = make_case_dims(seed, per_class, hidden, n_exp);
+                let want = canonical(&case);
+                // The ordered multi-panel S1 result on the original layout (tile-sized panels).
+                let tile_cuts: Vec<usize> = (0..=case.g.div_ceil(16))
+                    .map(|i| (i * 16).min(case.g))
+                    .collect();
+                let ordered = run(&case, &tile_cuts, true, true);
+                assert_eq!(diffs(&ordered, &want), 0, "{hidden}x{n_exp} S1 ordered");
+                let mut rng = Rng(seed ^ 0x5eed);
+                for (name, mask) in placements(n_exp, &mut rng) {
+                    let (hy, g_gpu) = hybrid_case(&case, &|e| mask[e]);
+                    let ctx = format!("{hidden}x{n_exp} seed {seed:#x} {name}");
+                    // GPU rows are the streamed experts' extents, CPU rows come after them.
+                    let want_gpu: usize = (0..n_exp)
+                        .filter(|&e| mask[e])
+                        .map(|e| case.start[e + 1] - case.start[e])
+                        .sum();
+                    assert_eq!(g_gpu, want_gpu, "{ctx}");
+                    assert!(hy.g >= g_gpu, "{ctx}");
+                    // The inverse is a bijection of the valid slots onto hybrid rows, and a slot
+                    // lands in the GPU part exactly when its expert is streamed.
+                    let mut seen = vec![false; hy.g];
+                    for slot in 0..case.tokens * K {
+                        let (id, row) = (case.topk[slot], hy.inv[slot]);
+                        let valid_row = (0..n_exp as i32).contains(&id)
+                            && case.inv[slot] >= 0
+                            && (case.inv[slot] as usize) < case.g;
+                        if !valid_row {
+                            assert_eq!(row, -1, "{ctx} slot {slot}");
+                            continue;
+                        }
+                        assert!(row >= 0 && (row as usize) < hy.g, "{ctx} slot {slot}");
+                        assert!(!seen[row as usize], "{ctx}: hybrid row {row} named twice");
+                        seen[row as usize] = true;
+                        assert_eq!(
+                            (row as usize) < g_gpu,
+                            mask[id as usize],
+                            "{ctx} slot {slot}"
+                        );
+                        // The hybrid row holds the original row's bytes.
+                        let old = case.inv[slot] as usize;
+                        assert_eq!(
+                            hy.down[row as usize * hidden..(row as usize + 1) * hidden],
+                            case.down[old * hidden..(old + 1) * hidden],
+                            "{ctx} slot {slot}"
+                        );
+                    }
+                    // CPU rows are real rows only: every CPU hybrid row is named by a slot.
+                    assert!(
+                        seen[g_gpu..].iter().all(|&s| s),
+                        "{ctx}: an unreferenced CPU row"
+                    );
+                    // One launch over the permuted table == canonical == the ordered S1 panels.
+                    let got = run_hybrid_single(&hy);
+                    assert_eq!(diffs(&got, &want), 0, "{ctx}: vs canonical");
+                    assert_eq!(diffs(&got, &ordered), 0, "{ctx}: vs ordered S1");
+                    // And the monolithic canonical combine over the hybrid layout agrees.
+                    assert_eq!(diffs(&canonical(&hy), &want), 0, "{ctx}: hybrid canonical");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slowlink_sp_hybrid_layout_really_permutes_the_rows() {
+        // The equality above must not be the identity layout in disguise.
+        let case = make_case(0xABCD, 6);
+        let (hy, g_gpu) = hybrid_case(&case, &|e| e % 2 == 0);
+        assert!(g_gpu > 0 && g_gpu < hy.g);
+        assert_ne!(hy.inv, case.inv);
+        assert_ne!(hy.down.len(), case.down.len(), "CPU pads are dropped");
+        let moved = (0..case.tokens * K)
+            .filter(|&s| case.inv[s] >= 0 && hy.inv[s] >= 0 && case.inv[s] != hy.inv[s])
+            .count();
+        assert!(moved > case.tokens, "only {moved} slots moved");
+        // CPU-all drops every pad row: H = the number of real rows.
+        let (all_cpu, g0) = hybrid_case(&case, &|_| false);
+        assert_eq!(g0, 0);
+        let real = (0..case.tokens * K)
+            .filter(|&s| {
+                (0..case.n_exp as i32).contains(&case.topk[s])
+                    && case.inv[s] >= 0
+                    && (case.inv[s] as usize) < case.g
+            })
+            .count();
+        assert_eq!(all_cpu.g, real);
+        assert!(all_cpu.g < case.g);
+        // All streamed keeps every grouped row at its place.
+        let (all_gpu, g_all) = hybrid_case(&case, &|_| true);
+        assert_eq!((g_all, all_gpu.g), (case.g, case.g));
+        assert_eq!(all_gpu.down, case.down);
+    }
+
+    #[test]
+    fn slowlink_sp_hybrid_combine_negative_controls() {
+        let case = make_case(0xBADD, 8);
+        let want = canonical(&case);
+        let (hy, g_gpu) = hybrid_case(&case, &|e| e % 2 == 0);
+        assert!(g_gpu > 0 && g_gpu < hy.g);
+        assert_eq!(diffs(&run_hybrid_single(&hy), &want), 0);
+        // (a) The S1 per-panel immediate combine cannot be used on the hybrid table: applying
+        // the GPU part and the CPU part as two panels, in either order, breaks the ascending
+        // expert order of the tokens that hold both kinds of slots.  The first panel owns the
+        // invalid-row slots, the second none.
+        let two_panels = |first: (usize, usize), second: (usize, usize)| {
+            let mut acc: Vec<f32> = hy.init.iter().map(|&v| rbf(v)).collect();
+            apply_panel(&hy, &mut acc, first.0, first.1, (0, hy.n_exp));
+            apply_panel(&hy, &mut acc, second.0, second.1, (hy.n_exp, hy.n_exp));
+            apply_pad(&hy, &mut acc);
+            acc
+        };
+        let gpu_first = two_panels((0, g_gpu), (g_gpu, hy.g - g_gpu));
+        let cpu_first = two_panels((g_gpu, hy.g - g_gpu), (0, g_gpu));
+        assert!(
+            diffs(&gpu_first, &want) > 0,
+            "GPU-then-CPU panels must differ"
+        );
+        assert!(
+            diffs(&cpu_first, &want) > 0,
+            "CPU-then-GPU panels must differ"
+        );
+        // (b) Reordered ids: the combine order is a function of the expert ids alone, so
+        // reflecting them (ids kept, rows and weights untouched) changes the result.
+        let mut flipped = hybrid_case(&case, &|e| e % 2 == 0).0;
+        let ne = flipped.n_exp as i32;
+        for id in flipped.topk.iter_mut().filter(|id| (0..ne).contains(*id)) {
+            *id = ne - 1 - *id;
+        }
+        assert!(
+            diffs(&run_hybrid_single(&flipped), &want) > 0,
+            "reordered ids must differ"
+        );
+        // (c) A wrong inverse (two valid slots exchange their rows) is visible too.
+        let mut swapped = hybrid_case(&case, &|e| e % 2 == 0).0;
+        let valid: Vec<usize> = (0..swapped.inv.len())
+            .filter(|&s| swapped.inv[s] >= 0 && swapped.class[s / K] == 0)
+            .collect();
+        let (a, b) = (valid[0], valid[valid.len() / 2]);
+        assert_ne!(swapped.inv[a], swapped.inv[b]);
+        swapped.inv.swap(a, b);
+        assert!(
+            diffs(&run_hybrid_single(&swapped), &want) > 0,
+            "swapped rows must differ"
+        );
     }
 
     /// Result of [`canonical_combine_exact`].

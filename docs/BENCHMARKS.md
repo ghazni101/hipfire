@@ -144,6 +144,19 @@ proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
 with DFlash forced on.
 
+## Historical: 7900 XTX small-model snapshot (hipfire only)
+
+**Truth state:** historical
+Same-machine snapshot of hipfire MQ4 with asym3 KV and FlashAttention at
+matched ~140-token and ~530-token prompts and 128-token generation. No
+per-row binary/model hash manifest on this page.
+
+| Model | hf pp128 | hf pp512 | hf decode |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B | **10,861** | **12,962** | **353** |
+| Qwen 3.5 4B | **3,304** | **3,321** | **165** |
+| Qwen 3.5 9B | **1,920** | 1,919 | **122** |
+
 ## Historical: other arches (decode tok/s)
 
 **Truth state:** historical

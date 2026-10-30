@@ -43,6 +43,15 @@ pub enum Wave {
     Wave32,
     Wave64,
 }
+impl Wave {
+    /// Work-items per wavefront.
+    pub fn lanes(self) -> usize {
+        match self {
+            Wave::Wave32 => 32,
+            Wave::Wave64 => 64,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct SymbolId(pub String);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

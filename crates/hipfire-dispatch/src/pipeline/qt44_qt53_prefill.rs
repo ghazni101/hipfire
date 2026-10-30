@@ -1590,8 +1590,8 @@ fn shared_down_row_fold_gfx1201(
 /// experts were verified symmetric at load (the policy says so), the recipe
 /// keeps the BF16 boundaries the kernels implement, the activation is F32,
 /// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4` through the arch's symmetric IU4
-/// descriptor: default on for gfx1151 and gfx1201, default OFF and explicit `=1` only on
-/// gfx1100; >= 512 rows, C2 producers). It replaces scatter,
+/// descriptor: default on for gfx1100, gfx1151 and gfx1201, `=0` off; >= 512 rows, C2
+/// producers). It replaces scatter,
 /// gate/up, unscatter/rotation and down; the combine reads its BF16 rows like
 /// the F16 WMMA arm's.
 fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {

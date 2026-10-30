@@ -102,6 +102,23 @@ pub struct KernelSpec {
     /// CU mode (`workgroup_processor_mode 0`): every wave of a workgroup on one CU.
     pub cu_mode: bool,
 }
+impl KernelSpec {
+    /// Enabled system SGPRs: workgroup id X, plus Y and (when `workgroup_id_z`) Z.
+    pub fn system_sgprs(&self, workgroup_id_z: bool) -> u8 {
+        1 + u8::from(self.system_sgpr_workgroup_id_y) + u8::from(workgroup_id_z)
+    }
+    /// The `.amdhsa_user_sgpr_count` the descriptor declares: `user_sgpr_count` real user SGPRs
+    /// padded per [`Arch::declared_user_sgprs`] (gfx1100: user + system >= 16, as LLVM).
+    pub fn declared_user_sgprs(&self, workgroup_id_z: bool) -> u8 {
+        self.arch
+            .declared_user_sgprs(self.user_sgpr_count, self.system_sgprs(workgroup_id_z))
+    }
+    /// Where the hardware puts the workgroup ids of this kernel (after the DECLARED user SGPRs).
+    pub fn workgroup_ids(&self, workgroup_id_z: bool) -> Result<crate::arch::WgIds, String> {
+        self.arch
+            .workgroup_ids(self.declared_user_sgprs(workgroup_id_z))
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryScope {
     LdsOnly,

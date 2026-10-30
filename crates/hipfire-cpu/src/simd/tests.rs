@@ -1472,6 +1472,57 @@ mod exact {
         }
     }
 
+    /// FNV-1a over the bit patterns of `out`.
+    fn digest(out: &[f32]) -> u64 {
+        out.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+            (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Old-vs-new byte equality on the real D2 arm shapes. The digests were
+    /// produced by the pre-D1 tree (`138e20f1b3`: nibble-plane decode, one
+    /// 128-block at a time) on these seeded weights/activations through the
+    /// shared sourced GEMV: Flash-Next gate_up `[1280, 2560]` (qt 44) and down
+    /// `[2560, 640]` (qt 53), four experts carrying 1, 2, 3 and 4 activation
+    /// rows (the R1..R4 windows). Any change to a per-output FMA order, chain
+    /// split, lane join or affine association moves a digest.
+    #[test]
+    fn flash_next_arm_shapes_match_the_pre_d1_golden_digests() {
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, None) {
+            eprintln!("skip: AVX2/F16C absent on this runner");
+            return;
+        }
+        let mut got = Vec::new();
+        for (q, m, k) in [
+            (CpuQuant::Mq4G256V2, 1280usize, 2560usize),
+            (CpuQuant::Mq4G128V2, 2560, 640),
+        ] {
+            let mut rng = Rng(0xD1_0000 + k as u64);
+            let jobs: Vec<Job> = (1..=4usize)
+                .map(|n| Job {
+                    q,
+                    packed: random_weights(q, m, k, &mut rng),
+                    xs: (0..n)
+                        .map(|t| activations(k, (n + t) % MODES, &mut rng))
+                        .collect(),
+                })
+                .collect();
+            let src = Src(jobs);
+            let total: usize = (1..=4usize).map(|n| m * n).sum();
+            let mut out = vec![0.0f32; total];
+            gemv_shared_sourced(m, k, &mut out, &src, None);
+            got.push(digest(&out));
+        }
+        assert_eq!(
+            got, GOLDEN_FLASH_NEXT_DIGESTS,
+            "pre-D1 golden digests moved: {got:#x?}"
+        );
+    }
+
+    /// Digests of [`flash_next_arm_shapes_match_the_pre_d1_golden_digests`]
+    /// (qt 44 gate_up, qt 53 down) from the pre-D1 tree.
+    const GOLDEN_FLASH_NEXT_DIGESTS: [u64; 2] = [0x5c98_d582_2f42_3f75, 0x581f_60e2_3a00_487c];
+
     /// The whole sourced path (Σx prep + dedup, rayon blocking, tier dispatch)
     /// reproduces, bit for bit, the AVX2 uncached row dots, for 1..=9, 16 and 17
     /// activation rows per job (past each tier's multi-token group width, odd

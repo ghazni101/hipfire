@@ -1068,6 +1068,10 @@ impl KernelKey {
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => ArchPredicate::Always,
+            // ggml block formats (GGUF-native, no kernel yet): no key resolves
+            // them, so resolution fails with MissingImpl; explicit so a future
+            // ggml route has to decide its arch gate.
+            GgmlQ4K | GgmlQ5K | GgmlQ6K | GgmlQ8_0 | GgmlIQ4XS => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

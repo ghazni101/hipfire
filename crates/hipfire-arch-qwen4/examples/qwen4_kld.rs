@@ -83,9 +83,10 @@
 //! `--untiered d2|pcie` is the shipped un-tiered pair instead (eval/s11ref with `--decode`,
 //! or speed; no `--hot-budget-mib`/`--hotset`): no hot set and no tier lease, the loader's
 //! placement unchanged (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` unset or `auto` resolves the
-//! product's automatic placement through `expert_residency::incumbent_auto_resident_layers`;
-//! a fixed count is an optional diagnostic override, set the same in both arms). The
-//! resolved placement is read back from the placed
+//! product's automatic placement through `expert_residency::incumbent_auto_resident_layers`,
+//! which also leaves this tool's own logits buffer free (`logit_rows` x vocab F32: ~1.9 GiB for a
+//! 2048-row all-row eval chunk, which the product never holds); a fixed count is an optional
+//! diagnostic override, set the same in both arms). The resolved placement is read back from the placed
 //! weights and recorded as `host_placed_trunk_layers` + `placement_digest`; a pair is only
 //! comparable when both digests are equal. The same code24 decode n10 route runs in both
 //! arms, so the pair differs only in who multiplies the host-mapped experts. `d2` needs
@@ -856,6 +857,9 @@ impl Model {
                             slab_recipe,
                             false,
                         ),
+                        // The all-row logits `Self::load` allocates after the placement
+                        // (the product keeps the last row only): left free by the placement.
+                        residency::all_row_logits_bytes(logit_rows, receipt.config.vocab_size)?,
                     )?;
                     match resolved {
                         Some(layers) => {
@@ -1370,7 +1374,18 @@ fn score(
             "--tail-split must be below the window length {n_ctx}"
         ));
     }
-    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot, pin)?;
+    // KV capacity large enough that short-context corpora (code24, n_ctx 512) load through S1
+    // and exercise SP, with the PRODUCT S1 window. S1's minimum request (1537) is not enough:
+    // the admitted window's route region also carries the K1+tail cohort rows (~3.1K on the
+    // SymIu4 profile), so a 1537-row window is refused as degenerate. And the window is
+    // `min(S1_WINDOW_ROWS, max_seq)`, so a 4096-row `max_seq` gives a 4096-row window whose
+    // route region (96 MiB on the SymIu4 profile) fits only 769 hybrid-SP rows (< the 2048
+    // minimum): `sp: region fit` declines and SP never runs. The product window
+    // (16,896 rows, the one a 262,144-token load admits) fits 4,507 rows on SymIu4 and 5,376 on
+    // the F16 route. Logit rows stay n_ctx: scores are unchanged.
+    const KLD_S1_MAX_SEQ: usize = hipfire_arch_qwen4::slowlink_admission::S1_WINDOW_ROWS;
+    let max_seq = n_ctx.max(KLD_S1_MAX_SEQ);
+    let mut m = Model::load(model, max_seq, n_ctx, ple_hot, pin)?;
     emit_untiered_receipt(&m, output)?;
     if m.vocab != h.n_vocab {
         return Err(format!(

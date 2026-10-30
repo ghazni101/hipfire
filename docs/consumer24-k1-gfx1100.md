@@ -146,8 +146,12 @@ contains `0xf` in each negated lane, with lane 7 sign equal to the parity
 of the seven explicit sign bits. No codebook pointer is added to the ABI.
 
 gfx1100-forced differences from the gfx1201 emission, and nothing else:
-workgroup ids are the system SGPRs `s2` (x) and `s3` (y) (declared in the
-register plan, no `ttmp` and no `0xffff` mask); the barrier is `s_barrier`;
+workgroup ids are the system SGPRs after the declared user SGPRs (declared in the
+register plan, no `ttmp` and no `0xffff` mask): gfx1100's
+`FeatureUserSGPRInit16Bug` pads the user SGPRs to user + system >= 16, so x / y
+are `s14` / `s15` (the `_t8` entries, which also enable z: `s13` / `s14` /
+`s15`) and the kernarg pointer block is `s[88:95]` instead of `s[8:15]`
+(gfx1151 keeps `s2` / `s3` / `s4` and `s[8:15]`); the barrier is `s_barrier`;
 waits and `s_waitcnt_depctr`/`s_delay_alu` hazard guards are the builder's
 gfx11 ones (never hand-placed). The f16 scale widening is
 `v_cvt_f32_f16_e64 vD, vD.l` on both architectures, the spelling the

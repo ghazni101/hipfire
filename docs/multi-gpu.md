@@ -898,6 +898,21 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
 
 - **AR decode** and **pipelined prefill**: a prompt is cut into canonical chunks
   that flow through the bands in order; only the last chunk computes the head.
+  **gfx1201 prefill chunk:** under PP the canonical chunk defaults to **4096
+  rows** (a single card stays at 16384 rows under the compact plan), so a 32K
+  prompt is eight chunks in flight instead of two or three and the band pipeline
+  fills. An explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins (`=16384` restores the
+  previous chunk); the bands and the mesh planner share one chunk. Output equals a
+  single-card run at the same chunk. Decode is unchanged (~54 tok/s). Measured
+  2026-10-28, 4x R9700 (PP4), packed mq4-xts, beta c7c44097cc + explicit chunk
+  env, greedy, one fresh process per arm:
+
+  | Prefill tok/s | 16384 rows (old default) | 8192 rows | 4096 rows (new default) |
+  |---|---:|---:|---:|
+  | 8K | 4,838 | 6,039 | 6,709 |
+  | 32K | 6,953 | 14,026 | 16,657 |
+  | 64K | 13,445 | 16,735 | 18,260 |
+  | 131K | 15,194 | 17,444 | 17,885 |
 - **Per-band sessions**: every band attaches its own in-memory session cache
   (`memory.session_cache_bytes`, an independent opportunistic budget per band, see
   [`env-vars.md`](env-vars.md)); only client-committed all-band snapshots are
@@ -1206,6 +1221,30 @@ protocol) is on by default; on every other topology both default off:
   the signal tape and the exchange (about 80 KiB for Qwen3.8-27B). Enabling
   this control implies the alternating protocol unless
   `HIPFIRE_TP_PEER_ALTERNATING=0`.
+- `HIPFIRE_TP_PEER_PUSH` (tri-state): inside the whole-token graph each rank
+  pushes its partial into the other ranks' fine-grained VRAM mailboxes as
+  16-byte tagged granules and polls its own mailbox, replacing the host
+  exchange (TP2) or the pack/copy/fold/event route (TP4) with one kernel per
+  rank and no fence. On a gfx1201 pair the f32 variant is bit-identical and
+  drops the in-graph collective chain from 9.2 to 4.3 us, but 27B decode gains
+  only 0.6%, so it is opt-in there. On four gfx1201 ranks it is the default:
+  the bf16 variant is what lets the whole-token graph capture a TP4 decode
+  token (next paragraph).
+
+On four exact gfx1201 ranks on the generic mesh route the whole-token graph is
+also the default (`HIPFIRE_TP_FULL_GRAPH=0` or `HIPFIRE_TP_PEER_PUSH=0` restore
+the eager event route). The bf16 exchange is unchanged (`x + (r(p0) + r(p1) +
+r(p2) + r(p3))`, rank order, fp32 adds), computed by one `tp_peer_pushn`
+kernel per rank per collective: the rank packs its partial to bf16, writes it
+to its slot of every peer's mailbox bank, waits (bounded) for the three other
+slots in its own mailbox, and folds. Two banks alternate with a device-resident
+per-rank generation, so a replayed graph needs no host reset; a rank that saw
+all peers' granules for generation g knows each peer finished g-1. The load
+qualifies the mailboxes with 64 eager exchanges compared bit for bit with a
+host replay. The pushes go to one peer at a time with a fence and barrier between
+destinations (concurrent write-through stores to several peers collapse to
+about 1.5 GB/s per sender). Decode of Qwen3.8-27B mq4-xts on 4x R9700:
+54.0 -> 77.5 tok/s (+43%).
 
 On exact homogeneous gfx1100 and gfx1201 pairs the whole-token graph is the
 default; `HIPFIRE_TP_FULL_GRAPH=0` restores the segmented-graph route with

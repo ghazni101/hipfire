@@ -49,7 +49,7 @@ PYTEST_PATHS=(
     scripts/test_registry_gen_ornith.py scripts/test_registry_gen_vision.py
     scripts/test_registry_gen_coverage.py scripts/test_registry_gen_decider.py
     scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
-    scripts/test_check_changelog.py scripts/test_kernel_idproof.py
+    scripts/test_check_changelog.py scripts/test_check_conflict_markers.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
     scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
 )

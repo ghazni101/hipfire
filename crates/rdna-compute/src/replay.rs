@@ -35,6 +35,7 @@ use redline_dispatch::{
 
 use crate::code_object::{CodeObjectId, RecordedArtifact};
 use crate::dispatch::VmmResourceMove;
+use crate::pm4_ledger;
 
 pub(crate) mod railgun_lower;
 pub(crate) mod railgun_shadow;
@@ -968,6 +969,26 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
         ]);
     }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // A0..A3 weights, x, norm weight, signs1, signs2 (read); y0..y3 and
+        // the rotated x_rot (write). A qkv (3-source) launch passes A3/y3 as
+        // aliases of A2/y2 with m3 == 0.
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            read(48),
+            read(56),
+            write(64),
+            write(72),
+            write(80),
+            write(88),
+            write(96),
+        ]);
+    }
     if matches!(
         kernel,
         "gemm_mq4g256v2_moe_grouped_wmma_k2"
@@ -1880,6 +1901,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
     ) {
         return Some(64);
+    }
+    if kernel == "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201" {
+        // 13 ptr + m0..m3 + nw + eps = 128 explicit bytes (no hidden arguments).
+        return Some(128);
     }
     if matches!(
         kernel,
@@ -4638,6 +4663,34 @@ fn replay_sequence_hash<'a>(launches: impl IntoIterator<Item = &'a RecordedHipLa
     hash
 }
 
+/// One retained launch as a dispatch-ledger row (`HIPFIRE_REDLINE_LEDGER`).
+/// Only called with the ledger on, at prepare time.
+fn ledger_dispatch_row(launch: &RecordedHipLaunch) -> pm4_ledger::DispatchRow {
+    pm4_ledger::DispatchRow {
+        kernel: launch.kernel.clone(),
+        artifact: pm4_ledger::ArtifactRow::of(
+            launch
+                .artifact
+                .as_deref()
+                .expect("prepare resolved an owning code object for every retained launch"),
+        ),
+        grid: launch.grid,
+        block: launch.block,
+        shared_mem: launch.shared_mem,
+        grid_binding: launch.grid_binding.map(
+            |ReplayGridBinding::PositionCeilDiv {
+                 axis,
+                 addend,
+                 divisor,
+             }| pm4_ledger::GridBindingRow {
+                axis,
+                addend,
+                divisor,
+            },
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReplayObservation {
     pub count: u64,
@@ -5150,7 +5203,25 @@ impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled_checked(
         &mut self,
     ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
-        if dispatch_profile_enabled() {
+        // SAFETY: same contract as this method's # Safety.
+        unsafe { self.replay_and_wait_profiled_spans(None) }
+    }
+
+    /// [`Self::replay_and_wait_profiled_checked`] that also hands the
+    /// per-dispatch spans of an instrumented single-queue tape to `spans_out`
+    /// (`HIPFIRE_REDLINE_LEDGER_TIMING`). `None` is exactly the historical
+    /// behaviour; a phased tape has no per-dispatch spans and leaves
+    /// `spans_out` untouched.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait_profiled_checked`].
+    unsafe fn replay_and_wait_profiled_spans(
+        &mut self,
+        spans_out: Option<&mut Vec<u64>>,
+    ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
+        let diagnostic = dispatch_profile_enabled();
+        if diagnostic || spans_out.is_some() {
             if let Self::Single(graph) = self {
                 // Execute the instrumented graph once. Reuse the same timestamp
                 // vector for whole-tape timing and the one-line legacy report.
@@ -5159,8 +5230,12 @@ impl PreparedPm4Graph {
                     .map_err(|(error, q)| (error, q))?;
                 static REPORTED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if diagnostic && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     report_dispatch_spans(&spans);
+                }
+                if let Some(out) = spans_out {
+                    out.clear();
+                    out.extend_from_slice(&spans);
                 }
                 return Ok(timing);
             }
@@ -5293,6 +5368,9 @@ pub struct PreparedPm4Replay {
     /// and u32 dynamic bindings). Precomputed once at prepare time.
     bound_exempt_ranges: Vec<Vec<(usize, usize)>>,
     encoded_revision: BindingRevision,
+    /// Replay counters of the dispatch ledger (`HIPFIRE_REDLINE_LEDGER`);
+    /// `None` unless the ledger is on, in which case replay does nothing extra.
+    ledger: Option<std::sync::Arc<pm4_ledger::Program>>,
 }
 
 impl PreparedPm4Replay {
@@ -5401,16 +5479,26 @@ impl PreparedPm4Replay {
         }
         crate::gap_timing::add_since(crate::gap_timing::Slot::Patch, patch_started);
         let wait_started = crate::gap_timing::now();
+        // Ledger timing mode (`HIPFIRE_REDLINE_LEDGER_TIMING`) asks the
+        // instrumented tape for its per-dispatch spans; otherwise `None` and
+        // an empty (unallocated) vector: the historical replay.
+        let mut ledger_spans = Vec::new();
+        let want_spans = self
+            .ledger
+            .as_deref()
+            .is_some_and(pm4_ledger::Program::wants_spans);
         // SAFETY: forwarded from the caller that owns the model allocations.
-        let result = unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(
-            |(error, quiescence)| RetainedReplayFailure {
-                error: error.to_string(),
-                quiescence: match quiescence {
-                    Quiescence::Proven => ReplayQuiescence::Proven,
-                    Quiescence::Unknown => ReplayQuiescence::Unknown,
-                },
+        let result = unsafe {
+            self.graph
+                .replay_and_wait_profiled_spans(want_spans.then_some(&mut ledger_spans))
+        }
+        .map_err(|(error, quiescence)| RetainedReplayFailure {
+            error: error.to_string(),
+            quiescence: match quiescence {
+                Quiescence::Proven => ReplayQuiescence::Proven,
+                Quiescence::Unknown => ReplayQuiescence::Unknown,
             },
-        );
+        });
         crate::gap_timing::add_since(crate::gap_timing::Slot::SubmitWait, wait_started);
         if let Ok(timing) = &result {
             crate::gap_timing::add_ns(
@@ -5420,6 +5508,16 @@ impl PreparedPm4Replay {
                     .saturating_sub(timing.first_start)
                     .saturating_mul(1_000_000_000)
                     / timing.frequency_hz.max(1),
+            );
+        }
+        if let (Some(ledger), Ok(timing)) = (self.ledger.as_deref(), &result) {
+            ledger.note_replay(
+                timing
+                    .last_end
+                    .saturating_sub(timing.first_start)
+                    .saturating_mul(1_000_000_000)
+                    / timing.frequency_hz.max(1),
+                &ledger_spans,
             );
         }
         result
@@ -6350,6 +6448,9 @@ impl ReplayController {
         dispatch_profile: bool,
         allow_uncalibrated: bool,
     ) -> Result<(usize, u32, u64), String> {
+        // `HIPFIRE_REDLINE_LEDGER_TIMING=1` (ledger on): prepare the per-dispatch
+        // timestamp tape. Perturbing and recorded as such; off unless requested.
+        let dispatch_profile = dispatch_profile || pm4_ledger::timing_requested();
         if !allow_uncalibrated && !self.position_bindings_calibrated {
             return Err(
                 "position bindings not calibrated; call synthesize_position_bindings or explicitly opt out via prepare_pm4_prefix_allow_uncalibrated".to_owned(),
@@ -6602,6 +6703,9 @@ impl ReplayController {
         }
         let mut dependency_fence = None;
         let mut dispatch_boundaries = Vec::new();
+        // Execution-slot -> recorded-index map for the ledger, only when the
+        // single-IB reorder permutes the tape and the ledger is on.
+        let mut ledger_exec_order: Option<Vec<usize>> = None;
         let (graph, command_dwords) = if queue_limit == 1 {
             let recorded = &self.recorded[..prefix];
             let reorder_window = pm4_single_ib_reorder_from_config(device.name());
@@ -6633,6 +6737,9 @@ impl ReplayController {
                     order
                 }
             };
+            if reorder_window.is_some() && pm4_ledger::enabled() {
+                ledger_exec_order = Some(order.clone());
+            }
             let dependency_mode = match gfx1010_dependency {
                 Gfx1010DependencyPolicy::ReleaseWait => {
                     let fence = pool
@@ -7230,6 +7337,29 @@ impl ReplayController {
             &dynamic_kernarg_bindings,
             &dynamic_gdn_frames,
         );
+        // Retain-time dispatch ledger (`HIPFIRE_REDLINE_LEDGER`): one row per
+        // retained dispatch, written here and never on the replay path.
+        let ledger = if pm4_ledger::enabled() {
+            pm4_ledger::register_program(
+                pm4_ledger::ProgramMeta {
+                    device_ordinal,
+                    arch: device.name().to_owned(),
+                    pm4_architecture: format!("{pm4_architecture:?}"),
+                    command_dwords,
+                    queue_id,
+                    queues: graph.queue_count(),
+                    phases: graph.phase_count(),
+                    sequence_hash: replay_sequence_hash(self.recorded.iter().take(prefix)),
+                    exec_order: ledger_exec_order,
+                    timing: dispatch_profile,
+                    pid: std::process::id(),
+                    prepared_unix_ms: pm4_ledger::unix_ms(),
+                },
+                self.recorded.iter().take(prefix).map(ledger_dispatch_row),
+            )
+        } else {
+            None
+        };
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -7249,6 +7379,7 @@ impl ReplayController {
             bound_explicit_lens,
             bound_exempt_ranges,
             encoded_revision: self.binding_revision,
+            ledger,
         });
         self.route_identities_sealed = true;
         self.state = ReplayState::Ready;
@@ -7426,6 +7557,9 @@ impl ReplayController {
             }
         }
         // Quiescence proven: safe to release retained resources.
+        // Replays are complete: persist the ledger's cumulative counters (no-op
+        // unless `HIPFIRE_REDLINE_LEDGER` is set).
+        pm4_ledger::flush_all();
         self.prepared_pm4 = None;
         self.prepared = None;
         self.prepared_max_position = None;
@@ -8823,6 +8957,7 @@ mod tests {
         "fused_qkvza_mq4g256v2_k2048_hoist_x32_gfx1100",
         "fused_qkv_mq4g256v2",
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
+        "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_k5120_gfx1100",
         "fused_gate_up_mq4g256v2_k5120_gfx1201",

@@ -643,6 +643,14 @@ These behaviors shipped in 0.4.2 and are in every later release.
   logs one reason and runs GPU-only. Every other architecture resolves auto
   silently to off. `off` is the kill switch; timings are fixture-bound and live
   in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
+- **Qwen3.8-Flash-Next PLE residency.** The artifact embeds its PLE rows as
+  Q8 (54.4 GB); `hipfire ple derive --format q4 <model>` writes a `.ple-q4`
+  sidecar beside it that the load picks up automatically, dropping those rows
+  to 28.8 GB. Measured on a gfx1151 host (Ryzen AI Max+ PRO 495, 192 GB):
+  25.6 GB less residency, the load admits at 154.7 GB free, and generation
+  stays coherent - but numerics change (a greedy paragraph differs from the
+  embedded-q8 run), so treat the sidecar as a capacity lever for 128 GB-class
+  hosts, not a free default.
 - **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
   `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
   holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16

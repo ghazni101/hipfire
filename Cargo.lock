@@ -1582,6 +1582,7 @@ name = "hipfire-client"
 version = "0.4.4"
 dependencies = [
  "hipfire-config",
+ "libc",
  "serde_json",
  "thiserror 2.0.18",
  "ureq",
@@ -1764,6 +1765,7 @@ dependencies = [
  "saddle-core",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2733,6 +2735,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_json",
+ "sha2",
  "syn 2.0.119",
 ]
 

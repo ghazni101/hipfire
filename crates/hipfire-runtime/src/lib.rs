@@ -133,6 +133,7 @@ pub mod weight_store;
 
 pub mod emit_text;
 pub mod eos_filter;
+pub mod prefill_progress;
 pub mod prompt_frame;
 pub mod semantic;
 pub mod session_table;

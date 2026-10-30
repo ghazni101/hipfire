@@ -49,7 +49,14 @@ Branch protection on `master` requires these CI job names from
 
 plus **one approving review**.
 
-Those three jobs stay required. Do not disable them. `hw-gate` is **not**
+Those three jobs stay required. Do not disable them. `build` and
+`unit + integration tests (no GPU)` are aggregate checks over the matrix jobs
+`build shard (...)` / `test shard (...)`: they pass only if every shard passes,
+so the check names above are stable while the shards are rebalanced. Test
+shards run under the `ci` Cargo profile (`cargo test --profile ci`: optimised
+where the exhaustive CPU oracle tests live, debug assertions and overflow
+checks on). Local equivalent of one shard: copy its command from the matrix in
+[`ci.yml`](../.github/workflows/ci.yml). `hw-gate` is **not**
 among the required checks: a missing, skipped, or unsuccessful hw-gate run
 is not a merge blocker by itself, and a successful hw-gate run is not
 automatic acceptance, auto-promotion, or a substitute for the approving

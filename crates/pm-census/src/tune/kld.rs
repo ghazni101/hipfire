@@ -4,10 +4,15 @@
 
 //! R7 model-level KLD/state evidence: HFKSEQ v2 reader, paired per-chunk KLD
 //! statistics, evidence assembly (re-reading and hash-checking both kldseq
-//! files) and the `pm-census tune kld|promote|trial-table` CLI.
+//! files) and the `pm-census tune kld|kld-power|promote|trial-table` CLI.
+//!
+//! `tune kld` defaults to the R7 per-chunk Student-t statistic (`--stat
+//! per-chunk`); `--stat token-bootstrap` runs the R9 token-level statistic of
+//! [`super::ktok`] (statistic, gate and the power calculation are documented
+//! there) and `tune kld-power` prints the sample-size arithmetic alone.
 
 use super::{
-    promote, store, ClaimPolicyV1, KldRunV1, KldStateEvidenceV1, PairedKldV1, TuneRecordV1,
+    ktok, promote, store, ClaimPolicyV1, KldRunV1, KldStateEvidenceV1, PairedKldV1, TuneRecordV1,
     RECORD_SCHEMA,
 };
 use std::path::Path;
@@ -15,7 +20,7 @@ use std::path::Path;
 const MAGIC: &[u8; 8] = b"HFKSEQ\0\0";
 const HEADER: usize = 20;
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
@@ -115,7 +120,7 @@ pub fn paired(inc: &[(f64, f64, f64)], cand: &[(f64, f64, f64)]) -> Result<Paire
     })
 }
 
-fn read_verified(run: &KldRunV1) -> Result<Vec<u8>, String> {
+pub(super) fn read_verified(run: &KldRunV1) -> Result<Vec<u8>, String> {
     let b = std::fs::read(&run.kldseq_path)
         .map_err(|e| format!("read {} ({}): {e}", run.kldseq_path, run.role))?;
     let sha = sha256_hex(&b);
@@ -194,27 +199,208 @@ fn latest_record(store_path: &str, id: &str) -> Result<TuneRecordV1, String> {
         .ok_or_else(|| format!("no record for candidate id {id} in {store_path}"))
 }
 
-const USAGE: &str = "usage:\n  pm-census tune kld --grade screen|promotion --incumbent RUN.json --candidate RUN.json --out EV.json\n  pm-census tune trial-table --store S.jsonl --candidate-id ID --out DIR\n  pm-census tune promote --store S.jsonl --candidate-id ID [--kld EV.json] [--policy P.json]";
+const USAGE: &str = "usage:\n  pm-census tune kld --grade screen|promotion --incumbent RUN.json --candidate RUN.json --out EV.json\n  pm-census tune kld --stat token-bootstrap --grade screen|promotion --stratum LABEL=INC_RUN.json,CAND_RUN.json [--stratum ...] --out EV.json [--margin 0.0005] [--alpha 0.05] [--power 0.8] [--seed N]\n  pm-census tune kld-power --sd SD --margin M [--alpha 0.05] [--power 0.8] [--delta 0] [--tokens-per-chunk 1023] [--available N]\n  pm-census tune trial-table --store S.jsonl --candidate-id ID --out DIR\n  pm-census tune promote --store S.jsonl --candidate-id ID [--kld EV.json] [--kld-token EV.json] [--policy P.json]";
 
-/// `pm-census tune kld|trial-table|promote ...` (`args[0]` is the subcommand).
+/// Like [`flags`] but a flag may repeat (values kept in order).
+fn flags_multi(
+    args: &[String],
+    allowed: &[&str],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let mut m: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut i = 0;
+    while i < args.len() {
+        let f = args[i].as_str();
+        let name = f.strip_prefix("--").filter(|n| allowed.contains(n));
+        let Some(name) = name else {
+            return Err(format!("unknown argument {f}"));
+        };
+        let v = args
+            .get(i + 1)
+            .ok_or_else(|| format!("{f} needs a value"))?;
+        m.entry(name.to_owned()).or_default().push(v.clone());
+        i += 2;
+    }
+    Ok(m)
+}
+
+/// The single value of a flag that must not repeat.
+fn one<'a>(
+    m: &'a std::collections::BTreeMap<String, Vec<String>>,
+    k: &str,
+) -> Result<Option<&'a str>, String> {
+    match m.get(k).map(Vec::as_slice) {
+        None => Ok(None),
+        Some([v]) => Ok(Some(v.as_str())),
+        Some(_) => Err(format!("--{k} given more than once")),
+    }
+}
+
+fn need<'a>(
+    m: &'a std::collections::BTreeMap<String, Vec<String>>,
+    k: &str,
+) -> Result<&'a str, String> {
+    one(m, k)?.ok_or_else(|| format!("--{k} is required"))
+}
+
+fn num<T: std::str::FromStr>(v: Option<&str>, k: &str, default: T) -> Result<T, String> {
+    match v {
+        None => Ok(default),
+        Some(s) => s.parse().map_err(|_| format!("--{k}: cannot parse {s:?}")),
+    }
+}
+
+/// `LABEL=INCUMBENT_RUN.json,CANDIDATE_RUN.json`.
+fn parse_stratum(s: &str) -> Result<(String, KldRunV1, KldRunV1), String> {
+    let (label, paths) = s
+        .split_once('=')
+        .ok_or_else(|| format!("--stratum {s:?}: want LABEL=INC_RUN.json,CAND_RUN.json"))?;
+    let (inc, cand) = paths
+        .split_once(',')
+        .ok_or_else(|| format!("--stratum {s:?}: want LABEL=INC_RUN.json,CAND_RUN.json"))?;
+    Ok((label.to_owned(), load(inc)?, load(cand)?))
+}
+
+/// `pm-census tune kld --stat token-bootstrap ...`: build and write the
+/// evidence, print the statistic, per-stratum diagnostics, the power
+/// calculation at the measured stratified chunk sd, and the gate preview.
+fn kld_token_cli(m: &std::collections::BTreeMap<String, Vec<String>>) -> Result<(), String> {
+    if m.contains_key("incumbent") || m.contains_key("candidate") {
+        return Err(
+            "--incumbent/--candidate belong to --stat per-chunk; use --stratum LABEL=INC.json,CAND.json"
+                .to_owned(),
+        );
+    }
+    let strata = m
+        .get("stratum")
+        .ok_or("--stratum is required (repeat once per reference corpus)")?
+        .iter()
+        .map(|s| parse_stratum(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let margin: f64 = num(one(m, "margin")?, "margin", 0.0005)?;
+    let alpha: f64 = num(one(m, "alpha")?, "alpha", 0.05)?;
+    let power: f64 = num(one(m, "power")?, "power", 0.8)?;
+    let seed: u64 = num(one(m, "seed")?, "seed", ktok::DEFAULT_SEED)?;
+    let ev = ktok::build_token_evidence(need(m, "grade")?, strata, ktok::BOOT_B, seed)?;
+    let tokens_per_chunk = ev.strata[0].tokens_per_chunk;
+    let pw = ktok::kld_power(
+        ev.stat.sd_chunk,
+        margin,
+        alpha,
+        power,
+        0.0,
+        tokens_per_chunk,
+        Some(ev.stat.n_chunks),
+    )?;
+    store::write_json(Path::new(need(m, "out")?), &ev)?;
+    let gate = ktok::judge_bounds(&ev, margin);
+    let strata_json: Vec<serde_json::Value> = ev
+        .strata
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "label": s.label,
+                "n_chunks": s.n_chunks,
+                "tokens_per_chunk": s.tokens_per_chunk,
+                "mean_diff": s.mean_diff,
+                "sd_token": s.sd_token,
+                "sd_chunk": s.sd_chunk,
+                "deff": s.deff,
+                "top1pct_abs_share": s.top1pct_abs_share,
+                "exact": s.exact,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "stat": ev.stat,
+        "strata": strata_json,
+        "power": pw,
+        "gate": {
+            "kld_margin": margin,
+            "pass": gate.is_ok(),
+            "reason": gate.err(),
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&doc).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
+
+/// `pm-census tune kld|kld-power|trial-table|promote ...` (`args[0]` is the subcommand).
 pub fn cli(args: &[String]) -> Result<(), String> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(USAGE.to_owned());
     };
     match sub.as_str() {
         "kld" => {
-            let m = flags(rest, &["grade", "incumbent", "candidate", "out"])?;
-            let ev = build_evidence(
-                req(&m, "grade")?,
-                load(req(&m, "incumbent")?)?,
-                load(req(&m, "candidate")?)?,
+            let m = flags_multi(
+                rest,
+                &[
+                    "grade",
+                    "stat",
+                    "incumbent",
+                    "candidate",
+                    "out",
+                    "stratum",
+                    "margin",
+                    "alpha",
+                    "power",
+                    "seed",
+                ],
             )?;
-            let out = req(&m, "out")?;
-            store::write_json(Path::new(out), &ev)?;
-            println!(
-                "{}",
-                serde_json::to_string(&ev.paired).map_err(|e| e.to_string())?
-            );
+            match one(&m, "stat")?.unwrap_or("per-chunk") {
+                "per-chunk" => {
+                    for k in ["stratum", "margin", "alpha", "power", "seed"] {
+                        if m.contains_key(k) {
+                            return Err(format!("--{k} applies to --stat token-bootstrap only"));
+                        }
+                    }
+                    let ev = build_evidence(
+                        need(&m, "grade")?,
+                        load(need(&m, "incumbent")?)?,
+                        load(need(&m, "candidate")?)?,
+                    )?;
+                    store::write_json(Path::new(need(&m, "out")?), &ev)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&ev.paired).map_err(|e| e.to_string())?
+                    );
+                    Ok(())
+                }
+                "token-bootstrap" => kld_token_cli(&m),
+                other => Err(format!("--stat {other:?}, want per-chunk|token-bootstrap")),
+            }
+        }
+        "kld-power" => {
+            let m = flags_multi(
+                rest,
+                &[
+                    "sd",
+                    "margin",
+                    "alpha",
+                    "power",
+                    "delta",
+                    "tokens-per-chunk",
+                    "available",
+                ],
+            )?;
+            let available = one(&m, "available")?
+                .map(|s| {
+                    s.parse::<usize>()
+                        .map_err(|_| format!("--available: cannot parse {s:?}"))
+                })
+                .transpose()?;
+            let p = ktok::kld_power(
+                num(Some(need(&m, "sd")?), "sd", 0.0)?,
+                num(Some(need(&m, "margin")?), "margin", 0.0)?,
+                num(one(&m, "alpha")?, "alpha", 0.05)?,
+                num(one(&m, "power")?, "power", 0.8)?,
+                num(one(&m, "delta")?, "delta", 0.0)?,
+                num(one(&m, "tokens-per-chunk")?, "tokens-per-chunk", 1023)?,
+                available,
+            )?;
+            println!("{}", serde_json::to_string(&p).map_err(|e| e.to_string())?);
             Ok(())
         }
         "trial-table" => {
@@ -226,7 +412,10 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "promote" => {
-            let m = flags(rest, &["store", "candidate-id", "kld", "policy"])?;
+            let m = flags(
+                rest,
+                &["store", "candidate-id", "kld", "kld-token", "policy"],
+            )?;
             let store_path = req(&m, "store")?;
             let mut rec = latest_record(store_path, req(&m, "candidate-id")?)?;
             let policy: ClaimPolicyV1 = match m.get("policy") {
@@ -235,6 +424,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             };
             if let Some(k) = m.get("kld") {
                 rec.evidence.kld_state = Some(load(k)?);
+            }
+            if let Some(k) = m.get("kld-token") {
+                rec.evidence.kld_token = Some(load(k)?);
             }
             let ev = &rec.evidence;
             let numeric = std::iter::once(&ev.discovery)
@@ -318,6 +510,8 @@ mod tests {
             selected_code_object_sha256: None,
             kldseq_path: path.display().to_string(),
             kldseq_sha256: sha256_hex(bytes),
+            ktok_path: None,
+            ktok_sha256: None,
             device_uuid: "u".into(),
             fabric_job: Some("j".into()),
             slice_mean_kld: 0.01,

@@ -971,6 +971,24 @@ pub fn emit_committed_event(
     let _ = writeln!(stdout, "{}", envelope);
 }
 
+/// Emit one `prefill_progress` JSONL event after a prompt-prefill chunk.
+///
+/// `done`/`total` are prompt tokens this request prefills (a cache-hit prefix
+/// is in neither). Writes nothing once `done >= total`, so single-chunk prompts
+/// and the final chunk stay silent, and nothing at all under
+/// `HIPFIRE_PREFILL_PROGRESS=0`. Call it where the chunk loop already returned
+/// control to the host (next to `check_abort`), with the same writer the
+/// request's token events use. See [`hipfire_runtime::prefill_progress`].
+pub fn emit_prefill_progress(
+    stdout: &mut (impl std::io::Write + ?Sized),
+    id: &str,
+    attempt_id: Option<u64>,
+    done: usize,
+    total: usize,
+) {
+    hipfire_runtime::prefill_progress::emit_to(stdout, id, attempt_id, done, total);
+}
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
@@ -2167,5 +2185,24 @@ mod tests {
             0,
             usize::MAX - 1
         ));
+    }
+
+    #[test]
+    fn prefill_progress_emits_one_escaped_line_only_below_total() {
+        let mut out: Vec<u8> = Vec::new();
+        super::emit_prefill_progress(&mut out, "r\"1\\x", Some(4), 1024, 4096);
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).expect("json");
+        assert_eq!(v["type"], "prefill_progress");
+        assert_eq!(v["id"], "r\"1\\x");
+        assert_eq!(v["attempt_id"], 4);
+        assert_eq!(v["done"], 1024);
+        assert_eq!(v["total"], 4096);
+
+        let mut none: Vec<u8> = Vec::new();
+        super::emit_prefill_progress(&mut none, "r1", Some(4), 4096, 4096);
+        super::emit_prefill_progress(&mut none, "r1", Some(4), 512, 512);
+        assert!(none.is_empty(), "no event at done == total");
     }
 }

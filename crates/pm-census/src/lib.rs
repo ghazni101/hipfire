@@ -13,12 +13,16 @@
 //! * [`extract`] — `WorkloadCaseV1` corpus extraction from real routes
 //!   (rocprofv3 traces, Redline captures, railgun program manifests,
 //!   pm_loop records).
+//! * [`ledger`] — ingest of the retained-PM4 dispatch ledger
+//!   (`HIPFIRE_REDLINE_LEDGER`) into a count- or timestamp-weighted
+//!   `CensusV1` cell for the dispatches rocprofv3 cannot see.
 //! * [`noise`] — measurement-noise harness over pm_loop records: A/A null
 //!   controls, per-round ABBA dispersion, cross-process sign tests.
 
 pub mod census;
 pub mod extract;
 pub mod inventory;
+pub mod ledger;
 pub mod noise;
 pub mod rocprof;
 pub mod tune;

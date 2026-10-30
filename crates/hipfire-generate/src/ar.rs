@@ -1085,20 +1085,28 @@ fn clear_generation_route() {
 /// standalone entry points cannot erase an outer request's route when they
 /// return. The start latch is still keyed to the exact attempt captured on
 /// entry; dropping one guard never clears another request's latch.
+///
+/// The scope also owns the request's `prefill_progress` target
+/// ([`hipfire_runtime::prefill_progress::scope`]), so prompt-prefill loops in
+/// crates without the request writer can `report` progress for this
+/// `(id, attempt)`.
 pub struct GenerationRouteScope {
     id: String,
     attempt: u64,
     previous_route: Option<GenerationRoute>,
+    _prefill_progress: hipfire_runtime::prefill_progress::Scope,
 }
 
 impl GenerationRouteScope {
     pub fn enter(route: GenerationRoute, id: &str) -> Self {
         let previous_route = active_generation_route();
         set_generation_route(route);
+        let attempt = active_attempt_id();
         Self {
             id: id.to_owned(),
-            attempt: active_attempt_id(),
+            attempt,
             previous_route,
+            _prefill_progress: hipfire_runtime::prefill_progress::scope(id, Some(attempt)),
         }
     }
 }
@@ -2009,7 +2017,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
 
     emit_generation_start(route, stdout, id, started_in_think);
     let t0 = Instant::now();
-    if let Err(error) = forward_chunk(m, gpu, prompt_tokens, &prompt_logits) {
+    // The prompt prefill is the only call that may report `prefill_progress`
+    // from the arch crates' chunk loops (Qwen4 tiles); the phase ends before
+    // the first decode forward.
+    let prefill_result = {
+        let _prompt_phase = hipfire_runtime::prefill_progress::prompt_phase();
+        forward_chunk(m, gpu, prompt_tokens, &prompt_logits)
+    };
+    if let Err(error) = prefill_result {
         let _ = gpu.free_tensor(prompt_logits);
         let _ = gpu.free_tensor(decode_logits);
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -4675,6 +4690,13 @@ pub fn generate(
                     return;
                 }
                 m.seq_pos += chunk_len;
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    new_tokens.len() - rest.len(),
+                    new_tokens.len(),
+                );
                 // The eviction gate remains closed until adaptive KV reaches
                 // its explicit handoff point and finishes every transcode.
                 // Drive that transition at the same bounded committed-prefix
@@ -4734,7 +4756,14 @@ pub fn generate(
             let chunk_max = if m.kv_adaptive.is_some() {
                 qwen35::PREFILL_MAX_BATCH
             } else {
-                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+                let deduction = qwen35::prefill::request_kv_growth_deduction(
+                    gpu,
+                    kv,
+                    m.seq_pos + new_tokens.len(),
+                );
+                match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+                    gpu, weights, config, dn, kv, deduction,
+                ) {
                     Ok(limit) => limit,
                     Err(e) => {
                         eprintln!(
@@ -4774,6 +4803,13 @@ pub fn generate(
                     return;
                 }
                 m.seq_pos += chunk.len();
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    end,
+                    new_tokens.len(),
+                );
                 // Adaptive KV: downshift BETWEEN prefill chunks the moment the
                 // start-tier (q8/fwht4) buffer fills, so a long prompt can't
                 // overflow the floor-sized buffer before decode begins. The
@@ -4823,6 +4859,7 @@ pub fn generate(
                     speculative::take_dn_checkpoint(
                         &mut m.prefill_checkpoints,
                         dn,
+                        kv,
                         gpu,
                         m.seq_pos,
                         ckpt_interval(),
@@ -5355,6 +5392,7 @@ pub fn generate(
                 speculative::take_dn_checkpoint(
                     &mut m.prefill_checkpoints,
                     dn,
+                    kv,
                     gpu,
                     m.seq_pos,
                     ckpt_interval(),
@@ -6201,6 +6239,7 @@ pub fn generate(
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
+        let mut hit_stop = false;
         for _ in 0..max_tokens {
             // Decode-side abort check (mirrors the Qwen AR loop): a client
             // cancel bails at the next iteration with an attested
@@ -6221,10 +6260,20 @@ pub fn generate(
                 streamed_tokens.len() - 1,
                 t0.elapsed().as_millis() as u64,
             );
+            // The terminator is committed (KV + conversation) but never streamed
+            // as text, matching the DFlash/DSpark routes.
+            let is_stop = next_token == config.eos_token
+                || im_end_token == Some(next_token)
+                || tokenizer.is_terminator(next_token);
             let fed = stream_bytes.len();
             tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
             let new_bytes = &stream_bytes[fed..];
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            let action = if is_stop {
+                FilterAction::Hold
+            } else {
+                filter.observe(new_bytes)
+            };
+            if let FilterAction::Emit(text_bytes) = action {
                 let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(
                     stdout,
@@ -6288,13 +6337,8 @@ pub fn generate(
                 }
             };
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
+            if is_stop {
+                hit_stop = true;
                 break;
             }
 
@@ -6373,6 +6417,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+            "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
         if !pflash_frag.is_empty() {

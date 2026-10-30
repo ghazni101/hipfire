@@ -57,6 +57,8 @@ struct hf_device_wait_block {
 #define HF_WAIT_SITE_RMSNORM_AWQ_WAVEGRID_ARRIVALS 6u
 #define HF_WAIT_SITE_RMSNORM_AWQ_WAVEGRID_READY 7u
 #define HF_WAIT_SITE_HC_CONTROL_RSQRT_ONCE 8u
+#define HF_WAIT_SITE_TP_PEER_PUSH_GFX1201 9u
+#define HF_WAIT_SITE_TP_PEER_PUSHN_GFX1201 10u
 
 // Polls between counter reads. A wait that ends within this many polls never
 // reads the counter.

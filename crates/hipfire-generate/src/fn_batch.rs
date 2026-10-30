@@ -1297,6 +1297,23 @@ pub fn drive_qwen4_lane_batch(
                     .find(|r| r.epoch == advance.epoch)
                     .ok_or("qwen4 advance not in plan")?;
                 if request.kind == RequestStepKind::Prefill {
+                    // `prefill_progress` for the lane's prompt chunk (the
+                    // last chunk is silent: `done < total` only).
+                    if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
+                        let progress = Owner::of(m, gpu).ok().and_then(|owner| {
+                            let cell = owner.bundle.lanes()?.lane(&advance.epoch)?;
+                            Some((cell.host.prefilled, cell.host.prompt.len()))
+                        });
+                        if let Some((done, total)) = progress {
+                            crate::common::emit_prefill_progress(
+                                stdout,
+                                &lane.key.id,
+                                Some(lane.key.attempt_id),
+                                done,
+                                total,
+                            );
+                        }
+                    }
                     if !advance.committed_ids.is_empty() {
                         let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
                         ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;

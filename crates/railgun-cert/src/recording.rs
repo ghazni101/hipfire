@@ -1188,12 +1188,31 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp2-graph-fused-reduce",
         predicates: &[CaptureMode],
-        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp_graph_signal_reduce_gfx1100` (hipfire-runtime multi_gpu.rs)",
+        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp2_peer_push_reduce_gfx1201` on a gfx1201 pair once the load-time peer-push qualification passed (`HIPFIRE_TP_PEER_PUSH=0` and any gfx1100 pair use `tp_graph_signal_reduce_gfx1100`) (hipfire-runtime multi_gpu.rs)",
         effect: KernelSelection,
-        switches: "captured: one fused signal barrier + coherent payload exchange + residual add kernel per rank; eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
-        kernels: &["tp_graph_signal_reduce_gfx1100", "add_peer_residual_f32"],
+        switches: "captured: one fused peer exchange + residual add kernel per rank (gfx1201: tagged peer-VRAM granules; otherwise signal barrier + coherent payload exchange); eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
+        kernels: &[
+            "tp2_peer_push_reduce_gfx1201",
+            "tp_graph_signal_reduce_gfx1100",
+            "add_peer_residual_f32",
+        ],
         verdict: ByteExact,
-        evidence: "both kernels compute `x + (p0 + p1)` per element in rank order with fp32 adds only (no contraction), from the same partial bytes; the payload exchange copies bits; `tp2_cross_device_graph_reduce` (lab) checks exact results on every replay; multi-GPU TP is not a default program",
+        evidence: "all three kernels compute `x + (p0 + p1)` per element in rank order with fp32 adds only (no contraction), from the same partial bytes; the payload exchange copies bits (the peer-push kernel tags every 8-byte half with the generation and folds only granules whose tags match); `tp2_cross_device_graph_reduce` (lab) checks exact results on every replay; multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp4-graph-peer-push-reduce16",
+        predicates: &[CaptureMode],
+        condition: "peer_reduce (hipfire-runtime multi_gpu/executor.rs): decode `AllReduceAdd` on 3 or 4 gfx1201 ranks, bf16 exchange, every rank capturing (the TP3/TP4 whole-token graph: `HIPFIRE_TP_FULL_GRAPH` default on, `HIPFIRE_TP_PEER_PUSH=0` and `HIPFIRE_TP_FULL_GRAPH=0` off) with the load-time peer-push qualification passed → `tp_peer_pushn_reduce_bf16_gfx1201`",
+        effect: KernelSelection,
+        switches: "captured: one bf16 peer-push kernel per rank (tagged 16-byte granules in the peers' fine-grained VRAM, device-resident generations); eager: `tp_pack16_bf16` + peer copies + event record/wait + `tp_fold16_bf16`",
+        kernels: &[
+            "tp_peer_pushn_reduce_bf16_gfx1201",
+            "tp_pack16_bf16",
+            "tp_fold16_bf16",
+        ],
+        verdict: ByteExact,
+        evidence: "both routes compute `x + (r(p0) + r(p1) + ... + r(p_{n-1}))` per element, r = the shared round-to-nearest-even bf16 round trip of kernels/src/tp_exchange16.h applied to every rank's term (the rank's own included), left-associated in rank order with fp32 adds only; the peer-push kernel accepts a granule only when both 8-byte halves carry the current generation. The load qualifies it with 64 exchanges compared bit for bit with a host replay and greedy token IDs match the eager route on 3 prompts; multi-GPU TP is not a default program",
         reaches: &[],
     },
     Decision {
@@ -1327,7 +1346,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-qsa-bf16-split-bound",
         predicates: &[IsRecording, CaptureMode],
-        condition: "qsa_bf16_split_route (tensor_ops.rs): HIPFIRE_QWEN4_QSA_BF16_SPLIT (default on, `=0` kill switch) on exact gfx1201 with BF16 pooled keys; `bounded = is_recording()` makes the fused-vs-split crossover (2048 blocks up to 256 rows, 8192 above) read `shape_blocks` instead of the live block count, and `capture_mode` (hipGraph, which cannot patch kernargs) keeps the fused selector. indexed_attention_select_bf16_split(bounded): score stride, score grid ceil(shape_blocks/256) and filter compact grid ceil(shape_blocks/4096) come from `shape_blocks`; block_count (PositionDivU32 {rows, compress}) and position_start (PositionPlusU32 {group row offset}) of every score/threshold/compact/finish launch are declared to the recorder; scratch is the dedicated qsa_select_scores slot reserved before capture (bundle.rs)",
+        condition: "qsa_bf16_split_route (tensor_ops.rs): HIPFIRE_QWEN4_QSA_BF16_SPLIT (default on, `=0` kill switch) on exact gfx1201 and exact gfx1100 (gfx1100 also killed by HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0) with BF16 pooled keys; `bounded = is_recording()` makes the fused-vs-split crossover (2048 blocks up to 256 rows, 8192 above) read `shape_blocks` instead of the live block count, and `capture_mode` (hipGraph, which cannot patch kernargs) keeps the fused selector. indexed_attention_select_bf16_split(bounded): score stride, score grid ceil(shape_blocks/256) and filter compact grid ceil(shape_blocks/4096) come from `shape_blocks`; block_count (PositionDivU32 {rows, compress}) and position_start (PositionPlusU32 {group row offset}) of every score/threshold/compact/finish launch are declared to the recorder; scratch is the dedicated qsa_select_scores slot reserved before capture (bundle.rs)",
         effect: LaunchShape,
         switches: "recorded: hipcc BF16 rows8/rows16 scores + exact filter trio at the shape bound; eager: the same kernels at live-count grids above the crossover, fused indexed_attention_select_bf16_batched below it; captured (hipGraph): fused",
         kernels: &[
@@ -1338,7 +1357,7 @@ pub const DECISIONS: &[Decision] = &[
             "qsa_filter_finish",
         ],
         verdict: ByteExact,
-        evidence: "rdna-compute tests/qsa_bf16_scores.rs on gfx1201 (HIPFIRE_QWEN4_QSA_BF16_SPLIT on, the default): split arms eager and at the shape bound vs the fused BF16 incumbent over 2048..65536 blocks, rows 1/8/17, dense and tied keys, partial blocks, forced filter repair (selection, mirror, persisted flag and canaries identical); recorded tapes at three capture positions replayed through the recorded-HIP oracle at positions 0..capacity vs the fused incumbent run eagerly at that position",
+        evidence: "rdna-compute tests/qsa_bf16_scores.rs on gfx1201 (HIPFIRE_QWEN4_QSA_BF16_SPLIT on, the default) and on gfx1100 (7900 XTX; production route, recorded replay and arms end-to-end tests, plus the exhaustive score bit-for-bit gate at 255/257/2048/8192/32768/65536 blocks): split arms eager and at the shape bound vs the fused BF16 incumbent over 2048..65536 blocks, rows 1/8/17, dense and tied keys, partial blocks, forced filter repair (selection, mirror, persisted flag and canaries identical); recorded tapes at three capture positions replayed through the recorded-HIP oracle at positions 0..capacity vs the fused incumbent run eagerly at that position",
         reaches: &[],
     },
     Decision {
@@ -1355,7 +1374,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-opt-in-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
+        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked_inner (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
         effect: KernelSelection,
         switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; gfx1151 single-token decode: one gemv_mq4g256v2_multirow_r2_x3 for the three GDN a/b/z launches (ZBA_X3), one gemv_bf16_xf32_x2_q8_0_k2560_staged_pair for gemv_bf16_xf32_x4 + gemv_q8_0_k2560_staged_pair (HEAD_FUSE); recorded/captured: the incumbent unfused launches",
         kernels: &[],
@@ -1445,7 +1464,7 @@ pub const DECISIONS: &[Decision] = &[
         predicates: &[CaptureMode, GraphSlotCapturing],
         condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs), the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs), and the S1 layer-major tile step stage_tile (slowlink_prefill.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture. The S1 tile step passes the same `gpu.graphs.capture_mode` through the same helper into the same `stage_ple_rows` upload-mode branches, so the recorded and eager tiles stage identical bytes to the identical device buffer",
         effect: LaunchMechanism,
-        switches: "hipMemcpyAsync on the null stream with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
+        switches: "hipMemcpyAsync on the compute stream from pinned staging with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
         kernels: &[],
         verdict: Invariant,
         evidence: "same staged PLE bytes, destination and stream order before the unchanged PLE apply kernels; the fence retires before the staging buffer is next written, torn down or dropped, so no copy reads rewritten bytes",
@@ -2146,6 +2165,12 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-ple-async-upload"],
     },
     Site {
+        file: "hipfire-arch-qwen4/src/ple_stage.rs",
+        function: "upload_blocking",
+        occurrences: 1,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
         file: "hipfire-arch-qwen4/src/slowlink_prefill.rs",
         function: "stage_tile",
         occurrences: 1,
@@ -2204,6 +2229,12 @@ pub const SITES: &[Site] = &[
         function: "ensure_mapped_capacity",
         occurrences: 3,
         decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/state_parity.rs",
+        function: "run_mtp_head_d2_probe",
+        occurrences: 2,
+        decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
         file: "hipfire-daemon/src/bench.rs",
@@ -2291,7 +2322,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
-        function: "project_trunk_masked",
+        function: "project_trunk_masked_inner",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
     },
@@ -2511,6 +2542,12 @@ pub const SITES: &[Site] = &[
         function: "abort_rank_graph_captures",
         occurrences: 2,
         decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu/executor.rs",
+        function: "peer_reduce",
+        occurrences: 1,
+        decisions: &["tp4-graph-peer-push-reduce16"],
     },
     Site {
         file: "hipfire-runtime/src/multi_gpu.rs",

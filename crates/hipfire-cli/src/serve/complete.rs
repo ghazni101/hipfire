@@ -2505,6 +2505,17 @@ pub(crate) fn complete_request_attempt(
     let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
+        // Prefill progress is a display hint, not part of the response
+        // contract: it skips the semantic fold and gate (so it can never fail
+        // a request or become a delta) and is dropped if it somehow precedes
+        // `gen_start`. The stream sink frames it as an SSE comment.
+        if event_type == Some("prefill_progress") {
+            if contract_gate.contract().is_some() {
+                event_callback(event)?;
+            }
+            return Ok(());
+        }
+
         // Staged terminal: commit_ready carries done fields with type != done.
         // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
         if event_type == Some("commit_ready") {
@@ -2771,6 +2782,9 @@ pub(crate) fn complete_request_attempt(
         meta.engine_stats = serde_json::from_value(stats.clone()).ok();
     }
     meta.last_activity = Instant::now();
+    if let Some(message) = meta.spill.as_mut().and_then(|spill| spill.check()) {
+        crate::spill::emit(&message);
+    }
 
     if let Some(completion) = committed {
         return Ok(completion);

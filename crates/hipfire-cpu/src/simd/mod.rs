@@ -157,11 +157,15 @@ pub(crate) enum SimdTier {
     Scalar,
 }
 
-/// Whether the CPU reports AVX-512F on top of everything the V2 AVX2 kernels
-/// need (AVX2, FMA, F16C) — the requirement of the [`x86_512`] kernels.
+/// Whether the CPU reports AVX-512F and VBMI (`vpmultishiftqb`, the nibble
+/// unpack) on top of everything the V2 AVX2 kernels need (AVX2, FMA, F16C) —
+/// the requirement of the [`x86_512`] kernels. A CPU with F but without VBMI
+/// (Skylake-X) runs the bit-identical AVX2 kernels instead.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn avx512_available() -> bool {
-    avx2_f16c_available() && std::arch::is_x86_feature_detected!("avx512f")
+    avx2_f16c_available()
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512vbmi")
 }
 
 #[cfg(not(target_arch = "x86_64"))]

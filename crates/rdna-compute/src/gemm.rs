@@ -261,6 +261,11 @@ fn gfx12_bt_tile(batch_size: usize) -> usize {
     unreachable!("batch sizes below 64 returned above")
 }
 
+/// Waves per block of the gfx12 qt49 (MQ3G256V2) base WMMA kernels
+/// (`MQ3_KS` in the kernel sources): each wave owns every 4th K group and
+/// wave 0 reduces the partials through LDS. Must match the kernels.
+const MQ3_SPLITK_WAVES: u32 = 8;
+
 /// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
 /// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
 /// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
@@ -516,6 +521,19 @@ pub(crate) fn hc_down_tile_selected(
         }
 }
 
+/// gfx1100 HC `input_mix_down` fill tile (`HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100`, default on):
+/// exact gfx1100, M == 320 (four full 80-row tiles: no ragged M tile) and K % 64 == 0.
+/// Bit-identical to the 64 x 64 / k64 pipelined tile it replaces (same ascending-K WMMA chain
+/// per output element); any other shape keeps the generic M < 512 tile.
+pub(crate) fn hc_mix_fill80_gfx1100_selected(
+    arch: &str,
+    enabled: bool,
+    m: usize,
+    k: usize,
+) -> bool {
+    enabled && arch == "gfx1100" && m == 320 && k % 64 == 0
+}
+
 /// Smallest route-row count the gfx1201 fused HC-down + activation kernel takes; below it the
 /// three-launch chain wins.
 pub const HC_DOWN_FUSED_MIN_ROWS: usize = 1536;
@@ -656,6 +674,12 @@ impl LdsTile {
     pub const fn pipelined(self) -> Self {
         Self { pipe: true, ..self }
     }
+
+    /// gfx1100 HC input_mix_down (M = 320; [`hc_mix_fill80_gfx1100_selected`]): an 80 x 32
+    /// workgroup of two 80 x 16 waves, grid 4 x ceil(N / 32) (192 waves at N = 768 instead of
+    /// the 64 x 64 tile's 120), pinned fragment schedule. Not in [`Gpu::LDS_TILE_VARIANTS`]:
+    /// it has no plain twin and no fused-epilogue entries, and no tile chain can reach it.
+    pub const HC_MIX_FILL80_GFX1100: Self = Self::new(80, 32, 80, 16, 64, false).pipelined();
 
     /// The same tile with the plain load → barrier → WMMA → barrier main loop.
     /// This is what `HIPFIRE_FLUX_GEMM_PIPE=0` selects.
@@ -1051,6 +1075,20 @@ fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
 /// under the 300 W cap. Parsed once so a producer and its consumers agree.
 static A4_SLAB: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
+/// gfx1201 GDN input projection merge on the non-fused IU4 verify path
+/// (`HIPFIRE_GDN_ZBA_FOLD`, default on; `=0` restores the four separate QKV,
+/// Z, beta and alpha SETs): one QKV + Z fold launch, or the Z fold SET +
+/// split. Byte-identical outputs.
+static GDN_ZBA_FOLD: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GDN_ZBA_FOLD", true));
+/// gfx1201 small-N verify schedules (`HIPFIRE_VERIFY_V64`, default on; `=0` kills): slab
+/// launches of at most [`VERIFY_V64_MAX_N`] rows load the `_v64` exports of the `_b1s`
+/// bundle (full_add/full_set/qkvzaset/gate_up_silu) instead of the shipped ones.
+/// Byte-identical outputs.
+static VERIFY_V64: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_VERIFY_V64", true));
+/// Largest launch row count (`n`) that takes the `_v64` slab exports.
+const VERIFY_V64_MAX_N: usize = 128;
 /// Token-fastest grid for the slab HIN producer (`HIPFIRE_A4_HIN_TOKFAST`,
 /// default on; `=0` opts out): `fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast`
 /// on grid [N, K/256] instead of the group-fastest `_slab` twin on [K/256, N].
@@ -1133,6 +1171,153 @@ static GFX1100_PM_GEMM: LazyLock<bool> =
 #[inline]
 fn gfx1100_pm_gemm(m: usize) -> bool {
     *GFX1100_PM_GEMM && m < (1 << 22)
+}
+
+/// gfx1100 MQ6 residual PM twin (`HIPFIRE_MQ6_RESID_PM_GFX1100`, default on; `=0` restores the
+/// hipcc `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` for every shape). Parsed once.
+static MQ6_RESID_PM_GFX1100: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MQ6_RESID_PM_GFX1100", true));
+
+/// Waves of the gfx1100 MQ6 residual PM twin for an MQ6 residual with `batch_size` tokens and
+/// `m` output rows, or `None` to keep hipcc. Only where hipcc selects MW8 (`batch_size >= 464`)
+/// on exact gfx1100: `m >= 6144` -> w8, `2560 <= m < 6144` -> w4, smaller `m` stays hipcc.
+/// Card ratios PM/hipcc at N=768: M10240 0.521, M6144 0.542, M12288 0.496 (w8); M2560 K6144
+/// 0.692 (w4).
+fn mq6_resid_pm_gfx1100_waves(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    enabled: bool,
+) -> Option<usize> {
+    if !enabled || bits != 6 {
+        return None;
+    }
+    if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
+        return None;
+    }
+    match m {
+        6144.. => Some(8),
+        2560..=6143 => Some(4),
+        _ => None,
+    }
+}
+
+/// Launch geometry of the exact-gfx1100 MQ6 residual hipcc "pk twin" ports
+/// (`kernels/src/gemm_mq6g256v2_residual_gfx1100_port.hip`). One kernel body, two tilings; both
+/// keep the incumbent's `A,X,Y,M,K,N` kernargs and bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq6ResidPortGeom {
+    /// `R2Mq6-01-pk-w8n256`: tile 128 rows x 256 tokens, block 256 (8 waves), 40 KiB static LDS.
+    W8N256,
+    /// `R2Mq6-04-pk-w4n128`: tile 64 rows x 128 tokens, block 128 (4 waves), 20 KiB static LDS.
+    W4N128,
+}
+
+impl Mq6ResidPortGeom {
+    const fn symbol(self) -> &'static str {
+        match self {
+            Self::W8N256 => "gemm_mq6g256v2_residual_gfx1100_port_w8n256",
+            Self::W4N128 => "gemm_mq6g256v2_residual_gfx1100_port_w4n128",
+        }
+    }
+    /// Output rows per workgroup (16 per wave).
+    const fn tile_m(self) -> usize {
+        match self {
+            Self::W8N256 => 128,
+            Self::W4N128 => 64,
+        }
+    }
+    /// Tokens per workgroup (16 per accumulator chain).
+    const fn tile_n(self) -> usize {
+        match self {
+            Self::W8N256 => 256,
+            Self::W4N128 => 128,
+        }
+    }
+    const fn block(self) -> usize {
+        match self {
+            Self::W8N256 => 256,
+            Self::W4N128 => 128,
+        }
+    }
+    /// Launch grid `[ceil(m / tile_m), ceil(n / tile_n), 1]`.
+    const fn grid(self, m: usize, n: usize) -> [u32; 3] {
+        [
+            m.div_ceil(self.tile_m()) as u32,
+            n.div_ceil(self.tile_n()) as u32,
+            1,
+        ]
+    }
+}
+
+/// Which gfx1100 kernel runs an MQ6 residual GEMM where hipcc would run MW8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq6ResidGfx1100Route {
+    /// hipcc "pk twin" port ([`Mq6ResidPortGeom`]).
+    Port(Mq6ResidPortGeom),
+    /// Embedded certified PM twin with this many waves (`gemm_mq6g256v2_residual_pm_gfx1100_w{4,8}`).
+    Pm(usize),
+}
+
+/// Geometry of the gfx1100 MQ6 residual hipcc port for an MQ6 residual with `batch_size` tokens,
+/// `m` output rows and `k` inputs, or `None`. `enabled` is `FeatureFlags::mq6_resid_port_gfx1100`
+/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, default on; `=0` kills it). Only where hipcc selects MW8
+/// (exact gfx1100, `batch_size >= 464`): `m >= 6144` -> w8n256, `2560 <= m < 6144` -> w4n128,
+/// smaller `m` (the 48-row `ba` projection) stays hipcc MW8. The port addresses weights and
+/// activations through raw buffer descriptors with 31-bit byte offsets, so shapes whose weight
+/// (`m * k/256 * 200` B) or fp16 activation (`batch_size * k * 2` B) extent reaches 2 GiB, and
+/// `k % 256 != 0`, are refused here and keep the incumbent. Card ratios port/hipcc (bit-identical
+/// outputs, N=768): w8n256 qkv (M10240) 0.508, qg (M12288) 0.479, z (M6144) 0.507; w4n128 out
+/// (M2560 K6144) 0.607, qkv 0.524.
+fn mq6_resid_port_gfx1100_geom(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    k: usize,
+    enabled: bool,
+) -> Option<Mq6ResidPortGeom> {
+    const EXTENT_LIMIT: u128 = 1 << 31;
+    if !enabled || bits != 6 || k == 0 || k % 256 != 0 {
+        return None;
+    }
+    if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
+        return None;
+    }
+    let weight_bytes =
+        m as u128 * (k / 256) as u128 * crate::dispatch::MQ6G256V2_GROUP_BYTES as u128;
+    let x_bytes = batch_size as u128 * k as u128 * 2;
+    if weight_bytes >= EXTENT_LIMIT || x_bytes >= EXTENT_LIMIT {
+        return None;
+    }
+    match m {
+        6144.. => Some(Mq6ResidPortGeom::W8N256),
+        2560..=6143 => Some(Mq6ResidPortGeom::W4N128),
+        _ => None,
+    }
+}
+
+/// Route of an exact-gfx1100 MQ6 residual GEMM where hipcc would run MW8, in precedence order:
+/// hipcc port ([`mq6_resid_port_gfx1100_geom`]) -> PM twin ([`mq6_resid_pm_gfx1100_waves`]) ->
+/// `None` (the generic path, hipcc MW8). `port_enabled` / `pm_enabled` are the two kill switches
+/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, `HIPFIRE_MQ6_RESID_PM_GFX1100`).
+fn mq6_resid_gfx1100_route(
+    arch: &str,
+    bits: u8,
+    batch_size: usize,
+    m: usize,
+    k: usize,
+    port_enabled: bool,
+    pm_enabled: bool,
+) -> Option<Mq6ResidGfx1100Route> {
+    if bits != 6 || k % 256 != 0 {
+        return None;
+    }
+    if let Some(geom) = mq6_resid_port_gfx1100_geom(arch, bits, batch_size, m, k, port_enabled) {
+        return Some(Mq6ResidGfx1100Route::Port(geom));
+    }
+    mq6_resid_pm_gfx1100_waves(arch, bits, batch_size, m, pm_enabled).map(Mq6ResidGfx1100Route::Pm)
 }
 
 /// Developer A/B of the gfx1100 builder bundle with one binary (for example
@@ -1650,7 +1835,9 @@ pub(crate) fn lds256_tile_source_selected(
 ) -> (&'static str, &'static str) {
     let qwen4_tile = matches!(
         entry,
-        "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
+        "gemm_wmma_lds_64_64_32_64_k64"
+            | "gemm_wmma_lds_64_64_32_64_k64_p"
+            | "gemm_wmma_lds_80_32_80_16_k64_p"
     );
     if qwen4_tile && !is_gfx1151 {
         (
@@ -21879,10 +22066,11 @@ impl Gpu {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
                     "",
-                    if add {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s"
-                    } else {
-                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s"
+                    match (add, *VERIFY_V64 && batch_size <= VERIFY_V64_MAX_N) {
+                        (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
+                        (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
+                        (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
+                        (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s_v64",
                     },
                 )
             } else if isa {
@@ -22673,6 +22861,666 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Symmetric qt49 W3A4 consumer over the token-order K128 `block_i4_128`
+    /// sidecar. gfx1201 handles partial tiles; gfx1100 V2C needs full tiles.
+    fn gemm_mq3v25_prequant_iu4(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) || k % 256 != 0 || m == 0 || n == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 requires validated symmetric qt49 on gfx1100/gfx1201, positive M/N and K divisible by 256",
+            ));
+        }
+        if self.scratch.int4_mmq_slab_at(xq) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 reads token-order block_i4_128, not the slab sidecar",
+            ));
+        }
+        let (module, kernel, src, grid, block, lds) = match self.arch.as_str() {
+            "gfx1100" if m % 128 == 0 && n % 128 == 0 => (
+                "gemm_mq3v25_iu4_v2c_gfx1100",
+                "gemm_mq3v25_residual_iu4_v2c",
+                kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC,
+                [(n / 128) as u32, (m / 128) as u32, 1],
+                [32, 8, 1],
+                32768,
+            ),
+            "gfx1201" => (
+                "gemm_mq3v25_residual_mmq_iu4_gfx1201",
+                "gemm_mq3v25_residual_mmq_iu4",
+                kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC,
+                [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+                [256, 1, 1],
+                20480,
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "MQ3V25 A4 gfx1100 kernel requires full M/N tiles",
+                ))
+            }
+        };
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        self.ensure_kernel(module, src, kernel)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = xq;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut ai = i32::from(add);
+        let mut params = [
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ai as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(kernel, grid, block, lds, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b.push_i32(ai);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 consumers only accept complete token tiles. Keep the aligned
+    /// prefix on IU4 and leave a short suffix for the incumbent fp16 GEMM.
+    fn mq3v25_iu4_full_n(&self, n: usize) -> usize {
+        match self.arch.as_str() {
+            "gfx1100" => n / 128 * 128,
+            _ => n,
+        }
+    }
+
+    /// gfx1100 full-tile consumers cannot read a short beta/alpha row block.
+    /// Keep those small projections on the incumbent SET while their full-
+    /// tile QKV/Z siblings reuse the single IU4 pack.
+    fn gemm_mq3v25_iu4_set_or_legacy(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let tile = match self.arch.as_str() {
+            "gfx1100" => 128,
+            _ => 1,
+        };
+        if m % tile != 0 || n % tile != 0 {
+            self.gemm_mq3g256v2(a, x, y, m, k, n)
+        } else {
+            self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, false)
+        }
+    }
+
+    /// Consumer-facing SET/ADD for unfused batched qt49 projections.
+    pub fn gemm_mq3v25_residual_iu4(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return if add {
+                self.gemm_mq3g256v2_residual_wmma(a, x, y, m, k, n)
+            } else {
+                self.gemm_mq3g256v2(a, x, y, m, k, n)
+            };
+        }
+        if full == n {
+            let xq = self.ensure_int4_mmq_x(x, n, k)?;
+            return self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, add);
+        }
+        let x_body = x.sub_offset(0, full * k);
+        let y_body = y.sub_offset(0, full * m);
+        let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+        self.gemm_mq3v25_prequant_iu4(a, xq, &y_body, m, k, full, add)?;
+        let tail = n - full;
+        let x_tail = x.sub_offset(full * k, tail * k);
+        let y_tail = y.sub_offset(full * m, tail * m);
+        if add {
+            self.gemm_mq3g256v2_residual_wmma(a, &x_tail, &y_tail, m, k, tail)
+        } else {
+            self.gemm_mq3g256v2(a, &x_tail, &y_tail, m, k, tail)
+        }
+    }
+
+    pub fn gemm_mq3v25_residual_iu4_prepared(
+        &mut self,
+        a: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(a, xq, y, m, k, n, add)
+    }
+
+    /// Four SETs, one producer; partial beta/alpha rows are guarded by the
+    /// kernel rather than going through the MQ4-only small-tail converter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu4_prepared(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wqkv, xq, qkv, mqkv, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wz, xq, z, mz, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wb, xq, beta, mb, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wa, xq, alpha, ma, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu4_prepared(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wq, xq, q, mq, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wk, xq, kout, mk, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wv, xq, v, mv, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu4_prepared(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        self.gemm_mq3v25_prequant_iu4(wg, xq, gate, mg, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu4(wu, xq, up, mu, k, n, false)
+    }
+
+    /// Single-launch gate/up-SiLU h producer, only when the F1-lite caller
+    /// consumes h instead of the separate gate and up scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_mq3v25_iu4_prepared(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        prep: &crate::scratch::Int4MmqPrepared,
+        h: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201"
+            || !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric)
+            || mg != mu
+            || mg % 128 != 0
+            || k % 256 != 0
+            || mg == 0
+            || n == 0
+            || bf16_h_a4_enabled()
+            || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        let xq = self.int4_mmq_prepared_ptr(prep, k, n)?;
+        if self.scratch.int4_mmq_slab_at(xq) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A4 reads token-order block_i4_128, not the slab sidecar",
+            ));
+        }
+        const MODULE: &str = "gemm_mq3v25_residual_mmq_iu4_gfx1201";
+        const KERNEL: &str = "gemm_mq3v25_gate_up_silu_mmq_iu4";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU4_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut gp = wg.buf.as_ptr();
+        let mut up = wu.buf.as_ptr();
+        let mut xp = xq;
+        let mut hp = h.buf.as_ptr();
+        let mut mi = mg as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params = [
+            &mut gp as *mut _ as *mut c_void,
+            &mut up as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut hp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            2 * mg * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * mg * 4,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(2 * mg).div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_ptr(xp);
+                b.push_ptr(hp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu4(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        x: &GpuTensor,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_qkvza_mq3g256v2_wmma(
+                wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n,
+            );
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let qkv_body = qkv.sub_offset(0, full * mqkv);
+            let z_body = z.sub_offset(0, full * mz);
+            let beta_body = beta.sub_offset(0, full * mb);
+            let alpha_body = alpha.sub_offset(0, full * ma);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wqkv, &x_body, xq, &qkv_body, mqkv, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wz, &x_body, xq, &z_body, mz, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wb, &x_body, xq, &beta_body, mb, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wa, &x_body, xq, &alpha_body, ma, k, full)?;
+            let tail = n - full;
+            return self.gemm_qkvza_mq3g256v2_wmma(
+                wqkv,
+                wz,
+                wb,
+                wa,
+                &x.sub_offset(full * k, tail * k),
+                &qkv.sub_offset(full * mqkv, tail * mqkv),
+                &z.sub_offset(full * mz, tail * mz),
+                &beta.sub_offset(full * mb, tail * mb),
+                &alpha.sub_offset(full * ma, tail * ma),
+                mqkv,
+                mz,
+                mb,
+                ma,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wqkv, x, xq, qkv, mqkv, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wz, x, xq, z, mz, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wb, x, xq, beta, mb, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wa, x, xq, alpha, ma, k, n)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu4(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        x: &GpuTensor,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_qkv_mq3g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n);
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let q_body = q.sub_offset(0, full * mq);
+            let k_body = kout.sub_offset(0, full * mk);
+            let v_body = v.sub_offset(0, full * mv);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wq, &x_body, xq, &q_body, mq, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wk, &x_body, xq, &k_body, mk, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wv, &x_body, xq, &v_body, mv, k, full)?;
+            let tail = n - full;
+            return self.gemm_qkv_mq3g256v2_wmma(
+                wq,
+                wk,
+                wv,
+                &x.sub_offset(full * k, tail * k),
+                &q.sub_offset(full * mq, tail * mq),
+                &kout.sub_offset(full * mk, tail * mk),
+                &v.sub_offset(full * mv, tail * mv),
+                mq,
+                mk,
+                mv,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wq, x, xq, q, mq, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wk, x, xq, kout, mk, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wv, x, xq, v, mv, k, n)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu4(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a4_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A4 is not admitted"));
+        }
+        let full = self.mq3v25_iu4_full_n(n);
+        if full == 0 {
+            return self.gemm_gate_up_mq3g256v2_wmma(wg, wu, x, gate, up, mg, mu, k, n);
+        }
+        if full != n {
+            let x_body = x.sub_offset(0, full * k);
+            let gate_body = gate.sub_offset(0, full * mg);
+            let up_body = up.sub_offset(0, full * mu);
+            let xq = self.ensure_int4_mmq_x(&x_body, full, k)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wg, &x_body, xq, &gate_body, mg, k, full)?;
+            self.gemm_mq3v25_iu4_set_or_legacy(wu, &x_body, xq, &up_body, mu, k, full)?;
+            let tail = n - full;
+            return self.gemm_gate_up_mq3g256v2_wmma(
+                wg,
+                wu,
+                &x.sub_offset(full * k, tail * k),
+                &gate.sub_offset(full * mg, tail * mg),
+                &up.sub_offset(full * mu, tail * mu),
+                mg,
+                mu,
+                k,
+                tail,
+            );
+        }
+        let xq = self.ensure_int4_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wg, x, xq, gate, mg, k, n)?;
+        self.gemm_mq3v25_iu4_set_or_legacy(wu, x, xq, up, mu, k, n)
+    }
+
+    /// Signed-i8 K128 qt49 consumer; the caller provides one packed activation
+    /// shared by every projection in a fused family.
+    fn gemm_mq3v25_prequant_iu8(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) || k % 256 != 0 || m == 0 || n == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ3V25 A8 requires validated symmetric qt49, exact gfx1201 and K divisible by 256",
+            ));
+        }
+        self.bind_thread()?;
+        self.flush_residual_fold()?;
+        const MODULE: &str = "gemm_mq3v25_residual_mmq_iu8_gfx1201";
+        const KERNEL: &str = "gemm_mq3v25_residual_mmq_iu8";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ3V25_RESIDUAL_MMQ_IU8_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut ai = i32::from(add);
+        let mut params = [
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut ai as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            KERNEL,
+            m * (k / 256) * crate::dispatch::MQ3G256V2_GROUP_BYTES + n * m * 4,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            19456,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b.push_i32(ai);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq3v25_residual_iu8(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(a, xq, y, m, k, n, add)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq3v25_iu8(
+        &mut self,
+        wqkv: &GpuTensor,
+        wz: &GpuTensor,
+        wb: &GpuTensor,
+        wa: &GpuTensor,
+        x: &GpuTensor,
+        qkv: &GpuTensor,
+        z: &GpuTensor,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        mqkv: usize,
+        mz: usize,
+        mb: usize,
+        ma: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wqkv, xq, qkv, mqkv, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wz, xq, z, mz, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wb, xq, beta, mb, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wa, xq, alpha, ma, k, n, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_mq3v25_iu8(
+        &mut self,
+        wq: &GpuTensor,
+        wk: &GpuTensor,
+        wv: &GpuTensor,
+        x: &GpuTensor,
+        q: &GpuTensor,
+        kout: &GpuTensor,
+        v: &GpuTensor,
+        mq: usize,
+        mk: usize,
+        mv: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wq, xq, q, mq, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wk, xq, kout, mk, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wv, xq, v, mv, k, n, false)
+    }
+
+    /// No fused iu8 gate/up entry exists: one quantizer, two SET launches,
+    /// followed by the caller's unchanged SiLU epilogue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_mq3v25_iu8(
+        &mut self,
+        wg: &GpuTensor,
+        wu: &GpuTensor,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        mg: usize,
+        mu: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if !self.flags.mq3v25_a8_enabled(self.mq3v2_symmetric) {
+            return Err(hip_bridge::HipError::new(1, "MQ3V25 A8 is not admitted"));
+        }
+        let xq = self.ensure_int8_mmq_x(x, n, k)?;
+        self.gemm_mq3v25_prequant_iu8(wg, xq, gate, mg, k, n, false)?;
+        self.gemm_mq3v25_prequant_iu8(wu, xq, up, mu, k, n, false)
     }
 
     /// ADD-epilogue fold, caller side. Offers `delta` (f32, >= n*m elements,
@@ -30055,6 +30903,25 @@ impl Gpu {
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
         // K 2560): 128 x 128 over 128 x 256, 175 vs 213 us at 640 x 2560 x 1131;
         // every tile keeps each output's K order.
+        if hc_mix_fill80_gfx1100_selected(
+            self.arch.as_str(),
+            self.flags.qwen4_hc_mix_fill80_gfx1100_enabled(),
+            m,
+            k,
+        ) {
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                &w_view,
+                x_f16,
+                y,
+                None,
+                m,
+                k,
+                batch_size,
+                LdsTile::HC_MIX_FILL80_GFX1100,
+                k,
+                k,
+            );
+        }
         let tile = match m {
             0..512 => LdsTile::new(64, 64, 32, 64, 64, false),
             512..1024 => LdsTile::new(128, 128, 32, 64, 64, false),
@@ -31794,7 +32661,7 @@ impl Gpu {
             pipe: _,
         } = tile;
         assert!(
-            Self::LDS_TILE_VARIANTS.contains(&tile),
+            Self::LDS_TILE_VARIANTS.contains(&tile) || tile == LdsTile::HC_MIX_FILL80_GFX1100,
             "gemm_f16_x_f16_wmma_lds_tiled: no kernel for {}",
             tile.entry()
         );
@@ -34455,6 +35322,286 @@ impl Gpu {
         Ok(())
     }
 
+    /// gfx1201 non-fused verify/short-batch Z + beta + alpha: ONE `_b1s` SET
+    /// over the loader's Z fold (`z_m + 128` rows, beta at row `z_m`, alpha at
+    /// `z_m + 64`; [`Self::iu4_gdn_fold_rows`]) into `y_z_fold`
+    /// (`Y[token * (z_m + 128) + row]`), then a copy kernel scatters Z, beta
+    /// and alpha. Pure copies of the rows the separate SET launches would
+    /// produce, so the outputs are byte-identical. Returns `Ok(false)` without
+    /// launching when not admitted: exact gfx1201, the fold predicate holds,
+    /// the weight buffer really is the fold, `0 < n <= 128`, the scratch and
+    /// outputs are large enough and 16-byte aligned, and
+    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_zba_fold_g12_iu4_prepared(
+        &mut self,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_z_fold: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let folded_m = Self::iu4_gdn_fold_rows(z_m).0;
+        let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
+        if !(self.iu4_gdn_fold_active([qkv_m, z_m, 48, 48], k)
+            && n > 0
+            && n <= 128
+            && a_z_fold.buf.size() == folded_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            && y_z_fold.buf.size() >= n * folded_m * 4
+            && y_z.buf.size() >= n * z_m * 4
+            && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
+            && [a_z_fold, y_z_fold, y_z, y_beta, y_alpha]
+                .into_iter()
+                .all(aligned))
+        {
+            return Ok(false);
+        }
+        self.flush_residual_fold()?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z_fold, xq, y_z_fold, folded_m, k, n)?;
+        const NAME: &str = "split_mq4v2_z_betaalpha_g12";
+        self.ensure_kernel(
+            "split_mq4v2_z_betaalpha",
+            kernels::SPLIT_MQ4V2_Z_BETAALPHA_SRC,
+            NAME,
+        )?;
+        let mut src = y_z_fold.buf.as_ptr();
+        let mut z = y_z.buf.as_ptr();
+        let mut beta = y_beta.buf.as_ptr();
+        let mut alpha = y_alpha.buf.as_ptr();
+        let mut zm = z_m as i32;
+        let mut fm = folded_m as i32;
+        let mut nv = n as i32;
+        let mut params: [*mut c_void; 7] = [
+            &mut src as *mut _ as *mut c_void,
+            &mut z as *mut _ as *mut c_void,
+            &mut beta as *mut _ as *mut c_void,
+            &mut alpha as *mut _ as *mut c_void,
+            &mut zm as *mut _ as *mut c_void,
+            &mut fm as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", NAME, n * (folded_m + z_m + 96) * 4);
+        let result =
+            self.launch_maybe_blob(NAME, [n as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src);
+                b.push_ptr(z);
+                b.push_ptr(beta);
+                b.push_ptr(alpha);
+                b.push_i32(zm);
+                b.push_i32(fm);
+                b.push_i32(nv);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// gfx1201 verify-batch GDN input projection in ONE launch: the
+    /// `gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s` twin of the fused
+    /// QKV + Z-fold kernel with the GDN preparation removed. QKV row tiles
+    /// store every row like the plain SET kernel into `y_qkv`
+    /// (`Y[token * qkv_m + row]`), Z tiles into `y_z`, and the beta/alpha tile
+    /// into `y_beta`/`y_alpha` (stride 48). `a_z_fold` is the loader's Z fold.
+    /// Byte-identical to the separate SET launches. Returns `Ok(false)`
+    /// without launching unless: exact gfx1201, slab activations,
+    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`, [`Self::iu4_gdn_fold_active`],
+    /// `0 < n <= 128`, and weights/outputs are large enough and 16-byte aligned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_set_g12_iu4_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dims: [usize; 4],
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let aligned = |t: &GpuTensor| (t.buf.as_ptr() as usize) % 16 == 0;
+        if !(self.iu4_gdn_fold_active(dims, k)
+            && n > 0
+            && n <= 128
+            && a_qkv.buf.size() >= dims[0] * row_bytes
+            && a_z_fold.buf.size() == Self::iu4_gdn_fold_rows(dims[1]).0 * row_bytes
+            && y_qkv.buf.size() >= n * dims[0] * 4
+            && y_z.buf.size() >= n * dims[1] * 4
+            && [y_beta, y_alpha].iter().all(|t| t.buf.size() >= n * 48 * 4)
+            && [a_qkv, a_z_fold, y_qkv, y_z, y_beta, y_alpha]
+                .into_iter()
+                .all(aligned))
+        {
+            return Ok(false);
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        if !self.scratch.int4_mmq_slab_at(xq) {
+            return Ok(false);
+        }
+        let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s";
+        let symbol = if *VERIFY_V64 {
+            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
+        } else {
+            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s"
+        };
+        // An owed residual add must land before any further GEMM.
+        self.flush_residual_fold()?;
+        self.ensure_embedded_kernel(module, g12_iu4_b1s_image()?, symbol)?;
+        self.iu4_verify_note_iu4(n);
+        let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
+        let mut xq_ptr = xq;
+        let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
+        let mut ints = [dims[0] as i32, dims[1] as i32, k as i32, n as i32];
+        // The five GDN pointer slots are never read; `y_qkv` is the `X` slot.
+        let mut gdn_ptrs = [y_z, y_z, y_z, y_z, y_z, y_qkv].map(|t| t.buf.as_ptr());
+        let mut scales = [0.0f32, 0.0f32];
+        let [p0, p1] = &mut ptrs;
+        let [o0, o1, o2] = &mut outs;
+        let [i0, i1, i2, i3] = &mut ints;
+        let [g0, g1, g2, g3, g4, g5] = &mut gdn_ptrs;
+        let [f0, f1] = &mut scales;
+        let mut params: Vec<*mut c_void> = vec![
+            p0 as *mut _ as *mut c_void,
+            p1 as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            o0 as *mut _ as *mut c_void,
+            o1 as *mut _ as *mut c_void,
+            o2 as *mut _ as *mut c_void,
+            i0 as *mut _ as *mut c_void,
+            i1 as *mut _ as *mut c_void,
+            i2 as *mut _ as *mut c_void,
+            i3 as *mut _ as *mut c_void,
+            g0 as *mut _ as *mut c_void,
+            g1 as *mut _ as *mut c_void,
+            g2 as *mut _ as *mut c_void,
+            g3 as *mut _ as *mut c_void,
+            g4 as *mut _ as *mut c_void,
+            g5 as *mut _ as *mut c_void,
+            f0 as *mut _ as *mut c_void,
+            f1 as *mut _ as *mut c_void,
+        ];
+        let fold_rows = Self::iu4_gdn_fold_rows(dims[1]).0;
+        let row_tiles = (dims[0] + fold_rows).div_ceil(128);
+        let bytes = (dims[0] + dims[1] + 96) * row_bytes + n * (dims[0] + dims[1] + 96) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
+        let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
+        let result = self.launch_maybe_blob(
+            symbol,
+            [row_tiles as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let (ptrs, xq, outs, ints, gdn_ptrs, scales) = blob_ptrs;
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ptrs {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(xq);
+                for p in outs {
+                    b.push_ptr(p);
+                }
+                for i in ints {
+                    b.push_i32(i);
+                }
+                for p in gdn_ptrs {
+                    b.push_ptr(p);
+                }
+                for f in scales {
+                    b.push_f32(f);
+                }
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// [`Self::gemm_qkvza_mq4g256v2_wmma_iu4_prepared`] with the gfx1201 Z fold
+    /// SET + split ([`Self::gemm_zba_fold_g12_iu4_prepared`]) replacing the
+    /// separate Z / beta / alpha SETs when admitted. QKV SET is issued once
+    /// either way; `a_z` is the loader's Z fold buffer when the fold applies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_mq4g256v2_wmma_iu4_prepared_zba(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z_fold: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if self.arch != "gfx1201" {
+            return self.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+                a_qkv, a_z, a_beta, a_alpha, x, prepared, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                beta_m, alpha_m, k, n,
+            );
+        }
+        if beta_m == 48
+            && alpha_m == 48
+            && self.gemm_qkvza_set_g12_iu4_prepared(
+                a_qkv,
+                a_z,
+                prepared,
+                y_qkv,
+                y_z,
+                y_beta,
+                y_alpha,
+                [qkv_m, z_m, beta_m, alpha_m],
+                k,
+                n,
+            )?
+        {
+            return Ok(());
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+        if beta_m == 48
+            && alpha_m == 48
+            && self.gemm_zba_fold_g12_iu4_prepared(
+                a_z, prepared, y_z_fold, y_z, y_beta, y_alpha, qkv_m, z_m, k, n,
+            )?
+        {
+            return Ok(());
+        }
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, n)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, n)
+    }
+
     /// gfx1201 A4 fused GDN input projection is admitted for these weights:
     /// the certified `_b1` bundle (not the control), symmetric MQ4V2, the
     /// Qwen3.5 GDN geometry the epilogue hard-codes (q/k/v = 16 + 16 + 48
@@ -36955,6 +38102,18 @@ impl Gpu {
                 "",
                 if bf16_h_a4_enabled() {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16"
+                } else if *VERIFY_V64
+                    && n <= VERIFY_V64_MAX_N
+                    && crate::pm_tune::lookup(
+                        &self.arch,
+                        crate::pm_tune::GATE_UP_B1S_SYMBOL,
+                        m,
+                        k,
+                        g12_iu4_b1s_image()?,
+                    )?
+                    .is_none()
+                {
+                    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_v64"
                 } else {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s"
                 },
@@ -41377,6 +42536,25 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
+        if let Some(route) = mq6_resid_gfx1100_route(
+            self.arch.as_str(),
+            bits,
+            batch_size,
+            m,
+            k,
+            self.flags.mq6_resid_port_gfx1100_enabled(),
+            *MQ6_RESID_PM_GFX1100,
+        ) {
+            match route {
+                Mq6ResidGfx1100Route::Port(geom) => {
+                    self.gemm_mq6_residual_port_gfx1100(geom, a_raw, x, y, m, k, batch_size)?;
+                }
+                Mq6ResidGfx1100Route::Pm(waves) => {
+                    self.gemm_mq6_residual_pm_gfx1100(waves, a_raw, x, y, m, k, batch_size)?;
+                }
+            }
+            return Ok(true);
+        }
         if let Some(waves) = mqv2_mw_waves(
             self.arch.as_str(),
             bits,
@@ -42220,6 +43398,180 @@ impl Gpu {
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 MQ6 residual twin (`gemm_mq6g256v2_residual_pm_gfx1100_w{4,8}`, embedded
+    /// certified builder object `kernels/gemm_mq6g256v2_residual_pm_gfx1100.hxaco`): same
+    /// `A X Y M K N` kernargs, WMMA chain and `Y += acc` epilogue as the hipcc
+    /// `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`, so bytes are identical. Block `32 * waves`,
+    /// grid `[ceil(M / (16 * waves)), ceil(N / 256), 1]`, static LDS 40960, dynamic 0.
+    /// Selected by [`mq6_resid_pm_gfx1100_waves`].
+    pub fn gemm_mq6_residual_pm_gfx1100(
+        &mut self,
+        waves: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let func_name: &'static str = match waves {
+            4 => "gemm_mq6g256v2_residual_pm_gfx1100_w4",
+            8 => "gemm_mq6g256v2_residual_pm_gfx1100_w8",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq6_residual_pm_gfx1100: unsupported waves",
+                ));
+            }
+        };
+        if m == 0 || batch_size == 0 || k == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_pm_gfx1100: K must be a multiple of 256",
+            ));
+        }
+        if self.arch.as_str() != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_pm_gfx1100: exact gfx1100 required",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(
+            "gemm_mq6g256v2_residual_pm_gfx1100",
+            kernels::GEMM_MQ6G256V2_RESIDUAL_PM_GFX1100,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [
+                m.div_ceil(16 * waves) as u32,
+                batch_size.div_ceil(256) as u32,
+                1,
+            ],
+            [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1100 MQ6 residual hipcc "pk twin" ports (`gemm_mq6g256v2_residual_gfx1100_port_w8n256`
+    /// / `_w4n128`, JIT module `gemm_mq6g256v2_residual_gfx1100_port`): the card-proven
+    /// `R2Mq6-01-pk-w8n256` / `R2Mq6-04-pk-w4n128` candidates. Same `A X Y M K N` kernargs, WMMA
+    /// chain and `Y += acc` epilogue as the hipcc `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds`,
+    /// so bytes are identical. Block / grid / static LDS per [`Mq6ResidPortGeom`]
+    /// (grid `[ceil(M / tile_m), ceil(N / tile_n), 1]`, dynamic LDS 0). Selected by
+    /// [`mq6_resid_gfx1100_route`].
+    fn gemm_mq6_residual_port_gfx1100(
+        &mut self,
+        geom: Mq6ResidPortGeom,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let func_name = geom.symbol();
+        if m == 0 || batch_size == 0 || k == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_port_gfx1100: K must be a multiple of 256",
+            ));
+        }
+        if self.arch.as_str() != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6_residual_port_gfx1100: exact gfx1100 required",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq6g256v2_residual_gfx1100_port",
+            kernels::GEMM_MQ6G256V2_RESIDUAL_GFX1100_PORT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            geom.grid(m, batch_size),
+            [geom.block() as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -45567,7 +46919,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             &kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -45797,7 +47149,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [32 * MQ3_SPLITK_WAVES, 1, 1],
             0,
             &mut params,
             || {
@@ -46011,7 +47363,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -46195,7 +47547,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [if bt_b == 1 { 32 * MQ3_SPLITK_WAVES } else { 32 }, 1, 1],
             0,
             &mut params,
             || {
@@ -49282,8 +50634,8 @@ impl Gpu {
 /// header passed [`Gpu::qwen4_moe_sym_check`]: true requests it, false keeps
 /// the whole incumbent route (scatter, producers and GEMMs), and unset follows
 /// the arch descriptor's `default_requested` ([`MoeSymIu4Kernel`]): requested on
-/// gfx1151 and gfx1201 (an asymmetric artifact fails the check and stays on the
-/// incumbent), OFF on gfx1100 (`=1` opts in). `=1` on a device without a
+/// gfx1100, gfx1151 and gfx1201 (an asymmetric artifact fails the check and stays on
+/// the incumbent); `=0` is the kill switch on every arch. `=1` on a device without a
 /// descriptor, or without the exact C2 candidate set, prints one diagnostic and
 /// keeps the incumbent ([`sym_iu4_request`]). Read once.
 pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
@@ -50165,8 +51517,8 @@ pub struct MoeSymIu4Kernel {
     /// inline value, so the checker-only metadata is separate from the GEMM symbol selection
     /// that reads the other descriptor fields; call it where the checker launches.
     pub checker: fn() -> MoeSymIu4Checker,
-    /// An unset `HIPFIRE_QWEN4_MOE_SYM_IU4` requests the route: true for the qualified gfx1151 /
-    /// gfx1201 defaults, false for gfx1100 (default OFF until its Flash-Next qualification).
+    /// An unset `HIPFIRE_QWEN4_MOE_SYM_IU4` requests the route: true for the qualified gfx1100 /
+    /// gfx1151 / gfx1201 defaults (`=0` is the kill switch on every arch).
     pub default_requested: bool,
 }
 
@@ -50256,7 +51608,7 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
             k: crate::slab_moe::SLAB_DOWN_K,
         },
         checker: moe_sym_iu4_checker_gfx1100,
-        default_requested: false,
+        default_requested: true,
     },
     MoeSymIu4Kernel {
         arch: "gfx1151",
@@ -50756,12 +52108,12 @@ impl Gpu {
 /// grouping, the two A4 producers and the two grouped IU4 GEMMs. Every
 /// launcher is driven by one [`MoeSymIu4Kernel`] descriptor
 /// ([`Gpu::qwen4_moe_sym_kernel`]): gfx1151 and gfx1201 (qualified defaults)
-/// and gfx1100 (MQ4 NT1 builder entries, default OFF). A device or codec
+/// and gfx1100 (MQ4 NT1 builder entries; all three qualified defaults). A device or codec
 /// without a descriptor refuses.
 impl Gpu {
     /// The route is requested and possible on this device ([`sym_iu4_request`]):
     /// the flag (unset = the descriptor's `default_requested`: requested on
-    /// gfx1151/gfx1201, off on gfx1100), a descriptor for this arch, and the
+    /// gfx1100/gfx1151/gfx1201), a descriptor for this arch, and the
     /// frozen C2 producer candidate set (`-DIU4_A4_CANDIDATES=2`; any other
     /// value keeps the incumbent). An explicit `HIPFIRE_QWEN4_MOE_SYM_IU4=1`
     /// that cannot be served prints one diagnostic per process and keeps the
@@ -55387,9 +56739,11 @@ mod route_selector_tests {
             for entry in [
                 "gemm_wmma_lds_64_64_32_64_k64",
                 "gemm_wmma_lds_64_64_32_64_k64_p",
+                "gemm_wmma_lds_80_32_80_16_k64_p",
                 "gemm_wmma_lds_128_128_32_64_k64_p",
             ] {
-                let special = entry.starts_with("gemm_wmma_lds_64_64");
+                let special = entry.starts_with("gemm_wmma_lds_64_64")
+                    || entry == "gemm_wmma_lds_80_32_80_16_k64_p";
                 let previous = if special && !halo {
                     (
                         "qwen4_gemm_wmma_lds256",
@@ -55404,6 +56758,40 @@ mod route_selector_tests {
                 assert_eq!(lds256_tile_source_selected(halo, entry), previous);
             }
         }
+    }
+
+    /// The gfx1100 HC `input_mix_down` fill tile: exact gfx1100, M == 320,
+    /// K % 64 == 0, kill switch off the route; its entry is the
+    /// `LdsTile::entry()` of the 80 x 32 / 80 x 16 k64 pipelined tile, two
+    /// waves, 4 x 24 workgroups at N = 768 (192 waves, five chains per wave).
+    #[test]
+    fn hc_mix_fill80_gfx1100_predicate_and_geometry() {
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+            for enabled in [false, true] {
+                for m in [1, 80, 319, 320, 321, 400, 640] {
+                    for k in [64, 2560, 10240, 10241, 10304] {
+                        assert_eq!(
+                            hc_mix_fill80_gfx1100_selected(arch, enabled, m, k),
+                            enabled && arch == "gfx1100" && m == 320 && k % 64 == 0,
+                            "{arch} enabled={enabled} m={m} k={k}"
+                        );
+                    }
+                }
+            }
+        }
+        let tile = LdsTile::HC_MIX_FILL80_GFX1100;
+        assert_eq!(tile.entry(), "gemm_wmma_lds_80_32_80_16_k64_p");
+        assert!(tile.pipe && !tile.swap);
+        assert_eq!(
+            (tile.bm / tile.wm) * (tile.bn / tile.wn),
+            2,
+            "two waves per workgroup"
+        );
+        assert_eq!(320usize.div_ceil(tile.bm), 4);
+        assert_eq!(768usize.div_ceil(tile.bn), 24);
+        assert_eq!(320 % tile.bm, 0, "no ragged M tile at the selected M");
+        // It is deliberately not a tile-chain variant (no plain twin, no epilogue set).
+        assert!(!Gpu::LDS_TILE_VARIANTS.contains(&tile));
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -55950,7 +57338,7 @@ mod route_selector_tests {
         assert!(gfx1100.is_some());
         assert_eq!(
             sym_iu4_request(gfx1100, None, MOE_SYM_C2),
-            SymIu4Request::Off
+            SymIu4Request::Requested
         );
         assert_eq!(
             sym_iu4_request(gfx1100, Some(false), MOE_SYM_C2),
@@ -56022,7 +57410,6 @@ mod route_selector_tests {
                     let expected = match (name, flag) {
                         (_, Some(false)) => SymIu4Request::Off,
                         ("none", _) => SymIu4Request::Unsupported(SYM_IU4_NO_DESCRIPTOR),
-                        ("gfx1100", None) => SymIu4Request::Off,
                         _ if !c2 => SymIu4Request::Unsupported(SYM_IU4_NOT_C2),
                         _ => SymIu4Request::Requested,
                     };
@@ -56035,25 +57422,65 @@ mod route_selector_tests {
                 }
             }
         }
-        // Literal spot checks: unset requests gfx1151/gfx1201 (the qualified defaults) and not
-        // gfx1100; an explicit =1 opts gfx1100 in; =0 kills every arch.
+        // Literal spot checks: unset requests gfx1100/gfx1151/gfx1201 (the qualified defaults);
+        // an explicit =1 requests the same; =0 kills every arch (HIPFIRE_QWEN4_MOE_SYM_IU4=0).
         let flag_of = |arch: &str, flag| sym_iu4_request(Some(moe_sym_row(arch)), flag, MOE_SYM_C2);
         assert_eq!(flag_of("gfx1151", None), SymIu4Request::Requested);
         assert_eq!(flag_of("gfx1201", None), SymIu4Request::Requested);
-        assert_eq!(flag_of("gfx1100", None), SymIu4Request::Off);
+        assert_eq!(flag_of("gfx1100", None), SymIu4Request::Requested);
         assert_eq!(flag_of("gfx1100", Some(true)), SymIu4Request::Requested);
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert_eq!(flag_of(arch, Some(false)), SymIu4Request::Off, "{arch}");
+            assert!(moe_sym_row(arch).default_requested, "{arch}");
+            // Unset and an explicit =1 request the same route (the default is the same
+            // verdict as the opt-in), and =0 is the only way off.
             assert_eq!(
-                moe_sym_row(arch).default_requested,
-                arch != "gfx1100",
-                "{arch}"
+                flag_of(arch, None),
+                flag_of(arch, Some(true)),
+                "{arch}: unset follows =1"
             );
         }
         // The single diagnostic names the arch, the reason and the kept incumbent route.
         let notice = sym_iu4_unsupported_notice("gfx1101", SYM_IU4_NO_DESCRIPTOR);
         assert!(notice.contains("gfx1101") && notice.contains(SYM_IU4_NO_DESCRIPTOR));
         assert!(notice.contains("keeping the incumbent route"));
+    }
+
+    /// gfx1100 requests the aggregate route by default (the S1 slow-link window and the regular
+    /// prefill read this one verdict), `HIPFIRE_QWEN4_MOE_SYM_IU4=0` is the kill switch, and a
+    /// candidate set other than C2 withdraws the default without a diagnostic-worthy flag.
+    #[test]
+    fn moe_sym_iu4_gfx1100_is_requested_by_default_and_zero_kills_it() {
+        let gfx1100 = Some(moe_sym_row("gfx1100"));
+        // The product's gfx11 producers are always built with the C2 candidate set.
+        assert_eq!(
+            sym_iu4_request(gfx1100, None, MOE_SYM_C2),
+            SymIu4Request::Requested
+        );
+        assert_eq!(
+            sym_iu4_request(gfx1100, Some(true), MOE_SYM_C2),
+            SymIu4Request::Requested
+        );
+        // The kill switch is `Off` whatever the compiler flags are.
+        for extra in [MOE_SYM_C2, "", "-DIU4_A4_CANDIDATES=1", "-O3"] {
+            assert_eq!(
+                sym_iu4_request(gfx1100, Some(false), extra),
+                SymIu4Request::Off,
+                "{extra:?}"
+            );
+        }
+        // Unset with a non-C2 candidate set is withdrawn exactly like gfx1151 / gfx1201.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert_eq!(
+                sym_iu4_request(Some(moe_sym_row(arch)), None, "-DIU4_A4_CANDIDATES=1"),
+                SymIu4Request::Unsupported(SYM_IU4_NOT_C2),
+                "{arch}"
+            );
+        }
+        // The route still needs 512 routed rows and never takes the agent-turn append scope.
+        assert!(!sym_iu4_rows_admit(511, false));
+        assert!(sym_iu4_rows_admit(QWEN4_MOE_SYM_IU4_MIN_ROWS, false));
+        assert!(!sym_iu4_rows_admit(QWEN4_MOE_SYM_IU4_MIN_ROWS, true));
     }
 
     /// 511 rows stay on the incumbent, 512 and above take the route, the agent-turn append
@@ -56450,7 +57877,7 @@ mod route_selector_tests {
             ([4, 8], [128, 128], [[8192, 0], [16384, 0]])
         );
         assert!(
-            gfx1151.default_requested && gfx1201.default_requested && !gfx1100.default_requested
+            gfx1100.default_requested && gfx1151.default_requested && gfx1201.default_requested
         );
     }
     /// The serving scatter binds the registered canonical gfx1100 twin (and its
@@ -56744,6 +58171,224 @@ mod qwen4_moe_stream8_selection {
                 other[i] = value;
                 assert!(!selected("gfx1151", true, false, other));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mq6_resid_pm_gfx1100_selection {
+    use super::mq6_resid_pm_gfx1100_waves as pick;
+
+    #[test]
+    fn m_boundaries_on_gfx1100() {
+        for (m, want) in [
+            (48, None),
+            (640, None),
+            (2559, None),
+            (2560, Some(4)),
+            (6143, Some(4)),
+            (6144, Some(8)),
+            (10240, Some(8)),
+            (12288, Some(8)),
+        ] {
+            assert_eq!(pick("gfx1100", 6, 768, m, true), want, "m={m}");
+        }
+    }
+
+    #[test]
+    fn only_where_hipcc_selects_mw8() {
+        assert_eq!(pick("gfx1100", 6, 463, 10240, true), None);
+        assert_eq!(pick("gfx1100", 6, 416, 10240, true), None);
+        assert_eq!(pick("gfx1100", 6, 464, 10240, true), Some(8));
+        assert_eq!(pick("gfx1100", 6, 464, 2560, true), Some(4));
+    }
+
+    #[test]
+    fn kill_switch_other_bits_and_other_arches_unchanged() {
+        assert_eq!(pick("gfx1100", 6, 768, 10240, false), None);
+        for bits in [3u8, 4, 5] {
+            assert_eq!(pick("gfx1100", bits, 768, 10240, true), None, "bits={bits}");
+        }
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101",
+        ] {
+            assert_eq!(pick(arch, 6, 768, 10240, true), None, "{arch}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mq6_resid_port_gfx1100_selection {
+    use super::Mq6ResidGfx1100Route::{Pm, Port};
+    use super::Mq6ResidPortGeom::{W4N128, W8N256};
+    use super::{
+        mq6_resid_gfx1100_route as route, mq6_resid_port_gfx1100_geom as geom, Mq6ResidGfx1100Route,
+    };
+
+    /// Qwen4 Flash-Next prefill: QKV M10240 / QG M12288 / Z M6144 at K2560, out M2560 K6144, ba M48.
+    const N: usize = 768;
+
+    #[test]
+    fn m_boundaries_on_gfx1100() {
+        for (m, k, want) in [
+            (48, 2560, None),
+            (640, 2560, None),
+            (2559, 2560, None),
+            (2560, 6144, Some(W4N128)),
+            (2561, 2560, Some(W4N128)),
+            (6143, 2560, Some(W4N128)),
+            (6144, 2560, Some(W8N256)),
+            (10240, 2560, Some(W8N256)),
+            (12288, 2560, Some(W8N256)),
+        ] {
+            assert_eq!(geom("gfx1100", 6, N, m, k, true), want, "m={m}");
+        }
+    }
+
+    #[test]
+    fn n_boundaries_follow_hipcc_mw8_choice() {
+        // hipcc picks MW8 from N >= 464, MW4 for 416..=463 and no MW below 416.
+        for n in [1, 64, 415, 416, 417, 463] {
+            for m in [2560, 6143, 6144, 12288] {
+                assert_eq!(geom("gfx1100", 6, n, m, 2560, true), None, "n={n} m={m}");
+                assert_eq!(
+                    route("gfx1100", 6, n, m, 2560, true, true),
+                    None,
+                    "n={n} m={m}"
+                );
+            }
+        }
+        for n in [464, 465, 768, 1536, 16896] {
+            assert_eq!(
+                geom("gfx1100", 6, n, 10240, 2560, true),
+                Some(W8N256),
+                "n={n}"
+            );
+            assert_eq!(
+                geom("gfx1100", 6, n, 2560, 6144, true),
+                Some(W4N128),
+                "n={n}"
+            );
+            assert_eq!(geom("gfx1100", 6, n, 48, 2560, true), None, "n={n}");
+        }
+    }
+
+    /// Every (port, PM) switch combination at every M class: port -> PM twin -> hipcc MW8.
+    #[test]
+    fn precedence_for_every_flag_combination() {
+        type R = Option<Mq6ResidGfx1100Route>;
+        for (m, k, port_on, pm_on, want) in [
+            // M >= 6144 (w8n256 / PM w8)
+            (10240usize, 2560usize, true, true, Some(Port(W8N256))),
+            (10240, 2560, true, false, Some(Port(W8N256))),
+            (10240, 2560, false, true, Some(Pm(8))),
+            (10240, 2560, false, false, None),
+            (6144, 2560, true, true, Some(Port(W8N256))),
+            (6144, 2560, false, true, Some(Pm(8))),
+            (6144, 2560, false, false, None),
+            (12288, 2560, true, false, Some(Port(W8N256))),
+            (12288, 2560, false, true, Some(Pm(8))),
+            // 2560 <= M < 6144 (w4n128 / PM w4)
+            (6143, 2560, true, true, Some(Port(W4N128))),
+            (6143, 2560, true, false, Some(Port(W4N128))),
+            (6143, 2560, false, true, Some(Pm(4))),
+            (6143, 2560, false, false, None),
+            (2560, 6144, true, true, Some(Port(W4N128))),
+            (2560, 6144, true, false, Some(Port(W4N128))),
+            (2560, 6144, false, true, Some(Pm(4))),
+            (2560, 6144, false, false, None),
+            // M < 2560 (ba): hipcc MW8 under every combination
+            (2559, 2560, true, true, None),
+            (2559, 2560, false, true, None),
+            (640, 2560, true, true, None),
+            (48, 2560, true, true, None),
+            (48, 2560, true, false, None),
+            (48, 2560, false, true, None),
+            (48, 2560, false, false, None),
+        ] {
+            let got: R = route("gfx1100", 6, N, m, k, port_on, pm_on);
+            assert_eq!(got, want, "m={m} port={port_on} pm={pm_on}");
+        }
+    }
+
+    #[test]
+    fn other_bits_arches_and_k_are_unchanged() {
+        for bits in [2u8, 3, 4, 5, 8] {
+            assert_eq!(
+                geom("gfx1100", bits, N, 10240, 2560, true),
+                None,
+                "bits={bits}"
+            );
+            assert_eq!(
+                route("gfx1100", bits, N, 10240, 2560, true, true),
+                None,
+                "bits={bits}"
+            );
+        }
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101", "gfx906", "",
+        ] {
+            assert_eq!(geom(arch, 6, N, 10240, 2560, true), None, "{arch}");
+            assert_eq!(route(arch, 6, N, 10240, 2560, true, true), None, "{arch}");
+        }
+        for k in [1, 255, 257, 2559, 2561] {
+            assert_eq!(geom("gfx1100", 6, N, 10240, k, true), None, "k={k}");
+            assert_eq!(route("gfx1100", 6, N, 10240, k, true, true), None, "k={k}");
+        }
+        // k == 0 is never the port (the launchers return before launching, as before).
+        assert_eq!(geom("gfx1100", 6, N, 10240, 0, true), None);
+        assert_eq!(geom("gfx1100", 6, N, 0, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, 0, 10240, 2560, true), None);
+    }
+
+    /// The raw buffer descriptors carry 31-bit byte offsets; shapes that do not fit keep the
+    /// incumbent (and, with the PM twin on, the PM twin, which has its own admission).
+    #[test]
+    fn extents_that_exceed_31_bits_keep_the_incumbent() {
+        // fp16 X: n * k * 2 < 2^31.
+        let n_ok = ((1usize << 31) - 1) / (2 * 2560);
+        assert_eq!(geom("gfx1100", 6, n_ok, 10240, 2560, true), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, n_ok + 1, 10240, 2560, true), None);
+        assert_eq!(
+            route("gfx1100", 6, n_ok + 1, 10240, 2560, true, true),
+            Some(Pm(8))
+        );
+        // MQ6 weights: m * (k / 256) * 200 < 2^31.
+        let m_ok = ((1usize << 31) - 1) / (10 * 200);
+        assert_eq!(geom("gfx1100", 6, N, m_ok, 2560, true), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, N, m_ok + 1, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, N, usize::MAX / 4, 2560, true), None);
+    }
+
+    #[test]
+    fn launch_geometry_matches_the_carded_candidates() {
+        assert_eq!(
+            W8N256.symbol(),
+            "gemm_mq6g256v2_residual_gfx1100_port_w8n256"
+        );
+        assert_eq!(
+            W4N128.symbol(),
+            "gemm_mq6g256v2_residual_gfx1100_port_w4n128"
+        );
+        assert_eq!(
+            (W8N256.tile_m(), W8N256.tile_n(), W8N256.block()),
+            (128, 256, 256)
+        );
+        assert_eq!(
+            (W4N128.tile_m(), W4N128.tile_n(), W4N128.block()),
+            (64, 128, 128)
+        );
+        // Card grids: qkv 80x3 / 160x6, out (M2560) 20x3 / 40x6; ragged N rounds up.
+        assert_eq!(W8N256.grid(10240, 768), [80, 3, 1]);
+        assert_eq!(W8N256.grid(12288, 768), [96, 3, 1]);
+        assert_eq!(W8N256.grid(6144, 768), [48, 3, 1]);
+        assert_eq!(W4N128.grid(10240, 768), [160, 6, 1]);
+        assert_eq!(W4N128.grid(2560, 768), [40, 6, 1]);
+        assert_eq!(W8N256.grid(6145, 769), [49, 4, 1]);
+        assert_eq!(W4N128.grid(2561, 769), [41, 7, 1]);
+        // Block = 32 lanes per wave, one wave per 16 rows.
+        for g in [W8N256, W4N128] {
+            assert_eq!(g.block(), 32 * (g.tile_m() / 16));
         }
     }
 }

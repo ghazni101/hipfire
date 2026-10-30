@@ -48,7 +48,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use hipfire_kernel_abi::families::{self, mq6_i8, qwen4_moe_sym as moe_abi};
+use hipfire_kernel_abi::families::{
+    self, ggml_convert as convert_abi, ggml_mmvq as ggml_abi, ggml_mmvq_fused as ggml_fused,
+    mq6_i8, qwen4_moe_sym as moe_abi,
+};
 use hipfire_kernel_abi::{
     check_export, validate_invocation, AbiError, Arch, ArgEvidence, Drift, EvidenceSource,
     ExportEvidence, ExportV1, Expr, FormatId, InvocationV1, KernelAbiV1, ObjectRefV1,
@@ -70,7 +73,162 @@ use sha2::{Digest, Sha256};
 /// Embedded exports with no PeaceMaker generator path, as `(arch, symbol, reason)`. Exact: an
 /// export without a generator that is not listed here fails, and a listed export that gains a
 /// generator (or disappears) fails. Every embedded export currently has one.
-const NO_GENERATOR_PATH: &[(&str, &str, &str)] = &[];
+const NO_GENERATOR_PATH: &[(&str, &str, &str)] = &[
+    ("gfx1201", "ggml_mmvq_iq4_xs_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q4_k_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q6_k_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q8_0_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_q8_1_quantize_gfx1201", GGML_SHIM_REASON),
+    ("gfx1201", "ggml_mmvq_q5_k_gfx1201", GGML_FUSED_SHIM_REASON),
+    (
+        "gfx1201",
+        "ggml_mmvq_iq4_xs_res_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_mmvq_q4_k_res_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_mmvq_q5_k_res_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_mmvq_q6_k_res_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_mmvq_q8_0_res_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_q8_1_quantize_gather_gfx1201",
+        GGML_FUSED_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_q81_roundtrip_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_iq4_xs_f16_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_iq4_xs_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row_iq4_xs_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row1_iq4_xs_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q4_k_f16_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q4_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row_q4_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row1_q4_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q5_k_f16_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q5_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row_q5_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row1_q5_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q6_k_f16_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q6_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row_q6_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row1_q6_k_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q8_0_f16_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_dequant_q8_0_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row_q8_0_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+    (
+        "gfx1201",
+        "ggml_get_row1_q8_0_f32_gfx1201",
+        GGML_CONVERT_SHIM_REASON,
+    ),
+];
+
+/// The ggml shim is hipcc-compiled from `kernels/src/ggml_mmvq_shim.hip`; PeaceMaker emits
+/// nothing for it, so its only offline evidence is the committed object's metadata.
+const GGML_SHIM_REASON: &str =
+    "hipcc-built from third_party/ggml upstream device code; no PeaceMaker generator";
+
+/// The S3 additions come from `kernels/src/ggml_mmvq_fused_shim.hip`, the same way.
+const GGML_FUSED_SHIM_REASON: &str =
+    "hipcc-built from third_party/ggml upstream device code (fused shim); no PeaceMaker generator";
+
+/// The S3 convert exports come from `kernels/src/ggml_convert_shim.hip`, the same way.
+const GGML_CONVERT_SHIM_REASON: &str =
+    "hipcc-built from third_party/ggml upstream device code (convert shim); no PeaceMaker generator";
 
 /// Every `HipccSource` export `(arch, symbol)`: no offline object, so no metadata evidence.
 const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
@@ -172,6 +330,15 @@ static OBJECTS: LazyLock<BTreeMap<&'static str, LiftedObject>> = LazyLock::new(|
         .collect()
 });
 
+/// Name of the contract's explicit field at `offset` (empty if there is none, so a metadata
+/// arg the contract lacks still drifts).
+fn unnamed_arg_name(export: &ExportV1, offset: u32) -> String {
+    families::find_export(export.arch, export.symbol)
+        .and_then(|(abi, _)| abi.fields.iter().find(|f| f.offset == offset))
+        .map(|f| f.name.to_string())
+        .unwrap_or_default()
+}
+
 /// `ExportEvidence` of `export` from the real metadata of its committed object.
 fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
     let ObjectRefV1::Embedded { artifact, .. } = export.object else {
@@ -224,7 +391,13 @@ fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
             .args
             .iter()
             .map(|a| ArgEvidence {
-                name: a.name.clone(),
+                // hipcc-built objects (the ggml shim) carry no `.name`: the contract's field
+                // name at the same offset stands in; offset, size and kind are still compared.
+                name: if a.name.is_empty() {
+                    unnamed_arg_name(export, a.offset)
+                } else {
+                    a.name.clone()
+                },
                 offset: a.offset,
                 size: a.size,
                 value_kind: a.value_kind.clone(),
@@ -1156,4 +1329,509 @@ fn broken_recipe_interchange_is_rejected_before_enqueue() {
             got: moe_abi::FORMAT_Y_GATE_UP_SWIGLU_BF16,
         }
     );
+}
+
+// ---- ggml shim: pin, object and invocation evidence -----------------------------------
+
+const GGML_IQ4_XS: &str = "ggml_mmvq_iq4_xs_gfx1201";
+
+/// Every `sha256  local-path  upstream-path` line of `third_party/ggml/PIN` names a file of the
+/// snapshot whose bytes hash to the pinned digest: an upstream re-pin without updating the PIN,
+/// or an edit inside the verbatim snapshot, fails here. Lines starting with `#` and
+/// `key=value` metadata lines (an `=` before the first space) are skipped.
+#[test]
+fn ggml_snapshot_matches_pin() {
+    let dir = repo_root().join("third_party/ggml");
+    let pin = std::fs::read_to_string(dir.join("PIN")).expect("third_party/ggml/PIN");
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for line in pin.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let first = line.split(' ').next().unwrap_or("");
+        if first.contains('=') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 3 || fields[0].len() != 64 {
+            failures.push(format!("malformed PIN line: {line:?}"));
+            continue;
+        }
+        let path = dir.join(fields[1]);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let got = hex(&Sha256::digest(&bytes));
+                if !got.eq_ignore_ascii_case(fields[0]) {
+                    failures.push(format!(
+                        "{}: sha256 is {got}, PIN pins {}",
+                        fields[1], fields[0]
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("{}: unreadable: {e}", path.display())),
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "PIN lists no files");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The ggml exports live in an offload bundle (`.co`), lifted by the same path as the `.hxaco`
+/// images: all five must be present in `embedded_objects_match_contracts`' evidence.
+#[test]
+fn ggml_exports_have_object_evidence() {
+    let mut n = 0;
+    for abi in ggml_abi::ABIS {
+        for export in abi.exports {
+            let evidence = object_evidence_ok(export);
+            assert_eq!(check_export(abi, export, &evidence), vec![], "{}", abi.id);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 5);
+}
+
+/// Negative control: a ggml contract pinning another object hash drifts from the real object.
+#[test]
+fn broken_ggml_object_sha() {
+    const WRONG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let real_abi = &ggml_abi::GGML_MMVQ_IQ4_XS;
+    let real = real_export(real_abi, Arch::Gfx1201, GGML_IQ4_XS);
+    let ObjectRefV1::Embedded {
+        module,
+        artifact,
+        sha256,
+    } = real.object
+    else {
+        panic!("{GGML_IQ4_XS} is not an embedded export");
+    };
+    let evidence = object_evidence_ok(real);
+    assert_eq!(check_export(real_abi, real, &evidence), vec![]);
+
+    let mut exports = real_abi.exports.to_vec();
+    for e in exports.iter_mut() {
+        e.object = ObjectRefV1::Embedded {
+            module,
+            artifact,
+            sha256: WRONG,
+        };
+    }
+    let leaked = leak_with_exports(real_abi, exports);
+    let leaked_export = real_export(leaked, Arch::Gfx1201, GGML_IQ4_XS);
+    assert_eq!(
+        check_export(leaked, leaked_export, &evidence),
+        vec![Drift::ObjectSha {
+            symbol: GGML_IQ4_XS.into(),
+            contract: WRONG.into(),
+            evidence: sha256.to_string(),
+        }]
+    );
+}
+
+/// `iq4_xs` mmvq at `M = 5120, K = 5120`: admitted with exact extents, rejected one weight
+/// byte short.
+#[test]
+fn ggml_iq4_xs_invocation_admission() {
+    let abi = &ggml_abi::GGML_MMVQ_IQ4_XS;
+    let params = [5120u64, 5120];
+    let operands = |weight_bytes: u64| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(weight_bytes), // M * (K / 256) * 136
+                format: ggml_abi::FORMAT_IQ4_XS_136,
+            },
+            OperandBinding {
+                address: 0x4000_0000,
+                bytes: Some(5760), // K / 32 * 36
+                format: ggml_abi::FORMAT_Q8_1_MMVQ,
+            },
+            OperandBinding {
+                address: 0x5000_0000,
+                bytes: Some(20_480), // M * 4
+                format: ggml_abi::FORMAT_F32_M,
+            },
+        ]
+    };
+    let inv = |ops: &'static [OperandBinding]| InvocationV1 {
+        arch: Arch::Gfx1201,
+        symbol: GGML_IQ4_XS,
+        params: &params,
+        operands: ops,
+        grid: [5120, 1, 1],
+        block: [32, 8, 1],
+        dynamic_lds: 0,
+    };
+    let good: &'static [OperandBinding] = Box::leak(Box::new(operands(13_926_400)));
+    admitted(abi, &inv(good));
+    let short: &'static [OperandBinding] = Box::leak(Box::new(operands(13_926_399)));
+    assert_eq!(
+        rejected(abi, &inv(short)),
+        AbiError::Extent {
+            abi: "ggml_mmvq.iq4_xs.gfx1201",
+            operand: "vx",
+            need: 13_926_400,
+            have: 13_926_399,
+        }
+    );
+}
+
+/// The S3 additions (`q5_k`, the `_res` epilogue variants, the gather producer) are
+/// hipcc-compiled from `kernels/src/ggml_mmvq_fused_shim.hip`: all seven exports must
+/// be present in the committed object with the contracts' metadata.
+#[test]
+fn ggml_fused_exports_have_object_evidence() {
+    let mut n = 0;
+    for abi in ggml_fused::ABIS {
+        for export in abi.exports {
+            let evidence = object_evidence_ok(export);
+            assert_eq!(check_export(abi, export, &evidence), vec![], "{}", abi.id);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 7);
+}
+
+/// Negative control: a fused contract pinning another object hash drifts from the real object.
+#[test]
+fn broken_ggml_fused_object_sha() {
+    const WRONG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const SYMBOL: &str = "ggml_mmvq_q5_k_res_gfx1201";
+    let real_abi = &ggml_fused::GGML_MMVQ_Q5_K_RES;
+    let real = real_export(real_abi, Arch::Gfx1201, SYMBOL);
+    let ObjectRefV1::Embedded {
+        module,
+        artifact,
+        sha256,
+    } = real.object
+    else {
+        panic!("{SYMBOL} is not an embedded export");
+    };
+    let evidence = object_evidence_ok(real);
+    assert_eq!(check_export(real_abi, real, &evidence), vec![]);
+
+    let mut exports = real_abi.exports.to_vec();
+    for e in exports.iter_mut() {
+        e.object = ObjectRefV1::Embedded {
+            module,
+            artifact,
+            sha256: WRONG,
+        };
+    }
+    let leaked = leak_with_exports(real_abi, exports);
+    let leaked_export = real_export(leaked, Arch::Gfx1201, SYMBOL);
+    assert_eq!(
+        check_export(leaked, leaked_export, &evidence),
+        vec![Drift::ObjectSha {
+            symbol: SYMBOL.into(),
+            contract: WRONG.into(),
+            evidence: sha256.to_string(),
+        }]
+    );
+}
+
+/// `q5_k` residual mmvq at `M = 2560, K = 5120`: admitted with exact extents (the `dst`
+/// operand is read-write), rejected one destination byte short.
+#[test]
+fn ggml_fused_q5_k_res_invocation_admission() {
+    let abi = &ggml_fused::GGML_MMVQ_Q5_K_RES;
+    let params = [2560u64, 5120];
+    let operands = |dst_bytes: u64| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(9_011_200), // M * (K / 256) * 176
+                format: ggml_fused::FORMAT_Q5_K_176,
+            },
+            OperandBinding {
+                address: 0x4000_0000,
+                bytes: Some(5760), // K / 32 * 36
+                format: ggml_abi::FORMAT_Q8_1_MMVQ,
+            },
+            OperandBinding {
+                address: 0x5000_0000,
+                bytes: Some(dst_bytes), // M * 4
+                format: ggml_abi::FORMAT_F32_M,
+            },
+        ]
+    };
+    fn inv<'a>(params: &'a [u64], ops: &'a [OperandBinding]) -> InvocationV1<'a> {
+        InvocationV1 {
+            arch: Arch::Gfx1201,
+            symbol: "ggml_mmvq_q5_k_res_gfx1201",
+            params,
+            operands: ops,
+            grid: [2560, 1, 1],
+            block: [32, 8, 1],
+            dynamic_lds: 0,
+        }
+    }
+    let good = operands(10_240);
+    admitted(abi, &inv(&params, &good));
+    let short = operands(10_239);
+    assert_eq!(
+        rejected(abi, &inv(&params, &short)),
+        AbiError::Extent {
+            abi: "ggml_mmvq_fused.q5_k_res.gfx1201",
+            operand: "dst",
+            need: 10_240,
+            have: 10_239,
+        }
+    );
+}
+
+/// The gather producer at `K = 6144`: admitted with exact extents, rejected for a
+/// non-multiple-of-32 `K` and one map byte short.
+#[test]
+fn ggml_fused_gather_invocation_admission() {
+    let abi = &ggml_fused::GGML_Q8_1_GATHER;
+    let operands = |map_bytes: u64| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(24_576), // K * 4
+                format: ggml_abi::FORMAT_F32_ROWS_S01,
+            },
+            OperandBinding {
+                address: 0x4000_0000,
+                bytes: Some(6912), // K / 32 * 36
+                format: ggml_abi::FORMAT_Q8_1_MMVQ,
+            },
+            OperandBinding {
+                address: 0x5000_0000,
+                bytes: Some(map_bytes), // K / 32 * 4
+                format: ggml_fused::FORMAT_I32_BLK_MAP,
+            },
+        ]
+    };
+    fn inv<'a>(params: &'a [u64], grid: u32, ops: &'a [OperandBinding]) -> InvocationV1<'a> {
+        InvocationV1 {
+            arch: Arch::Gfx1201,
+            symbol: "ggml_q8_1_quantize_gather_gfx1201",
+            params,
+            operands: ops,
+            grid: [grid, 1, 1],
+            block: [256, 1, 1],
+            dynamic_lds: 0,
+        }
+    }
+    let good = operands(768);
+    admitted(abi, &inv(&[6144u64], 24, &good));
+    let short = operands(767);
+    assert_eq!(
+        rejected(abi, &inv(&[6144u64], 24, &short)),
+        AbiError::Extent {
+            abi: "ggml_mmvq_fused.q8_1_gather.gfx1201",
+            operand: "blk_map",
+            need: 768,
+            have: 767,
+        }
+    );
+    assert!(matches!(
+        rejected(abi, &inv(&[6145u64], 25, &good)),
+        AbiError::Domain { .. }
+    ));
+}
+
+// ---- ggml convert shim: object and invocation evidence --------------------------------
+
+const CONVERT_Q4_K_F16: &str = "ggml_dequant_q4_k_f16_gfx1201";
+
+/// The S3 convert shim (dequant f16 / f32, gathers, A8 round trip) is hipcc-compiled from
+/// `kernels/src/ggml_convert_shim.hip`: all 21 exports must be present in the committed object with
+/// the contracts' metadata (explicit offsets / sizes, segment 36 / 40 / 28 / 12, no hidden args, no LDS).
+#[test]
+fn ggml_convert_exports_have_object_evidence() {
+    let mut n = 0;
+    for abi in convert_abi::ABIS {
+        for export in abi.exports {
+            let evidence = object_evidence_ok(export);
+            assert_eq!(check_export(abi, export, &evidence), vec![], "{}", abi.id);
+            n += 1;
+        }
+    }
+    assert_eq!(n, 21);
+}
+
+/// Both S3 families name the same `q5_k` format id (the weight is one byte layout).
+#[test]
+fn ggml_convert_q5_k_format_is_the_fused_family_s() {
+    assert_eq!(convert_abi::FORMAT_Q5_K_176, ggml_fused::FORMAT_Q5_K_176);
+}
+
+/// Negative control: a convert contract pinning another object hash drifts from the real object.
+#[test]
+fn broken_ggml_convert_object_sha() {
+    const WRONG: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    let real_abi = &convert_abi::q4_k::DEQUANT_F16;
+    let real = real_export(real_abi, Arch::Gfx1201, CONVERT_Q4_K_F16);
+    let ObjectRefV1::Embedded {
+        module,
+        artifact,
+        sha256,
+    } = real.object
+    else {
+        panic!("{CONVERT_Q4_K_F16} is not an embedded export");
+    };
+    let evidence = object_evidence_ok(real);
+    assert_eq!(check_export(real_abi, real, &evidence), vec![]);
+
+    let mut exports = real_abi.exports.to_vec();
+    for e in exports.iter_mut() {
+        e.object = ObjectRefV1::Embedded {
+            module,
+            artifact,
+            sha256: WRONG,
+        };
+    }
+    let leaked = leak_with_exports(real_abi, exports);
+    let leaked_export = real_export(leaked, Arch::Gfx1201, CONVERT_Q4_K_F16);
+    assert_eq!(
+        check_export(leaked, leaked_export, &evidence),
+        vec![Drift::ObjectSha {
+            symbol: CONVERT_Q4_K_F16.into(),
+            contract: WRONG.into(),
+            evidence: sha256.to_string(),
+        }]
+    );
+}
+
+/// `q4_k` -> f16 dequant of `M = 5120, K = 6144` with a column permutation: admitted with exact
+/// extents (weights, output, colmap), rejected one weight byte / one colmap byte short and for a
+/// `K` that is not a chunk multiple when a colmap is passed; a null colmap needs no chunk multiple.
+#[test]
+fn ggml_convert_q4_k_dequant_invocation_admission() {
+    let abi = &convert_abi::q4_k::DEQUANT_F16;
+    let (m, k) = (5120u64, 6144u64);
+    let weight = m * (k / 256) * 144;
+    let operands = |weight_bytes: u64, colmap_bytes: u64| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(weight_bytes), // M * (K / 256) * 144
+                format: ggml_abi::FORMAT_Q4_K_144,
+            },
+            OperandBinding {
+                address: 0x6000_0000,
+                bytes: Some(m * k * 2), // M * K * 2
+                format: convert_abi::FORMAT_F16_FLAT,
+            },
+            OperandBinding {
+                address: 0x5000_0000,
+                bytes: Some(colmap_bytes), // K / 128 * 4
+                format: convert_abi::FORMAT_I32_CHUNK_PERM,
+            },
+        ]
+    };
+    fn inv<'a>(params: &'a [u64], grid: u32, ops: &'a [OperandBinding]) -> InvocationV1<'a> {
+        InvocationV1 {
+            arch: Arch::Gfx1201,
+            symbol: CONVERT_Q4_K_F16,
+            params,
+            operands: ops,
+            grid: [grid, 1, 1],
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+        }
+    }
+    let nb = (m * k / 256) as u32;
+    let params = [m, k, 1];
+    let good = operands(weight, 192);
+    admitted(abi, &inv(&params, nb, &good));
+    let short_w = operands(weight - 1, 192);
+    assert_eq!(
+        rejected(abi, &inv(&params, nb, &short_w)),
+        AbiError::Extent {
+            abi: "ggml_convert.dequant_q4_k_f16.gfx1201",
+            operand: "vx",
+            need: weight,
+            have: weight - 1,
+        }
+    );
+    let short_c = operands(weight, 191);
+    assert_eq!(
+        rejected(abi, &inv(&params, nb, &short_c)),
+        AbiError::Extent {
+            abi: "ggml_convert.dequant_q4_k_f16.gfx1201",
+            operand: "colmap",
+            need: 192,
+            have: 191,
+        }
+    );
+    // The chunk rule (`K * COLMAP` a multiple of 128) only bites on the 32-element q8_0 contract: the 256-element
+    // formats already force K % 128 == 0. K = 160 (5 blocks) is admitted with a null colmap and rejected with one.
+    let q8 = &convert_abi::q8_0::DEQUANT_F16;
+    let q8_ops = |colmap_present: bool| {
+        [
+            OperandBinding {
+                address: 0x1000_0000,
+                bytes: Some(4 * 5 * 34), // M * (K / 32) * 34 at M = 4, K = 160
+                format: ggml_abi::FORMAT_Q8_0_34,
+            },
+            OperandBinding {
+                address: 0x6000_0000,
+                bytes: Some(4 * 160 * 2),
+                format: convert_abi::FORMAT_F16_FLAT,
+            },
+            OperandBinding {
+                address: if colmap_present { 0x5000_0000 } else { 0 },
+                bytes: Some(if colmap_present { 8 } else { 0 }),
+                format: convert_abi::FORMAT_I32_CHUNK_PERM,
+            },
+        ]
+    };
+    let q8_inv = |params: &'static [u64], ops: &'static [OperandBinding]| InvocationV1 {
+        arch: Arch::Gfx1201,
+        symbol: "ggml_dequant_q8_0_f16_gfx1201",
+        params,
+        operands: ops,
+        grid: [2, 1, 1], // ceil(4 * 160 / 512)
+        block: [256, 1, 1],
+        dynamic_lds: 0,
+    };
+    let null_ops: &'static [OperandBinding] = Box::leak(Box::new(q8_ops(false)));
+    admitted(q8, &q8_inv(&[4, 160, 0], null_ops));
+    let colmap_ops: &'static [OperandBinding] = Box::leak(Box::new(q8_ops(true)));
+    assert!(matches!(
+        rejected(q8, &q8_inv(&[4, 160, 1], colmap_ops)),
+        AbiError::Domain { .. }
+    ));
+}
+
+/// The by-value gather: a token past the table is rejected by the contract (expression error of the
+/// `TOK < ROWS` rule), the last row is admitted.
+#[test]
+fn ggml_convert_get_row1_invocation_admission() {
+    let abi = &convert_abi::q6_k::GET_ROW1;
+    let (rows, k) = (248_320u64, 5120u64);
+    let table = rows * (k / 256) * 210;
+    let ops: &'static [OperandBinding] = Box::leak(Box::new([
+        OperandBinding {
+            address: 0x1_0000_0000,
+            bytes: Some(table),
+            format: ggml_abi::FORMAT_Q6_K_210,
+        },
+        OperandBinding {
+            address: 0x6000_0000,
+            bytes: Some(k * 4),
+            format: convert_abi::FORMAT_F32_ROWS_NK,
+        },
+    ]));
+    let inv = |params: &'static [u64]| InvocationV1 {
+        arch: Arch::Gfx1201,
+        symbol: "ggml_get_row1_q6_k_f32_gfx1201",
+        params,
+        operands: ops,
+        grid: [20, 1, 1],
+        block: [64, 1, 1],
+        dynamic_lds: 0,
+    };
+    admitted(abi, &inv(Box::leak(Box::new([rows, k, rows - 1]))));
+    // `ROWS - (TOK + 1)` is negative: an expression error, which the validator rejects like a failed rule.
+    assert!(matches!(
+        rejected(abi, &inv(Box::leak(Box::new([rows, k, rows])))),
+        AbiError::Expr { .. }
+    ));
 }

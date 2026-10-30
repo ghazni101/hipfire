@@ -328,6 +328,7 @@ fn load_inner(
                     state_format,
                     scratch_mode,
                     dedicated_stage,
+                    0,
                 )?
                 .unwrap_or(load.config.num_hidden_layers)
             }

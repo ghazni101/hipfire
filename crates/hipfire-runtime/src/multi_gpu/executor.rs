@@ -1399,6 +1399,20 @@ fn peer_reduce(
             .all_reduce_sum_f32_peer_add_routed(partials, targets, rows, count, partial_slot)
             .map_err(hip_error);
     }
+    // TP3/TP4 decode inside a whole-token graph capture: one bf16 peer-push
+    // kernel per rank replaces the pack, copies, fold and events below, whose
+    // cross-device events cannot be captured. Same rounded, rank-ordered sum.
+    if gpus.devices.len() >= 3
+        && targets.len() == gpus.devices.len()
+        && gpus.devices.iter().all(|gpu| gpu.graphs.capture_mode)
+        && gpus.tp_exchange16_executor(rows, count) == Some(TpExchange16::Bf16)
+        && gpus.tp_peer_pushn_active()
+        && gpus.tp_peer_push_serves(count)
+    {
+        return gpus
+            .tp_peer_push_reduce_captured(partials, targets, count)
+            .map_err(hip_error);
+    }
     // `HIPFIRE_TP_EXCHANGE` bf16|f16 (or `auto` per rows/TP): the ranks exchange 16-bit partials
     // (`AllReduceAdd` only; the no-target `AllReduce` keeps f32). The same
     // rounded, rank-ordered sum the hand route's `peer_add_routed` adds.

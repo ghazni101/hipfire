@@ -15,10 +15,12 @@ pub mod effective;
 pub mod emu;
 pub mod emu_budget;
 pub mod emu_model;
+pub mod env_audit;
 pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
+pub mod load_summary;
 pub mod rocm;
 pub mod secret;
 pub mod tuning;
@@ -2268,7 +2270,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MTP_NGRAM_COPY"),
-        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover; auto (default) is off on every GPU for now."
+        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off."
     ),
     field!(
         "speculation.mtp_sampled",
@@ -4118,6 +4120,9 @@ pub fn is_developer_key(key: &str) -> bool {
 const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_d2_default",
+    "developer.qwen4_mtp_head_d2",
+    "developer.qwen4_sp",
+    "developer.qwen4_sp_touched",
     "developer.moe_sym_iu4",
     "developer.qwen4_slowlink_prefill",
     "developer.gdn_qk_indexed",
@@ -4928,7 +4933,7 @@ pub struct MtpHostSpillPolicy {
 
 /// Whether an MTP head stays attached once `host_mapped_expert_blobs` routed
 /// experts sit in host RAM. The arch's admitted list is data: an arch that
-/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1201"]`),
+/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1100", "gfx1201"]`),
 /// one with no such measurement passes none (qwen35's `&[]`). `On` always
 /// attaches (explicit opt-in); `Off` never does; a fully resident placement
 /// (`blobs == 0`) always attaches.
@@ -5168,9 +5173,11 @@ pub fn ngram_mod_copy_triple() -> (usize, usize, usize) {
 /// Native Qwen4 MTP n-gram copy lane arming (`speculation.mtp_ngram_copy`,
 /// env override `HIPFIRE_MTP_NGRAM_COPY`). `on`/`1` arms it wherever the
 /// native Qwen4 n-gram source is armed ([`mtp_ngram_enabled_for_arch`]),
-/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover,
-/// and `auto` (the schema default; an unset key also resolves to `auto`) is
-/// off on every GPU until a GPU's own receipts flip it.
+/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover
+/// (the kill switch), and `auto` (the schema default; an unset key also
+/// resolves to `auto`) arms it for native Qwen4 MTP (`model_arch == 16`) on
+/// gfx1151 and gfx1201, the GPUs whose greedy-identity and timing receipts
+/// flipped it; every other GPU stays off until its own receipts say otherwise.
 pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
     mtp_ngram_copy_enabled_for_arch_value(
         process_value("HIPFIRE_MTP_NGRAM_COPY").as_deref(),
@@ -5180,14 +5187,18 @@ pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool 
 }
 fn mtp_ngram_copy_enabled_for_arch_value(
     value: Option<&str>,
-    _model_arch: u32,
-    _gpu_arch: &str,
+    model_arch: u32,
+    gpu_arch: &str,
 ) -> bool {
     match value {
         Some("1" | "on") => true,
         Some("0" | "off") => false,
-        _ => false,
+        _ => copy_lane_arch_admitted(model_arch, gpu_arch),
     }
+}
+/// Native Qwen4 MTP (model arch 16) on the GPUs the copy lane's `auto` arms.
+fn copy_lane_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
+    model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
 /// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
 /// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
@@ -7159,6 +7170,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn qwen4_mtp_head_d2_is_a_typed_bool_developer_key_with_the_d2_default_spellings() {
+        const KEY: &str = "developer.qwen4_mtp_head_d2";
+        const ENV: &str = "HIPFIRE_QWEN4_MTP_HEAD_D2";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
+        const KEY: &str = "developer.qwen4_sp";
+        const ENV: &str = "HIPFIRE_QWEN4_SP";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        // Unset is None (the consumer applies the gfx1100 default); each spelling reads as a bool.
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        // Garbage is rejected when the layer is built, never silently ignored.
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "HIPFIRE_QWEN4_SP")]
+    fn qwen4_sp_panics_on_an_unparseable_snapshot_value() {
+        typed_developer_bool_value("HIPFIRE_QWEN4_SP", Some("garbage"));
+    }
+
+    #[test]
+    fn qwen4_sp_touched_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
+        const KEY: &str = "developer.qwen4_sp_touched";
+        const ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        assert_ne!(KEY, "developer.qwen4_sp");
+        // Unset is None: the consumer applies the gfx1100 default (not a config-level on/off).
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+    }
+
     const MOE_SYM_IU4_KEY: &str = "developer.moe_sym_iu4";
     const MOE_SYM_IU4_ENV: &str = "HIPFIRE_MOE_SYM_IU4";
 
@@ -8017,9 +8114,9 @@ mod tests {
     #[test]
     fn mtp_host_spill_policy_truth_table() {
         // (mode, blobs, arch, admitted) -> attach. qwen35 passes &[] (never
-        // attaches on a spill under auto); qwen4 passes &["gfx1201"].
+        // attaches on a spill under auto); qwen4 passes &["gfx1100", "gfx1201"].
         let qwen35: &[&str] = &[];
-        let qwen4: &[&str] = &["gfx1201"];
+        let qwen4: &[&str] = &["gfx1100", "gfx1201"];
         // Fully resident: attaches unless explicitly off.
         assert!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).attach);
         assert!(mtp_host_spill_policy(MtpMode::On, 0, "gfx1100", qwen35).attach);
@@ -8038,7 +8135,7 @@ mod tests {
         }
         // qwen4 under auto: attaches only on the admitted arch.
         assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1201", qwen4).attach);
-        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
         assert_eq!(
@@ -8150,8 +8247,8 @@ mod tests {
             (16, "gfx1100"),
             (5, "gfx1151"),
         ];
-        // auto/unset: off on every GPU until a GPU's receipts flip it.
-        let auto = [false; 4];
+        // auto/unset: native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 only.
+        let auto = [true, true, false, false];
         for (raw, expect) in [
             (Some("on"), [true; 4]),
             (Some("1"), [true; 4]),
@@ -10511,6 +10608,42 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
     }
 
+    /// `developer.qwen4_mtp_head_d2` (env `HIPFIRE_QWEN4_MTP_HEAD_D2`), a typed
+    /// boolean read once per load by the native MTP head attach: `Some(false)`
+    /// never arms the head's rows=1 D2 CPU split executor (the kill); `Some(true)`
+    /// and `None` (unset) arm it whenever the trunk's D2 split is armed on the
+    /// same load (non-EP), otherwise the head keeps the GPU route.
+    pub fn qwen4_mtp_head_d2() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
+    }
+
+    /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
+    /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
+    /// top-k* experts, run the rest on the CPU, one canonical combine). `None`
+    /// (unset) follows the arch default, which the consumer resolves
+    /// (`slowlink_sp::hybrid_knob_for`): **on for exact gfx1100**, off elsewhere. An
+    /// explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on any arch
+    /// (every arch but gfx1100 declines it by name). SP additionally needs an admitted S1
+    /// profile, gfx1100 and the other load-time admission rules; a failed rule declines it by
+    /// name and, with `developer.qwen4_sp_touched` on, the touched-only mode runs instead.
+    pub fn qwen4_sp() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP")
+    }
+
+    /// `developer.qwen4_sp_touched` (env `HIPFIRE_QWEN4_SP_TOUCHED`), a typed
+    /// boolean read once per Qwen4 load by the S1 short-prompt prefill hook's
+    /// touched-only mode (SP `TouchedOnly`: stream exactly the experts a layer
+    /// routes to, run S1's own per-panel pipeline over them, no CPU expert, byte-identical
+    /// to the stream-all sweep). `None` (unset) follows the arch default, which the
+    /// consumer resolves (`slowlink_sp::touched_knob_for`): **on for exact gfx1100**, off
+    /// elsewhere. An explicit `false`/`0` is the kill switch; an explicit `true`/`1` asks for it on
+    /// any arch (every arch but gfx1100 declines it by name: only gfx1100 is calibrated). It needs
+    /// an admitted S1 profile, gfx1100 and an aggregate window route; a failed rule declines it
+    /// by name. With `developer.qwen4_sp` also on, the hybrid SP mode wins.
+    pub fn qwen4_sp_touched() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED")
+    }
+
     /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU
     /// Qwen4 direct weight reader (parallel `O_DIRECT`/buffered file reads
     /// straight into pinned or staged device memory). Default on; exactly `0`
@@ -10562,26 +10695,105 @@ pub mod memory {
         }
     }
 
-    /// Pure body of [`qwen4_d2_return`]: unset is `Copy`; `copy` and `mapped`
-    /// (exact, lower-case) select a mode; every other spelling, including the
-    /// empty string, is an error that names the accepted values. A mistyped
-    /// transport must refuse the load, never silently run the other one.
-    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+    /// Pure body of [`qwen4_d2_transport`]'s return half: unset is `None` (the
+    /// caller applies the arch default, see [`default_d2_transport`]); `copy`
+    /// and `mapped` (exact, lower-case) select a mode; every other spelling,
+    /// including the empty string, is an error that names the accepted values.
+    /// A mistyped transport must refuse the load, never silently run the other
+    /// one.
+    pub fn parse_d2_return_explicit(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<D2Return>, String> {
         match raw {
-            None => Ok(D2Return::Copy),
-            Some("copy") => Ok(D2Return::Copy),
-            Some("mapped") => Ok(D2Return::Mapped),
+            None => Ok(None),
+            Some("copy") => Ok(Some(D2Return::Copy)),
+            Some("mapped") => Ok(Some(D2Return::Mapped)),
             Some(other) => Err(format!(
                 "HIPFIRE_QWEN4_D2_RETURN={other:?} is not a D2 return mode: expected `mapped` or `copy`"
             )),
         }
     }
 
-    /// `developer.qwen4_d2_return` (env `HIPFIRE_QWEN4_D2_RETURN`): the D2
-    /// cold-result transport, read from the process snapshot. Resolve it once
-    /// per load; an invalid value is an `Err` the loader must propagate.
-    pub fn qwen4_d2_return() -> std::result::Result<D2Return, String> {
-        parse_d2_return(process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref())
+    /// [`parse_d2_return_explicit`] with the arch-independent legacy default:
+    /// unset is `Copy`. The arch default lives in [`default_d2_transport`].
+    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+        parse_d2_return_explicit(raw).map(Option::unwrap_or_default)
+    }
+
+    /// The D2 return and join requests a load resolves for one arch.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct D2Transport {
+        pub ret: D2Return,
+        pub join: D2Join,
+        /// `true` when the arch default moved at least one request off the
+        /// legacy `copy` / `host` value (no explicit env value was given for
+        /// it), so the load log can name the provenance.
+        pub arch_default: bool,
+    }
+
+    /// Pure default of the D2 transport requests.
+    ///
+    /// An explicit `HIPFIRE_QWEN4_D2_RETURN` / `HIPFIRE_QWEN4_D2_JOIN` value
+    /// always wins. Unset on exact `gfx1100` the request is `mapped` + `cpwait`
+    /// (byte-exact transport and scheduling change; the per-layer capability
+    /// routing in `hipfire_dispatch::cpu_split` still decides: only all-cold
+    /// layers qualify, mixed layers keep `copy` / `host`). A defaulted join
+    /// follows the effective return: with `HIPFIRE_QWEN4_D2_RETURN=copy` the
+    /// CP-wait join would only be refused per layer, so the default join is
+    /// `host` and `copy` alone restores the old transport. Every other arch is
+    /// the legacy `copy` / `host`. `HIPFIRE_QWEN4_D2_RETURN=copy
+    /// HIPFIRE_QWEN4_D2_JOIN=host` is the kill switch on every arch.
+    pub fn default_d2_transport(
+        arch: &str,
+        explicit_return: Option<D2Return>,
+        explicit_join: Option<D2Join>,
+    ) -> (D2Return, D2Join) {
+        let gfx1100 = arch == "gfx1100";
+        let ret = explicit_return.unwrap_or(if gfx1100 {
+            D2Return::Mapped
+        } else {
+            D2Return::Copy
+        });
+        let join = explicit_join.unwrap_or(if gfx1100 && ret == D2Return::Mapped {
+            D2Join::CpWait
+        } else {
+            D2Join::Host
+        });
+        (ret, join)
+    }
+
+    /// Pure body of [`qwen4_d2_transport`]: parse both raw values and apply
+    /// [`default_d2_transport`]. An invalid spelling of either is an error.
+    pub fn resolve_d2_transport(
+        arch: &str,
+        raw_return: Option<&str>,
+        raw_join: Option<&str>,
+    ) -> std::result::Result<D2Transport, String> {
+        let explicit_return = parse_d2_return_explicit(raw_return)?;
+        let explicit_join = parse_d2_join_explicit(raw_join)?;
+        let (ret, join) = default_d2_transport(arch, explicit_return, explicit_join);
+        Ok(D2Transport {
+            ret,
+            join,
+            arch_default: (ret, join)
+                != (
+                    explicit_return.unwrap_or_default(),
+                    explicit_join.unwrap_or_default(),
+                ),
+        })
+    }
+
+    /// `developer.qwen4_d2_return` + `developer.qwen4_d2_join` (env
+    /// `HIPFIRE_QWEN4_D2_RETURN` / `HIPFIRE_QWEN4_D2_JOIN`): the D2 cold-result
+    /// transport and join requests for a device of `arch`, from the process
+    /// snapshot. Resolve once per load; an invalid value is an `Err` the
+    /// loader must propagate.
+    pub fn qwen4_d2_transport(arch: &str) -> std::result::Result<D2Transport, String> {
+        resolve_d2_transport(
+            arch,
+            process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref(),
+            process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref(),
+        )
     }
 
     /// Input-readiness mechanism of the D2 CPU split (`developer.qwen4_d2_ready`,
@@ -10655,25 +10867,27 @@ pub mod memory {
         }
     }
 
-    /// Pure body of [`qwen4_d2_join`]: unset is `Host`; `host` and `cpwait`
-    /// (exact, lower-case) select a mode; every other spelling, including the
-    /// empty string, is an error that names the accepted values.
-    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+    /// Pure body of [`qwen4_d2_transport`]'s join half: unset is `None` (the
+    /// caller applies the arch default, see [`default_d2_transport`]); `host`
+    /// and `cpwait` (exact, lower-case) select a mode; every other spelling,
+    /// including the empty string, is an error that names the accepted values.
+    pub fn parse_d2_join_explicit(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<D2Join>, String> {
         match raw {
-            None => Ok(D2Join::Host),
-            Some("host") => Ok(D2Join::Host),
-            Some("cpwait") => Ok(D2Join::CpWait),
+            None => Ok(None),
+            Some("host") => Ok(Some(D2Join::Host)),
+            Some("cpwait") => Ok(Some(D2Join::CpWait)),
             Some(other) => Err(format!(
                 "HIPFIRE_QWEN4_D2_JOIN={other:?} is not a D2 join mode: expected `cpwait` or `host`"
             )),
         }
     }
 
-    /// `developer.qwen4_d2_join` (env `HIPFIRE_QWEN4_D2_JOIN`): the D2 join
-    /// mechanism, read from the process snapshot. Resolve it once per load; an
-    /// invalid value is an `Err` the loader must propagate.
-    pub fn qwen4_d2_join() -> std::result::Result<D2Join, String> {
-        parse_d2_join(process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref())
+    /// [`parse_d2_join_explicit`] with the arch-independent legacy default:
+    /// unset is `Host`. The arch default lives in [`default_d2_transport`].
+    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+        parse_d2_join_explicit(raw).map(Option::unwrap_or_default)
     }
 
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
@@ -10792,6 +11006,78 @@ pub mod memory {
             }
             for mode in [D2Join::Host, D2Join::CpWait] {
                 assert_eq!(parse_d2_join(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_default_transport_table_over_arch_and_explicit_values() {
+            use D2Join::{CpWait, Host};
+            use D2Return::{Copy, Mapped};
+            let rows: &[(&str, Option<D2Return>, Option<D2Join>, (D2Return, D2Join))] = &[
+                // gfx1100: unset -> mapped + cpwait; explicit values always win.
+                ("gfx1100", None, None, (Mapped, CpWait)),
+                ("gfx1100", Some(Copy), Some(Host), (Copy, Host)), // kill switch
+                ("gfx1100", Some(Copy), None, (Copy, Host)),       // defaulted join follows return
+                ("gfx1100", None, Some(Host), (Mapped, Host)),
+                ("gfx1100", Some(Mapped), None, (Mapped, CpWait)),
+                ("gfx1100", None, Some(CpWait), (Mapped, CpWait)),
+                ("gfx1100", Some(Mapped), Some(Host), (Mapped, Host)),
+                ("gfx1100", Some(Copy), Some(CpWait), (Copy, CpWait)), // refused per layer
+                ("gfx1100", Some(Mapped), Some(CpWait), (Mapped, CpWait)),
+                // Every other arch keeps the legacy copy / host defaults.
+                ("gfx1201", None, None, (Copy, Host)),
+                ("gfx1151", None, None, (Copy, Host)),
+                ("gfx1030", None, None, (Copy, Host)),
+                ("gfx1100x", None, None, (Copy, Host)),
+                ("", None, None, (Copy, Host)),
+                ("gfx1201", Some(Mapped), None, (Mapped, Host)),
+                ("gfx1201", None, Some(CpWait), (Copy, CpWait)),
+                ("gfx1201", Some(Mapped), Some(CpWait), (Mapped, CpWait)),
+                ("gfx1201", Some(Copy), Some(Host), (Copy, Host)),
+            ];
+            for (arch, ret, join, want) in rows {
+                assert_eq!(
+                    default_d2_transport(arch, *ret, *join),
+                    *want,
+                    "{arch} return={ret:?} join={join:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn d2_transport_resolution_parses_explicit_values_and_reports_provenance() {
+            let resolve = resolve_d2_transport;
+            let t = resolve("gfx1100", None, None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Mapped, D2Join::CpWait, true)
+            );
+            let t = resolve("gfx1100", Some("copy"), Some("host")).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            let t = resolve("gfx1100", Some("copy"), None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            let t = resolve("gfx1100", Some("mapped"), Some("cpwait")).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Mapped, D2Join::CpWait, false)
+            );
+            let t = resolve("gfx1201", None, None).unwrap();
+            assert_eq!(
+                (t.ret, t.join, t.arch_default),
+                (D2Return::Copy, D2Join::Host, false)
+            );
+            // An invalid spelling refuses the load on every arch, never defaults.
+            for arch in ["gfx1100", "gfx1201"] {
+                let error = resolve(arch, Some("Mapped"), None).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_RETURN"), "{error}");
+                let error = resolve(arch, None, Some("")).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_JOIN"), "{error}");
             }
         }
 

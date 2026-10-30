@@ -521,6 +521,7 @@ impl Model {
                             slab_recipe,
                             false,
                         ),
+                        0,
                     )?;
                     match resolved {
                         Some(layers) => {

@@ -293,6 +293,10 @@ pub(super) fn mad64(b: &mut Builder, dst: u8, base: u8, x: u8, imm: u32) -> R {
 
 /// `dst = base + x * s[mult]` over a 64-bit SGPR pair (`x`, `mult` unsigned SGPRs); clobbers `T0`, `T1`.
 pub(super) fn mad64_reg(b: &mut Builder, dst: u8, base: u8, x: u8, mult: u8) -> R {
+    // `T0` is written before `s_mul_hi_u32` reads `x`: an index in T0/T1 would be clobbered.
+    if x == T0 || x == T1 {
+        return Err(format!("mad64: index s{x} aliases the T0/T1 scratch pair"));
+    }
     let a = b.spec.arch;
     sop(
         b,
@@ -397,19 +401,21 @@ fn prologue(b: &mut Builder) -> R {
         &[H_PTR + 1],
     )?;
     // xq + 72 * (g*L + slot).
+    // The record index goes to ROWS5 (dead after the pad-row test), not T0: `mad64` clobbers T0, and
+    // `s_mul_hi_u32` must read the index, not the low product.
     sop(
         b,
-        format!("s_mul_i32 s{T0}, s{GRP}, s{ARG_L}"),
-        &[T0],
+        format!("s_mul_i32 s{ROWS5}, s{GRP}, s{ARG_L}"),
+        &[ROWS5],
         &[GRP, ARG_L],
     )?;
     sop(
         b,
-        format!("{} s{T0}, s{T0}, s{SLOT}", s_add_i32(a)),
-        &[T0],
-        &[T0, SLOT],
+        format!("{} s{ROWS5}, s{ROWS5}, s{SLOT}", s_add_i32(a)),
+        &[ROWS5],
+        &[ROWS5, SLOT],
     )?;
-    mad64(b, XQ_PTR, ARG_XQ, T0, RECORD_BYTES)?;
+    mad64(b, XQ_PTR, ARG_XQ, ROWS5, RECORD_BYTES)?;
     lane_setup(b)
 }
 

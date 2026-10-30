@@ -50,9 +50,10 @@
 //! the layer (`use_path2`, `grouped_path_for_rows`, `qt44_qt53_prefill.rs:137-143`; how the
 //! layer routes T <= 8 before that predicate was not traced here). The launchers have no row
 //! floor of their own (checks: `m % 64`, `k % 256|128`,
-//! `grouped_rows % 16`, spans, `slots <= 2^22`). gfx1100 is additionally default-off in
-//! production (`default_requested: false`, `gemm.rs:50070`; `HIPFIRE_QWEN4_MOE_SYM_IU4=1` turns it
-//! on): forcing is fine for a screen and is reported in `stages_json`.
+//! `grouped_rows % 16`, spans, `slots <= 2^22`). Production requests the route by default on gfx1100,
+//! gfx1151 and gfx1201 (`default_requested: true`; `HIPFIRE_QWEN4_MOE_SYM_IU4=0` is the kill switch)
+//! from `rows >= 512` on: forcing the chain below the floor is fine for a screen and is reported in
+//! `stages_json`.
 //!
 //! # Combine semantics
 //!
@@ -643,9 +644,9 @@ impl Iu4Arm {
                 ],
                 "launcher_checks_kept": "m % 64, k % 256 (gate/up) | k % 128 (down), grouped_rows % 16, \
                                          spans, slots <= 2^22, header symmetry (qwen4_moe_sym_check at setup)",
-                "gfx1100_default_off": self.target == Target::Gfx1100,
-                "gfx1100_note": "production gfx1100 default_requested=false (gemm.rs:50070): the chain runs there \
-                                 only with HIPFIRE_QWEN4_MOE_SYM_IU4=1 and rows>=512; forced here for a screen",
+                "default_requested_note": "production default_requested=true on gfx1100, gfx1151 and gfx1201 \
+                                           (HIPFIRE_QWEN4_MOE_SYM_IU4=0 kills the route): the chain runs for \
+                                           rows>=512; forced here below the floor for a screen",
             },
             "combine_mode": {
                 "initial_zero": false,
@@ -1140,10 +1141,10 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("gemm.rs:50245"));
-            assert_eq!(
-                v["forced_below_policy_floor"]["gfx1100_default_off"],
-                arch == "gfx1100"
-            );
+            assert!(v["forced_below_policy_floor"]["default_requested_note"]
+                .as_str()
+                .unwrap()
+                .contains("default_requested=true"));
         }
         let v = Iu4Arm::new("gfx1201").unwrap().stages_json();
         assert_eq!(v["stages"][3]["origin"], "pm");

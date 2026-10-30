@@ -568,6 +568,23 @@ pub trait SpecTarget {
         Ok(())
     }
 
+    /// Roll the target back to the start `position` of the window the last
+    /// [`commit_prefix`](Self::commit_prefix) committed and re-run `replay`,
+    /// a prefix of that window's committed tokens (a terminal stop inside
+    /// the window, [`Speculator::repair_terminal_prefix`]). Valid only
+    /// before the next verify, advance or reset. `Ok(false)`: no window is
+    /// retained or it does not match; the target is unchanged. Default:
+    /// nothing retained.
+    fn repair_committed_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+        _position: usize,
+        _replay: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).

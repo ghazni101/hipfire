@@ -327,6 +327,90 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
         })
 }
 
+/// No allocation: callers supply one fixed projection set per layer.
+/// DeltaNet may retain its unrotated output projection as Q8_0 (HFQ qt3);
+/// every other projection, including FullAttn output, must be symmetric qt49.
+fn symmetric_mq3v2_projection_sets(
+    marker: bool,
+    mut layers: impl Iterator<Item = Option<([DType; 8], bool)>>,
+) -> bool {
+    let admissible = |(dtypes, delta_net): ([DType; 8], bool)| {
+        dtypes.iter().enumerate().all(|(i, &dtype)| {
+            dtype == DType::MQ3G256V2 || (delta_net && i == 4 && dtype == DType::Q8_0)
+        })
+    };
+    marker
+        && layers
+            .next()
+            .is_some_and(|projections| projections.is_some_and(admissible))
+        && layers.all(|projections| projections.is_some_and(admissible))
+}
+
+fn dense_layers_are_uniform_symmetric_mq3v2(weights: &Qwen35Weights) -> bool {
+    symmetric_mq3v2_projection_sets(
+        weights.mq3v2_symmetric,
+        weights.layers.iter().map(|layer| match layer {
+            LayerWeights::DeltaNet(layer) => Some((
+                [
+                    layer.wqkv.gpu_dtype,
+                    layer.wz.gpu_dtype,
+                    layer.w_alpha.gpu_dtype,
+                    layer.w_beta.gpu_dtype,
+                    layer.wo.gpu_dtype,
+                    layer.w_gate.gpu_dtype,
+                    layer.w_up.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                ],
+                true,
+            )),
+            LayerWeights::FullAttn(layer) => Some((
+                [
+                    layer.wq.gpu_dtype,
+                    layer.wk.gpu_dtype,
+                    layer.wv.gpu_dtype,
+                    layer.wo.gpu_dtype,
+                    layer.w_gate.gpu_dtype,
+                    layer.w_up.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                    layer.w_down.gpu_dtype,
+                ],
+                false,
+            )),
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => None,
+        }),
+    )
+}
+
+/// Symmetric qt49 dense model with an enabled A4 or A8 projection route: the
+/// widened (8192-row) chunk, its A4/A8 projection scratch sizing and the GDN
+/// chunk scan all key on this one predicate.
+fn mq3_wide_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
+    dense_layers_are_uniform_symmetric_mq3v2(weights)
+        && (gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric)
+            || gpu.flags.mq3v25_a4_enabled(gpu.mq3v2_symmetric))
+}
+
+/// Activation-projection sizing family of the widened route for projection
+/// scratch reservation: `Off` keeps the incumbent MQ4 sizing (FP8 on gfx1201,
+/// IU4 elsewhere); a symmetric qt49 route sizes against its A4 (72 B per K128
+/// block) or A8 (136 B per K128 block) prelude. A8 wins over A4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mq3WideProjection {
+    Off,
+    A4,
+    A8,
+}
+
+fn mq3_wide_projection(gpu: &Gpu, weights: &Qwen35Weights) -> Mq3WideProjection {
+    if !mq3_wide_route(gpu, weights) {
+        Mq3WideProjection::Off
+    } else if gpu.flags.mq3v25_a8_enabled(gpu.mq3v2_symmetric) {
+        Mq3WideProjection::A8
+    } else {
+        Mq3WideProjection::A4
+    }
+}
+
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
         .ok()
@@ -552,13 +636,16 @@ fn ordinary_prefill_static_ceiling(
         return None;
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 {
+    let mq3 = mq3_wide_route(gpu, weights);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 {
         return None;
     }
-    // gfx1201 keeps all four FP8 projection routes. gfx11 substitutes the
-    // existing IU4 K16 projection route; its full-attention layers remain on
-    // Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if native_mq4 {
+    // gfx1201 keeps all four FP8 projection routes for qt44; symmetric qt49
+    // uses A4/A8 on gfx1201 (its flag predicate is the admission) and the
+    // gfx1100 A4 flag already implies the IU4 prefill gate. gfx11 substitutes
+    // the existing IU4 K16 projection route; its full-attention layers remain
+    // on Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
+    let projection_route_admitted = if native_mq4 || mq3 {
         true
     } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup
@@ -2099,6 +2186,15 @@ fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
         .checked_div(128)?
         .checked_mul(72)
 }
+/// K128-major A8 prelude bytes/row at the `Kmax = hidden_dim` envelope: one
+/// 136-byte `block_i8_128` per K/128 block.
+fn iu8_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
+    config
+        .hidden_dim
+        .checked_add(127)?
+        .checked_div(128)?
+        .checked_mul(136)
+}
 /// Per-token physical K+V stride for the selected cache encoding. Only
 /// full-attention layers own KV; DeltaNet layers carry no token rows.
 pub fn vmm_kv_token_bytes(
@@ -2139,7 +2235,8 @@ pub fn vmm_kv_token_bytes(
 /// Larger PBS buffers are allocated lazily and admitted per request from free
 /// VRAM *after mapped KV*, not subtracted from the lifetime context bound.
 pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> Option<usize> {
-    let base = dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch)?;
+    let base =
+        dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch, Mq3WideProjection::Off)?;
     // The loader has not classified all projection tensors yet. Under the
     // explicit experimental MQ4 opt-ins, conservatively reserve their prelude
     // too; the default V2/other-format reservation remains unchanged.
@@ -2191,11 +2288,13 @@ fn dense_prefill_reservation_bytes(
     config: &Qwen35Config,
     rows: usize,
     arch: &str,
+    mq3: Mq3WideProjection,
 ) -> Option<usize> {
-    let projection = if arch == "gfx1201" {
-        fp8_row_bytes_wide(config)?
-    } else {
-        iu4_row_bytes_wide(config)?
+    let projection = match mq3 {
+        Mq3WideProjection::A8 => iu8_row_bytes_wide(config)?,
+        Mq3WideProjection::A4 => iu4_row_bytes_wide(config)?,
+        Mq3WideProjection::Off if arch == "gfx1201" => fp8_row_bytes_wide(config)?,
+        Mq3WideProjection::Off => iu4_row_bytes_wide(config)?,
     };
     let q16 = WIDENED_COMMIT_ROWS
         .checked_mul(config.n_heads)?
@@ -2211,11 +2310,18 @@ fn dense_prefill_reservation_bytes(
 /// reclaims the cache just before mapping if that growth needs its memory.
 /// Reserving *all* unmapped KV here made mixed-size prefills repeatedly free
 /// and reallocate the same multi-gigabyte PBS despite no KV growth.
-fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config) -> bool {
+fn can_retain_widened_pbs(
+    gpu: &Gpu,
+    kv: &llama::KvCache,
+    config: &Qwen35Config,
+    mq3: Mq3WideProjection,
+) -> bool {
     if !kv.uses_vmm_backend() {
         return true;
     }
-    let Some(minimum) = minimum_prefill_reservation_bytes(config, &gpu.arch) else {
+    let Some(minimum) =
+        dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, &gpu.arch, mq3)
+    else {
         return false;
     };
     let grow_only = widened_pbs_grow_only(gpu);
@@ -2296,21 +2402,24 @@ fn memory_admitted_rung(
     perf_rows: usize,
     lean: bool,
     native_mq4: bool,
+    mq3: Mq3WideProjection,
     cached: Option<&PrefillBatchScratch>,
     free_deduction: usize,
 ) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
     }
-    let fp8_projection = gpu.arch == "gfx1201";
+    let a8_projection = mq3 == Mq3WideProjection::A8;
+    let fp8_projection = gpu.arch == "gfx1201" && mq3 == Mq3WideProjection::Off;
     if (if lean {
         lean_dense_prefill_allocation_bytes(config, perf_rows)
     } else {
         dense_prefill_allocation_bytes(config, perf_rows)
     })
     .is_none()
+        || (a8_projection && iu8_row_bytes_wide(config).is_none())
         || (fp8_projection && fp8_row_bytes_wide(config).is_none())
-        || (!fp8_projection && iu4_row_bytes_wide(config).is_none())
+        || (!a8_projection && !fp8_projection && iu4_row_bytes_wide(config).is_none())
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
@@ -2332,9 +2441,18 @@ fn memory_admitted_rung(
     let live_fp8_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
     let live_fp8_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
     let live_iu4 = gpu.scratch.int4_mmq_x_scratch_bytes;
+    let live_iu8 = gpu.scratch.int8_mmq_x_scratch_bytes;
     let fp8_groups = config.hidden_dim / 256;
     let iu4_bytes_per_row = iu4_row_bytes_wide(config).unwrap_or(usize::MAX);
+    let iu8_bytes_per_row = iu8_row_bytes_wide(config).unwrap_or(usize::MAX);
     for &rung in WIDENED_RUNGS.iter().rev() {
+        // Symmetric qt49 A4/A8 on gfx1201 admit 8192/4096 before the 512 fallback.
+        if mq3 != Mq3WideProjection::Off
+            && gpu.arch == "gfx1201"
+            && !matches!(rung, 8192 | 4096 | 512)
+        {
+            continue;
+        }
         if rung > perf_rows {
             continue;
         }
@@ -2347,7 +2465,11 @@ fn memory_admitted_rung(
             dense_prefill_allocation_bytes(config, rung)
         }
         .unwrap_or(usize::MAX);
-        let projection_deficit = if native_mq4 {
+        let projection_deficit = if a8_projection {
+            rung.checked_mul(iu8_bytes_per_row)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(live_iu8)
+        } else if native_mq4 {
             native_mq4_projection_deficit(
                 config,
                 rung,
@@ -2403,6 +2525,21 @@ fn memory_admitted_rung(
     }
     Ok(WIDENED_COMMIT_ROWS)
 }
+/// Physical KV bytes this request will still map to reach `end_tokens` rows
+/// (clamped to the cache's physical capacity). Zero on non-VMM KV, when the
+/// mapping already covers the request, or if the query errors. Feed to
+/// [`ordinary_prefill_chunk_limit_deducting`] so the once-per-prompt chunk
+/// ceiling is sized against memory the same request is about to map.
+pub fn request_kv_growth_deduction(
+    gpu: &Gpu,
+    kv_cache: &llama::KvCache,
+    end_tokens: usize,
+) -> usize {
+    kv_cache
+        .planned_mapped_growth_bytes(gpu, end_tokens.min(kv_cache.physical_cap))
+        .unwrap_or(0)
+}
+
 ///
 /// Effective admitted ordinary chunk ceiling for this request: static
 /// eligibility, highest performance-admitted rung, explicit requested
@@ -2537,6 +2674,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
         perf,
         lean,
         native_mq4_widened_route(gpu, weights),
+        mq3_wide_projection(gpu, weights),
         cached,
         free_deduction,
     )?;
@@ -3998,7 +4136,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // Return the retained PBS to the cache (also on error: it is pure
         // scratch, and the next use overwrites before reading).
         if let Some(owned) = own_pbs {
-            if can_retain_widened_pbs(gpu, kv_cache, config) {
+            if can_retain_widened_pbs(gpu, kv_cache, config, mq3_wide_projection(gpu, weights)) {
                 *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
             } else {
                 let _ = owned.free_gpu(gpu);
@@ -4045,6 +4183,10 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // them in the same change -- see the all-together rule in
         // docs/plans/mq-lloyd-batched-prefill-followup.md.
         | DType::TQ2G128 | DType::BQ1G128
+        // GGUF-native block formats: unrotated unfused plain-GEMM prefill
+        // (`run_plain_gemm_key` dequantises each weight); lockstep with the
+        // `is_lowbit` / `qkv_all_ggml` widenings in hipfire-dispatch.
+        | DType::GgmlQ4K | DType::GgmlQ5K | DType::GgmlQ6K | DType::GgmlQ8_0 | DType::GgmlIQ4XS
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
         // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
         // routes these through gemm_hfq4g128 (with per-weight Givens
@@ -5576,7 +5718,7 @@ pub(crate) fn batch_chunk_embed_tokens(
         && !pre_embedded
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::Ggml(_)
         )
     {
         if !pre_uploaded {
@@ -5618,6 +5760,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                         len,
                         dim,
                     ),
+                    EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                        dtype,
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
                     _ => unreachable!(),
                 }
             })?;
@@ -5631,6 +5781,14 @@ pub(crate) fn batch_chunk_embed_tokens(
                     dim,
                 )?,
                 EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
+                    dtype,
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
@@ -5655,6 +5813,9 @@ pub(crate) fn batch_chunk_embed_tokens(
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Ggml(dtype) => {
+                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
                 }
                 _ => panic!("unsupported embedding format"),
             }
@@ -7247,6 +7408,8 @@ pub(crate) fn forward_batch_chunk_impl(
             "forward_batch_chunk: fp8 verify scope needs dense batched DeltaNet/FullAttention layers",
         ));
     }
+    let mq3_scan = mq3_wide_route(gpu, weights);
+    let mq4_scan = dense_layers_are_all_mq4v2(weights);
     let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
         // The GDN chunk-scan arm has no `SingletonWmma` producer.
         && !gpu.fp8_verify_scope
@@ -7257,13 +7420,16 @@ pub(crate) fn forward_batch_chunk_impl(
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.conv_kernel_dim == 4
-        && dense_layers_are_all_mq4v2(weights)
+        // Each dtype must have its own admitted qkvza producer; the A4/A8
+        // flags cannot enable a qt44 scan when the MQ4 projection route is off.
         // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
         // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
         // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
         // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
-        && (gpu.flags.iu4_prefill_enabled()
-            || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
+        && (mq3_scan
+            || (mq4_scan
+                && (gpu.flags.iu4_prefill_enabled()
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
         // The scan never reads KV, so the clause only names qualified tiers:
         // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
         // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
@@ -7355,11 +7521,16 @@ pub(crate) fn forward_batch_chunk_impl(
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                let qkvza_dtype = if mq3_scan {
+                    DType::MQ3G256V2
+                } else {
+                    DType::MQ4G256V2
+                };
                 let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
-                    && layer.wqkv.gpu_dtype == DType::MQ4G256V2
-                    && layer.wz.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_beta.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+                    && layer.wqkv.gpu_dtype == qkvza_dtype
+                    && layer.wz.gpu_dtype == qkvza_dtype
+                    && layer.w_beta.gpu_dtype == qkvza_dtype
+                    && layer.w_alpha.gpu_dtype == qkvza_dtype
                     && delta_layer_idx < dn_state.s_ef_residual.len();
                 batch_chunk_delta_net_attn(
                     gpu,
@@ -7613,6 +7784,67 @@ mod tests {
         routed_codebook_grouped_supported, routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
     };
     use rdna_compute::DType;
+
+    #[test]
+    fn ordinary_prefill_mq3v25_projection_admission_requires_marker_and_safe_q8_wo() {
+        let la = [DType::MQ3G256V2; 8];
+        let fa = [DType::MQ3G256V2; 8]; // FA's seven weights, down repeated
+        let layer = |dtypes, delta_net| Some((dtypes, delta_net));
+        assert!(symmetric_mq3v2_projection_sets(
+            true,
+            [layer(la, true), layer(fa, false)].into_iter()
+        ));
+        let mut pro_la = la;
+        pro_la[4] = DType::Q8_0; // qt3 DeltaNet linear_attn.out_proj
+        assert!(symmetric_mq3v2_projection_sets(
+            true,
+            [layer(pro_la, true), layer(fa, false)].into_iter()
+        ));
+        assert!(!symmetric_mq3v2_projection_sets(
+            false,
+            [layer(pro_la, true)].into_iter()
+        ));
+        let mut wrong_la = la;
+        wrong_la[5] = DType::Q8_0;
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(wrong_la, true)].into_iter()
+        ));
+        let mut wrong_fa = fa;
+        wrong_fa[3] = DType::Q8_0;
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(wrong_fa, false)].into_iter()
+        ));
+        assert!(!symmetric_mq3v2_projection_sets(true, std::iter::empty()));
+        assert!(!symmetric_mq3v2_projection_sets(
+            true,
+            [layer(la, true), None].into_iter()
+        ));
+    }
+
+    /// A8 sizes 136-byte `block_i8_128` rows, A4 sizes 72-byte `block_i4_128`
+    /// rows, and only the unrouted gfx1201 reservation keeps the FP8 sizing.
+    #[test]
+    fn mq3_wide_projection_reservation_uses_a4_a8_block_sizes() {
+        let config = widened_test_config();
+        assert_eq!(config.hidden_dim, 17_408);
+        assert_eq!(iu4_row_bytes_wide(&config), Some(136 * 72));
+        assert_eq!(iu8_row_bytes_wide(&config), Some(136 * 136));
+        let rows = 8192;
+        let at = |arch, mq3| dense_prefill_reservation_bytes(&config, rows, arch, mq3).unwrap();
+        let base = at("gfx1100", Mq3WideProjection::Off);
+        assert_eq!(at("gfx1100", Mq3WideProjection::A4), base);
+        assert_eq!(at("gfx1201", Mq3WideProjection::A4), base);
+        assert_eq!(
+            at("gfx1201", Mq3WideProjection::A8) - base,
+            rows * (136 * 136 - 136 * 72)
+        );
+        assert_eq!(
+            at("gfx1201", Mq3WideProjection::Off) - base,
+            rows * (fp8_row_bytes_wide(&config).unwrap() - 136 * 72)
+        );
+    }
 
     /// Head geometry of the generalized chunk scan: 16 key heads, value heads a
     /// multiple of 16 up to 48, 128-wide heads, 4-tap conv.

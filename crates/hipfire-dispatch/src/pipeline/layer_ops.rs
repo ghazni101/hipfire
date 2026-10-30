@@ -13,6 +13,7 @@
 //! validation; this module does not broaden that legacy contract.
 //! No operation owns a tensor or allocates execution-local storage.
 
+use super::projection_split::{is_split, split_projections};
 use crate::context::DispatchCtx;
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::WeightRef;
@@ -189,15 +190,17 @@ fn project_weights_with_epilogues(
     // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
     let members = [false, true, true, true];
     let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
-    project_weights_inner(
-        gpu,
-        input,
-        rows,
-        rotation,
-        projections,
-        gdn_regions.then_some(&members[..]),
-        epilogues,
-    )
+    split_projections(gpu, rows, projections, |gpu, projections| {
+        project_weights_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            gdn_regions.then_some(&members[..]),
+            epilogues,
+        )
+    })
 }
 
 /// A QSA q / k projection's fused RMSNorm + RoPE epilogue request
@@ -629,8 +632,54 @@ fn project_trunk(
     )
 }
 
+/// [`project_trunk_masked_inner`] under the installed projection split
+/// ([`split_projections`]). The IU4 trunk (an `a4` member or a GDN `zba`
+/// fold, whose folded payload is the whole Z|beta|alpha) projects whole.
 #[allow(clippy::too_many_arguments)]
 fn project_trunk_masked(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: &GpuTensor,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    a4: &[bool],
+    zba: Option<ZbaFold<'_>>,
+    gdn_in_proj: bool,
+    covered: &[bool],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
+) -> Result<(), DispatchError> {
+    if zba.is_some() || a4.iter().any(|&bit| bit) {
+        return project_trunk_masked_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            a4,
+            zba,
+            gdn_in_proj,
+            covered,
+            epilogues,
+        );
+    }
+    split_projections(gpu, rows, projections, |gpu, projections| {
+        project_trunk_masked_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            a4,
+            None,
+            gdn_in_proj,
+            covered,
+            epilogues,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_trunk_masked_inner(
     gpu: &mut Gpu,
     input: &GpuTensor,
     rows: usize,
@@ -1438,11 +1487,17 @@ fn execute_hyper_read_inner(
         }
         let down = &op.input_mix_down;
         let act = Some(1.0 / op.branches as f32);
-        hip(if down.dtype == DType::Q8_0 {
-            gpu.gemv_q8_0_k8_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
-        } else {
-            gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
-        })?;
+        // The rows a hook bands are its decision (the qwen4 hook leaves the
+        // row-tile twins past eight rows whole: they admit only full shapes).
+        let launch = |gpu: &mut Gpu, projections: &[(&WeightRef<'_>, &GpuTensor)]| {
+            let (down, low) = projections[0];
+            hip(if down.dtype == DType::Q8_0 {
+                gpu.gemv_q8_0_k8_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
+            } else {
+                gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
+            })
+        };
+        split_projections(gpu, op.rows, &[(down, &low)], launch)?;
         activated = true;
     } else {
         if !normalized_ready {
@@ -1751,6 +1806,8 @@ fn project_output_into_hyper_write(
         || gpu.flags.qwen4_hc_fuse_level() < 2
         || !covered
         || weight.m != write.hidden
+        // A split output projection is gathered before its HC write reads it.
+        || is_split(gpu, weight, rows)
         || write.branches != 4
         || write.rows != rows
         || write.input.dtype != DType::F32
@@ -3336,14 +3393,10 @@ fn execute_gated_delta_net_hc_impl(
     if let Some(xq) = fused_xq {
         // The gate emitted the A8 blocks: the INT8 route's GEMM, minus its producer.
         let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
-        return hip(gpu.gemm_mq6g256v2_i8_prequant(
-            op.output.buf,
-            xq,
-            &output_batch,
-            op.output.m,
-            op.output.k,
-            op.rows,
-        ));
+        return split_projections(gpu, op.rows, &[(&op.output, &output_batch)], |gpu, p| {
+            let (w, out) = p[0];
+            hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, op.rows))
+        });
     }
     // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
     // projection's epilogue; the projection then never lands in `output_tensor`.

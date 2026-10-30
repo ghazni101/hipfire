@@ -5113,9 +5113,32 @@ pub fn drive_qwen_vmm_continuous_batch(
                     crate::vmm_conv::checkpoint(
                         &mut ctl[idx].checkpoints,
                         &st.dn,
+                        &st.kv,
                         gpu,
                         st.position,
                     );
+                }
+                // `prefill_progress` for this lane's prompt chunk (silent on
+                // the last chunk: `done < total` only).
+                if matches!(
+                    r.kind,
+                    hipfire_runtime::slot_batch::RequestStepKind::Prefill
+                ) {
+                    if let (BatchLane::Running(lane), Some(st)) =
+                        (&sched.lanes[idx], store.request_state(&r.epoch))
+                    {
+                        let total = match ctl[idx].prefill_tokens {
+                            0 => lane.prompt_len.saturating_sub(ctl[idx].cached),
+                            n => n,
+                        };
+                        crate::common::emit_prefill_progress(
+                            stdout,
+                            &lane.key.id,
+                            Some(lane.key.attempt_id),
+                            st.position.saturating_sub(ctl[idx].cached),
+                            total,
+                        );
+                    }
                 }
             }
             // A lane with committed-but-unfed tokens (forced think close,

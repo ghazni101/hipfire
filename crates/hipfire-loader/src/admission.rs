@@ -243,17 +243,55 @@ pub(crate) fn qwen4_native_mtp(
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
+    use hipfire_config::load_summary::{note, Facet};
     if pp > 1 || ep > 1 {
-        return Ok(spec.mtp == Some(true));
+        let on = spec.mtp == Some(true);
+        if !on {
+            note(
+                Facet::SpecOff,
+                if spec.mtp == Some(false) {
+                    "MTP off: speculation.mtp=off"
+                } else {
+                    "MTP off: pp/ep topology (explicit --spec mtp arms it)"
+                },
+            );
+        }
+        return Ok(on);
     }
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    qwen4_native_mtp_for_floor(
-        spec.mtp,
-        retained,
-        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR,
-    )
+    let floor = hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR;
+    let verdict = qwen4_native_mtp_for_floor(spec.mtp, retained, floor);
+    if verdict == Ok(false) {
+        note(
+            Facet::SpecOff,
+            format!(
+                "MTP off: {}",
+                qwen4_mtp_off_reason(spec.mtp, retained, floor)
+            ),
+        );
+    }
+    verdict
+}
+
+/// The reason [`qwen4_native_mtp_for_floor`] returned `Ok(false)`, for the
+/// load summary. Only the label of the arm that already decided; the policy
+/// itself stays in [`qwen4_native_mtp_for_floor`].
+fn qwen4_mtp_off_reason(
+    spec_mtp: Option<bool>,
+    retained: bool,
+    measured_ar_floor: bool,
+) -> &'static str {
+    if spec_mtp == Some(false) {
+        "speculation.mtp=off"
+    } else if retained {
+        ".mq4r retained replay path"
+    } else if !measured_ar_floor {
+        "no measured AR floor (speculation.mtp=auto)"
+    } else {
+        "declined by policy"
+    }
 }
 
 /// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
@@ -340,15 +378,17 @@ pub(crate) fn qwen4_developer_ple_policy(
 /// Whether an admitted Qwen4 native MTP head stays attached once
 /// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
 /// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Device-resident loads (Strix Halo:
-/// MTP text = AR on 8/8, 1.41x) and exact gfx1201 (R9700, `auto` placement:
-/// greedy MTP text = AR on 8/8 prompts, faster on every one) keep the `auto`
-/// default on; other arches with host-mapped experts are unmeasured, so
+/// MTP text = AR on 8/8, 1.41x), exact gfx1201 (R9700, `auto` placement:
+/// greedy MTP text = AR on 8/8 prompts, faster on every one) and exact gfx1100
+/// (7900 XTX, trunk D2 CPU arm plus the MTP head D2 executor: +17.8% / +18.9% /
+/// +19.8% over AR at 32K / 131K / 250K, target ids identical, per-request AR
+/// floor still guards) keep the `auto` default on; other arches with host-mapped experts are unmeasured, so
 /// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
 /// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
 /// AR (the admitted head is never attached then).
 ///
 /// Thin twin over the shared [`hipfire_config::mtp_host_spill_policy`]: the
-/// qwen4 admitted list is `&["gfx1201"]` (the arch clause is data, not a
+/// qwen4 admitted list is `&["gfx1100", "gfx1201"]` (the arch clause is data, not a
 /// second function). Kept so the two policy call sites in `carriers.rs` keep
 /// their typed-`SpecLoadCfg` spelling.
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
@@ -357,7 +397,13 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     host_mapped_experts: usize,
 ) -> bool {
     let mode = hipfire_config::MtpMode::from_tri_state(spec.mtp);
-    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
+    hipfire_config::mtp_host_spill_policy(
+        mode,
+        host_mapped_experts,
+        gpu_arch,
+        &["gfx1100", "gfx1201"],
+    )
+    .attach
 }
 
 /// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
@@ -514,6 +560,10 @@ pub fn qwen4_request_admission(
 /// and the grouped MoE route are certified on gfx1100 (7900 XTX) and gfx1201
 /// (R9700). Every rank must be the SAME one of them (homogeneous).
 pub const QWEN4_EP_ARCHS: [&str; 2] = ["gfx1100", "gfx1201"];
+
+/// The refusal for a safetensors directory handed to a Flash-Next (qwen4) load.
+pub(crate) const QWEN4_SAFETENSORS_REFUSAL: &str = "qwen4: safetensors is a conversion input, \
+     not an executable HFQ artifact; quantize it first: hipfire quantize <dir>";
 
 /// Under the developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) the
 /// ranks also run aliased on gfx1151 (Strix Halo has one GPU): that proves
@@ -948,9 +998,7 @@ pub fn admit_qwen4_source(
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
-        return Err(
-            "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
-        );
+        return Err(QWEN4_SAFETENSORS_REFUSAL.into());
     };
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
         .map_err(|error| error.to_string())?;
@@ -1544,6 +1592,100 @@ pub const QWEN35_MIN_AUTO_CONTEXT: usize = 512;
 
 /// VMM page rounding reserved across the K/V owners in the projection.
 const QWEN35_VMM_PAGE_ROUNDING_BYTES: usize = 128 << 20;
+
+/// Largest context `t` in `[0, cap]` whose mapped-KV growth plus the
+/// per-request prefill `transient` fits in `free` bytes. Measured after the
+/// whole Qwen load (weights, KV owners' initial prefix, DeltaNet, scratch,
+/// drafts) so every load-time owner is already charged in `free`. `growth(t)`
+/// is the physical bytes still to map to hold `t` tokens; it is monotone in
+/// `t`, which makes the answer a binary search. Returns 0 when not even the
+/// empty context fits; a `growth` error propagates unchanged.
+pub fn qwen35_measured_fit(
+    free: usize,
+    transient: usize,
+    cap: usize,
+    mut growth: impl FnMut(usize) -> Result<usize, String>,
+) -> Result<usize, String> {
+    let mut fits =
+        |t: usize| -> Result<bool, String> { Ok(growth(t)?.saturating_add(transient) <= free) };
+    if !fits(0)? {
+        return Ok(0);
+    }
+    // Invariant: `lo` fits; `hi` is the largest candidate.
+    let (mut lo, mut hi) = (0usize, cap);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+#[cfg(test)]
+mod qwen35_measured_fit_tests {
+    use super::qwen35_measured_fit;
+
+    /// Linear growth with 100 B/token, mapped in whole 1000 B chunks above a
+    /// 500 B already-mapped prefix (monotone step function).
+    fn stepped(t: usize) -> Result<usize, String> {
+        let need = t * 100;
+        Ok(if need <= 500 {
+            0
+        } else {
+            (need - 500).div_ceil(1000) * 1000
+        })
+    }
+
+    #[test]
+    fn qwen35_measured_fit_exact_boundary() {
+        // free - transient = 3000 -> growth <= 3000 -> need <= 3500 -> t = 35.
+        assert_eq!(qwen35_measured_fit(3200, 200, 10_000, stepped), Ok(35));
+        // One byte short of the boundary drops a whole chunk (t = 25).
+        assert_eq!(qwen35_measured_fit(3199, 200, 10_000, stepped), Ok(25));
+        // Linear growth: exact byte boundary, no rounding.
+        assert_eq!(
+            qwen35_measured_fit(1000, 0, 10_000, |t| Ok(t * 10)),
+            Ok(100)
+        );
+        assert_eq!(qwen35_measured_fit(999, 0, 10_000, |t| Ok(t * 10)), Ok(99));
+    }
+
+    #[test]
+    fn qwen35_measured_fit_is_bounded_by_cap() {
+        assert_eq!(
+            qwen35_measured_fit(usize::MAX, 0, 777, |t| Ok(t * 10)),
+            Ok(777)
+        );
+        assert_eq!(qwen35_measured_fit(1 << 40, 0, 0, |t| Ok(t)), Ok(0));
+    }
+
+    #[test]
+    fn qwen35_measured_fit_nothing_fits_is_zero() {
+        // Transient alone exceeds free.
+        assert_eq!(qwen35_measured_fit(100, 101, 4096, |_| Ok(0)), Ok(0));
+        // Growth of even the empty context exceeds free.
+        assert_eq!(qwen35_measured_fit(100, 0, 4096, |_| Ok(101)), Ok(0));
+        assert_eq!(qwen35_measured_fit(0, 0, 4096, |t| Ok(t + 1)), Ok(0));
+    }
+
+    #[test]
+    fn qwen35_measured_fit_propagates_growth_error() {
+        let err = qwen35_measured_fit(1 << 30, 0, 4096, |_| Err("boom".to_string()));
+        assert_eq!(err, Err("boom".to_string()));
+        // An error raised only deep in the search still surfaces.
+        let err = qwen35_measured_fit(1 << 30, 0, 4096, |t| {
+            if t > 1000 {
+                Err("late".to_string())
+            } else {
+                Ok(0)
+            }
+        });
+        assert_eq!(err, Err("late".to_string()));
+    }
+}
 
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
@@ -3862,10 +4004,20 @@ mod tests {
         };
         // Device-resident experts: the admitted head stays on under `auto`.
         assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
-        // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
-        // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
+        // Host-mapped experts: `auto` keeps AR off gfx1100/gfx1201, an explicit `on`
+        // keeps MTP everywhere, and gfx1100/gfx1201 keep the head under `auto`.
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            21
+        ));
         assert!(!qwen4_mtp_with_host_mapped_experts(
             with(None),
+            "gfx1151",
+            21
+        ));
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(Some(false)),
             "gfx1100",
             21
         ));
@@ -6245,14 +6397,14 @@ mod qwen4_pp_admission_tests {
                 "{arch}"
             );
         }
-        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
+        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1100/gfx1201;
         // explicit `on` attaches everywhere; `off` never.
         assert!(qwen4_mtp_with_host_mapped_experts(
             with(None),
             "gfx1201",
             24
         ));
-        assert!(!qwen4_mtp_with_host_mapped_experts(
+        assert!(qwen4_mtp_with_host_mapped_experts(
             with(None),
             "gfx1100",
             24
@@ -6272,6 +6424,35 @@ mod qwen4_pp_admission_tests {
             "gfx1201",
             24
         ));
+    }
+
+    #[test]
+    fn qwen4_mtp_off_reason_labels_exactly_the_declined_arms() {
+        for mtp in [None, Some(true), Some(false)] {
+            for retained in [false, true] {
+                for floor in [false, true] {
+                    if qwen4_native_mtp_for_floor(mtp, retained, floor) == Ok(false) {
+                        let reason = qwen4_mtp_off_reason(mtp, retained, floor);
+                        assert_ne!(
+                            reason, "declined by policy",
+                            "unlabelled decline for ({mtp:?}, {retained}, {floor})"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            qwen4_mtp_off_reason(None, true, true),
+            ".mq4r retained replay path"
+        );
+        assert_eq!(
+            qwen4_mtp_off_reason(None, false, false),
+            "no measured AR floor (speculation.mtp=auto)"
+        );
+        assert_eq!(
+            qwen4_mtp_off_reason(Some(false), false, true),
+            "speculation.mtp=off"
+        );
     }
 
     #[test]

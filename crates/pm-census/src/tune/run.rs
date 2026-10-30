@@ -454,7 +454,7 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
         }
         if spec.id() == incumbent_id {
             let a = &offline[&incumbent_id];
-            if let Some(reason) = prune_reason(a, &domain.node_symbol) {
+            if let Some(reason) = prune_reason(a, &domain::baseline_symbol(domain)) {
                 return Err(format!(
                     "incumbent {} (epi {}) refused: {reason}",
                     incumbent_id,
@@ -473,7 +473,7 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
             continue;
         };
         c.offline = Some(a.clone());
-        if let Some(r) = prune_reason(a, &domain.node_symbol) {
+        if let Some(r) = prune_reason(a, &domain::baseline_symbol(domain)) {
             c.role = "pruned".to_owned();
             c.reason = Some(r);
             continue;
@@ -550,6 +550,7 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
         noise_floor,
         aa_runs,
         kld_state: None,
+        kld_token: None,
     };
     if drv.stop.is_none() {
         let screen = ClaimPolicyV1 {
@@ -672,7 +673,17 @@ pub fn run_all(domain: &DomainV1, cfg: &RunConfig) -> Result<Value, String> {
                         arch: c.spec.arch.clone(),
                         kernel: c.spec.kernel.clone(),
                         shape: c.spec.shape.clone(),
-                        numeric_contract: "exact".to_owned(),
+                        // An attempt measured NOT identical to the baseline makes the record
+                        // numeric (the KLD/state gate decides); unmeasured stays exact.
+                        numeric_contract: if std::iter::once(&ev.discovery)
+                            .chain(ev.confirms.iter())
+                            .any(|a| a.identical_to_baseline == Some(false))
+                        {
+                            "numeric"
+                        } else {
+                            "exact"
+                        }
+                        .to_owned(),
                         mode: "eager".to_owned(),
                         baseline_code_sha256: b,
                         candidate_co_sha256: co,

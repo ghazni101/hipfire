@@ -275,6 +275,13 @@ pub struct FeatureFlags {
     // ── Kernel variant overrides ─────────────────────────────────
     pub lloyd_mb4: Option<Mb4Mode>,
     pub mq3_mb4: Option<Mb4Mode>,
+    /// Symmetric qt49 (MQ3V2 `mq3v2.symmetric`) W3A4 prefill override
+    /// (`HIPFIRE_MQ3V25_A4`). Unset follows the per-arch default of
+    /// [`Self::mq3v25_a4_enabled`]; `0` is the kill switch.
+    pub mq3v25_a4: Option<bool>,
+    /// Symmetric qt49 W3A8 prefill on exact gfx1201 (`HIPFIRE_MQ3V25_A8=1`,
+    /// developer, default off). Wins over A4 when both are requested.
+    pub mq3v25_a8: bool,
     pub hfq4g128_mmq: bool,
     pub hfq3_mmq_layer_min: Option<usize>,
     pub hfq3_mmq_layer_max: Option<usize>,
@@ -404,11 +411,13 @@ pub struct FeatureFlags {
     /// outputs are byte-identical. N <= 16 never uses it. Default ON on exact
     /// gfx1201; `=0` restores the one-batch-tile-per-block launch.
     pub wmma_batch_tiles: bool,
-    /// `HIPFIRE_CB_VERIFY_CHUNK128=1` (default OFF) admits exact 64..=128-row
-    /// aggregated verify chunks for the continuous-batching speculative route
-    /// on exact gfx1201 (see `Gpu::mq4_verify_chunk_rows`): 128 rows through
-    /// the explicit `gemm_*_verify_exact` kernels instead of 63. `=0` keeps
-    /// the 63-row chunks and every existing route. Needs `wmma_batch_tiles`.
+    /// `HIPFIRE_CB_VERIFY_CHUNK128` (default ON on gfx1201, `=0` is the kill
+    /// switch) admits exact 64..=128-row aggregated verify chunks for the
+    /// continuous-batching speculative route on exact gfx1201 (see
+    /// `Gpu::mq4_verify_chunk_rows`): up to 128 rows per chunk instead of 63,
+    /// so 8 lanes of 8-row blocks (64 rows) run one weight pass instead of
+    /// two. `=0` keeps the 63-row chunks and every existing route. Needs
+    /// `wmma_batch_tiles`.
     pub cb_verify_chunk128: bool,
     /// `HIPFIRE_CB_VERIFY_PM` (default ON; only meaningful with the wide
     /// verify route): runs the 64..=128-row exact kernels from the embedded
@@ -808,6 +817,24 @@ pub struct FeatureFlags {
     pub qwen4_qsa_extent_sync: bool,
     /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
     pub qwen4_qsa_code_check: bool,
+    /// `HIPFIRE_MQ6_RESID_PORT_GFX1100`: the exact-gfx1100 MQ6 residual prefill
+    /// GEMM runs the card-proven hipcc "pk twin" ports
+    /// (`gemm_mq6g256v2_residual_gfx1100_port_{w8n256,w4n128}`) wherever hipcc
+    /// picks MW8. Parsed on unless the value is exactly `0` (kill switch);
+    /// acted on for exact gfx1100 only (`mq6_resid_port_gfx1100_enabled`).
+    pub mq6_resid_port_gfx1100: bool,
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
+    /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
+    /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
+    /// (kill switch); acted on for exact gfx1100 only
+    /// (`qwen4_qsa_hg4_q8_lite_enabled`).
+    pub qwen4_qsa_hg4_q8_lite: bool,
+    /// `HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100`: the HC `input_mix_down` projection
+    /// (M = 320) runs the bit-identical 80 x 32 fill tile
+    /// `gemm_wmma_lds_80_32_80_16_k64_p` instead of the 64 x 64 tile. Parsed on
+    /// unless the value is exactly `0` (kill switch); acted on for exact gfx1100
+    /// only (`qwen4_hc_mix_fill80_gfx1100_enabled`).
+    pub qwen4_hc_mix_fill80_gfx1100: bool,
 }
 
 /// Built-in default of `experimental.graph.ar` for an architecture on a host
@@ -1121,6 +1148,8 @@ impl FeatureFlags {
             // Kernel variant overrides
             lloyd_mb4: parse_mb4("HIPFIRE_LLOYD_MB4"),
             mq3_mb4: parse_mb4("HIPFIRE_MQ3_MB4"),
+            mq3v25_a4: parse_bool("HIPFIRE_MQ3V25_A4"),
+            mq3v25_a8: parse_bool("HIPFIRE_MQ3V25_A8").unwrap_or(false),
             hfq4g128_mmq: value("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
             hfq3_mmq_layer_min: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MIN"),
             hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
@@ -1185,7 +1214,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
             wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
-            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
+            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(arch == "gfx1201"),
             cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
             cb_verify_fp8: parse_bool("HIPFIRE_CB_VERIFY_FP8").unwrap_or(false),
             cb_verify_iu4: parse_bool("HIPFIRE_CB_VERIFY_IU4"),
@@ -1425,6 +1454,16 @@ impl FeatureFlags {
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
             qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref()
                 == Some("1"),
+            mq6_resid_port_gfx1100: value("HIPFIRE_MQ6_RESID_PORT_GFX1100")
+                .ok()
+                .as_deref()
+                != Some("0"),
+            qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
+                != Some("0"),
+            qwen4_hc_mix_fill80_gfx1100: value("HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100")
+                .ok()
+                .as_deref()
+                != Some("0"),
         }
     }
 
@@ -1466,6 +1505,26 @@ impl FeatureFlags {
     pub fn iu4_prefill_enabled(&self) -> bool {
         self.iu4_prefill.unwrap_or(true)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+    }
+
+    /// Symmetric qt49 W3A4 prefill for an artifact whose loader validated the
+    /// `mq3v2.symmetric` zero contract (`symmetric`). Shares the W4A4 opt-out
+    /// (`kernel.iu4_prefill`). Default on exact gfx1201; exact gfx1100 runs
+    /// only on `HIPFIRE_MQ3V25_A4=1`; every other arch keeps the F16 route.
+    pub fn mq3v25_a4_enabled(&self, symmetric: bool) -> bool {
+        symmetric
+            && self.iu4_prefill_enabled()
+            && match self.arch.as_str() {
+                "gfx1201" => self.mq3v25_a4.unwrap_or(true),
+                "gfx1100" => self.mq3v25_a4.unwrap_or(false),
+                _ => false,
+            }
+    }
+
+    /// Symmetric qt49 W3A8 prefill: explicit developer opt-in on exact
+    /// gfx1201 only. Wins over [`Self::mq3v25_a4_enabled`].
+    pub fn mq3v25_a8_enabled(&self, symmetric: bool) -> bool {
+        self.mq3v25_a8 && symmetric && self.arch == "gfx1201"
     }
 
     /// A8 projection route, only when explicitly selected: `HIPFIRE_A8_PREFILL`
@@ -1534,6 +1593,33 @@ impl FeatureFlags {
     /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// MQ6 residual hipcc "pk twin" ports
+    /// (`gemm_mq6g256v2_residual_gfx1100_port_{w8n256,w4n128}`): default on,
+    /// exact gfx1100 only (the only architecture they were carded on);
+    /// `HIPFIRE_MQ6_RESID_PORT_GFX1100=0` restores the PM twin
+    /// (`HIPFIRE_MQ6_RESID_PM_GFX1100`) or hipcc MW8. Bit-identical output.
+    pub fn mq6_resid_port_gfx1100_enabled(&self) -> bool {
+        self.mq6_resid_port_gfx1100 && self.arch == "gfx1100"
+    }
+
+    /// q8 grouped prefill attention low-LDS twin
+    /// (`indexed_attention_attention_q8_batched_hg4_lite`): default on, exact
+    /// gfx1100 only (the only architecture its win was measured on);
+    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE=0` restores
+    /// `indexed_attention_attention_q8_batched_hg4`. Bit-identical output.
+    pub fn qwen4_qsa_hg4_q8_lite_enabled(&self) -> bool {
+        self.qwen4_qsa_hg4_q8_lite && self.arch == "gfx1100"
+    }
+
+    /// HC `input_mix_down` fill tile (`gemm_wmma_lds_80_32_80_16_k64_p`, 80 x 32
+    /// workgroup of two 80 x 16 waves, 192 waves instead of 120): default on,
+    /// exact gfx1100 only (the only architecture it was measured on);
+    /// `HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100=0` restores
+    /// `gemm_wmma_lds_64_64_32_64_k64_p`. Bit-identical output.
+    pub fn qwen4_hc_mix_fill80_gfx1100_enabled(&self) -> bool {
+        self.qwen4_hc_mix_fill80_gfx1100 && self.arch == "gfx1100"
     }
 
     /// Q8 split-KV QSA decode attention: the same
@@ -1840,6 +1926,8 @@ impl FeatureFlags {
             mmq_diag_quantize_only: false,
             lloyd_mb4: None,
             mq3_mb4: None,
+            mq3v25_a4: None,
+            mq3v25_a8: false,
             hfq4g128_mmq: true,
             hfq3_mmq_layer_min: None,
             hfq3_mmq_layer_max: None,
@@ -1978,6 +2066,9 @@ impl FeatureFlags {
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
+            mq6_resid_port_gfx1100: false,
+            qwen4_qsa_hg4_q8_lite: false,
+            qwen4_hc_mix_fill80_gfx1100: false,
         }
     }
 }
@@ -2374,6 +2465,119 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
         assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());
+    }
+
+    /// The MQ6 residual ports are default on for exact gfx1100 only; exactly `0`
+    /// is the kill switch and every other value keeps them on.
+    #[test]
+    fn mq6_resid_port_gfx1100_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_MQ6_RESID_PORT_GFX1100" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).mq6_resid_port_gfx1100, "{arch}: unset");
+            assert_eq!(
+                flags(None).mq6_resid_port_gfx1100_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!flags(Some("0")).mq6_resid_port_gfx1100, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).mq6_resid_port_gfx1100_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).mq6_resid_port_gfx1100, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).mq6_resid_port_gfx1100_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").mq6_resid_port_gfx1100_enabled());
+    }
+
+    /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`
+    /// is the kill switch and every other value keeps it on.
+    #[test]
+    fn qwen4_qsa_hg4_q8_lite_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_QSA_HG4_Q8_LITE" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).qwen4_qsa_hg4_q8_lite, "{arch}: unset");
+            assert_eq!(flags(None).qwen4_qsa_hg4_q8_lite_enabled(), exact, "{arch}");
+            assert!(!flags(Some("0")).qwen4_qsa_hg4_q8_lite, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).qwen4_qsa_hg4_q8_lite_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).qwen4_qsa_hg4_q8_lite, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_hg4_q8_lite_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_hg4_q8_lite_enabled());
+    }
+
+    /// The HC mix fill tile is default on for exact gfx1100 only; exactly `0`
+    /// is the kill switch and every other value keeps it on.
+    #[test]
+    fn qwen4_hc_mix_fill80_gfx1100_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).qwen4_hc_mix_fill80_gfx1100, "{arch}: unset");
+            assert_eq!(
+                flags(None).qwen4_hc_mix_fill80_gfx1100_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!flags(Some("0")).qwen4_hc_mix_fill80_gfx1100, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).qwen4_hc_mix_fill80_gfx1100_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(
+                    flags(Some(raw)).qwen4_hc_mix_fill80_gfx1100,
+                    "{arch}: {raw:?}"
+                );
+                assert_eq!(
+                    flags(Some(raw)).qwen4_hc_mix_fill80_gfx1100_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").qwen4_hc_mix_fill80_gfx1100_enabled());
     }
 
     #[test]
@@ -2963,7 +3167,7 @@ mod tests {
     }
 
     #[test]
-    fn cb_verify_chunk128_defaults_off_and_pm_defaults_on() {
+    fn cb_verify_chunk128_defaults_on_for_gfx1201_and_pm_defaults_on() {
         let flags = |chunk: Option<&str>, pm: Option<&str>| {
             FeatureFlags::from_lookup("gfx1201", |name| match (name, chunk, pm) {
                 ("HIPFIRE_CB_VERIFY_CHUNK128", Some(v), _) => Ok(v.to_owned()),
@@ -2972,10 +3176,14 @@ mod tests {
             })
         };
         let default = flags(None, None);
-        assert!(!default.cb_verify_chunk128);
+        assert!(default.cb_verify_chunk128);
         assert!(default.cb_verify_pm);
         assert!(flags(Some("1"), None).cb_verify_chunk128);
         assert!(!flags(Some("0"), None).cb_verify_chunk128);
+        // Other arches never default it on (their cap stays 63 regardless).
+        let other = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        assert!(!other.cb_verify_chunk128);
+        // The unit-test constructor stays on the historical 63-row route.
         assert!(!flags(None, Some("0")).cb_verify_pm);
         assert!(flags(None, Some("1")).cb_verify_pm);
         assert!(!FeatureFlags::for_test("gfx1201").cb_verify_chunk128);

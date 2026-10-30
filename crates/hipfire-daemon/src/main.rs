@@ -15,6 +15,13 @@
 //!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
 //!   → {"type":"generate","id":"r1","prompt":"Hello","temperature":0.3,"max_tokens":512}
 //!   → {"type":"generate","id":"r1","prompt":"Describe this","image":"/path/to/img.png","temperature":0.3,"max_tokens":512}
+//!   ← {"type":"gen_start","id":"r1","attempt_id":1,...}
+//!   ← {"type":"prefill_progress","id":"r1","attempt_id":1,"done":2048,"total":9000}
+//!       Prompt-prefill progress, one line per completed chunk while `done < total`
+//!       (none for a single-chunk prompt or at `done == total`; counts exclude a
+//!       cache-hit prefix). Ordered after `gen_start` and before the first
+//!       `token`/`reasoning`. Default on; `HIPFIRE_PREFILL_PROGRESS=0` suppresses it.
+//!       Clients that do not know the type ignore it.
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
 //!   → {"type":"unload"}
@@ -84,6 +91,7 @@ use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
 mod effort_probe;
+mod load_summary;
 mod npu_route;
 mod process_init;
 mod request_guards;
@@ -1307,6 +1315,8 @@ fn main() {
                 // Held for the whole arm: every exit (success after the
                 // receipt, error ACK, refusal `continue`) ends the recording.
                 let _load_phase_scope = rdna_compute::load_phases::begin_load_scope();
+                // A new load: drop the previous load's decision notes.
+                hipfire_config::load_summary::begin();
                 // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
                 // Resolve once, before the weight-host envelope, slot caps and
                 // every pp gate below read the request.
@@ -1612,6 +1622,27 @@ fn main() {
                                 mode: Some(slot_params.kv_mode_resolved.to_owned()),
                                 ..slot_kv_diag.clone()
                             });
+                            let slot_summary = load_summary::summarize(
+                                &hipfire_config::load_summary::take(),
+                                &load_summary::SummaryState {
+                                    model: std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or(path),
+                                    arch: &arch,
+                                    kv_mode: slot_params.kv_mode_resolved,
+                                    kv_backend: &slot_kv_diag.backend,
+                                    kv_request: &slot_kv_diag.request,
+                                    max_seq: cap_tokens,
+                                    bound: "slots",
+                                    model_ctx: None,
+                                    card_cap: None,
+                                    speculator: (mtp_mode_effective == "on").then_some("mtp"),
+                                    pp: 1,
+                                    ep: false,
+                                },
+                            );
+                            eprintln!("{}", slot_summary.line);
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let mut ack = serde_json::json!({
                                 "type": "loaded",
@@ -1636,6 +1667,9 @@ fn main() {
                                 "pp": 1,
                                 "mtp_mode_effective": mtp_mode_effective,
                             });
+                            ack.as_object_mut()
+                                .expect("loaded ack is a JSON object")
+                                .insert("load_summary".to_string(), slot_summary.to_json());
                             ack.as_object_mut()
                                 .expect("loaded ack is a JSON object")
                                 .extend(effort_fields);
@@ -1761,18 +1795,45 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1);
                 let draft_path = if dflash_mode == "off" {
-                    if let Some(d) = raw_draft {
+                    if let Some(d) = &raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
                     }
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        match &raw_draft {
+                            Some(d) => format!(
+                                "DFlash off: speculation.dflash=off (draft {} not loaded)",
+                                Path::new(d).file_name().map_or_else(
+                                    || d.clone(),
+                                    |n| n.to_string_lossy().into_owned()
+                                )
+                            ),
+                            None => "DFlash off: speculation.dflash=off".to_string(),
+                        },
+                    );
                     None
                 } else if dflash_mode == "auto" && draft_tp > 1 {
                     if let Some(d) = raw_draft {
                         eprintln!(
                             "[hipfire-daemon] dflash_mode=auto with tp={draft_tp} — DFlash is not served on EP/TP; skipping draft load ({d})"
                         );
+                        hipfire_config::load_summary::note(
+                            hipfire_config::load_summary::Facet::SpecOff,
+                            format!(
+                                "DFlash off: not served on EP/TP (tp={draft_tp}, dflash_mode=auto)"
+                            ),
+                        );
                     }
                     None
                 } else {
+                    if raw_draft.is_none() {
+                        hipfire_config::load_summary::note(
+                            hipfire_config::load_summary::Facet::SpecOff,
+                            format!(
+                                "DFlash off: no draft paired (speculation.dflash={dflash_mode})"
+                            ),
+                        );
+                    }
                     raw_draft
                 };
                 // Shared Qwen3.5-VL tower sidecar (`qwen3.8-27b-vision.hfq`).
@@ -2790,11 +2851,33 @@ fn main() {
                             mode: Some(seq_kv.to_owned()),
                             ..pending_kv_diag.clone()
                         });
+                        // One INFO line: what is on/off and why, from the
+                        // engine's own decision notes plus state held here.
+                        let summary = load_summary::summarize(
+                            &hipfire_config::load_summary::take(),
+                            &load_summary::SummaryState {
+                                model: std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(path),
+                                arch,
+                                kv_mode: seq_kv,
+                                kv_backend: &pending_kv_diag.backend,
+                                kv_request: &pending_kv_diag.request,
+                                max_seq,
+                                bound: seq_bound,
+                                model_ctx,
+                                card_cap,
+                                speculator: m.speculator.as_ref().map(|s| s.name()),
+                                pp: m.pp,
+                                ep: staged_ep_batch,
+                            },
+                        );
+                        eprintln!("{}", summary.line);
                         // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             emit_load_phases();
-                            let _ = writeln!(
-                                stdout,
+                            let ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
@@ -2825,6 +2908,8 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(),
                                 seq_kv,
                             );
+                            let ack = load_summary::ack_with_summary(ack, &summary);
+                            let _ = writeln!(stdout, "{ack}");
                         } else {
                             let ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}","mtp_mode_effective":"{}"}}"#,
@@ -2856,6 +2941,7 @@ fn main() {
                                 seq_kv,
                                 m.mtp_mode,
                             );
+                            let ack = load_summary::ack_with_summary(ack, &summary);
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
                                 ack,
                                 &mut m,
@@ -5012,6 +5098,9 @@ fn main() {
             }
         }
     }
+    // stdin closed: persist the retained-PM4 dispatch ledger's replay counters
+    // (`HIPFIRE_REDLINE_LEDGER`; a no-op when unset).
+    rdna_compute::pm4_ledger::flush_all();
 }
 
 #[cfg(test)]

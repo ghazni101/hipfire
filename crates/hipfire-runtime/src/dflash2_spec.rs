@@ -33,8 +33,8 @@ use crate::dflash::{draft_forward_based, propose_candidates_device, DflashConfig
 use crate::dflash::{DflashWeights, DFLASH_BLOCK_MAX};
 use crate::hfq::HfqFile;
 use crate::spec::{
-    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch,
-    SpecStep, SpecTarget, Speculator,
+    accept_greedy_prefix, terminal_prefix_replay, PrefillOutcome, SpecAdvance, SpecGrammar,
+    SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use crate::spec_sampling::{accept_sampled_prefix, SampleSpec, SparseDist, SpecRng};
 use rdna_compute::Gpu;
@@ -434,6 +434,36 @@ impl Speculator for Dflash2Speculator {
             vs.clear();
         }
         Ok(())
+    }
+
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let replay = terminal_prefix_replay(window_seed, consumed);
+        let end = window_start + replay.len();
+        // The replay re-runs committed rows only, so their feature rows stand.
+        if replay.is_empty()
+            || window_start < self.host_base
+            || self.host_tokens.get(window_start..end) != Some(replay.as_slice())
+        {
+            return Ok(false);
+        }
+        let vs = self.verify_scratch()?;
+        if !target.repair_committed_prefix(gpu, vs.as_mut(), window_start, &replay)? {
+            return Ok(false);
+        }
+        let row_elems = self.row_elems();
+        self.target_hidden_host
+            .truncate((end - self.host_base) * row_elems);
+        self.host_tokens.truncate(end);
+        // Device copies of rows at or past `end` are stale now.
+        self.scratch.reset_upload_tracking();
+        Ok(true)
     }
 
     fn reset_state_evidence(&self) -> Option<crate::spec::SpecResetEvidence> {

@@ -6,6 +6,9 @@
 //! contracts as `pub static` [`KernelAbiV1`] values, its storage formats and
 //! numeric contracts as `pub const`, and the list `ABIS`.
 
+pub mod ggml_convert;
+pub mod ggml_mmvq;
+pub mod ggml_mmvq_fused;
 pub mod mq6_i8;
 pub mod qwen4_moe_sym;
 
@@ -17,6 +20,9 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
     mq6_i8::ABIS
         .iter()
         .chain(qwen4_moe_sym::ABIS.iter())
+        .chain(ggml_mmvq::ABIS.iter())
+        .chain(ggml_mmvq_fused::ABIS.iter())
+        .chain(ggml_convert::ABIS.iter())
         .copied()
 }
 
@@ -45,7 +51,7 @@ mod tests {
             }
             assert!(ids.insert(abi.id), "duplicate contract id {}", abi.id);
         }
-        assert_eq!(ids.len(), 18);
+        assert_eq!(ids.len(), 51);
     }
 
     #[test]

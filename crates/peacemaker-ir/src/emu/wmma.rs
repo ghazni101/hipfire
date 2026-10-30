@@ -724,8 +724,10 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
-            exec: u32::MAX,
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            nan_loose: false,
+            exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
             m0: 0,
@@ -733,6 +735,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(base: u16, len: u8) -> Operand {
@@ -905,7 +908,7 @@ mod tests {
     fn gfx11_divergent_replicas_are_hard_errors() {
         let f16 = |a_hi: bool, b_hi: bool, exec: u32| {
             let mut st = state();
-            st.exec = exec;
+            st.exec = u64::from(exec);
             for lane in [5, 21] {
                 put_half(&mut st, A, 6, lane, 1, 0x4200);
             }
@@ -941,7 +944,7 @@ mod tests {
         }
         let iu4 = |a_hi: bool, b_hi: bool, exec: u32| {
             let mut st = state();
-            st.exec = exec;
+            st.exec = u64::from(exec);
             for lane in [3, 19] {
                 put_nib(&mut st, A, 1, lane, 2, 0xe);
             }
@@ -2588,7 +2591,7 @@ mod tests {
                     enc(of, 1.0)
                 };
                 for vgpr in 0..8 {
-                    st.v[usize::from(D) + vgpr] = [word; 32];
+                    st.v[usize::from(D) + vgpr] = [word; 64];
                 }
             };
             for (lo, hi) in [(1, 0), (0, 1), (2, 2), (3, 3)] {

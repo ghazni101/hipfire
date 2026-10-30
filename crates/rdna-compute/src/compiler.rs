@@ -1590,6 +1590,16 @@ impl KernelCompiler {
     }
 
     /// Core hipcc argv: `core_hipcc_flags`, then passthrough, then -o out src.
+    ///
+    /// A source in a directory also gets `-fmacro-prefix-map=<dir>/=`. Device
+    /// `assert` expands `__FILE__` into the object's rodata, and the source
+    /// lives in a per-host cache (a per-build `mktemp` tree in the pack
+    /// script), so without the map the same module's bytes depend on where it
+    /// compiled. With it the object names only `{stem}.hip`, a function of the
+    /// module key. It is argv, not recipe: no cache key or pack index changes,
+    /// and the only objects that change are those that expand `__FILE__`. An
+    /// `=` in the directory cannot be spelled in a prefix map, so such a
+    /// directory keeps the unmapped (path-dependent) bytes.
     fn direct_hipcc_args(
         arch: &str,
         src_path: &Path,
@@ -1598,9 +1608,14 @@ impl KernelCompiler {
     ) -> Vec<String> {
         let mut args = core_hipcc_flags(arch);
         args.extend(passthrough);
+        let src = src_path.to_str().unwrap();
+        let dir = &src[..src.len() - src_path.file_name().map_or(src.len(), |n| n.len())];
+        if !dir.is_empty() && !dir.contains('=') {
+            args.push(format!("-fmacro-prefix-map={dir}="));
+        }
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
-        args.push(src_path.to_str().unwrap().into());
+        args.push(src.into());
         args
     }
 
@@ -2640,6 +2655,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_hipcc_args_map_the_source_directory_out_of_file_macros() {
+        let argv = |dir: &str| {
+            KernelCompiler::direct_hipcc_args(
+                "gfx1201",
+                &Path::new(dir).join("m.0123456789abcdef.hip"),
+                &Path::new(dir).join(".m.tmp"),
+                Vec::new(),
+            )
+        };
+        // The `__FILE__` baked into the object is `m.0123456789abcdef.hip`
+        // whatever directory the cache lives in.
+        let args = argv("/build-a/kernel-cache/gfx1201");
+        assert!(args.contains(&"-fmacro-prefix-map=/build-a/kernel-cache/gfx1201/=".to_owned()));
+        // The directory is the only difference apart from the paths themselves.
+        let other = argv("/build-b/kernel-cache/gfx1201");
+        assert_eq!(args.len(), other.len());
+        assert_eq!(
+            args.iter().filter(|a| a.contains("build-a")).count(),
+            other.iter().filter(|a| a.contains("build-b")).count()
+        );
+        // A directory with `=` cannot be spelled in a prefix map: no flag.
+        assert!(argv("/odd=dir")
+            .iter()
+            .all(|a| !a.starts_with("-fmacro-prefix-map")));
+    }
+
+    #[test]
     fn windows_shaped_rocm_root_flags_share_the_short_path_policy() {
         let long = Path::new(r"C:\Program Files\AMD\ROCm\7.2");
         let flags = KernelCompiler::rocm_root_flags_with(long, |path| {
@@ -3511,7 +3553,9 @@ mod tests {
                 .collect();
             if arch == "gfx1100" {
                 // Keep the sealed inventory unchanged. The later HC x8
-                // export is gfx1201-only and does not alter gfx11 exports.
+                // export is gfx1201-only and does not alter gfx11 exports; the
+                // q8 hg4 low-LDS twin is a later gfx11 export the sealed object
+                // predates.
                 assert_eq!(
                     old.iter()
                         .copied()
@@ -3519,7 +3563,10 @@ mod tests {
                     sealed
                         .iter()
                         .copied()
-                        .chain(["indexed_attention_rope_table_f32"])
+                        .chain([
+                            "indexed_attention_attention_q8_batched_hg4_lite",
+                            "indexed_attention_rope_table_f32",
+                        ])
                         .collect::<std::collections::BTreeSet<_>>()
                 );
             }

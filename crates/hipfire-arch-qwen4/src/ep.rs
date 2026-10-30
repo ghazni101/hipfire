@@ -18,11 +18,15 @@
 //! rank-generic over EP2..=EP8 (`attach_ep_mesh` admits `1 + peers` of 2..=8).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::ep_trunk_split::{
+    agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
+};
 use crate::gpu_forward::{
     Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
+use hipfire_dispatch::pipeline::projection_split::split_scope;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
 use hipfire_runtime::ep_tile_exchange::{EpTileExchange, EpTileExchangeSpec};
@@ -172,6 +176,7 @@ pub struct Qwen4EpPeer {
     mirrors: PeerMirrors,
     gather: Option<Arc<EpRowGather>>,
     tile: Option<Arc<EpTileExchange>>,
+    split: Option<TrunkSplitRank>,
 }
 
 impl Qwen4EpPeer {
@@ -197,6 +202,9 @@ impl Qwen4EpPeer {
                 tile.release(self.rank, &mut self.gpu)
                     .map_err(|error| format!("release tile exchange events: {error}")),
             );
+        }
+        if let Some(split) = self.split.take() {
+            note(split.release(&mut self.gpu));
         }
         note(
             self.bundle
@@ -265,20 +273,40 @@ impl BalancedOwners {
 }
 
 impl Qwen4EpRowGatherHook {
+    /// The static gather reads owner `e % ranks` in-kernel
+    /// (`EpSlotOwners::ExpertModulo`); `seal`'s ownership must be exactly that
+    /// placement over `QWEN4_EP_OWNER_EXPERTS` experts, and `rank` its rank.
     fn new(
         rank: usize,
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
         trunk_layers: usize,
         gather: Arc<EpRowGather>,
         buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let owners = seal.seal.owner_ranks();
+        let ranks = seal.seal.ranks();
+        if rank != seal.rank
+            || owners.len() != QWEN4_EP_OWNER_EXPERTS
+            || owners
+                .iter()
+                .enumerate()
+                .any(|(expert, &owner)| owner != expert % ranks)
+        {
+            return Err(format!(
+                "qwen4 EP row gather: rank {rank} (sealed rank {}) ownership over {} experts is \
+                 not the expert-modulo placement the gather kernel reads",
+                seal.rank,
+                owners.len()
+            ));
+        }
+        Ok(Self {
             rank,
             trunk_layers,
             gather,
             buffer_ptrs,
             last_buffer: AtomicUsize::new(NO_BUFFER),
             balanced: OnceLock::new(),
-        }
+        })
     }
 
     /// Install the rank's balanced layers (once, after `attach_ep`).
@@ -573,6 +601,8 @@ pub struct Qwen4EpMesh {
     /// Owner-routed chunk MoE transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`); `None`
     /// when the lever is off or was not admitted on every rank.
     tile: Option<Arc<EpTileExchange>>,
+    /// Rank 0's trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`); `None` when off.
+    split: Option<TrunkSplitRank>,
     ranks: usize,
     device_ids: Vec<i32>,
     used_bytes: Vec<u64>,
@@ -615,23 +645,41 @@ impl Qwen4EpMesh {
         local: impl FnOnce() -> Result<R, String>,
         job: PeerJob<'_, R>,
     ) -> Result<Vec<R>, String> {
-        self.pool
-            .run_all_forced(local, &|_, peer: &mut Qwen4EpPeer| {
+        let local_split = self.split.as_ref().and_then(TrunkSplitRank::hook);
+        self.pool.run_all_forced(
+            || {
+                let _scope = local_split.map(|hook| split_scope(hook));
+                local()
+            },
+            &|_, peer: &mut Qwen4EpPeer| {
+                let hook = peer.split.as_ref().and_then(TrunkSplitRank::hook);
+                let _scope = hook.map(|hook| split_scope(hook));
                 job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
-            })
+            },
+        )
     }
 
     /// Run `job` on every peer while `local` runs rank 0 on the caller's
     /// thread. Results in rank order. Any rank's error or panic aborts the
     /// row-gather barrier, poisons the mesh, and is returned (the first one).
+    /// Every rank's trunk split hook is installed for the call.
     pub(crate) fn run<R: Send>(
         &self,
         local: impl FnOnce() -> Result<R, String>,
         job: PeerJob<'_, R>,
     ) -> Result<Vec<R>, String> {
-        self.pool.run_all(local, &|_, peer: &mut Qwen4EpPeer| {
-            job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
-        })
+        let local_split = self.split.as_ref().and_then(TrunkSplitRank::hook);
+        self.pool.run_all(
+            || {
+                let _scope = local_split.map(|hook| split_scope(hook));
+                local()
+            },
+            &|_, peer: &mut Qwen4EpPeer| {
+                let hook = peer.split.as_ref().and_then(TrunkSplitRank::hook);
+                let _scope = hook.map(|hook| split_scope(hook));
+                job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
+            },
+        )
     }
 
     /// Run `job` on peer `rank` alone (rank 0 is not a peer).
@@ -645,7 +693,11 @@ impl Qwen4EpMesh {
     /// thread) and release rank 0's gather events. Always attempts every step.
     pub(crate) fn close(self, gpu: &mut Gpu) -> Result<(), String> {
         let Self {
-            pool, gather, tile, ..
+            pool,
+            gather,
+            tile,
+            split,
+            ..
         } = self;
         let mut first: Option<String> = None;
         let drained = pool.run_all_forced(|| sync_device(gpu), &|_, peer: &mut Qwen4EpPeer| {
@@ -663,6 +715,11 @@ impl Qwen4EpMesh {
         if let Some(tile) = tile {
             if let Err(error) = tile.release(0, gpu) {
                 first.get_or_insert(format!("rank 0: release tile exchange events: {error}"));
+            }
+        }
+        if let Some(split) = split {
+            if let Err(error) = split.release(gpu) {
+                first.get_or_insert(format!("rank 0: {error}"));
             }
         }
         first.map_or(Ok(()), Err)
@@ -832,6 +889,7 @@ impl Qwen4Bundle {
                         mirrors: PeerMirrors::default(),
                         gather: None,
                         tile: None,
+                        split: None,
                     };
                     let checked = peer
                         .check_seal(&seal)
@@ -899,12 +957,20 @@ impl Qwen4Bundle {
         let abort = gather.clone();
         pool.set_abort(move || abort.abort());
         let tile_slot: Mutex<Option<Arc<EpTileExchange>>> = Mutex::new(None);
+        let split_slot: Mutex<Option<TrunkSplitRank>> = Mutex::new(None);
+        let split_transport: Mutex<Option<Arc<EpRowGather>>> = Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
             if let Some(tile) = lock(&tile_slot).as_ref() {
                 tile.abort();
                 let _ = tile.release(0, gpu);
+            }
+            if let Some(transport) = lock(&split_transport).as_ref() {
+                transport.abort();
+            }
+            if let Some(split) = lock(&split_slot).take() {
+                let _ = split.release(gpu);
             }
             error
         };
@@ -984,8 +1050,106 @@ impl Qwen4Bundle {
             }
         }
 
+        // 2c. Trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`, #862): every rank's census of
+        // banded weights and its chunk rows must agree with rank 0's; each rank then registers
+        // two exchange buffers (allocated before P2P is enabled below) with one band transport.
+        let split_mode = match TrunkSplitMode::from_env() {
+            Ok(mode) => mode,
+            Err(error) => return Err(release_rank0(gpu, error)),
+        };
+        if split_mode.is_some() {
+            let layout = |bundle: &Qwen4Bundle| -> Result<(Vec<SplitWeight>, usize), String> {
+                let census = split_census(bundle)?;
+                let rows = bundle
+                    .execution
+                    .as_ref()
+                    .ok_or("the forward is not attached")?
+                    .prompt_chunk_rows();
+                Ok((census.into_iter().map(|(weight, _)| weight).collect(), rows))
+            };
+            let layouts = {
+                let me = &*self;
+                pool.run_all(|| layout(me), &|_, peer: &mut Qwen4EpPeer| {
+                    layout(&peer.bundle)
+                })
+            }
+            .and_then(|layouts| agree_layouts(&layouts).map(|()| layouts));
+            let layouts = match layouts {
+                Ok(layouts) => layouts,
+                Err(error) => return Err(release_rank0(gpu, error)),
+            };
+            let (census, chunk_rows) = &layouts[0];
+            let bytes = split_buffer_bytes(census, ranks, *chunk_rows).next_multiple_of(16);
+            let split_builder = Mutex::new(Some(EpRowGather::builder(EpRowGatherSpec {
+                ranks,
+                slots: 1,
+                row_bytes: bytes,
+            })));
+            let register_split = |rank: usize, gpu: &mut Gpu| -> Result<TrunkSplitRank, String> {
+                let split = TrunkSplitRank::allocate(rank, gpu, bytes)?;
+                let registered = match lock(&split_builder).as_mut() {
+                    Some(builder) => builder
+                        .register(rank, gpu, &split.buffers())
+                        .map_err(|error| format!("register trunk split buffers: {error}")),
+                    None => Err("trunk split builder already consumed".to_string()),
+                };
+                match registered {
+                    Ok(()) => Ok(split),
+                    Err(error) => {
+                        let _ = split.release(gpu);
+                        Err(error)
+                    }
+                }
+            };
+            let registered = {
+                let gpu0 = &mut *gpu;
+                pool.run_all(
+                    || {
+                        *lock(&split_slot) = Some(register_split(0, gpu0)?);
+                        Ok(())
+                    },
+                    &|rank, peer: &mut Qwen4EpPeer| {
+                        peer.split = Some(register_split(rank, &mut peer.gpu)?);
+                        Ok(())
+                    },
+                )
+            };
+            if let Err(error) = registered {
+                return Err(release_rank0(gpu, error));
+            }
+            let built = lock(&split_builder)
+                .take()
+                .ok_or_else(|| "trunk split builder already consumed".to_string())
+                .and_then(|builder| {
+                    builder
+                        .build()
+                        .map_err(|error| format!("build trunk split transport: {error}"))
+                });
+            match built {
+                Ok(transport) => {
+                    let aborts = (gather.clone(), lock(&tile_slot).clone(), transport.clone());
+                    pool.set_abort(move || {
+                        aborts.0.abort();
+                        if let Some(tile) = aborts.1.as_ref() {
+                            tile.abort();
+                        }
+                        aborts.2.abort();
+                    });
+                    *lock(&split_transport) = Some(transport);
+                }
+                Err(error) => return Err(release_rank0(gpu, error)),
+            }
+            eprintln!(
+                "qwen4 EP: trunk output split {split_mode:?} ({} weights banded over {ranks} \
+                 ranks, 2 x {:.1} MiB exchange buffers per rank)",
+                census.len(),
+                bytes as f64 / (1 << 20) as f64
+            );
+        }
+
         // 3. P2P after every load/allocation exists.
         let tile = lock(&tile_slot).clone();
+        let split_transport = lock(&split_transport).clone();
         let enable = |rank: usize, gpu: &mut Gpu| -> Result<(), String> {
             gather
                 .enable_peers(rank, gpu)
@@ -993,6 +1157,11 @@ impl Qwen4Bundle {
             if let Some(tile) = tile.as_ref() {
                 tile.enable_peers(rank, gpu)
                     .map_err(|error| format!("enable tile exchange peer access: {error}"))?;
+            }
+            if let Some(transport) = split_transport.as_ref() {
+                transport
+                    .enable_peers(rank, gpu)
+                    .map_err(|error| format!("enable trunk split peer access: {error}"))?;
             }
             Ok(())
         };
@@ -1006,6 +1175,29 @@ impl Qwen4Bundle {
         };
         if let Err(error) = enabled {
             return Err(release_rank0(gpu, error));
+        }
+
+        // 3b. Every rank's split hook over its own banded weights.
+        if let (Some(mode), Some(transport)) = (split_mode, split_transport.as_ref()) {
+            let install = |bundle: &Qwen4Bundle, split: Option<&mut TrunkSplitRank>| {
+                let census = split_census(bundle)?;
+                split.ok_or("trunk split buffers missing")?.install(
+                    mode,
+                    &census,
+                    transport.clone(),
+                );
+                Ok::<(), String>(())
+            };
+            let installed = {
+                let me = &*self;
+                pool.run_all(
+                    || install(me, lock(&split_slot).as_mut()),
+                    &|_, peer: &mut Qwen4EpPeer| install(&peer.bundle, peer.split.as_mut()),
+                )
+            };
+            if let Err(error) = installed {
+                return Err(release_rank0(gpu, error));
+            }
         }
 
         // 4. Compact expert sources of every rank.
@@ -1027,12 +1219,16 @@ impl Qwen4Bundle {
                 .as_ref()
                 .and_then(|forward| forward.ep_gather_buffers())
                 .ok_or("no EP gather buffers (the forward has no EP placement)")?;
+            let seal = bundle
+                .ep_seal()
+                .ok_or("the rank is not bound to an EP seal")?;
             let hook = Arc::new(Qwen4EpRowGatherHook::new(
                 rank,
+                seal,
                 trunk_layers,
                 gather.clone(),
                 buffers.map(|buffer| buffer.buf.as_ptr() as usize),
-            ));
+            )?);
             let mut forward = bundle
                 .execution
                 .take()
@@ -1148,10 +1344,12 @@ impl Qwen4Bundle {
             Err(error) => return Err(release_rank0(gpu, error)),
         };
         debug_assert_eq!(used_bytes.len(), ranks);
+        let split = lock(&split_slot).take();
         Ok(Qwen4EpMesh {
             pool,
             gather,
             tile,
+            split,
             ranks,
             device_ids,
             used_bytes,

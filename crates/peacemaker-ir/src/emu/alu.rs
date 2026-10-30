@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact CPU semantics for scalar and vector ALU opcodes (wave32).
+//! Exact CPU semantics for scalar and vector ALU opcodes (wave32 and wave64; see `emu/mod.rs` for the wave model).
 //!
 //! Every opcode is keyed by its exact ISA name; an unknown name is an error, never a
 //! best guess. Float arithmetic uses host IEEE-754 binary32 (`+ - * fma`, round to
@@ -84,6 +84,9 @@ use crate::{
     operand::{Dpp, InlineConst, Omod, Operand},
     Arch, FormFields, Inst,
 };
+#[cfg(test)]
+#[path = "isa_gap_tests.rs"]
+mod isa_gap_tests;
 
 const NAN_IN: &str = "NaN operand: the ISA document does not specify NaN propagation (selection/payload/sign) for this opcode";
 const NAN_OUT: &str =
@@ -238,9 +241,20 @@ fn sgn(v: u32, abs: bool, neg: bool) -> u32 {
     }
 }
 
+/// Lanes `base..base + 32` strictly below `lane`, as a dword mask (`v_mbcnt_lo/hi_u32_b32`).
+fn mbcnt_below(lane: usize, base: usize) -> u32 {
+    if lane <= base {
+        0
+    } else if lane >= base + 32 {
+        u32::MAX
+    } else {
+        (1u32 << (lane - base)) - 1
+    }
+}
+
 fn active(s: &State) -> impl Iterator<Item = usize> {
     let exec = s.exec;
-    (0..32).filter(move |lane| exec & (1 << lane) != 0)
+    (0..s.lanes).filter(move |lane| exec & (1u64 << lane) != 0)
 }
 
 pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
@@ -260,6 +274,11 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_readlane_b32" => readlane(i, s),
         "v_writelane_b32" => writelane(i, s),
         _ if name.starts_with("v_wmma") || name.starts_with("v_swmmac") => {
+            if s.lanes != 32 {
+                return Err(format!(
+                    "{name}: the WMMA/SWMMAC fragment layouts are modeled for wave32 only"
+                ));
+            }
             super::wmma::execute(arch, name, i, s)
         }
         _ if name.starts_with("v_dot") => super::dot::execute(arch, name, i, s),
@@ -267,7 +286,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_permlane16_b32" | "v_permlanex16_b32" => permlane(name, i, s),
         "v_div_scale_f32" => div_scale(arch, i, s),
         "v_s_rcp_f32" => udiv_scalar_rcp(arch, i, s),
-        "v_add_co_u32" | "v_add_co_ci_u32_e64" => add_carry(name, i, s),
+        "v_add_co_u32" | "v_add_co_ci_u32_e64" | "v_add_co_ci_u32_e32" => add_carry(name, i, s),
         "v_cvt_pk_f32_fp8_e32" | "v_cvt_pk_f32_fp8_e64" => cvt_pk_f32_fp8(arch, i, s),
         _ if name.starts_with("v_cmp") => compare(name, i, s),
         _ => lanes(arch, name, i, s),
@@ -356,7 +375,7 @@ fn vopd(arch: Arch, x: &str, y: &str, split: usize, i: &Inst, s: &mut State) -> 
         }
         return Ok(());
     }
-    let mut out = [[0u32; 2]; 32];
+    let mut out = [[0u32; 2]; 64];
     for lane in active(s) {
         out[lane] = [
             dword(vector(arch, x, ox, i, s, lane, Src0::Plain)?)?,
@@ -369,33 +388,48 @@ fn vopd(arch: Arch, x: &str, y: &str, split: usize, i: &Inst, s: &mut State) -> 
     }
     Ok(())
 }
-
-/// VOP3 carry add: read all source lanes and the incoming mask before either destination is written.
-/// Inactive lanes retain their VGPR and contribute zero bits to the outgoing wave32 carry mask.
+/// VOP2/VOP3 carry add: read all source lanes and the incoming mask before either destination is written.
+/// Inactive lanes retain their VGPR and contribute zero bits to the outgoing wave32 carry mask. The VOP2 `_e32`
+/// carry-in form (`v_add_co_ci_u32_e32 vdst, vcc_lo, src0, vsrc1, vcc_lo`) decodes to three operands and carries
+/// through VCC implicitly; the VOP3 forms name the carry-out (`sdst`) and carry-in (`ssrc2`) masks explicitly.
 fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     plain(i)?;
     if i.mods.dpp.is_some() || i.mods.sdwa.is_some() || i.mods.op_sel != 0 {
         return Err(format!("{name}: DPP/SDWA/op_sel is not modeled"));
     }
     let o = &i.operands;
-    let has_cin = name == "v_add_co_ci_u32_e64";
-    if o.len() != if has_cin { 5 } else { 4 } {
+    let has_cin = name != "v_add_co_u32";
+    // Operand layouts: [vdst, sdst, s0, s1(, ssrc2)] (VOP3) or [vdst, s0, s1] with VCC in and out (VOP2).
+    let implicit_vcc = has_cin && o.len() == 3;
+    if !implicit_vcc && o.len() != if has_cin { 5 } else { 4 } {
         return Err(format!("{name}: missing or extra carry operand"));
     }
-    let cin = if has_cin { s.read(&o[4], 0, 0)? } else { 0 };
-    let mut out = [0u32; 32];
-    let mut carry = 0u32;
+    let (a_idx, b_idx) = if implicit_vcc { (1, 2) } else { (2, 3) };
+    let cin = if !has_cin {
+        0
+    } else if implicit_vcc {
+        s.vcc
+    } else {
+        s.read_mask(&o[4])?
+    };
+    let mut out = [0u32; 64];
+    let mut carry = 0u64;
     for lane in active(s) {
-        let sum = u64::from(s.read(&o[2], lane, 0)?)
-            + u64::from(s.read(&o[3], lane, 0)?)
-            + u64::from(cin >> lane & 1);
+        let sum = u64::from(s.read(&o[a_idx], lane, 0)?)
+            + u64::from(s.read(&o[b_idx], lane, 0)?)
+            + (cin >> lane & 1);
         out[lane] = sum as u32;
-        carry |= ((sum >> 32) as u32) << lane;
+        carry |= (sum >> 32) << lane;
     }
     for lane in active(s) {
         s.put(&o[0], lane, 0, out[lane])?;
     }
-    s.put(&o[1], 0, 0, carry)
+    if implicit_vcc {
+        s.vcc = carry;
+        Ok(())
+    } else {
+        s.put_mask(&o[1], carry)
+    }
 }
 
 fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
@@ -412,14 +446,16 @@ fn readfirstlane(i: &Inst, s: &mut State) -> Result<()> {
 /// `v_readlane_b32 sdst, vsrc, lane`: reads the lane selected by the low five bits of the third
 /// operand whatever EXEC says.
 fn readlane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let lane =
+        (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], lane, 0)?;
     s.put(&i.operands[0], 0, 0, v)
 }
 
 /// `v_writelane_b32 vdst, ssrc, lane`: writes one lane of `vdst`, whatever EXEC says.
 fn writelane(i: &Inst, s: &mut State) -> Result<()> {
-    let lane = (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? & 31) as usize;
+    let lane =
+        (s.read(i.operands.get(2).ok_or("missing lane select")?, 0, 0)? as usize) & (s.lanes - 1);
     let v = s.read(&i.operands[1], 0, 0)?;
     s.put(&i.operands[0], lane, 0, v)
 }
@@ -508,7 +544,7 @@ fn lanes(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result<()> {
         return Ok(());
     }
     let fi = dpp_fi(i);
-    let mut vals: [Option<Val>; 32] = [None; 32];
+    let mut vals: [Option<Val>; 64] = [None; 64];
     for lane in active(s) {
         let d = match dpp {
             Some(d) => match dpp_plan(&d, fi, s, lane)? {
@@ -685,7 +721,7 @@ fn mix_in(arch: Arch, s: &State, o: &[Operand], i: &Inst, lane: usize) -> Result
             if abs || neg {
                 return Err(NAN_MOD.into());
             }
-            if m.op_sel != 0 || m.op_sel_hi & 0b101 != 0 {
+            if !s.nan_loose && (m.op_sel != 0 || m.op_sel_hi & 0b101 != 0) {
                 return Err("NaN operand of v_fma_mix with op_sel or a half A/C source: only op_sel:[0,0,0] with B as the half source is measured".into());
             }
         }
@@ -818,7 +854,7 @@ fn vector(
         "v_mov_b32" | "v_dual_mov_b32" => (Class::Int, raw(0)?),
         "v_cndmask_b32" | "v_dual_cndmask_b32" => {
             let mask = if o.len() > 3 {
-                s.read(&o[3], lane, 0)?
+                s.read_mask(&o[3])?
             } else {
                 s.vcc
             };
@@ -829,7 +865,12 @@ fn vector(
         // Lanes below this one set in the wave32 mask `src0`, plus `src1`.
         "v_mbcnt_lo_u32_b32" => (
             Class::Int,
-            raw(1)?.wrapping_add((raw(0)? & ((1u32 << lane) - 1)).count_ones()),
+            raw(1)?.wrapping_add((raw(0)? & mbcnt_below(lane, 0)).count_ones()),
+        ),
+        // Lanes 32.. below this one set in the upper dword of the wave64 mask (zero for every wave32 lane).
+        "v_mbcnt_hi_u32_b32" => (
+            Class::Int,
+            raw(1)?.wrapping_add((raw(0)? & mbcnt_below(lane, 32)).count_ones()),
         ),
         "v_sub_nc_u32" => (Class::Int, raw(0)?.wrapping_sub(raw(1)?)),
         "v_subrev_nc_u32" => (Class::Int, raw(1)?.wrapping_sub(raw(0)?)),
@@ -863,6 +904,11 @@ fn vector(
             Class::Int,
             (raw(0)? & 0xff_ffff).wrapping_mul(raw(1)? & 0xff_ffff),
         ),
+        // D = bits 47:32 of the 48-bit product of the two 24-bit-masked operands (RDNA ISA V_MUL_HI_U32_U24).
+        "v_mul_hi_u32_u24" => (
+            Class::Int,
+            ((u64::from(raw(0)? & 0xff_ffff) * u64::from(raw(1)? & 0xff_ffff)) >> 32) as u32,
+        ),
         "v_mad_u32_u24" => (
             Class::Int,
             (raw(0)? & 0xff_ffff)
@@ -883,6 +929,19 @@ fn vector(
             Class::Int,
             (((u64::from(raw(0)?) << 32) | u64::from(raw(1)?)) >> (raw(2)? & 31)) as u32,
         ),
+        // D = ({S0, S1} >> (S2[1:0] * 8))[31:0] (RDNA3 ISA, V_ALIGNBYTE_B32): S0 carries the MSBs, S1 the LSBs. S2 is a
+        // 16-bit operand on gfx11 (OPSEL[2] picks the half of a VGPR); only the unselected-low-half form is modeled.
+        "v_alignbyte_b32" => {
+            if m.op_sel != 0 {
+                return Err(
+                    "v_alignbyte_b32: OPSEL (16-bit source half select) is not modeled".into(),
+                );
+            }
+            (
+                Class::Int,
+                (((u64::from(raw(0)?) << 32) | u64::from(raw(1)?)) >> ((raw(2)? & 3) * 8)) as u32,
+            )
+        }
         "v_bfe_u32" => {
             let width = raw(2)? & 31;
             (
@@ -1017,6 +1076,15 @@ fn vector(
             Class::F32,
             legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
         ),
+        // gfx1100 VOPD `v_dual_max_f32`/`v_dual_min_f32`: the same compare-select as `v_max_f32`/`v_min_f32`.
+        "v_dual_max_f32" => (
+            Class::F32,
+            legacy_select(arch, g(0, false)?, g(1, false)?, true)?,
+        ),
+        "v_dual_min_f32" => (
+            Class::F32,
+            legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
+        ),
         "v_max3_f32" => (
             Class::F32,
             legacy_select(
@@ -1033,6 +1101,26 @@ fn vector(
                 legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
                 g(2, false)?,
                 false,
+            )?,
+        ),
+        // gfx11 VOP3 three-operand legacy min/max (RDNA3 ISA): `v_maxmin_f32 = min(max(S0, S1), S2)` and
+        // `v_minmax_f32 = max(min(S0, S1), S2)`, each stage the legacy compare-select of `v_max_f32`/`v_min_f32`.
+        "v_maxmin_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, true)?,
+                g(2, false)?,
+                false,
+            )?,
+        ),
+        "v_minmax_f32" => (
+            Class::F32,
+            legacy_select(
+                arch,
+                legacy_select(arch, g(0, false)?, g(1, false)?, false)?,
+                g(2, false)?,
+                true,
             )?,
         ),
         "v_max_num_f32" | "v_dual_max_num_f32" => (Class::F32, num_select(f(0)?, f(1)?, true)),
@@ -1112,6 +1200,68 @@ fn vector(
                     },
                 )
             }
+        }
+        // Packed f16 (VOP3P): result half `h` takes each source's half chosen by `op_sel` (low result)
+        // or `op_sel_hi` (high result); `v_pk_add_f16` is the fused `a * 1 + b` and `v_pk_mul_f16` the fused
+        // `a * b + (-0)` (the -0 addend keeps the sign of a zero product), so every result is one correctly rounded
+        // (nearest even, denormals kept) operation. Finite operands only.
+        "v_pk_fma_f16" | "v_pk_add_f16" | "v_pk_mul_f16" => {
+            if m.neg_lo != 0
+                || m.neg_hi != 0
+                || m.neg != 0
+                || m.abs != 0
+                || m.clamp
+                || m.omod != Omod::None
+            {
+                return Err(format!("{name}: neg/abs/clamp/omod are not modeled"));
+            }
+            let kind = stem(name);
+            let mut half = [0u16; 2];
+            for (h, slot) in half.iter_mut().enumerate() {
+                let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
+                let mut w = [0u32; 3];
+                for (n, wn) in
+                    w.iter_mut()
+                        .enumerate()
+                        .take(if kind == "v_pk_fma_f16" { 3 } else { 2 })
+                {
+                    let word = raw(n)?;
+                    let hv = (if sel >> n & 1 != 0 { word >> 16 } else { word }) as u16;
+                    if hv & 0x7c00 == 0x7c00 {
+                        return Err(format!("{name}: non-finite f16 operand is not modeled"));
+                    }
+                    *wn = convert::f16_to_f32(hv);
+                }
+                *slot = match kind {
+                    "v_pk_fma_f16" => fma_f16(w[0], w[1], w[2]),
+                    "v_pk_mul_f16" => fma_f16(w[0], w[1], 0x8000_0000),
+                    _ => fma_f16(w[0], 0x3f80_0000, w[1]),
+                };
+            }
+            (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
+        }
+        // Packed 16-bit logical right shift (VOP3P, `rev` order: S0 is the shift count, S1 the value). Result half
+        // `h` is `S1.half(sel1) >> (S0.half(sel0) & 15)`, where `sel` is `op_sel` (low result) or `op_sel_hi`
+        // (high result) and bit k picks the high half of source k. An inline constant reads as its 32-bit word.
+        "v_pk_lshrrev_b16" => {
+            if m.neg_lo != 0
+                || m.neg_hi != 0
+                || m.neg != 0
+                || m.abs != 0
+                || m.clamp
+                || m.omod != Omod::None
+            {
+                return Err(format!("{name}: neg/abs/clamp/omod are not modeled"));
+            }
+            let (c, x) = (raw(0)?, raw(1)?);
+            let mut half = [0u16; 2];
+            for (h, slot) in half.iter_mut().enumerate() {
+                let sel = if h == 0 { m.op_sel } else { m.op_sel_hi };
+                let cnt = (if sel & 1 != 0 { c >> 16 } else { c }) & 15;
+                let val = (if sel >> 1 & 1 != 0 { x >> 16 } else { x }) as u16;
+                *slot = val >> cnt;
+            }
+            (Class::Own, u32::from(half[0]) | u32::from(half[1]) << 16)
         }
         "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
             let byte = u32::from(stem(name).as_bytes()[stem(name).len() - 1] - b'0');
@@ -1252,6 +1402,206 @@ fn vector(
                 u32::from(convert::f32_to_f16_rtz(a)) | u32::from(convert::f32_to_f16_rtz(b)) << 16,
             )
         }
+        // D.f16 = fma(S0.f16, S1.f16, S2.f16) (`v_fmac_f16`: S2 is the destination half), ONE rounding (the product of two
+        // halves is exact in f64, `fma_f16` rounds the odd-rounded sum once to nearest even). Finite operands only: NaN and
+        // infinite halves are not measured. The destination is a true16 half; the other half is preserved.
+        "v_fma_f16" | "v_fmac_f16" => {
+            half_dst(o)?;
+            plain_16(i, d, true)?;
+            let finite = |x: u32| -> Result<u32> {
+                if x >> 23 & 0xff == 0xff {
+                    Err(format!("{name}: infinite f16 operand is not modeled"))
+                } else {
+                    Ok(x)
+                }
+            };
+            let (a, b) = (
+                finite(f16_operand(s, o, i, lane, 0)?)?,
+                finite(f16_operand(s, o, i, lane, 1)?)?,
+            );
+            let c = if stem(name) == "v_fma_f16" {
+                finite(f16_operand(s, o, i, lane, 2)?)?
+            } else {
+                finite(f16_in(half_src(s, &o[0], i, lane, 2)?)?)?
+            };
+            let mut h = fma_f16(a, b, c);
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        // D.b16 = S0.b16 (true16: the other half of the destination is preserved).
+        "v_mov_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            if m.clamp {
+                return Err("clamp on v_mov_b16 is not modeled".into());
+            }
+            (
+                Class::Own,
+                u32::from(half_src(
+                    s,
+                    o.get(1).ok_or("missing vector operand")?,
+                    i,
+                    lane,
+                    0,
+                )?),
+            )
+        }
+        // D.f16 = u16_to_f16(S0.u16): a u16 is exact in binary32, so one rounding to binary16 (65520.. rounds to infinity).
+        "v_cvt_f16_u16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let x = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let mut h = convert::f32_to_f16(f32::from(x).to_bits());
+            if m.clamp {
+                h = clamp_f16(h);
+            }
+            (Class::Own, u32::from(h))
+        }
+        "v_or3_b32" => (Class::Int, raw(0)? | raw(1)? | raw(2)?),
+        // D = the 32 bits of S0 in reverse order (RDNA3 ISA V_BFREV_B32; no input/output modifiers).
+        "v_bfrev_b32" => (Class::Int, raw(0)?.reverse_bits()),
+        "v_not_b32" => (Class::Int, !raw(0)?),
+        // D.i = index of the first 1 bit counting from the MSB, -1 if S0 == 0 (V_CLZ_I32_U32).
+        "v_clz_i32_u32" => {
+            let x = raw(0)?;
+            (
+                Class::Int,
+                if x == 0 { u32::MAX } else { x.leading_zeros() },
+            )
+        }
+        "v_xor3_b32" => (Class::Int, raw(0)? ^ raw(1)? ^ raw(2)?),
+        // D = S1 + popcount(S0), wrapping (V_BCNT_U32_B32).
+        "v_bcnt_u32_b32" => (Class::Int, raw(1)?.wrapping_add(raw(0)?.count_ones())),
+        "v_min3_i32" => (
+            Class::Int,
+            (raw(0)? as i32).min(raw(1)? as i32).min(raw(2)? as i32) as u32,
+        ),
+        // The ISA pseudocode: if max3(S0,S1,S2) == S0 then max(S1,S2) elif max3 == S1 then max(S0,S2) else max(S0,S1).
+        "v_med3_i32" => {
+            let (a, b, c) = (raw(0)? as i32, raw(1)? as i32, raw(2)? as i32);
+            let max3 = a.max(b).max(c);
+            (
+                Class::Int,
+                (if max3 == a {
+                    b.max(c)
+                } else if max3 == b {
+                    a.max(c)
+                } else {
+                    a.max(b)
+                }) as u32,
+            )
+        }
+        // Median of three: the ISA pseudocode's max3/max chain. A NaN operand (the pseudocode returns min3 for it, whose NaN
+        // rule is not measured) and a median zero whose operand zeros differ in sign (max of +0 and -0 is not specified)
+        // are errors.
+        "v_med3_f32" => {
+            let (a, b, c) = (fnum(0)?, fnum(1)?, fnum(2)?);
+            let max3 = a.max(b).max(c);
+            let r = if max3 == a {
+                b.max(c)
+            } else if max3 == b {
+                a.max(c)
+            } else {
+                a.max(b)
+            };
+            let zeros: Vec<bool> = [a, b, c]
+                .iter()
+                .filter(|x| **x == 0.0)
+                .map(|x| x.is_sign_negative())
+                .collect();
+            if zeros.iter().any(|z| *z != zeros[0]) {
+                return Err("v_med3_f32: operand zeros of both signs: the sign of the median zero is not specified".into());
+            }
+            (Class::F32, r.to_bits())
+        }
+        // D.f = trunc(S0.f) (round toward zero, IEEE roundToIntegralTowardZero: a zero result keeps the input sign).
+        // A NaN operand is an error (propagation is not measured).
+        "v_trunc_f32" => (Class::F32, fnum(0)?.trunc().to_bits()),
+        // ISA: D = trunc(S0); if S0 < 0 && S0 != D then D += -1.0: the floor.
+        "v_floor_f32" => (Class::F32, fnum(0)?.floor().to_bits()),
+        // D.i = exponent(S0.f) - 127 + 1 with `exponent` the biased exponent field, so S0 = significand * 2**D with the
+        // significand in [0.5, 1); D = 0 for +-infinity and NaN (ISA pseudocode). A zero or denormal input has no
+        // biased-exponent meaning the pseudocode agrees with C frexp() on: refused.
+        "v_frexp_exp_i32_f32" => {
+            let x = f(0)?;
+            let e = (x >> 23) & 0xff;
+            if e == 0 {
+                return Err("v_frexp_exp_i32_f32: zero/denormal input is not modeled (pseudocode and frexp() disagree)".into());
+            }
+            (
+                Class::FloatToInt,
+                if e == 0xff {
+                    0
+                } else {
+                    (e as i32 - 126) as u32
+                },
+            )
+        }
+        // D.f = S0.f for +-infinity (a NaN is refused: payload/quieting not specified), else the significand
+        // mantissa(S0.f) in [0.5, 1) with the input sign: exponent field forced to 126. Zero/denormal refused as above.
+        "v_frexp_mant_f32" => {
+            let x = f(0)?;
+            let e = (x >> 23) & 0xff;
+            let v = if e == 0xff {
+                if x & 0x7f_ffff != 0 {
+                    return Err(NAN_IN.into());
+                }
+                x
+            } else if e == 0 {
+                return Err("v_frexp_mant_f32: zero/denormal input is not modeled (pseudocode and frexp() disagree)".into());
+            } else {
+                (x & 0x807f_ffff) | (126 << 23)
+            };
+            (Class::F32, v)
+        }
+        // D.u16 = S1.u16 << S0[3:0] (RDNA3 ISA V_LSHLREV_B16; true16: the other destination half is preserved).
+        "v_lshlrev_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let count = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)? & 15;
+            let x = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(x << count))
+        }
+        // D.u16 = S0.u16 | S1.u16 (no input/output modifiers).
+        "v_or_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let a = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
+            let b = half_src(s, o.get(2).ok_or("missing vector operand")?, i, lane, 1)?;
+            (Class::Own, u32::from(a | b))
+        }
+        // D.u16 = VCC[lane] ? S1.u16 : S0.u16; VOP3 names the mask in S2. Float modifiers are refused.
+        "v_cndmask_b16" => {
+            half_dst(o)?;
+            plain_16(i, d, false)?;
+            let mask = s.read(o.get(3).ok_or("missing vector operand")?, lane, 0)?;
+            let pick = if mask >> lane & 1 != 0 { 2 } else { 1 };
+            (
+                Class::Own,
+                u32::from(half_src(s, &o[pick], i, lane, pick - 1)?),
+            )
+        }
+        // D = VGPR[lane][SRC0 + M0] (RDNA3 ISA V_MOVRELS_B32): SRC0 names a VGPR, M0 is the relative offset.
+        "v_movrels_b32" => {
+            let Some(Operand::Reg(r)) = o.get(1) else {
+                return Err("v_movrels_b32: SRC0 must be a VGPR".into());
+            };
+            if r.kind != crate::reg::Kind::V {
+                return Err("v_movrels_b32: SRC0 must be a VGPR".into());
+            }
+            let idx = u64::from(r.base) + u64::from(s.m0);
+            if idx >= 256 {
+                return Err(format!("v_movrels_b32: v{idx} is outside the VGPR file"));
+            }
+            (Class::Int, s.v[idx as usize][lane])
+        }
+        // D.i32 = S0.i24 * S1.i24 (low 32 bits of the product).
+        "v_mul_i32_i24" => {
+            let sext = |x: u32| ((x << 8) as i32) >> 8;
+            (Class::Int, sext(raw(0)?).wrapping_mul(sext(raw(1)?)) as u32)
+        }
         "v_exp_f32" | "v_rcp_f32" | "v_rcp_iflag_f32" | "v_log_f32" | "v_rsq_f32"
         | "v_sqrt_f32" => {
             if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
@@ -1298,7 +1648,7 @@ fn vector(
 
 fn cvt_pk_f32_fp8(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
-    let mut out = [None; 32];
+    let mut out = [None; 64];
     for lane in active(s) {
         let h = half_src(s, &o[1], i, lane, 0)?;
         let mut pair = [0u32; 2];
@@ -1331,9 +1681,14 @@ fn permlane(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     if m.abs | m.neg != 0 || m.omod != Omod::None || m.clamp || m.op_sel & 0b1100 != 0 {
         return Err(format!("{name}: abs/neg/omod/clamp and OPSEL[2]/OPSEL[3] are not modeled (only OPSEL[0]=FI, OPSEL[1]=BC)"));
     }
+    if s.lanes != 32 {
+        return Err(format!(
+            "{name}: permlane16 rows are modeled for wave32 only"
+        ));
+    }
     let sel = u64::from(s.read(&o[2], 0, 0)?) | (u64::from(s.read(&o[3], 0, 0)?) << 32);
     let cross = name == "v_permlanex16_b32";
-    let mut vals = [None; 32];
+    let mut vals = [None; 64];
     for lane in active(s) {
         let row = if cross { (lane ^ 16) & 16 } else { lane & 16 };
         let src = row | ((sel >> (4 * (lane & 15))) & 15) as usize;
@@ -1515,8 +1870,8 @@ fn div_scale_isa(s0: u32, s1: u32, s2: u32) -> Result<(u32, bool)> {
 fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let m = &i.mods;
-    let mut out = [None; 32];
-    let mut vcc = 0u32;
+    let mut out = [None; 64];
+    let mut vcc = 0u64;
     for lane in active(s) {
         let src = |n: usize| -> Result<u32> {
             let v = sgn(
@@ -1545,7 +1900,7 @@ fn div_scale(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
             s.put(&o[0], lane, 0, v)?;
         }
     }
-    s.put(&o[1], 0, 0, vcc)
+    s.put_mask(&o[1], vcc)
 }
 
 /// `v_div_fixup_f32 D, S0 (quotient), S1 (denominator), S2 (numerator)`. The special-case chain is the ISA's
@@ -1747,7 +2102,7 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         ));
     }
     let fi = dpp_fi(i);
-    let mut mask = 0u32;
+    let mut mask = 0u64;
     for lane in active(s) {
         let d = match dpp {
             Some(d) => match dpp_plan(&d, fi, s, lane)? {
@@ -1822,7 +2177,7 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.exec = mask;
         Ok(())
     } else if o.len() >= 3 {
-        s.put(&o[0], 0, 0, mask)
+        s.put_mask(&o[0], mask)
     } else {
         s.vcc = mask;
         Ok(())
@@ -1954,7 +2309,7 @@ fn udiv_scalar_rcp(arch: Arch, i: &Inst, s: &mut State) -> Result<()> {
     if m.neg != 0 || m.abs != 0 || m.omod != Omod::None || m.clamp {
         return Err("v_s_rcp_f32: neg/abs/omod/clamp are not measured".into());
     }
-    if s.exec != u32::MAX {
+    if s.exec != s.lane_mask() {
         return Err("v_s_rcp_f32 with a partial EXEC is not measured".into());
     }
     let o = &i.operands;
@@ -2008,13 +2363,87 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.scc = value != 0;
         return Ok(());
     }
+    // SOP2: D.u64 = S0.u64 >> S1[5:0] (logical); SCC reports a nonzero 64-bit result.
+    if name == "s_lshr_b64" {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = a >> (rd(s, 2)? & 63);
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // SOP2: D.u64 = S0.u64 ^ S1.u64; SCC = D != 0. Both pairs are read before the destination is written.
+    if name == "s_xor_b64" {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = a ^ b;
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // SOP2 64-bit lane-mask logic: D = S0 op S1 over the whole mask (wave64: all 64 lanes), SCC = D != 0.
+    if matches!(name, "s_and_b64" | "s_or_b64" | "s_and_not1_b64") {
+        let a = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let b = s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let value = match name {
+            "s_and_b64" => a & b,
+            "s_or_b64" => a | b,
+            _ => a & !b,
+        };
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, value)?;
+        s.scc = value != 0;
+        return Ok(());
+    }
+    // SOP1 64-bit saveexec family: D = EXEC; EXEC = S0 op EXEC (`and_not1`: S0 & ~EXEC); SCC = EXEC != 0.
+    // S0 is captured first because native divergence masks alias the saved destination.
+    if matches!(
+        name,
+        "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_and_not1_saveexec_b64"
+    ) {
+        let mask = s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?;
+        let old = s.exec;
+        s.put_wide(o.first().ok_or("missing scalar operand")?, 0, old)?;
+        s.exec = match name {
+            "s_and_saveexec_b64" => old & mask,
+            "s_or_saveexec_b64" => mask | old,
+            _ => mask & !old,
+        } & s.lane_mask();
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
+    // gfx11 `s_and_not1_saveexec_b32` (= `s_andn2_saveexec_b32`): D = EXEC; EXEC = S0 & ~EXEC; SCC = EXEC != 0.
+    if name == "s_and_not1_saveexec_b32" {
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
+        let old = s.exec;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
+        s.exec = mask & !old & 0xffff_ffff;
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
     // Save the old wave32 EXEC, then intersect EXEC with S0 and report nonempty EXEC.
     // Capture S0 first because native divergence masks can alias the saved destination.
     if name == "s_and_saveexec_b32" {
-        let mask = rd(s, 1)?;
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
         let old = s.exec;
-        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old)?;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
         s.exec = old & mask;
+        s.scc = s.exec != 0;
+        return Ok(());
+    }
+    // Save the old wave32 EXEC, then EXEC = S0 | EXEC and SCC = EXEC != 0 (RDNA3 ISA S_OR_SAVEEXEC_B32).
+    if name == "s_or_saveexec_b32" {
+        if s.lanes != 32 {
+            return Err(format!("{name} is a wave32 instruction"));
+        }
+        let mask = u64::from(rd(s, 1)?);
+        let old = s.exec;
+        s.put(o.first().ok_or("missing scalar operand")?, 0, 0, old as u32)?;
+        s.exec = (mask | old) & 0xffff_ffff;
         s.scc = s.exec != 0;
         return Ok(());
     }
@@ -2115,7 +2544,19 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         "s_xor_b32" => nonzero(a ^ b),
         "s_andn2_b32" => nonzero(a & !b),
         "s_orn2_b32" => nonzero(a | !b),
+        // gfx11 spelling of `s_andn2_b32` / `s_orn2_b32`.
+        "s_and_not1_b32" => nonzero(a & !b),
+        "s_or_not1_b32" => nonzero(a | !b),
+        // D = |S0.i32| (wrapping for i32::MIN); SCC = D != 0.
+        "s_abs_i32" => nonzero((a as i32).wrapping_abs() as u32),
+        // tmp = (S0.u32 << N) + S1.u32 in 64 bits; D = tmp[31:0]; SCC = tmp >= 2^32.
+        "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+            let n = u32::from(name.as_bytes()[6] - b'0');
+            let sum = (u64::from(a) << n) + u64::from(b);
+            (sum as u32, Some(sum >> 32 != 0))
+        }
         "s_not_b32" => nonzero(!a),
+        "s_brev_b32" => (a.reverse_bits(), None),
         "s_lshl_b32" => nonzero(a << (b & 31)),
         "s_lshr_b32" => nonzero(a >> (b & 31)),
         "s_ashr_i32" => nonzero(((a as i32) >> (b & 31)) as u32),
@@ -2200,8 +2641,10 @@ mod tests {
         State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
-            exec: u32::MAX,
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            nan_loose: false,
+            exec: 0xffff_ffff,
             vcc: 0,
             scc: false,
             m0: 0,
@@ -2209,6 +2652,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         }
     }
     fn reg(kind: Kind, base: u16, len: u8) -> Operand {
@@ -2488,7 +2932,7 @@ mod tests {
                         }
                         let i = insn_on(arch, name, ops);
                         let mut st = state();
-                        st.exec = exec;
+                        st.exec = u64::from(exec);
                         st.vcc = 0x8000_0001;
                         st.scc = true;
                         st.s[2] = 0xdead_beef;
@@ -2515,7 +2959,7 @@ mod tests {
                                 assert_eq!(st.vcc, 0x8000_0001);
                             }
                             Operand::Special(Special::VccLo) => {
-                                assert_eq!(st.vcc, carry);
+                                assert_eq!(st.vcc, u64::from(carry));
                                 assert_eq!(st.s[2], 0xdead_beef);
                             }
                             _ => {
@@ -2523,7 +2967,7 @@ mod tests {
                                 assert_eq!(st.s[2], 0xdead_beef);
                             }
                         }
-                        assert_eq!((st.exec, st.scc), (exec, true));
+                        assert_eq!((st.exec, st.scc), (u64::from(exec), true));
                     }
                 }
             }
@@ -2614,14 +3058,14 @@ mod tests {
                 for scc in [false, true] {
                     let i = insn_on(arch, "s_and_saveexec_b32", vec![sreg(2), sreg(2)]);
                     let mut st = state();
-                    st.exec = old;
+                    st.exec = u64::from(old);
                     st.vcc = 0x1234_5678;
                     st.scc = scc;
                     st.s[2] = mask;
                     st.s[3] = 0xdead_beef;
                     execute(arch, "s_and_saveexec_b32", &i, &mut st).unwrap();
                     assert_eq!(st.s[2], old, "{arch:?}");
-                    assert_eq!((st.exec, st.scc), (want, want != 0));
+                    assert_eq!((st.exec, st.scc), (u64::from(want), want != 0));
                     assert_eq!((st.vcc, st.s[3]), (0x1234_5678, 0xdead_beef));
                 }
             }
@@ -2934,7 +3378,7 @@ mod tests {
                     let mut i = base.clone();
                     apply(&mut i);
                     let mut st = fresh();
-                    st.exec = exec;
+                    st.exec = u64::from(exec);
                     let before = st.v[0];
                     assert!(
                         run(&i, &mut st).is_err(),
@@ -3278,6 +3722,152 @@ mod tests {
         i.mods.clamp = true;
         run("v_fma_mixlo_f16", &i, &mut st).unwrap();
         assert_eq!(st.v[0][0], 0xdead_0000, "clamp of a negative result is +0");
+    }
+
+    // VOP3P: op_sel picks each source's half for the low result, op_sel_hi for the high result.
+    #[test]
+    fn v_pk_fma_f16_selects_halves_and_rounds_once() {
+        let mut i = insn("v_pk_fma_f16", vec![v(0), v(1), v(2), v(3)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0xdead_4000; // a: low 2.0
+        st.v[2][0] = 0x4500_4200; // b: low 3.0, high 5.0
+        st.v[3][0] = 0x3c00_beef; // c: high 1.0
+        i.mods.op_sel = 0b100; // c from its high half in the low result
+        i.mods.op_sel_hi = 0b110; // a low, b high, c high in the high result
+        run("v_pk_fma_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4980_4700, "lo 2*3+1 = 7, hi 2*5+1 = 11");
+        // One rounding: (1 + 2^-10)^2 - (1 + 2^-9) = 2^-20, a subnormal f16; a rounded product gives 0.
+        i.mods.op_sel = 0;
+        i.mods.op_sel_hi = 0b111;
+        st.v[1][0] = 0x3c01_3c01;
+        st.v[2][0] = 0x3c01_3c01;
+        st.v[3][0] = 0xbc02_bc02;
+        run("v_pk_fma_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x0010_0010);
+        // Non-finite operands and modifiers are refused, not approximated.
+        st.v[1][0] = 0x7c00_3c00;
+        assert!(run("v_pk_fma_f16", &i, &mut st).is_err());
+        st.v[1][0] = 0x3c00_3c00;
+        i.mods.neg_lo = 1;
+        assert!(run("v_pk_fma_f16", &i, &mut st).is_err());
+    }
+
+    /// RDNA ISA V_MUL_HI_U32_U24: `D0.u = ((S0.u & 0xffffff) * (S1.u & 0xffffff)) >> 32` (48-bit product).
+    #[test]
+    fn v_mul_hi_u32_u24_masks_to_24_bits_and_takes_product_bits_47_32() {
+        let mut st = state();
+        st.exec = 1;
+        let i = insn("v_mul_hi_u32_u24_e32", vec![v(0), v(1), v(2)]);
+        // (2^24-1)^2 = 2^48 - 2^25 + 1; since 2^25 < 2^32 the high word is 2^16 - 1 = 0xffff.
+        st.v[1][0] = 0xabff_ffff; // bits above 24 must be ignored
+        st.v[2][0] = 0xffff_ffff;
+        run("v_mul_hi_u32_u24_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xffff);
+        // 2^23 * 2^23 = 2^46 -> 2^14.
+        st.v[1][0] = 0x0080_0000;
+        st.v[2][0] = 0x0080_0000;
+        run("v_mul_hi_u32_u24_e32", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4000);
+        // Inline constant S0 = 36 (as `v_mul_hi_u32_u24 v2, 36, v12`): 36 * 1 = 36 < 2^32 -> 0. An unmasked
+        // 0xff00_0001 would give (0xff00_0001 * 36) >> 32 = 35.
+        let k = insn(
+            "v_mul_hi_u32_u24_e32",
+            vec![v(0), Operand::Inline(InlineConst::Integer(36)), v(2)],
+        );
+        st.v[2][0] = 0xff00_0001;
+        run("v_mul_hi_u32_u24_e32", &k, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0);
+        // Inline -1 is the word 0xffff_ffff, masked to 0xffffff like any other operand.
+        let k = insn(
+            "v_mul_hi_u32_u24_e32",
+            vec![v(0), Operand::Inline(InlineConst::Integer(-1)), v(2)],
+        );
+        st.v[2][0] = 0xffff_ffff;
+        run("v_mul_hi_u32_u24_e32", &k, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0xffff);
+    }
+
+    /// RDNA ISA V_PK_LSHRREV_B16: result half `h` = `S1.half(sel1) >> (S0.half(sel0) & 15)`; `op_sel` bit k picks the
+    /// high half of source k for the low result, `op_sel_hi` bit k for the high result.
+    #[test]
+    fn v_pk_lshrrev_b16_selects_halves_per_result_half() {
+        let mut i = insn("v_pk_lshrrev_b16", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0x0013_0004; // count: lo 4, hi 19 (&15 = 3)
+        st.v[2][0] = 0xff00_0f0f; // value: lo 0x0f0f, hi 0xff00
+        i.mods.op_sel = 0;
+        i.mods.op_sel_hi = 0;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x00f0_00f0, "both: lo 0x0f0f >> 4");
+        i.mods.op_sel = 0b11;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x00f0_1fe0, "lo: 0xff00 >> 3; hi: 0x0f0f >> 4");
+        i.mods.op_sel = 0b01;
+        i.mods.op_sel_hi = 0b10;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x0ff0_01e1, "lo: 0x0f0f >> 3; hi: 0xff00 >> 4");
+        i.mods.op_sel = 0b10;
+        i.mods.op_sel_hi = 0b01;
+        run("v_pk_lshrrev_b16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x01e1_0ff0, "lo: 0xff00 >> 4; hi: 0x0f0f >> 3");
+        // Modifiers that an integer shift cannot define are refused.
+        i.mods.neg_lo = 1;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
+        i.mods.neg_lo = 0;
+        i.mods.neg_hi = 1;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
+        i.mods.neg_hi = 0;
+        i.mods.clamp = true;
+        assert!(run("v_pk_lshrrev_b16", &i, &mut st).is_err());
+    }
+
+    #[test]
+    fn v_pk_add_f16_adds_the_selected_halves() {
+        let mut i = insn("v_pk_add_f16", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 1;
+        st.v[1][0] = 0x3c00_4000; // 1.0 high, 2.0 low
+        st.v[2][0] = 0x4500_4200; // 5.0 high, 3.0 low
+        i.mods.op_sel_hi = 0b011;
+        run("v_pk_add_f16", &i, &mut st).unwrap();
+        assert_eq!(st.v[0][0], 0x4600_4500, "lo 2+3 = 5, hi 1+5 = 6");
+        // A constant from one half for both results, as the MQ6 dequant bias add does.
+        i.mods.op_sel = 0b10;
+        i.mods.op_sel_hi = 0b10;
+        run("v_pk_add_f16", &i, &mut st).unwrap();
+        assert_eq!(
+            st.v[0][0], 0x4700_4700,
+            "a low (2.0) + b high (5.0) in both results"
+        );
+    }
+
+    #[test]
+    fn v_min_i32_is_signed() {
+        let i = insn("v_min_i32_e32", vec![v(0), v(1), v(2)]);
+        let mut st = state();
+        st.exec = 0b11;
+        st.v[1][0] = (-5i32) as u32;
+        st.v[2][0] = 3;
+        st.v[1][1] = 7;
+        st.v[2][1] = (-9i32) as u32;
+        run("v_min_i32_e32", &i, &mut st).unwrap();
+        assert_eq!((st.v[0][0], st.v[0][1]), ((-5i32) as u32, (-9i32) as u32));
+    }
+
+    #[test]
+    fn s_brev_b32_reverses_bits_and_keeps_scc() {
+        let i = insn("s_brev_b32", vec![sreg(0), sreg(1)]);
+        let mut st = state();
+        st.scc = true;
+        st.s[1] = 0xf0;
+        run("s_brev_b32", &i, &mut st).unwrap();
+        assert_eq!(st.s[0], 0x0f00_0000);
+        assert!(st.scc);
+        st.s[1] = u32::MAX - 1; // -2: the unbounded buffer-descriptor size 0x7fffffff
+        run("s_brev_b32", &i, &mut st).unwrap();
+        assert_eq!(st.s[0], 0x7fff_ffff);
     }
 
     #[test]
@@ -3924,7 +4514,7 @@ mod tests {
             load(&mut st);
             st.exec &= !(1 << 16); // lane 16 inactive: its D0 and VCC bit stay
             st.v[0][16] = 0xcafe_f00d;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             st.scc = true;
             execute(arch, "v_div_scale_f32", &i, &mut st).unwrap();
             for (l, (_, want, _)) in rows.iter().enumerate() {
@@ -3938,7 +4528,7 @@ mod tests {
             assert_eq!(st.v[0][25], 0xdead_beef);
             assert_eq!(
                 st.vcc,
-                mask & !(1 << 16),
+                u64::from(mask & !(1u32 << 16)),
                 "{arch:?} VCC is overwritten by the predicate, inactive lanes read 0"
             );
             assert!(st.scc, "SCC is untouched");
@@ -4036,7 +4626,7 @@ mod tests {
                 execute(arch, "v_div_scale_f32", &i, &mut st).unwrap();
                 assert_eq!(
                     (st.v[0][0], st.vcc),
-                    (want, u32::from(flag)),
+                    (want, u64::from(flag)),
                     "{arch:?} {s0:#x} {s1:#x} {s2:#x}"
                 );
             }
@@ -4198,7 +4788,7 @@ mod tests {
         let fmas = |vcc: bool, [a, b, c]: [u32; 3]| {
             let mut st = state();
             st.exec = 1;
-            st.vcc = u32::from(vcc);
+            st.vcc = u64::from(vcc);
             (st.v[1][0], st.v[2][0], st.v[3][0]) = (a, b, c);
             execute(Arch::Gfx1201, "v_div_fmas_f32", &i, &mut st).unwrap();
             st.v[0][0]
@@ -5045,14 +5635,14 @@ mod tests {
     ) -> Result<(u32, u32, u32)> {
         let i = insn_on(arch, name, ops);
         let mut st = state();
-        st.exec = (1u64 << lanes.len()).wrapping_sub(1) as u32;
+        st.exec = (1u64 << lanes.len()).wrapping_sub(1);
         st.s[10] = u32::MAX;
-        st.vcc = u32::MAX;
+        st.vcc = 0xffff_ffff;
         for (lane, (a, b)) in lanes.iter().enumerate() {
             set64(&mut st, 4, lane, *a);
             set64(&mut st, 6, lane, *b);
         }
-        execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
+        execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc as u32, st.exec as u32))
     }
 
     #[test]
@@ -5262,7 +5852,7 @@ mod tests {
             let mut st = state();
             st.exec = 1;
             st.s[10] = u32::MAX;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             st.v[1][0] = a;
             st.v[2][0] = b;
             execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
@@ -5337,7 +5927,7 @@ mod tests {
             let mut st = state();
             st.exec = 1;
             st.s[10] = u32::MAX;
-            st.vcc = u32::MAX;
+            st.vcc = 0xffff_ffff;
             (st.v[1][0], st.v[2][0]) = (a.to_bits(), b.to_bits());
             execute(arch, name, &i, &mut st).map(|_| (st.s[10], st.vcc, st.exec))
         };
@@ -5455,7 +6045,7 @@ mod tests {
         };
         let i = insn_on(arch, name, ops);
         let mut st = state();
-        st.exec = u32::MAX;
+        st.exec = 0xffff_ffff;
         st.s[1] = src;
         execute(arch, name, &i, &mut st).map(|_| st.s[0])
     }
@@ -5722,7 +6312,7 @@ mod tests {
         {
             st.v[1][lane] = x;
         }
-        st.vcc = u32::MAX;
+        st.vcc = 0xffff_ffff;
         execute(arch, "v_cmp_gt_f32_e32", &i, &mut st).unwrap();
         assert_eq!(
             st.vcc, 0b1000_0111,

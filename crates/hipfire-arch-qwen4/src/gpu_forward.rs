@@ -22,6 +22,7 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
+use crate::ep_seal::Qwen4EpRankSeal;
 use crate::ple_stage::{
     ple_async_upload, ple_async_upload_enabled, PleHostStage, PLE_ASYNC_UPLOAD_ENV,
 };
@@ -193,6 +194,57 @@ pub(crate) fn prefill_chunk_requested_from(
 ) -> usize {
     explicit_prefill_chunk_rows(env)
         .unwrap_or_else(|| qwen4_prefill_chunk_default(arch, mode, link))
+        .min(max_seq)
+}
+
+/// Flash-Next pipeline-parallel prefill chunk on gfx1201. Under PP the band
+/// pipeline needs several chunks in flight; the 16384-row compact default
+/// leaves a 32K prompt only 2-3 chunks, so smaller tiles fill it. Measured
+/// on 4x R9700 (PP4, packed mq4-xts, fresh processes, greedy), prefill tok/s
+/// at 16384 / 8192 / 4096 rows: 8K 4,838 / 6,039 / 6,709; 32K 6,953 / 14,026 /
+/// 16,657; 64K 13,445 / 16,735 / 18,260; 131K 15,194 / 17,444 / 17,885.
+/// Decode is unchanged (~54 tok/s). Numerics equal a single card at the same
+/// explicit chunk (`HIPFIRE_PREFILL_CHUNK_ROWS=4096`), which is also the
+/// gfx1201 Full-plan / EP default.
+pub const QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201: usize = 4096;
+
+/// [`qwen4_prefill_chunk_requested`] for a pipeline-parallel band or mesh:
+/// an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` wins, else
+/// [`QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201`] on gfx1201, else the single-card
+/// default; never above `max_seq`. Every PP call site must use this so bands
+/// and the mesh agree on one chunk.
+pub fn qwen4_pp_prefill_chunk_requested(
+    gpu: &Gpu,
+    max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> usize {
+    pp_prefill_chunk_requested_from(
+        &gpu.arch,
+        hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
+            .ok()
+            .as_deref(),
+        max_seq,
+        mode,
+        || crate::host_link::host_link(gpu),
+    )
+}
+
+/// [`qwen4_pp_prefill_chunk_requested`] with the env value and host link supplied.
+pub(crate) fn pp_prefill_chunk_requested_from(
+    arch: &str,
+    env: Option<&str>,
+    max_seq: usize,
+    mode: Qwen4ForwardScratchMode,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> usize {
+    explicit_prefill_chunk_rows(env)
+        .unwrap_or_else(|| {
+            if arch == "gfx1201" {
+                QWEN4_PP_PREFILL_CHUNK_ROWS_GFX1201
+            } else {
+                qwen4_prefill_chunk_default(arch, mode, link)
+            }
+        })
         .min(max_seq)
 }
 
@@ -1560,26 +1612,17 @@ impl Qwen4MoeLayerRuntime {
     }
 
     /// Whether this layer is the qualified S1 shape: uniform MQ4 experts with
-    /// no every-call CPU splice or tier split, no stock FP8, no expert-keep
+    /// no tier split, no stock FP8, no expert-keep
     /// pruning mask and no non-MQ4 slab codec. `Err` names the first reason;
     /// the S1 selector turns it into a pre-mutation incumbent verdict.
-    ///
-    /// The CPU refusal is [`host_arith_every_call`]: a D1 splice layer, or a D2
-    /// split of an explicit `memory.offload_exec=cpu` load
-    /// (`split_explicit`, the forward's `cpu_split_explicit`). A split armed
-    /// only by the per-load D2 default never runs host arithmetic on prefill
-    /// rows ([`host_arith_call`]), so S1 streams that layer's experts like any
-    /// other host-mapped layer and decode keeps the split.
-    pub(crate) fn s1_layer_check(&self, split_explicit: bool) -> Result<(), &'static str> {
+    /// S1 never runs host arithmetic: D1 is switched off per S1 tile binding
+    /// (`s1_tile_cpu_deferred`) and D2 is bound splitless
+    /// (`routed_view(false, ..)`), so `offload_exec` (D1 splice, explicit D2)
+    /// does not affect admission. Fp8, tier layers, non-uniform MQ4, the
+    /// keep mask and a mixed slab stay refused.
+    pub(crate) fn s1_layer_check(&self) -> Result<(), &'static str> {
         if self.fp8 {
             return Err("stock FP8 experts");
-        }
-        if host_arith_every_call(
-            self.cpu_deferred_experts || self.cpu_expert_owners.is_some(),
-            self.cpu_split.is_some() || self.cpu_cold_owners.is_some(),
-            split_explicit,
-        ) {
-            return Err("CPU expert splice");
         }
         if self.tier.is_some() {
             return Err("expert tiers");
@@ -1631,6 +1674,17 @@ impl Qwen4MoeLayerRuntime {
         ))
     }
 
+    /// `(gate/up, down)` dtypes of expert `id`, `None` for an expert the layer
+    /// does not hold: what the SP admission reads to prove the CPU engine can
+    /// execute the host layers' experts.
+    pub(crate) fn s1_expert_dtypes(&self, id: usize) -> Option<(DType, DType)> {
+        let expert = self.experts.get(id)?;
+        if expert.gate_up.tensor.buf.size() == 0 || expert.down.tensor.buf.size() == 0 {
+            return None;
+        }
+        Some((expert.gate_up.dtype, expert.down.dtype))
+    }
+
     /// The transport sources of this host layer's experts: pinned CPU
     /// addresses of the immutable weight payload, translated from the device
     /// alias addresses of the layer's pointer entries. A slab arena layer has
@@ -1640,10 +1694,9 @@ impl Qwen4MoeLayerRuntime {
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         layer: usize,
-        split_explicit: bool,
     ) -> Result<panel_stage::LayerExpertSources, Qwen4GpuForwardError> {
         use panel_stage::{AliasExpert, LayerExpertSources, PanelCodec};
-        self.s1_layer_check(split_explicit).map_err(|why| {
+        self.s1_layer_check().map_err(|why| {
             invalid(format!(
                 "slow-link layer {layer} is not S1 qualified: {why}"
             ))
@@ -2772,10 +2825,12 @@ const fn tile_ranks_supported(ranks: usize) -> bool {
     matches!(ranks, 2..=8)
 }
 
-/// The `experts` little-endian i32 owners (`expert % ranks`) the launcher reads.
-fn tile_owner_table_bytes(experts: usize, ranks: usize) -> Vec<u8> {
-    (0..experts)
-        .flat_map(|expert| ((expert % ranks) as i32).to_le_bytes())
+/// The little-endian i32 owner of every expert the launcher reads, from the
+/// sealed ownership ([`crate::ep_seal::Qwen4EpSeal::owner_ranks`]).
+fn tile_owner_table_bytes(owners: &[usize]) -> Vec<u8> {
+    owners
+        .iter()
+        .flat_map(|&owner| (owner as i32).to_le_bytes())
         .collect()
 }
 
@@ -2843,6 +2898,7 @@ impl Qwen4TileRoute {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         placement: Qwen4EpPlacement,
+        owners: &[usize],
         scratch: &Qwen4GpuForwardScratch,
         mode: Qwen4ForwardScratchMode,
         max_chunk: usize,
@@ -2910,7 +2966,12 @@ impl Qwen4TileRoute {
         if max_tiles == 0 {
             return refuse("no tile capacity");
         }
-        let owners = tile_owner_table_bytes(config.num_experts, placement.ranks);
+        if owners.len() != config.num_experts {
+            return Err(invalid(
+                "the sealed owner table does not cover every expert",
+            ));
+        }
+        let owners = tile_owner_table_bytes(owners);
         let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
         let sentinels = vec![0xFFu8; tile_capacity * word];
         let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
@@ -2966,6 +3027,9 @@ pub(crate) struct Qwen4BalancedPlan {
 /// weights carry an EP placement).
 pub(crate) struct Qwen4ForwardEp {
     placement: Qwen4EpPlacement,
+    /// The rank's binding to its load's seal: every EP dispatch table and the
+    /// owner tables derive from it.
+    seal: Qwen4EpRankSeal,
     dummy: Qwen4EpDummyExpert,
     /// Per-layer full (P2P) tables for chunk forwards; empty until
     /// [`Qwen4GpuForward::attach_ep`].
@@ -2992,6 +3056,7 @@ impl Qwen4ForwardEp {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         placement: Qwen4EpPlacement,
+        seal: Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
         validate_ep_placement(placement, config.num_experts)?;
         let elements = QWEN4_EP_GATHER_MAX_ROWS
@@ -3018,6 +3083,7 @@ impl Qwen4ForwardEp {
         };
         let state = Self {
             placement,
+            seal,
             dummy,
             moe_full: Vec::new(),
             buffers,
@@ -3249,9 +3315,11 @@ impl Qwen4MoeLayerRuntime {
             config,
             Qwen4ExpertTableLayout::Single,
             None,
+            None,
             true,
             d2_default,
             crate::expert_tier_owners::ExpertReadView::BorrowPrefill(class),
+            false,
         )
     }
 
@@ -3272,9 +3340,11 @@ impl Qwen4MoeLayerRuntime {
             config,
             Qwen4ExpertTableLayout::Single,
             None,
+            None,
             true,
             d2_default,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
@@ -3285,6 +3355,7 @@ impl Qwen4MoeLayerRuntime {
         moe: &MoeWeights,
         layer_label: usize,
         config: &Qwen4Config,
+        head_split: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::build(
             gpu,
@@ -3294,9 +3365,11 @@ impl Qwen4MoeLayerRuntime {
             config,
             Qwen4ExpertTableLayout::Single,
             None,
+            None,
             false,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            head_split,
         )
     }
 
@@ -3316,7 +3389,8 @@ impl Qwen4MoeLayerRuntime {
 
     /// EP decode runtime: the resident expert tensors are this rank's compact
     /// `placement.local_count(num_experts)` experts; owned experts name them, every other
-    /// expert names `dummy`.
+    /// expert names `dummy`. Dispatch binds the sealed plan of expert group `group`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_moe_ep(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -3325,7 +3399,12 @@ impl Qwen4MoeLayerRuntime {
         config: &Qwen4Config,
         placement: Qwen4EpPlacement,
         dummy: &Qwen4EpDummyExpert,
+        seal: &Qwen4EpRankSeal,
+        group: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        let sealed = seal
+            .expert_binding(group, placement, gpu.device_id)
+            .map_err(invalid)?;
         Self::build(
             gpu,
             weights,
@@ -3337,15 +3416,18 @@ impl Qwen4MoeLayerRuntime {
                 dummy: dummy.source(),
             },
             Some(dummy),
+            Some(sealed),
             true,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
     /// EP chunk runtime: owned experts name the local compact tensors, every
     /// other expert names the owning peer's compact tensors
-    /// (`peers_for_layer[rank]`).
+    /// (`peers_for_layer[rank]`). Dispatch binds the sealed plan of `layer_label`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_moe_full(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -3354,7 +3436,11 @@ impl Qwen4MoeLayerRuntime {
         config: &Qwen4Config,
         placement: Qwen4EpPlacement,
         peers_for_layer: &[Qwen4PeerExpertSource],
+        seal: &Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        let sealed = seal
+            .expert_binding(layer_label, placement, gpu.device_id)
+            .map_err(invalid)?;
         Self::build(
             gpu,
             weights,
@@ -3366,16 +3452,20 @@ impl Qwen4MoeLayerRuntime {
                 peers: peers_for_layer,
             },
             None,
+            Some(sealed),
             true,
             false,
             crate::expert_tier_owners::ExpertReadView::Resident,
+            false,
         )
     }
 
-    /// Every table is one single-owner (rank 0 of 1) dispatch table whose
-    /// views mirror the host pointer entries; EP tables differ only in which
-    /// allocation an entry names, so dispatch validates and seals them like
-    /// the single-device table.
+    /// Single-device tables are one rank-0-of-1 dispatch table. EP tables
+    /// (`sealed`, required exactly for the `Ep` and `Full` layouts) are the
+    /// rank's binding adapted from the sealed plan: real owners and compact
+    /// slots, while the views name whatever allocation each entry uses
+    /// (local, zero dummy or peer).
+    #[allow(clippy::too_many_arguments)]
     fn build(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
@@ -3384,10 +3474,21 @@ impl Qwen4MoeLayerRuntime {
         config: &Qwen4Config,
         layout: Qwen4ExpertTableLayout<'_>,
         dummy: Option<&Qwen4EpDummyExpert>,
+        sealed: Option<(ExpertTable, ExpertBindingCache)>,
         allow_tiers: bool,
         d2_default: bool,
         read_view: crate::expert_tier_owners::ExpertReadView,
+        head_split: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        let ep_layout = matches!(
+            layout,
+            Qwen4ExpertTableLayout::Ep { .. } | Qwen4ExpertTableLayout::Full { .. }
+        );
+        if ep_layout != sealed.is_some() {
+            return Err(invalid(format!(
+                "layer {layer_label}: EP tables need the sealed rank binding, single-device tables none"
+            )));
+        }
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
         let shared_gate_source = weights.resident(&moe.shared_gate)?;
@@ -3790,13 +3891,20 @@ impl Qwen4MoeLayerRuntime {
             })?;
             metadata.push(if absent { record.into_absent() } else { record });
         }
-        let table = ExpertTable::new(metadata)
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}")))?;
-        let mut cache = table
-            .prepare_binding(0, 1, gpu.device_id)
-            .map_err(|error| {
-                Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}"))
-            })?;
+        let (table, mut cache) = match sealed {
+            Some(sealed) => sealed,
+            None => {
+                let table = ExpertTable::new(metadata).map_err(|error| {
+                    Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}"))
+                })?;
+                let cache = table
+                    .prepare_binding(0, 1, gpu.device_id)
+                    .map_err(|error| {
+                        Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}"))
+                    })?;
+                (table, cache)
+            }
+        };
 
         let gate_entries = experts
             .iter()
@@ -3947,13 +4055,15 @@ impl Qwen4MoeLayerRuntime {
             None => whole_layer.then_some(cpu_splice::SplitOwnerKind::WholeLayer),
         };
         let split_admission = cpu_splice::CpuSplitAdmission {
-            enabled: (if tier_layer.is_some() {
-                explicit_cpu_split || d2_default
-            } else {
-                d2_default
-            }) && allow_tiers
-                && layer_label < config.num_hidden_layers
-                && kept_ids.is_none(),
+            enabled: d2_split_enabled(
+                tier_layer.is_some(),
+                explicit_cpu_split,
+                d2_default,
+                allow_tiers,
+                layer_label < config.num_hidden_layers,
+                kept_ids.is_none(),
+                head_split,
+            ),
             kind: split_kind,
             bound_hotset: tier_layer
                 .as_ref()
@@ -4077,7 +4187,15 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        runtime.attach_cpu_split(gpu, config)
+        runtime.attach_cpu_split(
+            gpu,
+            config,
+            if head_split {
+                1
+            } else {
+                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
+            },
+        )
     }
 
     /// Create the layer's D2 split executor from its cold-expert owner's
@@ -4088,6 +4206,7 @@ impl Qwen4MoeLayerRuntime {
         mut self,
         gpu: &mut Gpu,
         config: &Qwen4Config,
+        rows: usize,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let Some(placement) = self
             .cpu_cold_owners
@@ -4099,31 +4218,24 @@ impl Qwen4MoeLayerRuntime {
         // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
         // `HIPFIRE_QWEN4_D2_JOIN` are read from the immutable process snapshot
         // for this load: an invalid spelling refuses the load before any
-        // executor storage exists. `copy`, `sync` and `host` (the defaults and
-        // the kill values) leave the executor exactly as `new` built it. A
-        // refused `mapped` or `cpwait` is capability routing, logged here and
-        // summarized once per load by the loader, never silent.
+        // executor storage exists. `copy`, `sync` and `host` leave the executor
+        // exactly as `new` built it; they are the kill values, and unset
+        // return/join are `copy`/`host` except on gfx1100, where the arch
+        // default requests `mapped`/`cpwait` (`default_d2_transport`; an
+        // explicit value always wins). A refused `mapped` or `cpwait` is
+        // capability routing, logged here and summarized once per load by the
+        // loader, never silent.
         // The initial ctor keeps the legacy default-4 executor rows; the
         // load-only post-admission prewarm (`reserve_d2_wide_rows`) resizes an
         // armed layer to the real need before the first window.
-        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+        let transport = hipfire_config::memory::qwen4_d2_transport(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
+        let (request, join) = (transport.ret, transport.join);
         let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
-        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
-            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
-        })?;
-        let built = self.new_split_executor(
-            gpu,
-            config,
-            &placement,
-            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
-            request,
-            ready,
-            join,
-        );
+        let built = self.new_split_executor(gpu, config, &placement, rows, request, ready, join);
         match built {
             Ok(executor) => {
                 self.cpu_split = Some(executor);
@@ -4527,7 +4639,7 @@ impl Qwen4MoeLayerRuntime {
         }
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
-        runtime.attach_cpu_split(gpu, config)
+        runtime.attach_cpu_split(gpu, config, hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
     }
 
     /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor
@@ -4564,13 +4676,11 @@ impl Qwen4MoeLayerRuntime {
         // re-reading them here yields exactly what the initial ctor applied,
         // so the resized executor preserves them. Snapshot refusal before any
         // new storage exists (same as the initial path).
-        let request = hipfire_config::memory::qwen4_d2_return().map_err(|error| {
+        let transport = hipfire_config::memory::qwen4_d2_transport(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
+        let (request, join) = (transport.ret, transport.join);
         let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
-            Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
-        })?;
-        let join = hipfire_config::memory::qwen4_d2_join().map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
         let placement = self
@@ -5020,6 +5130,13 @@ impl Qwen4ExpertStage {
                         "  qwen4 long-prefill expert staging: off (dedicated tier stage buffers are not charged to placement on {} unless {QWEN4_EXPERT_STAGE_ENV}=1; zero-copy mapped reads)",
                         gpu.arch
                     );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::Prefill,
+                        format!(
+                            "long-prefill expert staging off (tier stage buffers not charged to placement on {})",
+                            gpu.arch
+                        ),
+                    );
                     Ok(None)
                 }
             };
@@ -5046,6 +5163,10 @@ impl Qwen4ExpertStage {
         }
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("long-prefill expert staging off ({reason})"),
+            );
             Ok(None)
         };
         // Resident layers are a prefix (`place_routed_experts`), so each
@@ -5251,6 +5372,13 @@ impl Qwen4ExpertStage {
             2 * layer_bytes >> 20,
             if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!(
+                "long-prefill expert staging on (>= {} rows)",
+                stage.min_rows
+            ),
         );
         Ok(Some(stage))
     }
@@ -9302,12 +9430,6 @@ impl Qwen4GpuForward {
             self.cpu_split_explicit,
         )
     }
-    /// Whether this load's D2 split was requested explicitly
-    /// (`memory.offload_exec=cpu`, not passback) rather than armed by the
-    /// per-load default: the `split_explicit` input of the S1 layer check.
-    pub(crate) fn cpu_split_explicit(&self) -> bool {
-        self.cpu_split_explicit
-    }
     /// Whether a call of `rows` rows over `route_rows` routing rows in the
     /// given phase executes host arithmetic ([`host_arith_call`]). `gpu`
     /// supplies this call's frozen row-exact width; capacity is the minimum
@@ -9379,6 +9501,16 @@ impl Qwen4GpuForward {
     /// storage). Tests pass `lab_armed` explicitly instead of reading it here.
     pub(crate) fn cpu_lab_override_present(gpu: &Gpu) -> bool {
         rdna_compute::prefill_invariant::qwen4_wide_verify_override_present(&gpu.arch)
+    }
+
+    /// The S1 admission verdict of every trunk MoE layer, `(label, verdict)`
+    /// in layer order: the head's runtime is never in this list.
+    pub(crate) fn s1_layer_verdicts(&self) -> Vec<(usize, Result<(), &'static str>)> {
+        self.moe
+            .iter()
+            .flatten()
+            .map(|layer| (layer.label, layer.s1_layer_check()))
+            .collect()
     }
 
     /// Minimum allocated executor capacity across armed split layers (`0`
@@ -9518,7 +9650,7 @@ impl Qwen4GpuForward {
     /// The frozen split identity ([`Self::host_exec_identity`]) when any layer
     /// is armed for D2.
     pub(crate) fn split_digest(&self) -> Option<String> {
-        (self.cpu_split_layers > 0).then(|| self.host_exec_identity())
+        (self.cpu_split_layers > 0).then(|| self.d2_exec_identity())
     }
     /// Numerical identity of the armed host arithmetic, for cache/session
     /// scoping. Empty when no CPU arithmetic is armed (default, `pcie`, or a
@@ -9533,7 +9665,19 @@ impl Qwen4GpuForward {
     /// with bit `i` = layer label `i` over the layers that actually armed.
     /// Thread count and scheduling are not part of it: they change timing,
     /// never arithmetic order.
+    ///
+    /// A load that admitted the SP short-prompt prefill hook (default off,
+    /// `developer.qwen4_sp`) appends the part `sp-e1v1`: SP computes the CPU
+    /// experts' rows with the E1 F32/BF16-boundary arithmetic, a different
+    /// prefix-state domain, so an SP-on process never shares a snapshot (disk
+    /// tier included) with an SP-off lineage.
     pub(crate) fn host_exec_identity(&self) -> String {
+        crate::bundle::with_sp_identity(self.d2_exec_identity(), self.slowlink.sp_armed())
+    }
+
+    /// The D1/D2 part of [`Self::host_exec_identity`]: the frozen split
+    /// identity ([`Self::split_digest`]) never carries the SP token.
+    fn d2_exec_identity(&self) -> String {
         use cpu_splice::SplitOwnerKind::{Slab, Tier, WholeLayer};
         let cpu_all: Vec<usize> = self
             .moe
@@ -10127,7 +10271,10 @@ impl Qwen4GpuForward {
                     d2_resolved
                 };
             if let Some(placement) = bundle.weights.ep_placement() {
-                let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
+                let seal = bundle.ep_seal().cloned().ok_or_else(|| {
+                    invalid("an EP placement needs the load's seal (bind_ep_seal)")
+                })?;
+                let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement, seal)?);
                 populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
                     Qwen4MoeLayerRuntime::from_moe_ep(
                         gpu,
@@ -10137,6 +10284,8 @@ impl Qwen4GpuForward {
                         &bundle.config,
                         placement,
                         &state.dummy,
+                        &state.seal,
+                        layer,
                     )
                 })?;
             } else {
@@ -10417,8 +10566,8 @@ impl Qwen4GpuForward {
                     }
                 }
             }
-            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for gfx1151 and
-            // gfx1201, default OFF and explicit `=1` only on gfx1100, `=0` off): verify each
+            // Symmetric IU4 MoE (`HIPFIRE_QWEN4_MOE_SYM_IU4`: default on for gfx1100, gfx1151
+            // and gfx1201, `=0` off): verify each
             // layer's final expert headers once, before any capture, and size the route's
             // scratch for the chunk cap. Layers that fail (every layer of an
             // asymmetric artifact) keep the F16 route; nothing runs (and no new
@@ -10436,6 +10585,7 @@ impl Qwen4GpuForward {
                         gpu,
                         &bundle.config,
                         state.placement,
+                        &state.seal.seal.owner_ranks(),
                         &scratch,
                         mode,
                         max_chunk,
@@ -10508,8 +10658,8 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above runs there
-            // only under an explicit `HIPFIRE_QWEN4_MOE_SYM_IU4=1` (default OFF on gfx1100), yet
+            // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above does not run
+            // there when `HIPFIRE_QWEN4_MOE_SYM_IU4=0` (or no layer passed the header check), yet
             // the slab K2 prefill reuses its grouping scratch, down sidecar and shared gate/up
             // scratch. Reserve them here, before any capture, through the same reserve (no
             // growth when that block already ran). gfx1201 slab loads are unchanged.
@@ -10698,7 +10848,7 @@ impl Qwen4GpuForward {
             host_token_bytes,
             uploaded_id_rows: 0,
             host_ple: PleHostStage::new(
-                host_ple_bytes,
+                host_ple_bytes.len(),
                 ple_async_upload_enabled(
                     hipfire_config::developer_var(PLE_ASYNC_UPLOAD_ENV)
                         .ok()
@@ -10740,7 +10890,7 @@ impl Qwen4GpuForward {
             mesh_route_rows: None,
             mesh_segment: None,
             mesh_next_op: None,
-            mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
+            mesh_tokens: PleHostStage::new(max_chunk * std::mem::size_of::<i32>(), true),
             lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
                 max_chunk * std::mem::size_of::<i32>(),
             ),
@@ -10967,10 +11117,14 @@ impl Qwen4GpuForward {
             .map(|ep| std::array::from_fn(|index| &ep.buffers[index]))
     }
 
-    /// This rank's EP binding for a head MoE runtime: its placement and the
-    /// zero dummy expert (`None` on the single-device route).
-    pub(crate) fn ep_binding(&self) -> Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)> {
-        self.ep.as_ref().map(|ep| (ep.placement, &ep.dummy))
+    /// This rank's EP binding for a head MoE runtime: its placement, the
+    /// zero dummy expert and its seal (`None` on the single-device route).
+    pub(crate) fn ep_binding(
+        &self,
+    ) -> Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert, &Qwen4EpRankSeal)> {
+        self.ep
+            .as_ref()
+            .map(|ep| (ep.placement, &ep.dummy, &ep.seal))
     }
 
     /// What an EP rank's MTP head borrows from this forward at call time: the
@@ -11076,6 +11230,7 @@ impl Qwen4GpuForward {
             }
         }
         let dummy = ep.dummy.source();
+        let seal = ep.seal.clone();
         let layer_peers_of =
             |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
                 peers
@@ -11103,6 +11258,7 @@ impl Qwen4GpuForward {
                         config,
                         placement,
                         &layer_peers,
+                        &seal,
                     )?);
                     ordinal += 1;
                 }
@@ -11167,6 +11323,7 @@ impl Qwen4GpuForward {
                         config,
                         placement,
                         &layer_peers_of(ordinal)?,
+                        &seal,
                     )?;
                     if live.symmetric != symmetric
                         || live.host_mapped != host_mapped
@@ -11663,8 +11820,6 @@ impl Qwen4GpuForward {
     pub(crate) fn slowlink_forward_blocker(&self, config: &Qwen4Config) -> Option<&'static str> {
         if self.ep.is_some() {
             Some("expert parallelism")
-        } else if self.has_cpu_deferred_experts() {
-            Some("CPU expert splice")
         } else if self.qsa_tap.is_some() {
             Some("the QSA parity tap")
         } else if self.route_trace.is_some() {
@@ -12882,7 +13037,10 @@ impl Qwen4GpuForward {
             });
         }
         let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
-        let f16_moe = std::mem::replace(&mut gpu.qwen4_append_f16_moe_scope, append);
+        let f16_moe = std::mem::replace(
+            &mut gpu.qwen4_append_f16_moe_scope,
+            crate::slowlink_sp::f16_moe_scope(append, self.slowlink.sp_f16_moe()),
+        );
         let ragged_scope = native_trunk_prefill_scope(
             self.prefill_scope,
             gpu.qwen4_trunk_iu4,
@@ -15241,6 +15399,70 @@ mod ep_table_tests {
     }
 }
 
+/// Split-admission `enabled` decision of one layer build. Trunk layers need
+/// the load's D2 default (or the explicit `cpu` mode for tier layers) on a
+/// tier-capable build; the native MTP head (`head_split`, untiered and never
+/// D1) is armed by its own knob and is still refused when a keep mask prunes
+/// its experts.
+pub(crate) fn d2_split_enabled(
+    tier: bool,
+    explicit_cpu_split: bool,
+    d2_default: bool,
+    allow_tiers: bool,
+    label_in_trunk: bool,
+    kept_none: bool,
+    head_split: bool,
+) -> bool {
+    ((if tier {
+        explicit_cpu_split || d2_default
+    } else {
+        d2_default
+    }) && allow_tiers
+        && label_in_trunk
+        || head_split)
+        && kept_none
+}
+
+#[cfg(test)]
+mod d2_split_enabled_tests {
+    use super::d2_split_enabled;
+
+    /// The trunk formula, verbatim from before the head knob existed.
+    fn trunk(tier: bool, explicit: bool, d2: bool, allow: bool, label: bool, kept: bool) -> bool {
+        (if tier { explicit || d2 } else { d2 }) && allow && label && kept
+    }
+
+    #[test]
+    fn trunk_admission_is_unchanged_for_every_input_without_the_head_knob() {
+        for bits in 0..64u32 {
+            let b = |n: u32| bits & (1 << n) != 0;
+            assert_eq!(
+                d2_split_enabled(b(0), b(1), b(2), b(3), b(4), b(5), false),
+                trunk(b(0), b(1), b(2), b(3), b(4), b(5)),
+                "{bits:06b}"
+            );
+        }
+    }
+
+    #[test]
+    fn head_arms_without_the_trunk_gates_and_a_pruned_head_is_refused() {
+        // Today's head: untiered, D1-free, no D2 default, not a trunk label.
+        assert!(!d2_split_enabled(
+            false, false, false, false, false, true, false
+        ));
+        assert!(d2_split_enabled(
+            false, false, false, false, false, true, true
+        ));
+        assert!(!d2_split_enabled(
+            false, false, false, false, false, false, true
+        ));
+        // The knob never un-refuses a keep-masked trunk-shaped layer either.
+        assert!(!d2_split_enabled(
+            false, true, true, true, true, false, true
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -15365,6 +15587,35 @@ mod tests {
             qwen4_prefill_chunk_rungs(16384).collect::<Vec<_>>(),
             [16384, 8192, 4096, 2048, 1536]
         );
+    }
+
+    #[test]
+    fn pp_prefill_chunk_is_4096_on_gfx1201_and_otherwise_the_single_card_default() {
+        use super::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
+        use super::{pp_prefill_chunk_requested_from as pp, prefill_chunk_requested_from};
+        use crate::host_link::HostLink::Unmeasured;
+        let probe = || unreachable!("probed");
+        // Both scratch plans pipeline 4096-row chunks under PP.
+        assert_eq!(pp("gfx1201", None, usize::MAX, FnSymGfx1201, probe), 4096);
+        assert_eq!(pp("gfx1201", None, usize::MAX, Full, probe), 4096);
+        // Explicit env wins, rounded to whole 256-row tiles.
+        assert_eq!(
+            pp("gfx1201", Some("16384"), usize::MAX, FnSymGfx1201, probe),
+            16384
+        );
+        assert_eq!(pp("gfx1201", Some("5000"), usize::MAX, Full, probe), 4864);
+        // Capped at max_seq.
+        assert_eq!(pp("gfx1201", None, 2048, Full, probe), 2048);
+        assert_eq!(pp("gfx1201", Some("16384"), 8192, Full, probe), 8192);
+        // Other arches keep the single-card default.
+        for arch in ["gfx1100", "gfx1151"] {
+            for mode in [FnSymGfx1201, Full] {
+                assert_eq!(
+                    pp(arch, None, usize::MAX, mode, || Unmeasured),
+                    prefill_chunk_requested_from(arch, None, usize::MAX, mode, || Unmeasured),
+                );
+            }
+        }
     }
 
     #[test]
@@ -15690,46 +15941,32 @@ mod tests {
         assert!(!admitted(true, true, 0, 0, true, 64, 64));
     }
 
-    /// Which calls of a load run host arithmetic (and so need eager HIP): D1
-    /// and an explicit-mode D2 on every call, the automatic default's D2 only
-    /// on a whole narrow non-prefill window — so wide verify and every prefill
-    /// call (tails, short prompts) keep their old graph and replay behaviour.
-    /// The load-wide part is composed exactly as the forward composes it.
-    /// The S1 CPU-splice guard (`slowlink_forward_blocker`,
-    /// `Qwen4MoeLayerRuntime::s1_layer_check`) refuses exactly the loads that
-    /// can run host arithmetic on a prefill row: D1 or an explicit D2 split.
-    /// An automatic-default D2 split (`split_explicit = false`) never executes
-    /// on prefill rows, so S1 must admit it (the XTX Flash-Next default,
-    /// where the refusal sent every long prompt to the chunk-major route).
+    /// S1 never binds the D2 executor: it binds `routed_view(false, ..)`, so
+    /// `d2_phase = false` and a split is never admitted, whatever the tile
+    /// shape. D1 and an explicit D2 stay "every call" for decode (the caps are
+    /// unchanged).
     #[test]
-    fn s1_cpu_guard_refuses_only_when_prefill_rows_run_host_arithmetic() {
-        use super::{host_arith_call, host_arith_every_call};
-        for d1 in [false, true] {
-            for has_split in [false, true] {
-                for explicit in [false, true] {
-                    let refused = host_arith_every_call(d1, has_split, explicit);
-                    let prefill_host = [false, true].into_iter().any(|lab| {
-                        [1usize, 4, 64, 768, 1536, 16384].into_iter().any(|rows| {
-                            host_arith_call(refused, has_split, true, rows, rows, lab, 64, 64)
-                        })
-                    });
-                    assert_eq!(
-                        refused, prefill_host,
-                        "d1={d1} split={has_split} explicit={explicit}"
+    fn s1_never_binds_the_d2_executor() {
+        use super::{d2_executor_admitted, host_arith_every_call};
+        for rows in [1usize, 2, 3, 4, 5, 64, 768] {
+            for route_rows in [rows, 8192] {
+                for lab in [false, true] {
+                    assert!(
+                        !d2_executor_admitted(true, false, rows, route_rows, lab, 8, 64),
+                        "rows={rows} route_rows={route_rows} lab={lab}"
                     );
                 }
             }
         }
-        // The two named cases.
-        assert!(
-            !host_arith_every_call(false, true, false),
-            "automatic D2 admits S1"
-        );
+        assert!(host_arith_every_call(true, false, false), "D1 every call");
         assert!(
             host_arith_every_call(false, true, true),
-            "explicit cpu refuses S1"
+            "explicit D2 every call"
         );
-        assert!(host_arith_every_call(true, false, false), "D1 refuses S1");
+        assert!(
+            !host_arith_every_call(false, true, false),
+            "automatic D2 per call"
+        );
     }
 
     #[test]
@@ -17782,13 +18019,6 @@ mod ep_rank_generic_tests {
         assert!(!ep_lever_on(Some("0")));
     }
 
-    fn owners(table: &[u8]) -> Vec<i32> {
-        table
-            .chunks_exact(4)
-            .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
-            .collect()
-    }
-
     #[test]
     fn owner_routed_prefill_admits_exactly_ep2_through_ep8_on_gfx1100_and_gfx1201() {
         for ranks in 2usize..=8 {
@@ -17802,24 +18032,6 @@ mod ep_rank_generic_tests {
         }
         for arch in ["gfx1200", "gfx1151", "gfx1101", "gfx942", ""] {
             assert!(!rdna_compute::moe::ep_tile_pm_arch(arch), "{arch:?}");
-        }
-    }
-
-    #[test]
-    fn owner_table_is_expert_modulo_ranks_and_balanced() {
-        for ranks in [2usize, 3, 4, 5, 6, 8] {
-            let table = owners(&tile_owner_table_bytes(512, ranks));
-            assert_eq!(table.len(), 512);
-            assert!(table
-                .iter()
-                .enumerate()
-                .all(|(e, &o)| o == (e % ranks) as i32));
-            for rank in 0..ranks {
-                assert_eq!(
-                    table.iter().filter(|&&o| o == rank as i32).count(),
-                    Qwen4EpPlacement { rank, ranks }.local_count(512)
-                );
-            }
         }
     }
 

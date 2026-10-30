@@ -5685,6 +5685,151 @@ mod tests {
         assert_eq!(fp8.token_capacity(2 * MIB), 4064);
     }
 
+    /// gfx1100 map-only discipline for the QSA context arenas
+    /// (`ensure_mapped_capacity` / `map_ahead_for_decode` ->
+    /// `grow_context_arena`): across an 8K prefill, a decode map-ahead, a
+    /// reset, a shorter request and a 32K request, every arena's plan only
+    /// ever asks for a map at its current mapped frontier. The plan has no
+    /// shrink or remap request, a covered request is a no-op, and a request
+    /// after `reset` (which never unmaps) maps nothing it already holds.
+    #[test]
+    fn gfx1100_vmm_qsa_context_growth_only_maps_forward_at_the_frontier() {
+        let s: usize = 262_144;
+        let compress: usize = 4;
+        // (row bytes, tokens per row, F16 four-token blocks) per arena kind
+        // at the q8/F32/fp8 strides of the neighbouring plan test.
+        let arenas: [(usize, usize, bool); 4] = [
+            (2048, 1, false),
+            (512, 1, false),
+            (512, compress, false),
+            (516, 1, true),
+        ];
+        for granularity in [4096, 2 * MIB] {
+            for (row_bytes, tokens_per_row, blocks) in arenas {
+                let capacity_rows = s.div_ceil(tokens_per_row);
+                let plan = context_arena_plan(row_bytes, capacity_rows, granularity).unwrap();
+                let mut mapped = 0usize;
+                let mut maps = 0usize;
+                let map_ahead = decode_map_ahead_tokens(8204, Some(64), 3, s).unwrap();
+                // Prefill tiles, decode map-ahead, a reset-then-short request,
+                // a longer one, and a capacity-sized request.
+                for required in [
+                    512, 1024, 4096, 8204, map_ahead, 1, 700, 8204, 20_000, 32_780, 700, s,
+                ] {
+                    let rows = required.div_ceil(tokens_per_row);
+                    let rows = if blocks {
+                        qsa_f16_arena_rows(rows).min(capacity_rows)
+                    } else {
+                        rows
+                    };
+                    match plan.growth(mapped, rows).unwrap() {
+                        Some(growth) => {
+                            assert_eq!(
+                                growth.offset_bytes, mapped,
+                                "growth must map at the frontier, never inside the mapped prefix"
+                            );
+                            assert!(growth.size_bytes > 0);
+                            assert_eq!(growth.size_bytes % granularity, 0);
+                            mapped += growth.size_bytes;
+                            maps += 1;
+                            assert_eq!(growth.token_capacity, plan.token_capacity(mapped));
+                        }
+                        None => assert!(
+                            plan.token_capacity(mapped) >= rows,
+                            "no growth is only valid when the prefix covers the request"
+                        ),
+                    }
+                    assert!(plan.token_capacity(mapped) >= rows);
+                }
+                assert!(maps >= 1 && mapped <= plan.reserve_bytes());
+            }
+        }
+    }
+
+    /// Source audit (CPU): the Qwen4 QSA arena paths never unmap, release or
+    /// reallocate a live VMM owner. `reset_inner` clears in place with
+    /// `memset` (a VMM owner's buffer is its mapped prefix); growth is one
+    /// `grow_vmm_tensor` forward map plus a memset of exactly the new bytes;
+    /// hipMemUnmap is not called anywhere in this crate.
+    #[test]
+    fn gfx1100_vmm_qsa_reset_and_growth_never_unmap_or_reallocate_arenas() {
+        fn code(source: &str, signature: &str, end: &str) -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"));
+            let rest = &source[start..];
+            let body = &rest[..rest.find(end).expect("end of function")];
+            body.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let src = include_str!("state.rs");
+        let unmap = format!("{}{}", "mem_", "unmap");
+        let forbidden = [
+            unmap.as_str(),
+            "mem_release",
+            "free_tensor",
+            "release_tensor",
+            "alloc_vmm_tensor",
+            "reserve(",
+            "zeros(",
+            "std::mem::replace",
+            "std::mem::take",
+        ];
+
+        let reset = code(src, "    fn reset_inner(", "\n    }\n");
+        for token in forbidden.into_iter().chain(["grow_vmm_tensor"]) {
+            assert!(!reset.contains(token), "reset_inner contains `{token}`");
+        }
+        assert!(reset.contains(".memset("), "reset clears arenas in place");
+
+        let ensure = code(src, "    pub fn ensure_mapped_capacity(", "\n    }\n");
+        for token in forbidden.into_iter().chain(["memset", "grow_vmm_tensor"]) {
+            assert!(
+                !ensure.contains(token),
+                "ensure_mapped_capacity contains `{token}`"
+            );
+        }
+        assert!(ensure.contains("grow_context_arena("));
+
+        let grow = code(src, "fn grow_context_arena(", "\n}\n");
+        for token in forbidden {
+            assert!(
+                !grow.contains(token),
+                "grow_context_arena contains `{token}`"
+            );
+        }
+        assert_eq!(grow.matches(".grow_vmm_tensor(").count(), 1);
+        // The zero-fill covers the view of the bytes just mapped, never the
+        // already-live prefix.
+        assert!(grow.contains("tensor.sub_offset(growth.offset_bytes / element"));
+
+        fn scan(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    scan(&path, needle, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    if text.contains(needle) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &format!(".{unmap}("),
+            &mut hits,
+        );
+        assert!(
+            hits.is_empty(),
+            "direct hipMemUnmap in arch-qwen4: {hits:?}"
+        );
+    }
+
     /// gfx942 serves fp8 K/V only on an explicit request, as the FNUZ format
     /// (F32 index keys); `auto`/unset/`bf16` stay on the F32 reference state.
     /// gfx1201 keeps its OCP `Fp8` (BF16 index) default; the RDNA3 q8 default

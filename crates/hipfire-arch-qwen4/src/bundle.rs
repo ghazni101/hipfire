@@ -48,6 +48,7 @@ use std::time::Duration;
 
 #[path = "session_pair.rs"]
 mod session_pair;
+pub(crate) use session_pair::with_sp_identity;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub(crate) use session_pair::SlowlinkFailPoint;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
@@ -1565,6 +1566,10 @@ impl Qwen4Bundle {
                 .unwrap_or_else(|| requested.min(1536)),
         };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!("chunk {max_chunk} rows"),
+        );
         let attempt = Qwen4GpuForward::new_inner(
             gpu,
             self,
@@ -1672,6 +1677,20 @@ impl Qwen4Bundle {
                 "Qwen4 MTP resources are already attached".to_string(),
             ));
         }
+        // Read once per load, like the other D2 knobs. The head follows the
+        // trunk's D2 verdict (`split_layers` is the trunk's armed set only:
+        // the head executor never enters `forward.moe`).
+        let ep_binding = self
+            .execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::ep_binding);
+        let decision = crate::mtp_gpu::head_d2_decision(
+            hipfire_config::memory::qwen4_mtp_head_d2(),
+            self.execution
+                .as_ref()
+                .is_some_and(|forward| !forward.split_layers().is_empty()),
+            ep_binding.is_some(),
+        );
         let mtp = Qwen4MtpGpu::new_with_backend(
             gpu,
             &self.weights,
@@ -1680,11 +1699,26 @@ impl Qwen4Bundle {
             self.state.qsa_backend(),
             // The forward is attached before the head: its EP binding (placement
             // and the rank's dummy expert) builds the head's EP decode table.
-            self.execution
-                .as_ref()
-                .and_then(Qwen4GpuForward::ep_binding),
+            ep_binding,
+            decision == crate::mtp_gpu::HeadD2Decision::Armed,
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
+        match (decision, mtp.head_d2_modes(), mtp.head_d2_host_bytes()) {
+            (
+                crate::mtp_gpu::HeadD2Decision::Armed,
+                Some(modes),
+                Some((pinned, mapped)),
+            ) => eprintln!(
+                "  qwen4 MTP head D2: armed ({modes}, all-cold {}, pinned host {pinned} B, mapped host {mapped} B)",
+                self.config.num_experts
+            ),
+            (crate::mtp_gpu::HeadD2Decision::Armed, _, _) => eprintln!(
+                "  qwen4 MTP head D2: off (head split admission refused; see the D2 refusal line)"
+            ),
+            (crate::mtp_gpu::HeadD2Decision::Off(why), _, _) => {
+                eprintln!("  qwen4 MTP head D2: off ({})", why.reason())
+            }
+        }
         self.mtp = Some(mtp);
         // The S1 entry `pending` backup is charged by the admission of a
         // native-MTP load: bind it with the head, never on a request.
@@ -3925,7 +3959,10 @@ impl Qwen4Bundle {
             });
         match mapped {
             Ok(()) => eprintln!(
-                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
+                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens}); gather workspace {} KiB reserved / {} KiB mapped, {} VMM owners",
+                gpu.qsa_gather_reserved_bytes() >> 10,
+                gpu.qsa_gather_scratch_bytes() >> 10,
+                gpu.vmm_allocation_count()
             ),
             Err(error) => eprintln!(
                 "  qwen4 QSA map-ahead through {target} tokens failed ({error}); growing on demand"
@@ -4383,6 +4420,10 @@ impl Qwen4Bundle {
                 self.session_at_boundary(gpu, &prompt[..end])?;
             }
             pos = end;
+            // `prefill_progress`: rows this request computes (the restored
+            // `reused` prefix is in neither count). Silent outside the
+            // prompt phase and once `pos` reaches the end.
+            hipfire_runtime::prefill_progress::report(pos - reused, prompt.len() - reused);
         }
         self.slowlink_record_incumbent(reused, &windows);
         Ok(())

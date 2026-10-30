@@ -573,7 +573,7 @@ const PM_OBJECT: ObjectRefV1 = ObjectRefV1::Embedded {
     artifact: "kernels/gemm_mq6g256v2_mmq_i8_pm_gfx1201.hxaco",
     // `sha256sum` of the committed object. (The doc comment of
     // `kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201` quotes an older digest.)
-    sha256: "1c2dcba4b9433e71acba6ba27fabe96c21cedf1a1497e5abed79b0804952e5da",
+    sha256: "c1458584a1b8ab53e613c982c9a3e87c530c80e83e76223ed4f677d594bad300",
 };
 
 /// 128 x 128 grid: `[ceil(M/128), ceil(N/128), 1]` (`gemm_mq6_i8.rs:451-454`

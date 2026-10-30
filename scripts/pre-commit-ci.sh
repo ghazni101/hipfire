@@ -34,6 +34,7 @@ run bash scripts/leanup-ratchets.sh
 run python3 scripts/check-crate-maps.py --check
 run python3 scripts/check-scratch-growth.py
 run python3 scripts/check-changelog.py
+run python3 scripts/check-conflict-markers.py
 run bash scripts/ratchet-diff.sh ${1:+"$1"}
 if cargo deny --version >/dev/null 2>&1; then
     run cargo deny check bans licenses sources

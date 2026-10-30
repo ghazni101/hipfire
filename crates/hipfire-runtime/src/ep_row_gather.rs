@@ -42,6 +42,18 @@
 //! Eager only: events are created, recorded and waited on the host timeline; this
 //! transport is not usable inside a captured/retained-replay body.
 //!
+//! # Band exchange (output-axis split, #862)
+//!
+//! [`EpRowGather::exchange_bands`] serves an output-axis split instead: every
+//! rank writes its column band of one or more `[rows, m]` outputs into its own
+//! buffer (band-compact, `rows * band_bytes` at an offset per output), and the
+//! gather copies EVERY rank's band (its own included) into columns
+//! `[q * band_bytes, (q + 1) * band_bytes)` of the full output with one pitched
+//! copy per rank. Same publish → barrier → wait protocol and the same buffer
+//! alternation rule. Each call also carries a geometry tag that must be equal on
+//! all ranks, checked after the barrier, so ranks that disagree on the layout
+//! fail instead of copying mismatched bands.
+//!
 //! # Lifetime
 //!
 //! `hip_bridge::Event` has no `Drop`. The producer events are created on each
@@ -56,7 +68,7 @@ use hip_bridge::{
     HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{Gpu, GpuTensor};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -231,6 +243,7 @@ impl SpinBarrier {
 struct RankReg {
     device_id: i32,
     ptrs: Vec<usize>,
+    sizes: Vec<usize>,
     events: Vec<Event>,
 }
 
@@ -292,6 +305,7 @@ impl EpRowGatherBuilder {
             }
         }
         let mut ptrs = Vec::with_capacity(k);
+        let mut sizes = Vec::with_capacity(k);
         for (index, buf) in buffers.iter().enumerate() {
             self.spec.check_buffer_len(index, buf.buf.size())?;
             let ptr = buf.buf.as_ptr() as usize;
@@ -301,6 +315,7 @@ impl EpRowGatherBuilder {
                 ));
             }
             ptrs.push(ptr);
+            sizes.push(buf.buf.size());
         }
         gpu.bind_thread()?;
         let flags = HIP_EVENT_DISABLE_TIMING | HIP_EVENT_RELEASE_TO_SYSTEM;
@@ -319,6 +334,7 @@ impl EpRowGatherBuilder {
         self.regs[rank] = Some(RankReg {
             device_id: gpu.device_id,
             ptrs,
+            sizes,
             events,
         });
         Ok(())
@@ -361,7 +377,9 @@ impl EpRowGatherBuilder {
             .into_iter()
             .map(|r| RankState {
                 device_id: r.device_id,
+                tags: r.ptrs.iter().map(|_| AtomicU64::new(0)).collect(),
                 ptrs: r.ptrs,
+                sizes: r.sizes,
                 events: r.events.into_iter().map(|e| Mutex::new(Some(e))).collect(),
                 peers_enabled: AtomicBool::new(false),
             })
@@ -383,11 +401,28 @@ struct RankState {
     /// Device addresses of this rank's buffers (valid on every peer after
     /// `enable_peers`; ROCm uses one unified address space).
     ptrs: Vec<usize>,
+    /// Byte sizes of the same buffers (the band gather's copy-source bounds).
+    sizes: Vec<usize>,
+    /// Band-exchange geometry tag per buffer index. A rank rewrites the tag of
+    /// buffer `b` only at the next invocation on `b`, after the barrier every
+    /// peer passes only once it has checked this one.
+    tags: Vec<AtomicU64>,
     /// Producer-complete events, one per buffer index. `None` after `release`.
     /// The `Mutex` makes the type `Sync` (`Event` is `Send` only); it is
     /// uncontended by protocol (record and wait of one index never overlap).
     events: Vec<Mutex<Option<Event>>>,
     peers_enabled: AtomicBool,
+}
+
+/// One output of [`EpRowGather::exchange_bands`]: every rank's band of `rows`
+/// rows of `band_bytes` sits band-compact at `offset` in its buffer; the
+/// gather writes rank `q`'s band to bytes `[q * band_bytes, (q + 1) *
+/// band_bytes)` of each `ranks * band_bytes` row of `dst`.
+pub struct EpBand<'a> {
+    pub offset: usize,
+    pub band_bytes: usize,
+    pub rows: usize,
+    pub dst: &'a GpuTensor,
 }
 
 /// Shared EP row-gather transport (`Arc<EpRowGather>`, one clone per rank thread).
@@ -503,26 +538,10 @@ impl EpRowGather {
     ) -> HipResult<()> {
         self.check(gpu, rank, buffer)?;
         self.spec.check_call_slots(slots)?;
-        gpu.bind_thread()?;
-        if !self.ranks[rank].peers_enabled.load(Ordering::Acquire) {
-            return Err(err(format!(
-                "ep_row_gather: gather on rank {rank} before enable_peers"
-            )));
-        }
+        self.wait_peers(gpu, rank, buffer)?;
         let mut src = [0usize; MAX_RANKS];
         for (peer, state) in self.ranks.iter().enumerate() {
             src[peer] = state.ptrs[buffer];
-            if peer == rank {
-                continue;
-            }
-            let guard = lock(&state.events[buffer]);
-            let event = guard
-                .as_ref()
-                .ok_or_else(|| err("ep_row_gather: gather after release".into()))?;
-            match (self.device_waits, gpu.active_stream.as_ref()) {
-                (true, Some(stream)) => gpu.hip.stream_wait_event(stream, event)?,
-                _ => gpu.hip.event_synchronize(event)?,
-            }
         }
         match slot_owners {
             EpSlotOwners::ExpertModulo(slot_experts, n_experts) => gpu.ep_gather_rows_by_owner(
@@ -567,6 +586,133 @@ impl EpRowGather {
         if let Err(e) = self.gather(gpu, rank, buffer, slot_owners, slots) {
             self.abort();
             return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Wait every peer's producer event of `buffer` (host waits unless the
+    /// builder opted into device waits).
+    fn wait_peers(&self, gpu: &mut Gpu, rank: usize, buffer: usize) -> HipResult<()> {
+        gpu.bind_thread()?;
+        if !self.ranks[rank].peers_enabled.load(Ordering::Acquire) {
+            return Err(err(format!(
+                "ep_row_gather: gather on rank {rank} before enable_peers"
+            )));
+        }
+        for (peer, state) in self.ranks.iter().enumerate() {
+            if peer == rank {
+                continue;
+            }
+            let guard = lock(&state.events[buffer]);
+            let event = guard
+                .as_ref()
+                .ok_or_else(|| err("ep_row_gather: gather after release".into()))?;
+            match (self.device_waits, gpu.active_stream.as_ref()) {
+                (true, Some(stream)) => gpu.hip.stream_wait_event(stream, event)?,
+                _ => gpu.hip.event_synchronize(event)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Band exchange (see the module docs): `publish` → barrier → geometry
+    /// check → one pitched copy per rank and band. `tag` identifies the call's
+    /// geometry and must be equal on every rank; a mismatch aborts the
+    /// transport. Every band must lie inside the rank's buffer and `dst` must
+    /// hold `rows` rows of `ranks * band_bytes`.
+    pub fn exchange_bands(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        buffer: usize,
+        tag: u64,
+        bands: &[EpBand<'_>],
+    ) -> HipResult<()> {
+        let result = self.check(gpu, rank, buffer).and_then(|()| {
+            self.check_bands(bands)?;
+            self.ranks[rank].tags[buffer].store(tag, Ordering::Release);
+            self.publish(gpu, rank, buffer)
+        });
+        if let Err(e) = result {
+            self.abort();
+            return Err(e);
+        }
+        self.barrier.wait().map_err(|m| err(m.into()))?;
+        if let Err(e) = self.gather_bands(gpu, rank, buffer, tag, bands) {
+            self.abort();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn check_bands(&self, bands: &[EpBand<'_>]) -> HipResult<()> {
+        let capacity = self.spec.buffer_bytes();
+        for band in bands {
+            let end = band
+                .rows
+                .checked_mul(band.band_bytes)
+                .and_then(|bytes| bytes.checked_add(band.offset));
+            let dst = band
+                .rows
+                .checked_mul(band.band_bytes)
+                .and_then(|bytes| bytes.checked_mul(self.spec.ranks));
+            match (end, dst) {
+                (Some(end), Some(dst)) if end <= capacity && dst <= band.dst.buf.size() => {}
+                _ => {
+                    return Err(err(format!(
+                    "ep_row_gather: band of {} rows x {} B at {} exceeds the {capacity} B buffer \
+                         or its {} B destination",
+                    band.rows,
+                    band.band_bytes,
+                    band.offset,
+                    band.dst.buf.size()
+                )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn gather_bands(
+        &self,
+        gpu: &mut Gpu,
+        rank: usize,
+        buffer: usize,
+        tag: u64,
+        bands: &[EpBand<'_>],
+    ) -> HipResult<()> {
+        if let Some(peer) = self
+            .ranks
+            .iter()
+            .position(|state| state.tags[buffer].load(Ordering::Acquire) != tag)
+        {
+            return Err(err(format!(
+                "ep_row_gather: band layout of rank {peer} disagrees with rank {rank} (tag {tag:#x})"
+            )));
+        }
+        self.wait_peers(gpu, rank, buffer)?;
+        let ranks = self.spec.ranks;
+        for band in bands {
+            for (owner, state) in self.ranks.iter().enumerate() {
+                // SAFETY: non-owning view of the owner's registered buffer, live
+                // until that rank's `release`; the copy is bounds-checked against it.
+                let src = unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(
+                        state.ptrs[buffer] as *mut std::ffi::c_void,
+                        state.sizes[buffer],
+                    )
+                };
+                gpu.memcpy_dtod_2d_at_ordered_async(
+                    &band.dst.buf,
+                    owner * band.band_bytes,
+                    ranks * band.band_bytes,
+                    &src,
+                    band.offset,
+                    band.band_bytes,
+                    band.band_bytes,
+                    band.rows,
+                )?;
+            }
         }
         Ok(())
     }

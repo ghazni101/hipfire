@@ -22,6 +22,7 @@
 
 pub mod executor;
 pub mod tp_exchange;
+mod tp_peer_push;
 pub mod transport;
 use std::ffi::c_void;
 
@@ -194,6 +195,9 @@ pub struct Gpus {
     tp_graph_payload_bytes: usize,
     tp_graph_barrier_count: usize,
     tp_graph_capture_epoch: usize,
+    /// gfx1201 TP2 tagged peer-VRAM reduction (mailboxes, generations,
+    /// qualification verdict); `None` when not requested or not admitted.
+    tp_peer_push: Option<tp_peer_push::TpPeerPush>,
     /// Default-off generic mesh leases; legacy PP/TP/EP never populate this.
     mesh_execution: executor::MeshExecutionState,
 }
@@ -219,6 +223,9 @@ const GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
 /// 19.99 -> 18.55 ms/token at ctx 128 and 20.59 -> 18.97 ms/token at ctx 8192;
 /// rank-0 logits byte-identical on every token.
 const GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
+/// gfx1201 TP4 (bf16 peer-push exchange): whole-token graph default when
+/// `HIPFIRE_TP_FULL_GRAPH` is unset.
+const GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
 
 /// The exact homogeneous TP2 meshes the whole-token graph route admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +320,15 @@ fn tp_graph_payload_layout(bytes: usize) -> Option<(usize, usize)> {
 
 fn tp_graph_payload_offset(segment: usize, rank: usize, slot: usize) -> usize {
     (rank * 2 + slot) * segment
+}
+
+/// Which cross-rank protocol a whole-token graph captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WholeTokenGraph {
+    /// Exact gfx1100/gfx1201 pair: signal barrier + coherent payload exchange.
+    Tp2,
+    /// gfx1201 TP4: bf16 peer-push mailboxes.
+    PeerPush,
 }
 
 /// What [`Gpus::tp2_whole_token_graph_forward`] did for one token.
@@ -484,6 +500,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            tp_peer_push: None,
             mesh_execution: Default::default(),
         }
     }
@@ -547,6 +564,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            tp_peer_push: None,
             mesh_execution: Default::default(),
         })
     }
@@ -603,6 +621,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            tp_peer_push: None,
             mesh_execution: Default::default(),
         })
     }
@@ -696,6 +715,9 @@ impl Gpus {
             }
         }
         self.peer_access_enabled = all_ok;
+        if all_ok {
+            self.qualify_tp_peer_push();
+        }
         Ok(all_ok)
     }
 
@@ -1320,6 +1342,9 @@ impl Gpus {
         self.tp_graph_payloads = payloads;
         self.tp_graph_payload_host = Some(host as usize);
         self.tp_graph_payload_bytes = segment;
+        // Peer-VRAM mailboxes for the gfx1201 pair must exist before peer
+        // access is enabled; best effort, the shadow protocol above remains.
+        self.prepare_tp_peer_push(bytes);
         Ok(())
     }
 
@@ -1334,7 +1359,7 @@ impl Gpus {
             gpu.bind_thread()?;
             gpu.hip.memset(&self.tp_graph_signals[rank], 0, bytes)?;
         }
-        Ok(())
+        self.reset_tp_peer_push()
     }
 
     /// Fail if a bounded device wait on any rank stopped on its deadline
@@ -1360,19 +1385,54 @@ impl Gpus {
             .filter_map(|gpu| gpu.take_device_wait_timeout())
             .map(|timeout| timeout.to_string())
             .collect();
-        if timeouts.is_empty() {
+        // Timeouts a `download_*` reader already consumed on its own rank (rank 0
+        // reads the logits) still invalidate the step and desynchronize the TP
+        // generations, so they take the reset path below too.
+        let consumed_elsewhere = self
+            .devices
+            .iter()
+            .map(|gpu| gpu.take_unreported_device_wait_timeouts() as usize)
+            .sum::<usize>()
+            .saturating_sub(timeouts.len());
+        if timeouts.is_empty() && consumed_elsewhere == 0 {
             return if router_faults.is_empty() {
                 Ok(())
             } else {
                 Err(HipError::new(0, &router_faults.join("; ")))
             };
         }
+        let timeouts = if timeouts.is_empty() {
+            vec![format!(
+                "{consumed_elsewhere} device wait timeout(s) were consumed by an earlier read of this step"
+            )]
+        } else {
+            timeouts
+        };
         let mut message = timeouts
             .into_iter()
             .chain(router_faults)
             .collect::<Vec<_>>()
             .join("; ");
-        if self.tp_graph_signals.len() == self.devices.len() && self.tp_graph_barrier_count > 0 {
+        let signals_ready =
+            self.tp_graph_signals.len() == self.devices.len() && self.tp_graph_barrier_count > 0;
+        if !signals_ready && self.tp_peer_push.is_some() {
+            // TP4 peer push has no signal tape; its generations and
+            // mailboxes restart together after every rank drained.
+            let reset = self
+                .devices
+                .iter()
+                .try_for_each(|gpu| {
+                    gpu.bind_thread()?;
+                    gpu.hip.device_synchronize()
+                })
+                .and_then(|()| self.reset_tp_peer_push());
+            if let Err(error) = reset {
+                message.push_str(&format!(
+                    "; TP peer-push generation reset after the timeout failed: {error}"
+                ));
+            }
+        }
+        if signals_ready {
             let reset = self
                 .devices
                 .iter()
@@ -1386,6 +1446,14 @@ impl Gpus {
                     "; TP graph signal reset after the timeout failed: {error}"
                 ));
             }
+        }
+        // A stalled rank resumes after its peers gave up and runs its remaining
+        // waits into the deadline too; the resets above drained every rank, so
+        // those late records exist now. Clear them here so they cannot fail the
+        // next request.
+        for gpu in &self.devices {
+            let _ = gpu.take_device_wait_timeout();
+            let _ = gpu.take_unreported_device_wait_timeouts();
         }
         Err(HipError::new(0, &message))
     }
@@ -1480,6 +1548,42 @@ impl Gpus {
         Ok(true)
     }
 
+    /// Whether `HIPFIRE_TP_FULL_GRAPH` (tri-state, default
+    /// [`GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT`]) requests the whole-token
+    /// graph for this mesh of four gfx1201 ranks.
+    fn tp_push_whole_token_graph_requested(&self) -> bool {
+        let n = self.devices.len();
+        if n != 4 || self.devices.iter().any(|gpu| !gpu.arch_caps.is_gfx1201()) {
+            return false;
+        }
+        match tp_full_graph_env().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT,
+        }
+    }
+
+    /// Load-time half of the gfx1201 TP4 whole-token decode graph: when
+    /// requested (`HIPFIRE_TP_FULL_GRAPH`, and `HIPFIRE_TP_PEER_PUSH` not `0`)
+    /// allocate the peer-VRAM mailboxes and resolve the kernel. Call before peer
+    /// access is enabled. Returns whether the route is prepared; qualification
+    /// runs in [`Self::enable_peer_all`].
+    pub fn prepare_tp_push_whole_token_graph(&mut self, payload_bytes: usize) -> bool {
+        if !self.tp_push_whole_token_graph_requested() {
+            return false;
+        }
+        self.prepare_tp_peer_push(payload_bytes);
+        self.tp_peer_push.is_some()
+    }
+
+    /// Decode-time admission of the TP4 whole-token graph: requested,
+    /// peer access enabled, mailboxes prepared and qualified.
+    pub fn tp_push_whole_token_graph_ready(&self) -> bool {
+        self.tp_push_whole_token_graph_requested()
+            && self.peer_access_enabled
+            && self.tp_peer_pushn_active()
+    }
+
     /// Decode-time admission of the homogeneous gfx1100/gfx1201 TP2
     /// whole-token graph: the load
     /// half prepared `barriers` generations and the payload exchange, the
@@ -1507,6 +1611,28 @@ impl Gpus {
         barriers: usize,
         forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
     ) -> HipResult<TpGraphStep> {
+        self.whole_token_graph_forward_impl(WholeTokenGraph::Tp2, barriers, forward)
+    }
+
+    /// Run one dense-TP decode token on the gfx1201 TP4 whole-token graph:
+    /// the same capture/replay lifecycle as the TP2 graph, with every
+    /// collective a bf16 peer-push kernel per rank (device-resident
+    /// generations, no events, no host waits) in place of the event/copy
+    /// route. See [`Self::prepare_tp_push_whole_token_graph`].
+    pub fn tp_push_whole_token_graph_forward(
+        &mut self,
+        barriers: usize,
+        forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
+    ) -> HipResult<TpGraphStep> {
+        self.whole_token_graph_forward_impl(WholeTokenGraph::PeerPush, barriers, forward)
+    }
+
+    fn whole_token_graph_forward_impl(
+        &mut self,
+        kind: WholeTokenGraph,
+        barriers: usize,
+        forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
+    ) -> HipResult<TpGraphStep> {
         if self
             .devices
             .iter()
@@ -1531,20 +1657,23 @@ impl Gpus {
             self.drop_rank_graphs(true);
             return Err(HipError::new(
                 0,
-                &format!("TP2 whole-token graph state is partial: {captured}/{n}"),
+                &format!("whole-token graph state is partial: {captured}/{n}"),
             ));
         }
         let step = if captured == 0 {
-            self.capture_tp2_whole_token_graph(barriers, forward)?;
+            self.capture_whole_token_graph(kind, barriers, forward)?;
             TpGraphStep::Captured
         } else {
             TpGraphStep::Replayed
         };
+        if kind == WholeTokenGraph::PeerPush {
+            self.tp_peer_push_inject_fault()?;
+        }
         for (rank, gpu) in self.devices.iter().enumerate() {
             let stream = gpu.active_stream.as_ref().ok_or_else(|| {
                 HipError::new(
                     0,
-                    &format!("TP2 whole-token graph rank {rank} has no active stream"),
+                    &format!("whole-token graph rank {rank} has no active stream"),
                 )
             })?;
             gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, stream)?;
@@ -1552,19 +1681,23 @@ impl Gpus {
         Ok(step)
     }
 
-    fn capture_tp2_whole_token_graph(
+    fn capture_whole_token_graph(
         &mut self,
+        kind: WholeTokenGraph,
         barriers: usize,
         forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
     ) -> HipResult<()> {
         let no_stream = |rank: usize| {
             HipError::new(
                 0,
-                &format!("TP2 whole-token graph rank {rank} has no active stream"),
+                &format!("whole-token graph rank {rank} has no active stream"),
             )
         };
         self.drop_rank_graphs(false);
-        self.begin_tp_graph_signal_capture()?;
+        match kind {
+            WholeTokenGraph::Tp2 => self.begin_tp_graph_signal_capture()?,
+            WholeTokenGraph::PeerPush => self.begin_tp_peer_push_capture()?,
+        }
         for rank in 0..self.devices.len() {
             let begin = {
                 let gpu = &mut self.devices[rank];
@@ -1585,12 +1718,15 @@ impl Gpus {
             self.abort_rank_graph_captures();
             return Err(error);
         }
-        let recorded = self.tp_graph_captured_signal_count();
+        let recorded = match kind {
+            WholeTokenGraph::Tp2 => self.tp_graph_captured_signal_count(),
+            WholeTokenGraph::PeerPush => self.tp_peer_push_captured_count(),
+        };
         if recorded != barriers {
             self.abort_rank_graph_captures();
             return Err(HipError::new(
                 0,
-                &format!("TP2 whole-token graph captured {recorded} barriers, expected {barriers}"),
+                &format!("whole-token graph captured {recorded} barriers, expected {barriers}"),
             ));
         }
         for rank in 0..self.devices.len() {
@@ -1669,6 +1805,9 @@ impl Gpus {
             {
                 first_error.get_or_insert(error);
             }
+        }
+        if let Err(error) = self.free_tp_peer_push() {
+            first_error.get_or_insert(error);
         }
         self.tp_graph_payload_bytes = 0;
         self.tp_graph_barrier_count = 0;
@@ -1763,6 +1902,7 @@ impl Gpus {
             tp_graph_payload_bytes: 0,
             tp_graph_barrier_count: 0,
             tp_graph_capture_epoch: 0,
+            tp_peer_push: None,
             mesh_execution: Default::default(),
         })
     }
@@ -2986,6 +3126,13 @@ impl Gpus {
                     0,
                     &format!("{operation}: TP graph peer shadows were not prepared before capture"),
                 ));
+            }
+            if self.tp_peer_push_serves(count) {
+                // Tagged peer-VRAM granules: one kernel per rank, no coherent
+                // host shadow, no fence. Bit-identical `x + (p0 + p1)`.
+                self.tp_peer_push_reduce(partials, residuals, count)?;
+                self.tp_graph_capture_epoch += 1;
+                return Ok(());
             }
             let segment = self.tp_graph_payload_bytes;
             for rank in 0..n {

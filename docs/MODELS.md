@@ -683,6 +683,10 @@ hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag
 
 Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). Unsupported GGUF quants fail closed in the quantizer.
 
+#### GGUF-native serving (developer tools, gfx1201, default off)
+
+With `HIPFIRE_GGUF_NATIVE=1`, `eval_hipfire`, `bench_qwen35_mq4` and `gguf_native_gen` load a dense Qwen3.5 / 3.6 / 3.8 `.gguf` as it is: the ggml blocks (IQ4_XS, Q4_K, Q5_K, Q6_K, Q8_0) are uploaded unchanged, never re-quantised, and the value-head order the exporter changed is undone on the host (row permutations) or carried with the weight (the `out_proj` K axis). Decode runs the `ggml.a8q81` route (activations quantised per 32 to q8_1, integer dot, f32 scale fold); prefill dequantises each weight to F16 and uses the F16 WMMA GEMM. The load log prints the model's bits per weight (summed over every tensor), the route and `kld_class=UNMEASURED` until a KLD run against a pinned teacher exists for the file. A GGUF whose MTP block holds a type outside the admitted set loads trunk-only with the reason named. The product CLI, daemon and `hipfire serve` do not load GGUF yet, and the legacy Q4_K / Q6_K kernels used by the quantizer path are unchanged. Env switches: [env-vars.md](env-vars.md) "GGUF-native".
+
 ---
 
 ## On-disk layout

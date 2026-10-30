@@ -664,6 +664,9 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
+    /// GGUF-native table in ggml block bytes (`DType::Ggml*`), dequantised per
+    /// row by the ggml get-row kernel of that type.
+    Ggml(DType),
 }
 
 /// Single-token embedding lookup, dispatched on the table's storage format.
@@ -684,6 +687,7 @@ pub fn embedding_lookup_dispatch(
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
+        EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup(dtype, table, output, token, dim),
     }
 }
 
@@ -2157,6 +2161,13 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             // tiled prefill GEMMs; lockstep with qwen35::is_batchable_la.
             | DType::TQ2G128
             | DType::BQ1G128
+            // GGUF-native block formats: unfused plain-GEMM prefill (lockstep
+            // with qwen35::is_batchable_la and the hipfire-dispatch widenings).
+            | DType::GgmlQ4K
+            | DType::GgmlQ5K
+            | DType::GgmlQ6K
+            | DType::GgmlQ8_0
+            | DType::GgmlIQ4XS
             // ParoQ4G64: per-projection batched Givens + portable HFQ4-G64
             // GEMM (`paro_g64_gemm`). ParoQ4G128 stays per-token here.
             | DType::ParoQ4G64
@@ -2802,6 +2813,9 @@ fn forward_prefill_chunk(
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Ggml(dtype) => {
+                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {
                     unreachable!()

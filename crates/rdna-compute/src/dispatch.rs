@@ -966,6 +966,22 @@ pub enum DType {
     E8PI4G128R256,
     /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
     E8PI4G128R128,
+    /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
+    /// Distinct from the legacy llama `Q4K` until that path is cut over to the
+    /// ggml kernels. Consumed only by the GGUF-native route (decode mmvq GEMV,
+    /// dequantising prefill GEMM, embedding gather; see `ggml_ops`): every other
+    /// execution site must refuse it by name ([`DType::ggml_name`]), never
+    /// reinterpret it as another dtype. `K % 256 == 0`.
+    GgmlQ4K,
+    /// ggml Q5_K (GGUF type 13): 176 B per 256 elements, 5.5 bpw. `K % 256 == 0`.
+    GgmlQ5K,
+    /// ggml Q6_K (GGUF type 14): 210 B per 256 elements, 6.5625 bpw. `K % 256 == 0`.
+    GgmlQ6K,
+    /// ggml Q8_0 (GGUF type 8): 34 B per 32 elements, 8.5 bpw. `K % 32 == 0`.
+    GgmlQ8_0,
+    /// ggml IQ4_XS (GGUF type 23): 136 B per 256 elements, 4.25 bpw (non-linear
+    /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
+    GgmlIQ4XS,
 }
 
 impl DType {
@@ -1028,7 +1044,12 @@ impl DType {
             | DType::MQ2I4G128R256
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
-            | DType::E8PI4G128R128 => 1, // byte-level
+            | DType::E8PI4G128R128
+            | DType::GgmlQ4K
+            | DType::GgmlQ5K
+            | DType::GgmlQ6K
+            | DType::GgmlQ8_0
+            | DType::GgmlIQ4XS => 1, // byte-level
         }
     }
 
@@ -1072,6 +1093,12 @@ impl DType {
                 .map(|scales| scales & !15)?
                 .checked_add(blocks.checked_mul(16)?)?
                 .checked_add(16),
+            // ggml block formats: whole blocks per row.
+            DType::GgmlQ4K => grouped(256, 144),
+            DType::GgmlQ5K => grouped(256, 176),
+            DType::GgmlQ6K => grouped(256, 210),
+            DType::GgmlQ8_0 => grouped(32, 34),
+            DType::GgmlIQ4XS => grouped(256, 136),
             // MQ-I4 is planar (codes plane, then scale plane): no per-row
             // stride exists, and the size needs M as well as K.
             DType::MQ3I4G128R256
@@ -1233,7 +1260,55 @@ impl DType {
                 | DType::MQ5G256V2
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
+                | DType::GgmlQ4K
+                | DType::GgmlQ5K
+                | DType::GgmlQ6K
+                | DType::GgmlIQ4XS
         )
+    }
+
+    /// Whether this is one of the ggml-format dtypes that carry GGUF block
+    /// bytes as-is (`Ggml*`). Distinct from the legacy llama `Q4K`/`Q6K`/`Q8_0`.
+    /// No kernel consumes them yet, so execution sites refuse them with
+    /// [`DType::ggml_refusal`] instead of falling through to another dtype.
+    pub fn is_ggml(self) -> bool {
+        self.ggml_name().is_some()
+    }
+
+    /// Canonical ggml type name of a `Ggml*` dtype; `None` for every other dtype.
+    pub fn ggml_name(self) -> Option<&'static str> {
+        match self {
+            DType::GgmlQ4K => Some("Q4_K"),
+            DType::GgmlQ5K => Some("Q5_K"),
+            DType::GgmlQ6K => Some("Q6_K"),
+            DType::GgmlQ8_0 => Some("Q8_0"),
+            DType::GgmlIQ4XS => Some("IQ4_XS"),
+            _ => None,
+        }
+    }
+
+    /// `(elements per block, bytes per block)` of a `Ggml*` dtype.
+    pub fn ggml_block(self) -> Option<(usize, usize)> {
+        match self {
+            DType::GgmlQ4K => Some((256, 144)),
+            DType::GgmlQ5K => Some((256, 176)),
+            DType::GgmlQ6K => Some((256, 210)),
+            DType::GgmlQ8_0 => Some((32, 34)),
+            DType::GgmlIQ4XS => Some((256, 136)),
+            _ => None,
+        }
+    }
+
+    /// Refusal text for an execution site that has no GGUF-native path and was
+    /// handed a `Ggml*` dtype; `None` for every other dtype.
+    pub fn ggml_refusal(self) -> Option<String> {
+        self.ggml_name().map(|name| {
+            format!(
+                "this route has no ggml kernel for GGUF {name} weights: GGUF-native serving \
+                 (HIPFIRE_GGUF_NATIVE=1) runs the decode GEMV and the dequantising prefill GEMM \
+                 only; use an MQ or HFQ model for this feature"
+            )
+        })
     }
 }
 
@@ -1595,6 +1670,10 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Memory the admitted context still needs, set by the loader after a
+    /// measured post-load fit so optional per-request allocations (DeltaNet
+    /// checkpoints beyond the charged one) yield to it. `None` = no floor.
+    pub kv_fit_floor: Option<KvFitFloor>,
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
@@ -1639,12 +1718,18 @@ pub struct Gpu {
     /// device address. Read after each step by
     /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
     device_wait: Option<crate::device_wait::DeviceWaitMapping>,
+    /// Device wait timeouts read (and so cleared) since the multi-GPU step
+    /// check last collected them; see [`Gpu::take_unreported_device_wait_timeouts`].
+    device_wait_unreported: std::sync::atomic::AtomicU32,
     /// Host-mapped router non-finite fault word (`crate::router_fault`), allocated
     /// at `Gpu` init and kept for the `Gpu`'s lifetime because captured graphs bake
     /// in its device address. Folded into [`Gpu::take_device_wait_error`].
     router_fault: Option<crate::router_fault::RouterFaultMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Host-mapped coherent buffer the S1 count barrier's copy kernel writes (two arrays),
+    /// reserved at load by `reserve_slowlink_count_host`.
+    pub slowlink_count_host: Option<hip_bridge::MappedHostBuffer>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
     /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
     /// every successful launch so `sync_with_deadline` can name the suspect
@@ -1722,6 +1807,10 @@ pub struct Gpu {
     pub qwen4_trunk_iu4: bool,
     /// Armed only by the noncompact Qwen4 eager prefill wrapper.
     pub qwen4_trunk_iu4_prefill_scope: bool,
+    /// Artifact-level MQ3V2 (qt49) symmetric grid contract. Set by the model
+    /// loader from HFQ `mq3v2.symmetric` metadata after group validation;
+    /// false for legacy/asymmetric artifacts.
+    pub mq3v2_symmetric: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -1835,6 +1924,15 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+}
+
+/// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvFitFloor {
+    /// The published (admitted) context in tokens.
+    pub admitted_tokens: usize,
+    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -2051,6 +2149,38 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
             }
         })
         .collect()
+}
+
+/// `hipErrorInvalidValue`: the code for a null device alias that HIP reported as success.
+const HOST_ALIAS_INVALID_CODE: u32 = 1;
+
+/// Resolve the GPU-addressable alias of a freshly `hipHostMalloc`'d mapping, failing closed.
+///
+/// A non-null alias is returned unchanged (it may differ from `host_ptr`). A lookup error or
+/// a null success frees `host_ptr` exactly once through `free_host` and returns an error;
+/// the host pointer is never substituted for the alias, because HIP documents it as invalid
+/// for kernels and the result would read as zeros or garbage rather than fail. A lookup
+/// error keeps its original code, with any cleanup failure appended as context.
+fn resolve_host_mapped_alias(
+    host_ptr: *mut c_void,
+    get_alias: impl FnOnce(*mut c_void) -> HipResult<*mut c_void>,
+    free_host: impl FnOnce(*mut c_void) -> HipResult<()>,
+) -> HipResult<*mut c_void> {
+    let mut error = match get_alias(host_ptr) {
+        Ok(alias) if !alias.is_null() => return Ok(alias),
+        Ok(_) => HipError::new(
+            HOST_ALIAS_INVALID_CODE,
+            "hipHostGetDevicePointer returned a null device alias for a host-mapped allocation",
+        ),
+        Err(error) => error,
+    };
+    if let Err(cleanup) = free_host(host_ptr) {
+        error.message.push_str(&format!(
+            "; additionally hipHostFree of the unaliased host allocation failed: {}",
+            cleanup.message
+        ));
+    }
+    Err(error)
 }
 
 impl Gpu {
@@ -2874,6 +3004,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            kv_fit_floor: None,
             dflash_gdn_replay_scratch: HashMap::new(),
             vmm_arenas: HashMap::new(),
             vmm_generations: HashMap::new(),
@@ -2882,8 +3013,10 @@ impl Gpu {
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
+            device_wait_unreported: std::sync::atomic::AtomicU32::new(0),
             router_fault: None,
             active_stream: None,
+            slowlink_count_host: None,
             last_kernel: None,
             #[cfg(feature = "lab")]
             lab_kernel_fault: LabKernelFaultCountdown::default(),
@@ -2917,6 +3050,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
@@ -2987,6 +3121,7 @@ impl Gpu {
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             qwen4_trunk_iu4_prefill_scope: false,
+            mq3v2_symmetric: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
@@ -4968,12 +5103,16 @@ impl Gpu {
     }
 
     /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
-    /// VMM owner: gfx1151 or gfx1201 (the arches with evidence for it), a
+    /// VMM owner: gfx1151, gfx1201, or gfx1100 unless
+    /// `HIPFIRE_QWEN4_VMM_GFX1100=0` (the arches with evidence for it), a
     /// platform the VMM KV backend is certified on (not native Windows, not
     /// WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
     pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
-        (self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+        (self.arch_caps.is_gfx1151()
+            || self.arch_caps.is_gfx1201()
+            || (self.arch_caps.is_gfx1100()
+                && hipfire_config::devices::qwen4_vmm_gfx1100_enabled()))
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }
@@ -5000,16 +5139,20 @@ impl Gpu {
             return self.qsa_gather_legacy(reserve_bytes).map(drop);
         }
         let reserve_bytes = reserve_bytes.max(1);
-        if self
-            .scratch
-            .qsa_gather_vmm
-            .as_ref()
-            .is_some_and(|workspace| workspace.byte_size() >= reserve_bytes)
-        {
+        let action = crate::scratch::qsa_gather_reserve_action(
+            self.scratch
+                .qsa_gather_vmm
+                .as_ref()
+                .map(GpuTensor::byte_size),
+            reserve_bytes,
+        );
+        if action == crate::scratch::QsaGatherReserve::Keep {
             return Ok(());
         }
         self.refuse_qsa_gather_growth_while_armed(reserve_bytes)?;
-        if self.scratch.qsa_gather_vmm.is_some() {
+        if action == crate::scratch::QsaGatherReserve::ReplaceRetiring {
+            // Never unmap/remap the live VA in place: release retires it (the
+            // range stays reserved) and the allocation below takes a new one.
             self.invalidate_for_scratch_growth();
             self.release_qsa_gather_workspace()?;
         }
@@ -6840,27 +6983,13 @@ impl Gpu {
             })?;
         // The device alias is what kernels are handed; the host pointer is what
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
-        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
-            Ok(p) if !p.is_null() => p,
-            other => {
-                // Loud, once: HIP documents that the mapped device pointer differs
-                // from the host pointer on discrete GPUs and that
-                // `hipHostGetDevicePointer` is *required* to obtain the one a kernel
-                // may dereference (hipHostMallocDefault alone does not map). Falling
-                // back to the host pointer therefore hands kernels a pointer HIP
-                // calls invalid, which reads as zeros or garbage rather than an
-                // error -- indistinguishable from a bad weight downstream.
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[host-mapped] hipHostGetDevicePointer failed ({other:?}); using the host \
-                         pointer as the device alias -- GPU reads of these bytes are undefined \
-                         (CPU reads via host_bytes stay correct, so the two disagree silently)"
-                    );
-                });
-                host_ptr
-            }
-        };
+        // Fail closed: a missing alias frees the allocation and refuses the load; the
+        // host pointer is never handed to kernels in its place.
+        let dev_ptr = resolve_host_mapped_alias(
+            host_ptr,
+            |host| self.hip.host_get_device_pointer(host, 0),
+            |host| self.hip.host_free(host),
+        )?;
         let key = dev_ptr as usize;
         if self.host_mapped.insert(key, host_ptr as usize).is_some() {
             self.host_mapped.remove(&key);
@@ -6972,9 +7101,24 @@ impl Gpu {
     /// with this.
     pub fn take_device_wait_timeout(&self) -> Option<crate::device_wait::DeviceWaitTimeout> {
         // bind_thread: skip — reads host memory only, touches no device state.
-        self.device_wait
+        let timeout = self
+            .device_wait
             .as_ref()
-            .and_then(|mapping| mapping.take(self.device_id))
+            .and_then(|mapping| mapping.take(self.device_id));
+        if timeout.is_some() {
+            self.device_wait_unreported
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        timeout
+    }
+
+    /// Timeouts this GPU's wait block reported since the last call, whoever
+    /// read them: a `download_*` reader clears the record on its own rank, so
+    /// the multi-GPU step check (`Gpus::take_device_wait_errors`) would
+    /// otherwise never learn the step failed and skip the TP state reset.
+    pub fn take_unreported_device_wait_timeouts(&self) -> u32 {
+        self.device_wait_unreported
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Fail if a bounded device spin wait on this GPU stopped on its deadline
@@ -10249,6 +10393,81 @@ mod lab_fn_carve_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_alias_lookup_error_frees_once_and_propagates_original() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |p| {
+                assert_eq!(p, h);
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_null_is_explicit_error_never_host_pointer() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let r = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(std::ptr::null_mut()),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.message.contains("null device alias"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_cleanup_failure_keeps_original_cause_and_context() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |_| {
+                frees.set(frees.get() + 1);
+                Err(hip_bridge::HipError::new(1, "free refused"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert!(err.message.contains("hipHostFree"));
+        assert!(err.message.contains("free refused"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_distinct_from_host_is_returned_without_cleanup() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let a = 0x9000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let got = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(a),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, a);
+        assert_ne!(got, h);
+        assert_eq!(frees.get(), 0);
+    }
+
     #[cfg(feature = "lab")]
     #[test]
     fn lab_kernel_fault_counts_successes_then_fails_once_and_disarms() {
@@ -10450,6 +10669,47 @@ mod tests {
         }
         assert!(!DType::MQ4G128V2.is_mq_i4());
         assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
+    }
+
+    /// The ggml dtypes carry GGUF block bytes as-is: distinct from the legacy
+    /// llama `Q4K`/`Q6K`/`Q8_0`, exact per-row bytes, and a named refusal for
+    /// every execution site (no ggml kernel exists yet).
+    #[test]
+    fn ggml_dtypes_are_distinct_byte_level_and_refused_by_name() {
+        for (dt, name, elems, bytes) in [
+            (DType::GgmlQ4K, "Q4_K", 256, 144),
+            (DType::GgmlQ5K, "Q5_K", 256, 176),
+            (DType::GgmlQ6K, "Q6_K", 256, 210),
+            (DType::GgmlQ8_0, "Q8_0", 32, 34),
+            (DType::GgmlIQ4XS, "IQ4_XS", 256, 136),
+        ] {
+            assert_eq!(dt.size(), 1, "{name}");
+            assert!(dt.is_ggml());
+            assert_eq!(dt.ggml_name(), Some(name));
+            assert_eq!(dt.ggml_block(), Some((elems, bytes)));
+            assert_eq!(dt.row_bytes(elems * 20), Some(20 * bytes), "{name}");
+            let refusal = dt.ggml_refusal().expect("refusal text");
+            assert!(
+                refusal.contains(name) && refusal.contains("no ggml kernel"),
+                "{refusal}"
+            );
+            assert_eq!(dt.requires_k_mod_256(), elems == 256, "{name}");
+        }
+        // never aliases a legacy dtype.
+        assert_ne!(DType::GgmlQ4K, DType::Q4K);
+        assert_ne!(DType::GgmlQ6K, DType::Q6K);
+        assert_ne!(DType::GgmlQ8_0, DType::Q8_0);
+        for legacy in [
+            DType::Q4K,
+            DType::Q6K,
+            DType::Q8_0,
+            DType::MQ4G256V2,
+            DType::F16,
+        ] {
+            assert!(!legacy.is_ggml());
+            assert_eq!(legacy.ggml_refusal(), None);
+            assert_eq!(legacy.ggml_block(), None);
+        }
     }
 
     #[test]

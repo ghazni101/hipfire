@@ -81,6 +81,7 @@ v_add_f32_e32	vop2	0x3	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_add_f32_e3
 v_sub_f32_e32	vop2	0x4	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_sub_f32_e32 v174, v209, v173	095D5BD1	-
 v_mul_f32_e32	vop2	0x8	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_f32_e32 v194, s2, v3	11840602	-
 v_mul_u32_u24_e32	vop2	0xb	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_u32_u24_e32 v8, 0x408, v8	161010FF 00000408	-
+v_mul_hi_u32_u24_e32	vop2	0xc	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_hi_u32_u24_e32 v2, 36, v12	180418A4	-
 v_min_i32_e32	vop2	0x11	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_i32_e32 v8, s15, v8	2210100F	-
 v_max_i32_e32	vop2	0x12	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_i32_e32 v9, 0, v9	24121280	-
 v_min_u32_e32	vop2	0x13	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_u32_e32 v11, s15, v11	2616160F	-
@@ -275,7 +276,7 @@ s_mov_b64	sop1	0x1	SDST:64,SSRC0:64	SDST	SSRC0	-	-	s_mov_b64 s[26:27], 0	BE9A018
 s_mul_u64	sop2	0x55	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	-	-	s_mul_u64 s[2:3], s[12:13], s[0:1]	AA82000C	-
 s_or_b64	sop2	0x19	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	-	-	s_or_b64 s[4:5], s[8:9], s[2:3]	8C840208	-
 s_or_not1_b32	sop2	0x24	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_or_not1_b32 s25, s25, exec_lo	92197E19	-
-s_prefetch_data	smem	0x26	SBASE:64,SOFFSET:32	-	SBASE,SOFFSET	-	-	s_prefetch_data s[16:17], 0x110, null, 0	F404C008 F8000110	w0_extra:ignored:0x2080000:0x0,w1_extra:ignored:0x1000000:0x0
+s_prefetch_data	smem	0x26	SBASE:64,SOFFSET:32	-	SBASE,SOFFSET	-	-	s_prefetch_data s[16:17], 0x110, null, 0	F404C008 F8000110	w0_extra:ignored:0x2080000:0x0,w1_extra:ignored:0x1000000:0x0,smem_len:honored:0x7c0:0x0/0x40/0x80/0xc0/0x100/0x140/0x180/0x1c0/0x200/0x240/0x280/0x2c0/0x300/0x340/0x380/0x3c0/0x400/0x440/0x480/0x4c0/0x500/0x540/0x580/0x5c0/0x600/0x640/0x680/0x6c0/0x700/0x740/0x780/0x7c0
 s_rndne_f32	sop1	0x63	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_rndne_f32 s15, s13	BE8F630D	-
 s_setpc_b64	sop1	0x48	SSRC0:64	-	SSRC0	pc:w	-	s_setpc_b64 s[102:103]	BE804866	-
 s_sext_i32_i16	sop1	0xf	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_sext_i32_i16 s7, s7	BE870F07	-
@@ -365,6 +366,7 @@ v_mul_i32_i24_e32	vop2	0x9	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_i3
 v_perm_b32	vop3	0x244	VDST:32,SRC0:32,SRC1:32,SRC2:32,literal@last	VDST	SRC0,SRC1,SRC2	-	-	v_perm_b32 v25, v19, v21, 0x504010c	D6440019 03FE2B13 0504010C	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_pk_fma_f16	vop3p	0xe	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_pk_fma_f16 v12, v12, s3, s16	CC0E400C 1840070C	w0_extra:ignored:0x800000:0x0
 v_pk_mul_f16	vop3p	0x10	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_mul_f16 v33, v12, v33	CC104021 1A02430C	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_pk_lshrrev_b16	vop3p	0x5	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_lshrrev_b16 v20, 8, v20 op_sel:[1,0] op_sel_hi:[0,0]	CC054814 02022888	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_pk_add_f16	vop3p	0xf	VDST:32,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	-	-	v_pk_add_f16 v64, 0xe480, v64 op_sel_hi:[0,1]	CC0F4040 120280FF 0000E480	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_rcp_iflag_f32_e32	vop1	0x2b	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rcp_iflag_f32_e32 v1, v1	7E025701	w0_extra:ignored:0x10000:0x0
 v_rsq_f32_e32	vop1	0x2e	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rsq_f32_e32 v0, v0	7E005D00	w0_extra:ignored:0x10000:0x0
@@ -526,3 +528,7 @@ v_cmpx_lt_i64_e32	vopc	0xd1	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_eq_u64_e32	vopc	0xda	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u64_e32 0, v[7:8]	7DB40E80	-
 v_cmpx_le_u64_e32	vopc	0xdb	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u64_e32 s[22:23], v[2:3]	7DB60416	-
 v_cmpx_gt_u64_e32	vopc	0xdc	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u64_e32 s[2:3], v[3:4]	7DB80602	-
+s_and_not1_b64	sop2	0x23	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_and_not1_b64 exec, exec, s[2:3]	91FE027E	-
+s_and_not1_saveexec_b64	sop1	0x31	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_not1_saveexec_b64 s[0:1], s[24:25]	BE803118	-
+s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b64 s[0:1], s[0:1]	BE802300	-
+s_code_end	sopp	0x1f	-	-	-	-	-	s_code_end	BF9F0000	-

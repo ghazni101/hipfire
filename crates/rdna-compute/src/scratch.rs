@@ -358,6 +358,9 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// GGUF-native route scratch (q8_1 activation row, prefill dequantisation
+    /// region); see [`crate::ggml_ops`].
+    pub ggml: crate::ggml_ops::GgmlScratch,
     /// Int8 activation scratch `(xq, dx)` of the opt-in exact-gfx1100
     /// small-batch verify GEMV (`gemv_q8x.rs`), allocated on first use.
     pub q8x_act: Option<(GpuTensor, GpuTensor)>,
@@ -1559,6 +1562,35 @@ pub(crate) fn vmm_prefix_growth(
     needed
         .checked_next_multiple_of(granularity)?
         .checked_sub(mapped)
+}
+
+/// What [`crate::Gpu::qsa_gather_reserve`] does for a VMM gather workspace
+/// asking for `requested` bytes when `reserved` bytes of virtual extent are
+/// held (`None`: nothing reserved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QsaGatherReserve {
+    /// The held reservation already covers the request; nothing is touched.
+    Keep,
+    /// Nothing is held: reserve a fresh VA.
+    Reserve,
+    /// A smaller reservation is held. Its pages are never unmapped and
+    /// remapped in place (gfx1100: a remapped VA keeps translating to the old
+    /// backing): the old arena is released (VA retired, never reused) and a
+    /// fresh VA is reserved.
+    ReplaceRetiring,
+}
+
+/// See [`QsaGatherReserve`]. A reservation is never shrunk and never grown in
+/// place.
+pub(crate) fn qsa_gather_reserve_action(
+    reserved: Option<usize>,
+    requested: usize,
+) -> QsaGatherReserve {
+    match reserved {
+        Some(held) if held >= requested => QsaGatherReserve::Keep,
+        Some(_) => QsaGatherReserve::ReplaceRetiring,
+        None => QsaGatherReserve::Reserve,
+    }
 }
 
 /// Byte size of the `q8_1_mmq_x_scratch` slot for `(k, batch_size)`: one 144 B
@@ -4283,6 +4315,150 @@ mod scratch_growth_tests {
         // Past the reservation, or without a granularity: refused.
         assert_eq!(vmm_prefix_growth(2 * G, 5 * G / 2, G, 5 * G / 2 + 1), None);
         assert_eq!(vmm_prefix_growth(0, 64 * G, 0, 1), None);
+    }
+
+    /// gfx1100 map-only discipline for the gather workspace: a held
+    /// reservation is kept when it covers the request, never shrunk, and a
+    /// larger request replaces it with a fresh VA (the old one is released and
+    /// retired by `VmmArena::release`), never grown or remapped in place.
+    #[test]
+    fn qsa_gather_reservation_is_never_shrunk_or_grown_in_place() {
+        use QsaGatherReserve::{Keep, ReplaceRetiring, Reserve};
+        assert_eq!(qsa_gather_reserve_action(None, 1), Reserve);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 100), Keep);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 1), Keep);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 101), ReplaceRetiring);
+        // The two fixed decode reservations (F32 split-K 48 splits, q8 split-KV
+        // 32 splits) in either arrival order: at most one replacement, and the
+        // larger one then serves both.
+        let (small, large) = (32 * 1028 * 24 * 64, 48 * 1032 * 24 * 64);
+        let mut held = None;
+        let mut replacements = 0;
+        for request in [small, large, small, large, small] {
+            match qsa_gather_reserve_action(held, request) {
+                Keep => {}
+                Reserve => held = Some(request),
+                ReplaceRetiring => {
+                    replacements += 1;
+                    held = Some(request);
+                }
+            }
+        }
+        assert_eq!((held, replacements), (Some(large), 1));
+    }
+
+    /// Mapping the gather workspace (and, by the same rule, a QSA arena) only
+    /// advances the mapped frontier: every growth is a whole number of pages,
+    /// the prefix after it covers the request, and nothing ever asks for the
+    /// mapped prefix to shrink.
+    #[test]
+    fn vmm_prefix_growth_only_moves_the_frontier_forward() {
+        const G: usize = 2 << 20;
+        let reserved = 64 * G;
+        let mut mapped = 0usize;
+        for needed in [1, G, 5 * G + 3, 3 * G, 7, 64 * G, 64 * G - 1] {
+            let grow = vmm_prefix_growth(mapped, reserved, G, needed).unwrap();
+            assert_eq!(grow % G, 0, "growth must be whole pages");
+            let next = mapped + grow;
+            assert!(next >= mapped && next >= needed && next <= reserved);
+            if needed <= mapped {
+                assert_eq!(grow, 0, "a covered request maps nothing");
+            }
+            mapped = next;
+        }
+    }
+
+    /// Source audit (CPU) of the gfx1100 VMM growth path in `dispatch.rs`:
+    /// growth only calls the arena's forward map; the gather reserve's one
+    /// replacement path releases (retires) the old reservation before it
+    /// allocates a fresh VA; neither unmaps, remaps or frees on any other path.
+    /// hipMemUnmap is not called from this crate at all.
+    #[test]
+    fn gather_and_vmm_growth_paths_never_unmap_or_remap_a_live_va() {
+        fn code(source: &str, signature: &str, end: &str) -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"));
+            let rest = &source[start..];
+            let body = &rest[..rest.find(end).expect("end of function")];
+            body.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let src = include_str!("dispatch.rs");
+        let unmap = format!("{}{}", "mem_", "unmap");
+        let never = |body: &str, what: &str, extra: &[&str]| {
+            for token in [unmap.as_str(), "mem_release", "free_tensor", "release("]
+                .into_iter()
+                .chain(extra.iter().copied())
+            {
+                assert!(!body.contains(token), "{what} contains `{token}`");
+            }
+        };
+
+        let grow = code(src, "fn grow_vmm_tensor_impl(", "\n    }\n");
+        never(&grow, "grow_vmm_tensor_impl", &["alloc_vmm_tensor"]);
+        assert!(grow.contains(".map_next(") && grow.contains(".map_next_granules("));
+
+        let prefix = code(src, "fn map_qsa_gather_prefix(", "\n    }\n");
+        never(&prefix, "map_qsa_gather_prefix", &["alloc_vmm_tensor"]);
+        assert!(prefix.contains("grow_vmm_tensor("));
+
+        let scratch = code(src, "pub(crate) fn qsa_gather_scratch(", "\n    }\n");
+        never(&scratch, "qsa_gather_scratch", &["alloc_vmm_tensor"]);
+        assert!(scratch.contains("map_qsa_gather_prefix("));
+
+        let reserve = code(src, "pub(crate) fn qsa_gather_reserve(", "\n    }\n");
+        never(&reserve, "qsa_gather_reserve", &[]);
+        let replace = reserve
+            .find("QsaGatherReserve::ReplaceRetiring")
+            .expect("replacement branch");
+        let release = reserve
+            .find("release_qsa_gather_workspace()")
+            .expect("old reservation is released");
+        let alloc = reserve.find("alloc_vmm_tensor(").expect("fresh VA");
+        assert!(
+            replace < release && release < alloc,
+            "a replaced reservation must be released (VA retired) before the fresh one is reserved"
+        );
+        assert_eq!(reserve.matches("release_qsa_gather_workspace()").count(), 1);
+
+        // The release wrapper only frees the arena owner (VmmArena::release
+        // unmaps its own segments and retires the VA).
+        let wrapper = code(
+            src,
+            "pub(crate) fn release_qsa_gather_workspace(",
+            "\n    }\n",
+        );
+        assert!(wrapper.contains("free_tensor(workspace)"));
+        assert!(!wrapper.contains(unmap.as_str()));
+
+        // No hipMemUnmap in rdna-compute at all: the only unmapping is inside
+        // hip-bridge's VmmArena teardown.
+        fn scan(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    scan(&path, needle, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    if text.contains(needle) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &format!(".{unmap}("),
+            &mut hits,
+        );
+        assert!(
+            hits.is_empty(),
+            "direct hipMemUnmap in rdna-compute: {hits:?}"
+        );
     }
 
     /// Geometry helpers shared by the ensure bodies and the `Gpu` guards:

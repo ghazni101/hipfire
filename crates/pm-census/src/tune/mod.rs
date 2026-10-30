@@ -18,11 +18,14 @@
 //!   `kld_state` stage judges model-level KLD / state-equality evidence.
 //! * [`kld`] (R7): HFKSEQ reader, paired per-chunk KLD statistics and the
 //!   `pm-census tune kld|promote|trial-table` CLI.
+//! * [`ktok`] (R9): HFKTOK reader, the token-bootstrap statistic over per-token
+//!   paired differences and the `kld-power` sample-size calculation.
 //!
 //! The types below are the frozen contract between those modules.
 
 pub mod domain;
 pub mod kld;
+pub mod ktok;
 pub mod promote;
 pub mod run;
 pub mod store;
@@ -144,6 +147,10 @@ pub struct TuneEvidenceV1 {
     /// Model-level KLD / state-equality evidence (see [`kld`]).
     #[serde(default)]
     pub kld_state: Option<KldStateEvidenceV1>,
+    /// Token-bootstrap KLD evidence (R9, see [`ktok`]); when present it decides
+    /// the numeric `kld_state` verdict instead of `kld_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kld_token: Option<KldTokenEvidenceV2>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -293,6 +300,12 @@ pub struct KldRunV1 {
     pub selected_code_object_sha256: Option<String>,
     pub kldseq_path: String,
     pub kldseq_sha256: String,
+    /// HFKTOK v1 per-token file of the run (`eval_hipfire --per-token-output`);
+    /// required by the `token-bootstrap` statistic only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ktok_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ktok_sha256: Option<String>,
     pub device_uuid: String,
     /// Fabric job id when known (the hold's child does not see it).
     #[serde(default)]
@@ -334,4 +347,77 @@ pub struct ProductSelectV1 {
     /// Relative to the table file's directory (absolute also accepted).
     pub code_object: String,
     pub code_object_sha256: String,
+}
+
+/// `schema` of [`KldTokenEvidenceV2`].
+pub const KLD_TOKEN_SCHEMA: &str = "hipfire.kld_token_evidence.v2";
+/// `stat` of [`TokenBootstrapV2`].
+pub const KLD_TOKEN_STAT: &str = "token-bootstrap";
+
+/// One reference corpus of a token-bootstrap evidence: an incumbent/candidate
+/// run pair, their HFKTOK per-token files re-read and hash-verified, and the
+/// per-stratum diagnostics of the per-token paired differences
+/// `d = candidate - incumbent`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KldStratumV2 {
+    /// Caller-chosen corpus label (`wt2`, `ag`, ...).
+    pub label: String,
+    pub incumbent: KldRunV1,
+    pub candidate: KldRunV1,
+    pub n_chunks: usize,
+    pub tokens_per_chunk: usize,
+    /// Token-weighted mean of `d` over the stratum.
+    pub mean_diff: f64,
+    /// Sample sd (n-1) of `d` over the stratum's tokens.
+    pub sd_token: f64,
+    /// Sample sd (n-1) of the stratum's per-chunk mean differences.
+    pub sd_chunk: f64,
+    /// Design effect `sd_chunk^2 * tokens_per_chunk / sd_token^2` (0 when `sd_token` is 0).
+    pub deff: f64,
+    /// Share of `sum |d|` carried by the top 1% `|d|` tokens of the stratum.
+    pub top1pct_abs_share: f64,
+    /// Every per-token difference of the stratum is exactly 0.
+    pub exact: bool,
+}
+
+/// The pooled token-bootstrap statistic over every stratum.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TokenBootstrapV2 {
+    /// Always [`KLD_TOKEN_STAT`].
+    pub stat: String,
+    pub n_strata: usize,
+    pub n_chunks: usize,
+    pub n_tokens: usize,
+    /// Token-weighted mean of `d` over every stratum.
+    pub point: f64,
+    /// Stratified chunk-level standard error of `point`.
+    pub se: f64,
+    /// One-sided 95% upper bound: 95th percentile of the stratified chunk block bootstrap.
+    pub boot_hi95: f64,
+    /// One-sided 95% normal-theory upper bound: `point + 1.645 * se`.
+    pub normal_hi95: f64,
+    pub boot_b: usize,
+    /// SplitMix64 seed of the bootstrap stream.
+    pub seed: u64,
+    /// Sample sd of `d` over all tokens.
+    pub sd_token: f64,
+    /// Effective per-chunk sd of the stratified estimator: `se * sqrt(n_chunks)`
+    /// (the single-stratum chunk sd; the `--sd` of `pm-census tune kld-power`).
+    pub sd_chunk: f64,
+    /// Share of `sum |d|` carried by the top 1% `|d|` tokens over all strata.
+    pub top1pct_abs_share: f64,
+    /// Every per-token difference of every stratum is exactly 0.
+    pub exact: bool,
+}
+
+/// Model-level KLD evidence under the token-bootstrap statistic. Held in
+/// [`TuneEvidenceV1::kld_token`]; the frozen V1 evidence types are unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KldTokenEvidenceV2 {
+    /// Always [`KLD_TOKEN_SCHEMA`].
+    pub schema: String,
+    /// `screen` or `promotion`.
+    pub grade: String,
+    pub strata: Vec<KldStratumV2>,
+    pub stat: TokenBootstrapV2,
 }

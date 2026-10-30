@@ -103,7 +103,14 @@ pub fn lift_raw(
             hex(&spec.exec_sha256)
         )));
     }
-    let body = decode_body(name, code, spec.extent.offset, arch, spec.binary_sha256)?;
+    let body = decode_body(
+        name,
+        code,
+        spec.extent.offset,
+        arch,
+        spec.binary_sha256,
+        Frontend::Aco,
+    )?;
 
     // Relocations may only name an instruction literal dword.
     let mut literals = BTreeSet::new();

@@ -63,6 +63,9 @@ pub struct RefReport {
     pub pass: bool,
 }
 
+/// The `--kernel`s that take `--pool` / `--flush-l2` / `--flush` (cold timing with a rotating weight pool).
+pub const COLD_KERNELS: [&str; 2] = ["iu4_gemm", "qkvzaset"];
+
 /// Raw `--key value` flags the driver did not consume. A module `take`s the
 /// flags it understands and the driver errors on whatever is left.
 #[derive(Clone, Debug, Default)]
@@ -129,6 +132,18 @@ pub trait Workload {
     fn output(&self, gpu: &Gpu, arm: Arm) -> Result<Vec<u8>>;
     /// Compare a downloaded output to the CPU reference.
     fn check(&self, out: &[u8]) -> Result<RefReport>;
+    /// [`Workload::check`] of `arm`'s output, for a workload whose arms follow
+    /// different references (a numeric candidate against an exact baseline).
+    fn check_arm(&self, _arm: Arm, out: &[u8]) -> Result<RefReport> {
+        self.check(out)
+    }
+    /// Declared numeric contract `{baseline, candidate, relation}` of the record
+    /// (`relation` `"exact"` or `"numeric"`, as [`ChainWorkload::numeric_contract`]);
+    /// `Null`: the workload declares none and the record carries no
+    /// `numeric_contract` field.
+    fn numeric_contract(&self) -> Value {
+        Value::Null
+    }
     /// Max absolute element difference between two outputs (interpreting the
     /// bytes in the kernel's output dtype); `inf` if any element differs in
     /// NaN-ness. 0.0 iff element-wise equal.
@@ -144,6 +159,44 @@ pub trait Workload {
     /// shape if every instruction is qualified; otherwise
     /// `Value::String("refused (<reason>)")`. Never fabricate a result.
     fn emu(&self) -> Value;
+
+    /// `--emu`, pre-card gate: run `cand` and the incumbent `base` object on the peacemaker emulator
+    /// (complete grid, every buffer its own exact-size region with unmapped guard gaps, definedness-tracked
+    /// LDS) and return the `emu_gate` record `{status: "pass"|"fail", reason, shape, instructions,
+    /// workgroups, cand_out_sha256, base_out_sha256, ..}`. `None`: this workload has no emulator gate.
+    fn emu_gate(&self, _cand: &Object, _base: &Object) -> Option<Value> {
+        None
+    }
+
+    /// `--pool` / `--flush-l2` / `--flush` (cold timing, `support/cold.rs`): called once after
+    /// construction, before `setup`, with the mode (never `Hot`). A workload that supports it
+    /// allocates a rotating weight pool in `setup` ([`Workload::pool_sets`] sets whose total exceeds
+    /// the last-level cache) and records the mode with `cold::annotate_shape` in its `shape_json`;
+    /// the driver evicts the caches between timed dispatches. The default refuses.
+    fn set_cold(&mut self, mode: crate::cold::ColdMode) -> Result<()> {
+        Err(format!(
+            "{} is not supported by --kernel {} (cold timing: {})",
+            mode.flag(),
+            self.kernel(),
+            COLD_KERNELS.join(", ")
+        ))
+    }
+    /// Distinct weight sets a timing pool cycles (1: no pool, every dispatch reads the same weights).
+    fn pool_sets(&self) -> usize {
+        1
+    }
+    /// [`Workload::launch`] with weight set `set` (`0..pool_sets()`; set 0 is the correctness set the
+    /// CPU reference reads). The driver issues timed dispatch `i` on set `i % pool_sets()`.
+    fn launch_set(&self, arm: Arm, _set: usize) -> Launch {
+        self.launch(arm)
+    }
+    /// A NULL kernel with the baseline's resource descriptor (VGPRs, LDS, kernarg size) whose body is
+    /// a single `s_endpgm`, launched with [`Workload::launch_set`]'s grid, block, LDS and kernarg: its
+    /// hipEvent time is the fixed dispatch cost the driver reports as `timing.null_dispatch`.
+    /// `Ok(None)`: this workload has none.
+    fn null_object(&self) -> Result<Option<Object>> {
+        Ok(None)
+    }
 }
 
 /// Construction context the driver hands a [`ChainWorkload`].

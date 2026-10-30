@@ -105,9 +105,10 @@
 //! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm.
 //! These arms follow the product switch: `copy` is
 //! `hipfire_config::mtp_ngram_copy_enabled_for_arch` of the loaded GPU
-//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by default:
-//! the native-MTP n-gram takeover; `HIPFIRE_MTP_NGRAM_COPY=on` runs them on
-//! the copy lane). The mode is recorded as `copy_lane` in every arm's config,
+//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`; `auto` is the
+//! copy lane on gfx1151 / gfx1201 and the native-MTP 5/3/3 takeover elsewhere;
+//! `HIPFIRE_MTP_NGRAM_COPY=off` runs them on the 5/3/3 pool, `on` on the copy
+//! lane). The mode is recorded as `copy_lane` in every arm's config,
 //! and the parent resolves it from each arm's receipt GPU, so ids of one mode
 //! are never reused as the other's:
 //!
@@ -1377,7 +1378,18 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         (temp, top_p, top_k, min_p),
         trials,
     );
-    let ids_path = dir.join(format!("{arm}.ids.json"));
+    // `HIPFIRE_SAMPLED_MTP_SHARD=START..END` runs a slice of the global trial
+    // indices (seeds stay global) and writes `<arm>.<START>-<END>.*`; unset
+    // keeps the whole-arm `<arm>.*` files. `sampled_mtp_merge_short_shards`
+    // joins shards into the whole-arm files the parent comparison reads.
+    let (start, end) = shard_range(arm, trials)?;
+    let sharded = (start, end) != (0, trials);
+    let stem = if sharded {
+        format!("{arm}.{start}-{end}")
+    } else {
+        arm.to_string()
+    };
+    let ids_path = dir.join(format!("{stem}.ids.json"));
     if ids_path.exists() {
         check_config(&ids_path, &settings_config)?;
     }
@@ -1399,14 +1411,14 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     );
     println!("ARM {arm} config {settings_config}");
     let started = std::time::Instant::now();
-    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
     if arm == "ar" {
         let logits = loaded
             .gpu
             .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
             .map_err(|e| e.to_string())?;
         let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
-        for trial in 0..trials {
+        for trial in start..end {
             let seed = trial_seed(0xA11, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
@@ -1419,7 +1431,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
         };
-        for trial in 0..trials {
+        for trial in start..end {
             let seed = trial_seed(0x5EC, trial);
             let result = run(&mut loaded, seed)?;
             evidence.observe(
@@ -1435,28 +1447,27 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         // Only a forced floor-off route replays byte for byte; the adaptive
         // route's choices depend on wall-clock prices.
         if hw_identity::forced_floor_off(&env) {
-            for trial in 0..REPLAYS.min(trials) {
+            let replays = REPLAYS.min(end - start);
+            for local in 0..replays {
+                let trial = start + local;
                 let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
-                if replay.ids != samples[trial] {
+                if replay.ids != samples[local] {
                     return Err(format!(
                         "seed {} replayed {:?}, first run {:?}",
                         trial + 1,
                         replay.ids,
-                        samples[trial]
+                        samples[local]
                     ));
                 }
             }
-            println!(
-                "ARM {arm} replayed {} seeds identically",
-                REPLAYS.min(trials)
-            );
+            println!("ARM {arm} replayed {replays} seeds identically");
         } else {
             println!(
                 "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
                 hw_identity::route_class(&env)
             );
         }
-        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
+        evidence.write(dir, &stem, budget, LATE_MARGINALS[0])?;
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
     // Positions after an EOS read as EOS.
@@ -1464,7 +1475,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         ids.resize(TOKENS, eos);
     }
     println!(
-        "ARM {arm} {trials} trials in {:.1}s; first sample: {:?}",
+        "ARM {arm} trials {start}..{end} in {:.1}s; first sample: {:?}",
         started.elapsed().as_secs_f64(),
         loaded.tokenizer.decode(&samples[0])
     );
@@ -1479,6 +1490,125 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         .bundle
         .free_gpu(&mut loaded.gpu)
         .map_err(|e| e.to_string())
+}
+
+/// Joins the shards of each short arm (`<arm>.<START>-<END>.*` written by
+/// `sampled_mtp_distribution_arm` under `HIPFIRE_SAMPLED_MTP_SHARD`) into the
+/// whole-arm files the parent comparison reuses: ids concatenated in trial
+/// order, the (identical) config and receipt of the first shard, evidence
+/// counters summed and per-trial rows / texts concatenated. CPU only: no GPU,
+/// no model read. Shards must cover `0..trials` exactly once and carry equal
+/// configs; the parent still checks the merged config against the current
+/// environment, so a stale or mixed shard set fails there.
+#[test]
+#[ignore = "CPU only: merges shards written by sampled_mtp_distribution_arm; needs HIPFIRE_SAMPLED_MTP_OUT"]
+fn sampled_mtp_merge_short_shards() {
+    let dir = out_dir();
+    let trials: usize = env_or(TRIALS_ENV, 2000);
+    for arm in ARMS {
+        let shards = late_shards(&dir, arm).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!shards.is_empty(), "{arm}: no shards in {}", dir.display());
+        let gaps = shard_gaps(&shards, trials).unwrap_or_else(|e| panic!("{arm}: {e}"));
+        assert!(
+            gaps.is_empty(),
+            "{arm}: shards leave {gaps:?} of 0..{trials} uncovered"
+        );
+        let ids_file = |r: (usize, usize), ext: &str| late_file(&dir, arm, r, ext);
+        let mut ids: Vec<Vec<u32>> = Vec::new();
+        let config =
+            read_json(&ids_file(shards[0], "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+        for &r in &shards {
+            let c = read_json(&ids_file(r, "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                c, config,
+                "{arm}: shard {r:?} was produced under a different config"
+            );
+            let part: Vec<Vec<u32>> =
+                serde_json::from_slice(&fs::read(ids_file(r, "ids.json")).expect("shard ids"))
+                    .expect("shard ids json");
+            assert_eq!(
+                part.len(),
+                r.1 - r.0,
+                "{arm}: shard {r:?} holds {} trials",
+                part.len()
+            );
+            ids.extend(part);
+        }
+        assert_eq!(ids.len(), trials);
+        let whole = dir.join(format!("{arm}.ids.json"));
+        fs::write(&whole, serde_json::to_vec(&ids).unwrap()).unwrap();
+        write_config(&whole, &config).unwrap_or_else(|e| panic!("{e}"));
+        let receipt =
+            read_json(&ids_file(shards[0], "ids.receipt.json")).unwrap_or_else(|e| panic!("{e}"));
+        write_receipt(&whole, &receipt).unwrap_or_else(|e| panic!("{e}"));
+        if arm != "ar" {
+            let mut merged = read_json(&dir.join(format!(
+                "{arm}.{}-{}.evidence.json",
+                shards[0].0, shards[0].1
+            )))
+            .unwrap_or_else(|e| panic!("{e}"));
+            let mut text = String::new();
+            for (i, &r) in shards.iter().enumerate() {
+                let stem = format!("{arm}.{}-{}", r.0, r.1);
+                text.push_str(
+                    &fs::read_to_string(dir.join(format!("{stem}.text.txt"))).unwrap_or_default(),
+                );
+                if i == 0 {
+                    continue;
+                }
+                let e = read_json(&dir.join(format!("{stem}.evidence.json")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                for key in [
+                    "trials",
+                    "no_window_trials",
+                    "calibration_ok_trials",
+                    "retired_trials",
+                    "full_trials",
+                    "late_full_trials",
+                    "mtp_windows",
+                    "ar_windows",
+                    "ngram_windows",
+                    "steps",
+                    "drafted",
+                    "accepted",
+                    "post_retirement_ar_steps",
+                ] {
+                    merged[key] =
+                        json!(merged[key].as_u64().unwrap_or(0) + e[key].as_u64().unwrap_or(0));
+                }
+                for key in ["retire_steps", "per_trial"] {
+                    let extra = e[key].as_array().cloned().unwrap_or_default();
+                    merged[key].as_array_mut().expect(key).extend(extra);
+                }
+                let counters = merged["counters"].as_object_mut().expect("counters");
+                for (name, total) in counters.iter_mut() {
+                    *total = json!(
+                        total.as_u64().unwrap_or(0) + e["counters"][name].as_u64().unwrap_or(0)
+                    );
+                }
+                assert_eq!(
+                    merged["probe_budget"], e["probe_budget"],
+                    "{arm}: probe budget differs"
+                );
+                if merged["first_full_trial"].is_null() {
+                    merged["first_full_trial"] = e["first_full_trial"].clone();
+                }
+            }
+            assert_eq!(
+                merged["trials"].as_u64(),
+                Some(trials as u64),
+                "{arm}: merged evidence trials"
+            );
+            write_json(&dir.join(format!("{arm}.evidence.json")), &merged)
+                .unwrap_or_else(|e| panic!("{e}"));
+            fs::write(dir.join(format!("{arm}.text.txt")), text).unwrap();
+        }
+        eprintln!(
+            "{arm}: merged {} shards into {}",
+            shards.len(),
+            whole.display()
+        );
+    }
 }
 
 const ID_ARM_TEST: &str = "sampled_mtp_identity_arm";

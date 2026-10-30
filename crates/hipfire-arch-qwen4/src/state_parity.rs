@@ -2432,6 +2432,174 @@ fn bundle_family_json(gpu: &Gpu, bundle: &crate::bundle::Qwen4Bundle) -> Result<
     Ok(json!({"target": target, "mtp": mtp, "draft_request_state": draft}))
 }
 
+/// Native MTP head D2 wiring probe on a real Flash-Next model (GPU-gated; the
+/// caller is the `mtp_head_d2_hw` test, one fresh process per
+/// `HIPFIRE_QWEN4_MTP_HEAD_D2` arm). Reports the trunk's D2 observables before
+/// and after `attach_mtp` (they must be equal: the head executor never enters
+/// `forward.moe`), whether the head is armed, and one head draft step both
+/// eager (an armed head must succeed) and under `graphs.capture_mode` (an
+/// armed head must return `Err`, never fall back to the GPU route).
+pub fn run_mtp_head_d2_probe(model_path: &Path, max_seq: usize) -> Result<Value, String> {
+    use crate::bundle::Qwen4Bundle;
+
+    fn trunk(bundle: &Qwen4Bundle) -> Value {
+        let forward = bundle.execution.as_ref();
+        json!({
+            "split_layers": bundle.split_layers(),
+            "split_digest": bundle.split_digest(),
+            "split_owner_kinds": bundle.split_owner_kinds(),
+            "split_return_modes": bundle.split_return_modes(),
+            "d2_storage_capacity_rows": forward.and_then(|f| f.d2_storage_capacity_rows()),
+            "cpu_storage_capacity_rows": bundle.cpu_storage_capacity_rows(),
+            "cpu_d2_storage_bytes": bundle.cpu_d2_storage_bytes(),
+            "s1_layer_verdicts": forward
+                .map(|f| f.s1_layer_verdicts())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(label, verdict)| json!([label, verdict.err()]))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
+        .map_err(|error| format!("open {}: {error}", model_path.display()))?;
+    let mut gpu =
+        Gpu::init().map_err(|error| format!("hardware probe requires HIP GPU: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    if gpu.is_uma() {
+        hfq.drop_mmap();
+    }
+    let mesh =
+        hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
+    let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
+    let use_ranges = gpu.is_uma();
+    let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &receipt.manifest.weights)?;
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            qwen4_oracle_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+                use_ranges,
+            )
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+    let backend = Qwen4KvBackend::automatic(&gpu);
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
+        receipt.config,
+        &receipt.manifest.identity.recipe,
+        transaction,
+        &receipt.placements,
+        &mut gpu,
+        max_seq,
+        receipt.ple,
+        receipt.ple_rows,
+        crate::state::Qwen4StateFormat::F32,
+        backend,
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    bundle
+        .attach_forward(&mut gpu, max_seq, scratch_mode)
+        .map_err(|error| error.to_string())?;
+    let before = trunk(&bundle);
+    bundle
+        .attach_mtp(&mut gpu, max_seq)
+        .map_err(|error| error.to_string())?;
+    map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
+    let after = trunk(&bundle);
+    let armed = bundle.mtp.as_ref().is_some_and(|mtp| mtp.head_d2_armed());
+    let host_bytes = bundle.mtp.as_ref().and_then(|mtp| mtp.head_d2_host_bytes());
+
+    // One head draft step on a zero backbone hidden: eager, then under capture.
+    let dim = bundle
+        .config
+        .hc_count
+        .checked_mul(bundle.config.hidden_size)
+        .ok_or("probe hidden width overflow")?;
+    let hidden = gpu
+        .upload_f32(&vec![0.0f32; dim], &[dim])
+        .map_err(|error| error.to_string())?;
+    let eager = bundle
+        .mtp_forward_token(&mut gpu, 1, Some(&hidden), 0, true)
+        .map_err(|error| error.to_string());
+    gpu.graphs.capture_mode = true;
+    let captured = bundle
+        .mtp_forward_token(&mut gpu, 1, Some(&hidden), 0, true)
+        .map_err(|error| error.to_string());
+    gpu.graphs.capture_mode = false;
+    let _ = gpu.free_tensor(hidden);
+
+    // T5 data: N deterministic head tokens through the production head step.
+    // Top-1 ids and the F32 logits rows are returned so the parent can compare
+    // the GPU route (arm off) with the D2 route (arm on): draft top-1
+    // agreement and the logit max-abs / ULP histogram.
+    const PARITY_STEPS: usize = 64;
+    let vocab = bundle.config.vocab_size;
+    let logits = gpu
+        .upload_f32(&vec![0.0f32; vocab], &[vocab])
+        .map_err(|error| error.to_string())?;
+    let mut top1 = Vec::with_capacity(PARITY_STEPS);
+    let mut rows: Vec<f32> = Vec::with_capacity(PARITY_STEPS * vocab);
+    let stepped = (|| -> Result<(), String> {
+        for step in 0..PARITY_STEPS {
+            let token = (step as u32 * 7919 + 13) % vocab as u32;
+            let drafted = bundle
+                .mtp_forward_token_logits(&mut gpu, token, step + 1, true, &logits)
+                .map_err(|error| error.to_string())?;
+            top1.push(drafted);
+            rows.extend(
+                gpu.download_f32(&logits)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(())
+    })();
+    let _ = gpu.free_tensor(logits);
+    stepped?;
+    let dump = hipfire_config::developer_var("HIPFIRE_MTP_HEAD_D2_DUMP").ok();
+    if let Some(path) = dump {
+        let bytes: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).map_err(|error| format!("write {path}: {error}"))?;
+    }
+    Ok(json!({
+        "parity_steps": PARITY_STEPS,
+        "parity_vocab": vocab,
+        "parity_top1": top1,
+        "trunk_before_attach_mtp": before,
+        "trunk_after_attach_mtp": after,
+        "head_d2_armed": armed,
+        "head_d2_host_bytes": host_bytes.map(|(pinned, mapped)| json!([pinned, mapped])),
+        "eager_ok": eager.is_ok(),
+        "eager_error": eager.err(),
+        "capture_ok": captured.is_ok(),
+        "capture_error": captured.err(),
+    }))
+}
+
 /// The hardware oracles' routed-expert placement: every expert resident
 /// unless `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` asks for layers `0..N` in VRAM
 /// and the rest host-mapped (a discrete card that cannot hold them all, and

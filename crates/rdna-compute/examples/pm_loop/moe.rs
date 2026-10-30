@@ -46,6 +46,15 @@
 //! timed against the shipped baseline and reported as `identical_to_baseline: false`. The
 //! chains/prefetch/grouped axes of `R4Spec` stay private Rust experiments (`pm_r4_screen`).
 //!
+//! `--cand-object FILE` (`--arch gfx1100` only; `pm_loop.rs`): FILE is the candidate code object
+//! instead of the emit, e.g. `pm-krsi-1100/emit` builds a modified copy of
+//! `crates/peacemaker-isa/src/kernels/qwen4_moe_sym_gfx1100/` into `gate_up.co` / `down.co`
+//! (`tools/moe_check.sh`). It must expose the entry's symbol with the in-tree emit's ABI
+//! (kernarg layout, workgroup size, LDS, wave mode; refused otherwise, stage `cand_object`); M7,
+//! resources and `code_sha256` then run as for an emitted candidate (`candidate.cand_object`
+//! = `{path, sha256, variant, identical_to_generator}`) and the GPU path (identity vs shipped,
+//! CPU reference, timing) is unchanged.
+//!
 //! Correctness requires the candidate to be bitwise equal to the shipped baseline (every NT and
 //! `gp` entry is byte-identical to the others on the same activations) AND to pass the CPU
 //! reference below.
@@ -197,6 +206,7 @@ use peacemaker_isa::Arch;
 use rayon::prelude::*;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 /// Contract-crate twin of `arch`; every arch of this adapter has a `qwen4_moe_sym` contract.
@@ -505,13 +515,13 @@ fn pick_evenly(live: &[usize], n: usize) -> Vec<usize> {
 /// `(sc, zp)` header with `zp == -8*sc` exactly: independently varied normal
 /// scales of both signs (2^-12 .. 2^-4), plus zero groups of both zero signs.
 /// `examples/qwen4_moe_sym.rs:198-211`.
-fn sym_header(r: &mut Rng) -> (u16, u16) {
+fn sym_header(r: &mut Rng, span: u64) -> (u16, u16) {
     match r.below(64) {
         0 => (0x0000, 0x8000),
         1 => (0x8000, 0x0000),
         _ => {
             let sign = (r.below(2) as u16) << 15;
-            let exp = 3 + r.below(9) as u16;
+            let exp = 3 + r.below(span) as u16;
             let man = r.below(1024) as u16;
             let sc = sign | (exp << 10) | man;
             let zp = (sign ^ 0x8000) | ((exp + 3) << 10) | man;
@@ -523,12 +533,12 @@ fn sym_header(r: &mut Rng) -> (u16, u16) {
 /// One expert's rows: QT44 (136 B groups, `K % 256`) or QT53 (68 B groups,
 /// `K % 128`), every header symmetric, every nibble code uniform.
 /// `examples/qwen4_moe_sym.rs:223-244`.
-fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64) {
+fn symmetric_weights_into(w: &mut [u8], group_bytes: usize, seed: u64, span: u64) {
     let mut r = Rng(seed ^ 0x5eed_0000_0000_0001);
     let hdrs = group_bytes / 68;
     for g in w.chunks_exact_mut(group_bytes) {
         for h in 0..hdrs {
-            let (sc, zp) = sym_header(&mut r);
+            let (sc, zp) = sym_header(&mut r, span);
             g[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
             g[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
         }
@@ -717,6 +727,9 @@ struct Problem {
     sorted: Vec<i32>,
     tiles: Vec<i32>,
     xq: OnceLock<Vec<u8>>,
+    /// Emulator gate only: narrow the synthetic weight scales (header exponent span 4 instead of 9) so no
+    /// accumulator reaches the SwiGLU divisions the emulator has not measured. Never set on a device run.
+    tame: bool,
 }
 
 impl Problem {
@@ -789,6 +802,7 @@ impl Problem {
             sorted,
             tiles,
             xq: OnceLock::new(),
+            tame: false,
         };
         let need = p.device_bytes();
         if need > DEVICE_CAP {
@@ -840,7 +854,7 @@ impl Problem {
         let seed = self.geo.seed
             ^ (idx as u64).wrapping_mul(GOLDEN)
             ^ (self.group_bytes as u64).wrapping_mul(0x1_0000_0001);
-        symmetric_weights_into(out, self.group_bytes, seed);
+        symmetric_weights_into(out, self.group_bytes, seed, if self.tame { 4 } else { 9 });
     }
 
     /// Epoch-major `[epochs][x_src_rows]` `block_i4_128` records: `d` a normal
@@ -1369,6 +1383,8 @@ struct Moe {
     reference: OnceLock<Vec<(usize, Vec<u16>)>>,
     /// `--rip`: source path and text of the candidate script.
     rip: Option<(String, String)>,
+    /// `--cand-object`: path and bytes of the prebuilt candidate code object (gfx1100 only).
+    cand_object: Option<(String, Vec<u8>)>,
 }
 
 fn arm_index(arm: Arm) -> usize {
@@ -1632,21 +1648,89 @@ fn rip_object(entry: Entry, path: &str, source: &str) -> Result<Object> {
     })
 }
 
+/// A prebuilt candidate code object for `entry` (`--cand-object`; gfx1100 NT1, built by the
+/// standalone emitter of a candidate module copy): refused unless it exposes `entry`'s symbol with
+/// the ABI (kernarg layout, workgroup size, LDS, wave mode) of the in-tree Rust emit of that
+/// entry, so the launch contract, kernarg encoding and grid of the baseline arm stay valid. M7,
+/// resources and `code_sha256` then run on it exactly as on an emitted candidate.
+fn cand_object_object(entry: Entry, path: &str, bytes: &[u8]) -> Result<Object> {
+    let symbol = entry.symbol();
+    let generator = entry.emit()?;
+    let gen_elf = peacemaker_isa::native::assemble(&generator.s_text, entry.spec.arch)?;
+    let got = crate::iu4::abi_signature(bytes, &symbol)
+        .map_err(|e| format!("--cand-object {path}: not a code object exposing {symbol}: {e}"))?;
+    let want = crate::iu4::abi_signature(&gen_elf, &symbol)?;
+    if got != want {
+        return Err(format!(
+            "--cand-object {path}: ABI mismatch with the in-tree emit of {}:\n  object:    {got}\n  generator: {want}",
+            entry.variant()
+        ));
+    }
+    Ok(Object {
+        source: json!({
+            "source": format!("--cand-object {path} (prebuilt candidate code object)"),
+            "variant": entry.variant(),
+            "sha256": sha256_hex(bytes),
+        }),
+        desc: json!({
+            "knobs": spec_json(entry),
+            "cand_object": {
+                "path": path,
+                "sha256": sha256_hex(bytes),
+                "variant": entry.variant(),
+                "identical_to_generator": bytes == gen_elf.as_slice(),
+            },
+        }),
+        exports: vec![symbol.clone()],
+        launch_symbol: symbol,
+        bytes: bytes.to_vec(),
+    })
+}
+
 /// Constructor for `--kernel qwen4_moe_sym` without `--rip` (gfx1201).
 #[cfg(test)]
 pub fn new(shape: &str, knobs: &mut Knobs) -> Result<Box<dyn Workload>> {
     new_with_rip(shape, knobs, None, Arch::Gfx1201)
 }
 
-/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry); `arch` =
-/// gfx1201 (default), gfx1151 or gfx1100: the shipped baseline, candidate emit, R1 contract and
-/// geometry are all that arch's (see the module doc's `# Shipped baseline`).
+/// Test constructor: `--rip` only, no `--cand-object`.
+#[cfg(test)]
 pub fn new_with_rip(
     shape: &str,
     knobs: &mut Knobs,
     rip: Option<&std::path::Path>,
     arch: Arch,
 ) -> Result<Box<dyn Workload>> {
+    new_with_cand_object(shape, knobs, rip, arch, None)
+}
+
+/// Constructor for `--kernel qwen4_moe_sym`; `rip` = `--rip FILE.rip` (every MQ4 entry);
+/// `cand_object` = `--cand-object FILE` (a prebuilt candidate code object, gfx1100 only: read and
+/// ABI-checked against the in-tree emit of the entry by `candidate()`); `arch` =
+/// gfx1201 (default), gfx1151 or gfx1100: the shipped baseline, candidate emit, R1 contract and
+/// geometry are all that arch's (see the module doc's `# Shipped baseline`).
+pub fn new_with_cand_object(
+    shape: &str,
+    knobs: &mut Knobs,
+    rip: Option<&std::path::Path>,
+    arch: Arch,
+    cand_object: Option<&std::path::Path>,
+) -> Result<Box<dyn Workload>> {
+    let cand_object = match cand_object {
+        Some(p) => {
+            if arch != Arch::Gfx1100 {
+                return Err(format!(
+                    "--cand-object is supported on gfx1100 only (got {})",
+                    arch.name()
+                ));
+            }
+            Some((
+                p.display().to_string(),
+                std::fs::read(p).map_err(|e| format!("--cand-object {}: {e}", p.display()))?,
+            ))
+        }
+        None => None,
+    };
     abi_arch(arch)?;
     let rip = match rip {
         Some(p) => Some((
@@ -1693,7 +1777,37 @@ pub fn new_with_rip(
         dev: None,
         reference: OnceLock::new(),
         rip,
+        cand_object,
     }))
+}
+
+/// Unmapped bytes between the exact-size buffers of an emulator-gate run (the gate demands >= 64 KiB).
+const EMU_GUARD: u64 = 0x2_0000;
+/// Shapes of the emulator gate: an aligned and a ragged token count (grouped rows pad to 16 per expert) at a tiny K
+/// (gate_up K=512 / 4 epochs, down K=128 / 1 epoch) and at the production K (H=2560, I=640: gate_up K=2560 / 20
+/// epochs, down K=640 / 5 epochs), so K-specialised paths (e.g. an epoch-count guard) are emulated too. ALL must pass.
+const EMU_GATE_SHAPES: [(&str, &str); 4] = [
+    ("tiny", "E=2,TOP=2,T=20,H=512,I=128"),
+    ("ragged", "E=2,TOP=2,T=37,H=512,I=128"),
+    ("prod", "E=2,TOP=2,T=20,H=2560,I=640"),
+    ("prod_ragged", "E=2,TOP=2,T=37,H=2560,I=640"),
+];
+/// Production-extent cases of the gate: the judge shape (Flash-Next geometry, T=16896) and T=4096 with the real
+/// kernargs and exact-size guarded buffers (hundreds of MB to ~1 GB of address space, lazily backed), emulating
+/// only sampled workgroups ([`Moe::extent_wgs`]); the sampled outputs are compared with the emulated incumbent's.
+/// Catches address-arithmetic faults that only appear at production record indices.
+const EMU_EXTENT_SHAPES: [(&str, &str); 2] = [
+    ("extent_t16896", "fn,T=16896"),
+    ("extent_t4096", "fn,T=4096"),
+];
+
+/// One emulated arm of the gate: output bytes and counters.
+struct EmuArm {
+    y: Vec<u8>,
+    y_bytes_written: u64,
+    instructions: u64,
+    workgroups: u64,
+    lds_static: Option<u64>,
 }
 
 impl Moe {
@@ -1994,7 +2108,7 @@ impl Moe {
         )
         .map_err(|e| format!("lift: {e}"))?
         .program;
-        let emu = Emulator::new(&program, &object.launch_symbol)?;
+        let emu = Emulator::new(&program, &object.launch_symbol)?.hw_model();
 
         let mut mem = Memory::default();
         let mut table = Vec::with_capacity(geo.experts * 8);
@@ -2066,6 +2180,329 @@ impl Moe {
             "tolerance": report.tolerance,
         }))
     }
+
+    /// One arm of [`Moe::emu_gate_run`]: lift `object`, run its complete grid on the emulator at `p` with
+    /// definedness-tracked LDS and every buffer an exact-size region of its own, `EMU_GUARD` unmapped bytes apart
+    /// (no slack: any access past a buffer is an unmapped-memory error). `Err` is the verbatim refusal.
+    fn emu_gate_arm(
+        p: &Problem,
+        entry: Entry,
+        object: &Object,
+        wgs: Option<&[(u32, u32)]>,
+    ) -> Result<EmuArm> {
+        use peacemaker_ir::emu::{Emulator, Launch as EmuLaunch, Memory};
+        let program = peacemaker_lift::lift_object(
+            &object.bytes,
+            peacemaker_lift::Options {
+                frontend: peacemaker_ir::inst::Frontend::Builder,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?
+        .program;
+        let lds_static = program
+            .kernels
+            .iter()
+            .find(|k| k.symbol.0 == object.launch_symbol)
+            .and_then(|k| match &k.abi {
+                peacemaker_ir::inst::Abi::Hsa { descriptor, .. } => {
+                    Some(u64::from(descriptor.group_segment_fixed_size))
+                }
+                _ => None,
+            });
+        let emu = Emulator::new(&program, &object.launch_symbol)?
+            .hw_model()
+            .gfx1100_as_gfx1151();
+        let geo = &p.geo;
+        let mut mem = Memory::default();
+        // Sampled (extent) runs back only the experts the sampled tiles use; every other table entry is 0 (an access
+        // through it is an unmapped-memory error). `vec![0; n]` is calloc'd, so untouched pages cost no memory.
+        let needed: Option<std::collections::BTreeSet<i32>> = wgs.map(|w| {
+            w.iter()
+                .map(|&(_, gy)| p.tiles[gy as usize])
+                .filter(|&e| e >= 0)
+                .collect()
+        });
+        let mut table = Vec::with_capacity(geo.experts * 8);
+        for e in 0..geo.experts {
+            if needed.as_ref().is_some_and(|n| !n.contains(&(e as i32))) {
+                table.extend_from_slice(&0u64.to_le_bytes());
+                continue;
+            }
+            let mut w = vec![0u8; p.stride];
+            p.fill_weights(e % geo.distinct, &mut w);
+            let base = mem.map_guarded(format!("expert{e}"), w, EMU_GUARD)?;
+            table.extend_from_slice(&base.to_le_bytes());
+        }
+        let table_len = table.len() as u64;
+        let table_base = mem.map_guarded("table".into(), table, EMU_GUARD)?;
+        let tiles = Problem::i32_bytes(&p.tiles);
+        let tiles_len = tiles.len() as u64;
+        let tiles_base = mem.map_guarded("tiles".into(), tiles, EMU_GUARD)?;
+        let sorted = Problem::i32_bytes(&p.sorted);
+        let sorted_len = sorted.len() as u64;
+        let sorted_base = mem.map_guarded("sorted".into(), sorted, EMU_GUARD)?;
+        let xq = if entry.gp {
+            p.make_xq_gp()
+        } else {
+            p.xq().to_vec()
+        };
+        let xq_len = xq.len() as u64;
+        let xq_base = mem.map_guarded("xq".into(), xq, EMU_GUARD)?;
+        let y_len = p.y_bytes();
+        let y_base = mem.map_guarded("y".into(), vec![0u8; y_len], EMU_GUARD)?;
+        let launch = p.launch_for(
+            entry,
+            [
+                (table_base, table_len),
+                (tiles_base, tiles_len),
+                (sorted_base, sorted_len),
+                (xq_base, xq_len),
+                (y_base, y_len as u64),
+            ],
+        )?;
+        let kernarg = mem.map_guarded("kernarg".into(), launch.kernarg.clone(), EMU_GUARD)?;
+        let mut instructions = 0u64;
+        let all: Vec<(u32, u32)>;
+        let run: &[(u32, u32)] = match wgs {
+            Some(w) => w,
+            None => {
+                all = (0..launch.grid[1])
+                    .flat_map(|gy| (0..launch.grid[0]).map(move |gx| (gx, gy)))
+                    .collect();
+                &all
+            }
+        };
+        for &(gx, gy) in run {
+            if gx >= launch.grid[0] || gy >= launch.grid[1] {
+                return Err(format!(
+                    "workgroup ({gx},{gy}) outside the launch grid {:?}",
+                    launch.grid
+                ));
+            }
+            instructions += emu
+                .run_workgroup_counted(
+                    &EmuLaunch {
+                        kernarg_ptr: kernarg,
+                        workgroup: [gx, gy, 0],
+                        block: launch.block,
+                        dynamic_lds: launch.lds,
+                    },
+                    &mut mem,
+                )
+                .map_err(|e| format!("workgroup ({gx},{gy}): {e}"))?;
+        }
+        let region = mem
+            .regions
+            .iter()
+            .find(|r| r.name == "y")
+            .ok_or("emulator memory lost the y region")?;
+        let y = match wgs {
+            None => region.bytes.clone(),
+            Some(w) => {
+                // The output rows of every sampled tile (16 grouped rows each), ascending. A live tile that wrote
+                // nothing is a failure (an all-zero output would otherwise compare equal to an all-zero incumbent).
+                let tile_bytes = 16 * p.row_len * 2;
+                let tiles: std::collections::BTreeSet<usize> =
+                    w.iter().map(|&(_, gy)| gy as usize).collect();
+                let mut y = Vec::with_capacity(tiles.len() * tile_bytes);
+                for t in tiles {
+                    let (lo, hi) = (t * tile_bytes, (t + 1) * tile_bytes);
+                    let live =
+                        p.tiles[t] >= 0 && p.sorted[16 * t..16 * t + 16].iter().any(|&x| x >= 0);
+                    if live && !(lo..hi).any(|i| region.written.contains(i)) {
+                        return Err(format!("sampled live tile {t} wrote no output"));
+                    }
+                    y.extend_from_slice(&region.bytes[lo..hi]);
+                }
+                y
+            }
+        };
+        Ok(EmuArm {
+            y,
+            y_bytes_written: region.written.count() as u64,
+            instructions,
+            workgroups: run.len() as u64,
+            lds_static,
+        })
+    }
+
+    /// Sampled workgroups of an extent run: grid corners, the first/last live, ragged (padding slots) and sentinel
+    /// (all-padding) tiles, the first tile of the last live expert, and eight seeded random (gx, tile) pairs.
+    fn extent_wgs(p: &Problem, grid: [u32; 3]) -> Vec<(u32, u32)> {
+        let nt = p.ntiles();
+        let slots = |t: usize| &p.sorted[16 * t..16 * t + 16];
+        let live = |t: usize| p.tiles[t] >= 0 && slots(t).iter().any(|&s| s >= 0);
+        let ragged = |t: usize| live(t) && slots(t).iter().any(|&s| s < 0);
+        let sentinel = |t: usize| p.tiles[t] < 0;
+        let first = |f: &dyn Fn(usize) -> bool| (0..nt).find(|&t| f(t));
+        let last = |f: &dyn Fn(usize) -> bool| (0..nt).rev().find(|&t| f(t));
+        let mut tiles: Vec<usize> = vec![0, nt - 1];
+        for f in [&live as &dyn Fn(usize) -> bool, &ragged, &sentinel] {
+            tiles.extend(first(f));
+            tiles.extend(last(f));
+        }
+        if let Some(l) = last(&live) {
+            let e = p.tiles[l];
+            tiles.extend((0..nt).find(|&t| p.tiles[t] == e));
+        }
+        let mut wgs: Vec<(u32, u32)> = tiles
+            .iter()
+            .flat_map(|&t| [0, grid[0] - 1].map(|gx| (gx, t as u32)))
+            .collect();
+        let mut rng = Rng(p.geo.seed ^ 0xE87E_0000_0000_0000 ^ nt as u64);
+        for _ in 0..8 {
+            let t = rng.below(nt as u64) as u32;
+            let gx = rng.below(u64::from(grid[0])) as u32;
+            wgs.push((gx, t));
+        }
+        wgs.sort_unstable();
+        wgs.dedup();
+        wgs
+    }
+
+    /// The pre-card emulator gate (`--emu`): `cand` and `base` (the incumbent) each run their complete grid on the
+    /// emulator at the tiny shapes of [`EMU_GATE_SHAPES`]. It FAILS on: an access outside a mapped buffer, an LDS
+    /// access out of bounds or a read of LDS bytes this workgroup never wrote, a barrier deadlock, the instruction
+    /// limit, any instruction the emulator or lifter cannot execute (named), an output that is not bit-identical to
+    /// the emulated incumbent, and an output that fails the CPU reference. The record is `emu_gate`.
+    fn emu_gate_run(&self, cand: &Object, base: &Object) -> Value {
+        let arch = self.problem.geo.arch;
+        let (cand_entry, base_entry) = (self.cand, self.base.entry());
+        let mut cases = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        let (mut instructions, mut workgroups) = (0u64, 0u64);
+        let (mut cand_hash, mut base_hash) = (Sha256::new(), Sha256::new());
+        let short = |e: &str| e.split(" | ").next().unwrap_or(e).to_owned();
+        let all_cases = EMU_GATE_SHAPES
+            .iter()
+            .map(|&(n, s)| (n, s, false))
+            .chain(EMU_EXTENT_SHAPES.iter().map(|&(n, s)| (n, s, true)));
+        for (name, shape, extent) in all_cases {
+            let built = Geo::parse(&format!("{shape},seed=7"), arch)
+                .and_then(|geo| Problem::new(&geo, cand_entry.spec.kind))
+                .map(|mut p| {
+                    p.tame = true;
+                    p
+                });
+            let p = match built {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push(format!("{name}: shape {shape}: {e}"));
+                    cases.push(json!({"name": name, "status": "fail", "reason": e}));
+                    continue;
+                }
+            };
+            let mut case = json!({"name": name, "shape": p.shape_json()});
+            let wgs = extent.then(|| Self::extent_wgs(&p, p.geometry(cand_entry.spec).0));
+            if let Some(w) = &wgs {
+                case["sampled_workgroups"] = json!(w.len());
+                case["sampled"] = json!(w);
+            }
+            let c = Self::emu_gate_arm(&p, cand_entry, cand, wgs.as_deref());
+            let b = Self::emu_gate_arm(&p, base_entry, base, wgs.as_deref());
+            let mut reasons: Vec<String> = Vec::new();
+            match (&c, &b) {
+                (Ok(c), Ok(b)) => {
+                    let identical = c.y == b.y;
+                    if !identical {
+                        let first = c.y.iter().zip(&b.y).position(|(x, y)| x != y);
+                        reasons.push(format!(
+                            "output not bit-identical to the emulated incumbent ({} of {} bytes differ, first at byte {})",
+                            c.y.iter().zip(&b.y).filter(|(x, y)| x != y).count(),
+                            c.y.len(),
+                            first.map_or("n/a".to_owned(), |i| i.to_string())
+                        ));
+                    }
+                    // Extent runs have no CPU reference (it needs every row); the tiny/prod cases carry it.
+                    let reference = if extent {
+                        Vec::new()
+                    } else {
+                        p.reference(Sample::Full)
+                    };
+                    let report = |y: &[u8]| match p.compare(y, &reference, Sample::Full) {
+                        Ok(r) => (
+                            r.pass,
+                            json!({"reference": r.reference, "pass": r.pass,
+                                   "max_abs_err": r.max_abs_err, "tolerance": r.tolerance}),
+                        ),
+                        Err(e) => (false, json!({"pass": false, "error": e})),
+                    };
+                    let (cand_ok, cand_ref) = if extent {
+                        (true, json!("not computed at extent: bit-identity vs the emulated incumbent only"))
+                    } else {
+                        report(&c.y)
+                    };
+                    let (base_ok, base_ref) = if extent {
+                        (true, json!(null))
+                    } else {
+                        report(&b.y)
+                    };
+                    if !cand_ok {
+                        reasons.push(format!(
+                            "candidate output fails the CPU reference: {cand_ref}"
+                        ));
+                    }
+                    if !base_ok {
+                        reasons.push(format!(
+                            "emulated incumbent fails the CPU reference: {base_ref}"
+                        ));
+                    }
+                    cand_hash.update(&c.y);
+                    base_hash.update(&b.y);
+                    instructions += c.instructions;
+                    workgroups += c.workgroups;
+                    case["workgroups"] = json!(c.workgroups);
+                    case["identical_to_incumbent"] = json!(identical);
+                    case["reference"] = json!({"candidate": cand_ref, "incumbent": base_ref});
+                }
+                _ => {}
+            }
+            for (who, r) in [("candidate", &c), ("incumbent", &b)] {
+                match r {
+                    Ok(a) => {
+                        case[who] = json!({
+                            "instructions": a.instructions,
+                            "workgroups": a.workgroups,
+                            "out_sha256": sha256_hex(&a.y),
+                            "out_bytes": a.y.len(),
+                            "out_bytes_written": a.y_bytes_written,
+                            "lds_static_bytes": a.lds_static,
+                        })
+                    }
+                    Err(e) => reasons.push(format!("{who}: {}", short(e))),
+                }
+            }
+            if reasons.is_empty() {
+                case["status"] = json!("pass");
+            } else {
+                case["status"] = json!("fail");
+                case["reason"] = json!(reasons.join("; "));
+                failures.push(format!("{name}: {}", reasons.join("; ")));
+            }
+            cases.push(case);
+        }
+        let status = if failures.is_empty() { "pass" } else { "fail" };
+        json!({
+            "status": status,
+            "reason": if failures.is_empty() { "ok".to_owned() } else { failures.join(" | ") },
+            "shape": EMU_GATE_SHAPES
+                .iter()
+                .chain(EMU_EXTENT_SHAPES.iter())
+                .map(|(n, s)| format!("{n}:{s}"))
+                .collect::<Vec<_>>(),
+            "instructions": instructions,
+            "workgroups": workgroups,
+            "cand_out_sha256": format!("{:x}", cand_hash.finalize()),
+            "base_out_sha256": format!("{:x}", base_hash.finalize()),
+            "guard_bytes": EMU_GUARD,
+            "strict_lds": true,
+            "inputs": "synthetic, weight scale span narrowed (Problem::tame) so no accumulator reaches emulator-unmeasured SwiGLU divisions",
+            "numeric_model": "gfx1100 executed with the gfx1151 WMMA + transcendental model on both arms (no hardware-qualified gfx1100 model); arms compared emulated-vs-emulated and against the CPU reference",
+            "candidate_sha256": sha256_hex(&cand.bytes),
+            "incumbent_sha256": sha256_hex(&base.bytes),
+            "cases": cases,
+        })
+    }
 }
 
 impl Workload for Moe {
@@ -2093,6 +2530,9 @@ impl Workload for Moe {
     }
 
     fn candidate(&self) -> Result<Object> {
+        if let Some((path, bytes)) = &self.cand_object {
+            return cand_object_object(self.cand, path, bytes);
+        }
         if let Some((path, text)) = &self.rip {
             return rip_object(self.cand, path, text);
         }
@@ -2218,6 +2658,10 @@ impl Workload for Moe {
             Ok(v) => v,
             Err(reason) => Value::String(format!("refused ({reason})")),
         }
+    }
+
+    fn emu_gate(&self, cand: &Object, base: &Object) -> Option<Value> {
+        Some(self.emu_gate_run(cand, base))
     }
 }
 
@@ -3063,8 +3507,8 @@ mod tests {
     #[test]
     fn rip_reordered_kloop_keeps_the_abi_and_never_claims_identity() {
         let edited = TWIN.replace(
-            "            moent::advance(wg)?;\n            moent::load_w(wg, g, 0)?;\n",
-            "            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
+            "            moent::advance(wg)?;\n            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n",
+            "            if g.gate_up() && g.nt() == 8 {\n                wg.barrier(())?;\n            }\n            moent::load_w(wg, g, 0)?;\n            moent::advance(wg)?;\n",
         );
         assert_ne!(edited, TWIN);
         for epi in ["down_gp_nt4", "gate_up_nt8"] {
@@ -3096,6 +3540,26 @@ mod tests {
                     assert!(o["workgroups"].as_u64().unwrap() > 0);
                 }
                 other => panic!("{other}"),
+            }
+        }
+    }
+
+    /// The pre-card gate on the shipped gfx1100 object (candidate = the in-tree emit, incumbent = the shipped
+    /// bundle): both run the whole grid on the emulator with guard gaps and strict LDS and agree bit-for-bit.
+    #[test]
+    fn emu_gate_passes_the_in_tree_gfx1100_entries() {
+        for epi in ["gate_up", "down"] {
+            let w = on("E=2,TOP=2,T=20,H=512,I=128", &[("epi", epi)], Arch::Gfx1100).unwrap();
+            let g = w
+                .emu_gate(&w.candidate().unwrap(), &w.baseline().unwrap())
+                .unwrap();
+            assert_eq!(g["status"], "pass", "{epi}: {g}");
+            assert!(g["instructions"].as_u64().unwrap() > 0);
+            assert_eq!(g["cand_out_sha256"], g["base_out_sha256"], "{epi}");
+            let cases = g["cases"].as_array().unwrap();
+            assert_eq!(cases.len(), EMU_GATE_SHAPES.len() + EMU_EXTENT_SHAPES.len());
+            for c in &cases[EMU_GATE_SHAPES.len()..] {
+                assert!(c["sampled_workgroups"].as_u64().unwrap() >= 8, "{c}");
             }
         }
     }
@@ -3250,6 +3714,70 @@ mod tests {
                 assert_eq!(l.block[0], e.spec.threads());
             }
         }
+    }
+
+    /// `--cand-object` (gfx1100): the emitted object round-trips (identical to the generator, the
+    /// same launch symbol/exports as an emitted candidate); garbage, a wrong-kind object and a
+    /// non-gfx1100 arch are refused before any launch.
+    #[test]
+    fn cand_object_is_checked_against_the_in_tree_emit() {
+        let dir = std::env::temp_dir().join(format!("pm_loop_cand_object_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let build = |epi: &str, path: &std::path::Path, arch: Arch| {
+            new_with_cand_object(
+                "fn,T=64",
+                &mut knobs(&[("epi", epi)]),
+                None,
+                arch,
+                Some(path),
+            )
+        };
+        for epi in ["gate_up", "down"] {
+            let e = Entry::parse(epi, Arch::Gfx1100).unwrap();
+            let emitted = emit_object(e, json!({})).unwrap();
+            let p = write(&format!("{epi}.co"), &emitted.bytes);
+            let c = build(epi, &p, Arch::Gfx1100).unwrap().candidate().unwrap();
+            assert_eq!(c.bytes, emitted.bytes, "{epi}");
+            assert_eq!(c.launch_symbol, emitted.launch_symbol, "{epi}");
+            assert_eq!(c.exports, emitted.exports, "{epi}");
+            assert_eq!(
+                c.desc["cand_object"]["identical_to_generator"], true,
+                "{epi}"
+            );
+            // The other kind's object does not expose this entry's symbol.
+            let other = if epi == "down" { "gate_up" } else { "down" };
+            let o = emit_object(Entry::parse(other, Arch::Gfx1100).unwrap(), json!({})).unwrap();
+            let po = write(&format!("{epi}_wrong.co"), &o.bytes);
+            let e = build(epi, &po, Arch::Gfx1100)
+                .unwrap()
+                .candidate()
+                .unwrap_err();
+            assert!(
+                e.contains("--cand-object") && e.contains(&emitted.launch_symbol),
+                "{e}"
+            );
+        }
+        let junk = write("junk.co", b"not an elf");
+        let e = build("gate_up", &junk, Arch::Gfx1100)
+            .unwrap()
+            .candidate()
+            .unwrap_err();
+        assert!(e.contains("--cand-object"), "{e}");
+        let e = build("gate_up", &dir.join("missing.co"), Arch::Gfx1100)
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("--cand-object") && e.contains("missing.co"),
+            "{e}"
+        );
+        let e = build("gate_up", &junk, Arch::Gfx1151).err().unwrap();
+        assert!(e.contains("gfx1100 only"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An entry an arch has no shipped object for is refused naming the entry and the arch; so

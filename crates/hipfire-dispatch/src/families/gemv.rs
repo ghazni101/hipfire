@@ -316,6 +316,29 @@ impl GemvFamily {
         )
     }
 
+    /// GGUF-native weights (`DType::Ggml*`): one q8_1 producer launch then the
+    /// ggml mmvq export of the weight's type (numeric contract
+    /// `ggml.a8q81.<type>`). The input is always the raw F32 activation row
+    /// (no rotation plan), and `WithResidual` accumulates into `y` (the
+    /// residual stream) in the same launch. No fused SwiGLU variant exists.
+    fn run_ggml(&self, gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
+        let w = params.w;
+        let accumulate = match params.variant {
+            GemvVariant::Plain | GemvVariant::Prerotated => false,
+            GemvVariant::WithResidual => true,
+            GemvVariant::WithSwiGLUResidual => {
+                return Err(DispatchError::UnsupportedVariant {
+                    family: "gemv",
+                    variant: "ggml_swiglu_residual",
+                    arch: "",
+                    quant: w.dtype.ggml_name().unwrap_or("ggml"),
+                })
+            }
+        };
+        gpu.ggml_gemv(w.dtype, w.buf, w.m, w.k, params.x, params.y, accumulate)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
     /// Run a GEMV operation.
     ///
     /// Validates arch compatibility via `resolve()`, then dispatches to the
@@ -337,6 +360,9 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
+        if params.w.dtype.is_ggml() {
+            return self.run_ggml(gpu, params);
+        }
         if params.w.dtype == DType::MQ4G128V2 {
             reject_mq4g128v2()?;
         }
@@ -761,6 +787,11 @@ mod residual_coverage_tests {
             MQ2I4G128R128,
             E8PI4G128R256,
             E8PI4G128R128,
+            GgmlQ4K,
+            GgmlQ5K,
+            GgmlQ6K,
+            GgmlQ8_0,
+            GgmlIQ4XS,
         );
         let mut missing = Vec::new();
         for dtype in all {

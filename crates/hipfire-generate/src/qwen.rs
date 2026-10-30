@@ -900,6 +900,13 @@ pub fn ep_serve_qwen35_dense_tp(
             let _ = stdout.flush();
             return;
         }
+        crate::common::emit_prefill_progress(
+            stdout,
+            id,
+            Some(active_attempt_id()),
+            chunk_index * tp_prefill_chunk + chunk.len(),
+            prompt_ids.len(),
+        );
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
@@ -1237,7 +1244,16 @@ pub fn ep_serve_qwen35_moe(
         }
         let result = qwen35_moe_ep_prefill_window(m, prompt_ids, off);
         match result {
-            Ok(end) => off = end,
+            Ok(end) => {
+                off = end;
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    off,
+                    prompt_n,
+                );
+            }
             Err(message) => {
                 qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
                 let _ = stdout.flush();
@@ -4656,18 +4672,24 @@ pub fn generate_spec(
                 .saturating_add(spec.block_size()),
         );
     }
-    let prefill_outcome = spec_prefill(
-        pp.as_deref_mut(),
-        gpu,
-        spec.as_mut(),
-        slot,
-        &prompt_tokens,
-        &prefill_tokens,
-        prefill_start,
-        cache_hit,
-        resume_from,
-        &|| check_abort(&id_for_abort),
-    );
+    // Prompt phase: the speculators' prompt-prefill chunk loops report
+    // `prefill_progress` only here, never from the mid-request realign,
+    // forced-advance or repair re-prefills below.
+    let prefill_outcome = {
+        let _prompt_phase = hipfire_runtime::prefill_progress::prompt_phase();
+        spec_prefill(
+            pp.as_deref_mut(),
+            gpu,
+            spec.as_mut(),
+            slot,
+            &prompt_tokens,
+            &prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+            &|| check_abort(&id_for_abort),
+        )
+    };
     let first_token = match classify_spec_prefill(prefill_outcome) {
         Ok(first_token) => first_token,
         Err(terminal) => {

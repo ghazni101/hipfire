@@ -282,6 +282,10 @@ name = "eval_hipfire"
 required-features = ["deltanet"]
 
 [[example]]
+name = "gguf_native_gen"
+required-features = ["deltanet"]
+
+[[example]]
 name = "verify_route_logits"
 required-features = ["deltanet"]
 

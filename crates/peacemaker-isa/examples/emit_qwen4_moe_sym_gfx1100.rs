@@ -73,10 +73,12 @@ mod app {
     /// Immutable baselines (lead): the gfx1201 objects and the shared sources. Re-pinned on land-rc5 over beta 12daf4fe9:
     /// the objects are the exact beta 12daf4fe9 blobs (n_experts@60 guard; rc3/rc4 pins were
     /// fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 / 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833).
+    /// The gfx1201 pin was then moved by the gfx1201 NT8 `gate_up` epoch-lock bake (was
+    /// 0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e).
     const PINNED_OBJECTS: [(&str, &str); 2] = [
         (
             "qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-            "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
+            "44177c21de25bec8502f63f318e682dc4fa1948420723c75dec14fa63cfed723",
         ),
         (
             "qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco",
@@ -84,12 +86,14 @@ mod app {
         ),
     ];
     const PINNED_SOURCES: [(&str, &str); 2] = [
+        // Re-pinned on land2 (gfx1201 NT8 gate_up lock bake, 75f0d90173): qwen4_moe_sym.rs is
+        // f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c; earlier pin below.
         // Re-pinned on land-rc5: qwen4_moe_sym.rs is beta 12daf4fe9 (cdb4f9c6a9ca0c4017aa17e88d134cf3e22fe3fced04e3896f2dc7b5a04c446f)
         // plus the retained consumer24 E8P dispatch; qwen4_moe_sym_w3.rs is exactly beta 12daf4fe9. rc3/rc4 pins:
         // 02ac151d8c548badb646ada96eec4516d1c3258528dad8f1fa4984ed7043c00e, b15ef478422178342b6cba2a021555dcc837aba604e95e3ce0a2008911b3bbce.
         (
             "src/kernels/qwen4_moe_sym.rs",
-            "d5a348744d7e9425c339461317bdd0c6c56623e5fb4d3ab3eb30b9b57e1235f8",
+            "f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c",
         ),
         (
             "src/kernels/qwen4_moe_sym_w3.rs",
@@ -435,6 +439,8 @@ mod app {
             ]
             .iter()
             .filter(|s| spec.codec != Codec::E8p || !E8P_ONLY_FORBIDDEN.contains(*s))
+            // The BF16 MQ4 GateUp/Down entries own workgroup barriers (lockstep / K=640 pipeline).
+            .filter(|s| !(spec.codec == Codec::Mq4 && !spec.acc && **s == "s_barrier*"))
             .map(|s| (*s).to_owned())
             .collect(),
             vgpr_max: Some(u32::from(e.shape.next_free_vgpr).div_ceil(8) * 8),
@@ -554,6 +560,7 @@ mod app {
         dis: &str,
         elf: &Path,
         module_text: &str,
+        negative: Negative,
     ) -> R<ObjectAudit> {
         let insns = symbol_insns(dis, symbol)?;
         let mut mnemonics: BTreeMap<&str, u32> = BTreeMap::new();
@@ -589,6 +596,14 @@ mod app {
 
         // No gfx12 waits, scratch, flat/global, barriers, lane moves, FP-mode writes; LDS data and barriers only in E8P.
         let e8p = spec.codec == Codec::E8p;
+        // The BF16 MQ4 GateUp entry owns the per-epoch lockstep barrier (2 per K loop trip) and the
+        // BF16 MQ4 Down entry the unrolled K=640 pipeline (5, one after each epoch's issue).
+        let lockstep = spec.codec == Codec::Mq4 && !spec.acc;
+        let barriers_expected = match (lockstep, spec.kind) {
+            (true, Kind::GateUp) => 2,
+            (true, Kind::Down) if negative == Negative::None => 5,
+            _ => 0,
+        };
         for i in &insns {
             let m = i.mnemonic.as_str();
             let bad = m.starts_with("s_wait_")
@@ -597,7 +612,7 @@ mod app {
                 || m.starts_with("global_")
                 || (!e8p && m.starts_with("ds_load"))
                 || (!e8p && m.starts_with("ds_store"))
-                || (!e8p && m.starts_with("s_barrier"))
+                || (!e8p && barriers_expected == 0 && m.starts_with("s_barrier"))
                 || m.starts_with("v_readlane")
                 || (!e8p && m.starts_with("v_writelane"))
                 || m == "s_denorm_mode"
@@ -609,6 +624,12 @@ mod app {
                     i.addr
                 ));
             }
+        }
+        if !e8p && barriers_expected != 0 && count("s_barrier") != barriers_expected {
+            return Err(format!(
+                "{symbol}: {} s_barrier, the lockstep design requires exactly {barriers_expected}",
+                count("s_barrier")
+            ));
         }
         // E8P: exactly the stage and unpack census of the authored design (see `e8p.rs`).
         if e8p {
@@ -1035,7 +1056,14 @@ mod app {
             if m7["lift"].as_str() != Some("byte-exact") || m7["obligations"] != json!({}) {
                 return Err(format!("{symbol}: M7 not clean: {m7}"));
             }
-            let audit = audit_object(spec, &symbol, &build.disassembly, &build.elf, &text)?;
+            let audit = audit_object(
+                spec,
+                &symbol,
+                &build.disassembly,
+                &build.elf,
+                &text,
+                negative,
+            )?;
             let mut row = json!({
                 "symbol": symbol, "variant": variant, "threads": spec.threads,
                 "source_sha256": sha256(e.s_text.as_bytes()),

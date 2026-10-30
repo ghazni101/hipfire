@@ -115,25 +115,37 @@ use sealed::Token;
 /// State carried around a loop or across a join. The loop body is emitted
 /// twice (the backend's fixpoint check), so the core respawns the
 /// back-edge state for the second emission; nothing else can duplicate a
-/// token or region.
+/// token or region. `agrees` compares the build-time values of two paths
+/// that meet at a join (`Workgroup::wg_if_else`).
 pub trait Carried: sealed::Sealed + Sized {
     #[doc(hidden)]
     fn respawn(&self, token: &Token) -> Self;
+    #[doc(hidden)]
+    fn agrees(&self, other: &Self, token: &Token) -> bool;
 }
 impl sealed::Sealed for () {}
 impl Carried for () {
     fn respawn(&self, _: &Token) -> Self {}
+    fn agrees(&self, _: &Self, _: &Token) -> bool {
+        true
+    }
 }
 impl<R, S: State> sealed::Sealed for LdsRegion<R, S> {}
 impl<R, S: State> Carried for LdsRegion<R, S> {
     fn respawn(&self, _: &Token) -> Self {
         LdsRegion::new(self.slots, self.last)
     }
+    fn agrees(&self, other: &Self, _: &Token) -> bool {
+        self.slots.ids() == other.slots.ids() && self.last == other.last
+    }
 }
-impl<R, C: State, N: State> sealed::Sealed for Ring<R, C, N> {}
-impl<R, C: State, N: State> Carried for Ring<R, C, N> {
+impl<R, C: State, N: State, const D: usize> sealed::Sealed for Ring<R, C, N, D> {}
+impl<R, C: State, N: State, const D: usize> Carried for Ring<R, C, N, D> {
     fn respawn(&self, _: &Token) -> Self {
         self.duplicate()
+    }
+    fn agrees(&self, other: &Self, _: &Token) -> bool {
+        Ring::agrees(self, other)
     }
 }
 impl<W: WaitModel, E: Event> sealed::Sealed for Pending<W, E> {}
@@ -141,15 +153,21 @@ impl<W: WaitModel, E: Event> Carried for Pending<W, E> {
     fn respawn(&self, _: &Token) -> Self {
         Pending::new(self.last)
     }
+    fn agrees(&self, other: &Self, _: &Token) -> bool {
+        self.last == other.last
+    }
 }
 impl<E: Event> sealed::Sealed for Drained<E> {}
 impl<E: Event> Carried for Drained<E> {
     fn respawn(&self, _: &Token) -> Self {
         Drained::new(self.last)
     }
+    fn agrees(&self, other: &Self, _: &Token) -> bool {
+        self.last == other.last
+    }
 }
 macro_rules! carried_tuple {
-    ($($t:ident),+) => {
+    ($($t:ident $i:tt),+) => {
         impl<$($t: Carried),+> sealed::Sealed for ($($t,)+) {}
         impl<$($t: Carried),+> Carried for ($($t,)+) {
             #[allow(non_snake_case)]
@@ -157,17 +175,20 @@ macro_rules! carried_tuple {
                 let ($($t,)+) = self;
                 ($($t.respawn(token),)+)
             }
+            fn agrees(&self, other: &Self, token: &Token) -> bool {
+                true $(&& self.$i.agrees(&other.$i, token))+
+            }
         }
     };
 }
-carried_tuple!(A);
-carried_tuple!(A, B);
-carried_tuple!(A, B, C);
-carried_tuple!(A, B, C, D);
-carried_tuple!(A, B, C, D, E);
-carried_tuple!(A, B, C, D, E, F);
-carried_tuple!(A, B, C, D, E, F, G);
-carried_tuple!(A, B, C, D, E, F, G, H);
+carried_tuple!(A 0);
+carried_tuple!(A 0, B 1);
+carried_tuple!(A 0, B 1, C 2);
+carried_tuple!(A 0, B 1, C 2, D 3);
+carried_tuple!(A 0, B 1, C 2, D 3, E 4);
+carried_tuple!(A 0, B 1, C 2, D 3, E 4, F 5);
+carried_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6);
+carried_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
 
 /// One wave of a kernel on target `T`, lowered by backend `B`.
 pub struct Wave<'b, T: Target, B: Backend> {
@@ -315,9 +336,9 @@ impl<'b, T: Target, B: Backend> Wave<'b, T, B> {
         self.b.ds_load(&self.auth, r.slots.ids(), insn)
     }
     /// One LDS load from a ring's current buffer.
-    pub fn ds_load_cur<R, N: State>(
+    pub fn ds_load_cur<R, N: State, const D: usize>(
         &mut self,
-        r: &Ring<R, Published, N>,
+        r: &Ring<R, Published, N, D>,
         insn: B::Insn,
     ) -> Result<(), String> {
         let slots: Slots = r
@@ -646,6 +667,43 @@ impl<'b, T: Target, B: Backend> Workgroup<'b, T, B> {
         self.wave.b.join(&self.wave.auth, skipped)?;
         self.wave.b.label(&self.wave.auth, target)?;
         Ok(state)
+    }
+    /// Two-way workgroup branch whose arms may hold barriers and change LDS
+    /// ownership. `cond` true branches to `else_label` and runs `els` from
+    /// the branch point's state (`state` respawned); otherwise `then` runs
+    /// and ends with `s_branch join`. The backend joins both arms' states at
+    /// `join`, and the arms must end in equal carried values (ring `cur`,
+    /// live buffers and slots) and backend state, else this is an `Err`.
+    pub fn wg_if_else<SI: Carried, SO: Carried>(
+        &mut self,
+        cond: WgUniform<Scc>,
+        else_label: &str,
+        join: &str,
+        state: SI,
+        then: impl FnOnce(&mut Self, SI) -> Result<SO, String>,
+        els: impl FnOnce(&mut Self, SI) -> Result<SO, String>,
+    ) -> Result<SO, String> {
+        fresh(self.wave.b, cond.at)?;
+        self.wave.b.branch_scc1(&self.wave.auth, else_label)?;
+        let at = self.wave.b.fork();
+        let for_else = state.respawn(&Token);
+        let out_then = then(self, state)?;
+        self.wave.b.branch(&self.wave.auth, join)?;
+        let then_end = self.wave.b.fork();
+        self.wave.b.resume(&self.wave.auth, at)?;
+        self.wave.b.label(&self.wave.auth, else_label)?;
+        let out_else = els(self, for_else)?;
+        if !out_then.agrees(&out_else, &Token) {
+            return Err(format!(
+                "wg_if_else {join}: the arms end in different ring or region values; both arms must leave the same cur/live buffers"
+            ));
+        }
+        self.wave
+            .b
+            .join(&self.wave.auth, then_end)
+            .map_err(|e| format!("wg_if_else {join}: the arms end in different LDS states: {e}"))?;
+        self.wave.b.label(&self.wave.auth, join)?;
+        Ok(out_else)
     }
     /// Reserve the kernel exit `label` (placed later by `end`).
     pub fn exit(&mut self, label: &str) -> Result<End, String> {

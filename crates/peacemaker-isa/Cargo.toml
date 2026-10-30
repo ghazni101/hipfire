@@ -48,6 +48,10 @@ required-features = ["toolchain"]
 name = "mq_i4_moe_gemv_mq4only_gfx1100_emit"
 required-features = ["toolchain"]
 
+[[example]]
+name = "mq6_resid_gfx1100_emit"
+required-features = ["toolchain"]
+
 # gfx1100 research probes / fixture emitters (native writer only, no ROCm tools): opt-in `--features lab`.
 [[example]]
 name = "gfx1100_divide_cases_probe"

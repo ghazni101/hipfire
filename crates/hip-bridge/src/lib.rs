@@ -56,7 +56,7 @@ pub use rocsolver::{
 };
 pub use vmm::{
     clear_vmm_faults, inject_vmm_fault, retired_va_bytes, retry_pending_granule_releases,
-    vmm_live_granule_bytes, VmmArena, VmmFaultKind, VmmPhysicalId, VmmSharedPrefix,
+    vmm_live_granule_bytes, VmmArena, VmmDriver, VmmFaultKind, VmmPhysicalId, VmmSharedPrefix,
 };
 
 /// Re-export memory copy direction for callers.

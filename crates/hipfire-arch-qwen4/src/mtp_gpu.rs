@@ -2258,6 +2258,71 @@ fn admit_mtp(weights: &Qwen4Weights, config: &Qwen4Config) -> Result<(), MtpGpuE
     }
 }
 
+/// Rows of the head's D2 split executor: one draft token per call.
+pub(crate) const HEAD_D2_ROWS: usize = 1;
+
+/// Device bytes the head's rows=1 D2 executor adds when armed: its one device
+/// allocation, the `masked_indices` table (4 B per routed slot). Zero when
+/// unarmed.
+fn head_d2_device_bytes(config: &Qwen4Config, head_d2: bool) -> Option<usize> {
+    if !head_d2 {
+        return Some(0);
+    }
+    let (_input, mask, _output) = hipfire_dispatch::cpu_split::CpuSplitExecutor::storage_bytes(
+        HEAD_D2_ROWS,
+        config.hidden_size,
+        config.num_experts_per_tok,
+    );
+    (mask != usize::MAX).then_some(mask)
+}
+
+/// Why the native MTP head keeps its GPU expert route on this load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadD2Off {
+    /// `HIPFIRE_QWEN4_MTP_HEAD_D2=0` (the kill).
+    KnobOff,
+    /// The trunk's D2 split has no armed layer on this load (a fast-link card
+    /// keeps the PCIe-read head).
+    TrunkD2Off,
+    /// Expert-parallel bundles never split the head.
+    Ep,
+}
+
+impl HeadD2Off {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::KnobOff => "HIPFIRE_QWEN4_MTP_HEAD_D2=0",
+            Self::TrunkD2Off => "trunk D2 split is not armed on this load (the head follows it)",
+            Self::Ep => "expert-parallel bundle",
+        }
+    }
+}
+
+/// Load-time verdict for arming the head's experts with a D2 executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadD2Decision {
+    Armed,
+    Off(HeadD2Off),
+}
+
+/// Pure decision behind `attach_mtp`: `Some(false)` never arms (the kill);
+/// otherwise (`Some(true)` or unset) the head follows the trunk: armed when the
+/// trunk's D2 split is armed on this load and the bundle is not EP.
+pub(crate) fn head_d2_decision(
+    knob: Option<bool>,
+    trunk_split_layers_nonempty: bool,
+    ep: bool,
+) -> HeadD2Decision {
+    match knob {
+        Some(false) => HeadD2Decision::Off(HeadD2Off::KnobOff),
+        Some(true) | None if ep => HeadD2Decision::Off(HeadD2Off::Ep),
+        Some(true) | None if !trunk_split_layers_nonempty => {
+            HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
+        }
+        Some(true) | None => HeadD2Decision::Armed,
+    }
+}
+
 impl Qwen4MtpGpu {
     /// `(resident, load scratch)` device bytes [`Self::new_with_backend`]
     /// commits for QSA context storage `context` and a language head stored
@@ -2268,6 +2333,7 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         context: &Qwen4ContextCommit,
         head_dtype: DType,
+        head_d2: bool,
     ) -> Option<(usize, usize)> {
         let (policy, layout) = draft_head_config(config);
         let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
@@ -2275,6 +2341,7 @@ impl Qwen4MtpGpu {
             .ok()?
             .checked_add(MtpGpuState::device_bytes(config, context)?)?
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
+            .checked_add(head_d2_device_bytes(config, head_d2)?)?
             .checked_add(draft)?;
         Some((resident, scratch))
     }
@@ -2289,6 +2356,7 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         context: &Qwen4ContextCommit,
         head_dtype: DType,
+        head_d2: bool,
     ) -> Option<(Vec<u64>, Vec<u64>)> {
         let (policy, layout) = draft_head_config(config);
         let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
@@ -2301,6 +2369,9 @@ impl Qwen4MtpGpu {
         let mut resident = MtpGpuScratch::allocation_sizes(config)?;
         resident.extend(MtpGpuState::allocation_sizes(config, context)?);
         resident.extend(Qwen4MoeLayerRuntime::allocation_sizes(config)?);
+        if head_d2 {
+            resident.push(u64::try_from(head_d2_device_bytes(config, true)?).ok()?);
+        }
         resident.extend(widen(draft)?);
         Some((resident, widen(draft_scratch)?))
     }
@@ -2316,10 +2387,15 @@ impl Qwen4MtpGpu {
         config: &Qwen4Config,
         max_seq: usize,
         backend: Qwen4KvBackend,
-        ep: Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)>,
+        ep: Option<(
+            Qwen4EpPlacement,
+            &Qwen4EpDummyExpert,
+            &crate::ep_seal::Qwen4EpRankSeal,
+        )>,
+        head_d2: bool,
     ) -> Result<Self, MtpGpuError> {
         admit_mtp(weights, config)?;
-        if weights.ep_placement() != ep.map(|(placement, _)| placement) {
+        if weights.ep_placement() != ep.map(|(placement, _, _)| placement) {
             return Err(invalid(
                 "the MTP head's EP binding must be the forward's placement the weights were loaded with (EP weights are rank-compact)",
             ));
@@ -2352,7 +2428,8 @@ impl Qwen4MtpGpu {
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
                 let built = match ep {
-                    Some((placement, dummy)) => Qwen4MoeLayerRuntime::from_moe_ep(
+                    // The head's sealed expert group follows the trunk layers.
+                    Some((placement, dummy, seal)) => Qwen4MoeLayerRuntime::from_moe_ep(
                         gpu,
                         weights,
                         moe_weights,
@@ -2360,6 +2437,8 @@ impl Qwen4MtpGpu {
                         config,
                         placement,
                         dummy,
+                        seal,
+                        config.num_hidden_layers,
                     ),
                     None => Qwen4MoeLayerRuntime::from_moe_untiered(
                         gpu,
@@ -2367,6 +2446,7 @@ impl Qwen4MtpGpu {
                         moe_weights,
                         0,
                         config,
+                        head_d2,
                     ),
                 };
                 match built {
@@ -2411,6 +2491,54 @@ impl Qwen4MtpGpu {
             ep_bound,
             moe_steps: 0,
         })
+    }
+
+    /// Whether the head's experts run on a rows=1 D2 split executor.
+    pub(crate) fn head_d2_armed(&self) -> bool {
+        self.head_d2_executor().is_some()
+    }
+
+    fn head_d2_executor(&self) -> Option<&hipfire_dispatch::cpu_split::CpuSplitExecutor> {
+        self.moe
+            .as_ref()
+            .and_then(Qwen4MoeLayerRuntime::cpu_split_storage_executor)
+    }
+
+    /// Host bytes the armed head executor owns: `(pinned, mapped)`, the three
+    /// pinned transfer buffers (input, mask, output) and the mapped cold-return
+    /// allocation of the `mapped` transport. `None` when unarmed or on
+    /// overflow. Never part of the trunk census (`cpu_d2_storage_bytes`).
+    pub(crate) fn head_d2_host_bytes(&self) -> Option<(usize, usize)> {
+        use hipfire_dispatch::cpu_split::{CpuSplitExecutor, D2ReturnMode};
+        let executor = self.head_d2_executor()?;
+        let rows = executor.capacity_rows();
+        let (input, mask, output) =
+            CpuSplitExecutor::storage_bytes(rows, executor.dim(), executor.top_k());
+        if input == usize::MAX || mask == usize::MAX || output == usize::MAX {
+            return None;
+        }
+        let pinned = input.checked_add(mask)?.checked_add(output)?;
+        let mapped = if executor.return_mode() == D2ReturnMode::Mapped {
+            executor
+                .dim()
+                .checked_mul(rows.checked_mul(executor.top_k())?)?
+                .checked_mul(4)?
+        } else {
+            0
+        };
+        Some((pinned, mapped))
+    }
+
+    /// One-line summary of the executor's selected transports for the load line.
+    pub(crate) fn head_d2_modes(&self) -> Option<String> {
+        let executor = self.head_d2_executor()?;
+        Some(format!(
+            "rows={}, return={:?} join={:?} ready={:?}",
+            executor.capacity_rows(),
+            executor.return_mode(),
+            executor.join_mode(),
+            executor.ready_mode(),
+        ))
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
@@ -3706,10 +3834,10 @@ mod tests {
                 DType::F32,
             ] {
                 let (resident, scratch) =
-                    Qwen4MtpGpu::allocation_sizes(&config, &context, head).unwrap();
+                    Qwen4MtpGpu::allocation_sizes(&config, &context, head, false).unwrap();
                 assert_eq!(
                     Some((sum(&resident) as usize, sum(&scratch) as usize)),
-                    Qwen4MtpGpu::device_bytes(&config, &context, head),
+                    Qwen4MtpGpu::device_bytes(&config, &context, head, false),
                     "{head:?} {context:?}"
                 );
                 let mut parts = MtpGpuScratch::allocation_sizes(&config).unwrap();
@@ -3801,6 +3929,64 @@ mod tests {
         assert!(!prompt_fill_uses_rows(true, 0));
         assert_eq!(append_rows_min(false), 2);
         assert_eq!(append_rows_min(true), 1);
+    }
+
+    #[test]
+    fn head_d2_decision_table() {
+        use HeadD2Decision::{Armed, Off};
+        // Unset and `1` both follow the trunk's D2 verdict (non-EP only).
+        for knob in [None, Some(true)] {
+            assert_eq!(head_d2_decision(knob, true, false), Armed);
+            assert_eq!(
+                head_d2_decision(knob, false, false),
+                Off(HeadD2Off::TrunkD2Off)
+            );
+            assert_eq!(head_d2_decision(knob, true, true), Off(HeadD2Off::Ep));
+            assert_eq!(head_d2_decision(knob, false, true), Off(HeadD2Off::Ep));
+        }
+        // `0` is the kill for every trunk/EP combination.
+        for trunk in [true, false] {
+            for ep in [true, false] {
+                assert_eq!(
+                    head_d2_decision(Some(false), trunk, ep),
+                    Off(HeadD2Off::KnobOff)
+                );
+            }
+        }
+        for off in [HeadD2Off::KnobOff, HeadD2Off::TrunkD2Off, HeadD2Off::Ep] {
+            assert!(!off.reason().is_empty());
+        }
+    }
+
+    /// Arming adds exactly the executor's one device allocation (the rows=1
+    /// masked-index table, 4 B per routed slot); unarmed is unchanged and the
+    /// inventory keeps summing to the byte query.
+    #[test]
+    fn armed_head_adds_exactly_the_masked_index_allocation() {
+        let config = compact_test_config();
+        let extra = 4 * config.num_experts_per_tok;
+        for context in [
+            Qwen4ContextCommit::legacy(4096),
+            Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 262_144, 1536, 2 << 20),
+        ] {
+            let sum = |v: &[u64]| v.iter().sum::<u64>() as usize;
+            let (off, off_scratch) =
+                Qwen4MtpGpu::allocation_sizes(&config, &context, DType::BF16, false).unwrap();
+            let (on, on_scratch) =
+                Qwen4MtpGpu::allocation_sizes(&config, &context, DType::BF16, true).unwrap();
+            assert_eq!(on.len(), off.len() + 1);
+            assert_eq!(sum(&on), sum(&off) + extra);
+            assert_eq!(on_scratch, off_scratch);
+            let (off_bytes, off_s) =
+                Qwen4MtpGpu::device_bytes(&config, &context, DType::BF16, false).unwrap();
+            let (on_bytes, on_s) =
+                Qwen4MtpGpu::device_bytes(&config, &context, DType::BF16, true).unwrap();
+            assert_eq!(on_bytes, off_bytes + extra);
+            assert_eq!(on_s, off_s);
+            assert_eq!(sum(&on), on_bytes);
+            assert_eq!(sum(&off), off_bytes);
+        }
+        assert_eq!(head_d2_device_bytes(&config, false), Some(0));
     }
 
     #[test]

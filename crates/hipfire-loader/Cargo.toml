@@ -56,6 +56,7 @@ serde_json.workspace = true
 [dev-dependencies]
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
 sha2.workspace = true
+tempfile = "3"
 
 # ---------------------------------------------------------------------------
 # Archived research probes.

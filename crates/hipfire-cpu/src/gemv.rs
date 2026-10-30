@@ -551,8 +551,16 @@ impl ActivationSumCache {
 /// the row budget per worker; more activation rows make each weight row
 /// heavier and reduce the grain. All arguments are positive.
 fn shared_rows_per_block(m: usize, n: usize, workers_per_job: usize) -> usize {
-    m.div_ceil(workers_per_job).div_ceil(n).isqrt().max(1)
+    let budget = m.div_ceil(workers_per_job).div_ceil(n).max(1);
+    (budget.isqrt() * SHARED_GRAIN_SCALE).clamp(1, budget)
 }
+
+/// Multiplier on the square-root row grain. Measured on the 16-worker MQ4
+/// expert arm (10 experts x 1 row): the plain square root splits a job into
+/// blocks of a few microseconds, where task hand-off is a visible share of the
+/// region; twice the grain trims the region time without leaving a tail longer
+/// than a block.
+const SHARED_GRAIN_SCALE: usize = 2;
 
 /// The batched GEMV's per-job rayon region. On x86_64 `sums`/`offsets`/
 /// `token_base`/`job_simd` are the prepared views (see [`ActivationSumCache`]);

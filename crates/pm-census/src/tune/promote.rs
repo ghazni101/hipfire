@@ -5,10 +5,14 @@
 //! R6/R7 promotion pipeline: `can_promote` evaluates ordered stages and refuses
 //! at the first failure. The final `kld_state` stage accepts either the
 //! bit-identical exact-output proof or, for numeric candidates, promotion-grade
-//! paired KLD evidence ([`kld_state_stage`]); a numeric candidate without that
-//! evidence is never promoted.
+//! KLD evidence: the R9 token-bootstrap evidence (`kld_token`, [`kld_token_stage`])
+//! when attached, else the R7 paired per-chunk evidence ([`kld_state_stage`]); a
+//! numeric candidate without that evidence is never promoted.
 
-use super::{AttemptV1, ClaimPolicyV1, KldStateEvidenceV1, PromotionV1, Refusal, TuneEvidenceV1};
+use super::{
+    ktok, AttemptV1, ClaimPolicyV1, KldRunV1, KldTokenEvidenceV2, PromotionV1, Refusal,
+    TuneEvidenceV1,
+};
 
 pub const STAGES: [&str; 6] = [
     "m7",
@@ -175,8 +179,7 @@ fn stage_confirm(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<(), Stri
 }
 
 /// Run/evidence consistency checks shared by every `kld_state` path.
-fn kld_consistency(ev: &TuneEvidenceV1, k: &KldStateEvidenceV1) -> Result<(), String> {
-    let (i, c) = (&k.incumbent, &k.candidate);
+fn kld_consistency(ev: &TuneEvidenceV1, i: &KldRunV1, c: &KldRunV1) -> Result<(), String> {
     if i.role != "incumbent" {
         return Err(format!("incumbent run role is {:?}", i.role));
     }
@@ -237,6 +240,71 @@ fn kld_consistency(ev: &TuneEvidenceV1, k: &KldStateEvidenceV1) -> Result<(), St
     Ok(())
 }
 
+/// Consistency of a token-bootstrap evidence: every stratum's run pair passes
+/// [`kld_consistency`] and carries hash-recorded per-token files; the strata
+/// agree on model, evaluator, KV flags and selected code object, and use
+/// distinct references (a repeated reference would count tokens twice).
+fn kld_token_consistency(ev: &TuneEvidenceV1, t: &KldTokenEvidenceV2) -> Result<(), String> {
+    let Some(first) = t.strata.first() else {
+        return Err("kld_token evidence has no strata".to_owned());
+    };
+    let mut labels = std::collections::BTreeSet::new();
+    let mut refs = std::collections::BTreeSet::new();
+    for s in &t.strata {
+        let why = |e: String| format!("stratum {}: {e}", s.label);
+        kld_consistency(ev, &s.incumbent, &s.candidate).map_err(why)?;
+        for r in [&s.incumbent, &s.candidate] {
+            if r.ktok_path.is_none() || r.ktok_sha256.is_none() {
+                return Err(why(format!("{} run has no ktok_path/ktok_sha256", r.role)));
+            }
+        }
+        if !labels.insert(s.label.as_str()) {
+            return Err(format!("stratum label {:?} repeats", s.label));
+        }
+        if !refs.insert(s.incumbent.reference_sha256.as_str()) {
+            return Err(why("reference_sha256 repeats another stratum's".to_owned()));
+        }
+        let (a, b) = (&first.incumbent, &s.incumbent);
+        let same = [
+            ("model_sha256", &a.model_sha256, &b.model_sha256),
+            ("evaluator_sha256", &a.evaluator_sha256, &b.evaluator_sha256),
+            ("kv_mode", &a.kv_mode, &b.kv_mode),
+            ("kv_v", &a.kv_v, &b.kv_v),
+        ];
+        for (n, x, y) in same {
+            if x != y {
+                return Err(why(format!("{n} differs from stratum {}", first.label)));
+            }
+        }
+        if s.candidate.selected_code_object_sha256 != first.candidate.selected_code_object_sha256 {
+            return Err(why(format!(
+                "candidate selected_code_object_sha256 differs from stratum {}",
+                first.label
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Numeric stage-6 verdict of a token-bootstrap evidence: promotion grade,
+/// consistent runs, both one-sided 95% upper bounds below `kld_margin` and at
+/// least [`ktok::STRATUM_MIN_CHUNKS`] chunks per stratum
+/// ([`ktok::judge_bounds`]). Refusal is the default.
+fn kld_token_stage(
+    ev: &TuneEvidenceV1,
+    t: &KldTokenEvidenceV2,
+    policy: &ClaimPolicyV1,
+) -> Result<(), String> {
+    if t.grade != "promotion" {
+        return Err(format!(
+            "kld_token grade is {:?}; screening-grade evidence never promotes (need \"promotion\")",
+            t.grade
+        ));
+    }
+    kld_token_consistency(ev, t)?;
+    ktok::judge_bounds(t, policy.kld_margin)
+}
+
 /// Stage 6: model-level KLD / state-equality evidence. Exposed so callers can
 /// judge it independently of stages 1-5.
 pub fn kld_state_stage(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<(), String> {
@@ -251,9 +319,21 @@ pub fn kld_state_stage(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<()
                         .to_owned(),
                 );
             }
-            kld_consistency(ev, k)?;
+            kld_consistency(ev, &k.incumbent, &k.candidate)?;
+        }
+        if let Some(t) = &ev.kld_token {
+            if !t.stat.exact {
+                return Err(
+                    "kld_token evidence attached to an identical-to-baseline candidate has exact=false (nonzero per-token differences)"
+                        .to_owned(),
+                );
+            }
+            kld_token_consistency(ev, t)?;
         }
         return Ok(());
+    }
+    if let Some(t) = &ev.kld_token {
+        return kld_token_stage(ev, t, policy);
     }
     let Some(k) = &ev.kld_state else {
         return Err(
@@ -266,7 +346,7 @@ pub fn kld_state_stage(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<()
             k.grade
         ));
     }
-    kld_consistency(ev, k)?;
+    kld_consistency(ev, &k.incumbent, &k.candidate)?;
     let min = policy.kld_promotion_min_chunks;
     if k.incumbent.max_chunks < min {
         return Err(format!(
@@ -317,7 +397,9 @@ pub fn can_promote(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<Promot
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tune::{CandidateSpecV1, KldRunV1, PairedKldV1};
+    use crate::tune::{
+        CandidateSpecV1, KldStateEvidenceV1, KldStratumV2, PairedKldV1, TokenBootstrapV2,
+    };
     use std::collections::BTreeMap;
 
     fn attempt(phase: &str) -> AttemptV1 {
@@ -364,6 +446,7 @@ mod tests {
             noise_floor: Some(0.01),
             aa_runs: 3,
             kld_state: None,
+            kld_token: None,
         }
     }
 
@@ -397,6 +480,8 @@ mod tests {
             selected_code_object_sha256: (role == "candidate").then(|| "co".to_owned()),
             kldseq_path: "k".into(),
             kldseq_sha256: "k".into(),
+            ktok_path: None,
+            ktok_sha256: None,
             device_uuid: "u".into(),
             fabric_job: Some("j".into()),
             slice_mean_kld: 0.01,
@@ -608,5 +693,159 @@ mod tests {
         let mut e = ev();
         e.confirms[0].candidate_code_sha256 = Some("other".into());
         assert_eq!(stage_of(&e), "confirm");
+    }
+
+    fn stratum(label: &str, refsha: &str, n_chunks: usize) -> KldStratumV2 {
+        let mut i = run("incumbent");
+        let mut c = run("candidate");
+        for r in [&mut i, &mut c] {
+            r.reference_sha256 = refsha.into();
+            r.ktok_path = Some("t".into());
+            r.ktok_sha256 = Some("t".into());
+        }
+        KldStratumV2 {
+            label: label.into(),
+            incumbent: i,
+            candidate: c,
+            n_chunks,
+            tokens_per_chunk: 1023,
+            mean_diff: -0.0003,
+            sd_token: 0.05,
+            sd_chunk: 0.004,
+            deff: 1.0,
+            top1pct_abs_share: 0.1,
+            exact: false,
+        }
+    }
+
+    fn token_ev(grade: &str, n: usize, hi: f64, exact: bool) -> KldTokenEvidenceV2 {
+        KldTokenEvidenceV2 {
+            schema: crate::tune::KLD_TOKEN_SCHEMA.into(),
+            grade: grade.into(),
+            strata: vec![stratum("wt2", "a", n), stratum("ag", "b", n)],
+            stat: TokenBootstrapV2 {
+                stat: crate::tune::KLD_TOKEN_STAT.into(),
+                n_strata: 2,
+                n_chunks: 2 * n,
+                n_tokens: 2 * n * 1023,
+                point: if exact { 0.0 } else { -0.0003 },
+                se: 0.0004,
+                boot_hi95: hi,
+                normal_hi95: hi,
+                boot_b: 20_000,
+                seed: 1,
+                sd_token: 0.05,
+                sd_chunk: 0.004,
+                top1pct_abs_share: 0.1,
+                exact,
+            },
+        }
+    }
+
+    fn numeric_token(t: KldTokenEvidenceV2) -> TuneEvidenceV1 {
+        let mut e = numeric(None);
+        e.kld_token = Some(t);
+        e
+    }
+
+    #[test]
+    fn token_bootstrap_decides_the_numeric_verdict() {
+        let p = ClaimPolicyV1::default();
+        // Both bounds below the margin, 24 chunks per stratum: promotes even though
+        // the R7 per-chunk evidence is absent (and would refuse at this sd).
+        assert!(can_promote(&numeric_token(token_ev("promotion", 24, 0.0004, false)), &p).is_ok());
+        // Either bound at/above the margin refuses with the numbers.
+        let r = kld_reason(&numeric_token(token_ev("promotion", 24, 0.0005, false)));
+        assert!(r.contains("boot_hi95") && r.contains("0.0005"), "{r}");
+        let mut t = token_ev("promotion", 24, 0.0004, false);
+        t.stat.normal_hi95 = 0.0007;
+        assert!(kld_reason(&numeric_token(t)).contains("normal_hi95"));
+        // Per-stratum floor.
+        let r = kld_reason(&numeric_token(token_ev("promotion", 19, 0.0, false)));
+        assert!(r.contains("per-stratum floor"), "{r}");
+        // Screening grade never promotes.
+        let r = kld_reason(&numeric_token(token_ev("screen", 24, 0.0, false)));
+        assert!(r.contains("screening"), "{r}");
+        // Exact identity of the per-token diffs passes as in R7.
+        assert!(can_promote(&numeric_token(token_ev("promotion", 24, 0.0, true)), &p).is_ok());
+        // kld_token takes precedence over a refusing kld_state, never the reverse.
+        let mut e = numeric_token(token_ev("promotion", 24, 0.0004, false));
+        e.kld_state = Some(kld("promotion", false, 0.5));
+        assert!(can_promote(&e, &p).is_ok());
+    }
+
+    #[test]
+    fn token_bootstrap_consistency_checks_each_refuse() {
+        type Mutator = Box<dyn Fn(&mut KldTokenEvidenceV2)>;
+        let cases: Vec<(&str, Mutator)> = vec![
+            (
+                "scoring_mode",
+                Box::new(|t| t.strata[1].incumbent.scoring_mode = "decode".into()),
+            ),
+            (
+                "repeats",
+                Box::new(|t| {
+                    t.strata[1].incumbent.reference_sha256 = "a".into();
+                    t.strata[1].candidate.reference_sha256 = "a".into();
+                }),
+            ),
+            (
+                "model_sha256",
+                Box::new(|t| {
+                    t.strata[1].incumbent.model_sha256 = "x".into();
+                    t.strata[1].candidate.model_sha256 = "x".into();
+                }),
+            ),
+            (
+                "ktok_path",
+                Box::new(|t| t.strata[0].candidate.ktok_path = None),
+            ),
+            (
+                "selected_code_object_sha256",
+                Box::new(|t| t.strata[1].candidate.selected_code_object_sha256 = Some("zz".into())),
+            ),
+            ("label", Box::new(|t| t.strata[1].label = "wt2".into())),
+            ("no strata", Box::new(|t| t.strata.clear())),
+        ];
+        for (name, m) in cases {
+            let mut t = token_ev("promotion", 24, 0.0, false);
+            m(&mut t);
+            let r = kld_reason(&numeric_token(t));
+            assert!(r.contains(name) || r.contains("strata"), "{name}: {r}");
+        }
+    }
+
+    #[test]
+    fn identical_path_checks_attached_token_evidence() {
+        let p = ClaimPolicyV1::default();
+        let mut e = ev();
+        e.kld_token = Some(token_ev("promotion", 24, 0.0, true));
+        assert!(can_promote(&e, &p).is_ok());
+        let mut e = ev();
+        e.kld_token = Some(token_ev("promotion", 24, 0.0, false));
+        assert!(kld_reason(&e).contains("exact=false"));
+    }
+
+    #[test]
+    fn frozen_v1_serialization_omits_the_r9_fields() {
+        let e = ev();
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("kld_token"), "{s}");
+        let mut r = run("incumbent");
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(!s.contains("ktok"), "{s}");
+        // Old records (no ktok fields) still load; new ones round trip.
+        let back: KldRunV1 = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
+        r.ktok_path = Some("p".into());
+        r.ktok_sha256 = Some("h".into());
+        let back: KldRunV1 = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        let back: TuneEvidenceV1 = serde_json::from_str(&s_ev(&e)).unwrap();
+        assert_eq!(back, e);
+    }
+
+    fn s_ev(e: &TuneEvidenceV1) -> String {
+        serde_json::to_string(e).unwrap()
     }
 }

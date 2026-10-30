@@ -430,6 +430,7 @@ mod tests {
                 noise_floor: None,
                 aa_runs: 0,
                 kld_state: None,
+                kld_token: None,
             },
             promotion,
         }

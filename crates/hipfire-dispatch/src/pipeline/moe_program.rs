@@ -103,6 +103,54 @@ fn router_shared_fuse_allowed(
         && env_enabled
 }
 
+/// Admission of the A3B decode norm fold (`HIPFIRE_A3B_NORM_FOLD`), static at
+/// seal: the plain norm + FWHT before the exact MQ4G256V2 hidden-2048 router /
+/// selector / shared gate / shared up quartet runs inside that quartet's launch
+/// ([`Gpu::fused_rmsnorm_proj4_mq4g256v2_fold`]). Exact gfx1201, rows == 1;
+/// anything else keeps the separate norm launch.
+#[allow(clippy::too_many_arguments)]
+fn a3b_norm_fold_admitted(
+    is_gfx1201: bool,
+    params: &MoeParams<'_>,
+    resolution: &MoeResolution,
+    route: Option<MoeRouteCapability>,
+    router_shared_fuse: bool,
+    skip_routing: bool,
+    cpu_split: bool,
+) -> bool {
+    use rdna_compute::DType::MQ4G256V2;
+    if !is_gfx1201 || params.batch_size != 1 || skip_routing || cpu_split {
+        return false;
+    }
+    let Some(shared) = params.shared.as_ref() else {
+        return false;
+    };
+    let w = |w: &crate::families::gemv::WeightRef<'_>, m: usize| {
+        w.dtype == MQ4G256V2
+            && w.awq_scale.is_none()
+            && w.m == m
+            && w.k == rdna_compute::norm_fold::NORM_FOLD_HIDDEN
+    };
+    matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
+        && matches!(params.normalization, MoeNormalization::RmsNorm { .. })
+        && params.x_rot_prerotated
+        && params.hidden == rdna_compute::norm_fold::NORM_FOLD_HIDDEN
+        && !params.skip_shared
+        && !params.cpu_deferred_experts
+        && params.ep_mode == crate::families::moe::MoeEpMode::None
+        && params.ep_row_gather.is_none()
+        && route.is_none()
+        && !router_shared_fuse
+        && resolution.needs_x_rot_local
+        && resolution.gate_fusable_mq4v2
+        && !resolution.gate_fusable
+        && w(&params.router, 256)
+        && w(&shared.weights.selector, 1)
+        && w(&shared.weights.gate, 512)
+        && w(&shared.weights.up, 512)
+        && super::norm_fold::env_enabled()
+}
+
 /// Opt-in gfx1100 decode down+last-combine admission. The fused kernel is a
 /// K=512 (two-group) body, so any other expert-down K (`mi`) stays on the
 /// expanded down + separate combine path. `env_enabled` is evaluated last and
@@ -162,6 +210,10 @@ pub(super) struct MoeDecodeSelection {
     /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
     /// (last) releases it. Implies `cpu_split`.
     pub(super) cpwait: bool,
+    /// A3B decode norm fold admitted for this layer (exact gfx1201, MQ4G256V2
+    /// hidden-2048 router + shared quartet after a plain norm, rows == 1, kill
+    /// switch `HIPFIRE_A3B_NORM_FOLD` not `0`); see [`a3b_norm_fold_admitted`].
+    pub(super) norm_fold: bool,
 }
 
 /// Static grouped-prefill choices resolved while sealing. It deliberately
@@ -311,6 +363,9 @@ pub(super) struct MoeStepState<'a> {
     /// ([`super::qt44_qt53_prefill::input_basis_front`]): written by the input-basis stage,
     /// borrowed by the shared gate/up, taken by the routed gate/up of the same invocation.
     front: RefCell<Option<super::qt44_qt53_prefill::MoeFront>>,
+    /// The normalize stage skipped the plain norm because the gate-side launch
+    /// recomputes it ([`a3b_norm_fold_admitted`]).
+    norm_fold_active: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -391,6 +446,7 @@ impl<'a> MoeStepState<'a> {
             norm_basis_folded: Cell::new(false),
             front_allowed: Cell::new(false),
             front: RefCell::new(None),
+            norm_fold_active: Cell::new(false),
         }
     }
 
@@ -698,7 +754,7 @@ impl<'a> SealedMoeOp<'a> {
     pub(super) fn normalize(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => {
-                let (params, _) = self.state.decode_parts()?;
+                let (params, selection) = self.state.decode_parts()?;
                 if let MoeNormalization::RmsNorm {
                     weight,
                     plain_out,
@@ -706,6 +762,11 @@ impl<'a> SealedMoeOp<'a> {
                 } = &params.normalization
                 {
                     if params.x_rot_prerotated {
+                        if selection.norm_fold && super::norm_fold::launchable(gpu) {
+                            // The gate-side launch recomputes this norm itself.
+                            self.state.norm_fold_active.set(true);
+                            return Ok(());
+                        }
                         gpu.fused_rmsnorm_rotate_mq(
                             params.x_residual,
                             weight,
@@ -951,6 +1012,9 @@ impl<'a> SealedMoeOp<'a> {
             return self.router_projection(gpu);
         }
         let (shared_gate, shared_up) = self.state.shared_views()?;
+        if self.state.norm_fold_active.get() {
+            return self.a3b_norm_fold_gate_side(gpu, params, selection, shared_gate, shared_up);
+        }
         super::decode_gate_side_stage(
             self.state.dispatch_ctx(),
             gpu,
@@ -964,6 +1028,55 @@ impl<'a> SealedMoeOp<'a> {
             shared_up,
             selection.route,
         )
+    }
+
+    /// Gate-side stage of a folded call: the norm + rotate and the router /
+    /// selector / shared gate / shared up rows of the incumbent
+    /// `fused_qkvza_mq4g256v2` launch as one dispatch over the same buffers.
+    fn a3b_norm_fold_gate_side(
+        &self,
+        gpu: &mut Gpu,
+        params: &MoeParams<'_>,
+        selection: &MoeDecodeSelection,
+        shared_gate: &GpuTensor,
+        shared_up: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        super::reject_fp8_moe_unless_routed(&params.dtypes, selection.route)?;
+        super::check_qt53_decode_fallback(params, selection.route)?;
+        let MoeNormalization::RmsNorm { weight, eps, .. } = &params.normalization else {
+            return Err(DispatchError::Hip(
+                "a3b norm fold requires a plain RMSNorm normalization".into(),
+            ));
+        };
+        let shared = params
+            .shared
+            .as_ref()
+            .ok_or_else(|| DispatchError::Hip("a3b norm fold requires the shared expert".into()))?;
+        let args = rdna_compute::norm_fold::NormFoldArgs {
+            x: params.x_residual,
+            norm_weight: weight,
+            x_rot: params.x_rot_local,
+            weights: [
+                params.router.buf,
+                shared.weights.selector.buf,
+                shared.weights.gate.buf,
+                shared.weights.up.buf,
+            ],
+            outs: [params.router_logits, shared.scalar, shared_gate, shared_up],
+            m: [
+                params.router.m,
+                shared.weights.selector.m,
+                shared.weights.gate.m,
+                shared.weights.up.m,
+            ],
+            eps: *eps,
+        };
+        let grid = rdna_compute::norm_fold::norm_fold_grid(
+            args.total_rows(),
+            super::norm_fold::MOE_GATE_ROWS_PER_WAVE,
+        );
+        gpu.fused_rmsnorm_proj4_mq4g256v2_fold(&args, grid)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
     pub(super) fn router_projection(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -3432,6 +3545,15 @@ pub(super) fn select_decode(
         cpwait: cpu_split
             && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
                 .is_some_and(CpuSplitExecutor::cpwait_active),
+        norm_fold: a3b_norm_fold_admitted(
+            ctx.arch.is_gfx1201(),
+            params,
+            &resolution,
+            route,
+            router_shared_fuse && !cpu_split,
+            skip_routing,
+            cpu_split,
+        ),
     })
 }
 

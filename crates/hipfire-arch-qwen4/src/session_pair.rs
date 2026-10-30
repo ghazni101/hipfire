@@ -530,6 +530,25 @@ pub(crate) fn slowlink_scope_tag(profile: Option<(usize, usize)>) -> String {
     })
 }
 
+/// Identity token an SP-armed load adds to its host-arithmetic identity: the
+/// short-prompt hook runs the CPU experts' rows through the E1 F32/BF16
+/// engine, a different prefix-state domain from every SP-off lineage.
+pub(crate) const SP_HOST_IDENTITY: &str = "sp-e1v1";
+
+/// `identity` (the D1/D2 host-arithmetic identity, empty when none is armed)
+/// with [`SP_HOST_IDENTITY`] appended (`+`-joined) when the load armed SP.
+/// Unchanged when SP is not armed, so every SP-off scope is byte for byte
+/// what it was.
+pub(crate) fn with_sp_identity(identity: String, sp_armed: bool) -> String {
+    if !sp_armed {
+        identity
+    } else if identity.is_empty() {
+        SP_HOST_IDENTITY.to_string()
+    } else {
+        format!("{identity}+{SP_HOST_IDENTITY}")
+    }
+}
+
 /// PLE token history after `tokens` follow `entry`.
 pub(crate) fn ple_history_after(entry: PleHistory, tokens: &[u32]) -> PleHistory {
     let mut history = entry;
@@ -889,7 +908,19 @@ impl Qwen4Bundle {
                 };
                 // A kill switch is "not asked", not a refusal.
                 let reason = reason.as_deref().filter(|_| selected_by != "env0");
-                incumbent_receipt_json(selected_by, reason, *entry, windows, *tile_rows)
+                let mut receipt =
+                    incumbent_receipt_json(selected_by, reason, *entry, windows, *tile_rows);
+                // The sticky SP verdict (knob on only): the incumbent ran, but
+                // the receipt still names why SP is or is not armed.
+                if let (Some(sp), Value::Object(map)) = (
+                    self.execution
+                        .as_ref()
+                        .and_then(|forward| forward.slowlink.sp_receipt(&[])),
+                    &mut receipt,
+                ) {
+                    map.insert("sp".to_string(), sp);
+                }
+                receipt
             }
         };
         if let Value::Object(map) = &mut receipt {
@@ -1147,9 +1178,6 @@ impl Qwen4Bundle {
         }
         if self.npu_trunk_planned() {
             return Err("NPU trunk planned for this request");
-        }
-        if self.has_cpu_deferred_experts() {
-            return Err("CPU routed-expert splice armed");
         }
         if self.state.row_capture_armed {
             return Err("speculative row capture armed");
@@ -2765,6 +2793,40 @@ mod slowlink_txn_tests {
             }
         }
         assert_eq!(slowlink_scope_tag(None), "");
+    }
+
+    #[test]
+    fn session_pair_sp_identity_gives_sp_on_and_sp_off_distinct_scopes() {
+        let base = |chunk: usize| format!("qwen4/Ar/chunk{chunk}/F");
+        let s1 = format!("{}{}", base(1536), slowlink_scope_tag(Some((1536, 8192))));
+        // `snapshot_scope` appends `/` + the host identity when it is non-empty.
+        let scope = |host: String| {
+            if host.is_empty() {
+                s1.clone()
+            } else {
+                format!("{s1}/{host}")
+            }
+        };
+        let d2 = "cpu-slab-split-v1/3".to_string();
+        let off = scope(with_sp_identity(String::new(), false));
+        let on = scope(with_sp_identity(String::new(), true));
+        let d2_off = scope(with_sp_identity(d2.clone(), false));
+        let d2_on = scope(with_sp_identity(d2.clone(), true));
+        // SP off: byte for byte the scope it was.
+        assert_eq!(off, s1);
+        assert_eq!(d2_off, format!("{s1}/{d2}"));
+        assert_eq!(with_sp_identity(d2.clone(), false), d2);
+        assert_eq!(with_sp_identity(String::new(), false), "");
+        // SP on: a distinct scope with and without D2, the token last.
+        assert_eq!(on, format!("{s1}/sp-e1v1"));
+        assert_eq!(d2_on, format!("{s1}/{d2}+sp-e1v1"));
+        let scopes = [&off, &on, &d2_off, &d2_on];
+        for (i, a) in scopes.iter().enumerate() {
+            for b in &scopes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(SP_HOST_IDENTITY, "sp-e1v1");
     }
 
     #[test]

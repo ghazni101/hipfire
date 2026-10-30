@@ -373,7 +373,7 @@ Implemented paths (anything else → `404`):
 | Method | Path | Role |
 |---|---|---|
 | `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`, `swap`; `503` unless `status` is `ok` |
-| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
+| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture?, load_summary? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture` / `load_summary`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it. `load_summary` (additive; absent when the daemon ack predates it) is the daemon's one-line load explanation, `{ line, spec, kv, context, placement, prefill }`: what speculation is on or off and why, the KV mode/backend, the admitted context and its bound, weight placement, and load-time prefill decisions (see [CLI.md](CLI.md#load-summary)). The same `line` is printed once on the daemon's stderr per load |
 | `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s`, `loaded_config`, `swap`. `loaded_config` is `{ model, kv_mode, kv_backend, max_seq }` — the values the resident model was actually loaded with, from the daemon's load ack (a field is `null` when the ack did not carry it); the whole object is `null` while no model is resident |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
@@ -528,7 +528,17 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   status as a non-stream request. A stream that fails after that ends with
   `data: {"error": {"message", "type"}}` and then `data: [DONE]`. Until
   `[DONE]`, 15 s without a frame sends a `: keepalive` SSE comment, which
-  SSE parsers ignore.
+  SSE parsers ignore. While the engine prefills a long prompt, the committed
+  stream also carries a `: prefill <done>/<total>` SSE comment (prompt tokens
+  processed so far; for example `: prefill 512/2048`) after each prefill chunk,
+  before the first token. It is sent only after the `200` is on the wire (it
+  never commits a stream early, so a pre-commit failure is still a JSON error;
+  progress reported before the commit is dropped), counts as activity for the
+  keepalive timer, never follows the final frame, and is ignored by SSE
+  parsers. `hipfire_client::read_openai_sse` surfaces it as
+  `OpenAiSseEvent::PrefillProgress`, and `hipfire run` and the TUI show it.
+  `/v1/messages` and `/v1/responses` streams carry the same comment;
+  non-streaming requests have none.
 - **`stream: false` / omitted falsey:** single `chat.completion` JSON body.
 - Oversized body → **413** before the daemon lock (Content-Length or streamed
   cap at `max_request_bytes`).
@@ -625,8 +635,8 @@ follow at the end, each with one `input_json_delta` holding the full arguments.
 Then `message_delta` (`stop_reason`, `usage`) and `message_stop`. The
 `message_start` usage is zero, because token counts are known only at the
 terminal, and `message_delta` carries the real counts. Commit timing,
-keepalives and the pre-commit JSON errors work as on chat. A failure after
-commit ends the stream with `event: error`.
+keepalives, `: prefill` progress comments and the pre-commit JSON errors work
+as on chat. A failure after commit ends the stream with `event: error`.
 
 Errors use the Anthropic shape `{"type": "error", "error": {"type", "message"}}`
 with chat's status mapping: 400 `invalid_request_error`, 404

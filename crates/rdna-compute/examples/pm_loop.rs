@@ -7,8 +7,9 @@
 //! `qwen4_moe_sym` and `qwen4_moe_verify`). Prints ONE JSON object (schema 1) on stdout.
 //!
 //! ```text
-//! pm_loop --kernel iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
-//!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R]
+//! pm_loop --kernel iu4_gemm|qkvzaset|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify --shape <S> [kernel knobs]
+//!         [--arch gfx1201|gfx1151|gfx1100] [--base-<knob> V ...] [--rip FILE.rip] [--time N] [--rounds R] [--flush]
+//!         [--cand-object FILE: qwen4_moe_sym --arch gfx1100 only, a prebuilt candidate object]
 //!         [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR]
 //!         [--null-control aa] [--noise-floor FILE]
 //!         (--offline: stop after step 2 below, no device opened, record `offline: true`; the
@@ -44,6 +45,19 @@
 //!    silu) reports `reference: "none"` and `pass` is then
 //!    `identical_to_baseline` (`pass_basis` says which). `--emu` runs the candidate on the peacemaker emulator
 //!    when every instruction is qualified, else `refused (<reason>)`.
+//!    **Pre-card emulator gate** (`--emu`, with or without `--offline`; `--kernel qwen4_moe_sym` today): before any
+//!    device is opened the candidate AND the shipped incumbent object run their whole grid on the emulator at
+//!    tiny shapes (aligned and ragged `T`), each buffer an exact-size region with >= 128 KiB unmapped guard gaps,
+//!    LDS definedness tracked per workgroup, under the emulator's gate model (`Emulator::hw_model`, no opt-out):
+//!    loads retire only at their `s_waitcnt` (`[in-flight]`), cross-wave LDS accesses need a retired access and a
+//!    barrier epoch between them (`[race]`), every workgroup runs under round-robin, run-ahead-per-wave and
+//!    seeded-random wave orders with bit-identical stores (`[schedule]`). The record's `emu_gate` is `pass` only if
+//!    there is no access outside a mapped buffer, no LDS access out of bounds or read of an LDS byte the workgroup
+//!    never wrote, no barrier deadlock or instruction-limit stop, every opcode is executable (a refusal names it),
+//!    none of those hazards, the candidate output is
+//!    bit-identical to the emulated incumbent's and both pass the CPU reference. A failed gate is stage
+//!    `emu_gate` (exit 3) and the card is never touched. gfx1100 runs use the gfx1151 WMMA/transcendental model
+//!    (`Emulator::gfx1100_as_gfx1151`; recorded in `emu_gate.numeric_model`) with narrowed weight scales.
 //! 4. Timing: ABBA, A = baseline, B = candidate, like `pm_decode_twins time`:
 //!    one checked warm launch per arm, then `--rounds R` (default 6) ABBA
 //!    rounds of `--time N` (default 50) launches per block, per-launch
@@ -125,11 +139,48 @@
 //! candidate_sha256, note}` and the candidate's M7 is the baseline's (`reused_from:
 //! "baseline"`). `--rip` is refused for chains.
 //!
+//! Route judge (`--kernel qwen4_moe_route --arch gfx1100`, `pm_loop/moe_route.rs`; `--offline` plans
+//! the launches and certifies the candidate's shipped PM bundles without a device): baseline = the
+//! shipped F16 grouped WMMA routed-MoE route of an S1 window, candidate = the symmetric-IU4 PM chain
+//! (`HIPFIRE_QWEN4_MOE_SYM_IU4=1`), the production panel schedule over one synthetic route. No
+//! identity gate (A4 vs F16); the record carries per-stage times, the ABBA chain ratio and the
+//! numeric distance of the two routes. `--rip`, `--emu` are refused; `--null-control aa` runs the
+//! baseline chain as the candidate and requires bit identity.
+//!
+//! Cold timing (`--pool`, `--flush-l2`, `--flush`; `--kernel iu4_gemm|qkvzaset`; `support/cold.rs`, shared with
+//! `hip_loop`): the default loop is HOT: the same weights back to back, so a verify-shape matrix of at most ~47 MB
+//! stays resident in the 64 MB Infinity Cache and a DRAM-bound change reads far smaller than in the model (the shipped
+//! `_v64` down: 62.6 us here, 97.6 us in-model). Modes, each a superset of the previous:
+//! * `--pool`: only the weights are cold. A pool of distinct seeded weight sets whose total exceeds 192 MiB (dispatch
+//!   `i`, either arm, uses set `i % sets`; the set count is odd so the ABBA arms do not alias set parity) exceeds
+//!   L2 + MALL; activations, instructions and the TLB entries of the small buffers stay warm.
+//! * `--flush-l2`: the pool plus, after every timed dispatch, a device-to-device copy of 2 x the device L2 per buffer
+//!   (the `hipDeviceAttributeL2CacheSize` attribute, else the documented 8 MiB of gfx1201; recorded as
+//!   `timing.l2_bytes` / `l2_source`): evicts L2, not the MALL.
+//! * `--flush`: the pool plus the full 2 x 96 MiB copy: also MALL, TLB, instruction and scalar caches. (`--flush` and
+//!   `--flush-l2` are exclusive; `--pool` combines with either.)
+//! The copy is enqueued OUTSIDE the hipEvent interval. Set 0 of the pool is the correctness set (the CPU reference
+//! reads it); the arms are additionally compared bit for bit on every other pool member (`correctness.pool =
+//! {sets, identical, per_set_identical, max_abs_diff_vs_baseline}`; a candidate identical on set 0 must stay
+//! identical on all of them), and the post-sampling check re-runs set 0. Recording: `shape.timing_pool` for every
+//! pooled mode, `shape.flush` (true only for `--flush`) and `shape.flush_l2` (true only for `--flush-l2`) (only when
+//! pooled: a hot run's `shape` keeps its bytes, so `pm-census noise` groups still match; the four modes never share a
+//! shape), `timing.cold_mode` / `timing.flush` always, `timing.flush_method` and `flush_bytes_per_buffer` when
+//! flushing.
+//!
+//! `timing.null_dispatch` (`iu4_gemm`, `qkvzaset`, every mode): a NULL kernel with the baseline's emitted descriptor
+//! (VGPRs, LDS, kernarg) and a body of one `s_endpgm`, launched with the workload's own grid, block, LDS and kernarg
+//! in the same process and cold mode, hipEvent-bracketed like a timed arm (400 launches after 40 warm-up). Every
+//! `*_us` in the record contains this fixed host-launch + dispatch cost; it is REPORTED (`subtracted: false`), never
+//! removed. `--pool|--flush-l2|--flush` with a 2:4 sparse arm is refused (the packed image has no pool); other kernels
+//! refuse the flags.
+//!
 //! Exit status: 0 ok; 1 correctness failure (record still printed); 3 the
 //! candidate could not be emitted/certified/launched (record printed with the
 //! error); 2 usage error.
 //!
-//! Kernel knobs and shape grammar: see the doc comment of `pm_loop/iu4.rs`
+//! Kernel knobs and shape grammar: see the doc comment of `pm_loop/qkvzaset.rs` (`--kernel qkvzaset`, the fused
+//! verify GDN projection, 120-byte ABI, identity vs the shipped `_b1s`/`_v64` export) and of `pm_loop/iu4.rs`
 //! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
 //! (`--kernel fp8_gemm`), `pm_loop/fa.rs` (`--kernel fa_prefill`) and `pm_loop/moe.rs`
 //! (`--kernel qwen4_moe_sym`).
@@ -156,6 +207,8 @@
 mod abba;
 #[path = "pm_loop/c8.rs"]
 mod c8;
+#[path = "support/cold.rs"]
+mod cold;
 #[path = "pm_loop/common.rs"]
 mod common;
 #[path = "pm_loop/fa.rs"]
@@ -168,6 +221,8 @@ mod gdn;
 mod iu4;
 #[path = "pm_loop/moe.rs"]
 mod moe;
+#[path = "pm_loop/moe_route.rs"]
+mod moe_route;
 #[path = "pm_loop/moe_verify.rs"]
 mod moe_verify;
 #[path = "pm_loop/moe_verify_iu4.rs"]
@@ -176,6 +231,8 @@ mod moe_verify_iu4;
 mod mq6;
 #[path = "pm_loop/prod.rs"]
 mod prod;
+#[path = "pm_loop/qkvzaset.rs"]
+mod qkvzaset;
 #[path = "pm_loop/rotate.rs"]
 mod rotate;
 #[path = "pm_loop/workload.rs"]
@@ -193,8 +250,9 @@ const SCHEMA: u32 = 1;
 const CHAIN_KERNEL: &str = "qwen4_moe_verify";
 /// `--arch` values.
 const ARCHES: [&str; 3] = ["gfx1201", "gfx1151", "gfx1100"];
-/// Kernels that accept an `--arch` other than gfx1201.
-const TRI_ARCH_KERNELS: [&str; 2] = ["qwen4_moe_sym", "qwen4_moe_verify"];
+/// Kernels that accept an `--arch` other than gfx1201 (`qwen4_moe_route` only gfx1100, enforced by
+/// `moe_route::check_cli`).
+const TRI_ARCH_KERNELS: [&str; 3] = ["qwen4_moe_sym", "qwen4_moe_verify", "qwen4_moe_route"];
 const DEFAULT_TIME: usize = 50;
 const DEFAULT_ROUNDS: usize = 6;
 const DEFAULT_MAX_ROUNDS: usize = 256;
@@ -237,6 +295,10 @@ struct Opts {
     out: Option<PathBuf>,
     /// `--rip FILE`: candidate compiled from a `.rip` source (iu4_gemm only).
     rip: Option<PathBuf>,
+    /// `--cand-object FILE`: a prebuilt code object used as the candidate instead of the emit
+    /// (`--kernel qwen4_moe_sym --arch gfx1100` only; built from a candidate copy of the gfx11 NT1
+    /// module by the standalone emitter project, `pm-krsi-1100/emit`).
+    cand_object: Option<PathBuf>,
     /// `--null-control aa`: time the baseline object against a clone of itself.
     null_control: bool,
     /// `--noise-floor FILE`: a `pm-census noise` document.
@@ -245,11 +307,16 @@ struct Opts {
     noise_floor_doc: Option<Value>,
     /// `--offline`: stop after emit + M7 + baseline resolution (no device).
     offline: bool,
+    /// `--pool` / `--flush-l2` / `--flush`: cold-cache timing (`support/cold.rs`): a rotating weight
+    /// pool whose total exceeds the last-level cache, plus (L2: 2 x the device L2, full: 2 x 96 MiB)
+    /// a device copy after every timed dispatch, outside the event interval; `iu4_gemm` and
+    /// `qkvzaset` only.
+    cold: cold::ColdMode,
     knobs: Knobs,
 }
 
 const DRIVER_FLAGS: &str =
-    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--out DIR] [--rip FILE.rip] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
+    "--kernel K --shape S [--arch gfx1201|gfx1151|gfx1100] [--time N] [--rounds R] [--max-rounds R] [--time-budget-s S] [--min-effect F] [--emu] [--offline] [--pool | --flush-l2 | --flush] [--out DIR] [--rip FILE.rip] [--cand-object FILE] [--null-control aa] [--noise-floor FILE] [--<knob> V]... [--base-<knob> V]...";
 
 fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     let mut o = Opts {
@@ -264,10 +331,12 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         emu: false,
         out: None,
         rip: None,
+        cand_object: None,
         null_control: false,
         noise_floor: None,
         noise_floor_doc: None,
         offline: false,
+        cold: cold::ColdMode::Hot,
         knobs: Knobs::default(),
     };
     while let Some(arg) = a.next() {
@@ -281,6 +350,16 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
         }
         if key == "offline" {
             o.offline = true;
+            continue;
+        }
+        let mode = match key.as_str() {
+            "pool" => Some(cold::ColdMode::Pool),
+            "flush-l2" => Some(cold::ColdMode::FlushL2),
+            "flush" => Some(cold::ColdMode::Flush),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            o.cold = o.cold.combine(mode)?;
             continue;
         }
         let value = a
@@ -322,6 +401,7 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             }
             "out" => o.out = Some(PathBuf::from(value)),
             "rip" => o.rip = Some(PathBuf::from(value)),
+            "cand-object" => o.cand_object = Some(PathBuf::from(value)),
             "null-control" => {
                 if value != "aa" {
                     return Err(format!(
@@ -341,6 +421,9 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel.is_empty() {
         return Err(format!("missing --kernel (usage: {DRIVER_FLAGS})"));
     }
+    if o.kernel == moe_route::KERNEL {
+        moe_route::check_cli(o.arch, o.emu)?;
+    }
     if o.arch != ARCHES[0] && !TRI_ARCH_KERNELS.contains(&o.kernel.as_str()) {
         return Err(format!(
             "--kernel {} targets gfx1201 only (got --arch {})",
@@ -355,6 +438,14 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
     if o.kernel == CHAIN_KERNEL && o.offline {
         return Err(format!(
             "--offline is not supported with --kernel {CHAIN_KERNEL}: chain arms are enqueued through the device launchers"
+        ));
+    }
+    if o.cold.pool() && !workload::COLD_KERNELS.contains(&o.kernel.as_str()) {
+        return Err(format!(
+            "{} is only supported with --kernel {} (got --kernel {}): cold-cache timing needs a weight pool",
+            o.cold.flag(),
+            workload::COLD_KERNELS.join("|"),
+            o.kernel
         ));
     }
     if o.rip.is_some()
@@ -375,13 +466,39 @@ fn parse_args(mut a: impl Iterator<Item = String>) -> Result<Opts> {
             o.kernel
         ));
     }
+    if o.cand_object.is_some() {
+        if o.kernel != "qwen4_moe_sym" || o.arch != "gfx1100" {
+            return Err(format!(
+                "--cand-object is only supported with --kernel qwen4_moe_sym --arch gfx1100 (got --kernel {} --arch {})",
+                o.kernel, o.arch
+            ));
+        }
+        if o.rip.is_some() {
+            return Err(
+                "--cand-object cannot be combined with --rip (two candidate sources)".into(),
+            );
+        }
+        if o.null_control {
+            return Err(
+                "--null-control aa cannot be combined with --cand-object (no candidate is emitted)"
+                    .into(),
+            );
+        }
+    }
     if o.null_control {
         if o.rip.is_some() {
             return Err(
                 "--null-control aa cannot be combined with --rip (no candidate is emitted)".into(),
             );
         }
-        if let Some(k) = o.knobs.0.keys().find(|k| k.starts_with("base-")) {
+        // `--base-shipped` only picks WHICH shipped object is the baseline (the
+        // incumbent); the A/A then times that baseline against itself.
+        if let Some(k) = o
+            .knobs
+            .0
+            .keys()
+            .find(|k| k.starts_with("base-") && k.as_str() != "base-shipped")
+        {
             return Err(format!(
                 "--null-control aa cannot be combined with --{k} (the candidate is the resolved baseline)"
             ));
@@ -414,15 +531,20 @@ fn build_workload(o: &mut Opts) -> Result<Box<dyn Workload>> {
         "mq6_i8_gemm" => mq6::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fp8_gemm" => fp8::new(&shape, &mut knobs, o.rip.as_deref())?,
         "fa_prefill" => fa::new(&shape, &mut knobs, o.rip.as_deref())?,
-        "qwen4_moe_sym" => {
-            moe::new_with_rip(&shape, &mut knobs, o.rip.as_deref(), arch_enum(o.arch)?)?
-        }
+        "qwen4_moe_sym" => moe::new_with_cand_object(
+            &shape,
+            &mut knobs,
+            o.rip.as_deref(),
+            arch_enum(o.arch)?,
+            o.cand_object.as_deref(),
+        )?,
         "iu4_c8_producer_pm" => c8::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "moe_rotate_i4_pm" => rotate::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
         "gdn_chunk_prep_pm" => gdn::new_with_rip(&shape, &mut knobs, o.rip.as_deref())?,
+        "qkvzaset" => qkvzaset::new(&shape, &mut knobs)?,
         other => {
             return Err(format!(
-                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm)"
+                "unknown --kernel {other} (iu4_gemm|mq6_i8_gemm|fp8_gemm|fa_prefill|qwen4_moe_sym|qwen4_moe_verify|iu4_c8_producer_pm|moe_rotate_i4_pm|gdn_chunk_prep_pm|qkvzaset)"
             ))
         }
     };
@@ -575,7 +697,12 @@ fn load(gpu: &Gpu, obj: &Object) -> Result<Loaded> {
 }
 
 fn launch(gpu: &Gpu, w: &dyn Workload, arm: Arm, f: &Loaded) -> Result<()> {
-    let mut l = w.launch(arm);
+    launch_set(gpu, w, arm, 0, f)
+}
+
+/// [`launch`] on weight set `set` of the workload's timing pool (`Workload::launch_set`).
+fn launch_set(gpu: &Gpu, w: &dyn Workload, arm: Arm, set: usize, f: &Loaded) -> Result<()> {
+    let mut l = w.launch_set(arm, set);
     // SAFETY: the workload packs the kernarg per the kernel's declared ABI
     // and every pointer addresses a live allocation it owns.
     unsafe {
@@ -583,6 +710,95 @@ fn launch(gpu: &Gpu, w: &dyn Workload, arm: Arm, f: &Loaded) -> Result<()> {
             .launch_kernel_blob(&f.func, l.grid, l.block, l.lds, None, &mut l.kernarg)
     }
     .map_err(err)
+}
+
+/// Identity of the two arms on every member of the `--flush` weight pool (sets `1..`; set 0 is the
+/// correctness set the caller already compared): each arm runs once on each set from its restored
+/// state, and the outputs are compared bit for bit.
+fn pool_identity(gpu: &Gpu, w: &dyn Workload, bf: &Loaded, cf: &Loaded) -> Result<Value> {
+    let sets = w.pool_sets();
+    let (mut per_set, mut worst) = (Vec::new(), 0f64);
+    for set in 1..sets {
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            w.reset(gpu, arm)?;
+        }
+        launch_set(gpu, w, Arm::Baseline, set, bf)?;
+        launch_set(gpu, w, Arm::Candidate, set, cf)?;
+        gpu.hip.device_synchronize().map_err(err)?;
+        let (b, c) = (
+            w.output(gpu, Arm::Baseline)?,
+            w.output(gpu, Arm::Candidate)?,
+        );
+        worst = worst.max(w.max_abs_diff(&b, &c)?);
+        per_set.push(b == c);
+    }
+    Ok(json!({
+        "sets": sets, "members_checked": per_set.len(),
+        "identical": per_set.iter().all(|x| *x), "per_set_identical": per_set,
+        "max_abs_diff_vs_baseline": worst,
+        "note": "candidate vs baseline on every pool member (set 0 above); no CPU reference for sets >= 1",
+    }))
+}
+
+/// Null dispatches timed per run (after [`NULL_WARM`] unrecorded ones).
+const NULL_LAUNCHES: usize = 400;
+const NULL_WARM: usize = 40;
+
+/// `timing.null_dispatch`: the hipEvent time of a NULL kernel (the baseline's descriptor, body
+/// `s_endpgm`) launched with the workload's own grid, block, LDS and kernarg, in the same process,
+/// the same cold mode (pool rotation, eviction after every launch) and the same event bracketing as
+/// the timed arms: the fixed dispatch cost every reading in this record contains. It is REPORTED,
+/// never subtracted. `None`: the workload has no null kernel.
+fn measure_null(gpu: &Gpu, w: &dyn Workload, flush: Option<&cold::Flush>) -> Option<Value> {
+    let obj = match w.null_object() {
+        Ok(Some(o)) => o,
+        Ok(None) => return None,
+        Err(e) => return Some(json!({"error": e})),
+    };
+    let run = || -> Result<Value> {
+        let nf = load(gpu, &obj)?;
+        let sets = w.pool_sets();
+        let start = gpu.hip.event_create().map_err(err)?;
+        let stop = match gpu.hip.event_create() {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = gpu.hip.event_destroy(start);
+                return Err(err(e));
+            }
+        };
+        let timed = (|| -> Result<Vec<f64>> {
+            cold::evict(&gpu.hip, flush)?;
+            let mut ns = Vec::with_capacity(NULL_LAUNCHES);
+            for i in 0..NULL_WARM + NULL_LAUNCHES {
+                gpu.hip.event_record(&start, None).map_err(err)?;
+                launch_set(gpu, w, Arm::Baseline, i % sets, &nf)?;
+                gpu.hip.event_record(&stop, None).map_err(err)?;
+                gpu.hip.event_synchronize(&stop).map_err(err)?;
+                if i >= NULL_WARM {
+                    ns.push(f64::from(gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?) * 1e6);
+                }
+                cold::evict(&gpu.hip, flush)?;
+            }
+            Ok(ns)
+        })();
+        let d1 = gpu.hip.event_destroy(start).map_err(err);
+        let d2 = gpu.hip.event_destroy(stop).map_err(err);
+        let ns = timed?;
+        d1?;
+        d2?;
+        Ok(json!({
+            "us": arm_json(&timing_stats(&ns)?),
+            "launches": ns.len(),
+            "kernel": obj.launch_symbol,
+            "object_sha256": sha256_hex(&obj.bytes),
+            "body": "s_endpgm",
+            "method": "the baseline's emitted descriptor (VGPRs, LDS, kernarg) with the body replaced by one s_endpgm, \
+                launched with the workload's grid/block/LDS/kernarg, hipEvent-bracketed like a timed arm, in this process and cold mode",
+            "subtracted": false,
+            "note": "every timing.*_us in this record contains this fixed cost; it is reported, not removed",
+        }))
+    };
+    Some(run().unwrap_or_else(|e| json!({"error": e})))
 }
 
 fn device_json(gpu: &Gpu) -> Value {
@@ -745,6 +961,12 @@ trait ArmExec {
     fn begin_round(&mut self, _round: usize) {}
     fn reset(&mut self, arm: Arm) -> Result<()>;
     fn launch(&mut self, arm: Arm) -> Result<()>;
+    /// Evict the caches (`--flush`) the way the other kernels of a decode step do. Enqueued before
+    /// the first launch of a batch and after every timed launch, so it is never inside an event
+    /// interval. Default: nothing.
+    fn evict(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Single-object workload: the workload plus the two loaded modules.
@@ -753,6 +975,10 @@ struct SingleExec<'a> {
     w: &'a dyn Workload,
     base: &'a Loaded,
     cand: &'a Loaded,
+    /// `--flush`: the eviction buffers.
+    flush: Option<&'a cold::Flush>,
+    /// Timed launches issued so far: dispatch `i` runs on weight set `i % w.pool_sets()`.
+    slot: usize,
 }
 
 impl ArmExec for SingleExec<'_> {
@@ -767,7 +993,12 @@ impl ArmExec for SingleExec<'_> {
             Arm::Baseline => self.base,
             Arm::Candidate => self.cand,
         };
-        launch(self.gpu, self.w, arm, f)
+        let set = self.slot % self.w.pool_sets();
+        self.slot += 1;
+        launch_set(self.gpu, self.w, arm, set, f)
+    }
+    fn evict(&mut self) -> Result<()> {
+        cold::evict(&self.gpu.hip, self.flush)
     }
 }
 
@@ -809,6 +1040,7 @@ fn sample_rounds(ex: &mut dyn ArmExec, n: usize, rounds: usize, s: &mut Sampled)
         }
     };
     let measured = (|| -> Result<()> {
+        ex.evict()?;
         for (i, which) in timing_schedule(n, rounds)?.enumerate() {
             if i % (4 * n) == 0 {
                 ex.begin_round(done + i / (4 * n));
@@ -827,6 +1059,7 @@ fn sample_rounds(ex: &mut dyn ArmExec, n: usize, rounds: usize, s: &mut Sampled)
                 TimingArm::Incumbent => s.base_ns.push(ns),
                 TimingArm::Candidate => s.cand_ns.push(ns),
             }
+            ex.evict()?;
         }
         Ok(())
     })();
@@ -933,6 +1166,11 @@ fn timed_record(
         );
     }
     t["post_outputs_unchanged"] = json!(true);
+    t["flush"] = json!(o.cold == cold::ColdMode::Flush);
+    t["cold_mode"] = json!(o.cold.name());
+    if o.cold == cold::ColdMode::Flush {
+        t["flush_method"] = json!(cold::flush_method());
+    }
     Ok(t)
 }
 
@@ -973,6 +1211,9 @@ fn crossover_json(t: &Value) -> Result<Value> {
 
 fn run(o: &mut Opts) -> (Value, Outcome) {
     let mut rec = json!({"schema": SCHEMA, "kernel": o.kernel, "arch": o.arch});
+    if o.kernel == moe_route::KERNEL {
+        return moe_route::run(o);
+    }
     if o.kernel == CHAIN_KERNEL {
         return match build_chain(o) {
             Ok(w) => run_chain(o, w),
@@ -983,6 +1224,11 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Ok(w) => w,
         Err(e) => return fail(rec, "args", e),
     };
+    if o.cold.pool() {
+        if let Err(e) = w.set_cold(o.cold) {
+            return fail(rec, "args", e);
+        }
+    }
     let arch = w.arch();
     rec["arch"] = json!(arch);
     rec["shape"] = w.shape_json();
@@ -990,6 +1236,10 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         rec[key] = value;
     }
     rec["candidate"] = json!({"knobs": w.candidate_knobs()});
+    let contract = w.numeric_contract();
+    if !contract.is_null() {
+        rec["numeric_contract"] = contract;
+    }
     let out_dir = out_dir_of(o);
 
     // 1. emit + link. `--null-control aa`: no candidate is emitted; it is a
@@ -1000,7 +1250,16 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     } else {
         match w.candidate() {
             Ok(c) => Some(c),
-            Err(e) => return fail(rec, if o.rip.is_some() { "rip" } else { "emit" }, e),
+            Err(e) => {
+                let stage = if o.rip.is_some() {
+                    "rip"
+                } else if o.cand_object.is_some() {
+                    "cand_object"
+                } else {
+                    "emit"
+                };
+                return fail(rec, stage, e);
+            }
         }
     };
     let base = match w.baseline() {
@@ -1008,6 +1267,32 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Err(e) => return fail(rec, "baseline", e),
     };
     let cand = emitted.unwrap_or_else(|| base.clone());
+
+    // Pre-card emulator gate (`--emu`, offline or not): no candidate reaches a device unless the candidate and the
+    // shipped incumbent both run their whole grid on the emulator (guarded buffers, definedness-tracked LDS) and
+    // agree bit-for-bit. The record keeps `emu_gate` even when M7 or the gate itself ends the run.
+    let mut emu_gate_failed: Option<String> = None;
+    if o.emu {
+        match w.emu_gate(&cand, &base) {
+            Some(g) => {
+                if g["status"] != "pass" {
+                    emu_gate_failed = Some(
+                        g["reason"]
+                            .as_str()
+                            .unwrap_or("emulator gate failed")
+                            .to_owned(),
+                    );
+                }
+                rec["emu_gate"] = g;
+            }
+            None => {
+                rec["emu_gate"] = json!({
+                    "status": "unavailable",
+                    "reason": format!("no emulator gate for --kernel {}", o.kernel),
+                });
+            }
+        }
+    }
 
     // 2. certify + resources
     if !aa {
@@ -1101,6 +1386,9 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             return fail(rec, "m7", msg);
         }
     }
+    if let Some(reason) = emu_gate_failed {
+        return fail(rec, "emu_gate", reason);
+    }
     if o.offline {
         // Offline legality screen (R4 pruning): emit + link + M7 + baseline
         // resolution only; no device is opened and nothing is timed.
@@ -1142,8 +1430,8 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         Ok(v) => v,
         Err(e) => return fail(rec, "launch", e),
     };
-    let reference = w.check(&cand_out);
-    let base_report = w.check(&base_out);
+    let reference = w.check_arm(Arm::Candidate, &cand_out);
+    let base_report = w.check_arm(Arm::Baseline, &base_out);
     let diff = match w.max_abs_diff(&base_out, &cand_out) {
         Ok(d) => d,
         Err(e) => return fail(rec, "compare", e),
@@ -1152,9 +1440,21 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     // Without a CPU reference (e.g. an epilogue whose device intrinsics are not
     // reproducible) bit identity with the shipped baseline is the only
     // admissible evidence: `pass` is then `identical_to_baseline`.
+    // A declared NUMERIC candidate with no CPU reference cannot be identical;
+    // it passes when finite and NaN-pattern-equal to the baseline (`diff` is
+    // `inf` otherwise), and the KLD/state gate decides promotion.
+    let numeric = w.numeric_contract()["relation"] == "numeric";
     let pass = match &reference {
         Ok(r) => r.pass && (identical || !w.requires_baseline_identity()),
+        Err(_) if numeric => diff.is_finite(),
         Err(_) => identical,
+    };
+    let emu_field = if !o.emu {
+        json!("not requested (--emu)")
+    } else if rec["emu_gate"]["status"] == "pass" {
+        json!("see emu_gate")
+    } else {
+        tidy_emu(w.emu())
     };
     rec["correctness"] = json!({
         "reference": reference.as_ref().map(|r| r.reference.as_str()).unwrap_or("none"),
@@ -1162,36 +1462,75 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "max_abs_err": reference.as_ref().ok().map(|r| r.max_abs_err),
         "tolerance": reference.as_ref().ok().map(|r| r.tolerance),
         "pass": pass,
-        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else { "identical_to_baseline (no CPU reference)" },
+        "pass_basis": if reference.is_ok() && w.requires_baseline_identity() { "cpu_reference and identical_to_baseline" } else if reference.is_ok() { "cpu_reference" } else if numeric { "numeric_contract (no CPU reference; candidate finite and NaN-pattern-equal to baseline)" } else { "identical_to_baseline (no CPU reference)" },
         "baseline_max_abs_err": base_report.as_ref().ok().map(|r| r.max_abs_err),
         "baseline_pass": base_report.as_ref().ok().map(|r| r.pass),
         "baseline_reference_error": base_report.as_ref().err(),
         "identical_to_baseline": identical,
         "max_abs_diff_vs_baseline": diff,
         "output_bytes": cand_out.len(),
-        "emu": if o.emu { tidy_emu(w.emu()) } else { json!("not requested (--emu)") },
+        "emu": emu_field,
     });
+    // `--flush`: the arms must also agree on every member of the weight pool.
+    let mut pass = pass;
+    if w.pool_sets() > 1 {
+        match pool_identity(&gpu, &*w, &bf, &cf) {
+            Ok(p) => {
+                // Identical on the correctness set: identical on every pool member too.
+                if identical && p["identical"] != json!(true) {
+                    pass = false;
+                    rec["correctness"]["pass"] = json!(false);
+                }
+                rec["correctness"]["pool"] = p;
+            }
+            Err(e) => return fail(rec, "launch", e),
+        }
+    }
     if !pass {
         rec["timing"] = json!({"status": "refused: candidate failed correctness"});
         return (rec, Outcome::CorrectnessFailed);
     }
 
     // 4. ABBA timing
+    let l2 = cold::l2_bytes(&gpu.hip, gpu.device_id);
+    let flush = match cold::flush_bytes(o.cold, l2.0) {
+        Some(bytes) => match cold::Flush::alloc_bytes(&gpu.hip, bytes) {
+            Ok(f) => Some(f),
+            Err(e) => return fail(rec, "setup", e),
+        },
+        None => None,
+    };
     let sampled = sample(
         &mut SingleExec {
             gpu: &gpu,
             w: &*w,
             base: &bf,
             cand: &cf,
+            flush: flush.as_ref(),
+            slot: 0,
         },
         o,
     );
     let post = (|| -> Result<bool> {
-        // The last timed launch of each arm must still equal its warm output.
         gpu.hip.device_synchronize().map_err(err)?;
+        if w.pool_sets() > 1 {
+            // The last timed launch of each arm ran on whichever pool set it fell on: re-run both
+            // arms on set 0 and compare with the warm outputs.
+            for (arm, f) in [(Arm::Baseline, &bf), (Arm::Candidate, &cf)] {
+                w.reset(&gpu, arm)?;
+                launch(&gpu, &*w, arm, f)?;
+            }
+            gpu.hip.device_synchronize().map_err(err)?;
+        }
+        // The last timed launch of each arm must still equal its warm output.
         Ok(w.output(&gpu, Arm::Baseline)? == base_out
             && w.output(&gpu, Arm::Candidate)? == cand_out)
     })();
+    // The fixed dispatch cost of this very launch shape, measured in the same process and mode.
+    let null_dispatch = measure_null(&gpu, &*w, flush.as_ref());
+    if let Some(f) = flush {
+        f.free(&gpu.hip);
+    }
     match (sampled, post) {
         (Ok((s, stop, secs)), Ok(true)) => {
             let baseline_sha = rec["baseline"]["co_sha256"]
@@ -1201,6 +1540,17 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
             match timed_record(o, &rec["shape"], &baseline_sha, &s, stop, secs) {
                 Ok(t) => rec["timing"] = t,
                 Err(e) => return fail(rec, "timing", e),
+            }
+            if let Some(bytes) = cold::flush_bytes(o.cold, l2.0) {
+                if o.cold == cold::ColdMode::FlushL2 {
+                    rec["timing"]["flush_method"] = json!(cold::flush_method_of(bytes));
+                }
+                rec["timing"]["flush_bytes_per_buffer"] = json!(bytes);
+                rec["timing"]["l2_bytes"] = json!(l2.0);
+                rec["timing"]["l2_source"] = json!(l2.1);
+            }
+            if let Some(n) = null_dispatch {
+                rec["timing"]["null_dispatch"] = n;
             }
         }
         (Ok(_), Ok(false)) => {
@@ -1552,6 +1902,30 @@ mod tests {
         let c = crossover_json(&json!({"noise": {"round_ratios": [1.0]}})).unwrap();
         assert!(c.get("crossover_ratio").is_none());
         assert!(crossover_json(&json!({})).is_err());
+    }
+
+    #[test]
+    fn cand_object_is_gfx1100_qwen4_moe_sym_only() {
+        let ok = "--kernel qwen4_moe_sym --arch gfx1100 --offline --cand-object /tmp/c.co";
+        let o = parse_args(args(ok)).unwrap();
+        assert_eq!(
+            o.cand_object.as_deref(),
+            Some(std::path::Path::new("/tmp/c.co"))
+        );
+        assert!(parse_args(args("--kernel qwen4_moe_sym"))
+            .unwrap()
+            .cand_object
+            .is_none());
+        for bad in [
+            "--kernel qwen4_moe_sym --arch gfx1151 --cand-object /tmp/c.co",
+            "--kernel qwen4_moe_sym --cand-object /tmp/c.co",
+            "--kernel iu4_gemm --arch gfx1100 --cand-object /tmp/c.co",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --rip /tmp/a.rip",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object /tmp/c.co --null-control aa",
+            "--kernel qwen4_moe_sym --arch gfx1100 --cand-object",
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -2070,5 +2444,209 @@ mod tests {
         let v = vs_noise_floor(&doc, "mq6_i8_gemm", &shape, "bb", 0.9);
         assert!(v["floor"].is_null() && v["status"].is_string());
         assert_eq!(v["group"], "g5");
+    }
+
+    #[test]
+    fn flush_flag_parses_and_is_cold_kernels_only() {
+        for k in ["iu4_gemm", "qkvzaset"] {
+            let o = parse_args(args(&format!("--kernel {k} --flush --shape N=64"))).unwrap();
+            assert_eq!(o.cold, cold::ColdMode::Flush, "{k}");
+            assert!(
+                o.knobs.0.is_empty(),
+                "--flush is not a knob: {:?}",
+                o.knobs.0
+            );
+            assert_eq!(
+                parse_args(args(&format!("--kernel {k}"))).unwrap().cold,
+                cold::ColdMode::Hot
+            );
+        }
+        // `--flush` takes no value: the next flag is parsed as itself.
+        let o = parse_args(args("--kernel iu4_gemm --flush --time 7 --epi add")).unwrap();
+        assert_eq!((o.cold, o.time), (cold::ColdMode::Flush, 7));
+        assert_eq!(o.knobs.0.get("epi").map(String::as_str), Some("add"));
+        for k in [
+            "qwen4_moe_sym",
+            "qwen4_moe_verify",
+            "mq6_i8_gemm",
+            "fa_prefill",
+            "nope",
+        ] {
+            let e = parse_args(args(&format!("--kernel {k} --flush"))).unwrap_err();
+            assert!(
+                e.contains("--flush is only supported with --kernel iu4_gemm|qkvzaset"),
+                "{k}: {e}"
+            );
+        }
+        assert!(DRIVER_FLAGS.contains("[--pool | --flush-l2 | --flush]"));
+        assert_eq!(workload::COLD_KERNELS, ["iu4_gemm", "qkvzaset"]);
+    }
+
+    #[test]
+    fn cold_aware_workloads_build_and_the_rest_refuse_flush() {
+        // The kernels that take --flush build GPU-free and report a pool once cold.
+        for (kernel, shape) in [("iu4_gemm", "M=5120,N=64,K=17408"), ("qkvzaset", "N=64")] {
+            let mut o = parse_args(args(&format!(
+                "--kernel {kernel} --flush --shape {shape} --epi add"
+            )))
+            .unwrap();
+            if kernel == "qkvzaset" {
+                o.knobs.0.remove("epi");
+            }
+            let mut w = build_workload(&mut o).unwrap();
+            assert_eq!(w.pool_sets(), 1);
+            w.set_cold(cold::ColdMode::Flush).unwrap();
+            assert!(w.pool_sets() >= 3 && w.pool_sets() % 2 == 1, "{kernel}");
+            assert_eq!(w.shape_json()["flush"], true);
+            assert!(
+                w.shape_json()["timing_pool"]["total_bytes"]
+                    .as_u64()
+                    .unwrap()
+                    > cold::POOL_BYTES as u64
+            );
+        }
+        // A workload without a pool refuses (the default `Workload::set_cold`).
+        let mut o = parse_args(args("--kernel fa_prefill --shape fn:small")).unwrap();
+        if let Ok(mut w) = build_workload(&mut o) {
+            let e = w.set_cold(cold::ColdMode::Pool).unwrap_err();
+            assert!(
+                e.contains("--pool is not supported by --kernel fa_prefill"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn timing_record_names_the_flush() {
+        let mut hot = parse_args(args("--kernel iu4_gemm")).unwrap();
+        let mut cold = parse_args(args("--kernel iu4_gemm --flush")).unwrap();
+        for o in [&mut hot, &mut cold] {
+            (o.time, o.rounds) = (2, 6);
+        }
+        let s = flat(2, 12, 100_000.0, 100_000.0);
+        let shape = json!({});
+        let t = timed_record(&hot, &shape, "sha", &s, abba::ExtendStop::MaxRounds, 1.0).unwrap();
+        assert_eq!(t["flush"], false);
+        assert!(t.get("flush_method").is_none());
+        let t = timed_record(&cold, &shape, "sha", &s, abba::ExtendStop::MaxRounds, 1.0).unwrap();
+        assert_eq!(t["flush"], true);
+        let m = t["flush_method"].as_str().unwrap();
+        assert!(
+            m.starts_with("2 x 96 MiB device-to-device copy") && m.contains("outside"),
+            "{m}"
+        );
+    }
+
+    /// Dispatch `i` of the timing schedule runs on set `i % sets` (odd): both arms cycle the whole pool.
+    #[test]
+    fn rotating_pool_gives_every_arm_every_set() {
+        for sets in [3usize, 5, 13] {
+            let (mut base, mut cand) = (vec![0usize; sets], vec![0usize; sets]);
+            for (slot, which) in timing_schedule(7, 6).unwrap().enumerate() {
+                let set = slot % sets;
+                match which {
+                    TimingArm::Incumbent => base[set] += 1,
+                    TimingArm::Candidate => cand[set] += 1,
+                }
+            }
+            for (name, v) in [("base", &base), ("cand", &cand)] {
+                assert!(
+                    v.iter().all(|c| *c > 0),
+                    "{name} misses a set at {sets} sets: {v:?}"
+                );
+                let (lo, hi) = (v.iter().min().unwrap(), v.iter().max().unwrap());
+                assert!(hi - lo <= 2 * 7, "{name} is lopsided at {sets} sets: {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pool_and_flush_l2_flags_parse_compose_and_exclude() {
+        use cold::ColdMode::*;
+        let mode =
+            |flags: &str| parse_args(args(&format!("--kernel iu4_gemm {flags}"))).map(|o| o.cold);
+        assert_eq!(mode("--pool").unwrap(), Pool);
+        assert_eq!(mode("--flush-l2").unwrap(), FlushL2);
+        assert_eq!(mode("--pool --flush-l2").unwrap(), FlushL2);
+        assert_eq!(mode("--flush-l2 --pool").unwrap(), FlushL2);
+        assert_eq!(mode("--pool --flush").unwrap(), Flush);
+        assert_eq!(mode("").unwrap(), Hot);
+        assert!(mode("--flush --flush-l2")
+            .unwrap_err()
+            .contains("exclusive"));
+        assert!(mode("--flush-l2 --flush").is_err());
+        // None of them is a knob, and a later flag with a value still parses.
+        let o = parse_args(args("--kernel qkvzaset --pool --time 9 --variant b1s")).unwrap();
+        assert_eq!((o.cold, o.time), (Pool, 9));
+        assert_eq!(o.knobs.0.keys().collect::<Vec<_>>(), ["variant"]);
+        for k in ["qwen4_moe_sym", "mq6_i8_gemm", "nope"] {
+            for f in ["--pool", "--flush-l2", "--flush"] {
+                let e = parse_args(args(&format!("--kernel {k} {f}"))).unwrap_err();
+                assert!(
+                    e.starts_with(&format!(
+                        "{f} is only supported with --kernel iu4_gemm|qkvzaset"
+                    )),
+                    "{k} {f}: {e}"
+                );
+            }
+        }
+        assert!(DRIVER_FLAGS.contains("--pool | --flush-l2 | --flush"));
+    }
+
+    #[test]
+    fn every_cold_mode_reaches_the_workload_shape() {
+        use cold::ColdMode::*;
+        for (kernel, shape) in [("iu4_gemm", "M=5120,N=64,K=17408"), ("qkvzaset", "N=64")] {
+            let mut shapes = Vec::new();
+            for m in [Hot, Pool, FlushL2, Flush] {
+                let mut o = parse_args(args(&format!(
+                    "--kernel {kernel} --shape {shape} --epi add"
+                )))
+                .unwrap();
+                if kernel == "qkvzaset" {
+                    o.knobs.0.remove("epi");
+                }
+                let mut w = build_workload(&mut o).unwrap();
+                if m.pool() {
+                    w.set_cold(m).unwrap();
+                }
+                assert_eq!(w.pool_sets() > 1, m.pool(), "{kernel} {m:?}");
+                let s = w.shape_json();
+                assert_eq!(s.get("timing_pool").is_some(), m.pool());
+                assert_eq!(
+                    s.get("flush").map(|v| v == &json!(true)),
+                    m.pool().then_some(m == Flush)
+                );
+                assert_eq!(s.get("flush_l2").is_some(), m == FlushL2);
+                shapes.push(s);
+            }
+            // The four modes never share a shape (a noise group keys on it).
+            for i in 0..4 {
+                for j in 0..i {
+                    assert_ne!(shapes[i], shapes[j], "{kernel} {i} {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timing_record_names_the_cold_mode() {
+        let s = flat(2, 12, 100_000.0, 100_000.0);
+        for (flags, mode, flush) in [
+            ("", "hot", false),
+            ("--pool", "pool", false),
+            ("--flush-l2", "flush-l2", false),
+            ("--flush", "flush", true),
+        ] {
+            let mut o = parse_args(args(&format!("--kernel iu4_gemm {flags}"))).unwrap();
+            (o.time, o.rounds) = (2, 6);
+            let t =
+                timed_record(&o, &json!({}), "sha", &s, abba::ExtendStop::MaxRounds, 1.0).unwrap();
+            assert_eq!(
+                (t["cold_mode"].as_str(), t["flush"].as_bool()),
+                (Some(mode), Some(flush))
+            );
+            assert_eq!(t.get("flush_method").is_some(), flush, "{mode}: only the full flush is named here; flush-l2 names its bytes after the L2 query");
+        }
     }
 }

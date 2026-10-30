@@ -234,6 +234,61 @@ fn compare_bytes(bl: &ByteLayout, decl: &Decl) -> Vec<String> {
     probs
 }
 
+/// A launch whose kernarg image comes from a validated `KernelAbiV1` contract
+/// (`kernel_params(&mut v, &mut kparams)` + `kernel_abi::blob(v.explicit())`) instead
+/// of hand-written pushes. Its layout is the contract's field table of each candidate
+/// symbol; `kernel_abi_drift` proves that table against the generator and the object
+/// metadata, and `compare_bytes` here proves it against the declared HIP/PM arguments,
+/// so a symbol with no contract export fails closed.
+fn contract_site_variants(site: &Site, cands: &[String]) -> Option<Result<Vec<Variant>, String>> {
+    let squash = |t: &[Tt]| {
+        text(t)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    if site.kind != 'm'
+        || squash(&site.params_ex) != "&mutkparams[..nk]"
+        || !squash(&site.closure_ex).contains("crate::kernel_abi::blob(v.explicit())")
+    {
+        return None;
+    }
+    let mut out: Vec<Variant> = Vec::new();
+    for c in cands {
+        let mut layouts: Vec<ByteLayout> = Vec::new();
+        for arch in hipfire_kernel_abi::Arch::ALL {
+            if let Some((abi, _)) = hipfire_kernel_abi::families::find_export(arch, c) {
+                let bl = ByteLayout {
+                    len: abi.explicit_bytes,
+                    writes: abi.fields.iter().map(|f| (f.offset, f.width)).collect(),
+                };
+                if !layouts
+                    .iter()
+                    .any(|l| l.len == bl.len && l.writes == bl.writes)
+                {
+                    layouts.push(bl);
+                }
+            }
+        }
+        if layouts.is_empty() {
+            return Some(Err(format!(
+                "contract launch of `{c}`: no KernelAbiV1 export carries this symbol"
+            )));
+        }
+        for bl in layouts {
+            out.push(Variant {
+                assign: BTreeMap::new(),
+                param_idents: Vec::new(),
+                pushes: Vec::new(),
+                has_params: false,
+                bytes: Some(bl),
+                only_for: Some(vec![c.clone()]),
+            });
+        }
+    }
+    Some(Ok(out))
+}
+
 /// Outcome for one function.
 #[derive(Default, Debug)]
 pub struct FnReport {
@@ -1111,7 +1166,9 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
                     ));
                     continue;
                 }
-                let variants_res = if probe_site {
+                let variants_res = if let Some(r) = contract_site_variants(site, &cands) {
+                    r
+                } else if probe_site {
                     world.probe_variants(fi, fk, site, &names)
                 } else {
                     world.site_layouts(&ctx, site)

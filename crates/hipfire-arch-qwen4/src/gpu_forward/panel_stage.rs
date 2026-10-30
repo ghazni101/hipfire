@@ -1563,6 +1563,46 @@ impl<B: PanelBackend> RingCore<B> {
 
 // ── layer-ahead schedule ─────────────────────────────────────────────
 
+/// The weight schedule a window runs against the page ring.
+///
+/// [`PanelSchedule`] is S1's page-order sweep (layer ahead, one transfer per
+/// group, prefetching before the route exists); [`SpSchedule`] is the
+/// short-prompt hook's selective schedule (one layer at a time, only the
+/// groups the planner chose, no lookahead). Both drive the same [`RingCore`],
+/// so page lifecycle, tickets, events, drain and quarantine are shared.
+pub(crate) trait RingSchedule {
+    /// Start of the window; returns the number of groups enqueued.
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize>;
+
+    /// Compute reaches host layer `layer`; returns the groups enqueued.
+    fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize>;
+
+    /// Enqueue whatever the schedule's policy allows (call after each retire).
+    fn pump<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize>;
+
+    /// The ticket of current-layer `group`, which compute needs now.
+    fn require<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket>;
+
+    /// The ticket of `(layer, group)` once enqueued.
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket>;
+
+    /// Payload bytes this window's schedule submits: the full sweep for
+    /// [`PanelSchedule`], the bytes of the groups enqueued so far this window
+    /// for [`SpSchedule`] (equal to the sum of their layouts' submitted bytes).
+    fn submitted_bytes(&self) -> u64;
+}
+
 struct ScheduledLayer {
     sources: LayerExpertSources,
     groups: Vec<ExpertGroupPlan>,
@@ -1653,6 +1693,17 @@ impl PanelSchedule {
         )
     }
 
+    /// The expert sources of host layer `layer`.
+    pub(crate) fn sources_of(&self, layer: usize) -> Option<&LayerExpertSources> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .map(|l| &l.sources)
+    }
+
+    // The [`RingSchedule`] operations are also inherent, so callers that
+    // drive a `PanelSchedule` directly need not import the trait.
+
     /// Start of the window: lookahead covers the first host layer while
     /// resident layers compute. Pumps immediately.
     pub(crate) fn prime<B: PanelBackend>(
@@ -1660,6 +1711,50 @@ impl PanelSchedule {
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
     ) -> R<usize> {
+        RingSchedule::prime(self, core, ctx)
+    }
+
+    /// Compute reaches host layer `layer` (the next in the schedule).
+    pub(crate) fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize> {
+        RingSchedule::enter_layer(self, core, ctx, layer)
+    }
+
+    /// Enqueue as many groups as free pages allow: the current layer's
+    /// missing groups first, then the next layer's.
+    pub(crate) fn pump<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+    ) -> R<usize> {
+        RingSchedule::pump(self, core, ctx)
+    }
+
+    /// The ticket of `(layer, group)` once enqueued.
+    pub(crate) fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        RingSchedule::ticket(self, layer, group)
+    }
+
+    /// The ticket of a current-layer group compute needs now, enqueueing the
+    /// groups before it if the pool allowed none yet. Errors (no state
+    /// change) when the pool is full: retire earlier tickets first.
+    pub(crate) fn require<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        RingSchedule::require(self, core, ctx, layer, group)
+    }
+}
+
+impl RingSchedule for PanelSchedule {
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
         self.current = None;
         for layer in &mut self.layers {
             layer.next_group = 0;
@@ -1667,11 +1762,10 @@ impl PanelSchedule {
         }
         core.begin_window(ctx)?;
         self.apply_window(core)?;
-        self.pump(core, ctx)
+        RingSchedule::pump(self, core, ctx)
     }
 
-    /// Compute reaches host layer `layer` (the next in the schedule).
-    pub(crate) fn enter_layer<B: PanelBackend>(
+    fn enter_layer<B: PanelBackend>(
         &mut self,
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
@@ -1691,16 +1785,10 @@ impl PanelSchedule {
         }
         self.current = Some(expected);
         self.apply_window(core)?;
-        self.pump(core, ctx)
+        RingSchedule::pump(self, core, ctx)
     }
 
-    /// Enqueue as many groups as free pages allow: the current layer's
-    /// missing groups first, then the next layer's.
-    pub(crate) fn pump<B: PanelBackend>(
-        &mut self,
-        core: &mut RingCore<B>,
-        ctx: &B::Ctx,
-    ) -> R<usize> {
+    fn pump<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
         let mut issued = 0;
         for index in [self.current, self.next_index()].into_iter().flatten() {
             let layer = &mut self.layers[index];
@@ -1719,33 +1807,299 @@ impl PanelSchedule {
         Ok(issued)
     }
 
-    /// The ticket of `(layer, group)` once enqueued.
-    pub(crate) fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
-        self.layers
-            .iter()
-            .find(|l| l.sources.layer() == layer)
-            .and_then(|l| l.tickets.get(group as usize).copied().flatten())
-    }
-
-    /// The ticket of a current-layer group compute needs now, enqueueing the
-    /// groups before it if the pool allowed none yet. Errors (no state
-    /// change) when the pool is full: retire earlier tickets first.
-    pub(crate) fn require<B: PanelBackend>(
+    fn require<B: PanelBackend>(
         &mut self,
         core: &mut RingCore<B>,
         ctx: &B::Ctx,
         layer: usize,
         group: u32,
     ) -> R<PanelTicket> {
-        if let Some(ticket) = self.ticket(layer, group) {
+        if let Some(ticket) = RingSchedule::ticket(&*self, layer, group) {
             return Ok(ticket);
         }
-        self.pump(core, ctx)?;
-        self.ticket(layer, group).ok_or_else(|| {
+        RingSchedule::pump(self, core, ctx)?;
+        RingSchedule::ticket(&*self, layer, group).ok_or_else(|| {
             invalid(format!(
                 "panel layer {layer} group {group} cannot be enqueued: the pool is full or the layer is not current"
             ))
         })
+    }
+
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        self.layers
+            .iter()
+            .find(|l| l.sources.layer() == layer)
+            .and_then(|l| l.tickets.get(group as usize).copied().flatten())
+    }
+
+    fn submitted_bytes(&self) -> u64 {
+        self.sweep_bytes
+    }
+}
+
+// ── selective (short-prompt) schedule ────────────────────────────────
+
+/// One layer's planned groups and what the ring did with them.
+struct SpPlannedLayer {
+    layer: usize,
+    groups: Vec<ExpertGroupPlan>,
+    /// Per group: `(submitted payload bytes, payload end of its page layout)`.
+    layouts: Vec<(u64, usize)>,
+    tickets: Vec<Option<PanelTicket>>,
+    /// `enter_layer` enqueued the groups.
+    entered: bool,
+}
+
+/// The short-prompt hook's schedule: per layer, only the groups the planner
+/// chose (sparse ascending experts), all enqueued at layer entry, never
+/// prefetched and never waited for. Sources come from the window's
+/// [`PanelSchedule`] (borrowed, read-only). One transfer per group per window.
+///
+/// Per layer the order is `plan_layer(L, groups)` then `enter_layer(L)`; every
+/// group's tickets must be retired before the next layer is entered.
+pub(crate) struct SpSchedule<'a> {
+    sources: &'a PanelSchedule,
+    plan: Option<SpPlannedLayer>,
+    /// The last layer entered this window.
+    current: Option<usize>,
+    submitted: u64,
+}
+
+#[allow(dead_code)]
+impl<'a> SpSchedule<'a> {
+    pub(crate) fn new(sources: &'a PanelSchedule) -> Self {
+        Self {
+            sources,
+            plan: None,
+            current: None,
+            submitted: 0,
+        }
+    }
+
+    /// Plan host layer `layer`'s streamed set: `groups` are ascending expert
+    /// ids, each group `1..=MAX_GROUP_EXPERTS` long, ascending across groups
+    /// (so no expert streams twice), one codec per group. An empty list is a
+    /// layer that streams nothing. Pure: no ring or device state is touched,
+    /// and a refusal leaves the previous state unchanged.
+    pub(crate) fn plan_layer(&mut self, layer: usize, groups: &[Vec<u16>]) -> R<()> {
+        if let Some(open) = self.plan.as_ref().filter(|p| !p.entered) {
+            return Err(invalid(format!(
+                "sp schedule: layer {} is planned but not entered; layer {layer} cannot be planned over it",
+                open.layer
+            )));
+        }
+        if let Some(current) = self.current.filter(|&c| layer <= c) {
+            return Err(invalid(format!(
+                "sp schedule: layer {layer} is not after the entered layer {current}"
+            )));
+        }
+        let sources = self
+            .sources
+            .sources_of(layer)
+            .ok_or_else(|| invalid(format!("sp schedule: layer {layer} is not a host layer")))?;
+        let mut plans = Vec::with_capacity(groups.len());
+        let mut layouts = Vec::with_capacity(groups.len());
+        let mut previous: Option<usize> = None;
+        for (index, ids) in groups.iter().enumerate() {
+            let group = u32::try_from(index)
+                .map_err(|_| invalid("sp schedule: group index overflows u32"))?;
+            if ids.is_empty() || ids.len() > MAX_GROUP_EXPERTS {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {group}: {} experts is outside 1..={MAX_GROUP_EXPERTS}",
+                    ids.len()
+                )));
+            }
+            let experts: SmallVec<[usize; MAX_GROUP_EXPERTS]> =
+                ids.iter().map(|&id| usize::from(id)).collect();
+            for &id in &experts {
+                if previous.is_some_and(|p| id <= p) {
+                    return Err(invalid(format!(
+                        "sp schedule layer {layer} group {group}: expert {id} is not strictly ascending across the layer's groups"
+                    )));
+                }
+                previous = Some(id);
+            }
+            let codec = sources
+                .expert(experts[0])
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "sp schedule layer {layer} group {group}: expert {} is not held",
+                        experts[0]
+                    ))
+                })?
+                .codec;
+            for &id in &experts {
+                match sources.expert(id) {
+                    Some(expert) if expert.codec == codec => {}
+                    Some(_) => {
+                        return Err(invalid(format!(
+                            "sp schedule layer {layer} group {group}: expert {id} does not share codec {codec:?}"
+                        )))
+                    }
+                    None => {
+                        return Err(invalid(format!(
+                            "sp schedule layer {layer} group {group}: expert {id} is not held"
+                        )))
+                    }
+                }
+            }
+            let layout = plan_group_layout(&experts, sources)?;
+            layouts.push((layout.submitted_bytes() as u64, layout.used));
+            plans.push(ExpertGroupPlan {
+                layer,
+                group,
+                codec,
+                experts,
+            });
+        }
+        self.plan = Some(SpPlannedLayer {
+            layer,
+            tickets: vec![None; plans.len()],
+            groups: plans,
+            layouts,
+            entered: false,
+        });
+        Ok(())
+    }
+
+    /// The planned groups of `layer` (the layer last planned).
+    pub(crate) fn planned_groups(&self, layer: usize) -> Option<&[ExpertGroupPlan]> {
+        self.plan
+            .as_ref()
+            .filter(|p| p.layer == layer)
+            .map(|p| p.groups.as_slice())
+    }
+}
+
+impl RingSchedule for SpSchedule<'_> {
+    /// `begin_window` plus `set_layers(None, None)`: zero enqueues.
+    fn prime<B: PanelBackend>(&mut self, core: &mut RingCore<B>, ctx: &B::Ctx) -> R<usize> {
+        self.plan = None;
+        self.current = None;
+        self.submitted = 0;
+        core.begin_window(ctx)?;
+        core.set_layers(None, None)?;
+        Ok(0)
+    }
+
+    /// Enqueue every planned group of `layer` at once. Every refusal that can
+    /// be decided from the plan (not planned, more groups than free pages, an
+    /// oversized group) happens before the ring is touched. A group the ring
+    /// then cannot take is a protocol bug: the ring is quarantined and the
+    /// caller must drain; the host never waits for a page.
+    fn enter_layer<B: PanelBackend>(
+        &mut self,
+        core: &mut RingCore<B>,
+        ctx: &B::Ctx,
+        layer: usize,
+    ) -> R<usize> {
+        core.check_live()?;
+        let base = self.sources;
+        let plan = match self.plan.as_mut() {
+            Some(plan) if plan.layer == layer && !plan.entered => plan,
+            Some(plan) if plan.layer == layer => {
+                return Err(invalid(format!(
+                    "sp schedule: layer {layer} was already entered this window"
+                )))
+            }
+            other => {
+                return Err(invalid(format!(
+                    "sp schedule: layer {layer} entered without plan_layer (planned {:?})",
+                    other.map(|p| p.layer)
+                )))
+            }
+        };
+        let sources = base
+            .sources_of(layer)
+            .ok_or_else(|| invalid(format!("sp schedule: layer {layer} is not a host layer")))?;
+        if sources.num_experts() != core.spec.num_experts {
+            return Err(invalid(format!(
+                "sp schedule: sources hold a {}-entry table, the pool {}",
+                sources.num_experts(),
+                core.spec.num_experts
+            )));
+        }
+        let groups = plan.groups.len();
+        if groups > core.free.len() {
+            return Err(invalid(format!(
+                "sp schedule layer {layer}: {groups} groups need {groups} pages, the ring has {} free of {}",
+                core.free.len(),
+                core.pages.len()
+            )));
+        }
+        let page_bytes = core
+            .spec
+            .page_bytes()
+            .ok_or_else(|| invalid("panel page size overflows"))?;
+        for (group, &(_, used)) in plan.groups.iter().zip(&plan.layouts) {
+            if group.experts.len() > core.spec.experts_per_slot {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {}: {} experts exceed the pool's {} per page",
+                    group.group,
+                    group.experts.len(),
+                    core.spec.experts_per_slot
+                )));
+            }
+            if used
+                .checked_add(ARENA_TAIL_PAD_BYTES)
+                .map_or(true, |need| need > page_bytes)
+            {
+                return Err(invalid(format!(
+                    "sp schedule layer {layer} group {} needs {used} payload bytes plus pad, a page holds {page_bytes}",
+                    group.group
+                )));
+            }
+        }
+        core.set_layers(Some(layer), None)?;
+        plan.entered = true;
+        self.current = Some(layer);
+        for index in 0..groups {
+            match core.try_enqueue_scheduled(ctx, &plan.groups[index], sources)? {
+                Some(ticket) => {
+                    plan.tickets[index] = Some(ticket);
+                    self.submitted += plan.layouts[index].0;
+                }
+                None => {
+                    core.poisoned = true;
+                    return Err(invalid(format!(
+                        "sp schedule layer {layer} group {index}: no free page after {index} of {groups} groups although {groups} pages were free (protocol bug; drain the ring)"
+                    )));
+                }
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Nothing is prefetched or refilled: every group of the layer already
+    /// holds its page.
+    fn pump<B: PanelBackend>(&mut self, _core: &mut RingCore<B>, _ctx: &B::Ctx) -> R<usize> {
+        Ok(0)
+    }
+
+    /// The ticket of an enqueued group; never enqueues or waits.
+    fn require<B: PanelBackend>(
+        &mut self,
+        _core: &mut RingCore<B>,
+        _ctx: &B::Ctx,
+        layer: usize,
+        group: u32,
+    ) -> R<PanelTicket> {
+        RingSchedule::ticket(&*self, layer, group).ok_or_else(|| {
+            invalid(format!(
+                "sp schedule layer {layer} group {group} has no ticket: it is not in the entered layer's plan"
+            ))
+        })
+    }
+
+    fn ticket(&self, layer: usize, group: u32) -> Option<PanelTicket> {
+        self.plan
+            .as_ref()
+            .filter(|p| p.layer == layer && p.entered)
+            .and_then(|p| p.tickets.get(group as usize).copied().flatten())
+    }
+
+    fn submitted_bytes(&self) -> u64 {
+        self.submitted
     }
 }
 
@@ -2144,30 +2498,30 @@ impl ExpertPanelRing {
 
     /// Start a window and prefetch the first host layer's groups (no compute
     /// layer yet). Returns the number of groups enqueued.
-    pub(crate) fn prime(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+    pub(crate) fn prime<S: RingSchedule>(&mut self, gpu: &Gpu, schedule: &mut S) -> R<usize> {
         schedule.prime(&mut self.core, gpu)
     }
 
     /// Compute reached host layer `layer`.
-    pub(crate) fn enter_layer(
+    pub(crate) fn enter_layer<S: RingSchedule>(
         &mut self,
         gpu: &Gpu,
-        schedule: &mut PanelSchedule,
+        schedule: &mut S,
         layer: usize,
     ) -> R<usize> {
         schedule.enter_layer(&mut self.core, gpu, layer)
     }
 
-    /// Enqueue whatever free pages allow (call after each retire).
-    pub(crate) fn pump(&mut self, gpu: &Gpu, schedule: &mut PanelSchedule) -> R<usize> {
+    /// Enqueue whatever the schedule allows (call after each retire).
+    pub(crate) fn pump<S: RingSchedule>(&mut self, gpu: &Gpu, schedule: &mut S) -> R<usize> {
         schedule.pump(&mut self.core, gpu)
     }
 
-    /// Ticket of current-layer `group`, enqueueing it if still missing.
-    pub(crate) fn require(
+    /// Ticket of current-layer `group`, enqueueing it if the schedule does so.
+    pub(crate) fn require<S: RingSchedule>(
         &mut self,
         gpu: &Gpu,
-        schedule: &mut PanelSchedule,
+        schedule: &mut S,
         layer: usize,
         group: u32,
     ) -> R<PanelTicket> {
@@ -3456,10 +3810,15 @@ mod slowlink_ring {
 
     impl Mock {
         fn new(pages: usize) -> Self {
+            Self::sized(pages, EXPERTS)
+        }
+
+        /// A mock whose per-page pointer tables hold `experts` entries.
+        fn sized(pages: usize, experts: usize) -> Self {
             Self {
                 ops: Vec::new(),
                 tables: (0..pages)
-                    .map(|_| (vec![0; EXPERTS], vec![0; EXPERTS]))
+                    .map(|_| (vec![0; experts], vec![0; experts]))
                     .collect(),
                 clock: 0.0,
                 times: HashMap::new(),
@@ -4811,5 +5170,398 @@ mod slowlink_ring {
         assert_eq!(timeline.stats.timeline_overflow, 1);
         // Closing a layer that was never marked is an error (no invented data).
         assert!(ring.mark_layer_end(&(), 9).is_err());
+    }
+
+    // ── SP selective schedule on the CPU model of the ring ───────────
+
+    /// `experts` experts back to back, one codec.
+    fn sp_sources(layer: usize, experts: usize) -> LayerExpertSources {
+        let table = (0..experts)
+            .map(|id| {
+                let base = HOST + id * (GU + DN);
+                Some(ExpertSource {
+                    codec: PanelCodec(1),
+                    gate_up: ExpertExtent {
+                        addr: base,
+                        len: GU,
+                    },
+                    down: ExpertExtent {
+                        addr: base + GU,
+                        len: DN,
+                    },
+                })
+            })
+            .collect();
+        // SAFETY: the mock backend never dereferences a source address.
+        unsafe { LayerExpertSources::new(layer, HOST, experts * (GU + DN), table, Arc::new(0u8)) }
+            .unwrap()
+    }
+
+    fn sp_spec(pages: usize, experts: usize, per_slot: usize) -> PanelPoolSpec {
+        PanelPoolSpec {
+            active_slots: 2,
+            lookahead_pages: pages - 2,
+            experts_per_slot: per_slot,
+            num_experts: experts,
+            payload_bytes: per_slot * (GU + DN),
+            timeline_records: 64,
+            timeline_layers: 8,
+        }
+    }
+
+    fn sp_ring(pages: usize, experts: usize, per_slot: usize) -> RingCore<Mock> {
+        RingCore::new(
+            sp_spec(pages, experts, per_slot),
+            Mock::sized(pages, experts),
+        )
+        .unwrap()
+    }
+
+    fn ids(group: &[u16]) -> Vec<usize> {
+        group.iter().map(|&id| usize::from(id)).collect()
+    }
+
+    /// Consume every group of the entered layer, one acquire/retire each.
+    fn sp_consume(sp: &mut SpSchedule<'_>, ring: &mut RingCore<Mock>, layer: usize, groups: usize) {
+        for group in 0..groups as u32 {
+            let ticket = sp.require(ring, &(), layer, group).unwrap();
+            ring.acquire(&(), ticket).unwrap();
+            ring.retire(&(), ticket).unwrap();
+            assert_eq!(sp.pump(ring, &()).unwrap(), 0, "SP never refills a page");
+        }
+    }
+
+    #[test]
+    fn sp_ring_prime_enqueues_nothing_and_declares_no_layer() {
+        let sweep = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 16);
+        assert_eq!(sp.prime(&mut ring, &()).unwrap(), 0);
+        assert_eq!(
+            ring.backend.ops,
+            vec![Op::Base],
+            "only the window's base mark"
+        );
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.stats().submitted_payload_bytes, 0);
+        assert_eq!(sp.submitted_bytes(), 0);
+        assert_eq!((ring.current, ring.next), (None, None));
+        // No layer is current, so the page-order prefetch cannot sneak in.
+        let s = sources(2);
+        assert!(ring.try_enqueue(&(), &group(&s, 0), &s).is_err());
+        assert_eq!(sp.pump(&mut ring, &()).unwrap(), 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        // The sweep schedule on the same sources would have primed 16 groups.
+        let mut other = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut ring2 = core(2, 16);
+        assert_eq!(other.prime(&mut ring2, &()).unwrap(), 16);
+    }
+
+    #[test]
+    fn sp_ring_enter_layer_enqueues_exactly_the_plan() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = vec![vec![1, 5, 9, 13], vec![20, 21, 40, 41], vec![63]];
+        sp.plan_layer(3, &groups).unwrap();
+        assert_eq!(ring.stats().enqueued, 0, "planning touches no page");
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 3);
+        assert_eq!(ring.stats().enqueued, 3);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(ring.current, Some(3));
+        assert_eq!(sp.planned_groups(3).unwrap().len(), 3);
+        for (index, group) in groups.iter().enumerate() {
+            let ticket = sp.ticket(3, index as u32).unwrap();
+            assert_eq!((ticket.layer, ticket.group), (3, index as u32));
+            assert_eq!(sp.require(&mut ring, &(), 3, index as u32).unwrap(), ticket);
+            // The page's pointer tables name exactly the planned (sparse) experts.
+            let (gate_up, down) = &ring.backend.tables[ticket.slot];
+            for table in [gate_up, down] {
+                let held: Vec<usize> = table
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &entry)| entry != 0)
+                    .map(|(id, _)| id)
+                    .collect();
+                assert_eq!(held, ids(group));
+            }
+        }
+        // Nothing beyond the plan exists.
+        assert!(sp.ticket(3, 3).is_none());
+        assert!(sp.require(&mut ring, &(), 3, 3).is_err());
+        assert!(sp.require(&mut ring, &(), 7, 0).is_err());
+        sp_consume(&mut sp, &mut ring, 3, 3);
+        assert_eq!(ring.stats().enqueued, 3, "retires never refill");
+        assert_eq!(ring.stats().discarded, 0);
+        // A layer that streams nothing (k = 0) still advances the window.
+        sp.plan_layer(7, &[]).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 7).unwrap(), 0);
+        assert_eq!(ring.current, Some(7));
+        assert_eq!(ring.stats().enqueued, 3);
+    }
+
+    #[test]
+    fn sp_ring_submitted_bytes_equal_the_layout_sum() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let plans: Vec<(usize, Vec<Vec<u16>>)> = vec![
+            (
+                3,
+                vec![vec![0, 1, 2, 3], vec![10, 12, 14, 16], vec![30, 31]],
+            ),
+            (7, vec![vec![2, 40, 41, 42], vec![50]]),
+        ];
+        let mut expected = 0u64;
+        let mut experts = 0usize;
+        for (layer, groups) in &plans {
+            let held = sweep.sources_of(*layer).unwrap();
+            for group in groups {
+                let layout = plan_group_layout(&ids(group), held).unwrap();
+                expected += layout.submitted_bytes() as u64;
+                experts += group.len();
+            }
+        }
+        assert_eq!(expected, (experts * (GU + DN)) as u64);
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        for (layer, groups) in &plans {
+            sp.plan_layer(*layer, groups).unwrap();
+            assert_eq!(
+                sp.enter_layer(&mut ring, &(), *layer).unwrap(),
+                groups.len()
+            );
+            sp_consume(&mut sp, &mut ring, *layer, groups.len());
+        }
+        let stats = ring.stats();
+        assert_eq!(stats.submitted_payload_bytes, expected);
+        assert_eq!(sp.submitted_bytes(), expected);
+        assert_eq!(stats.acquired_payload_bytes, expected);
+        assert_eq!(stats.enqueued, 5);
+        assert_eq!((stats.retired, stats.discarded), (5, 0));
+        assert!(
+            sp.submitted_bytes() < sweep.sweep_bytes(),
+            "a selective window submits less than the full sweep"
+        );
+    }
+
+    #[test]
+    fn sp_ring_sixteen_groups_of_thirty_two_enqueue_without_stall() {
+        for pages in [16usize, 18] {
+            let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+            let mut sp = SpSchedule::new(&sweep);
+            let mut ring = sp_ring(pages, 512, 32);
+            sp.prime(&mut ring, &()).unwrap();
+            let groups: Vec<Vec<u16>> = (0..16)
+                .map(|g| (0..32).map(|i| (g * 32 + i) as u16).collect())
+                .collect();
+            sp.plan_layer(0, &groups).unwrap();
+            assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 16);
+            let stats = ring.stats();
+            assert_eq!(stats.enqueued, 16);
+            assert_eq!(stats.page_full_stalls, 0, "{pages} pages never stall");
+            assert_eq!(stats.submitted_payload_bytes, (512 * (GU + DN)) as u64);
+            assert_eq!(ring.free.len(), pages - 16);
+            sp_consume(&mut sp, &mut ring, 0, 16);
+            assert_eq!(ring.free.len(), pages);
+        }
+        // Sparse: every other expert, eight groups of 32 ascending experts.
+        let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = sp_ring(16, 512, 32);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = (0..8)
+            .map(|g| (0..32).map(|i| (2 * (g * 32 + i)) as u16).collect())
+            .collect();
+        sp.plan_layer(0, &groups).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 8);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(
+            ring.stats().submitted_payload_bytes,
+            (256 * (GU + DN)) as u64
+        );
+    }
+
+    #[test]
+    fn sp_ring_a_plan_beyond_the_pages_is_refused_before_any_enqueue() {
+        let sweep = PanelSchedule::new(vec![sp_sources(0, 512)], 32).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = sp_ring(16, 512, 32);
+        sp.prime(&mut ring, &()).unwrap();
+        // 17 groups of 30 experts: more groups than the ring's 16 pages.
+        let groups: Vec<Vec<u16>> = (0..17)
+            .map(|g| (0..30).map(|i| (g * 30 + i) as u16).collect())
+            .collect();
+        sp.plan_layer(0, &groups).unwrap();
+        let error = err_text(sp.enter_layer(&mut ring, &(), 0).unwrap_err());
+        assert!(error.contains("17 groups"), "{error}");
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.stats().page_full_stalls, 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base], "no copy was issued");
+        assert!(
+            !ring.is_quarantined(),
+            "a pre-enqueue refusal is not a failure"
+        );
+        assert_eq!(ring.current, None);
+        assert!(sp.ticket(0, 0).is_none());
+        // A new window recovers with a plan that fits.
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(0, &groups[..16]).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 0).unwrap(), 16);
+
+        // An oversized group for the pool's pages is also refused up front.
+        let small = PanelSchedule::new(vec![sources(3)], 4).unwrap();
+        let mut sp = SpSchedule::new(&small);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(3, &[vec![0, 1, 2, 3], vec![4, 5, 6, 7, 8]])
+            .unwrap();
+        let error = err_text(sp.enter_layer(&mut ring, &(), 3).unwrap_err());
+        assert!(error.contains("per page"), "{error}");
+        assert_eq!(ring.stats().enqueued, 0);
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        assert!(!ring.is_quarantined());
+    }
+
+    #[test]
+    fn sp_ring_failure_then_drain_refuses_the_stale_ticket() {
+        let sweep = PanelSchedule::new(vec![sources(3), sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let groups: Vec<Vec<u16>> = vec![vec![0, 1, 2, 3], vec![8, 9, 10, 11], vec![16, 17]];
+        sp.plan_layer(3, &groups).unwrap();
+        // Begin, Payload, Zero, Tables, End = 5 ops per dense group: fail the
+        // second group's copy.
+        ring.backend.fail_at = Some(ring.backend.ops.len() + 5);
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(ring.is_quarantined());
+        let first = sp.ticket(3, 0).expect("the group before the failure");
+        assert!(sp.ticket(3, 1).is_none());
+        assert_eq!(ring.stats().enqueued, 1);
+        assert!(err_text(ring.acquire(&(), first).unwrap_err()).contains("quarantined"));
+        // Nothing but the drain is accepted while quarantined.
+        assert!(sp.prime(&mut ring, &()).is_err());
+        ring.drain(&()).unwrap();
+        assert!(!ring.is_quarantined());
+        assert!(ring.acquire(&(), first).is_err());
+        assert!(ring.retire(&(), first).is_err());
+        // The next window refills the page under a new epoch: the old ticket
+        // stays refused as stale.
+        sp.prime(&mut ring, &()).unwrap();
+        sp.plan_layer(3, &groups).unwrap();
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 3);
+        let fresh = sp.ticket(3, 0).unwrap();
+        assert!(fresh.epoch > first.epoch);
+        let error = err_text(ring.acquire(&(), first).unwrap_err());
+        assert!(error.contains("stale"), "{error}");
+        sp_consume(&mut sp, &mut ring, 3, 3);
+        assert_eq!(ring.stats().submitted_payload_bytes, sp.submitted_bytes());
+    }
+
+    #[test]
+    fn sp_ring_windows_alternate_with_stream_all_windows() {
+        let layers = [2usize, 5];
+        let mut sweep = PanelSchedule::new(vec![sources(2), sources(5)], 4).unwrap();
+        let mut ring = core(2, 16);
+        let sp_window =
+            |sweep: &PanelSchedule, ring: &mut RingCore<Mock>, plan: &[(usize, Vec<Vec<u16>>)]| {
+                let mut sp = SpSchedule::new(sweep);
+                assert_eq!(sp.prime(ring, &()).unwrap(), 0);
+                let mut groups = 0u64;
+                for (layer, planned) in plan {
+                    sp.plan_layer(*layer, planned).unwrap();
+                    assert_eq!(sp.enter_layer(ring, &(), *layer).unwrap(), planned.len());
+                    sp_consume(&mut sp, ring, *layer, planned.len());
+                    groups += planned.len() as u64;
+                }
+                let stats = ring.stats();
+                assert_eq!(stats.enqueued, groups, "stats restart with each window");
+                assert_eq!(stats.submitted_payload_bytes, sp.submitted_bytes());
+                assert_eq!((stats.retired, stats.discarded), (groups, 0));
+                sp.submitted_bytes()
+            };
+        let first = vec![
+            (2usize, vec![vec![1u16, 5, 9, 13], vec![20, 21, 40, 41]]),
+            (5, vec![vec![63]]),
+        ];
+        let second = vec![(2usize, vec![vec![0u16, 2, 4, 6]]), (5, vec![])];
+
+        let a = sp_window(&sweep, &mut ring, &first);
+        assert_eq!(a, (9 * (GU + DN)) as u64);
+
+        // A stream-all window on the same ring: one full sweep.
+        sweep.prime(&mut ring, &()).unwrap();
+        for &layer in &layers {
+            sweep.enter_layer(&mut ring, &(), layer).unwrap();
+            for group in 0..16u32 {
+                let ticket = sweep.require(&mut ring, &(), layer, group).unwrap();
+                ring.acquire(&(), ticket).unwrap();
+                ring.retire(&(), ticket).unwrap();
+                sweep.pump(&mut ring, &()).unwrap();
+            }
+        }
+        assert_eq!(ring.stats().submitted_payload_bytes, sweep.sweep_bytes());
+        assert_eq!(RingSchedule::submitted_bytes(&sweep), sweep.sweep_bytes());
+        assert_eq!(ring.stats().enqueued, 32);
+
+        let b = sp_window(&sweep, &mut ring, &second);
+        assert_eq!(b, (4 * (GU + DN)) as u64);
+        // And back again: the first plan replays to the same bytes.
+        assert_eq!(sp_window(&sweep, &mut ring, &first), a);
+    }
+
+    #[test]
+    fn sp_ring_plan_and_layer_protocol_refusals_touch_nothing() {
+        let mixed = sources_with(3, Arc::new(0u8), |id| if id < 2 { 1 } else { 2 });
+        let sweep = PanelSchedule::new(vec![mixed, sources(7)], 4).unwrap();
+        let mut sp = SpSchedule::new(&sweep);
+        let mut ring = core(2, 4);
+        sp.prime(&mut ring, &()).unwrap();
+        let too_many: Vec<u16> = (0..33).collect();
+        for (layer, bad) in [
+            (4usize, vec![vec![0u16]]),               // not a host layer
+            (7, vec![vec![5, 3]]),                    // descending inside a group
+            (7, vec![vec![1, 2], vec![2, 3]]),        // an expert streamed twice
+            (7, vec![vec![4, 5], vec![0, 1]]),        // descending across groups
+            (7, vec![vec![]]),                        // empty group
+            (7, vec![too_many]),                      // more than a page holds
+            (7, vec![vec![0, (EXPERTS + 1) as u16]]), // expert not held
+            (3, vec![vec![0, 2]]),                    // two codecs in one group
+        ] {
+            assert!(sp.plan_layer(layer, &bad).is_err(), "{layer}: {bad:?}");
+        }
+        assert_eq!(ring.backend.ops, vec![Op::Base]);
+        // Refusals leave no plan behind.
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(sp.planned_groups(3).is_none() && sp.planned_groups(7).is_none());
+        // The codec boundary is a legal group boundary.
+        sp.plan_layer(3, &[vec![0, 1], vec![2, 3]]).unwrap();
+        // One plan at a time; the entered layer is the planned one, once.
+        assert!(sp.plan_layer(7, &[vec![1]]).is_err());
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
+        assert_eq!(sp.enter_layer(&mut ring, &(), 3).unwrap(), 2);
+        let live = [sp.ticket(3, 0).unwrap(), sp.ticket(3, 1).unwrap()];
+        assert!(sp.enter_layer(&mut ring, &(), 3).is_err());
+        assert!(
+            sp.plan_layer(3, &[vec![1]]).is_err(),
+            "not after the entered layer"
+        );
+        // The next layer cannot be entered while a page of this one is live;
+        // the refusal is not a device failure.
+        sp.plan_layer(7, &[vec![1]]).unwrap();
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
+        assert!(!ring.is_quarantined());
+        assert_eq!(ring.current, Some(3));
+        for ticket in live {
+            ring.acquire(&(), ticket).unwrap();
+            ring.retire(&(), ticket).unwrap();
+        }
+        assert_eq!(sp.enter_layer(&mut ring, &(), 7).unwrap(), 1);
+        assert_eq!(ring.current, Some(7));
+        // A layer is entered once per window, even after a drain.
+        ring.drain(&()).unwrap();
+        assert!(sp.enter_layer(&mut ring, &(), 7).is_err());
     }
 }
