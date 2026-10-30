@@ -230,3 +230,51 @@ dot4 decode −24% vs f32 (item 1, C9 below). All rows rc=0, klog=0.
 - With g27newA (hash/code/math, 0/8), all six 27B prompts are now covered solo + concurrent on the new build: 0 unstable, 0 concurrent mismatch.
 - Solo hashes equal the g27newB solo hashes (same build), so they are reproducible across server restarts.
 - 27B greedy vs pre: hashes differ on every prompt (pre = W4A4 numerics, new = f32/MQ4V2-exact). Expected; KL on 27B is the quality gate (f32 KL 2.06e-5 vs MQ4P).
+
+## C9 — IU4 W4A8 decode v2 (`HIPFIRE_IU4_DECODE=dot4`)
+
+**Root cause of the C8 dot4 slowdown** (156.7 vs 204.9 tok/s f32, 4B tg64@128):
+1. Each row re-quantized x per 256-group (2 ds_bpermute, 8 v_rndne, 8 v_med3 per group per row), so the work was repeated M times.
+2. Integer modes skipped the fused qkv/qkvza/gate_up keys (`iu4g256_fusion_ok`) and the IU4 down arm (gated_mlp.rs). The generic fallback allocated and freed per token.
+
+**Design:**
+- `iu4_quant_x_a8` (grid K/256, block 32) quantizes x once into `int4 xq[g*32+t] = {a_lo, a_hi, sumq, float_as_int(d)}`. The per-lane math is identical to C8 `iu4_row_dot_a8`.
+- `iu4_row_dot_a8q` uses the same accumulation expression, so results are bit-identical.
+- Kernels: `gemv_iu4g256_dot4q`, `_dot4q_residual`, `fused_iu4g256_dot4q_rows` (up to 4 matrices). Each is one row per block with `__launch_bounds__(32,16)`.
+- Scratch is a fixed 256 KiB `iu4_a8_x_scratch`, allocated once and never regrown, so graph capture stays valid. It errors if K*2 is over the limit.
+- `iu4_decode_w4a4()` is true only for dot8. dot4 now uses the fused keys and the down arm; dot8 keeps the per-token route.
+
+**ISA** (llvm-objdump, gfx1100, `isa/gemv_iu4.s`): `gemv_iu4g256_dot4q` has 10× `v_dot4_i32_iu8` (VOP3P op 22, RDNA3 ISA §16.10; unroll 4 + remainder), 5× `global_load_b128` and 10× `global_load_b32`. The inner loop has no ds_bpermute, v_rndne or v_med3.
+
+**Numerics** (`tests/iu4_dot4_gemv_gpu.rs`, dot4q arm): 45 cases (38 random including odd M, M=1, tails, large K, plus 7 real 4B tensors).
+- dot4q plain and residual are bit-identical to the C8 dot4 kernel.
+- A fused 3-matrix launch is bit-identical to per-matrix dot4q.
+- Two runs are bit-identical.
+- Worst error vs the CPU W4A8 contract is 3.379e-6. dot4 vs the f64 ref is 4.02e-2 (f32 path: 1.5e-7). klog 0.
+
+**A/B** (ab3, 4B, 3 interleaved rounds, medians, tok/s):
+
+| build/mode | pp512 | pp2048 | tg64@128 | tg64@4096 |
+|---|---|---|---|---|
+| C8 dot4 | 5836 | 5502 | 156.67 | 149.84 |
+| C9 dot4 | 5809 | 5490 | **192.42** | **181.26** |
+| C9 f32 (default) | 5818 | 5493 | 204.91 | 192.88 |
+| C9 dot8 | 5841 | 5492 | 192.25 | 181.36 |
+| MQ4P | 8073 | 7465 | 200.59 | 189.48 |
+
+Per-round tg64@128: C8 dot4 156.99/156.67/156.53; C9 dot4 192.74/192.42/191.74. dot4 decode is +22.8% (tg128) and +21.0% (tg4096), now 6% below f32. Prefill is unchanged (within noise).
+
+**KL / PPL vs MQ4P** (unchanged from C8 to every digit, as expected from bit-identity):
+- 4B dot4: text KL 3.575e-4, top1 1017/1023, PPL 4.6917; gen 1.245e-4, top1 254/256.
+- 4B dot8: 8.383e-4, PPL 4.6951.
+- 4B f32: 3.813e-5, PPL 4.6945.
+- MQ4P self-PPL: 4.6923.
+- 27B dot4: 8.271e-5, top1 509/511, PPL 5.8394. 27B f32: 2.055e-5, PPL 5.8412.
+
+f32 has ~4–10× lower KL and is also faster, so it **stays the default**.
+
+**Gates** (6 prompts: hash/code/math/story/ctx1k/ctx4k):
+- 4B g9d4 and g9d4cb: hashes identical to g8d4 and g8d4cb, 0 unstable, 0/12 concurrent mismatch.
+- 4B g9 (default f32): identical to g8, 0 unstable, 0/12.
+- klog 0 throughout.
+- 27B g27c9d4A (hash/code/math, solo + cb4 concurrent, dot4): 0 unstable, 0 concurrent mismatch, klog 0; hashes identical to g27newA (C8 f32 default).
