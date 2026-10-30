@@ -278,3 +278,27 @@ f32 has ~4–10× lower KL and is also faster, so it **stays the default**.
 - 4B g9 (default f32): identical to g8, 0 unstable, 0/12.
 - klog 0 throughout.
 - 27B g27c9d4A (hash/code/math, solo + cb4 concurrent, dot4): 0 unstable, 0 concurrent mismatch, klog 0; hashes identical to g27newA (C8 f32 default).
+
+## Item 2 — prefill profile, IU4P vs MQ4P (4B, pp2048)
+
+Method: `ppdrive.py` runs the daemon directly under `rocprofv3 --kernel-trace --stats`. It sends a load, then 4× `bench_prefill 2048`, then EOF so the daemon exits cleanly and the trace flushes. (The `hipfire bench` + HIPFIRE_DAEMON_BIN wrapper route wrote no CSV because the daemon is killed rather than exiting.) Under the tracer, IU4P runs ~391 ms/pass (5234 tok/s) and MQ4P ~302 ms/pass (6788 tok/s).
+
+GPU time summed over all 4 passes:
+
+| role | IU4P kernel | µs | MQ4P kernel | µs | Δ µs |
+|---|---|---|---|---|---|
+| qkv/gate_up GEMM (set) | gemm_iu4g256_mmq_full_set_x128 | 580658 | gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 | 343541 | +237117 |
+| down/out GEMM (add) | gemm_iu4g256_mmq_full_add_x128 | 212283 | …mmq_iu4_full_add_lf16_col_gfx1151 | 141126 | +71157 |
+| small-M GEMM | gemm_iu4g256_mmq_x128 (n=768) | 81667 | gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds | 11408 | +70259 |
+| IU8G32 / Q8_0 wo | gemm_iu8g32_residual_wmma | 177217 | gemm_q8_0_residual_wmma | 149040 | +28177 |
+| act quant | quantize_q8_1_mmq_ds4_x128 + rmsnorm/silu rotate | 40233 | rotate_i4 fused (rmsnorm/silu/mq_rotate) | 44937 | −4704 |
+| attention, GDN, conv | — | ~327k | — | ~333k | ≈0 |
+
+Total 1469 ms vs 1076 ms (+393 ms, ≈98 ms/pass, which matches the measured 391 vs 302 ms).
+
+Reading (measured): ~95% of the gap is the three IU4 MMQ GEMMs. MQ4P's prefill kernels are W4A4 integer MMQ: activations are quantized to int4 by the fused `*_rotate_i4` kernels and the GEMM uses the lf16_col layout. IU4P's MMQ is W4A8 (q8_1 activations).
+
+Hypotheses (untested):
+- (a) Most of the set/add gap is the A8-vs-A4 WMMA work plus layout/tile efficiency.
+- (b) The small-M gap (+70 ms) is a tile shape that is poor for small N. MQ4P routes those matrices to a WMMA mw4_lds kernel instead.
+- (c) IU8G32 wo is 19% slower than Q8_0 WMMA for the same math.
