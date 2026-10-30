@@ -413,41 +413,94 @@ fn decode_responses_content(body: &mut serde_json::Value, format: OcrFormat) {
     }
 }
 
+/// Which channel a delta belongs to. Reasoning and content are decoded
+/// separately: one shared decoder would emit reasoning text on the content
+/// channel — as the lead-in before the first block, or as the whole answer at
+/// end of generation when the answer never carried a block header — instead of
+/// once, on the channel the model wrote it to.
+#[derive(Clone, Copy)]
+enum StreamChannelKind {
+    Content,
+    Reasoning,
+}
+
 /// Per-response stream decode state, owned by the sink so every wire API
 /// (chat, Anthropic, Responses) sees the same decoded text deltas.
-enum StreamOcr {
+struct StreamOcr {
+    content: StreamChannel,
+    reasoning: StreamChannel,
+}
+
+impl StreamOcr {
+    fn new(format: OcrFormat) -> Self {
+        Self {
+            content: StreamChannel::new(format),
+            reasoning: StreamChannel::new(format),
+        }
+    }
+
+    fn channel_mut(&mut self, channel: StreamChannelKind) -> &mut StreamChannel {
+        match channel {
+            StreamChannelKind::Content => &mut self.content,
+            StreamChannelKind::Reasoning => &mut self.reasoning,
+        }
+    }
+
+    /// Feed a delta from `channel`; `Some(text)` when the client should receive
+    /// a frame, on that same channel.
+    fn push(&mut self, channel: StreamChannelKind, text: &str) -> Option<String> {
+        self.channel_mut(channel).push(text)
+    }
+
+    /// The remainder of each channel at end of generation.
+    fn finish(&mut self) -> [String; 2] {
+        [self.content.finish(), self.reasoning.finish()]
+    }
+}
+
+/// One channel's decoder.
+struct StreamChannel {
+    /// No text seen: an untouched channel sends nothing at end of generation.
+    seen: bool,
+    state: StreamChannelState,
+}
+
+enum StreamChannelState {
     Html(ocr::BlockStream),
     /// `blocks` has to buffer: a JSON array has no prefix form.
     Blocks(String),
 }
 
-impl StreamOcr {
+impl StreamChannel {
     fn new(format: OcrFormat) -> Self {
-        match format {
-            OcrFormat::Html => Self::Html(ocr::BlockStream::new()),
-            OcrFormat::Blocks => Self::Blocks(String::new()),
-        }
+        let state = match format {
+            OcrFormat::Html => StreamChannelState::Html(ocr::BlockStream::new()),
+            OcrFormat::Blocks => StreamChannelState::Blocks(String::new()),
+        };
+        Self { seen: false, state }
     }
 
-    /// Feed a token delta; `Some(text)` when the client should receive a frame.
     fn push(&mut self, text: &str) -> Option<String> {
-        match self {
-            Self::Html(stream) => {
+        self.seen = true;
+        match &mut self.state {
+            StreamChannelState::Html(stream) => {
                 let chunk = stream.push(text);
                 (!chunk.is_empty()).then_some(chunk)
             }
-            Self::Blocks(buffer) => {
+            StreamChannelState::Blocks(buffer) => {
                 buffer.push_str(text);
                 None
             }
         }
     }
 
-    /// The remainder at end of generation.
     fn finish(&mut self) -> String {
-        match self {
-            Self::Html(stream) => stream.finish(),
-            Self::Blocks(buffer) => ocr::blocks_json(buffer),
+        if !self.seen {
+            return String::new();
+        }
+        match &mut self.state {
+            StreamChannelState::Html(stream) => stream.finish(),
+            StreamChannelState::Blocks(buffer) => ocr::blocks_json(buffer),
         }
     }
 }
@@ -2725,24 +2778,27 @@ impl SseSink {
         }
         // Compact-block decoding happens before the API's encoder frames a
         // delta, so chat/Anthropic/Responses stream decoded text alike. A
-        // delta that completes no block sends nothing. Reasoning deltas decode
-        // too: a model without a non-thinking default answers on that channel.
-        let event = match (
-            &self.ocr,
-            event.get("type").and_then(serde_json::Value::as_str),
-        ) {
-            (Some(state), Some("token" | "reasoning")) => {
-                let Some(text) = event.get("text").and_then(serde_json::Value::as_str) else {
-                    return Ok(());
-                };
-                let Some(decoded) = state.borrow_mut().push(text) else {
-                    return Ok(());
-                };
-                let mut rewritten = event.clone();
-                rewritten["text"] = serde_json::Value::String(decoded);
-                std::borrow::Cow::Owned(rewritten)
-            }
-            _ => std::borrow::Cow::Borrowed(event),
+        // delta that completes no block sends nothing, and each channel keeps
+        // its own decoder: reasoning text is only ever emitted as reasoning.
+        let pending = self.ocr.as_ref().and_then(|state| {
+            let channel = match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("token") => StreamChannelKind::Content,
+                Some("reasoning") => StreamChannelKind::Reasoning,
+                _ => return None,
+            };
+            let text = event.get("text").and_then(serde_json::Value::as_str)?;
+            Some((state, channel, text))
+        });
+        let event = match pending {
+            Some((state, channel, text)) => match state.borrow_mut().push(channel, text) {
+                Some(decoded) => {
+                    let mut rewritten = event.clone();
+                    rewritten["text"] = serde_json::Value::String(decoded);
+                    std::borrow::Cow::Owned(rewritten)
+                }
+                None => return Ok(()),
+            },
+            None => std::borrow::Cow::Borrowed(event),
         };
         let Some(bytes) = self.encoder.borrow_mut().event(&event) else {
             return Ok(());
@@ -2785,9 +2841,12 @@ impl SseSink {
     /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
     fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
         if let Some(state) = &self.ocr {
-            let trailing = state.borrow_mut().finish();
-            if !trailing.is_empty() {
-                let event = serde_json::json!({ "type": "token", "text": trailing });
+            let [content, reasoning] = state.borrow_mut().finish();
+            for (kind, trailing) in [("token", content), ("reasoning", reasoning)] {
+                if trailing.is_empty() {
+                    continue;
+                }
+                let event = serde_json::json!({ "type": kind, "text": trailing });
                 if let Some(bytes) = self.encoder.borrow_mut().event(&event) {
                     self.send(ResponseChunk::plain(bytes))?;
                 }
@@ -2986,6 +3045,52 @@ mod tests {
                 "raw tokens must not reach the wire"
             );
         }
+    }
+
+    /// Reasoning and content keep separate decoders. A thinking model's
+    /// thoughts never reach the content channel — neither as the lead-in
+    /// before the first block nor as the whole answer at end of generation —
+    /// and a block the model wrote on the reasoning channel decodes there.
+    #[test]
+    fn stream_keeps_reasoning_and_content_decoders_separate() {
+        let (sink, _commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+            ocr: Some(OcrFormat::Html),
+        });
+        sink.forward_event(&reasoning_event("pondering the page"))
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "reasoning sends no content frame");
+        sink.forward_event(&token_event("<|Text|><|0|><|0|><|1|><|1|><p>one</p>"))
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "nothing until a block closes");
+        sink.forward_event(&token_event("<|Text|><|2|><|2|><|3|><|3|>"))
+            .unwrap();
+        let mut content = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            content.push_str(&String::from_utf8_lossy(&frame.bytes));
+        }
+        assert!(content.contains("data-label"), "{content}");
+        assert!(!content.contains("pondering"), "{content}");
+        let [content_tail, reasoning_tail] = sink.ocr.as_ref().unwrap().borrow_mut().finish();
+        assert_eq!(reasoning_tail, "pondering the page");
+        assert!(!content_tail.contains("pondering"), "{content_tail}");
+
+        let (sink, _commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+            ocr: Some(OcrFormat::Html),
+        });
+        sink.forward_event(&reasoning_event(
+            "<|Text|><|0|><|0|><|1|><|1|><p>thought</p>",
+        ))
+        .unwrap();
+        sink.forward_event(&reasoning_event("<|Text|><|2|><|2|><|3|><|3|>"))
+            .unwrap();
+        let frame = rx.try_recv().expect("reasoning block frame");
+        let text = String::from_utf8_lossy(&frame.bytes).into_owned();
+        assert!(text.contains("data-label"), "{text}");
+        assert!(text.contains("thought"), "{text}");
+        assert!(text.contains("reasoning_content"), "{text}");
+        assert!(!text.contains("<|Text|>"), "{text}");
     }
 
     /// Non-stream adapter bodies decode too.
@@ -3298,6 +3403,10 @@ mod tests {
 
     fn token_event(text: &str) -> serde_json::Value {
         serde_json::json!({ "type": "token", "id": "chatcmpl-1-1", "attempt_id": 1, "text": text })
+    }
+
+    fn reasoning_event(text: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "reasoning", "id": "chatcmpl-1-1", "attempt_id": 1, "text": text })
     }
 
     type TestSink = (
