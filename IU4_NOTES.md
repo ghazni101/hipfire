@@ -259,14 +259,14 @@ dot4 decode −24% vs f32 (item 1, C9 below). All rows rc=0, klog=0.
 | C8 dot4 | 5836 | 5502 | 156.67 | 149.84 |
 | C9 dot4 | 5809 | 5490 | **192.42** | **181.26** |
 | C9 f32 (default) | 5818 | 5493 | 204.91 | 192.88 |
-| C9 dot8 | 5841 | 5492 | 192.25 | 181.36 |
+| C9 dot4 + IU8 dot4 (all-int8) | 5841 | 5492 | 192.25 | 181.36 |
 | MQ4P | 8073 | 7465 | 200.59 | 189.48 |
 
 Per-round tg64@128: C8 dot4 156.99/156.67/156.53; C9 dot4 192.74/192.42/191.74. dot4 decode is +22.8% (tg128) and +21.0% (tg4096), now 6% below f32. Prefill is unchanged (within noise).
 
 **KL / PPL vs MQ4P** (unchanged from C8 to every digit, as expected from bit-identity):
 - 4B dot4: text KL 3.575e-4, top1 1017/1023, PPL 4.6917; gen 1.245e-4, top1 254/256.
-- 4B dot8: 8.383e-4, PPL 4.6951.
+- 4B dot4 + IU8 dot4 (all-int8): 8.383e-4, PPL 4.6951.
 - 4B f32: 3.813e-5, PPL 4.6945.
 - MQ4P self-PPL: 4.6923.
 - 27B dot4: 8.271e-5, top1 509/511, PPL 5.8394. 27B f32: 2.055e-5, PPL 5.8412.
