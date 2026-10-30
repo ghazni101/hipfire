@@ -685,7 +685,11 @@ it per request with `ocr_format` on a **non-streaming** turn:
 
 Both are answered by serve from the model's text, so a body with no block
 headers (a plain answer, or a prompt that never reached OCR) comes back
-unchanged rather than being rewritten. Streaming with `ocr_format` is a 400:
+unchanged rather than being rewritten. A
+serve started with `HIPFIRE_SERVE_OCR_FORMAT=html` (`serve.ocr_format`) applies
+that rendering to every non-streaming chat turn, so a client that cannot send
+the field still gets divs instead of tokens; a request's own `ocr_format`
+still wins, and streams stay raw. Streaming with `ocr_format` is a 400:
 deltas would carry the compact form first.
 
 **Generation contract** (the card's vLLM client): greedy, `top_p: 0.1`, no

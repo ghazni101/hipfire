@@ -469,6 +469,10 @@ pub(crate) struct ServeShared {
     /// `serve.ui` / `--ui`: the /ui chat-frontend routes are live. Immutable
     /// for the process lifetime, like `capabilities`.
     pub(crate) ui_enabled: bool,
+    /// `serve.ocr_format` / `HIPFIRE_SERVE_OCR_FORMAT`: decode compact-block
+    /// (Surya-2.5) answers on non-streaming chat turns. `None` is the raw
+    /// special-token form (the default); a request's own `ocr_format` wins.
+    pub(crate) ocr_format: Option<ocr::OcrFormat>,
     /// Bearer token every route except the minimal `/health` requires. `None`
     /// (no API key configured) leaves every route open, as before. Never
     /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
@@ -1876,6 +1880,15 @@ pub(crate) fn serve_foreground(
     // `--open` implies `--ui`: the launcher promise is meaningless without
     // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
     let ui_enabled = args.ui || args.open || config_bool(&global, "serve.ui")?;
+    // Compact-block decoding default for non-streaming chat turns. `raw` is
+    // the identity (the model's special tokens, which surya's own client
+    // parses); a request's own `ocr_format` wins over this.
+    let ocr_format_value = config_string(&global, "serve.ocr_format")?;
+    let ocr_format = ocr::OcrFormat::from_config(&ocr_format_value).ok_or_else(|| {
+        anyhow!(
+            "serve.ocr_format must be raw, html or blocks, got {ocr_format_value:?}"
+        )
+    })?;
     if ui_enabled {
         if api_key.is_some() {
             eprintln!("[hipfire] {UI_AUTH_NOTICE}");
@@ -1927,6 +1940,10 @@ pub(crate) fn serve_foreground(
         max_request_bytes,
         ui_enabled,
     );
+    let mut capabilities = capabilities;
+    capabilities["ocr_format"] = serde_json::json!(
+        ocr_format.map(ocr::OcrFormat::config_value).unwrap_or("raw")
+    );
     let shared = Arc::new(ServeShared {
         capabilities,
         metrics: metrics::Metrics::default(),
@@ -1976,6 +1993,7 @@ pub(crate) fn serve_foreground(
         backoff_hook: Mutex::new(None),
         stream_stall_timeout,
         ui_enabled,
+        ocr_format,
         api_key,
     });
     let bind = format_bind(host, port);

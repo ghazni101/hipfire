@@ -16957,6 +16957,7 @@ effort = "high"
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
                 ui_enabled: false,
+                ocr_format: None,
                 api_key,
             });
 

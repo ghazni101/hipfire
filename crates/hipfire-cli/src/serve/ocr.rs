@@ -95,6 +95,26 @@ impl OcrFormat {
     pub(crate) fn wire_values() -> &'static str {
         "\"html\" or \"blocks\""
     }
+
+    /// Map the serve-level default (`serve.ocr_format` /
+    /// `HIPFIRE_SERVE_OCR_FORMAT`) to a rendering. `raw` is the identity, so
+    /// it maps to `None`; an unknown value is `None` at the outer level.
+    pub(crate) fn from_config(value: &str) -> Option<Option<Self>> {
+        match value {
+            "raw" | "" => Some(None),
+            "html" => Some(Some(Self::Html)),
+            "blocks" => Some(Some(Self::Blocks)),
+            _ => None,
+        }
+    }
+
+    /// The config spelling, for `/health` and logs.
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Html => "html",
+            Self::Blocks => "blocks",
+        }
+    }
 }
 
 /// One decoded block.
@@ -926,5 +946,16 @@ mod tests {
         assert_eq!(OcrFormat::parse("blocks"), Some(OcrFormat::Blocks));
         assert_eq!(OcrFormat::parse("HTML"), None);
         assert_eq!(OcrFormat::parse("json"), None);
+    }
+
+    #[test]
+    fn config_values_map_and_reject() {
+        assert_eq!(OcrFormat::from_config("raw"), Some(None));
+        assert_eq!(OcrFormat::from_config(""), Some(None));
+        assert_eq!(OcrFormat::from_config("html"), Some(Some(OcrFormat::Html)));
+        assert_eq!(OcrFormat::from_config("blocks"), Some(Some(OcrFormat::Blocks)));
+        assert_eq!(OcrFormat::from_config("markdown"), None);
+        assert_eq!(OcrFormat::Html.config_value(), "html");
+        assert_eq!(OcrFormat::Blocks.config_value(), "blocks");
     }
 }

@@ -1340,6 +1340,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Serve the embedded chat UI at /ui on the serve listener; default off."
     ),
     field!(
+        "serve.ocr_format",
+        "ocr_format",
+        Serve,
+        Process,
+        DefaultValue::String("raw"),
+        ValueRule::Enum(&["raw", "html", "blocks"]),
+        false,
+        false,
+        Some("HIPFIRE_SERVE_OCR_FORMAT"),
+        "Decode compact-block (Surya-2.5) answers on non-streaming /v1/chat/completions: html = one <div data-bbox data-label> per block, blocks = JSON array, raw = the model's own special tokens (default). A request's own ocr_format wins over this default."
+    ),
+    field!(
         "serve.max_queue",
         "serve_max_queue",
         Serve,

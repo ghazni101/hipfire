@@ -176,7 +176,11 @@ impl WireApi {
 
     /// Lower a request body onto the chat-completions body. A chat request
     /// passes through untouched. `Err` is a client error (400).
-    fn lower(self, body: serde_json::Value) -> Result<GenerationRequest, String> {
+    fn lower(
+        self,
+        body: serde_json::Value,
+        ocr_default: Option<OcrFormat>,
+    ) -> Result<GenerationRequest, String> {
         match self {
             Self::ChatCompletions => {
                 let mut body = body;
@@ -188,9 +192,13 @@ impl WireApi {
                 // `ocr_format` is answered by this hop and never forwarded: it
                 // selects a rendering of the model's compact-block output, not
                 // a decoder setting. Refused on streams because a client that
-                // watches deltas would see the compact form arrive first.
+                // watches deltas would see the compact form arrive first. With
+                // no request field the serve-level default (`serve.ocr_format`
+                // / HIPFIRE_SERVE_OCR_FORMAT) applies, and only off-stream:
+                // a stream always carries the raw form.
                 let ocr = match body.as_object_mut().and_then(|body| body.remove("ocr_format")) {
-                    None => None,
+                    None if stream => None,
+                    None => ocr_default,
                     Some(value) => {
                         let Some(requested) = value.as_str() else {
                             return Err(format!(
@@ -1421,7 +1429,7 @@ async fn handle_generation(
         chat: body_val,
         stream: is_stream,
         encoding,
-    } = match api.lower(raw_body) {
+    } = match api.lower(raw_body, shared.ocr_format) {
         Ok(request) => request,
         Err(message) => return api.error_response(&message, 400),
     };
@@ -2673,7 +2681,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "ocr_format": "html",
         });
-        let request = WireApi::ChatCompletions.lower(body).expect("valid request");
+        let request = WireApi::ChatCompletions.lower(body, None).expect("valid request");
         assert!(
             request.chat.get("ocr_format").is_none(),
             "ocr_format is answered here, never forwarded"
@@ -2693,7 +2701,7 @@ mod tests {
             "messages": [],
         });
         let err = WireApi::ChatCompletions
-            .lower(streaming)
+            .lower(streaming, None)
             .err()
             .expect("streaming is refused");
         assert!(err.contains("non-streaming"), "{err}");
@@ -2704,7 +2712,7 @@ mod tests {
             "messages": [],
         });
         let err = WireApi::ChatCompletions
-            .lower(unknown)
+            .lower(unknown, None)
             .err()
             .expect("unknown format is refused");
         assert!(err.contains("ocr_format"), "{err}");
@@ -2714,7 +2722,44 @@ mod tests {
             "ocr_format": 1,
             "messages": [],
         });
-        assert!(WireApi::ChatCompletions.lower(not_a_string).is_err());
+        assert!(WireApi::ChatCompletions.lower(not_a_string, None).is_err());
+    }
+
+    /// The serve-level default (`serve.ocr_format` / HIPFIRE_SERVE_OCR_FORMAT)
+    /// renders non-streaming turns; a stream always carries the raw form, and
+    /// a request's own field wins over the default.
+    #[test]
+    fn serve_default_applies_only_off_stream_and_yields_to_the_request() {
+        let body = serde_json::json!({"model": "m", "messages": []});
+        let request = WireApi::ChatCompletions
+            .lower(body, Some(OcrFormat::Html))
+            .expect("valid request");
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Html)),
+            _ => panic!("expected the chat encoding"),
+        }
+
+        let streaming = serde_json::json!({"model": "m", "stream": true, "messages": []});
+        let request = WireApi::ChatCompletions
+            .lower(streaming, Some(OcrFormat::Html))
+            .expect("streaming keeps the raw form");
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, None),
+            _ => panic!("expected the chat encoding"),
+        }
+
+        let explicit = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "ocr_format": "blocks",
+        });
+        let request = WireApi::ChatCompletions
+            .lower(explicit, Some(OcrFormat::Html))
+            .expect("valid request");
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Blocks)),
+            _ => panic!("expected the chat encoding"),
+        }
     }
 
     /// Decoded content replaces the compact form; a plain answer is untouched.
