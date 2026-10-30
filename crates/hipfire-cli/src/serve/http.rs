@@ -320,7 +320,10 @@ fn take_ocr(
     body: &mut serde_json::Value,
     default: Option<OcrFormat>,
 ) -> Result<Option<OcrFormat>, String> {
-    let Some(value) = body.as_object_mut().and_then(|body| body.remove("ocr_format")) else {
+    let Some(value) = body
+        .as_object_mut()
+        .and_then(|body| body.remove("ocr_format"))
+    else {
         return Ok(default);
     };
     let Some(requested) = value.as_str() else {
@@ -354,32 +357,49 @@ fn decode_text_slot(slot: &mut serde_json::Value, format: OcrFormat) {
     }
 }
 
-/// Anthropic `message.content[]` text blocks.
+/// Anthropic `message.content[]` text blocks (and `thinking` blocks: a model
+/// served without its non-thinking default answers on the reasoning channel).
 fn decode_anthropic_content(body: &mut serde_json::Value, format: OcrFormat) {
-    let Some(items) = body.get_mut("content").and_then(serde_json::Value::as_array_mut) else {
+    let Some(items) = body
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         return;
     };
     for item in items {
-        if item.get("type").and_then(serde_json::Value::as_str) == Some("text") {
-            if let Some(text) = item.get_mut("text") {
-                decode_text_slot(text, format);
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get_mut("text") {
+                    decode_text_slot(text, format);
+                }
             }
+            Some("thinking") => {
+                if let Some(text) = item.get_mut("thinking") {
+                    decode_text_slot(text, format);
+                }
+            }
+            _ => {}
         }
     }
 }
 
 /// Responses `output[].content[]` parts (and the flattened `output_text`).
 fn decode_responses_content(body: &mut serde_json::Value, format: OcrFormat) {
-    if let Some(items) = body.get_mut("output").and_then(serde_json::Value::as_array_mut) {
+    if let Some(items) = body
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for item in items {
-            let Some(parts) = item.get_mut("content").and_then(serde_json::Value::as_array_mut)
+            let Some(parts) = item
+                .get_mut("content")
+                .and_then(serde_json::Value::as_array_mut)
             else {
                 continue;
             };
             for part in parts {
                 if matches!(
                     part.get("type").and_then(serde_json::Value::as_str),
-                    Some("output_text" | "text")
+                    Some("output_text" | "text" | "reasoning_text")
                 ) {
                     if let Some(text) = part.get_mut("text") {
                         decode_text_slot(text, format);
@@ -436,18 +456,13 @@ impl StreamOcr {
 /// compact-block answer. Content that carries no block headers is left as it
 /// is (see [`ocr::decode_html`]).
 fn decode_ocr_content(body: &mut serde_json::Value, format: OcrFormat) {
-    let Some(content) = body.pointer_mut("/choices/0/message/content") else {
-        return;
-    };
-    let Some(text) = content.as_str() else {
-        return;
-    };
-    let decoded = match format {
-        OcrFormat::Html => ocr::decode_html(text),
-        OcrFormat::Blocks => ocr::blocks_json(text),
-    };
-    if decoded != text {
-        *content = serde_json::Value::String(decoded);
+    for slot in [
+        "/choices/0/message/content",
+        "/choices/0/message/reasoning_content",
+    ] {
+        if let Some(text) = body.pointer_mut(slot) {
+            decode_text_slot(text, format);
+        }
     }
 }
 
@@ -2282,7 +2297,9 @@ async fn handle_streaming(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
-    let ocr = encoding.ocr().map(|format| RefCell::new(StreamOcr::new(format)));
+    let ocr = encoding
+        .ocr()
+        .map(|format| RefCell::new(StreamOcr::new(format)));
     let mut encoder = encoding.stream(&id, created, &model);
     let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
@@ -2708,9 +2725,13 @@ impl SseSink {
         }
         // Compact-block decoding happens before the API's encoder frames a
         // delta, so chat/Anthropic/Responses stream decoded text alike. A
-        // delta that completes no block sends nothing.
-        let event = match (&self.ocr, event.get("type").and_then(serde_json::Value::as_str)) {
-            (Some(state), Some("token")) => {
+        // delta that completes no block sends nothing. Reasoning deltas decode
+        // too: a model without a non-thinking default answers on that channel.
+        let event = match (
+            &self.ocr,
+            event.get("type").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(state), Some("token" | "reasoning")) => {
                 let Some(text) = event.get("text").and_then(serde_json::Value::as_str) else {
                     return Ok(());
                 };
@@ -2839,7 +2860,9 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "ocr_format": "html",
         });
-        let request = WireApi::ChatCompletions.lower(body, None).expect("valid request");
+        let request = WireApi::ChatCompletions
+            .lower(body, None)
+            .expect("valid request");
         assert!(
             request.chat.get("ocr_format").is_none(),
             "ocr_format is answered here, never forwarded"
@@ -2958,7 +2981,10 @@ mod tests {
             let text = String::from_utf8_lossy(&frame.bytes).into_owned();
             assert!(text.contains("0 0 1 1"), "{text}");
             assert!(text.contains("data-label"), "{text}");
-            assert!(!text.contains("<|Text|>"), "raw tokens must not reach the wire");
+            assert!(
+                !text.contains("<|Text|>"),
+                "raw tokens must not reach the wire"
+            );
         }
     }
 
@@ -3014,6 +3040,60 @@ mod tests {
                 .pointer("/choices/0/message/content")
                 .and_then(|value| value.as_str()),
             Some("hello")
+        );
+    }
+
+    /// A model served without its non-thinking default answers on the
+    /// reasoning channel; `ocr_format` decodes that slot too, on every API.
+    #[test]
+    fn decoded_content_covers_the_reasoning_channel() {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "<|Text|><|1|><|1|><|2|><|2|><p>r</p>",
+                },
+            }],
+        });
+        decode_ocr_content(&mut body, OcrFormat::Html);
+        assert_eq!(
+            body.pointer("/choices/0/message/reasoning_content")
+                .and_then(|value| value.as_str()),
+            Some("<div data-bbox=\"1 1 2 2\" data-label=\"Text\"><p>r</p></div>")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(|value| value.as_str()),
+            Some("")
+        );
+
+        let mut anthropic = serde_json::json!({
+            "content": [
+                { "type": "thinking", "thinking": "<|Text|><|1|><|1|><|2|><|2|><p>r</p>", "signature": "" },
+                { "type": "text", "text": "" },
+            ],
+        });
+        decode_anthropic_content(&mut anthropic, OcrFormat::Html);
+        assert_eq!(
+            anthropic
+                .pointer("/content/0/thinking")
+                .and_then(|v| v.as_str()),
+            Some("<div data-bbox=\"1 1 2 2\" data-label=\"Text\"><p>r</p></div>")
+        );
+
+        let mut responses = serde_json::json!({
+            "output": [{
+                "type": "reasoning",
+                "content": [{ "type": "reasoning_text", "text": "<|Text|><|1|><|1|><|2|><|2|><p>r</p>" }],
+            }],
+        });
+        decode_responses_content(&mut responses, OcrFormat::Html);
+        assert_eq!(
+            responses
+                .pointer("/output/0/content/0/text")
+                .and_then(|v| v.as_str()),
+            Some("<div data-bbox=\"1 1 2 2\" data-label=\"Text\"><p>r</p></div>")
         );
     }
 
@@ -3229,7 +3309,9 @@ mod tests {
     fn test_sink(encoding: ResponseEncoding) -> TestSink {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let commit = Arc::new(Mutex::new(StreamCommit::Pending));
-        let ocr = encoding.ocr().map(|format| RefCell::new(StreamOcr::new(format)));
+        let ocr = encoding
+            .ocr()
+            .map(|format| RefCell::new(StreamOcr::new(format)));
         let sink = SseSink {
             tx,
             commit: Arc::clone(&commit),
@@ -3280,7 +3362,10 @@ mod tests {
                 ocr: None,
             },
             ResponseEncoding::Anthropic { ocr: None },
-            ResponseEncoding::Responses { echo: responses, ocr: None },
+            ResponseEncoding::Responses {
+                echo: responses,
+                ocr: None,
+            },
         ] {
             let api = encoding.api();
             let (sink, commit, mut rx) = test_sink(encoding);

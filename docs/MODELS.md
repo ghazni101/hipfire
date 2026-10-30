@@ -674,14 +674,15 @@ That raw form is the card's own contract: surya's client attaches with
 `SURYA_INFERENCE_URL=http://host:port/v1` and parses the string itself
 (`parse_full_page_html`), so a server must return the special tokens — which
 `serve` does by default. A caller that wants the decoded form instead asks for
-it per request with `ocr_format` on a **non-streaming** turn:
+it per request with `ocr_format` (streaming or not; a stream decodes per block):
 
 - `"ocr_format": "html"` — `content` becomes one
   `<div data-bbox="x0 y0 x1 y1" data-label="…">…</div>` per block, newline
   separated: omitted cell/row closers restored, `<|box|>` folded back into a
   `data-bbox` attribute, merged cells converted to `colspan`/`rowspan`.
-- `"ocr_format": "blocks"` — `content` becomes a JSON array of
-  `{"label", "bbox", "html"}`.
+- `"ocr_format": "blocks"` — `content` becomes a JSON array of the parsed
+  blocks, `{"label", "bbox", "html", "truncated"}` (`truncated` is set on the
+  last block when the token cap cut the answer).
 
 Both are answered by serve from the model's text on all three text wire APIs
 (chat completions, Anthropic messages, Responses), so a body with no block
@@ -696,11 +697,29 @@ single turn back to the special tokens. A streamed turn decodes as it goes:
 arrives, so the concatenated deltas equal the non-streaming HTML), and
 `blocks` sends a single final delta because a JSON array has no prefix form.
 
+**Context.** A full page is ~3 700 prompt tokens plus up to 12 288 generated
+ones, so the card's own floor is 24 576. The checkpoint's HFQ carries no
+`max_position_embeddings`, so the load default is 4 096 and a full-page turn is
+rejected (`max_tokens=12288 does not fit the loaded context window of 4096`) or
+truncated to a few hundred tokens when `max_tokens` is omitted. Load this model
+with a context that holds the contract:
+
+```bash
+hipfire config set memory.max_seq 24576      # or: hipfire serve … --max-seq 24576
+```
+
+KV cost is small (six full-attention layers, 2 KV heads): 24 576 tokens is
+~0.15 GB on the q8 KV tier.
+
 **Generation contract** (the card's vLLM client): greedy, `top_p: 0.1`, no
 repetition penalty, `max_tokens` ≈ 12288 for a dense page; thinking off
-(`reasoning_effort: none`), which the registry's `recommended_settings` lower.
-Generation stops on the checkpoint's end token (`<|im_end|>`, id 2), so no stop
-strings are needed. Two serve limits apply when attaching the Python client:
+(`reasoning_effort: none`), which the registry's `recommended_settings` lower —
+**but only on a tag load** (`surya-ocr-2.5:q8`, `surya`): the registry layer
+supplies those defaults. A serve started with the artifact *path* instead gets
+the built-in defaults, thinking stays on, and the answer lands in
+`reasoning_content` with `content` empty (the Python client reads `content`);
+add `"reasoning_effort": "none"` to such requests. Generation stops on the
+checkpoint's end token (`<|im_end|>`, id 2), so no stop strings are needed. Two serve limits apply when attaching the Python client:
 `logprobs` are refused (400) — set `SURYA_INFERENCE_LOGPROBS=0`, per-block
 `confidence` then comes back null — and guided layout/table_rec
 (`SURYA_GUIDED_LAYOUT=1`) is refused because the schemas use `pattern`, outside
@@ -709,7 +728,7 @@ serve's strict JSON-Schema subset. Unguided layout answers in the same
 not usable against this route; full-page OCR is.
 
 ```bash
-hipfire serve surya-ocr-2.5:q8 127.0.0.1:9425 --vision=surya-ocr-2.5.vl
+hipfire serve surya-ocr-2.5:q8 127.0.0.1:9425 --max-seq 24576 --vision=surya-ocr-2.5.vl
 # Raw (what surya's own client wants):
 curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"surya-ocr-2.5:q8","reasoning_effort":"none","temperature":0,
