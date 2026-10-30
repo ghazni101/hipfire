@@ -157,7 +157,7 @@ environment variable.
 | `--kv-backend legacy\|vmm` | KV storage backend for models this service loads |
 | `--max-seq N` | KV context for every load, within the `memory.max_seq` bounds (512..1048576); overrides the configured/automatic context |
 | `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
-| `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
+| `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` / `HIPFIRE_IDLE_TIMEOUT` (default 300 s) and wins silently, so serve logs the effective value (`[hipfire] idle eviction: <n>s`, or an explicit warning when the flag disables a configured timeout) at startup |
 | `--tp N` | Tensor/expert-parallel degree (1..64) |
 | `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
 | `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
