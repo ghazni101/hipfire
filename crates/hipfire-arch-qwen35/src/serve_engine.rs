@@ -612,10 +612,24 @@ impl ModelRig {
                         }
                     }
                 }
-                for pref in &moe_prefills {
+                if !moe_prefills.is_empty() {
+                    // One forward for every prefilling slot. Mixing those
+                    // rows with decode hung 35B-A3B (the decode half stays
+                    // in `rest`); splitting one slot per launch serialized
+                    // prefill even when the scheduler had packed several
+                    // slots into this step. The MoE FFN is stateless per
+                    // row and the paged attention path is slot-addressed.
+                    let combined = merge_isolated_prefills(&moe_prefills);
+                    let n_pref = combined.m_per_slot.iter().filter(|&&m| m > 0).count();
+                    if n_pref > 1 {
+                        eprintln!(
+                            "[hipfire] batched MoE prefill: {n_pref} slots, {} rows",
+                            combined.total_rows()
+                        );
+                    }
                     self.forward_paged_batch(
                         gpu,
-                        pref,
+                        &combined,
                         pool,
                         graph,
                         lm_head_skip,
@@ -3917,6 +3931,37 @@ fn split_isolated_prefill(batch: &SlotBatch, isolate: &[bool]) -> (Vec<SlotBatch
     (isolated, rest)
 }
 
+/// Pack per-slot prefill batches back into one step, preserving slot order.
+/// `split_isolated_prefill` emits one batch per slot; the MoE prefill forward
+/// runs that pack as a single launch.
+fn merge_isolated_prefills(parts: &[SlotBatch]) -> SlotBatch {
+    let Some(first) = parts.first() else {
+        return SlotBatch::default();
+    };
+    let n = first.m_per_slot.len();
+    let mut out = SlotBatch {
+        m_per_slot: vec![0; n],
+        ..SlotBatch::default()
+    };
+    for part in parts {
+        for (s, &m) in part.m_per_slot.iter().enumerate() {
+            if m > 0 {
+                out.m_per_slot[s] = m;
+            }
+        }
+        out.tokens.extend_from_slice(&part.tokens);
+        out.positions.extend_from_slice(&part.positions);
+        out.row_slot.extend_from_slice(&part.row_slot);
+        if !part.pos3.is_empty() {
+            out.pos3.extend_from_slice(&part.pos3);
+        }
+        if !part.ext_emb.is_empty() {
+            out.ext_emb.extend_from_slice(&part.ext_emb);
+        }
+    }
+    out
+}
+
 /// The engine's view of the shared paged pool's physical backend. The
 /// resolver itself lives in `hipfire_config` so the CLI's startup gate and
 /// the daemon's KV diagnostic cannot drift from the engine.
@@ -3955,18 +4000,14 @@ fn resolve_slot_kv_storage(
 ) -> Result<SlotKvStorage, String> {
     if kv_backend_vmm || paged_backend_vmm {
         if pool_forced_off {
-            return Err(
-                "the multi-slot VMM cache is the shared page pool; \
+            return Err("the multi-slot VMM cache is the shared page pool; \
                  HIPFIRE_SLOTS_PAGED=0 turns that pool off"
-                    .to_string(),
-            );
+                .to_string());
         }
         if sequential_vl {
-            return Err(
-                "the multi-slot VMM cache is the shared page pool; \
+            return Err("the multi-slot VMM cache is the shared page pool; \
                  HIPFIRE_VL_SEQUENTIAL=1 needs contiguous slots and cannot use it"
-                    .to_string(),
-            );
+                .to_string());
         }
         if kv_backend_vmm && !paged_backend_vmm {
             eprintln!(
@@ -4301,6 +4342,86 @@ fn inject_publish_fault() -> bool {
         }
     }
     ARMED.swap(false, Ordering::Relaxed)
+}
+
+/// Drop every parked session's KV pages.
+///
+/// A finished request leaves its session resident so a continuation can
+/// reuse the slot. Nothing is in flight here, so those pages are only
+/// holding VMM granules. Closing them returns the pages to the pool, and
+/// the prefix-cache reclaim that follows drops any cache refs, so the next
+/// request reuses the committed granules in place instead of mapping new
+/// ones. A used VA keeps its physical binding until teardown
+/// ([`VmmPageMapper::sync`]), so nothing is unmapped. A continuation that
+/// arrives later misses and prefills again.
+fn release_idle_sessions(rig: &mut Rig) -> usize {
+    let ids: Vec<u64> = rig.sessions.iter().map(|(id, _)| id).collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    for &id in &ids {
+        rig.sessions
+            .close(&mut rig.pool, &mut rig.adm, SessionId(id));
+        rig.swap.forget(id);
+        let _ = rig.fair_queue.remove(id);
+    }
+    // A session that lost its slot without `pool.release` would leave the
+    // block table, and one live page pins the whole VMM granule.
+    for s in 0..rig.n_slots {
+        if rig.pool.block_table(SlotId(s)).is_some() {
+            rig.pool.release(SlotId(s));
+        }
+    }
+    if let Some(pp) = rig.pool.page_pool_mut() {
+        pp.drain_completed();
+    }
+    if let Ok(mut closed) = rig.closed_sessions.lock() {
+        closed.extend(ids.iter().copied());
+    }
+    ids.len()
+}
+
+/// Drop unpinned prefix-cache pages and DeltaNet snapshots.
+///
+/// Finished requests publish KV pages and a recurrent-state snapshot so a
+/// later turn can resume. Those snapshots are `hipMalloc`s beside the VMM
+/// page pool, and the configured ceiling is larger than the free memory on
+/// a 24 GB card, so leaving them resident fills the device and the next
+/// granule map fails. Cache refs are what keep the pages non-Free; evicting
+/// unpinned leaves makes them Free, so the pool reuses those granules'
+/// committed pages in place instead of mapping more
+/// ([`VmmPageMapper::sync`] never unmaps a used VA). Live slots hold table
+/// refs, so their pages stay.
+///
+/// Returns `(kv pages returned to the free list, checkpoint bytes freed)`.
+fn release_unpinned_device_cache(rig: &mut Rig) -> (usize, u64) {
+    let pages = if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+    {
+        let before = pp.free_pages();
+        idx.evict_unpinned_leaves(pp, usize::MAX);
+        pp.drain_completed();
+        pp.free_pages().saturating_sub(before)
+    } else {
+        0
+    };
+    let blobs = rig
+        .model
+        .checkpoint_pool
+        .as_mut()
+        .map(|pool| {
+            let mut out = Vec::new();
+            while let Some((_, blob)) = pool.pop_lru() {
+                out.push(blob);
+            }
+            out
+        })
+        .unwrap_or_default();
+    let mut ckpt_bytes = 0u64;
+    for blob in blobs {
+        ckpt_bytes += blob.bytes_len();
+        blob.free_gpu(&mut rig.gpu);
+    }
+    (pages, ckpt_bytes)
 }
 
 /// Publish generated-prefix pages at the client-commit boundary (Done event
@@ -5039,9 +5160,56 @@ fn run_loop(
         'serve: loop {
             let idle = slots.iter().all(|s| s.is_none());
             if idle && rig.wait_queue.queued_count() == 0 {
-                // VMM-paged granules are not returned at idle: a used VA
-                // keeps its physical allocation until teardown (see
-                // `VmmPageMapper::sync`), so freed pages are reused in place.
+                // A command already queued (a continuation, a new request)
+                // must run before parked KV is dropped.
+                match rx.try_recv() {
+                    Ok(cmd) => {
+                        handle_command(&mut rig, &mut slots, &mut work, &stats, cmd);
+                        continue 'serve;
+                    }
+                    Err(TryRecvError::Disconnected) => break 'serve,
+                    Err(TryRecvError::Empty) => {}
+                }
+                // Nothing in flight and nothing queued. Parked sessions
+                // still own KV pages, and the prefix cache owns snapshots
+                // allocated beside the VMM pool. Drop both so the pool's
+                // committed granules are reused in place by the next
+                // request, and the snapshot bytes go back to the device. A
+                // used VA keeps its physical binding until teardown (see
+                // `VmmPageMapper::sync`), so no granule is unmapped here.
+                // A later request with the same prefix misses and prefills
+                // again. A failed map poisons the mapper.
+                let sessions = release_idle_sessions(&mut rig);
+                let (pages, ckpt_bytes) = release_unpinned_device_cache(&mut rig);
+                if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
+                    // Checkpoint snapshots are raw hipMallocs. The tensor pool
+                    // can still be holding other freed buffers, which
+                    // hipMemGetInfo counts as used.
+                    rig.gpu.drain_pool();
+                    let held = rig.pool.page_pool().map(|pp| {
+                        pp.page_states()
+                            .iter()
+                            .filter(|s| **s != rdna_compute::page_pool::PageState::Free)
+                            .count()
+                    });
+                    eprintln!(
+                        "[hipfire] idle cache reclaim: {sessions} sessions, {pages} kv pages, {ckpt_bytes} checkpoint bytes, held_pages={held:?}"
+                    );
+                }
+                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                    let reason = format!("VMM-paged reclaim failed: {e}");
+                    poison = Some(reason);
+                    break 'serve;
+                }
+                if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
+                    let mapped = rig
+                        .model
+                        .paged_vmm
+                        .as_ref()
+                        .map(|mapper| mapper.mapped_bytes())
+                        .unwrap_or(0);
+                    eprintln!("[hipfire] idle cache reclaim mapped_bytes={mapped}");
+                }
                 // Nothing in flight and nothing queued: block rather than spin.
                 // With an idle TTL configured, wake periodically to close
                 // abandoned parked sessions instead of waiting for the next
@@ -5716,10 +5884,31 @@ fn run_loop(
                         ));
                         break;
                     }
+                    let (pages, ckpt_bytes) = release_unpinned_device_cache(&mut rig);
                     eprintln!(
                         "[serve] VMM page map refused slot {s}: {error}; \
-                         rejecting that request"
+                         reclaimed {pages} kv pages and {ckpt_bytes} checkpoint bytes"
                     );
+                    match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                        Ok(()) => continue,
+                        Err(retry_error) => {
+                            let poisoned = rig
+                                .model
+                                .paged_vmm
+                                .as_ref()
+                                .is_some_and(|mapper| mapper.is_poisoned());
+                            if poisoned {
+                                vmm_map_poison = Some(format!(
+                                    "VMM-paged map failed and the mapper is poisoned: {retry_error}"
+                                ));
+                                break;
+                            }
+                            eprintln!(
+                                "[serve] VMM page map refused slot {s} after reclaim: {retry_error}; \
+                                 rejecting that request"
+                            );
+                        }
+                    }
                     provision_failed.push(s);
                     if let Some(mut flight) = slots[s].take() {
                         let _ = send_event(
@@ -9137,7 +9326,8 @@ mod tests {
         assert_eq!(from_kv.paged_pages, Some(0));
 
         // The paged-backend spelling is the same pool.
-        let from_paged = resolve_slot_kv_storage(false, true, true, Some(64), false, false).unwrap();
+        let from_paged =
+            resolve_slot_kv_storage(false, true, true, Some(64), false, false).unwrap();
         assert!(from_paged.paged_vmm);
         assert_eq!(from_paged.paged_pages, Some(64));
 
@@ -9227,6 +9417,12 @@ mod tests {
         assert_eq!(rest.positions, vec![7]);
         assert_eq!(rest.pos3, vec![[7; 3]]);
         assert_eq!(rest.ext_emb, vec![0]);
+        let merged = merge_isolated_prefills(&iso);
+        assert_eq!(merged.m_per_slot, vec![2, 0, 3]);
+        assert_eq!(merged.tokens, vec![10, 11, 30, 31, 32]);
+        assert_eq!(merged.positions, vec![0, 1, 2, 3, 4]);
+        assert_eq!(merged.row_slot, vec![0, 0, 2, 2, 2]);
+        assert_eq!(merged.total_rows(), 5);
     }
 
     #[test]
