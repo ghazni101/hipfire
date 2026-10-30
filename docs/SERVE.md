@@ -286,7 +286,14 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
     context) or the live-slot pattern changes,
     because `max_ctx_len`, conv state and per-slot logit rows are recorded.
     Multi-row MoE decode is admitted up to `FEW_ROW_ROUTE_ROWS` live rows.
-    Still experimental, and not a production default.
+    Still experimental, and not a production default. Mixed-length concurrent
+    prefill at KV page-edge prompt lengths (127/128/129/255/256/257 tokens on
+    gfx1100) does not reproduce the solo completion: a lane can return another
+    length's completion, and four identical prompts in one batch can disagree
+    with each other and across runs. The mechanism is open; treat
+    concurrent == solo as unproven on this backend.
+    `scripts/check_vmm_paged_regressions.py` is the reproduction, and the log
+    is [`investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md`](investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md).
 
    `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
    storage from fixed per-slot slabs to one VMM reservation per slot, mapped

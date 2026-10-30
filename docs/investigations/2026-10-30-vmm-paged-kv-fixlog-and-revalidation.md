@@ -511,3 +511,79 @@ above the host-pool default being reverted (164.7/160.0/150.2, 206.8).
 | speed | VALIDATED: decode ×2.35-3.92, conc4 +36% vs base; prefill −1.3..−4.7% vs base |
 | not tested | the host-pool path after the revert; PRIV-off on this branch; models other than Nex-N2.5-mini MQ4R |
 Nothing pushed; ~/github/hipfire not touched.
+
+---
+
+## 2026-10-30 (later): re-validation after merging beta bd61265fc, and a concurrent-vs-solo finding
+
+The branch was merged forward to `upstream/beta` `bd61265fc` (`8ee106324`). Re-validated on
+gfx1100 (7900 XTX, HIP 7.16 / ROCm 10.1), branch HEAD `07bf59e07`.
+
+### What the merge itself broke, and what was fixed
+
+| item | result |
+|---|---|
+| `cargo build --release -p hipfire-daemon -p hipfire-cli` | exit 0 |
+| `cargo clippy --workspace --all-targets`, `cargo-fmt --all -- --check`, `scripts/check-crate-maps.py --check` | clean (a merge-induced `SseSink` initializer in a CLI test, four crate-map rows and three rustfmt hunks were branch fallout, fixed in `07bf59e07`) |
+| `redline-rocr` 78, `rdna-compute` vmm_page_pool 9 / kv_slots 15, `hipfire-arch-qwen35` lib 502 | pass |
+| `rdna-compute --test all_launcher_abi` 66, `--test flagship_pack_coverage` 12, `peacemaker-isa --test mq4_rows_x4` 19 | pass |
+| `kernel_registry_coverage` `every_runtime_hip_module_is_registered_or_allowlisted` | **pre-existing upstream**: the identical 40-finding set (railgun_window/tp_peer_push/vit_*/stale allowlist rows) fails on beta `bd61265fc` itself |
+| `kernels/mq4_rows_x4_pm_gfx1100.{s,co,hxaco,sha256}` | re-emitted from merged source (beta's gfx1100 SGPR change + this branch's dual-issue); gfx1151 artifacts re-emit byte-identically and the receipts (`.m7.json`, `shape.d/*`) are semantically unchanged, so they were left as committed |
+| `scripts/pre-commit-ci.sh upstream/beta` | all checks pass after the fixes above |
+
+### The finding: mixed-length concurrent prefill does not reproduce solo output
+
+Route: `HIPFIRE_SERVE_MULTI_SLOT=1 HIPFIRE_SERVE_MULTI_SLOT_PAGED=1
+HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND=vmm HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK=4096
+HIPFIRE_SERVE_MULTI_SLOT_SLOTS=4 HIPFIRE_SERVE_MULTI_SLOT_CTX=16384`, `--kv-mode q8`,
+`hipfire serve --idle-timeout 0`, non-streaming chat completions, `temperature: 0`,
+`chat_template_kwargs.enable_thinking: false`, 32 generated tokens, prompts built by
+`check_vmm_paged_regressions.py`'s `filler_prompt` (calibrated to an exact `prompt_tokens`).
+
+`python3 scripts/check_vmm_paged_regressions.py --port 11435 --model <9b.mq4>` — with the
+chunk pinned, which is what makes the 1151-1153 class disappear — fails 24 of 144 cases, and
+every failure is at the **page edges** 127/128/129/255/256/257, not at 1151-1153:
+
+| lanes | result (9B, gfx1100) | solo reference |
+|---|---|---|
+| `[127,128]` | 127 -> `a0ce0c1f` | 127 `9eb2c1af` |
+| `[127,128,129]` | 127 -> `a0ce0c1f`, 128 -> `9eb2c1af` (= **127's answer**) | 128 `c4c6d94c` |
+| `[127,128,129,130]` | 127 -> `a0ce0c1f`, 128 -> `9eb2c1af`, 129 -> `c4c6d94c` (= **128's answer**) | 129 `9d8da3f5` |
+| `[127,127,127,127]` | all four -> `a0ce0c1f`; a repeat run of the **same composition** gave 3x `a0ce0c1f` + 1x `9eb2c1af` | 127 `9eb2c1af` |
+| `[127,128,257,300]`, `[255,256,257,300]`, `[127,128,255,256]` | no mismatch in that run | - |
+
+Every prompt, token count and lane order was fixed across runs, so this is not a client-side
+mix-up: the server reports `prompt_tokens` 127/128/129/130 for those lanes and returns a
+completion that is byte-identical to a *different* length's solo completion. With four
+*identical* prompts in one batch, the four lanes can disagree with each other inside a single
+run, which also contradicts "output is deterministic for a fixed batch composition" for this
+backend.
+
+Dense 27B (`qwen3.8-27b.mq4p`, same flags) shows the same class at a lower rate: `[127,128,129,130]`
+returned 130 -> `a6e0dc5a`, which is solo 127's answer; `[127,128,129]` and `[255,256,257,300]`
+each returned one unique wrong answer. `[127,127,127,127]` and `[128,128,128,128]` were clean.
+
+### What it is not
+
+| candidate | test | outcome |
+|---|---|---|
+| the beta merge | same probes on pre-merge tip `38cb54fa7` (3 runs) | fails identically |
+| the shared-prefill commit `fb573685e` | same probes on its parent `8f9368f3d` (3 runs) | fails identically |
+| beta's batched lm_head (default on) | `HIPFIRE_BATCHED_HEAD=0` | still fails |
+| the VMM page mapper | `HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND=arena` (same codes, arena backing) | still fails |
+| client mixing | distinct-answer marker prompts, 129/130/257/256 tokens (off the page edges), 3 rounds | every lane returned its own marker, identical to solo |
+| device state | `journalctl -k` | 0 GCVM / page faults; all requests HTTP 200 |
+
+So the engine keeps per-lane request state (the marker probe passes), and the failure is in the
+**batched prefill row/token accounting at page-edge lengths**: a lane's prompt is executed as a
+prefix of itself (one row short), which makes its decode continue from another length's prompt.
+The marker probe's lengths were not page edges, which is why it stayed clean.
+
+### Status
+
+Open. Not fixed in this branch: it predates the last two commits, needs the batched-prefill
+row/slot/position accounting traced against the paged block table, and no fix can be claimed
+without repeating the EQ matrix, the page-edge matrix above and the 4x12000 soak. The route
+stays **experimental and not an admission route** (see `docs/VALIDATION.md`), and
+`check_vmm_paged_regressions.py` is the reproduction: it is expected to report the page-edge
+mismatches on gfx1100 until this is fixed.
