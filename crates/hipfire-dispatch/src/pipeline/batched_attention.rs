@@ -475,6 +475,8 @@ pub fn batch_chunk_full_attn_input_projection(
         layer.wq.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=57 IU4G256 is qt=44 relaid out: same FWHT-G256 input.
+            | DType::IU4G256
             // qt=52 shares qt=44's FWHT input contract; dispatch arm below
             // routes to the FP8-LUT twin.
             | DType::MQ4G256V2Lloyd
@@ -867,6 +869,19 @@ pub fn batch_chunk_full_attn_input_projection(
             layer.wv.m,
             layer.wq.k,
             n,
+        )?;
+    } else if qkv_same_dtype && layer.wq.dtype == DType::IU4G256 {
+        // qt=57: q/k/v MMQ launches over one quantized X.
+        gpu.gemm_iu4g256_multi(
+            &[
+                (&layer.wq.buf, &pbs.fa_q_full_batch, layer.wq.m),
+                (&layer.wk.buf, &pbs.fa_k_batch, layer.wk.m),
+                (&layer.wv.buf, &pbs.fa_v_batch, layer.wv.m),
+            ],
+            &pbs.x_rot_batch,
+            layer.wq.k,
+            n,
+            false,
         )?;
     } else if qkv_same_dtype {
         run_fused_qkv_key(
@@ -1325,6 +1340,8 @@ pub fn batch_chunk_full_attn_output_projection(
         layer.wo.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=57 IU4G256 is qt=44 relaid out: same FWHT-G256 input.
+            | DType::IU4G256
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs rotated x).
             | DType::MQ4G256V2Lloyd
             | DType::MQ4CG256
@@ -2917,6 +2934,7 @@ pub fn batched_gemm_single_weight(
     n: usize,
 ) -> HipResult<()> {
     match w.dtype {
+        DType::IU4G256 => gpu.gemm_iu4g256(&w.buf, x, y, w.m, w.k, n, false),
         DType::MQ4G256 | DType::HFQ4G256 => run_plain_gemm_key(
             gpu,
             crate::types::KernelKey::GemmHfq4G256,

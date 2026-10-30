@@ -4122,7 +4122,18 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let bf16_with_gfx942 =
         matches!(dt, DType::BF16) && arch == "gfx942" && rdna_compute::calib_force_bf16();
 
-    mq3_uniform_with_wmma
+    // IU4G256 (qt57): native IU4 Q8_1 MMQ prefill (`gemm_iu4g256_multi`, the
+    // MQ4V2 MMQ arithmetic over the planar IU4 rows) on gfx1100/gfx1151. The
+    // six rotation lists (qkv/wo/ffn/w_down in batched*.rs) and the
+    // gate_up/qkv/qkvza/epilogue/single-weight IU4 arms land in lockstep.
+    // `HIPFIRE_IU4_DECODE=dot8` keeps the original per-token W4A4 prefill;
+    // `dot4` (W4A8 decode only) keeps the MMQ prefill.
+    let iu4_with_mmq = dt == DType::IU4G256
+        && matches!(arch, "gfx1100" | "gfx1151")
+        && rdna_compute::iu4_decode_mode() != rdna_compute::Iu4DecodeMode::Dot8;
+
+    iu4_with_mmq
+        || mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_wmma
         || lloyd_mq4_with_wmma
@@ -4231,7 +4242,12 @@ pub fn qwen35_layer_batch_admissible(
                 ("w_up", l.w_up.gpu_dtype),
                 ("w_down", l.w_down.gpu_dtype),
             ] {
-                if !is_batchable_la(dt, arch) {
+                // qt59 IU8G32 is admitted only as the DeltaNet `wo` (natural
+                // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
+                let iu8g32_wo = name == "wo"
+                    && dt == DType::IU8G32
+                    && matches!(arch, "gfx1100" | "gfx1151");
+                if !iu8g32_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
                         0,
                         &format!("DeltaNet {name} dtype {dt:?} not batchable on {arch}"),
@@ -4534,6 +4550,18 @@ pub fn prefill_batch_pbs_eligible(
         qwen35_layer_batch_admissible(lw, config, arch).is_ok()
     });
     let result = scalar_ok && all_layers_ok;
+    if !all_layers_ok
+        && hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
+            .ok()
+            .as_deref()
+            == Some("1")
+    {
+        for (li, lw) in weights.layers.iter().enumerate() {
+            if let Err(e) = qwen35_layer_batch_admissible(lw, config, arch) {
+                eprintln!("[hipfire::batch_eligible] layer {li} rejected: {e:?}");
+            }
+        }
+    }
     if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
         .ok()
         .as_deref()
@@ -5427,7 +5455,7 @@ pub(crate) fn batch_chunk_embed_tokens(
         && !pre_embedded
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32
         )
     {
         if !pre_uploaded {
@@ -5469,6 +5497,13 @@ pub(crate) fn batch_chunk_embed_tokens(
                         len,
                         dim,
                     ),
+                    EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(
+                        &weights.token_embd,
+                        &output,
+                        &token_ids,
+                        len,
+                        dim,
+                    ),
                     _ => unreachable!(),
                 }
             })?;
@@ -5482,6 +5517,13 @@ pub(crate) fn batch_chunk_embed_tokens(
                     dim,
                 )?,
                 EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?,
+                EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,
@@ -5504,9 +5546,7 @@ pub(crate) fn batch_chunk_embed_tokens(
                 EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
                 }
-                EmbeddingFormat::IU8G32 => {
-                    gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
-                }
+                EmbeddingFormat::IU8G32 => unreachable!(),
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
@@ -7840,6 +7880,15 @@ mod tests {
         }
         // gfx12 unchanged already proven above, but explicitly re-prove
         // that the admit set includes both gfx12 variants
+        // IU4G256: native MMQ prefill on gfx1100/gfx1151 only.
+        if rdna_compute::iu4_decode_mode() != rdna_compute::Iu4DecodeMode::Dot8 {
+            assert!(is_batchable_la(DType::IU4G256, "gfx1100"));
+            assert!(is_batchable_la(DType::IU4G256, "gfx1151"));
+        }
+        for arch in ["gfx1201", "gfx1030", "gfx1010", "gfx906"] {
+            assert!(!is_batchable_la(DType::IU4G256, arch), "IU4 on {arch}");
+        }
+        assert!(!is_batchable_la(DType::IU8G256, "gfx1100"));
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1200"));
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
         // gfx1100/gfx1151 true (the two parity-proven parts)

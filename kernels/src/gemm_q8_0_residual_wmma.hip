@@ -67,18 +67,27 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
 
     // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
     for (int bi = 0; bi < blocks_per_row; bi++) {
+#ifdef HIPFIRE_IU8G32L
+        // IU8G32 (qt59) row: [K int8 codes][K/32 f16 scales]; same bytes per
+        // row as Q8_0 (34 B per 32), so row_stride is unchanged.
+        const char* sp = row_base + K + bi * 2;
+        const char* cp = row_base + bi * 32;
+#else
         const char* bp = row_base + bi * 34;
+        const char* sp = bp;
+        const char* cp = bp + 2;
+#endif
 
         _Float16 sc;
         {
             unsigned short s_bits;
-            __builtin_memcpy(&s_bits, bp, 2);
+            __builtin_memcpy(&s_bits, sp, 2);
             __builtin_memcpy(&sc, &s_bits, 2);
         }
 
         const _Float16* x_base = X + (long long)safe_batch * K + bi * 32;
 
-        const signed char* w0 = (const signed char*)(bp + 2);
+        const signed char* w0 = (const signed char*)(cp);
         half16_t a0;
         #pragma unroll
         for (int i = 0; i < 16; i++) {
@@ -87,7 +96,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
         half16_t b0 = *(const half16_t*)(x_base);
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc);
 
-        const signed char* w1 = (const signed char*)(bp + 2 + 16);
+        const signed char* w1 = (const signed char*)(cp + 16);
         half16_t a1;
         #pragma unroll
         for (int i = 0; i < 16; i++) {

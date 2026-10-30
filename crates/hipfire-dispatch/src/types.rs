@@ -217,6 +217,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvMq4G256V2
         | FusedQkvMq4G256V2VerifyExact
         | FusedQkvMq4G256V2Lloyd
+        | FusedQkvIu4G256
         | FusedQkvMq6G256V2
         | FusedQkvMq5G256V2
         | FusedQkvMq3G256V2
@@ -235,6 +236,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaMq4G256V2
         | FusedQkvzaMq4G256V2VerifyExact
         | FusedQkvzaMq4G256V2Lloyd
+        | FusedQkvzaIu4G256
         | FusedQkvzaMq6G256V2
         | FusedQkvzaMq5G256V2
         | FusedQkvzaMq3G256V2
@@ -252,6 +254,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedGateUpMq4G256V2
         | FusedGateUpMq4G256V2VerifyExact
         | FusedGateUpMq4G256V2Lloyd
+        | FusedGateUpIu4G256
         | FusedGateUpMq6G256V2
         | FusedGateUpMq5G256V2
         | FusedGateUpMq3G256V2
@@ -522,6 +525,11 @@ pub enum KernelKey {
     FusedGateUpMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedGateUpMq4G256V2Lloyd,
+    /// qt=57 (IU4G256) decode: one `fused_iu4g256_rows` launch over QKV,
+    /// QKVZA or gate+up; each row is bit-identical to `gemv_iu4g256`.
+    FusedQkvIu4G256,
+    FusedQkvzaIu4G256,
+    FusedGateUpIu4G256,
     FusedGateUpMq4CG256,
     FusedGateUpMq5G256V2,
     FusedGateUpMq6G256V2,

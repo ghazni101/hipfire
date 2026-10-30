@@ -2787,6 +2787,8 @@ pub const GEMV_IU8G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g2
 /// IU8G32 (qt 59) embedding lookup: one row dequantized to F32 from the
 /// planar Q8 grid. See `kernels/src/embedding_iu8g32.hip`.
 pub const EMBEDDING_IU8G32_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g32.hip");
+pub const EMBEDDING_IU8G32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_iu8g32_batched.hip");
 
 pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
     "#define Q8X_QUANT 1\n",
@@ -5302,6 +5304,22 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
 // codes (WMMA A_sign=true at mma_i8). Default decode is HIPFIRE_MMQ_LUT_PAIRTAB
 // (256×u16 LDS pair table, +512 B → shared 57856); set PAIRTAB=0 for the
 // v_perm A/B baseline (shared 57344, same as uniform).
+// IU4G256 (qt57) twin of the MQ4V2 Q8_1 MMQ family: `-DHIPFIRE_MMQ_IU4L=1`
+// swaps only the tile loader's address math for the IU4 row layout
+// ([K/2 codes][8 B header x G]); the arithmetic is the MQ4V2 kernel's, so a
+// qt57 tensor that is the relayout of a qt44 tensor gives bit-identical Y.
+// The six entry symbols are renamed (`gemm_iu4g256_mmq*`) because the
+// function cache is keyed by symbol name.
+pub const GEMM_IU4G256_MMQ_SRC: &str = concat!(
+    "#define HIPFIRE_MMQ_IU4L 1\n",
+    "#define gemm_mq4g256v2_residual_mmq gemm_iu4g256_mmq\n",
+    "#define gemm_mq4g256v2_residual_mmq_x128 gemm_iu4g256_mmq_x128\n",
+    "#define gemm_mq4g256v2_residual_mmq_full_add gemm_iu4g256_mmq_full_add\n",
+    "#define gemm_mq4g256v2_residual_mmq_full_set gemm_iu4g256_mmq_full_set\n",
+    "#define gemm_mq4g256v2_residual_mmq_full_add_x128 gemm_iu4g256_mmq_full_add_x128\n",
+    "#define gemm_mq4g256v2_residual_mmq_full_set_x128 gemm_iu4g256_mmq_full_set_x128\n",
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MMQ_LUT 1\n",
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
@@ -7780,6 +7798,15 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
+/// IU8G32 (qt59) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G32L`
+/// swaps only the row addressing ([K codes][K/32 f16 scales]); the f16 WMMA
+/// arithmetic is the Q8_0 kernel's, so a qt59 relayout of a Q8_0 tensor gives
+/// bit-identical Y. Entry renamed so the function cache cannot alias.
+pub const GEMM_IU8G32_RESIDUAL_WMMA_SRC: &str = concat!(
+    "#define HIPFIRE_IU8G32L 1\n",
+    "#define gemm_q8_0_residual_wmma gemm_iu8g32_residual_wmma\n",
+    include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip")
+);
 
 // gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)

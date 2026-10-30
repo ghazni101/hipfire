@@ -1088,6 +1088,18 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
             key: KernelKey::FusedGateUpMq4G256V2Lloyd,
             archs: WAVE32,
         },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvIu4G256,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaIu4G256,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpIu4G256,
+            archs: WAVE32,
+        },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
         // cross-arch internal ladder (MMQ→dp4a→dot2→fp16→scalar gfx1010), and

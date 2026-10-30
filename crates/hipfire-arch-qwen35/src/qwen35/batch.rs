@@ -937,7 +937,7 @@ impl Qwen35DecodeBatchState {
         // silently half-advertised at the first prefill.
         if !matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32
         ) {
             return Err(HipError::new(
                 0,
@@ -947,6 +947,7 @@ impl Qwen35DecodeBatchState {
         if !matches!(
             weights.output.gpu_dtype,
             DType::Q8_0
+                | DType::IU8G32
                 | DType::HFQ4G256
                 | DType::MQ4G256
                 | DType::MQ4G256V2
@@ -1605,6 +1606,26 @@ pub(crate) fn lm_head_batched(
     batch_size: usize,
 ) -> HipResult<()> {
     match output.gpu_dtype {
+        // qt59 (tied/untied lm_head in iu4 files): per-lane decode GEMV, so
+        // each lane's logits are bit-identical to the solo decode lm_head.
+        DType::IU8G32 => {
+            for i in 0..batch_size {
+                let row = hidden.sub_offset(i * output.k, output.k);
+                let logits_row = logits.sub_offset(i * output.m, output.m);
+                // Same Step::Gemv the solo decode lm_head runs (forward.rs),
+                // not llama::weight_gemv (which refuses qt 58/59).
+                let wr = output.dispatch_ref();
+                let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+                let step = hipfire_dispatch::pipeline::Step::Gemv {
+                    w: &wr,
+                    input: hipfire_dispatch::pipeline::GemvInput::Raw(&row),
+                    out: &logits_row,
+                };
+                hipfire_dispatch::pipeline::execute_steps(gpu, &ctx, &[step])
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            }
+            Ok(())
+        }
         DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(
             &output.buf,
             hidden,
@@ -1796,7 +1817,7 @@ pub fn prepare_decode_batch_inputs(
     // Reject unsupported formats before any device work (aligned with
     // `prefill_lane` / daemon `qwen_batch_weight_formats_supported`).
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => {}
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32 => {}
         EmbeddingFormat::F32 => {
             return Err(HipError::new(
                 0,
@@ -1825,6 +1846,13 @@ pub fn prepare_decode_batch_inputs(
             config.dim,
         )?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &weights.token_embd,
+            &state.pbs.x_batch,
+            &state.pbs.tokens,
+            n,
+            config.dim,
+        )?,
+        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(
             &weights.token_embd,
             &state.pbs.x_batch,
             &state.pbs.tokens,

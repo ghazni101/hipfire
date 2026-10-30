@@ -370,6 +370,25 @@ pub(crate) fn guard_qkv_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
         && gemv_steps_uniform(steps, DType::MQ4G256V2, true)
 }
 
+/// qt=57 (IU4G256) decode fusion: every projection IU4G256, Prerotated, no
+/// AWQ. Wave32 only (the kernel is a 32-lane block); `force_unfused` wins.
+fn iu4g256_fusion_ok(steps: &[Step], ctx: &DispatchCtx, n: usize) -> bool {
+    !ctx.flags.force_unfused
+        && !rdna_compute::iu4_decode_dot8()
+        && ctx.arch.is_wave32()
+        && steps.len() == n
+        && gemv_steps_uniform(steps, DType::IU4G256, true)
+}
+pub(crate) fn guard_qkv_iu4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    iu4g256_fusion_ok(steps, ctx, 4)
+}
+pub(crate) fn guard_qkvza_iu4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    iu4g256_fusion_ok(steps, ctx, 5)
+}
+pub(crate) fn guard_gate_up_iu4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    iu4g256_fusion_ok(steps, ctx, 3)
+}
+
 pub(crate) fn guard_qkv_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused {
         return false;
@@ -736,6 +755,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     },
     FusedPattern {
         ops: QKV3,
+        key: KernelKey::FusedQkvIu4G256,
+        guard: guard_qkv_iu4g256,
+    },
+    FusedPattern {
+        ops: QKV3,
         key: KernelKey::FusedQkvHfq4G256,
         guard: guard_qkv_hfq4g256,
     },
@@ -765,6 +789,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
         guard: guard_qkvza_mq4g256v2_lloyd,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaIu4G256,
+        guard: guard_qkvza_iu4g256,
     },
     FusedPattern {
         ops: QKVZA4,
@@ -803,6 +832,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq4G256V2Lloyd,
         guard: guard_gate_up_mq4g256v2_lloyd,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpIu4G256,
+        guard: guard_gate_up_iu4g256,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -2094,6 +2128,18 @@ fn launch_fused<'a>(
                 wb.m, wa.m, wqkv.k, luts,
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        // qt=57 IU4G256: one launch over every projection; the guard proved
+        // each step is an IU4G256 Prerotated Gemv sharing the activated input.
+        KernelKey::FusedQkvIu4G256
+        | KernelKey::FusedQkvzaIu4G256
+        | KernelKey::FusedGateUpIu4G256 => {
+            let mats: Vec<_> = steps[1..].iter().map(gemv_weight_out).collect();
+            let k = mats[0].0.k;
+            let rows: Vec<(&GpuTensor, &GpuTensor, usize)> =
+                mats.iter().map(|(w, y)| (w.buf, *y, w.m)).collect();
+            gpu.fused_iu4g256_rows(&rows, activated, k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))
         }
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq4G256V2

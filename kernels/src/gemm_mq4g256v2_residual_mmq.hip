@@ -408,8 +408,14 @@ static __device__ __forceinline__ void load_mq4v2_tile(
     for (int i0 = 0; i0 < MMQ_Y; i0 += rows_per_warp * MMQ_NWARPS) {
         const int i = i0 + threadIdx.y;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+#ifdef HIPFIRE_MMQ_IU4L
+        // IU4 (qt57) row: [K/2 codes][8 B hdr x G]; same 136 B/group row stride.
+        const char* gq = A + (long long)row * groups_per_row * 136 + kb * 128;
+        const unsigned int qs0 = *(const unsigned int*)(gq + txi * 4);
+#else
         const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
         const unsigned int qs0 = *(const unsigned int*)(gp + 8 + txi * 4);
+#endif
 
 #ifdef HIPFIRE_MMQ_LUT
 #if HIPFIRE_MMQ_LUT_PAIRTAB
@@ -450,7 +456,12 @@ static __device__ __forceinline__ void load_mq4v2_tile(
         const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
         if (i < MMQ_Y) {
             const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+#ifdef HIPFIRE_MMQ_IU4L
+            const char* gp = A + (long long)row * groups_per_row * 136
+                + groups_per_row * 128 + kb * 8;
+#else
             const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+#endif
             const int ksc = threadIdx.x & 1;
             const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
 #ifdef HIPFIRE_MMQ_LUT

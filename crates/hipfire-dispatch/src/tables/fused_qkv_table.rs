@@ -170,6 +170,10 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::IsGfx1201,
         ),
         (KernelKey::FusedGateUpMq4G256V2Lloyd, ArchPredicate::Always),
+        // qt=57 IU4G256: wave32 scalar f32-activation kernel (fused_iu4g256_rows).
+        (KernelKey::FusedQkvIu4G256, ArchPredicate::HasWave32),
+        (KernelKey::FusedQkvzaIu4G256, ArchPredicate::HasWave32),
+        (KernelKey::FusedGateUpIu4G256, ArchPredicate::HasWave32),
         (KernelKey::FusedGateUpMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq6G256V2, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256V2, ArchPredicate::Always),

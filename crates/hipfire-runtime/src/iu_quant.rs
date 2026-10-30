@@ -484,6 +484,62 @@ pub fn gemv_iu4_dot8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<
     Ok(y)
 }
 
+fn quant_i8(x: f32, id: f32) -> i32 {
+    let q = (x * id).round_ties_even();
+    let q = if q.is_finite() { q as i32 } else { 0 };
+    q.clamp(-127, 127)
+}
+
+/// Decode-GEMV contract for the W4A8 IU4 kernel (`gemv_iu4g256_dot4`,
+/// `HIPFIRE_IU4_DECODE=dot4`): as [`gemv_iu4_dot8`] but each 32-element
+/// block of the rotated `x` is quantized to signed int8 with
+/// `d = amax / 127`.
+pub fn gemv_iu4_dot4(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, String> {
+    validate(bytes, m, k, Layout::Iu4)?;
+    if x.len() != k {
+        return Err(format!(
+            "IU4 GEMV activation length {}, expected K={k}",
+            x.len()
+        ));
+    }
+    let row_b = row_bytes(k, Layout::Iu4).expect("validate checked the shape");
+    let code_b = code_bytes(k, Layout::Iu4).expect("validate checked the shape");
+    let mut y = vec![0.0f32; m];
+    for row in 0..m {
+        let raw = &bytes[row * row_b..(row + 1) * row_b];
+        let codes = &raw[..code_b];
+        let scales = &raw[code_b..];
+        let mut acc = 0.0f32;
+        let mut col = 0;
+        while col < k {
+            let mut amax = 0.0f32;
+            for j in 0..32 {
+                amax = amax.max(x[col + j].abs());
+            }
+            let d = amax / 127.0;
+            let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            for chunk in 0..4 {
+                let base = col + chunk * 8;
+                let mut dot = 0i32;
+                let mut sumq = 0i32;
+                for j in 0..8 {
+                    let q = quant_i8(x[base + j], id);
+                    let w = i32::from(code_at(codes, base + j, Layout::Iu4));
+                    dot += w * q;
+                    sumq += q;
+                }
+                let pair = (base / HALF) * SCALE_PAIR_BYTES;
+                let scale = load_f16(&scales[pair..pair + 2]);
+                let zero = load_f16(&scales[pair + 2..pair + 4]);
+                acc += (d * scale) * (dot as f32) + zero * (d * (sumq as f32));
+            }
+            col += 32;
+        }
+        y[row] = acc;
+    }
+    Ok(y)
+}
+
 /// Dequantise an IU tensor back to f32 in the rotated basis.
 ///
 /// `w[row, k] = f32(scale) * code + f32(zero)` with the pair for

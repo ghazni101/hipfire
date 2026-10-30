@@ -53,6 +53,20 @@ impl Gpu {
         self.gemv_iu8g32_launch("gemv_iu8g32_residual", a, x, y, m, k)
     }
 
+    /// Test/A-B entry: launch one named IU8G32 GEMV kernel (v1 or a v2
+    /// `_rN` variant) with no automatic selection.
+    pub fn gemv_iu8g32_named(
+        &mut self,
+        func: &'static str,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_iu8g32_launch_exact(func, a, x, y, m, k)
+    }
+
     fn gemv_iu8g32_launch(
         &mut self,
         func: &'static str,
@@ -68,8 +82,22 @@ impl Gpu {
                 "gemv_iu8g32: M > 0 and K % 32 == 0",
             ));
         }
+        let func = iu8g32_pick(func, x, a, m, k);
+        self.gemv_iu8g32_launch_exact(func, a, x, y, m, k)
+    }
+
+    fn gemv_iu8g32_launch_exact(
+        &mut self,
+        func: &'static str,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_iu8g32", kernels::GEMV_IU8G32_SRC, func)?;
+        let (grid, block) = iu8g32_geometry(func, m);
         let mut ap = a.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -82,7 +110,7 @@ impl Gpu {
             &mut mv as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(func, grid, block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ap);
             b.push_ptr(xp);
@@ -92,4 +120,61 @@ impl Gpu {
             b
         })
     }
+}
+
+/// `HIPFIRE_IU8_GEMV=v1` keeps the original one-byte-per-lane kernel (A/B).
+fn iu8g32_v1_forced() -> bool {
+    iu8g32_mode() == 1
+}
+
+/// `HIPFIRE_IU8_GEMV`: `v1` (original wave-per-row), `dot4` (W8A8 int8
+/// activation per 32, `v_dot4_i32_iu8`), anything else = v2 (f32 x).
+/// 0 = v2, 1 = v1, 2 = dot4. Read once.
+fn iu8g32_mode() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match hipfire_config::developer_var("HIPFIRE_IU8_GEMV").ok().as_deref() {
+        Some("v1") => 1,
+        Some("dot4") => 2,
+        _ => 0,
+    })
+}
+
+/// v2 (R rows/wave, dwordx4 code loads) when rows and `x` are 16B aligned.
+fn iu8g32_pick(func: &'static str, x: &GpuTensor, a: &GpuTensor, m: usize, k: usize) -> &'static str {
+    let row_bytes = k + k / 16;
+    let aligned = row_bytes % 16 == 0
+        && (x.buf.as_ptr() as usize) % 16 == 0
+        && (a.buf.as_ptr() as usize) % 16 == 0;
+    if iu8g32_v1_forced() || !aligned {
+        return func;
+    }
+    let add = func == "gemv_iu8g32_residual";
+    let r = if m >= 32768 { 4 } else if m >= 4096 { 2 } else { 1 };
+    if iu8g32_mode() == 2 {
+        return match (add, r) {
+            (false, 4) => "gemv_iu8g32_a8_r4",
+            (false, 2) => "gemv_iu8g32_a8_r2",
+            (false, _) => "gemv_iu8g32_a8_r1",
+            (true, 4) => "gemv_iu8g32_a8_residual_r4",
+            (true, 2) => "gemv_iu8g32_a8_residual_r2",
+            (true, _) => "gemv_iu8g32_a8_residual_r1",
+        };
+    }
+    match (add, r) {
+        (false, 4) => "gemv_iu8g32_v2_r4",
+        (false, 2) => "gemv_iu8g32_v2_r2",
+        (false, _) => "gemv_iu8g32_v2_r1",
+        (true, 4) => "gemv_iu8g32_v2_residual_r4",
+        (true, 2) => "gemv_iu8g32_v2_residual_r2",
+        (true, _) => "gemv_iu8g32_v2_residual_r1",
+    }
+}
+
+fn iu8g32_geometry(func: &str, m: usize) -> ([u32; 3], [u32; 3]) {
+    let r = if func.ends_with("_r4") { 4 } else if func.ends_with("_r2") { 2 } else if func.ends_with("_r1") { 1 } else { 0 };
+    if r == 0 {
+        return ([m as u32, 1, 1], [32, 1, 1]);
+    }
+    let waves = m.div_ceil(r);
+    ([waves.div_ceil(4) as u32, 1, 1], [128, 1, 1])
 }

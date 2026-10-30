@@ -361,7 +361,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gemv_iu8g32",
         kernels::GEMV_IU8G32_SRC,
-        ["gemv_iu8g32", "gemv_iu8g32_residual"]
+        ["gemv_iu8g32", "gemv_iu8g32_residual", "gemv_iu8g32_v2_r1", "gemv_iu8g32_v2_residual_r1", "gemv_iu8g32_v2_r2", "gemv_iu8g32_v2_residual_r2", "gemv_iu8g32_v2_r4", "gemv_iu8g32_v2_residual_r4", "gemv_iu8g32_a8_r1", "gemv_iu8g32_a8_residual_r1", "gemv_iu8g32_a8_r2", "gemv_iu8g32_a8_residual_r2", "gemv_iu8g32_a8_r4", "gemv_iu8g32_a8_residual_r4"]
     );
     add!(
         "gemv_iu8g256",
@@ -371,7 +371,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gemv_iu4g256",
         kernels::GEMV_IU4G256_SRC,
-        ["gemv_iu4g256", "gemv_iu4g256_residual"]
+        ["gemv_iu4g256", "gemv_iu4g256_residual", "fused_iu4g256_rows", "gemv_iu4g256_dot8", "gemv_iu4g256_dot8_residual", "gemv_iu4g256_dot4", "gemv_iu4g256_dot4_residual"]
     );
     add!(
         "gemv_mq4g256",

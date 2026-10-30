@@ -455,6 +455,8 @@ pub fn batch_chunk_delta_net_input_projection(
         layer.wqkv.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=57 IU4G256 is qt=44 relaid out: same FWHT-G256 input.
+            | DType::IU4G256
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs
             // rotated x); the DISPATCH arm below routes to the FP8-LUT twin.
             | DType::MQ4G256V2Lloyd
@@ -1000,6 +1002,31 @@ pub fn batch_chunk_delta_net_input_projection(
             layer.w_alpha.m,
             layer.wqkv.k,
             n,
+        )?;
+    } else if [layer.wqkv.dtype, layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
+        .contains(&DType::IU4G256)
+    {
+        if ![layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
+            .iter()
+            .all(|d| *d == layer.wqkv.dtype)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "batch_chunk_delta_net_input_projection: mixed IU4G256/other LA projections — refusing",
+            ));
+        }
+        // qt=57: qkv/z/beta/alpha MMQ launches over one quantized X.
+        gpu.gemm_iu4g256_multi(
+            &[
+                (&layer.wqkv.buf, &pbs.dn_qkv_batch, layer.wqkv.m),
+                (&layer.wz.buf, &pbs.dn_z_batch, layer.wz.m),
+                (&layer.w_beta.buf, &pbs.dn_beta_batch, layer.w_beta.m),
+                (&layer.w_alpha.buf, &pbs.dn_alpha_batch, layer.w_alpha.m),
+            ],
+            &pbs.x_rot_batch,
+            layer.wqkv.k,
+            n,
+            false,
         )?;
     } else {
         run_fused_qkvza_key(
@@ -1693,6 +1720,8 @@ pub fn batch_chunk_delta_net_output_projection(
         layer.wo.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=57 IU4G256 is qt=44 relaid out: same FWHT-G256 input.
+            | DType::IU4G256
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs rotated x).
             | DType::MQ4G256V2Lloyd
             | DType::MQ4CG256

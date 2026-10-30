@@ -73,11 +73,12 @@ pub fn qwen_batch_weight_formats_supported(
     use rdna_compute::DType;
     let embd_ok = matches!(
         weights.embd_format,
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32
     );
     let lm_ok = matches!(
         weights.output.gpu_dtype,
         DType::Q8_0
+            | DType::IU8G32
             | DType::HFQ4G256
             | DType::MQ4G256
             | DType::HFQ6G256
