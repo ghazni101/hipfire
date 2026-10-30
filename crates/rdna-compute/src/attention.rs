@@ -26859,7 +26859,10 @@ mod tests {
         // (64 queries = 1024 threads) and stays inside 64 KB.
         let (qpb, bytes) = vit_qtiled_launch(64).unwrap();
         assert_eq!(qpb, 64);
-        assert!(qpb * 16 <= 1024, "block must not exceed the 1024-thread max");
+        assert!(
+            qpb * 16 <= 1024,
+            "block must not exceed the 1024-thread max"
+        );
         assert!(bytes as usize <= 64 * 1024, "{bytes} B overflows LDS");
         // Wider heads buy LDS and must fall back to a smaller query tile;
         // non-multiples of 16 (the Qwen ViT's 72) keep the Q-tiled path

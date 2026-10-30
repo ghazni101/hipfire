@@ -105,7 +105,9 @@ fn main() {
     // F16 internally, so parity against the F32 naive reference is a
     // round-trip, not an arithmetic identity.
     if head_dim <= 80 {
-        let d_wmma = gpu.zeros(&[n * hidden], DType::F32).expect("alloc wmma out");
+        let d_wmma = gpu
+            .zeros(&[n * hidden], DType::F32)
+            .expect("alloc wmma out");
         gpu.vit_attention_wmma_f32(&d_qkv, &d_wmma, n, hidden, num_heads, head_dim)
             .expect("wmma vit attention");
         gpu.hip.device_synchronize().expect("sync");
