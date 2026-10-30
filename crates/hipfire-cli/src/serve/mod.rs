@@ -48,6 +48,7 @@ pub mod complete;
 pub(crate) mod decide;
 pub(crate) mod embeddings;
 pub mod http;
+pub(crate) mod ocr;
 pub(crate) mod responses;
 pub(crate) mod ui;
 

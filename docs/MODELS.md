@@ -636,6 +636,83 @@ curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
        "image_url":{"url":"data:image/png;base64,<page bytes>"}}]}]}'
 ```
 
+### Surya-ocr-2.5 (arch 5 — local-only row, no Hub artifact)
+
+`datalab-to/surya-ocr-2.5` — OpenRAIL-M document-OCR VLM on the Qwen3.5-VL
+architecture (24 hybrid DeltaNet/`full_attention` layers, 1024d, tied 88,526
+vocab, 262,144-token ceiling, `model.visual.*` patch-16 ViT tower).
+Registered local-only as `surya-ocr-2.5:q8` (aliases `surya-ocr-2.5`,
+`surya`); the family `surya-ocr-2.5`/`surya-ocr`/`surya` maps to arch 5 in
+`scripts/registry_gen.py`.
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `surya-ocr-2.5:q8` | `surya-ocr-2.5.q8` | 0.63 | 2 | Q8 trunk (all weights Q8 interleaved, embed/norms F16; 0.59 GiB); `--vision-only` sidecar `surya-ocr-2.5.vl` (0.20 GiB, F16 tower), the quant suffix stripped into the `vision` slot |
+
+Build from the HF snapshot (safetensors and configs at the directory root, so
+`--vision-only` needs no staging):
+
+```bash
+hipfire quantize <surya-dir> --format q8 --output <out>/surya-ocr-2.5.q8
+hipfire-quantize --input <surya-dir> --vision-only \
+    --output <out>/surya-ocr-2.5.vl      # <stem>.vl, one pack
+```
+
+On this host the artifacts live in `~/models/hipfire/Datalab/surya-ocr-2.5-Q8/`
+(trunk + `.vl`), catalogued in `~/.hipfire/models.toml` with absolute paths.
+
+**Output format.** This checkpoint does not write plain text or Markdown. Each
+block is a label token plus four coordinates on a 0–1000 grid followed by the
+block's HTML — `<|Text|><|120|><|87|><|881|><|255|><p>…</p>` — with
+`</td>`/`</th>`/`</tr>` and the block `</div>`s omitted, nested `data-bbox`
+written as `<|box|>` + four coordinates, and merged table cells as
+`data-kind="parent"`/`"ghost"`. The label tokens are `<|Text|>`,
+`<|Page-Header|>`, `<|Section-Header|>`, `<|Table|>`, `<|Figure|>` and the rest
+of `compact.BLOCK_LABELS`; `<|0|>`…`<|1000|>` are the coordinates.
+
+That raw form is the card's own contract: surya's client attaches with
+`SURYA_INFERENCE_URL=http://host:port/v1` and parses the string itself
+(`parse_full_page_html`), so a server must return the special tokens — which
+`serve` does by default. A caller that wants the decoded form instead asks for
+it per request with `ocr_format` on a **non-streaming** turn:
+
+- `"ocr_format": "html"` — `content` becomes one
+  `<div data-bbox="x0 y0 x1 y1" data-label="…">…</div>` per block, newline
+  separated: omitted cell/row closers restored, `<|box|>` folded back into a
+  `data-bbox` attribute, merged cells converted to `colspan`/`rowspan`.
+- `"ocr_format": "blocks"` — `content` becomes a JSON array of
+  `{"label", "bbox", "html"}`.
+
+Both are answered by serve from the model's text, so a body with no block
+headers (a plain answer, or a prompt that never reached OCR) comes back
+unchanged rather than being rewritten. Streaming with `ocr_format` is a 400:
+deltas would carry the compact form first.
+
+**Generation contract** (the card's vLLM client): greedy, `top_p: 0.1`, no
+repetition penalty, `max_tokens` ≈ 12288 for a dense page; thinking off
+(`reasoning_effort: none`), which the registry's `recommended_settings` lower.
+Generation stops on the checkpoint's end token (`<|im_end|>`, id 2), so no stop
+strings are needed. Two serve limits apply when attaching the Python client:
+`logprobs` are refused (400) — set `SURYA_INFERENCE_LOGPROBS=0`, per-block
+`confidence` then comes back null — and guided layout/table_rec
+(`SURYA_GUIDED_LAYOUT=1`) is refused because the schemas use `pattern`, outside
+serve's strict JSON-Schema subset. Unguided layout answers in the same
+`<|437|><|57|>…` token form, not JSON, so `surya_layout` and block-mode OCR are
+not usable against this route; full-page OCR is.
+
+```bash
+hipfire serve surya-ocr-2.5:q8 127.0.0.1:9425 --vision=surya-ocr-2.5.vl
+# Raw (what surya's own client wants):
+curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"surya-ocr-2.5:q8","reasoning_effort":"none","temperature":0,
+       "top_p":0.1,"max_tokens":12288,
+       "messages":[{"role":"user","content":[{"type":"image_url",
+       "image_url":{"url":"data:image/png;base64,<page bytes>"}},
+       {"type":"text","text":"OCR this image to HTML."}]}]}'
+# Decoded:
+#   … same body plus  "ocr_format": "html"  (or "blocks")
+```
+
 ---
 
 ## Aliases
@@ -675,6 +752,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
 | `lightonocr3` / `lightonocr3:0.8b-mq4` | `lightonocr3:0.8b` |
 | `lightonocr3:q8` | `lightonocr3:0.8b-q8` |
+| `surya-ocr-2.5` / `surya` | `surya-ocr-2.5:q8` |
 
 ---
 
@@ -685,7 +763,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | Family | arch_id | Crate | Registry examples |
 |---|---:|---|---|
 | LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, `qwen3:0.6b` (HF4 dense) |
-| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense, `lightonocr3:0.8b` (VL) |
+| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense, `lightonocr3:0.8b` (VL), `surya-ocr-2.5:q8` (VL/OCR) |
 | Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b*`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
 | DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash`, `deepseek-v4-flash:mq2lloyd`, `deepseek-v4-flash-preview` |

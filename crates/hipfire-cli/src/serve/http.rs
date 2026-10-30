@@ -14,6 +14,7 @@ use crate::serve::complete::{
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
+use crate::serve::ocr::{self, OcrFormat};
 use crate::serve::{anthropic, responses};
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
@@ -178,15 +179,45 @@ impl WireApi {
     fn lower(self, body: serde_json::Value) -> Result<GenerationRequest, String> {
         match self {
             Self::ChatCompletions => {
+                let mut body = body;
                 let stream = body.get("stream").and_then(|v| v.as_bool()) == Some(true);
                 let include_usage = body
                     .pointer("/stream_options/include_usage")
                     .and_then(|v| v.as_bool())
                     == Some(true);
+                // `ocr_format` is answered by this hop and never forwarded: it
+                // selects a rendering of the model's compact-block output, not
+                // a decoder setting. Refused on streams because a client that
+                // watches deltas would see the compact form arrive first.
+                let ocr = match body.as_object_mut().and_then(|body| body.remove("ocr_format")) {
+                    None => None,
+                    Some(value) => {
+                        let Some(requested) = value.as_str() else {
+                            return Err(format!(
+                                "ocr_format must be {}, got {}",
+                                OcrFormat::wire_values(),
+                                value
+                            ));
+                        };
+                        let Some(format) = OcrFormat::parse(requested) else {
+                            return Err(format!(
+                                "ocr_format must be {}, got {requested:?}",
+                                OcrFormat::wire_values()
+                            ));
+                        };
+                        if stream {
+                            return Err(
+                                "ocr_format requires a non-streaming request (stream must be false)"
+                                    .to_owned(),
+                            );
+                        }
+                        Some(format)
+                    }
+                };
                 Ok(GenerationRequest {
                     chat: body,
                     stream,
-                    encoding: ResponseEncoding::Chat { include_usage },
+                    encoding: ResponseEncoding::Chat { include_usage, ocr },
                 })
             }
             Self::AnthropicMessages => {
@@ -218,7 +249,11 @@ struct GenerationRequest {
 
 /// How a completion (and its stream) is rendered for the client's API.
 enum ResponseEncoding {
-    Chat { include_usage: bool },
+    Chat {
+        include_usage: bool,
+        /// Decode a compact-block (Surya-2.5) answer before returning it.
+        ocr: Option<OcrFormat>,
+    },
     Anthropic,
     Responses(responses::ResponseEcho),
 }
@@ -235,7 +270,13 @@ impl ResponseEncoding {
     /// The non-streaming response body.
     fn completion_body(&self, completion: &Completion) -> serde_json::Value {
         match self {
-            Self::Chat { .. } => completion_json(completion),
+            Self::Chat { ocr, .. } => {
+                let mut body = completion_json(completion);
+                if let Some(format) = ocr {
+                    decode_ocr_content(&mut body, *format);
+                }
+                body
+            }
             Self::Anthropic => anthropic::message_json(completion),
             Self::Responses(echo) => responses::response_json(completion, echo),
         }
@@ -243,7 +284,7 @@ impl ResponseEncoding {
 
     fn stream(self, id: &str, created: u64, model: &str) -> StreamEncoder {
         match self {
-            Self::Chat { include_usage } => StreamEncoder::Chat {
+            Self::Chat { include_usage, .. } => StreamEncoder::Chat {
                 id: id.to_owned(),
                 created,
                 model: model.to_owned(),
@@ -254,6 +295,25 @@ impl ResponseEncoding {
                 StreamEncoder::Responses(responses::ResponseStream::new(echo, id, created, model))
             }
         }
+    }
+}
+
+/// Replace `choices[0].message.content` with the decoded form of a
+/// compact-block answer. Content that carries no block headers is left as it
+/// is (see [`ocr::decode_html`]).
+fn decode_ocr_content(body: &mut serde_json::Value, format: OcrFormat) {
+    let Some(content) = body.pointer_mut("/choices/0/message/content") else {
+        return;
+    };
+    let Some(text) = content.as_str() else {
+        return;
+    };
+    let decoded = match format {
+        OcrFormat::Html => ocr::decode_html(text),
+        OcrFormat::Blocks => ocr::blocks_json(text),
+    };
+    if decoded != text {
+        *content = serde_json::Value::String(decoded);
     }
 }
 
@@ -2604,6 +2664,87 @@ mod tests {
     use std::task::Waker;
     use std::time::Duration;
 
+    /// `ocr_format` selects a rendering of the compact-block form; it is
+    /// stripped from the body so the daemon never sees it.
+    #[test]
+    fn ocr_format_is_stripped_and_selects_the_decoder() {
+        let body = serde_json::json!({
+            "model": "surya-ocr-2.5:q8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "ocr_format": "html",
+        });
+        let request = WireApi::ChatCompletions.lower(body).expect("valid request");
+        assert!(
+            request.chat.get("ocr_format").is_none(),
+            "ocr_format is answered here, never forwarded"
+        );
+        match request.encoding {
+            ResponseEncoding::Chat { ocr, .. } => assert_eq!(ocr, Some(OcrFormat::Html)),
+            _ => panic!("expected the chat encoding"),
+        }
+    }
+
+    #[test]
+    fn ocr_format_rejects_streaming_and_unknown_values() {
+        let streaming = serde_json::json!({
+            "model": "m",
+            "stream": true,
+            "ocr_format": "html",
+            "messages": [],
+        });
+        let err = WireApi::ChatCompletions
+            .lower(streaming)
+            .err()
+            .expect("streaming is refused");
+        assert!(err.contains("non-streaming"), "{err}");
+
+        let unknown = serde_json::json!({
+            "model": "m",
+            "ocr_format": "markdown",
+            "messages": [],
+        });
+        let err = WireApi::ChatCompletions
+            .lower(unknown)
+            .err()
+            .expect("unknown format is refused");
+        assert!(err.contains("ocr_format"), "{err}");
+
+        let not_a_string = serde_json::json!({
+            "model": "m",
+            "ocr_format": 1,
+            "messages": [],
+        });
+        assert!(WireApi::ChatCompletions.lower(not_a_string).is_err());
+    }
+
+    /// Decoded content replaces the compact form; a plain answer is untouched.
+    #[test]
+    fn decoded_content_replaces_the_compact_form() {
+        let mut body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<|Text|><|0|><|0|><|10|><|10|><p>x</p>",
+                },
+            }],
+        });
+        decode_ocr_content(&mut body, OcrFormat::Html);
+        assert_eq!(
+            body.pointer("/choices/0/message/content")
+                .and_then(|value| value.as_str()),
+            Some("<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>x</p></div>")
+        );
+
+        let mut plain = serde_json::json!({"choices": [{"message": {"content": "hello"}}]});
+        decode_ocr_content(&mut plain, OcrFormat::Blocks);
+        assert_eq!(
+            plain
+                .pointer("/choices/0/message/content")
+                .and_then(|value| value.as_str()),
+            Some("hello")
+        );
+    }
+
     #[test]
     fn bearer_headers_require_one_matching_ascii_credential() {
         let text = "k3y!".repeat(8);
@@ -2836,6 +2977,7 @@ mod tests {
     fn prefill_progress_before_commit_is_dropped_and_does_not_commit() {
         let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
             include_usage: false,
+            ocr: None,
         });
         sink.forward_event(&progress_event(512, 2048)).unwrap();
         sink.forward_event(&progress_event(1024, 2048)).unwrap();
@@ -2861,6 +3003,7 @@ mod tests {
         for encoding in [
             ResponseEncoding::Chat {
                 include_usage: false,
+                ocr: None,
             },
             ResponseEncoding::Anthropic,
             ResponseEncoding::Responses(responses),
@@ -2895,6 +3038,7 @@ mod tests {
     fn prefill_progress_flows_once_the_handler_has_committed() {
         let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
             include_usage: false,
+            ocr: None,
         });
         sink.forward_event(&progress_event(512, 2048)).unwrap();
         assert!(rx.try_recv().is_err());
@@ -2911,6 +3055,7 @@ mod tests {
     fn prefill_progress_never_follows_the_terminal_frame() {
         let (sink, _commit, mut rx) = test_sink(ResponseEncoding::Chat {
             include_usage: false,
+            ocr: None,
         });
         sink.forward_event(&token_event("hi")).unwrap();
         rx.try_recv().expect("token frame");
