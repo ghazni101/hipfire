@@ -166,6 +166,12 @@ pub trait Carrier: Send + Sync {
         ))
     }
 
+    /// Weight-slab packing of this carrier's load on a device of `gpu_arch`
+    /// when `HIPFIRE_WEIGHT_SLAB` is unset (`None`: the global default).
+    fn weight_slab_default(&self, _gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        None
+    }
+
     /// Read-only, per-carrier request-option refusal before GPU allocation.
     /// The default leaves other architectures' option behavior unchanged.
     fn admit_options(
@@ -1255,6 +1261,12 @@ pub struct LoadedModel {
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
+    /// Content fingerprints (sha256 of the image bytes, in order) of the images
+    /// resident in `conversation_tokens`. Every image's rows carry the same
+    /// `<|image_pad|>` id, so token equality alone cannot tell a replaced
+    /// same-size image from the resident one; a vision turn reuses the resident
+    /// conversation only when these match the prompt's images.
+    pub vl_image_fingerprints: Vec<[u8; 32]>,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
@@ -1318,6 +1330,7 @@ impl LoadedModel {
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
+            vl_image_fingerprints: Vec::new(),
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
@@ -3241,9 +3254,13 @@ fn finish_qwen35_load(
                         },
                     );
                     // Further DeltaNet checkpoints yield to the admitted context.
+                    // The prefill scratch is already resident whenever a prefill takes a
+                    // checkpoint, and the checkpoint term is the ring's own two-snapshot
+                    // budget (the gate charges each extra snapshot separately), so neither
+                    // is charged again here.
                     ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
                         admitted_tokens: ctx.max_seq.min(physical_cap),
-                        reserve_bytes: m.transient,
+                        reserve_bytes: m.transient.saturating_sub(m.prefill + m.checkpoints),
                     });
                 }
             }
@@ -3411,6 +3428,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    let vmm_runtime_refusal = gpu.vmm_runtime_refusal();
     let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
@@ -3435,7 +3453,7 @@ pub fn load_model_with_gemma4_drafter(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         crate::admission::SourceAdmissionOptions {
@@ -3767,6 +3785,7 @@ fn resolve_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: false,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))
@@ -3834,6 +3853,14 @@ fn resolve_qwen4_route_plan(
     {
         return Err("trunk overlay".into());
     }
+    // An applied `.hc8` sidecar adds its PM image to the walked plan (`RouteKernelInput::hc8_sidecar`).
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        hfq,
+        Path::new(req.path),
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )?
+    .is_some();
     let kv_mode = req
         .kv_mode_override
         .filter(|s| !s.is_empty())
@@ -3898,6 +3925,7 @@ fn resolve_qwen4_route_plan(
         hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
         flags: &gpu.flags,
         route_axes: &axes,
+        hc8_sidecar: hc8_sidecar,
     })
     .map_err(|e| format!("{e:?}"))?;
     Ok((plan, spec, seal))
@@ -4311,7 +4339,14 @@ pub fn load_admitted_with_gemma4_drafter(
         xdna: None,
         batch_request,
     };
-    let mut result = match carrier.load(source, &mut ctx) {
+    // Weight uploads of this load are packed into slabs per
+    // `HIPFIRE_WEIGHT_SLAB`, else the carrier's default (a no-op when off); the
+    // scope closes — sealing every slab — whether or not the carrier succeeds.
+    let slab_default = carrier.weight_slab_default(&ctx.gpu.arch);
+    ctx.gpu.weight_slab_scope_begin_with(slab_default);
+    let carrier_result = carrier.load(source, &mut ctx);
+    ctx.gpu.weight_slab_scope_end();
+    let mut result = match carrier_result {
         Ok(result) => result,
         Err(error) => {
             // The carrier already unwound its resources; join any compile
@@ -4976,7 +5011,8 @@ pub fn load_model_ep_with_kv_mode(
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available,
+            vmm_runtime_refusal: (!vmm_runtime_available)
+                .then_some("the HIP runtime has no VMM allocation granularity on every rank"),
             free_vram_bytes: None, // EP has no single-card KV capacity envelope.
         },
     )?;
@@ -6944,6 +6980,15 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+    if let Some(pinned) = gpu.pinned_weight_slabs() {
+        // A view that outlives its model keeps its whole slab allocated.
+        eprintln!(
+            "  weight-slab: {} slab(s) ({:.1} MiB) still allocated after unload, held by {} live view(s)",
+            pinned.slabs,
+            pinned.slab_bytes as f64 / (1024.0 * 1024.0),
+            pinned.live_views
+        );
+    }
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
     note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));

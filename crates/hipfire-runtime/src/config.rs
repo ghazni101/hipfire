@@ -24,7 +24,7 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 
 /// Automatic retained-Redline admission for a loaded model.
 ///
-/// MQ4R keeps its existing cross-model policy with two carve-outs. Muse
+/// MQ4R keeps its existing cross-model policy with three carve-outs. Muse
 /// Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
 /// Redline PM4 yet, so automatic admission is withheld until that lowering
 /// lands — the extension-only policy would otherwise route Glimmer onto a
@@ -42,7 +42,11 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
 /// The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) on exact gfx1201 is
 /// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
-/// ids identical to the HIP route. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
+/// ids identical to the HIP route. The Qwen3.5 dense `.mq3-xt` file on exact
+/// gfx1100 is admitted for single-GPU plain-AR decode (no drafter): its
+/// retained PM4 tape needs the GFX10/GFX11 scratch rings (`gemv_mq3g256v2_residual`
+/// has a 16-byte private segment), and served `generate` greedy ids are
+/// identical to the HIP graph with ~1.17x the decode tok/s. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// spill on either tier — an explicit layer or routed-expert count, or
 /// explicit `auto`) gets no retained default: its
@@ -50,6 +54,11 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// retained tape does not record. Expert parallelism (`ep` > 1, Flash-Next EP)
 /// runs one program per rank with a cross-device row gather between kernels,
 /// which a single-device retained tape cannot record, so it is never admitted.
+///
+/// Qwen4 (Flash-Next) on gfx1100/gfx1151 is never admitted automatically,
+/// `.mq4r` included (HIPF-254): recording closes the eager-only QSA split-KV
+/// decode attention, so the replay differs from the HIP route and measured
+/// slower on gfx1151.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -66,8 +75,28 @@ pub fn retained_redline_default(
     {
         return false;
     }
+    // HIPF-254: recording a Qwen4 body closes the eager-only QSA split-KV decode
+    // attention (gfx1100/gfx1151), so the replay differs from default HIP and
+    // measured ~5-8% slower on gfx1151. Lift only with a perf A/B that wins.
+    if model_arch.eq_ignore_ascii_case("qwen4") && matches!(gpu_arch, "gfx1100" | "gfx1151") {
+        return false;
+    }
     if is_qwen35_family(model_arch) && cpu_offload_configured() {
         return false;
+    }
+    // gfx1100 `.mq3-xt` (Qwen3.5 dense, plain AR): selected by file extension, like the
+    // `.mq4r` rule; its receipts are the 27B served identity + tok/s in CHANGELOG.md.
+    if gpu_arch == "gfx1100"
+        && model_arch.eq_ignore_ascii_case("qwen3_5")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+        && std::path::Path::new(model_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq3-xt"))
+    {
+        return true;
     }
     if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
         return true;
@@ -560,6 +589,59 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_qwen35_mq3_xt_plain_ar_is_admitted_and_nothing_wider() {
+        let f = "/models/qwen3.8-27b.mq3-xt";
+        assert!(retained_redline_default(
+            "gfx1100", "qwen3_5", f, 1, 1, false
+        ));
+        assert!(retained_redline_default(
+            "gfx1100",
+            "qwen3_5",
+            "/models/QWEN3.8-27B.MQ3-XT",
+            1,
+            1,
+            false
+        ));
+        // A drafter, multi-GPU, other GPU arches, other families and other
+        // extensions each keep the HIP graph (no widening without their own
+        // identity + timing receipts).
+        assert!(!retained_redline_default(
+            "gfx1100", "qwen3_5", f, 1, 1, true
+        ));
+        assert!(!retained_redline_default(
+            "gfx1100", "qwen3_5", f, 2, 1, false
+        ));
+        assert!(!retained_redline_default(
+            "gfx1100", "qwen3_5", f, 1, 2, false
+        ));
+        for arch in ["gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+            assert!(
+                !retained_redline_default(arch, "qwen3_5", f, 1, 1, false),
+                "{arch} must stay on HIP for .mq3-xt"
+            );
+        }
+        for model_arch in ["qwen3_5_moe", "qwen3", "gemma4", "deepseek4"] {
+            assert!(
+                !retained_redline_default("gfx1100", model_arch, f, 1, 1, false),
+                "{model_arch} .mq3-xt must stay on HIP on gfx1100"
+            );
+        }
+        for path in [
+            "/models/qwen3.8-27b.mq3",
+            "/models/qwen3.8-27b.mq4",
+            "/models/qwen3.8-27b.mq3-xts",
+            "/models/qwen3.8-27b.mq4-xts",
+        ] {
+            assert!(
+                !retained_redline_default("gfx1100", "qwen3_5", path, 1, 1, false),
+                "{path} must stay on HIP on gfx1100"
+            );
+        }
+        // The extension is not an MQ4R: the narrow MQ4R predicate stays untouched.
+        assert!(!mq4r_redline_default("gfx1100", f, 1, 1));
+    }
+
+    #[test]
     fn muse_glimmer_mq4r_defers_redline_until_pm4_lowering() {
         // Glimmer's trunk is a genuine MQ4R Redline SKU, but it is not lowered
         // to Redline PM4 yet, so the extension-only policy must not admit it.
@@ -743,6 +825,25 @@ mod tests {
                 gpu_arch, "qwen4", fn_xts, 1, 1, false
             ));
         }
+        // HIPF-254: a Flash-Next `.mq4r` stays on HIP on gfx1100/gfx1151; the
+        // extension route still admits it on gfx1201 and admits other archs.
+        let fn_mq4r = "/models/qwen3.8-flash-next.mq4r";
+        for gpu_arch in ["gfx1100", "gfx1151"] {
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen4", fn_mq4r, 1, 1, false
+            ));
+            assert!(retained_redline_default(
+                gpu_arch,
+                "qwen3_5",
+                "/models/m.mq4r",
+                1,
+                1,
+                false
+            ));
+        }
+        assert!(retained_redline_default(
+            "gfx1201", "qwen4", fn_mq4r, 1, 1, false
+        ));
     }
 
     #[test]

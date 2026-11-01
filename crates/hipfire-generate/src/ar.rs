@@ -27,14 +27,15 @@ use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{
-    currently_in_think, ThinkOutputRouter, ToolOutputRouter, ToolRouteError,
+    block_terminators_while_in_tool_call, currently_in_think, ThinkOutputRouter, ToolOutputRouter,
+    ToolRouteError,
 };
 use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::stop_sequence::StopMatcher;
+use hipfire_runtime::stop_sequence::{MinTokens, StopMatcher};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -329,6 +330,8 @@ pub fn qwen_ar_finish_route(
 /// `Ok(true)` when the filter signals Stop / EmitAndStop (decoded EOT)
 /// so the caller can break the decode loop without emitting marker text.
 /// A user stop-sequence match is reported by `stop.matched()`, not here.
+/// After a `<function=NAME>` header, a spelled-out stop marker stays in
+/// the tool text and does not end the turn.
 pub fn qwen_ar_observe_and_route(
     stdout: &mut impl std::io::Write,
     id: &str,
@@ -339,7 +342,12 @@ pub fn qwen_ar_observe_and_route(
     new_bytes: &[u8],
     visible_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
-    let (text_bytes, filter_stop) = match filter.observe(new_bytes) {
+    let action = if router.masks_builtin_terminators() {
+        filter.observe_suppressing_stops(new_bytes)
+    } else {
+        filter.observe(new_bytes)
+    };
+    let (text_bytes, filter_stop) = match action {
         FilterAction::Emit(text_bytes) => (text_bytes, false),
         FilterAction::EmitAndStop(text_bytes) => (text_bytes, true),
         FilterAction::Hold => return Ok(false),
@@ -497,6 +505,18 @@ pub struct QwenArSemanticProducer {
     pub stopped_by_filter: bool,
     /// User `stop` sequences, matched on answer text before it is emitted.
     pub stop: StopMatcher,
+    /// vLLM-compatible `min_tokens`: EOS ids, the filter's end-of-turn markers
+    /// and `stop` sequences are inactive until this many completion tokens are
+    /// committed (see [`MinTokens`]).
+    pub min_tokens: MinTokens,
+    /// Completion tokens committed before this producer took over (a request
+    /// promoted from a singleton into a lane arrives with its stream already
+    /// emitted).
+    pub committed_base: usize,
+    /// Whether the token last committed through [`Self::commit_raw`] was
+    /// sampled with stops active. Decode loops gate their own EOS-id checks
+    /// on it: below `min_tokens` an EOS id is an ordinary token.
+    pub last_stops_active: bool,
 }
 
 impl QwenArSemanticProducer {
@@ -523,7 +543,20 @@ impl QwenArSemanticProducer {
             raw_commit_positions: Vec::new(),
             stopped_by_filter: false,
             stop: StopMatcher::default(),
+            min_tokens: MinTokens::NONE,
+            committed_base: 0,
+            last_stops_active: true,
         }
+    }
+
+    /// Hold EOS, end-of-turn markers and `stop` sequences inactive until
+    /// `min_tokens` completion tokens are committed (`already_committed` of
+    /// them before this producer existed).
+    pub fn with_min_tokens(mut self, min_tokens: usize, already_committed: usize) -> Self {
+        self.min_tokens = MinTokens(min_tokens);
+        self.committed_base = already_committed;
+        self.last_stops_active = min_tokens <= already_committed;
+        self
     }
 
     /// Gate this turn's answer text on the request's `stop` sequences.
@@ -556,12 +589,18 @@ impl QwenArSemanticProducer {
         B: AsRef<[u8]>,
         E: FnMut(usize, &mut dyn std::io::Write),
     {
+        let committed_before = self.committed_base + self.raw_committed.len();
         let (pos, new_bytes) = raw_commit();
         self.raw_committed.push(token);
         self.raw_commit_positions.push(pos);
         match disposition {
             QwenArRawCommitDisposition::ClassifiedVisible => {
                 on_committed(pos, stdout);
+                // `min_tokens`: below it this token is ordinary content, so the
+                // filter's end-of-turn markers and `stop` sequences are off.
+                self.last_stops_active = self.min_tokens.stops_active(committed_before);
+                self.filter.set_stops_suspended(!self.last_stops_active);
+                self.stop.set_suspended(!self.last_stops_active);
                 if self.stopped_by_filter || self.stop.matched() {
                     return Ok(true);
                 }
@@ -967,6 +1006,15 @@ impl GenerationRoute {
         )
     }
 
+    /// Routes that honour the vLLM-compatible `min_tokens`: exactly the routes
+    /// that honour `stop`, because both ride the same producers (the
+    /// `QwenArSemanticProducer` of AR and the `Qwen35Emit` of speculative
+    /// decode), whose EOS and stop sequences `min_tokens` holds inactive.
+    /// Every other route would ignore it, so `generate` refuses it.
+    pub const fn supports_min_tokens(self) -> bool {
+        self.supports_stop()
+    }
+
     /// Routes whose fall-through into `generate`'s generic AR body must take
     /// the Qwen3.5 branch (cumulative KV + DeltaNet state on a
     /// `Qwen35Bundle`). Both Qwen routes get there: `QwenAr`, and
@@ -1021,6 +1069,33 @@ pub fn stop_or_reject(
 ) -> Option<Vec<String>> {
     match hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
         Ok(stops) => Some(stops),
+        Err(message) => {
+            crate::dense::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &message,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            None
+        }
+    }
+}
+/// Parse the request's vLLM-compatible `min_tokens` against `max_tokens`. An
+/// invalid value (not a non-negative integer, or above `max_tokens`) emits one
+/// correlated `validation` error and returns `None`; the caller skips the
+/// request.
+pub fn min_tokens_or_reject(
+    stdout: &mut impl Write,
+    id: &str,
+    msg: &serde_json::Value,
+    max_tokens: usize,
+) -> Option<usize> {
+    match hipfire_runtime::stop_sequence::parse_min_tokens_field(msg.get("min_tokens"), max_tokens)
+    {
+        Ok(min_tokens) => Some(min_tokens),
         Err(message) => {
             crate::dense::emit_active_attempt_error(
                 stdout,
@@ -2016,6 +2091,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     max_think_tokens: usize,
     started_in_think: bool,
     stop: &[String],
+    min_tokens: usize,
     tool_protocol_enabled: bool,
     // Prompt tokens the prefill restored rather than computed (reported as
     // `cached_tokens`; prefill tok/s counts only the computed rest).
@@ -2181,9 +2257,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // User stop sequences gate the answer channel before it is emitted: a
     // stop spanning a token boundary is held back, and the matched text and
     // everything after it never reach the client.
+    // `min_tokens` keeps EOS and stops inactive until that many tokens are
+    // committed; the decode loop starts empty, so nothing is committed yet.
     let mut semantic =
         QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled)
-            .with_stop(stop);
+            .with_stop(stop)
+            .with_min_tokens(min_tokens, 0);
     let mut streamed_tokens = Vec::new();
     let mut generated = 0usize;
     // Raw bytes of `streamed_tokens`, grown one token at a time.
@@ -2347,12 +2426,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             }
         };
         generated += 1;
-        // `filter_stop` also latches on a user stop-sequence match.
+        // `filter_stop` also latches on a user stop-sequence match. An EOS id
+        // below `min_tokens` is an ordinary token (`last_stops_active`).
         if filter_stop
-            || eos_tokens.contains(&next_token)
-            || m.tokenizer
-                .as_ref()
-                .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))
+            || (semantic.last_stops_active
+                && (eos_tokens.contains(&next_token)
+                    || m.tokenizer
+                        .as_ref()
+                        .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))))
         {
             natural_stop = true;
             break;
@@ -2559,6 +2640,7 @@ pub fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
@@ -2722,6 +2804,27 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    if min_tokens > 0 && !selected_route.supports_min_tokens() {
+        crate::dense::emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "min_tokens is not supported on producer route {} (routes with min_tokens: {})",
+                selected_route.name(),
+                GenerationRoute::ALL
+                    .iter()
+                    .filter(|r| r.supports_min_tokens())
+                    .map(|r| r.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
     let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
@@ -2797,6 +2900,7 @@ pub fn generate(
                 reasoning_effort,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -2846,6 +2950,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -2886,6 +2991,7 @@ pub fn generate(
                 messages_history,
                 think_mode,
                 stop,
+                min_tokens,
                 reasoning_effort,
                 enable_thinking,
                 request_seed,
@@ -2915,6 +3021,7 @@ pub fn generate(
                 messages_history,
                 think_mode,
                 stop,
+                min_tokens,
                 reasoning_effort,
                 enable_thinking,
                 request_seed,
@@ -3005,6 +3112,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3157,6 +3265,7 @@ pub fn generate(
                 temp,
                 top_p,
                 max_tokens,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,
@@ -3204,6 +3313,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 stop,
+                min_tokens,
                 enable_thinking,
             );
             return;
@@ -3248,6 +3358,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 stop,
+                min_tokens,
                 enable_thinking,
             );
             return;
@@ -3268,6 +3379,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3305,6 +3417,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3331,6 +3444,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3350,6 +3464,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3387,6 +3502,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3413,6 +3529,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3432,6 +3549,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3469,6 +3587,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3495,6 +3614,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3601,6 +3721,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -4232,7 +4353,7 @@ pub fn generate(
                 &new_tokens,
                 history,
                 tools,
-                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
                 "dense-ar",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
@@ -5350,7 +5471,8 @@ pub fn generate(
         // seq_pos advance before classify).
         let mut semantic =
             QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty)
-                .with_stop(stop);
+                .with_stop(stop)
+                .with_min_tokens(min_tokens, 0);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -5663,13 +5785,17 @@ pub fn generate(
                 }
             }
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
+            // Below `min_tokens` the sampled EOS is an ordinary token.
+            // Once a tool span has a `<function=NAME>` header it keeps
+            // going through EOS, <|im_end|>, and <|endoftext|>. A bare
+            // `<tool_call>` still ends the turn. User stops return above;
+            // the loop bound is the token budget.
+            let end_on_terminator = semantic.last_stops_active
+                && !semantic.router.masks_builtin_terminators()
+                && (next_token == config.eos_token
+                    || im_end_token == Some(next_token)
+                    || tokenizer.is_terminator(next_token));
+            if end_on_terminator {
                 break;
             }
 
@@ -5898,6 +6024,14 @@ pub fn generate(
                         2,
                         &mut blocked,
                     );
+                    block_terminators_while_in_tool_call(
+                        &mut blocked,
+                        semantic.router.masks_builtin_terminators(),
+                        [config.eos_token, tokenizer.eos_id]
+                            .into_iter()
+                            .chain(im_end_token)
+                            .chain(tokenizer.eot_id),
+                    );
                     let cfg = SamplerConfig {
                         temperature: temp,
                         top_p,
@@ -6068,6 +6202,14 @@ pub fn generate(
                     blocked.push(t);
                 }
             }
+            block_terminators_while_in_tool_call(
+                &mut blocked,
+                semantic.router.masks_builtin_terminators(),
+                [config.eos_token, tokenizer.eos_id]
+                    .into_iter()
+                    .chain(im_end_token)
+                    .chain(tokenizer.eot_id),
+            );
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,
@@ -6458,6 +6600,8 @@ pub fn generate(
         // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
+        // Same reasoning/content split as the DFlash/DSpark emitter.
+        let mut think = ThinkOutputRouter::new(started_in_think);
 
         let mut hit_stop = false;
         for _ in 0..max_tokens {
@@ -6487,20 +6631,13 @@ pub fn generate(
                 || tokenizer.is_terminator(next_token);
             let fed = stream_bytes.len();
             tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
-            let new_bytes = &stream_bytes[fed..];
-            let action = if is_stop {
-                FilterAction::Hold
-            } else {
-                filter.observe(new_bytes)
-            };
-            if let FilterAction::Emit(text_bytes) = action {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
+            if !is_stop {
+                crate::vision::vl_route_decode_text(
                     stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
                     id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
+                    &mut filter,
+                    &mut think,
+                    &stream_bytes[fed..],
                 );
                 let _ = stdout.flush();
             }
@@ -6579,6 +6716,8 @@ pub fn generate(
             rng_state = rng;
         }
         m.seq_pos += generated;
+        crate::vision::vl_finish_think_routing(stdout, id, &mut filter, &mut think);
+        let open_think = think.in_think();
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
@@ -6637,6 +6776,7 @@ pub fn generate(
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+            "cached_tokens": cached_tokens_count,
             "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
@@ -6651,7 +6791,24 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
+            ClientTerminalDecision::Commit => {
+                // Same store decision as the legacy spec route.
+                let decoded_full = tokenizer.decode(&streamed_tokens);
+                let action = crate::qwen::legacy_asst_turn_action(
+                    !hit_stop,
+                    open_think,
+                    started_in_think,
+                    &decoded_full,
+                    &[],
+                );
+                if action.store {
+                    let nl_set: std::collections::HashSet<u32> = nl.iter().copied().collect();
+                    let cached_seq =
+                        crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+                    crate::qwen::store_legacy_asst_turn(m, &action, cached_seq);
+                }
+                emit_active_route_done(stdout, id, &pending_done)
+            }
             ClientTerminalDecision::Abort => {
                 // Abort after commit: full fail-closed rollback first, then
                 // the attested aborted+done pair (or a single unattested

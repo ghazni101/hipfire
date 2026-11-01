@@ -317,12 +317,36 @@ fn input_basis_producer_fused_admitted(
         && gate_k == router_k
 }
 
+/// The prefill operands of a call as its stages read them: the sealed record itself, or, when the
+/// route stage reserved a usage-log destination for the call's routed ids
+/// ([`MoeRowGather::reserve_topk`]), a copy whose `topk_indices` is that view. Every stage of
+/// the call reads its ids through this, so the route writes and all readers see one buffer.
+pub(super) enum PrefillParamsView<'s> {
+    Sealed(&'s MoePrefillParams<'s>),
+    Routed(MoePrefillParams<'s>),
+}
+
+impl<'s> std::ops::Deref for PrefillParamsView<'s> {
+    type Target = MoePrefillParams<'s>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Sealed(params) => params,
+            Self::Routed(params) => params,
+        }
+    }
+}
+
 /// Invocation-local mutable state. It borrows the sealed call but never gets
 /// stored by that call, so borrowed Steps cannot form a self-referential owner.
 pub(super) struct MoeStepState<'a> {
     call: &'a SealedMoeCall<'a>,
     host_route: OnceCell<HostRoute>,
     route_stamp: Cell<Option<RouteStamp>>,
+    /// The routed-id view the call's hook reserved before its route launch
+    /// ([`MoeRowGather::reserve_topk`]); set once by the route stage, read through
+    /// [`Self::prefill_parts`]. Empty: the call routes into its own `topk_indices`.
+    topk_log: OnceCell<GpuTensor>,
     /// The IU4 activation token the router stage quantized for the shared
     /// group: written only by the router stage, taken (consumed, never
     /// re-quantized) by the shared gate/up stage of the same invocation.
@@ -338,6 +362,10 @@ pub(super) struct MoeStepState<'a> {
     /// H8a: the routed target's zero fill was absorbed; the qt44 combine
     /// writes it from +0.0 and clears this.
     initial_zero: Cell<bool>,
+    /// `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`: the absorbed fill ([`Self::initial_zero`]) is
+    /// consumed by the epilogue-fused shared down launch (`moe_shared_down_combine_rows_r<R>_zinit`),
+    /// not by the qt44 combine, so the epilogue fuse stays admitted despite `initial_zero`.
+    fuse_zinit: Cell<bool>,
     /// H4 level 3: the paired HC write the shared down may carry (taken by the
     /// stage), and whether it did.
     hc_write: RefCell<Option<super::qt44_qt53_prefill::HcSharedDown>>,
@@ -345,6 +373,13 @@ pub(super) struct MoeStepState<'a> {
     /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the shared down ran the whole tail as the
     /// HC row fold, including the next HC read's norm.
     hc_row_folded: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the combine stage deferred its launch to the shared
+    /// down stage's `moe_shared_down_combine_rows` (taken by that stage).
+    combine_deferred: Cell<bool>,
+    /// The call runs its whole lowered program through [`execute`] / [`execute_after_clear`]
+    /// (the only entries that run a `Combine` followed by its `SharedDown` in one state), so a
+    /// deferred combine is always consumed; direct stage entries leave it unset.
+    epilogue_fuse_allowed: Cell<bool>,
     /// Where this invocation is in the split transaction (never read when the
     /// call is not in the split mode).
     split_phase: Cell<SplitPhase>,
@@ -370,6 +405,28 @@ pub(super) struct MoeStepState<'a> {
     /// The normalize stage skipped the plain norm because the gate-side launch
     /// recomputes it ([`a3b_norm_fold_admitted`]).
     norm_fold_active: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: the lowering placed `Scatter` immediately after `Route`
+    /// (no `OwnerAssign`, no CPU split / deferral), so the route stage may run the router and the
+    /// scatter as one launch.
+    route_scatter_allowed: Cell<bool>,
+    /// The route stage ran the fused router + scatter launch; the next `Scatter` stage launches
+    /// nothing (and clears this).
+    route_scatter_done: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the scatter-side launch of this call (the scatter stage's
+    /// `moe_scatter_fused_top10_pmask` or the route stage's wide router + scatter launch) wrote the
+    /// wide-verify chain's owner-masked tile ids; the gate/up stage takes this (and clears it) and
+    /// does not launch `ep_tile_mask`.
+    tile_mask_written: Cell<bool>,
+    /// C1 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): the call runs its whole lowered program through
+    /// [`execute`] / [`execute_after_clear`], so a fold that defers work to a later stage always
+    /// reaches that stage (direct stage entries and the S1 prepare leave this false).
+    g942_fold_allowed: Cell<bool>,
+    /// The lowering is the plain grouped tail with the shared down after the combine.
+    g942_plain_tail: Cell<bool>,
+    /// The `SharedActivation` stage deferred its launch to the `Unscatter` stage (fold 2).
+    g942_act_deferred: Cell<bool>,
+    /// The `Combine` stage deferred its launch to the `SharedDown` stage (fold 3).
+    g942_combine_deferred: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -436,14 +493,18 @@ impl<'a> MoeStepState<'a> {
             call,
             host_route: OnceCell::new(),
             route_stamp: Cell::new(route_stamp),
+            topk_log: OnceCell::new(),
             shared_iu4: RefCell::new(None),
             shared_down_iu4: RefCell::new(None),
             shared_gate,
             shared_up,
             initial_zero: Cell::new(false),
+            fuse_zinit: Cell::new(false),
             hc_write: RefCell::new(None),
             hc_folded: Cell::new(false),
             hc_row_folded: Cell::new(false),
+            combine_deferred: Cell::new(false),
+            epilogue_fuse_allowed: Cell::new(false),
             split_phase: Cell::new(SplitPhase::Idle),
             split_reference: Cell::new(false),
             expert_iu4: OnceCell::new(),
@@ -451,11 +512,74 @@ impl<'a> MoeStepState<'a> {
             front_allowed: Cell::new(false),
             front: RefCell::new(None),
             norm_fold_active: Cell::new(false),
+            route_scatter_allowed: Cell::new(false),
+            route_scatter_done: Cell::new(false),
+            tile_mask_written: Cell::new(false),
+            g942_fold_allowed: Cell::new(false),
+            g942_plain_tail: Cell::new(false),
+            g942_act_deferred: Cell::new(false),
+            g942_combine_deferred: Cell::new(false),
         }
     }
 
     fn dispatch_ctx(&self) -> &DispatchCtx {
         self.call.dispatch_ctx()
+    }
+
+    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: whether this call's combine rides its shared down
+    /// ([`super::qt44_qt53_prefill::epilogue_fuse_applies`]) -- only for the plain lowering
+    /// whose `Combine` is followed by the `SharedDown` that consumes the deferral: no CPU split
+    /// or deferred experts (their combine / splice order differs), no tile exchange, and no
+    /// HC write or absorbed target fill already offered to those stages (the fill absorbed by
+    /// the fused launch itself, [`Self::fuse_zinit`], excepted).
+    fn epilogue_fuse_admitted(
+        &self,
+        gpu: &Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> bool {
+        (!self.initial_zero.get() || self.fuse_zinit.get())
+            && self.epilogue_fuse_route(gpu, params, selection)
+    }
+
+    /// [`Self::epilogue_fuse_admitted`] without the absorbed-fill term: whether the combine
+    /// stage of this call defers to the fused shared down launch when no fill was absorbed.
+    /// Depends on the call, the `hc_write` offer and the gpu only, so the decision made before
+    /// the combine stage ([`Self::absorbs_clear`]) is the one the stage re-derives.
+    fn epilogue_fuse_route(
+        &self,
+        gpu: &Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> bool {
+        self.epilogue_fuse_allowed.get()
+            && !selection.cpu_split
+            && !selection.cpu_deferred_experts
+            && params.ep_tile_exchange.is_none()
+            && self.hc_write.borrow().is_none()
+            && super::qt44_qt53_prefill::epilogue_fuse_applies(
+                gpu,
+                params,
+                selection.uses_grouped_rows(),
+            )
+    }
+
+    /// A deferred combine whose shared down never ran its launch would leave the target
+    /// uncombined: fail the call loudly.
+    fn require_epilogue_consumed(&self) -> Result<(), DispatchError> {
+        if self.combine_deferred.get() {
+            return Err(DispatchError::Hip(
+                "sealed moe: the combine was deferred to the shared down but its launch never ran"
+                    .into(),
+            ));
+        }
+        if self.g942_combine_deferred.get() || self.g942_act_deferred.get() {
+            return Err(DispatchError::Hip(
+                "sealed moe: a gfx942 MoE glue fold was deferred to a later stage that never ran it"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn decode_parts(&self) -> Result<(&MoeParams<'_>, &MoeDecodeSelection), DispatchError> {
@@ -475,7 +599,7 @@ impl<'a> MoeStepState<'a> {
 
     fn prefill_parts(
         &self,
-    ) -> Result<(&MoePrefillParams<'_>, &MoePrefillSelection), DispatchError> {
+    ) -> Result<(PrefillParamsView<'_>, &MoePrefillSelection), DispatchError> {
         let params = self.call.prefill_params().ok_or_else(|| {
             DispatchError::Hip("sealed moe: operation requires prefill operands".into())
         })?;
@@ -487,39 +611,102 @@ impl<'a> MoeStepState<'a> {
                 ));
             }
         };
-        Ok((params, selection))
+        let view = match self.topk_log.get() {
+            Some(log) => PrefillParamsView::Routed(params.with_topk_indices(log)),
+            None => PrefillParamsView::Sealed(params),
+        };
+        Ok((view, selection))
     }
 
-    /// Whether the qt44 combine of this call can take over `clear`'s zero
-    /// fill (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201):
-    /// the combine writes every element `clear` zeroes, into that very
-    /// tensor, nothing else writes it before the combine, and nothing is
-    /// recorded or captured (a retained tape keeps the clear's shape).
-    fn absorbs_clear(&self, gpu: &Gpu, clear: &super::layer_ops::ClearOp<'_>) -> bool {
-        if !gpu.flags.qwen4_moe_combine_zinit_enabled()
+    /// Ask the call's row-gather hook for a routed-id destination before the route launches
+    /// ([`MoeRowGather::reserve_topk`]). Only a replicated-route call that reaches its row gather
+    /// asks, and never while a graph capture or replay record is armed (the gather refuses
+    /// those); a hook that names no view leaves the call routing into its own scratch.
+    fn reserve_topk(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.prefill_parts()?;
+        let Some(gather) = params.ep_row_gather else {
+            return Ok(());
+        };
+        if !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::Replicated
+        ) || gpu.graphs.capture_mode
+            || gpu.graphs.verify.capturing.is_some()
+            || gpu.graphs.replay.capturing.is_some()
+            || gpu.replay.is_recording()
+        {
+            return Ok(());
+        }
+        let slots = params.batch_size.checked_mul(params.k_top).ok_or_else(|| {
+            DispatchError::Hip("sealed moe: top-k reservation extent overflows".into())
+        })?;
+        if let Some(view) =
+            gather.reserve_topk(gpu, params.ep_layer_idx, slots, params.topk_indices)
+        {
+            self.topk_log.set(view).map_err(|_| {
+                DispatchError::Hip(
+                    "sealed moe: top-k destination reserved twice in one invocation".into(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether the combine of this call can take over `clear`'s zero fill, and which launch
+    /// consumes it.
+    ///
+    /// [`ClearAbsorb::Combine`] (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`, exact gfx1151 / gfx1201; on
+    /// the wide-verify int8 chain also `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, exact gfx1201): the qt44
+    /// combine writes every element `clear` zeroes, into that very tensor, nothing else writes
+    /// it before the combine, and nothing is recorded or captured (a retained tape keeps the
+    /// clear's shape).
+    ///
+    /// [`ClearAbsorb::SharedDownFuse`] (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`, exact gfx1201): the
+    /// call's combine rides the epilogue-fused shared down launch
+    /// ([`Self::epilogue_fuse_route`]), whose `_zinit` entry stores every `(token, column)` of
+    /// the `batch * down_m` target from a +0.0 seed. The hc_write offer must already be installed
+    /// (the fuse is refused when the shared down carries an HC write).
+    fn absorbs_clear(&self, gpu: &Gpu, clear: &super::layer_ops::ClearOp<'_>) -> ClearAbsorb {
+        let combine_flag = gpu.flags.qwen4_moe_combine_zinit_enabled();
+        let rows_flag = gpu.flags.qwen4_ffn_clear_absorb_rows_enabled();
+        if !(combine_flag || rows_flag)
             || gpu.replay.is_recording()
             || gpu.replay.retained_body_active()
             || gpu.graphs.capture_mode
         {
-            return false;
+            return ClearAbsorb::No;
         }
         let Ok((params, selection)) = self.prefill_parts() else {
-            return false;
+            return ClearAbsorb::No;
         };
+        let params = &*params;
         let target = params.routed_out.unwrap_or(params.x_batch);
-        selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped)
+        let owns_target = selection
+            .route
+            .is_some_and(MoeRouteCapability::is_sealed_grouped)
             // A CPU-deferred call omits the combine that would consume the
             // absorbed fill, so it must never absorb one.
             && !selection.cpu_deferred_experts
             && !selection.cpu_split
             && matches!(params.prelude.normalization, MoeNormalization::Provided)
+            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
+            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m);
+        if !owns_target {
+            return ClearAbsorb::No;
+        }
+        if combine_flag
             && super::qt44_qt53_prefill::combine_initial_zero_applies(
                 gpu,
                 params,
                 selection.uses_grouped_rows(),
             )
-            && clear.tensor.buf.as_ptr() == target.buf.as_ptr()
-            && Some(clear.elements) == params.batch_size.checked_mul(params.down_m)
+        {
+            return ClearAbsorb::Combine;
+        }
+        if rows_flag && self.epilogue_fuse_route(gpu, params, selection) {
+            return ClearAbsorb::SharedDownFuse;
+        }
+        ClearAbsorb::No
     }
 
     fn shared_views(&self) -> Result<(&GpuTensor, &GpuTensor), DispatchError> {
@@ -641,6 +828,7 @@ impl<'a> MoeStepState<'a> {
                 .flatten();
         }
         if let Ok((params, selection)) = self.prefill_parts() {
+            let params = &*params;
             return selection
                 .cpu_split
                 .then(|| prefill_split_executor(params).ok())
@@ -786,6 +974,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if let MoeNormalization::RmsNorm {
                     weight,
                     plain_out,
@@ -892,6 +1081,7 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_input_basis_stage(gpu, params, selection.resolution);
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if self.state.norm_basis_folded.get() {
             // The normalize stage produced the F32 basis and the token (L4 fold).
             return Ok(());
@@ -1104,6 +1294,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1278,13 +1469,45 @@ impl<'a> SealedMoeOp<'a> {
                         "sealed moe: route producer ran twice in one invocation".into(),
                     ));
                 }
-                let (params, _) = self.state.prefill_parts()?;
+                self.state.reserve_topk(gpu)?;
+                let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 let scores = params.prelude.router_scores;
+                // The fused router + scatter launch: only when the lowering put `Scatter` right
+                // after this stage and the scatter stage would launch the plain grouped scatter.
+                let fuse = (self.state.route_scatter_allowed.get()
+                    && selection.uses_grouped_rows()
+                    && selection
+                        .route
+                        .is_some_and(MoeRouteCapability::is_sealed_grouped)
+                    && (gpu.moe_route_scatter_top10_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    ) || gpu.moe_glue_fold_route_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    ))
+                    && super::qt44_qt53_prefill::scatter_fusable(gpu, params))
+                .then(|| {
+                    Ok::<_, DispatchError>(super::sealed_moe::RouteScatterFuse {
+                        grouped_rows: selection.path2_m_total,
+                        launched: &self.state.route_scatter_done,
+                        // The wide router + scatter launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD` b) also
+                        // writes the wide-verify chain's owner-masked tile ids.
+                        owner_mask: super::qt44_qt53_prefill::glue_fold_owner_mask(gpu, params)?,
+                        mask_written: &self.state.tile_mask_written,
+                    })
+                })
+                .transpose()?;
                 let receipt = super::sealed_moe::produce_prefill_route(
                     self.state.call,
                     gpu,
                     scores,
+                    params.topk_indices,
                     params.prelude.norm_topk_prob,
+                    fuse,
                 )?;
                 self.state.call.validate_route_receipt(&receipt)?;
                 if let super::sealed_moe::PrefillRouteMode::ProduceRoot { slot } =
@@ -1402,6 +1625,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1445,10 +1669,20 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 2 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): nothing reads the shared activation
+            // before the shared down, so the plain tail launches it with the routed unscatter.
+            if self.state.g942_fold_allowed.get()
+                && self.state.g942_plain_tail.get()
+                && super::qt44_qt53_prefill::g942_fold_applies(gpu, params)
+            {
+                self.state.g942_act_deferred.set(true);
+                return Ok(());
+            }
             return super::qt44_qt53_prefill::shared_activation(
                 gpu,
                 params,
@@ -1503,10 +1737,28 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 3: the combine stage deferred to this launch (shared down GEMM, then one
+            // launch that combines the routed rows and applies the shared scaled add).
+            if self.state.g942_combine_deferred.replace(false) {
+                return super::qt44_qt53_prefill::g942_fold_shared_down_combine(gpu, params);
+            }
+            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: this call's combine was deferred by the
+            // combine stage; the one launch does combine, shared-down rows and shared fold.
+            if self.state.combine_deferred.replace(false) {
+                // An absorbed fill reaching a deferred combine is the fused launch's own
+                // (`epilogue_fuse_admitted` admits no other): it takes the `_zinit` entry.
+                return super::qt44_qt53_prefill::shared_down_combined(
+                    gpu,
+                    params,
+                    selection.uses_grouped_rows(),
+                    self.state.initial_zero.take(),
+                );
+            }
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
@@ -1534,6 +1786,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn scatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         self.state.require_route_ready()?;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
@@ -1550,7 +1803,14 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
-            return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
+            // The route stage already ran the scatter in its fused launch.
+            if self.state.route_scatter_done.replace(false) {
+                return Ok(());
+            }
+            let mask_written =
+                super::qt44_qt53_prefill::scatter_masked(gpu, params, selection.path2_m_total)?;
+            self.state.tile_mask_written.set(mask_written);
+            return Ok(());
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -1574,6 +1834,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1591,6 +1852,7 @@ impl<'a> SealedMoeOp<'a> {
                 selection.uses_grouped_rows(),
                 selection.path2_m_total,
                 front,
+                self.state.tile_mask_written.replace(false),
             );
         }
         if let ExpertIu4Decision::Admitted(plan) =
@@ -1617,6 +1879,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn unscatter(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if !selection.uses_grouped_rows() {
@@ -1628,6 +1891,15 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // C1 fold 2: the shared activation the `SharedActivation` stage deferred rides this
+            // launch.
+            if self.state.g942_act_deferred.replace(false) {
+                return super::qt44_qt53_prefill::g942_fold_unscatter_act(
+                    gpu,
+                    params,
+                    selection.path2_m_total,
+                );
+            }
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
         }
         if matches!(
@@ -1658,6 +1930,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1750,6 +2023,7 @@ impl<'a> SealedMoeOp<'a> {
             return Ok(());
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let view = self.state.masked_prefill(params, selection)?;
         let params = view.as_ref().unwrap_or(params);
         if selection
@@ -1816,6 +2090,7 @@ impl<'a> SealedMoeOp<'a> {
             );
         }
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         if selection.cpu_split {
             return self.split_combine_prefill(gpu, params, selection);
         }
@@ -1823,6 +2098,35 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the shared down stage's one launch combines
+            // the ten expanded rows itself; only the scratch preflight is owed here.
+            if self.state.epilogue_fuse_admitted(gpu, params, selection) {
+                self.state.combine_deferred.set(true);
+                return super::qt44_qt53_prefill::combine_deferred(
+                    gpu,
+                    params,
+                    selection.uses_grouped_rows(),
+                    selection.path2_m_total,
+                );
+            }
+            // C1 fold 3 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): the stock-FP8 combine defers to the
+            // shared down stage, whose one launch combines and applies the shared scaled add.
+            // Only the plain tail with no HC write offered and no absorbed fill (the folded
+            // launch reads and writes the target in place, like the unfused combine).
+            if self.state.g942_fold_allowed.get()
+                && self.state.g942_plain_tail.get()
+                && self.state.hc_write.borrow().is_none()
+                && !self.state.initial_zero.get()
+                && super::qt44_qt53_prefill::g942_fold_applies(gpu, params)
+            {
+                super::qt44_qt53_prefill::g942_fold_combine_preflight(
+                    gpu,
+                    params,
+                    selection.path2_m_total,
+                )?;
+                self.state.g942_combine_deferred.set(true);
+                return Ok(());
+            }
             // The row fold combines inside its own kernel; only the rank order
             // is owed here, and the absorbed target fill is not (the shared
             // down's rows overwrite the target).
@@ -1917,6 +2221,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, _) = self.state.prefill_parts()?;
+                let params = &*params;
                 let gpu_ref: &Gpu = &*gpu;
                 // `dim` is the model hidden size, which is exactly the routed down
                 // projection's row count: `MoePrefillParams` has no `hidden` field
@@ -1985,6 +2290,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if !selection.cpu_split {
                     return Err(split_error(
                         "PrepareSplit lowered without the split selection",
@@ -2037,6 +2343,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 if !selection.cpu_split {
                     return Err(split_error("JoinSplit lowered without the split selection"));
                 }
@@ -2069,15 +2376,18 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     /// CP-wait `Combine`: queue the wait behind the routed tail and hand the
-    /// canonical combine the mapped view. From here until `JoinSplit` the
+    /// canonical combine the mapped view (an all-cold layer) or the device
+    /// `expanded` rows the stream fills with the staged cold slots behind the
+    /// wait (a mixed layer, `HIPFIRE_QWEN4_D2_MIXED_CPWAIT`). From here until `JoinSplit` the
     /// stream is gated: no stage may synchronize it, and a call abandoned in
     /// the `Armed` phase aborts the wait (`MoeStepState`'s `Drop`).
     fn arm_cpwait_combine<'e>(
         &self,
         gpu: &Gpu,
         executor: &'e CpuSplitExecutor,
+        expanded: &'e GpuTensor,
     ) -> Result<&'e GpuTensor, DispatchError> {
-        let view = executor.cpwait_arm(gpu)?;
+        let view = executor.cpwait_arm(gpu, expanded)?;
         self.state.split_phase.set(SplitPhase::Armed);
         Ok(view)
     }
@@ -2110,7 +2420,7 @@ impl<'a> SealedMoeOp<'a> {
         let target = params.routed_out.unwrap_or(params.x_residual);
         let rows = params.batch_size;
         let combine_input = if cpwait {
-            self.arm_cpwait_combine(gpu, executor)?
+            self.arm_cpwait_combine(gpu, executor, params.down_expanded)?
         } else {
             executor.combine_outputs(params.down_expanded)?
         };
@@ -2158,7 +2468,7 @@ impl<'a> SealedMoeOp<'a> {
         let target = params.routed_out.unwrap_or(params.x_batch);
         let rows = params.batch_size;
         let combine_input = if cpwait {
-            self.arm_cpwait_combine(gpu, executor)?
+            self.arm_cpwait_combine(gpu, executor, params.down_expanded)?
         } else {
             executor.combine_outputs(params.down_expanded)?
         };
@@ -2247,6 +2557,7 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, _) = self.state.prefill_parts()?;
+                let params = &*params;
                 (
                     params.ep_row_gather.ok_or_else(missing)?,
                     params.ep_layer_idx,
@@ -2301,15 +2612,20 @@ impl<'a> SealedMoeOp<'a> {
             }
             MoeProtocol::GroupedPrefill => {
                 let (params, selection) = self.state.prefill_parts()?;
+                let params = &*params;
                 let gather = params.ep_row_gather.ok_or_else(missing)?;
                 if !selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
-                    || !super::qt44_qt53_prefill::writes_slot_ordered_rows(
+                    || !(super::qt44_qt53_prefill::writes_slot_ordered_rows(
                         gpu,
                         params,
                         selection.uses_grouped_rows(),
-                    )
+                    ) || super::qt44_qt53_prefill::ep_a8_wide(
+                        gpu,
+                        params,
+                        selection.uses_grouped_rows(),
+                    ))
                 {
                     return Err(DispatchError::Hip(
                             "sealed moe: an EP row gather needs the grouped QT44/QT53 down to have written slot-ordered expanded rows".into(),
@@ -2361,6 +2677,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn tile_mask(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let tx = params.ep_tile_exchange.ok_or_else(|| {
             DispatchError::Hip("sealed moe: tile mask lowered without a tile exchange".into())
         })?;
@@ -2370,6 +2687,7 @@ impl<'a> SealedMoeOp<'a> {
 
     pub(super) fn tile_exchange(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let (params, selection) = self.state.prefill_parts()?;
+        let params = &*params;
         let tx = params.ep_tile_exchange.ok_or_else(|| {
             DispatchError::Hip("sealed moe: tile exchange lowered without a tile exchange".into())
         })?;
@@ -2571,6 +2889,7 @@ fn lower_prefill<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.prefill_parts()?;
+    let params = &*params;
     if selection.cpu_split {
         // Checked before any other lowering decision: the mode must never
         // fall into the generic or deferred arms by accident.
@@ -2578,9 +2897,10 @@ fn lower_prefill<'a>(
             params,
             selection.route,
             selection.cpu_deferred_experts,
-            // The executor-dependent shape check ran at seal and runs again in
-            // `validate_split_prefill`; lowering needs no device object.
-            None,
+            // The width check reads the executor's ALLOCATED capacity: with
+            // `None` a window wider than 4 rows (HIPFIRE_QWEN4_D2_WINDOW_ROWS,
+            // the lab-wide window) always refused here, whatever was built.
+            prefill_split_executor(params).ok(),
         ) {
             return Err(split_error(reason));
         }
@@ -2641,12 +2961,21 @@ fn lower_prefill<'a>(
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         // Balanced EP ownership: right after the route wrote the ids, before
         // the scatter and every routed-table reader.
-        if params
+        let owner_assign = params
             .ep_row_gather
-            .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx))
-        {
+            .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx));
+        if owner_assign {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
         }
+        // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: only the lowering whose very next routed stage is
+        // `Scatter` (no owner assignment, no CPU split / deferral) lets the route stage launch
+        // the scatter with the router.
+        state.route_scatter_allowed.set(
+            !owner_assign
+                && !selection.cpu_split
+                && !selection.cpu_deferred_experts
+                && selection.uses_grouped_rows(),
+        );
         if selection.cpu_split {
             // Distinct eager CPU-cold/GPU-hot split. The original route feeds
             // the unchanged canonical combine and the shared expert; only the
@@ -2706,6 +3035,16 @@ fn lower_prefill<'a>(
             }
             return Ok(steps);
         }
+        // C1 (`HIPFIRE_QWEN4_G942_FOLD_MOE`): this lowering is the plain grouped tail (no CPU
+        // split or deferral, which returned above) with the shared down after the combine, the
+        // only shape in which `SharedActivation` may ride the unscatter launch and `Combine`
+        // may defer to `SharedDown`.
+        state.g942_plain_tail.set(
+            params.recipe.shared_after_combine()
+                && selection.uses_grouped_rows()
+                && params.ep_row_gather.is_none()
+                && params.ep_tile_exchange.is_none(),
+        );
         if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
@@ -2725,7 +3064,10 @@ fn lower_prefill<'a>(
         if params.ep_row_gather.is_some() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::RowGather))?;
         }
-        if params.ep_tile_exchange.is_some() {
+        if params
+            .ep_tile_exchange
+            .is_some_and(|tx| !tx.exchange.mask_only())
+        {
             append_step(
                 &mut steps,
                 Step::MoeStage(op(state), MoeStage::TileExchange),
@@ -2836,11 +3178,14 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     // borrow only this invocation and are dropped before the call returns.
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
+    state.epilogue_fuse_allowed.set(true);
+    state.g942_fold_allowed.set(true);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
-    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)?;
+    state.require_epilogue_consumed()
 }
 
 /// The stages of the S1 layer-major PREPARE half of a sealed grouped prefill, in
@@ -2870,6 +3215,7 @@ pub(super) fn execute_prepare(
         return execute_prepare_decode(gpu, call, &state);
     }
     let (params, selection) = state.prefill_parts()?;
+    let params = &*params;
     if !selection
         .route
         .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -2973,6 +3319,7 @@ pub(super) fn split_phase_probe(call: &SealedMoeCall<'_>) -> Result<(), String> 
         }
     }
     if let Ok((params, selection)) = state.prefill_parts() {
+        let params = &*params;
         if state.masked_prefill(params, selection).is_ok() {
             return Err("prefill tail took the masked view before PrepareSplit".into());
         }
@@ -3049,6 +3396,7 @@ pub(super) fn split_phase_probe(call: &SealedMoeCall<'_>) -> Result<(), String> 
         }
     }
     if let Ok((params, selection)) = state.prefill_parts() {
+        let params = &*params;
         if params.prelude.shared.is_none() {
             return Err("prefill fixture does not carry a shared expert".into());
         }
@@ -3110,15 +3458,13 @@ pub(super) fn execute_after_clear(
 ) -> Result<AfterClear, DispatchError> {
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
-    let absorbed = state.absorbs_clear(gpu, clear);
-    if !absorbed {
-        super::layer_ops::execute_clear(gpu, clear)?;
-    }
-    state.initial_zero.set(absorbed);
+    state.epilogue_fuse_allowed.set(true);
+    state.g942_fold_allowed.set(true);
     if let Some(write) = hc {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
+                let params = &*params;
                 if selection
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -3138,11 +3484,19 @@ pub(super) fn execute_after_clear(
         }
         *state.hc_write.borrow_mut() = offered;
     }
+    // The HC offer is decided above: `absorbs_clear` re-derives the epilogue fuse from it.
+    let absorb = state.absorbs_clear(gpu, clear);
+    if absorb == ClearAbsorb::No {
+        super::layer_ops::execute_clear(gpu, clear)?;
+    }
+    state.initial_zero.set(absorb != ClearAbsorb::No);
+    state.fuse_zinit.set(absorb == ClearAbsorb::SharedDownFuse);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)?;
+    state.require_epilogue_consumed()?;
     if state.initial_zero.get() {
         return Err(DispatchError::Hip(
             "sealed moe: the absorbed target clear was not consumed by the combine".into(),
@@ -3152,6 +3506,18 @@ pub(super) fn execute_after_clear(
         folded: state.hc_folded.get(),
         row_folded: state.hc_row_folded.get(),
     })
+}
+
+/// Who consumes the zero fill [`MoeStepState::absorbs_clear`] skipped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClearAbsorb {
+    /// The fill runs as its own `zero_f32`.
+    No,
+    /// The qt44 BF16-row combine stores from +0.0.
+    Combine,
+    /// The epilogue-fused shared down launch (`moe_shared_down_combine_rows_r<R>_zinit`) stores
+    /// from +0.0.
+    SharedDownFuse,
 }
 
 /// What [`execute_after_clear`] did beyond the call itself.
@@ -3818,10 +4184,9 @@ fn cpu_split_executor_for_join(
     crate::families::moe::cpu_split_executor_wide(experts, rows)
 }
 
-/// Pure width truth of [`cpu_split_prefill_conflict`] for tests: the
-/// structural refusal for a `rows`-row window given an allocated `capacity`,
+/// Pure width truth of [`cpu_split_prefill_conflict`]: the structural refusal
+/// for a `rows`-row window given an allocated `capacity` (`0` = no executor),
 /// without params or an executor. Wiring only, not numeric proof.
-#[cfg(test)]
 pub(super) fn cpu_split_prefill_conflict_width(
     rows: usize,
     capacity: usize,
@@ -3865,17 +4230,8 @@ pub(super) fn cpu_split_prefill_conflict(
     let capacity = executor
         .map(|executor| executor.capacity_rows())
         .unwrap_or(0);
-    let structural =
-        NARROW_VERIFY_MAX_ROWS.max(capacity.min(crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS));
-    if params.batch_size == 0 || params.batch_size > structural {
-        if params.batch_size > NARROW_VERIFY_MAX_ROWS {
-            return Some(
-                "the window exceeds the executor's allocated CPU window (wider windows are ordinary wide prefill)",
-            );
-        }
-        return Some(
-            "the window exceeds the four-row cap (wider windows are ordinary wide prefill)",
-        );
+    if let Some(reason) = cpu_split_prefill_conflict_width(params.batch_size, capacity) {
+        return Some(reason);
     }
     if cpu_deferred_experts || params.cpu_deferred_experts {
         return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");
@@ -6872,6 +7228,82 @@ pub struct GroupedMoeSharedScratch<'a> {
     /// F32 words, at least `single_expert_table_words(rows)`: grouping tables
     /// that run the qt44 gate/up/down weights as one-entry expert tables.
     pub tables: &'a GpuTensor,
+    /// Optional owner-held cache of the single-expert tables, keyed by the three weight pointers
+    /// and the row count, so a layer's tables are built once instead of every call. `None`: built
+    /// into `tables` on every call.
+    pub table_cache: Option<&'a SingleExpertTableCache>,
+}
+
+/// Single-expert grouping tables ([`Gpu::ffn_single_expert_tables`]) kept per (weight pointers,
+/// rows). The tables are a pure function of those inputs, so an entry found under its key is
+/// exactly what a rebuild would write, whatever the weights' history. Admitted only for eager
+/// prefill-sized calls ([`prefill_quant_admitted`]: a table built while a graph is captured or
+/// recorded has not run yet) and bounded by [`Self::MAX_ENTRIES`]; beyond that, or for any other
+/// call, the caller's shared scratch is rebuilt in place as before.
+#[derive(Default)]
+pub struct SingleExpertTableCache {
+    entries: RefCell<std::collections::HashMap<([usize; 3], usize), GpuTensor>>,
+}
+
+impl SingleExpertTableCache {
+    /// Most (layer, rows) entries kept.
+    pub const MAX_ENTRIES: usize = 256;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Entries held.
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+
+    /// Release every cached table. Call before the owner drops.
+    pub fn free(&self, gpu: &mut Gpu) {
+        for (_, t) in self.entries.borrow_mut().drain() {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
+    /// A view of the tables for (`w`, `rows`), building them once on first use. `None` when this
+    /// call is not admitted or the cache is full (the caller then builds into its scratch).
+    fn tables(
+        &self,
+        gpu: &mut Gpu,
+        rows: usize,
+        w: [&GpuTensor; 3],
+    ) -> Result<Option<GpuTensor>, DispatchError> {
+        if !prefill_quant_admitted(gpu, rows) {
+            return Ok(None);
+        }
+        let key = (
+            [
+                w[0].buf.as_ptr() as usize,
+                w[1].buf.as_ptr() as usize,
+                w[2].buf.as_ptr() as usize,
+            ],
+            rows,
+        );
+        if let Some(t) = self.entries.borrow().get(&key) {
+            return Ok(Some(t.shallow_clone()));
+        }
+        if self.entries.borrow().len() >= Self::MAX_ENTRIES {
+            return Ok(None);
+        }
+        let words = rdna_compute::ffn_activation::single_expert_table_words(rows);
+        let t = hip!(gpu.alloc_tensor(&[words], DType::F32))?;
+        if let Err(e) = gpu.ffn_single_expert_tables(&t, rows, w) {
+            let _ = gpu.free_tensor(t);
+            return Err(DispatchError::Hip(e.to_string()));
+        }
+        let view = t.shallow_clone();
+        self.entries.borrow_mut().insert(key, t);
+        Ok(Some(view))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -7214,8 +7646,20 @@ fn gated_ffn_from_basis(
         .iter()
         .any(|p| p.dtype == DType::MQ4G256V2);
     let views = if any_qt44 && !(cast.bf16() && rows == 1) {
-        hip!(gpu.ffn_single_expert_tables(s.tables, rows, [w.gate.buf, w.up.buf, w.down.buf]))?;
-        Some(Gpu::single_expert_views(s.tables, rows))
+        let weights = [w.gate.buf, w.up.buf, w.down.buf];
+        // Built once per (weights, rows) when the owner keeps a cache and the call is an eager
+        // prefill; otherwise into the shared scratch on every call.
+        let cached = match s.table_cache {
+            Some(cache) => cache.tables(gpu, rows, weights)?,
+            None => None,
+        };
+        match cached {
+            Some(t) => Some(Gpu::single_expert_views(&t, rows)),
+            None => {
+                hip!(gpu.ffn_single_expert_tables(s.tables, rows, weights))?;
+                Some(Gpu::single_expert_views(s.tables, rows))
+            }
+        }
     } else {
         None
     };
@@ -7301,6 +7745,29 @@ fn gated_ffn_from_basis(
         } else {
             None
         };
+    // gfx11 F16-WMMA qt44 gate and up read the same rotated basis: convert it to F16 once into
+    // the caller's plane and hand that to both launches (they skip their own convert for an
+    // F16-typed X; one kernel, one cast, same bytes).
+    // The plane is the first `rows * hidden` F16 words of `s.act`, which is written only after both
+    // projections ran (no extra scratch).
+    let gate_up_x16 = match s.act.as_f16_view(rows * hidden) {
+        Some(plane)
+            if gate_up_xq.is_none()
+                && cast.bf16()
+                && views.is_some()
+                && w.gate.dtype == DType::MQ4G256V2
+                && w.up.dtype == DType::MQ4G256V2
+                && ctx.arch.has_wmma_w32()
+                && !ctx.arch.is_rdna4()
+                && x_rot.numel() >= rows * hidden
+                && !sym_ok(&w.gate, s.gate_out, mi, hidden)
+                && !sym_ok(&w.up, s.up_out, mi, hidden) =>
+        {
+            hip!(gpu.convert_f32_to_f16_into(x_rot, &plane, rows * hidden))?;
+            Some(plane)
+        }
+        _ => None,
+    };
     for (which, (weight, y)) in [(&w.gate, s.gate_out), (&w.up, s.up_out)]
         .into_iter()
         .enumerate()
@@ -7310,7 +7777,11 @@ fn gated_ffn_from_basis(
             gpu,
             weight,
             which,
-            if rotated { x_rot } else { x },
+            if rotated {
+                gate_up_x16.as_ref().unwrap_or(x_rot)
+            } else {
+                x
+            },
             y,
             key,
             mi,
@@ -7432,6 +7903,7 @@ fn gated_ffn_per_row(
             rot: &row_view(s.rot, down_k, r),
             out: &row_view(s.out, hidden, r),
             tables: s.tables,
+            table_cache: None,
         };
         gated_ffn_from_basis(
             gpu,
@@ -7586,6 +8058,19 @@ pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool
         && g.down_k % 256 == 0
         && (2 * g.logical_mi) % 64 == 0
         && g.hidden % 64 == 0
+}
+
+/// `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` (developer, default on, exact gfx1100): the routed grouped down site
+/// runs the G5 fused producer (`ffn_situ_grouped_rotate_i8`: activation + rotation + A8 quantizer in one
+/// launch, bytewise the three-launch chain) on the 7900 XTX as it does on gfx1201 (where
+/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` governs it). `=0` restores the three-launch chain. The shared/dense
+/// rows entry is not part of this flag (it stays gfx1201-only).
+pub fn gfx1100_grouped_down_producer_enabled(arch: &str) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    arch == "gfx1100"
+        && *ON.get_or_init(|| {
+            hipfire_config::developer_bool("HIPFIRE_RAON_GFX1100_DOWN_PRODUCER", true)
+        })
 }
 
 /// Whether a down site runs the fused A8 producer (`Gpu::ffn_activation_grouped_rotate_i8_f32` /
@@ -7867,7 +8352,8 @@ pub fn execute_grouped_moe(gpu: &mut Gpu, op: &GroupedMoeOp<'_>) -> Result<(), D
             // output is byte-identical to the fused launch).
             let down_xq_fused = if !super::moe_capture::act_capture_enabled()
                 && grouped_down_producer_fused_admits(
-                    gpu.flags.gfx12_producer_quant_fused_enabled(),
+                    gpu.flags.gfx12_producer_quant_fused_enabled()
+                        || gfx1100_grouped_down_producer_enabled(&gpu.arch),
                     tiers.down,
                     &g,
                 ) {

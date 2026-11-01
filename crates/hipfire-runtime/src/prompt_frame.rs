@@ -865,9 +865,8 @@ pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortC
 /// slice can be passed straight into the Jinja `messages` context var via
 /// `Value::from_serialize(...)`. Templates probe `message['role']`,
 /// `message['content']`, `message['tool_calls']`, and (less commonly)
-/// `message['tool_call_id']` under strict-undefined mode; all four fields
-/// are always present (defaults: empty content, empty tool_calls vec, no
-/// tool_call_id) so probes never raise.
+/// `message['tool_call_id']`; the render env is lenient-undefined, so the
+/// omitted empty `tool_calls` and absent `tool_call_id` read as falsy.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -901,7 +900,9 @@ pub struct Message {
         rename = "name"
     )]
     pub rendered_name: Option<String>,
-    #[serde(default)]
+    /// Omitted when empty, as OpenAI clients do: Llama-3.x tests
+    /// `'tool_calls' in message` and raises on a list whose length is not 1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Set on Tool-role messages to identify which assistant tool_call
     /// this is responding to. Qwen3.5/3.6 templates currently ignore
@@ -923,6 +924,39 @@ pub struct Message {
     /// `reasoning_content` is the Harmony self-channel body. Never merge or repurpose them.
     #[serde(default)]
     pub tool_plan: String,
+}
+
+/// Placeholder the HTTP gateway leaves in a message's `content` for each
+/// OpenAI `image_url` part, at that part's position (U+FFFC, the Unicode
+/// object-replacement character). The images themselves travel beside the
+/// messages (`images_base64`, in slot order); a vision-capable generator swaps
+/// every slot for the model's image marker before rendering the chat template,
+/// so an image keeps its place in the conversation instead of being flattened
+/// away with the rest of the non-text parts. The gateway strips this
+/// character from user text, so a slot is always an image.
+pub const IMAGE_SLOT: char = '\u{FFFC}';
+
+/// Image slots across `messages` — must equal the number of images sent.
+pub fn count_image_slots(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|message| message.content.matches(IMAGE_SLOT).count())
+        .sum()
+}
+
+/// `messages` with every image slot replaced by `replacement` (the
+/// architecture's per-image marker text).
+pub fn expand_image_slots(messages: &[Message], replacement: &str) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut expanded = message.clone();
+            if expanded.content.contains(IMAGE_SLOT) {
+                expanded.content = expanded.content.replace(IMAGE_SLOT, replacement);
+            }
+            expanded
+        })
+        .collect()
 }
 
 /// One assistant-emitted tool call, attached to an assistant `Message`.
@@ -1307,9 +1341,9 @@ impl<'a> JinjaChatFrame<'a> {
     /// context for templates that opt into per-call rendering switches;
     /// pass `None` for the default empty map.
     ///
-    /// Strict-undefined empty defaults still apply when args are `None`,
-    /// so templates that probe `tools` / `documents` / `tool_call_kwargs`
-    /// don't raise.
+    /// `tools = None` binds `none` (as HF does: Llama-3.x tests
+    /// `tools is not none`); `documents` / `tool_call_kwargs` keep
+    /// strict-undefined empty defaults so templates probing them don't raise.
     pub fn render_messages(
         &self,
         messages: &[Message],
@@ -1401,14 +1435,19 @@ impl<'a> JinjaChatFrame<'a> {
                 String::from_utf8_lossy(&bytes).to_string()
             }
         };
-        // Strict-undefined empty defaults so templates that probe
-        // `tools` / `documents` / `tool_call_kwargs` on plain turns
-        // don't raise. Caller-provided values override the empties.
+        // HF passes every special token; Mistral v0.3 / Zephyr-style templates append
+        // `eos_token` to each assistant turn and fail on an undefined one.
+        let eos_token =
+            String::from_utf8_lossy(&self.tokenizer.decode_bytes(&[self.tokenizer.eos_id]))
+                .to_string();
+        // HF passes `tools=None` on plain turns: Llama-3.x renders its tool
+        // preamble on `tools is not none`, so an empty list is not neutral.
+        // `documents` / `tool_call_kwargs` keep empty defaults.
         let empty_list: Vec<serde_json::Value> = Vec::new();
         let empty_map = serde_json::Map::new();
         let tools_val = match tools {
             Some(t) => Value::from_serialize(t),
-            None => Value::from_serialize(&empty_list),
+            None => Value::from(()),
         };
         let kwargs_val = match tool_call_kwargs {
             Some(k) => Value::from_serialize(k),
@@ -1460,6 +1499,7 @@ impl<'a> JinjaChatFrame<'a> {
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
+            eos_token => eos_token,
             reasoning_strength => reasoning_strength_val,
             reasoning_effort => reasoning_effort_val,
             tools => tools_val,
@@ -1480,8 +1520,12 @@ impl<'a> JinjaChatFrame<'a> {
 /// Returns `None` if fewer than `n` distinct sentinels exist; the caller then
 /// falls back to a plain render. Distinctness within a turn is what makes a
 /// channel shift detectable; recycling the same set across turns keeps the pool
-/// bounded (`k = 1 + max_tool_slots + 1`).
-fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>> {
+/// bounded (`k = 1 + max_tool_slots + 1`). A candidate whose id is in `avoid`
+/// (the plain render's own tokens) is skipped: a sentinel the prompt already
+/// contains cannot be told from the real one, and the `pad` tier would
+/// otherwise pick a VL tokenizer's `<|image_pad|>` for every conversation with
+/// an image in it.
+fn pick_splice_sentinels(tok: &Tokenizer, n: usize, avoid: &[u32]) -> Option<Vec<(String, u32)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1550,11 +1594,20 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
             deduped.push((s, id));
         }
     }
-    if deduped.len() < n {
+    let mut picked: Vec<(String, u32)> = Vec::with_capacity(n);
+    for (s, id) in deduped {
+        if picked.len() == n {
+            break;
+        }
+        if avoid.contains(&id) {
+            continue;
+        }
+        picked.push((s, id));
+    }
+    if picked.len() < n {
         return None;
     }
-    deduped.truncate(n);
-    Some(deduped)
+    Some(picked)
 }
 
 /// Does this template already emit `primer` at the head of a HISTORY
@@ -1810,7 +1863,7 @@ pub fn build_cached_history_jinja_with(
     }
     // 3. Pick k distinct sentinels, recycled across turns.
     let k = 1 + max_tool_slots + 1;
-    let sentinels = match pick_splice_sentinels(tok, k) {
+    let sentinels = match pick_splice_sentinels(tok, k, &plain_tokens) {
         Some(v) => v,
         None => return Ok(plain_tokens),
     };
@@ -2987,11 +3040,29 @@ mod tests {
         assert_ne!(spliced, plain);
     }
 
+    /// A sentinel the prompt already contains (a VL tokenizer's `<|image_pad|>`
+    /// is in the `pad` tier) is skipped, so a conversation with an image still
+    /// finds two distinct sentinels and its history splice is not abandoned.
+    #[test]
+    fn pick_splice_sentinels_skips_tokens_the_prompt_contains() {
+        let t = make_tokenizer();
+        let ids = |picked: Option<Vec<(String, u32)>>| -> Vec<u32> {
+            picked
+                .expect("enough sentinels")
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect()
+        };
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[])), vec![9, 10]);
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[9, 1, 2])), vec![10, 11]);
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[10])), vec![9, 11]);
+        assert!(pick_splice_sentinels(&t, 2, &[9, 10, 11, 12, 13]).is_none());
+    }
     #[test]
     fn pick_splice_sentinels_none_reaches_plain_render() {
         let t = test_tokenizer_no_think();
         // This tokenizer has no reserved tokens, so n=1 should be None
-        assert!(pick_splice_sentinels(&t, 1).is_none());
+        assert!(pick_splice_sentinels(&t, 1, &[]).is_none());
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
         let frame = JinjaChatFrame {
             tokenizer: &t,
@@ -3261,6 +3332,83 @@ mod tests {
         assert!(
             without_tools.contains("MSGS:user=hi;"),
             "messages must still render w/o tools: got {without_tools:?}",
+        );
+    }
+
+    #[test]
+    fn llama3_tool_probes_see_hf_none_shapes() {
+        // Llama-3.1/3.2 template predicates: `tools is not none` gates the
+        // tool preamble; `'tool_calls' in message` requires exactly one call.
+        let t = make_tokenizer();
+        let template = "{% if tools is not none %}PREAMBLE;{% endif %}{% for m in messages %}{% if 'tool_calls' in m %}{% if m.tool_calls|length != 1 %}{{ raise_exception('single tool-calls') }}{% endif %}CALL;{% else %}{{ m.role }}={{ m.content }};{% endif %}{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msg = |role, content: &str| Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let history = vec![
+            msg(Role::User, "a"),
+            msg(Role::Assistant, "b"),
+            msg(Role::User, "c"),
+        ];
+        let rendered = frame.render_messages(&history, None, None).unwrap();
+        assert_eq!(rendered, "user=a;assistant=b;user=c;");
+    }
+
+    #[test]
+    fn mistral_v03_assistant_turns_end_with_eos_token() {
+        // Mistral v0.3 plain-assistant branch appends `eos_token`; HF passes it,
+        // and an undefined one makes `+` raise (Plain fallback).
+        let t = make_tokenizer();
+        let eos = String::from_utf8_lossy(&t.decode_bytes(&[t.eos_id])).to_string();
+        assert!(!eos.is_empty());
+        let template = "{%- for message in messages %}{%- if message['role'] == 'user' %}{{- '[INST] ' + message['content'] + '[/INST]' }}{%- elif message.tool_calls is defined and message.tool_calls is not none %}{{- '[TOOL_CALLS] [' }}{%- elif message['role'] == 'assistant' %}{{- ' ' + message['content']|trim + eos_token }}{%- endif %}{%- endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msg = |role, content: &str| Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let history = vec![
+            msg(Role::User, "a"),
+            msg(Role::Assistant, "b"),
+            msg(Role::User, "c"),
+            msg(Role::Assistant, "d"),
+            msg(Role::User, "e"),
+        ];
+        let rendered = frame.render_messages(&history, None, None).unwrap();
+        assert_eq!(
+            rendered,
+            format!("[INST] a[/INST] b{eos}[INST] c[/INST] d{eos}[INST] e[/INST]")
         );
     }
 

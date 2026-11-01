@@ -1685,6 +1685,7 @@ impl SlotBackend {
             tools,
             enable_grammar: self.tool_grammar,
             stop,
+            min_tokens: 0,
             max_think: 0,
             max_tokens,
             assistant_prefix: prefix,
@@ -2603,6 +2604,14 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // so a malformed field is a 400, not a silently dropped constraint.
     if let Err(e) = hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
         return Some(e);
+    }
+    // `min_tokens` holds EOS and stops inactive; the slot engine's EOS checks
+    // know nothing of it. Zero is neutral, anything else is refused.
+    if msg
+        .get("min_tokens")
+        .is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))
+    {
+        return Some("min_tokens not supported in experimental multi-slot".to_string());
     }
     // logprobs/top_logprobs are supported on the slot path: the engine
     // forces AR and attaches per-token log-probabilities. Validate the
@@ -3761,6 +3770,13 @@ mod tests {
                 validate_generate_caps(&bad).is_some(),
                 "malformed logprobs must be refused: {bad}"
             );
+        }
+        // `min_tokens` has no EOS gate in the slot engine: refused above zero.
+        let m4 = json!({"min_tokens": 4, "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m4).is_some());
+        for neutral in [json!(0), json!(null)] {
+            let m5 = json!({"min_tokens": neutral, "experimental_multi_slot": true});
+            assert!(validate_generate_caps(&m5).is_none());
         }
         // Finite think caps are ENFORCED (the grammar cursor force-closes the
         // span at the budget) and are therefore never refused at the door —

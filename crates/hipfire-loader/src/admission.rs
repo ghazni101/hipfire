@@ -172,7 +172,10 @@ pub struct KvBackendHints<'a> {
     pub kv_adaptive: Option<&'a str>,
     pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
     pub deepseek4_heterogeneous: bool,
-    pub vmm_runtime_available: bool,
+    /// Why this device's runtime cannot back the VMM backend (granularity
+    /// query or virtual-address reservation failed, see
+    /// `Gpu::vmm_runtime_refusal`), or `None` when it can.
+    pub vmm_runtime_refusal: Option<&'a str>,
     /// Free device bytes before this load, queried from HIP at admission.
     pub free_vram_bytes: Option<usize>,
 }
@@ -187,7 +190,7 @@ impl KvBackendHints<'_> {
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: false,
+            vmm_runtime_refusal: Some("no device was probed"),
             free_vram_bytes: None,
         }
     }
@@ -339,6 +342,185 @@ pub(crate) fn qwen4_native_mtp_for_head(
              load a profile with an MTP head or leave speculation.mtp unset"
         )),
         (false, _) => Ok(false),
+    }
+}
+
+/// Whether the base's metadata declares `qwen4_recipe.id == "stock-fp8"`.
+pub(crate) fn stock_fp8_base(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    serde_json::from_str::<serde_json::Value>(&hfq.metadata_json)
+        .ok()
+        .and_then(|meta| {
+            meta.pointer("/qwen4_recipe/id")
+                .and_then(|id| id.as_str().map(|id| id == "stock-fp8"))
+        })
+        .unwrap_or(false)
+}
+
+/// What the §7.1 policy table decided for one load.
+#[derive(Debug)]
+pub struct StockMtpDecision<T> {
+    /// The bound sidecar to attach (`None` = AR).
+    pub sidecar: Option<T>,
+    /// L1 `REFUSED` line (auto, bind failed).
+    pub refused: Option<String>,
+}
+
+impl<T> StockMtpDecision<T> {
+    fn ar() -> Self {
+        Self {
+            sidecar: None,
+            refused: None,
+        }
+    }
+}
+
+/// The §7.1 table with the filesystem passed in. `off` calls neither closure (never
+/// stats, never opens); `auto` stats the sidecar and, only when it exists, binds it
+/// (bound = attach, bind failed = L1 REFUSED line and AR); `on` refuses
+/// R1 (absent) or R2 (bind failed) before any allocation.
+pub(crate) fn stock_mtp_decision<T>(
+    mode: hipfire_config::MtpMode,
+    path: &std::path::Path,
+    exists: impl FnOnce() -> bool,
+    bind: impl FnOnce() -> Result<T, String>,
+) -> Result<StockMtpDecision<T>, String> {
+    use hipfire_config::MtpMode;
+    match mode {
+        MtpMode::Off => Ok(StockMtpDecision::ar()),
+        MtpMode::Auto => {
+            if !exists() {
+                return Ok(StockMtpDecision::ar());
+            }
+            Ok(match bind() {
+                Ok(bound) => StockMtpDecision {
+                    sidecar: Some(bound),
+                    ..StockMtpDecision::ar()
+                },
+                Err(reason) => StockMtpDecision {
+                    refused: Some(
+                        hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(
+                            path, &reason,
+                        ),
+                    ),
+                    ..StockMtpDecision::ar()
+                },
+            })
+        }
+        MtpMode::On => {
+            if !exists() {
+                return Err(format!(
+                    "qwen4: native MTP (--spec mtp) needs the stock-FP8 MTP head sidecar {}, which does not \
+                     exist; build it with `hipfire-quantize --recipe stock-fp8-mtp-sidecar --input <fp8-checkpoint-dir> --base <model>` \
+                     (2.70 GB) or leave speculation.mtp unset",
+                    path.display()
+                ));
+            }
+            match bind() {
+                Ok(bound) => Ok(StockMtpDecision {
+                    sidecar: Some(bound),
+                    ..StockMtpDecision::ar()
+                }),
+                Err(reason) => Err(format!(
+                    "qwen4: native MTP (--spec mtp) refused: stock-FP8 MTP sidecar {}: {reason}; rebuild it \
+                     against this base or leave speculation.mtp unset",
+                    path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// Resolve the stock-FP8 head sidecar beside `hfq`'s own path. A base that is not the
+/// stock-FP8 recipe never has one.
+pub fn resolve_stock_mtp_sidecar(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    spec_mtp: Option<bool>,
+) -> Result<StockMtpDecision<hipfire_arch_qwen4::stock_mtp_sidecar::BoundStockMtpSidecar>, String> {
+    let mode = hipfire_config::MtpMode::from_tri_state(spec_mtp);
+    if mode == hipfire_config::MtpMode::Off || !stock_fp8_base(hfq) {
+        return Ok(StockMtpDecision::ar());
+    }
+    let path = hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(hfq.path());
+    stock_mtp_decision(
+        mode,
+        &path,
+        || std::fs::metadata(&path).is_ok(),
+        || hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(hfq, &path),
+    )
+}
+
+/// The sidecar index sha256 admission bound for each model path (`None` = AR), so the
+/// carrier can refuse a sidecar that changed in between (R7).
+static ADMITTED_STOCK_MTP: std::sync::Mutex<
+    Option<std::collections::BTreeMap<std::path::PathBuf, Option<[u8; 32]>>>,
+> = std::sync::Mutex::new(None);
+
+pub(crate) fn record_admitted_stock_mtp(model: &std::path::Path, index_sha256: Option<[u8; 32]>) {
+    ADMITTED_STOCK_MTP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(model.to_path_buf(), index_sha256);
+}
+
+/// R7 against the admission record for `model` (no record = no admission ran here).
+pub(crate) fn check_admitted_stock_mtp(
+    model: &std::path::Path,
+    sidecar_path: &std::path::Path,
+    bound: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let admitted = ADMITTED_STOCK_MTP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(model).copied());
+    match admitted {
+        Some(admitted) => stock_mtp_r7(sidecar_path, admitted, bound),
+        None => Ok(()),
+    }
+}
+
+/// R7: the sidecar the carrier bound differs from the one admission bound.
+pub(crate) fn stock_mtp_r7(
+    path: &std::path::Path,
+    admitted: Option<[u8; 32]>,
+    bound: Option<[u8; 32]>,
+) -> Result<(), String> {
+    if admitted == bound {
+        return Ok(());
+    }
+    let hex = |sha: Option<[u8; 32]>| {
+        sha.map_or_else(
+            || "none".to_string(),
+            |sha| sha.iter().map(|byte| format!("{byte:02x}")).collect(),
+        )
+    };
+    Err(format!(
+        "qwen4: stock-FP8 MTP sidecar {} changed between admission and load (index sha256 {} -> {}); reload",
+        path.display(),
+        hex(admitted),
+        hex(bound)
+    ))
+}
+
+/// The cache-domain identity of an attached head: a session or prefix snapshot taken
+/// with one head is never served under another head or under none.
+pub(crate) fn stock_mtp_domain_digest(
+    index_sha256: &[u8; 32],
+) -> hipfire_runtime::serve_contract::Digest {
+    hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+        b"qwen4-mtp-sidecar",
+        index_sha256.as_slice(),
+    ])
+}
+
+/// Push [`stock_mtp_domain_digest`] into `sidecar_digests` iff the head is attached.
+pub(crate) fn push_stock_mtp_domain_digest(
+    sidecar_digests: &mut Vec<hipfire_runtime::serve_contract::Digest>,
+    index_sha256: Option<&[u8; 32]>,
+) {
+    if let Some(index_sha256) = index_sha256 {
+        sidecar_digests.push(stock_mtp_domain_digest(index_sha256));
     }
 }
 
@@ -519,6 +701,16 @@ pub struct Qwen4SourceAdmission {
     pub modality: InputModality,
     pub native_mtp: bool,
     pub manifest_source_tensors: usize,
+    /// The stock-FP8 MTP head sidecar that bound at admission (`None` = AR only).
+    pub mtp_sidecar: Option<Qwen4MtpSidecarAdmission>,
+}
+
+/// Path and index sha256 of the sidecar admission bound; the carrier rebinds and
+/// must see the same index sha256 (R7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen4MtpSidecarAdmission {
+    pub path: std::path::PathBuf,
+    pub index_sha256: [u8; 32],
 }
 
 /// Refuse unsupported Qwen4 request dimensions before touching source records.
@@ -1000,8 +1192,26 @@ pub fn admit_qwen4_source(
     let ModelSource::Hfq(hfq) = source else {
         return Err(QWEN4_SAFETENSORS_REFUSAL.into());
     };
-    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(gpu_arch))
-        .map_err(|error| error.to_string())?;
+    // §7.1: the stock-FP8 head sidecar is resolved before artifact admission and only
+    // when the base is the stock-FP8 recipe. `off` never touches the filesystem.
+    let decision = resolve_stock_mtp_sidecar(hfq, spec_mtp)?;
+    if let Some(refused) = &decision.refused {
+        eprintln!("{refused}");
+    }
+    let mtp_sidecar = decision.sidecar;
+    if stock_fp8_base(hfq) {
+        record_admitted_stock_mtp(
+            hfq.path(),
+            mtp_sidecar.as_ref().map(|bound| bound.index_sha256),
+        );
+    }
+    let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+        hfq,
+        Some(gpu_arch),
+        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        mtp_sidecar.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     // An inventory-valid developer profile the executor cannot run (a
     // synthetic MoE, a RoPE base the QSA kernels lack, a build without
     // `qwen4-dev-profiles`) is refused here, not after the weights upload.
@@ -1035,6 +1245,7 @@ pub fn admit_qwen4_source(
         effective_mesh,
         native_mtp,
         host_mapped_experts && receipt.recipe().fp8_experts(),
+        mtp_sidecar.is_some(),
     )
     .map_err(|error| error.to_string())?;
     qwen4_developer_ple_policy(
@@ -1049,6 +1260,10 @@ pub fn admit_qwen4_source(
         modality,
         native_mtp,
         manifest_source_tensors: receipt.source_tensor_count,
+        mtp_sidecar: mtp_sidecar.as_ref().map(|bound| Qwen4MtpSidecarAdmission {
+            path: bound.path.clone(),
+            index_sha256: bound.index_sha256,
+        }),
     })
 }
 
@@ -2605,6 +2820,19 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    // #1136: a Qwen3.5/3.6 weight format with no wave64 GEMV is refused here,
+    // before topology and any allocation, instead of failing the first forward.
+    if let ModelSource::Hfq(hfq) = &source {
+        if let Some(refusal) = hipfire_arch_qwen35::carrier::wave64_gemv_refusal(
+            arch_id,
+            gpu_arch,
+            hfq.tensor_infos()
+                .iter()
+                .map(|t| (t.name.as_str(), t.quant_type)),
+        ) {
+            return Err(refusal);
+        }
+    }
     // The carrier is resolved once for every topology; its declared axes
     // decide every multi-card request before any other topology verdict
     // (`ep`, then `tp`, then `pp`; one uniform sentence per refused axis). A
@@ -2814,17 +3042,16 @@ pub fn admit_source_with_options(
     // its capability replaces the Qwen/KvCache predicates below; its
     // topology is Single by the refusals above.
     let unsupported = if arch_id == QWEN4_ARCH_ID {
-        hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_available)
+        hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_refusal.is_none())
     } else if heterogeneous_reason {
         Some(
             "this mixed-GPU DeepSeek setup keeps its compressor cache in a layout the VMM backend cannot manage"
                 .to_string(),
         )
-    } else if !hints.vmm_runtime_available {
-        Some(
-            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs"
-                .to_string(),
-        )
+    } else if let Some(refusal) = hints.vmm_runtime_refusal {
+        Some(format!(
+            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs ({refusal})"
+        ))
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -3081,6 +3308,7 @@ pub fn admit_source_with_options(
                             | kv_mode::KvPair::Split(KvMode::Q8, kv_mode::VMode::Q8)
                     ),
                 kv_backend,
+                hints.vmm_runtime_refusal.is_some(),
             )?;
         }
         let k = pair.k();
@@ -3867,10 +4095,17 @@ mod tests {
         );
         // A `.mq4r` load on a retained-default GPU is the retained AR route.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1201", mq4r, 1, 1, 1),
             Ok(false)
         );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1, 1).is_err());
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1201", mq4r, 1, 1, 1).is_err());
+        // gfx1100/gfx1151 never retain Qwen4 (HIPF-254): the head stays on.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
+            assert_eq!(
+                qwen4_native_mtp(with(None), gpu_arch, mq4r, 1, 1, 1),
+                Ok(true)
+            );
+        }
         // Off the retained-default GPUs the name does not claim the load.
         assert_eq!(
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
@@ -4856,7 +5091,7 @@ mod tests {
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: None,
             };
             let admit = |request, arch| {
@@ -4877,6 +5112,80 @@ mod tests {
                 .map(|_| ())
                 .unwrap_err();
             assert!(error.contains("gfx940") && error.contains("legacy"));
+            cleanup(&trunk);
+        }
+        /// #1058: a runtime whose `hipMemAddressReserve` fails must resolve the
+        /// automatic backend to legacy at admission (before any weight is
+        /// uploaded), with the failure in the reason, instead of choosing VMM
+        /// and failing the load after the weights. An explicit `vmm` refuses
+        /// with the fix named; an explicit `legacy` is untouched.
+        #[test]
+        fn automatic_backend_falls_back_to_legacy_when_the_runtime_cannot_reserve_va() {
+            let trunk = write_hfq("kv-va-refusal", 5, false);
+            let path = trunk.to_str().unwrap();
+            let refusal = "a probe reservation of virtual address space failed: \
+                           HipError(2): hipMemAddressReserve: out of memory";
+            let hints = |vmm_runtime_refusal| KvBackendHints {
+                kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
+                kv_adaptive: None,
+                cask: None,
+                deepseek4_heterogeneous: false,
+                vmm_runtime_refusal,
+                free_vram_bytes: None,
+            };
+            let admit = |request, arch, refusal| {
+                super::super::admit_source(
+                    path,
+                    1,
+                    1,
+                    request,
+                    None,
+                    arch,
+                    None,
+                    "auto",
+                    None,
+                    16384,
+                    hints(refusal),
+                )
+            };
+            for arch in ["gfx1100", "gfx1201"] {
+                let healthy = admit(KvBackendRequest::Automatic, arch, None).unwrap();
+                assert_eq!(healthy.kv_backend, KvBackend::Vmm, "{arch}");
+                let fallback = admit(KvBackendRequest::Automatic, arch, Some(refusal)).unwrap();
+                assert_eq!(fallback.kv_backend, KvBackend::Legacy, "{arch}");
+                let reason = fallback.kv_backend_reason.as_deref().unwrap();
+                assert!(reason.contains("hipMemAddressReserve"), "{arch}: {reason}");
+                let warning =
+                    legacy_warning(fallback.kv_backend, fallback.kv_backend_reason.as_deref())
+                        .unwrap();
+                assert!(
+                    warning.contains("hipMemAddressReserve"),
+                    "{arch}: {warning}"
+                );
+                let explicit_vmm = admit(
+                    KvBackendRequest::Explicit(KvBackend::Vmm),
+                    arch,
+                    Some(refusal),
+                )
+                .map(|_| ())
+                .unwrap_err();
+                assert!(
+                    explicit_vmm.contains("hipMemAddressReserve")
+                        && explicit_vmm.contains("--kv-backend legacy"),
+                    "{arch}: {explicit_vmm}"
+                );
+                let explicit_legacy = admit(
+                    KvBackendRequest::Explicit(KvBackend::Legacy),
+                    arch,
+                    Some(refusal),
+                )
+                .unwrap();
+                assert_eq!(explicit_legacy.kv_backend, KvBackend::Legacy, "{arch}");
+                assert!(explicit_legacy.kv_backend_reason.is_none(), "{arch}");
+            }
             cleanup(&trunk);
         }
         /// P2: the V axis admission sizes VMM KV with is the one the carrier
@@ -4946,7 +5255,7 @@ mod tests {
         fn gfx1151_fwht_k_override_refuses_instead_of_legacy_fallback() {
             let trunk = write_hfq("kv-axis-refusal", 5, false);
             let path = trunk.to_str().unwrap();
-            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available| {
+            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available: bool| {
                 super::super::admit_source(
                     path,
                     1,
@@ -4966,7 +5275,8 @@ mod tests {
                         kv_adaptive: None,
                         cask: None,
                         deepseek4_heterogeneous: false,
-                        vmm_runtime_available,
+                        vmm_runtime_refusal: (!vmm_runtime_available)
+                            .then_some("the test runtime has no VMM"),
                         free_vram_bytes: None,
                     },
                 )
@@ -5040,7 +5350,7 @@ mod tests {
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: Some(24 << 30),
             };
             let omitted = super::super::admit_source(
@@ -5118,7 +5428,7 @@ mod tests {
             std::fs::write(dir.join("model.safetensors"), shard).unwrap();
             let hints = KvBackendHints {
                 kv_mode: Some("q8"),
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: Some(96 << 30),
                 ..KvBackendHints::without_device()
             };
@@ -7414,5 +7724,153 @@ mod qwen4_pp_admission_tests {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_dir(path.parent().unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod stock_mtp_policy_tests {
+    use super::*;
+    use hipfire_config::MtpMode;
+    use std::cell::Cell;
+    use std::path::Path;
+
+    const P: &str = "/unreadable/model.hfq.mtp";
+
+    /// Run one cell of the §7.1 table; returns the decision and how often each
+    /// closure ran (`exists`, `bind`).
+    fn cell(
+        mode: MtpMode,
+        present: bool,
+        binds: bool,
+    ) -> (Result<StockMtpDecision<u8>, String>, u32, u32) {
+        let stats = Cell::new(0u32);
+        let opens = Cell::new(0u32);
+        let decision = stock_mtp_decision(
+            mode,
+            Path::new(P),
+            || {
+                stats.set(stats.get() + 1);
+                present
+            },
+            || {
+                opens.set(opens.get() + 1);
+                if binds {
+                    Ok(7u8)
+                } else {
+                    Err("tensor x: payload sha256 a differs from the manifest's b".to_string())
+                }
+            },
+        );
+        (decision, stats.get(), opens.get())
+    }
+
+    #[test]
+    fn off_never_stats_or_opens_even_for_an_unreadable_path() {
+        for (present, binds) in [(false, false), (true, true), (true, false)] {
+            let (decision, stats, opens) = cell(MtpMode::Off, present, binds);
+            let decision = decision.unwrap();
+            assert!(decision.sidecar.is_none());
+            assert!(decision.refused.is_none());
+            assert_eq!((stats, opens), (0, 0));
+        }
+        // The resolver short-circuits `off` before computing the path at all.
+        assert_eq!(
+            MtpMode::from_tri_state(Some(false)),
+            MtpMode::Off,
+            "--spec off lowers to the off row"
+        );
+    }
+
+    #[test]
+    fn auto_attaches_a_bound_sidecar_logs_l1_on_bind_failure_and_is_silent_when_absent() {
+        // Absent: AR, silent, stat once, never opened.
+        let (absent, stats, opens) = cell(MtpMode::Auto, false, false);
+        let absent = absent.unwrap();
+        assert!(absent.sidecar.is_none() && absent.refused.is_none());
+        assert_eq!((stats, opens), (1, 0));
+        // Present and binds: attach, no REFUSED line.
+        let (bound, _, opens) = cell(MtpMode::Auto, true, true);
+        let bound = bound.unwrap();
+        assert_eq!(bound.sidecar, Some(7));
+        assert!(bound.refused.is_none());
+        assert_eq!(opens, 1);
+        // Present, bind fails: AR plus the L1 REFUSED line.
+        let (failed, _, _) = cell(MtpMode::Auto, true, false);
+        let failed = failed.unwrap();
+        assert!(failed.sidecar.is_none());
+        let line = failed.refused.unwrap();
+        assert!(
+            line.contains("REFUSED") && line.contains(P) && line.contains("AR only"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn on_refuses_r1_when_absent_and_r2_when_the_bind_fails_else_attaches() {
+        let (absent, _, opens) = cell(MtpMode::On, false, false);
+        let r1 = absent.unwrap_err();
+        assert!(
+            r1.starts_with("qwen4: native MTP (--spec mtp) needs the stock-FP8 MTP head sidecar")
+                && r1.contains(P)
+                && r1.contains("which does not exist")
+                && r1.contains("--recipe stock-fp8-mtp-sidecar"),
+            "{r1}"
+        );
+        assert_eq!(opens, 0);
+        let (failed, _, _) = cell(MtpMode::On, true, false);
+        let r2 = failed.unwrap_err();
+        assert!(
+            r2.starts_with("qwen4: native MTP (--spec mtp) refused: stock-FP8 MTP sidecar")
+                && r2.contains(P)
+                && r2.contains("payload sha256 a differs")
+                && r2.ends_with("rebuild it against this base or leave speculation.mtp unset"),
+            "{r2}"
+        );
+        let (bound, _, opens) = cell(MtpMode::On, true, true);
+        assert_eq!(bound.unwrap().sidecar, Some(7));
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn r7_names_both_index_digests() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(stock_mtp_r7(Path::new(P), Some(a), Some(a)).is_ok());
+        assert!(stock_mtp_r7(Path::new(P), None, None).is_ok());
+        let error = stock_mtp_r7(Path::new(P), Some(a), Some(b)).unwrap_err();
+        assert!(
+            error.contains(P)
+                && error.contains("changed between admission and load")
+                && error.contains(&"01".repeat(32))
+                && error.contains(&format!("{} -> {}", "01".repeat(32), "02".repeat(32)))
+                && error.ends_with("; reload"),
+            "{error}"
+        );
+        assert!(stock_mtp_r7(Path::new(P), Some(a), None)
+            .unwrap_err()
+            .contains("-> none"));
+    }
+
+    #[test]
+    fn cache_domain_digest_is_pushed_iff_the_head_is_attached() {
+        let index = [9u8; 32];
+        let mut digests = vec![vec![1u8]];
+        push_stock_mtp_domain_digest(&mut digests, None);
+        assert_eq!(digests, vec![vec![1u8]]);
+        push_stock_mtp_domain_digest(&mut digests, Some(&index));
+        assert_eq!(digests.len(), 2);
+        assert_eq!(
+            digests[1],
+            hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+                b"qwen4-mtp-sidecar".as_slice(),
+                index.as_slice()
+            ])
+        );
+        let mut other = Vec::new();
+        push_stock_mtp_domain_digest(&mut other, Some(&[8u8; 32]));
+        assert_ne!(
+            other[0], digests[1],
+            "a different head is a different domain"
+        );
     }
 }

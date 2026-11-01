@@ -511,6 +511,24 @@ fn emit_active_error_route_aware(
     }
 }
 
+/// The HIP runtime's out-of-memory text (`hipMalloc: out of memory`, `hipMemCreate: out of memory`).
+pub(crate) const DEVICE_OUT_OF_MEMORY: &str = "out of memory";
+
+/// The wire class and retryability of a fail-closed error. A device that ran out of memory is a
+/// capacity condition, never the client's fault: `overload` + retryable (HTTP 503 with
+/// `Retry-After`), whatever class the failing step names. Every other failure keeps its class.
+pub(crate) fn fail_closed_wire<'a>(
+    message: &str,
+    class: &'a str,
+    retryable: bool,
+) -> (&'a str, bool) {
+    if message.contains(DEVICE_OUT_OF_MEMORY) {
+        ("overload", true)
+    } else {
+        (class, retryable)
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -525,6 +543,7 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
     let _ = stdout.flush();
 }
@@ -545,6 +564,7 @@ pub fn emit_fail_closed_error_for_route(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     crate::ar::emit_generation_error(
         route,
         stdout,
@@ -1118,6 +1138,29 @@ pub fn reset_qwen35_recurrent(
     }
 }
 
+/// Cold start that keeps the assistant-turn cache: the attested rollback
+/// ([`production_fail_closed_rollback`], the one reset owner the daemon's
+/// `reset` command uses, which clears the cache) with the cache moved out and
+/// back. Entries are keyed by an assistant turn's content, not its position,
+/// and map it to the exact tokens the model emitted, so they stay valid across
+/// an ordinary cold start; dropping them would make the next turn's history
+/// render diverge from the KV it has just written and every following turn
+/// start cold. Used by the vision turn that cannot continue the resident
+/// conversation and by the decide session's cold start.
+pub fn cold_reset_keep_turn_cache(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let turns = std::mem::replace(
+        &mut m.asst_turn_cache,
+        hipfire_loader::AsstTurnCache::new_from_env(),
+    );
+    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    m.asst_turn_cache = turns;
+    m.vl_image_fingerprints.clear();
+    epilogue
+}
+
 /// Reset Qwen4's complete request owner (PLE epoch plus every recurrent/QSA/
 /// hyper-connection buffer).  Unlike the legacy Qwen3.5 helper this delegates
 /// to the bundle's fallible reset so PLE worker invalidation and GPU state
@@ -1447,6 +1490,9 @@ pub fn fail_closed_reset_target_and_spec(
         if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
         }
+        if let Some(b) = m.dots_ocr_mut() {
+            b.state.reset();
+        }
         if let Some(b) = m.qwen2_mut() {
             b.state.reset();
         }
@@ -1619,6 +1665,8 @@ pub struct SpecEmitRequest {
     /// runs when `tools` is `Some`).
     pub enable_grammar: bool,
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens` (0 ⇒ none); see `SpecEmitCtx::min_tokens`.
+    pub min_tokens: usize,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
@@ -2234,5 +2282,38 @@ mod tests {
         super::emit_prefill_progress(&mut none, "r1", Some(4), 4096, 4096);
         super::emit_prefill_progress(&mut none, "r1", Some(4), 512, 512);
         assert!(none.is_empty(), "no event at done == total");
+    }
+
+    #[test]
+    fn device_out_of_memory_fails_closed_as_a_retryable_overload() {
+        // cp9 j8160: a single-card singleton prefill that ran out of device memory reached the
+        // client as HTTP 400 `invalid_request_error` (class `validation`).
+        let oom = "prefill: Qwen4 bundle forward: Qwen4 GPU forward dispatch error: execute Qwen4 \
+                   layer program: Hip(\"HipError(2): hipMalloc: out of memory\")";
+        assert_eq!(
+            super::fail_closed_wire(oom, "validation", false),
+            ("overload", true)
+        );
+        assert_eq!(
+            super::fail_closed_wire(
+                "QSA context map failed: HipError(2): hipMemCreate: out of memory",
+                "gpu",
+                false
+            ),
+            ("overload", true)
+        );
+        // Every other failure keeps the class and retryability its call site names.
+        assert_eq!(
+            super::fail_closed_wire(
+                "think token budget exceeded (validation)",
+                "validation",
+                false
+            ),
+            ("validation", false)
+        );
+        assert_eq!(
+            super::fail_closed_wire("busy", "transient", true),
+            ("transient", true)
+        );
     }
 }

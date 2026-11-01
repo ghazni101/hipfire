@@ -16,7 +16,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
 | `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client, only on a host with a gfx1151 GPU (or no detected GPU); a gfx1100/gfx1201 host skips it. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
-| `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
+| `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 and 7900 XTX decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
@@ -165,6 +165,38 @@ weights and `=1` applies the overlay on any architecture.
   (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
   or served as models.
 
+### Flash-Next HC8 sidecar
+
+`<model>.hc8` is an optional sidecar of a Flash-Next (Qwen4) base: the
+hyper-connection mixer weights (`*input_mix_weight_down.weight` and
+`*input_mix_weight_up.weight` of every attn/mlp hyper connection, the final
+mixer, and the MTP ones when the base carries them) requantized offline from
+BF16 to 8-bit OCP E4M3 with one power-of-two f32 scale per output row. Every
+dequantized weight is exactly a BF16 value. The format is described in
+[`quant-formats/hc8-e4m3-row.md`](quant-formats/hc8-e4m3-row.md).
+
+- **Build.** `hipfire-quantize hc8 build --model <base> [--out <base>.hc8]
+  [--force]` reads the BF16 mixer tensors of the base (no GPU), writes the
+  sidecar, re-binds and re-reads it as a self-check, and prints a JSON report.
+  An existing output is refused unless `--force`.
+- **Placement.** The file is named `<model file name>.hc8`, next to the base
+  (the full file name plus `.hc8`), and is bound to that base by its length and
+  index sha256; a mismatching sidecar is refused with one log line and the BF16
+  base weights load.
+- **Default on, exact gfx1201.** When the sidecar is present the loader applies
+  it by default on exact gfx1201 only; other architectures load the BF16 base
+  untouched. `HIPFIRE_QWEN4_HC8=0` is the kill switch: the sidecar is ignored
+  and the BF16 weights load bit for bit as without it.
+
+- **Pull.** The client carries one pin, not the registry (the trunk-overlay
+  convention): `qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8` (659649536 B,
+  sha256 `2adf32e5…`) in the `hipfire-models/qwen3.8-flash-next` repo, matched
+  by the base's exact size (70888270360 B) and SHA-256 (`27dfff66…`, the
+  symmetric-trunk base). `hipfire pull <tag>` of an entry whose base matches
+  fetches it next to the base on a host with a gfx1201 GPU or no detected GPU
+  and skips it elsewhere; the stock split base (`eafaff94…`) has no pin.
+  `hipfire rm` removes it with its base.
+
 ### Flash-Next expert hotset
 
 The same four stock Flash-Next MQ4 XTS tags (one base artifact, sha256
@@ -178,7 +210,7 @@ published registry.
 
 - **Pull.** `hipfire pull <tag>` selects the hotset by default. On a terminal
   the interactive pull prompt has an independent default-on yes/no choice,
-  **Expert hot set (R9700 decode, 213 KB)**, shown in the summary only when
+  **Expert hot set (R9700 and 7900 XTX decode, 213 KB)**, shown in the summary only when
   selected (`--yes` and the TUI's Models-tab pull take the default); the "213 KB" is
   the rounded display label, the pinned file is 217676 B (~213 KiB). The hotset
   is downloaded and SHA-256 verified with the other sidecars to the sidecar path
@@ -469,13 +501,13 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. Every bench load is text-only (`vision_mode=off` is pinned whatever `vision.mode` resolves to: bench has no media input, and the default `auto` would otherwise add the ~0.9 GiB tower and shrink the load's measured capacity). `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields and the loaded `topology` (`{pp,tp,ep,cards[]}`, [below](#bench-matrix-topology)), and each row carries a `power` entry per run. |
 | `hipfire bench <model> --spec <m> ...` | Every bench generate sends greedy sampling with the neutral `repeat_penalty 1.0` (any other value routes the daemon to the plain AR decoder), so `--spec mtp\|dflash\|ngram\|dspark\|auto` measures the speculative decoder and `--spec off` the AR decoder on the same workload. JSON records `spec_requested`, a per-run `spec_route` (`"mtp"`, `"mtp+ngram"`, `"dflash"`, a daemon `spec` name, or `null` when AR ran) and per-run `spec_tau`; when `--spec` is not `off` but no run speculated, the bench prints a `warning:` and adds it to `warnings`. The `load_speculation` block records `mtp_mode` as requested beside `mtp_effective`, the daemon's `loaded` ack `mtp_mode_effective`: `auto` on a producer without a measured AR floor (Qwen3.5-class, DeepSeek V4) is effective `off`, so a `null` `spec_route` there is the capability gate rather than a failed attach, and `--spec mtp` measures the head (`mtp_effective` is `null` when the daemon or route reports none, as on EP loads). `spec_tau` averages over every window, including native MTP's AR floor tokens, which draft nothing, so a request the floor retired reads near zero whatever its drafts accepted. The per-run `spec_mtp` (`null` unless native MTP ran) splits the windows: `windows_mtp` (windows before retirement: native and n-gram windows plus the floor's timed AR tokens), `windows_floor_ar` (those timed AR tokens: the calibration token and any retirement probes), `windows_ar_retired` (head-free AR tokens after retirement), `retired_at` (index of the first retired window, `null` if the request never retired), `accepted` (the daemon's `done.accepted`) and `tau_mtp` = `accepted / (windows_mtp - windows_floor_ar)`, the acceptance of the windows that drafted (`null` from a daemon without `accepted` or `floor_ar_windows`). |
-| `hipfire bench <model> --concurrency 1,2,4,8 ...` | Closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). `--json` is not supported on this path. |
+| `hipfire bench <model> --concurrency 1,2,4,8 ...` | Closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/queue/TPOT p50/p99, decode concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). Every K>1 sample must pass an overlap check (streams actually decoding together) or its cell reads `FAIL (serialized)` and the run exits non-zero. `--json` prints the sweep with per-stream times and the verdicts. |
 | `hipfire bench <model> --emu <id\|off> ...` | SKU application-capacity profile for **every** spawned bench daemon arm (standard, `--matrix`, `--ttft`, `--concurrency`, `--exp`): sets `developer.emu` in each child's process snapshot, overrides `HIPFIRE_EMU` including `--emu off`, validates the id before anything spawns, and logs the effective value on stderr (`emu: effective profile ...`; silent when no profile is requested). The host still runs at full speed; only application memory capacity is capped. With a profile active the bench JSON `gpu` object (the daemon `diag`) gains an `emu` object (budgeted free/total, ledger); the `vram_free_mb`/`vram_total_mb` beside it stay physical. See [EMU.md](EMU.md). |
 | `hipfire emu list [-j\|--json]` | Print the SKU emulation registry: id, host gfx, target gfx, target CUs, memory, peak bandwidth, IC/L2, VGPR file, fidelity class. CPU-only. |
 | `hipfire emu validate <id> [-j\|--json] [--mib N ...]` | Start a fresh model-free daemon with `developer.emu=<id>` and run the `emu_validate` verb (finite eager/graph traffic and topology checks, ledger checks; `--mib` buffer sizes, 1..=2048, repeatable). Prints a summary plus the pretty receipt, or one raw JSON line with `--json`. Exits nonzero when the capacity, host-topology or graph section fails (or the receipt status is `fail`); `unavailable` is reported, not failed. The daemon refuses a request whose id differs from the installed profile, or a loaded model. Requires a compatible host (see [EMU.md](EMU.md)); GPU runs belong in the fabric scheduler. |
 | `hipfire emu estimate <id> --input FILE [-j\|--json]` | CPU-only derating **estimate** of the profile's target from a measured `DeratingInput` JSON (schema v1: run identity, host/target resource rates, per-kernel observations). Never starts a daemon, never touches HIP. The report keeps `measured` (input), `estimate` (model output; `estimated_wall_ns` is `null` with reasons when time closure, rates or identity are missing) and `target_profile` (registry metadata) apart. Exit 0 also when the estimate is `unavailable`; nonzero for unreadable or malformed input. |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
-| `hipfire diag [-j\|--json]` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
+| `hipfire diag [-j\|--json]` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. On Windows it also shows the process priority class and warns when it is Idle or BelowNormal (see [Windows — native](GETTING_STARTED.md#windows--native)). |
 | `hipfire --version` | Concise semver + build commit + source ref identity. |
 | `hipfire version [--json]` | Detailed build/source match, checkout state, target, config schema, and installed-daemon SHA-256. |
 | `hipfire update [REF]` | **Linux managed installs:** advance the current branch or auto-detect and install a branch/tag/commit; a leading `@` on `REF` is optional. |
@@ -507,6 +539,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 | `--warmups N` | Discarded warmup requests before the measured runs of the standard bench, `--ttft` and `--matrix`; default `10`. A standard-bench warmup is a full request with the same prompt and `--max-tokens` as a measured run, and `0` skips warmups entirely. The standard `--json` output records the count actually run as `warmups_run`. Not used by `--concurrency`, which always runs its own discarded warmup per K ([below](#bench-concurrency---concurrency)). |
 | `--ttft` | Client-side time to first token: per run, generate one token on the standard prompt and time request-send to first streamed token; reports `prompt_tokens` and TTFT. Standard path only (not with `--matrix`). |
 | `--max-tokens N` | Generated tokens per measured request: default `128` on the standard bench, `256` on the `--concurrency` `steady` shape. |
+| `--min-tokens N` | Hold EOS and stop sequences inactive until N tokens were generated (the daemon's vLLM-compatible `min_tokens`), clamped to each request's `--max-tokens`: fixed-length measured rows on a prompt the model would end early (the mq3 raw code prompt emits EOS after about 2 tokens). Unset sends no `min_tokens`. |
 | `--reasoning-on` | Let a reasoning model think during the bench (off by default, because a think span usually cannot close inside the benchmark's token budget and the daemon then fails that turn closed); pair with a large enough `--max-tokens`. |
 | `--spec <m>`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq` | Same contracts as on `run`/`serve`. |
 | `--prompt-file PATH` | Read the standard-bench prompt verbatim (raw bytes); mutually exclusive with positional prompt words. |
@@ -526,7 +559,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 | Backend | What it loads and sends |
 |---|---|
 | `batch` | The VMM continuous-batching route `hipfire serve` runs with `serve.vmm_batch` on: `continuous_batch_size` = max K (at least 2) plus the `serve_vmm_batch` load object built from `serve.batch_spec`, `serve.batch_nonexact`, `serve.max_batch_tokens` and `serve.prefill_min_tokens`. Requests are the chat requests serve forwards, with `serve_continuous_batch`. The driver refuses a daemon that did not stage `continuous_batch_route: "vmm"`. A lone request takes the singleton route, as under serve. |
-| `noslots` | No batching. The daemon serves one request at a time and the other lanes wait client-side, as serve queues them with batching off. The wait counts in TTFT. |
+| `noslots` | No batching. The daemon serves one request at a time and the other lanes wait client-side, as serve queues them with batching off. The wait is the `queue` column, not TTFT. Its K>1 cells fail the overlap check by construction. |
 | `slots` | The experimental multi-slot engine (`experimental_multi_slot`). |
 | `both` | All three, one after another. Only one daemon is resident at a time. |
 
@@ -538,17 +571,27 @@ The `multiturn` workload makes each request a two-turn chat. The follow-up ("Exp
 
 `--temperature` overrides the shape's temperature (default `0` for `steady`). The daemon has no `ignore_eos`, so `steady` fixes the output length by prompt choice: its prompts ask for answers longer than 256 tokens. Check that the `finish` column reads `length` only. Sampled requests (temperature > 0) are not batched: the VMM route serves greedy requests only, so a sampled sweep measures the singleton route queued K deep.
 
-Each sample prints one line on stderr: output tok/s, steady tok/s, TTFT and TPOT p50/p99, in-flight, τ, ok/total, tokens and duration, finish reasons, routes (`execution_mode/batched=`), cached prompt tokens, mean prompt tokens and the md5 of the decoded texts. The final table has one row per (backend, workload, K):
+Each sample prints one line on stderr: output tok/s, steady tok/s, TTFT, queue and TPOT p50/p99, decode conc, overlap verdict, τ, ok/total, tokens and duration, finish reasons, routes (`execution_mode/batched=`), cached prompt tokens, mean prompt tokens and the md5 of the decoded texts. The final table has one row per (backend, workload, K):
 
 - **out tok/s**: output throughput, output tokens ÷ (last completion − first send). The median of the runs, with min–max in brackets.
 - **steady tok/s**: tokens whose arrival falls in the steady window ÷ the window. The window runs from the moment all of the first K requests have a token to the first completion after the last send.
-- **TTFT**: first token − send. **TPOT**: (completion − first token) ÷ (tokens − 1). Both are the medians of the per-sample p50/p99.
-- **in-flight**: achieved concurrency, Σ request latency ÷ duration.
+- **TTFT**: first token − dispatch (the moment the request was written to the daemon). **queue**: dispatch − queue entry, the client-side wait, reported separately. **TPOT**: (completion − first token) ÷ (tokens − 1). All are the medians of the per-sample p50/p99.
+- **decode conc**: time-weighted mean number of streams in decode ([first token, completion]) over the steady window. A serialized run reads about 1 whatever K says.
 - **τ**: output tokens per verify window, token-weighted over the sample.
 - **tokens**: median output tokens per sample.
 - **finish**, **batched**, **cached**, **errors**: summed over all samples. A failed request counts no tokens.
 
 A daemon that sends no frame for 300 s fails the sweep. Its in-flight requests are cancelled first.
+
+**Overlap check (K>1).** A cell labelled concurrent is valid only if its streams actually decoded together. Every K>1 sample is judged over its steady window, with each stream's decode interval = [first token, completion]:
+
+- **(a)** the fraction of the window with at least K streams in decode must be ≥ 0.5;
+- **(b)** the time-weighted mean number of streams in decode is reported as **decode conc**;
+- **(c)** TTFT (from queue entry) of the first K dispatched requests against dispatch order must not be linear: R² > 0.9 with max/min > 3 means the streams were served one after another.
+
+A sample passes iff (a) holds and (c) does not fire. A degenerate steady window at K>1 fails. A failing sample is invalid: it is excluded from every aggregate, its progress line prints the verdict instead of throughput, and a cell with no passing sample shows `FAIL (serialized)` in the table and none of its numbers. If any K>1 cell has no passing sample, the run exits non-zero. There is no flag to turn the check off. K=1 is not judged. The `noslots` baseline serves one request at a time by design, so its K>1 cells read `FAIL (serialized)` but do not fail the run. A lane whose stream hits EOS early lowers (a) for the moment its refill is not yet decoding; a brief dip passes, many lanes ending early with slow refills fail.
+
+`--json` prints the sweep as JSON instead of the table: per cell the status, every passing sample, and the rejected samples (verdict and per-stream times only, no throughput). Each sample carries `streams[]` with `t_send` (queue entry), `t_dispatch` (request written to the daemon), `t_first`, `t_end` and the `overlap` verdict fields (`window_start_s`, `window_end_s`, `frac_all_decoding`, `decode_concurrency`, `ttft_r2`, `ttft_max_min`, `ttft_linear`, `pass`, `reason`), so a receipt carries the proof.
 
 ### Bench context (`max_seq`)
 
@@ -843,6 +886,8 @@ The whole run is bounded at 60 s. An optional probe that would start past the de
 **Topology questions.** `--tp N` and the config keys `topology.pp` / `topology.ep` go through the same admission as a load, so a model whose carrier does not declare that axis ([table](multi-gpu.md#which-carriers-declare-which-axis)) is `DOES NOT FIT` with the load's own sentence (for example `raon1_mini: this model family cannot be split across GPUs in expert-parallel mode (topology.ep = 2). Set topology.ep = 1 to load it on one GPU`) instead of a single-GPU plan. Every model whose carrier does not declare `topology.ep` is refused at load admission, before the resident model is unloaded. `--tp` is the only tensor/expert-parallel spelling (`HIPFIRE_TP` is not read; there is no `topology.tp`).
 
 **What it reads.** The model file's header (installed file, or for a tag that is not installed a sparse replica fetched by HTTP Range under `<HIPFIRE_HOME>/cache/fit-headers/`: the header, metadata and tensor index, plus the few payload records admission itself reads; about 14 to 37 MB per model, and for Flash-Next on a GPU whose PLE rows are q4 (gfx1151) also the q4 table's embedded rank section, about 305 MiB, because admission verifies it. Replicas are reused from the cache without network), your resolved config and per-model overrides, the KFD topology and sysfs for each GPU (architecture, VRAM total and used, PCIe link), `/proc/meminfo`, the TTM pool and GTT limit, the `hipfire calibrate` record when it is fresh, and the bundled receipts table `registry/receipts-v1.json`. Free device memory is computed the way the engine's `device_mem_info` reports it, without HIP (discrete: VRAM total minus used; unified-memory APU: the smaller of the GTT headroom and available RAM less CMA plus the TTM pool). Once a process opens the GPU, HIP reports slightly less; the report says so in its notes.
+
+**Native Windows.** There is no KFD topology, sysfs or `/proc`, so fit loads the HIP runtime once to list the GPUs the daemon would see (HIP order; an inherited `HIP_VISIBLE_DEVICES` is applied by HIP), each with its `hipMemGetInfo` free and total VRAM, and reads host RAM with `GlobalMemoryStatusEx`; there is no GTT cap or TTM pool. A calibration record matches on HIP's PCI address and VRAM total. `hardware.devices` is refused (select the card with `HIP_VISIBLE_DEVICES`), and the fix lines point at `hipfire diag`, since `hipfire doctor` is Linux-only (#1145).
 
 **Overrides.** `--kv-mode`, `--kv-k`, `--kv-v` and `--spec` layer a one-shot override over your config exactly as the same flags on `hipfire run` do. Fit builds the load parameters with the one helper `run` uses for them (config, `--kv-mode`, the `--kv-k`/`--kv-v` axes, the effective speculation selector, and the DFlash draft that selector keeps), so admission sees the overridden values and every refusal is the engine's own text in an `admission` finding: an unsupported KV mode or axis pair on this architecture, `--spec mtp` on a profile with no MTP head, `--spec dflash` on an artifact with no declared draft. The plan header names the flags (``plan (what `hipfire run --kv-mode q8 --spec mtp` would load on GPU0)``) and the JSON echoes them as `overrides`. Fit never downloads weights: the header replica above is its only network use, and `--spec dflash` does not fetch the draft.
 

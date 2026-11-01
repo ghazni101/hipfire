@@ -557,6 +557,17 @@ forward. Singleton forward bytes and numerics are unchanged.
   stages. The flag is planner capacity only: the oracle's
   singleton-versus-lanes comparison and its `--ks`, `--row-budget` and
   `--policies` are unchanged. The report records `reserve_lanes`.
+- **Speculative-lane schema.** `fn_mesh_lane_oracle` also parses `--spec ar|mtp`
+  (default `ar`: everything above, unchanged), `--k` (1..=7, default 3) and
+  `--routes floor|cycle|batched` (default `cycle`) for `--spec mtp`, plus
+  `--soak-seconds S [--soak-seed N]` and
+  `--fault-point before-draft|head-round|target-edge|repair|before-publish`
+  (`mtp` only; a soak and a fault point are exclusive). Every run writes
+  `manifest.json` (expanded command, SHA-256 of each `--prompt-file` and of the
+  binary, model hash, recorded environment). `--spec mtp` is parsed and
+  recorded but refuses with "not yet implemented by S3/S5" until the EP/PP
+  speculative lane protocol lands; the refusal is an interface boundary, not a
+  pass.
 
 This section records behavior only; it carries no measurement and no exactness
 evidence. The changed placement is not covered by the EP2/EP4 evidence above.
@@ -769,6 +780,24 @@ restore a dirty borrow epoch first (a clean epoch passes with no barrier) and re
 Lane **prefill** tiles are the singleton chunk program on a lane state, so a tile of more than 512 rows borrows exactly
 as a singleton prompt tile does; a step's tiles are one whole-prompt entry, so the donors are restored once per step,
 not once per tile. A load without lanes is unchanged.
+
+**Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) take the decoupled reserve like the AR lanes.** The load charges the
+mixed store (`ep_lane_store_device_bytes_mixed`: the first 3 slots with MTP state, the rest AR-only) to the decoupled census
+and takes the plan when it holds more resident layers than the ordinary lane placement. `HIPFIRE_EP_MTP_RESERVE_SHARE=0` is
+the kill switch: the MTP store then keeps the ordinary reserve plus the mixed store (the load logs `qwen4 EP reserve
+decoupling: not applied (native-MTP EP lanes are staged ... HIPFIRE_EP_MTP_RESERVE_SHARE=0 ...)`; 25 resident layers at the
+defaults), and a spec store that still reaches a reserve-sharing load is refused at staging with a label (`native-MTP lanes
+are refused on an EP reserve-sharing load`) and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`,
+or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
+
+Mesh window phases against the borrow window (a borrowed epoch is only ever opened by a prompt forward of more than 512
+rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through `ep_reserve_lane_step_enter` (restores a dirty
+epoch, resident bank, rows checked); the head draft rounds and catch-ups run on the head's own scratch and weights and the
+EP gather buffers, never the trunk scratch bank or donor layers (the singleton MTP draft is the same code); prepare (ring
+row rollback and head rebuild) runs no trunk forward; prompt tiles of an MTP lane run the singleton `mtp_prefill_chunk`
+inside the step's `share_prompt_begin_mtp_fill` / `share_prompt_end` bracket, so the donors are whole before the step
+returns. A mesh window refuses to start on an open epoch, and the staging refuses a step row budget wider than the resident
+bank.
 
 **EP prefill-chunk auto-fit (opt-in, `HIPFIRE_EP_CHUNK_AUTOFIT=1`).** The PP lever steps the chunk down because a band
 must fit; an EP load always fits (host-mapped layers), so the question is only decode against prefill. EP2 mq4-xts, 2x
@@ -1453,9 +1482,27 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   stage policy. Every `G` and every policy must keep lane outputs
   byte-identical; the choice is a scheduling decision, not a numerical one,
   and no measured gain is claimed on this page.
-- **AR lanes only.** Native-MTP lanes are not staged under PP/EP
-  (`continuous_batch_spec = false`, `continuous_batch_spec_mode = "off"`),
-  whatever `speculation.mtp` requests.
+- **Native-MTP lanes: EP yes (explicit `--spec mtp`), PP no.** Under PP the
+  lanes are AR lanes (`continuous_batch_spec = false`,
+  `continuous_batch_spec_mode = "off"`), whatever `speculation.mtp` requests.
+  Under EP, with `serve.vmm_batch`, `serve.batch_spec` and the MTP head
+  attached (`--spec mtp`), concurrent greedy requests run as native-MTP lanes
+  with the singleton's default n-gram copy lane
+  (`speculation.mtp_ngram_copy`): rank 0 is the root and alone chooses every
+  window's route, depth and proposal source, reads the head's drafts and the
+  target picks and decides the accepted prefix; every rank replays the root's
+  ordered messages on its replicated lane store (`ep_mesh_lanes`), so each row
+  gather has a peer. The load reserves the spec lane store before it splits
+  the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
+  copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
+  (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
+  the kill switch (EP lanes are AR lanes, as before). Sampled requests
+  (`serve.batch_sampled`, neutral penalties) run on the same lanes: rank 0
+  reads the head's exact candidates and its target logits rows, and the root
+  alone draws every proposal and every Leviathan accept/residual/bonus.
+  A lone request keeps the singleton MTP route; the floor retires a lane to AR
+  windows when native drafts do not pay (high concurrency). The daemon logs
+  each lane drive's route mix by step concurrency (`[fn-lane-mesh-mix]`).
 - **No promotion.** A running singleton request is never promoted into a lane
   under PP/EP (`continuous_batch_promotion = false`); on one card it is `true`.
 - **Stage-policy admission is per-stage proof rows.** Sharing is decided per

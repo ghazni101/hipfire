@@ -2280,6 +2280,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         54 => "I64",
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
+        57 => "HC8E4M3Row",
         131 => "MQ3I4G128R256",
         132 => "MQ3I4G128R128",
         133 => "MQ2I4G128R256",
@@ -2422,8 +2423,8 @@ struct RawLlamaConfig {
     rms_norm_eps: f32,
     #[serde(default = "default_llama_max_pos")]
     max_position_embeddings: usize,
-    #[serde(default = "default_llama_rope")]
-    rope_theta: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
     // Real safetensors configs ship `bos_token_id`/`eos_token_id` as either a
     // scalar (most LLaMA/Mistral) or an array (Llama-3.1: `[128001, 128009]`).
     // Keep them as raw Values and resolve to the FIRST element in finalize
@@ -2487,11 +2488,66 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        // transformers >= 5 nests theta inside `rope_parameters` and prefers it
+        // over a top-level key (`convert_rope_params_to_dict`).
+        rope_freq_base: config["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .map(|t| t as f32)
+            .or(raw.rope_theta)
+            .unwrap_or_else(default_llama_rope),
+        rope_llama3: llama3_rope(config)?,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
         has_qk_norm,
     })
+}
+
+/// The checkpoint's `rope_parameters` / `rope_scaling` as the LLaMA carrier's
+/// RoPE: plain, or the `llama3` remap (HF `_compute_llama3_parameters`). Other
+/// `rope_type`s refuse rather than run unscaled.
+fn llama3_rope(config: &serde_json::Value) -> Result<rdna_compute::rope::RopeLlama3, String> {
+    use rdna_compute::rope::RopeLlama3;
+    let Some(p) = ["rope_parameters", "rope_scaling"]
+        .iter()
+        .find_map(|key| config.get(*key).filter(|v| v.is_object()))
+    else {
+        return Ok(RopeLlama3::OFF);
+    };
+    let kind = p
+        .get("rope_type")
+        .or_else(|| p.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    match kind {
+        "default" => return Ok(RopeLlama3::OFF),
+        "llama3" => {}
+        other => {
+            return Err(format!(
+                "llama: unsupported rope_type {other:?} (supported: default, llama3)"
+            ))
+        }
+    }
+    let float = |key: &str| {
+        p.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("llama: llama3 rope_parameters missing {key}"))
+    };
+    let (factor, low, high) = (
+        float("factor")?,
+        float("low_freq_factor")?,
+        float("high_freq_factor")?,
+    );
+    let original = p
+        .get("original_max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("llama: llama3 rope_parameters missing original_max_position_embeddings")?;
+    if !(factor.is_finite() && factor >= 1.0 && high > low) {
+        return Err(format!(
+            "llama: llama3 rope needs factor >= 1 and high_freq_factor > low_freq_factor \
+             (factor {factor}, low {low}, high {high})"
+        ));
+    }
+    Ok(RopeLlama3::new(factor, low, high, original as usize))
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Result<LlamaConfig, String> {
@@ -3572,6 +3628,50 @@ mod llama_config_tests {
         assert_eq!(c.bos_token, 128000);
         assert_eq!(c.eos_token, 128001);
         assert!(!c.has_qk_norm);
+    }
+
+    #[test]
+    fn transformers5_rope_parameters_theta() {
+        use rdna_compute::rope::RopeLlama3;
+        let mut config = config_value("llama")["config"].clone();
+        config.as_object_mut().unwrap().remove("rope_theta");
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 10000.0);
+        config["rope_parameters"] = serde_json::json!({
+            "rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.rope_llama3, RopeLlama3::new(32.0, 1.0, 4.0, 8192));
+        config["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(
+            c.rope_freq_base, 500000.0,
+            "rope_parameters wins, as in HF 5.x"
+        );
+    }
+
+    #[test]
+    fn rope_scaling_llama3_parses_and_unknown_types_refuse() {
+        use rdna_compute::rope::RopeLlama3;
+        let mut config = config_value("llama")["config"].clone();
+        assert_eq!(
+            llama_config_from_value(&config, false).unwrap().rope_llama3,
+            RopeLlama3::OFF
+        );
+        config["rope_scaling"] = serde_json::json!({
+            "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+        });
+        assert_eq!(
+            llama_config_from_value(&config, false).unwrap().rope_llama3,
+            RopeLlama3::new(32.0, 1.0, 4.0, 8192)
+        );
+        config["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        let err = llama_config_from_value(&config, false).unwrap_err();
+        assert!(err.contains("unsupported rope_type \"yarn\""), "{err}");
     }
 
     #[test]

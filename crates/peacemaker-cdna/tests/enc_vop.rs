@@ -213,9 +213,12 @@ fn cases() -> Vec<Inst> {
             Vop2Op::AddF16 | Vop2Op::SubF16 | Vop2Op::MulF16 | Vop2Op::MaxF16 | Vop2Op::MinF16 => {
                 (Lit(0x1234), Lit(0xfff0))
             }
-            Vop2Op::AddU16 | Vop2Op::SubU16 | Vop2Op::LshlrevB16 | Vop2Op::MulLoU16 => {
-                (Lit(0xfff0), Lit(0x40))
-            }
+            Vop2Op::AddU16
+            | Vop2Op::SubU16
+            | Vop2Op::LshlrevB16
+            | Vop2Op::LshrrevB16
+            | Vop2Op::AshrrevI16
+            | Vop2Op::MulLoU16 => (Lit(0xfff0), Lit(0x40)),
             _ => (Lit(0x1234_5678), Lit(0xffff_fff0)),
         };
         let srcs: Vec<Src> = if op.reads_vcc() {
@@ -740,6 +743,45 @@ fn round_trip_against_llvm() {
 }
 
 #[test]
+fn integer16_signed_literals_keep_the_full_encoded_dword() {
+    let mut texts = Vec::new();
+    let mut bytes = Vec::new();
+    for op in [
+        Vop2Op::AddU16,
+        Vop2Op::SubU16,
+        Vop2Op::LshlrevB16,
+        Vop2Op::LshrrevB16,
+        Vop2Op::AshrrevI16,
+        Vop2Op::MulLoU16,
+    ] {
+        for value in [-1i32, -16, -256, -32768] {
+            let inst = i2(op, Vgpr(0), Lit(value as u32), Vgpr(1), VopExt::None);
+            let words = inst.words(A).expect("signed16 literal encodes");
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[1], value as u32, "never truncate or normalize");
+            assert_eq!(Inst::decode(A, &words).unwrap(), (inst.clone(), 2));
+            assert!(inst.to_string().contains(&format!("lit({value})")));
+            texts.push(inst.to_string());
+            bytes.push(oracle::bytes(&words));
+        }
+        for value in [0x1_0000, 0xffff_0000, 0xffff_7fff] {
+            assert!(i2(op, Vgpr(0), Lit(value), Vgpr(1), VopExt::None)
+                .words(A)
+                .is_err());
+        }
+    }
+    if !oracle::disabled() {
+        // LLVM prints a masked halfword even for a sign-extended raw literal.
+        // Compare the assembled bytes of our lossless signed spelling, not that
+        // lossy pretty-print. The ordinary canonical corpus still checks both.
+        let encoded = oracle::mc_encode(A, &texts).unwrap();
+        for ((_, actual), expected) in encoded.iter().zip(&bytes) {
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
 fn illegal_forms_rejected() {
     let n = VopExt::None;
     let s = sdwa();
@@ -1172,4 +1214,72 @@ fn footprints() {
             && has(&f.defs, RegFile::Exec, 0, 2)
             && !has(&f.defs, RegFile::Vcc, 0, 2)
     );
+}
+
+/// `v_cmp_ngt_f32` (opcode 75) and `v_cmp_nlt_f32` (opcode 78) as they appear
+/// in the compiled gfx942 elementwise kernel: `v_cmp_nlt_f32 vcc, s0, v0` =
+/// 0x7c9c0000, `v_cmp_ngt_f32 vcc, s0, v0` = 0x7c960000.
+#[test]
+fn unordered_float_compares_pinned() {
+    for (op, word, name) in [
+        (VopcOp::CmpNltF32, 0x7c9c_0000u32, "v_cmp_nlt_f32"),
+        (VopcOp::CmpNgtF32, 0x7c96_0000, "v_cmp_ngt_f32"),
+    ] {
+        let inst = ic(op, Sgpr(0), Vgpr(0), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, s0, v0"));
+    }
+}
+
+/// Signed 64-bit compares (gfx942 opcodes 228 / 230), bytes proven against
+/// the hardware oracle: `v_cmp_gt_i64 vcc, v[0:1], v[2:3]` = `00 05 c8 7d`,
+/// `v_cmp_ge_i64 vcc, v[0:1], v[2:3]` = `00 05 cc 7d`.
+#[test]
+fn signed_i64_compares_pinned() {
+    for (op, word, name, opcode) in [
+        (VopcOp::CmpGtI64, 0x7dc8_0500u32, "v_cmp_gt_i64", 228u8),
+        (VopcOp::CmpGeI64, 0x7dcc_0500, "v_cmp_ge_i64", 230),
+    ] {
+        assert_eq!(op.name(), name);
+        assert_eq!(op.opcode(A), Some(opcode));
+        assert_eq!(op.src_dwords(), 2);
+        assert!(!op.is_cmpx());
+        let inst = ic(op, Vgpr(0), Vgpr(2), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, v[0:1], v[2:3]"));
+        let inv_two_pi = ic(op, Float(InlineFloat::InvTwoPi), Vgpr(8), VopExt::None);
+        assert_eq!(
+            inv_two_pi.to_string(),
+            format!("{name}_e32 vcc, 0.15915494309189532, v[8:9]")
+        );
+
+        // Width bounds: a pair at v254 is the last legal VSRC1; v255 and an
+        // odd-width operand fall off the file / are refused.
+        assert!(ic(op, Vgpr(2), Vgpr(254), VopExt::None).words(A).is_ok());
+        assert!(ic(op, Vgpr(2), Vgpr(255), VopExt::None).words(A).is_err());
+        // No SDWA / DPP form for a 64-bit compare.
+        assert!(ic(op, Vgpr(2), Vgpr(4), VopExt::Sdwa(sdwa()))
+            .words(A)
+            .is_err());
+
+        let f = ic(op, Sgpr(4), Vgpr(6), VopExt::None).footprint();
+        assert!(
+            has(&f.uses, RegFile::Exec, 0, 2)
+                && has(&f.uses, RegFile::Sgpr, 4, 2)
+                && has(&f.uses, RegFile::Vgpr, 6, 2)
+                && has(&f.defs, RegFile::Vcc, 0, 2)
+                && !has(&f.defs, RegFile::Exec, 0, 2),
+            "{name}"
+        );
+    }
 }

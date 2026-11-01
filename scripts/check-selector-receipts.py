@@ -28,9 +28,16 @@ import tempfile
 from pathlib import Path
 
 SCHEMA = "pm.selector_receipt.v1"
+# Unit of the receipt classes and `value`: `rows` (the sweep's row class; default for receipts without the field) or
+# `launch_rows` (the size the launcher compares: a grouped contract's m_total).
+ROW_KEYS = {"rows", "launch_rows"}
 BASELINE_REL = "scripts/selector-receipts-baseline.txt"
-# (path, NAME) pairs awaiting a receipt from a card job (none pending).
-PENDING: set = set()
+# (path, NAME) pairs awaiting a receipt from a card job. Remove the entry and annotate the constant when the receipt lands.
+PENDING: set = {
+    # The slab-route automatic S1 request floor: the card receipt is the short-prompt sweep
+    # (PP=32,64,96,128,256,512, arms A and I of tools/mq3wire-job/s1slab-job.sh).
+    ("crates/hipfire-arch-qwen4/src/slowlink_admission.rs", "S1_SLAB_AUTO_MIN_ROWS"),
+}
 NAME_RE = re.compile(
     r"(^|_)(MIN|MAX)_(N|M|ROWS|TOKENS|BATCH|T)($|_)"
     r"|ROWS_MIN|MIN_ROWS|MIN_TOKENS|ROWS_MAX|MAX_ROWS"
@@ -83,6 +90,8 @@ def check_receipt(root: Path, rel_receipt: str, name: str, value: int):
         return f"receipt {rel_receipt} constant {r.get('constant')!r} != {name}"
     if r.get("value") != value:
         return f"receipt {rel_receipt} value {r.get('value')!r} != {value}"
+    if r.get("row_key", "rows") not in ROW_KEYS:
+        return f"receipt {rel_receipt} row_key {r.get('row_key')!r} not in {sorted(ROW_KEYS)}"
     if r.get("covers") is not True:
         return f"receipt {rel_receipt} does not cover the value (covers != true)"
     for rec in r.get("records") or []:
@@ -99,7 +108,7 @@ def run_check(root: Path, pending=PENDING):
     baseline = load_baseline(root)
     found = scan(root)
     present = {(rel, name) for rel, name, *_ in found}
-    violations, awaiting = [], []
+    violations, awaiting, covered = [], [], []
     for rel, name, value, ln, lines in found:
         key = (rel, name)
         if key in baseline:
@@ -123,13 +132,22 @@ def run_check(root: Path, pending=PENDING):
         err = check_receipt(root, receipt, name, value)
         if err:
             violations.append(f"{rel}:{ln}: {name}: {err}")
+        else:
+            try:
+                rk = json.loads((root / receipt).read_text()).get("row_key", "rows")
+            except (OSError, ValueError):
+                rk = "?"
+            covered.append(f"{rel}:{ln}: {name} = {value}: receipt {receipt} row_key={rk}")
     for pair in sorted(baseline - present):
         violations.append(f"{BASELINE_REL}: stale baseline line `{pair[0]} {pair[1]}` (constant no longer exists)")
+    run_check.covered = covered
     return violations, awaiting
 
 
 def report(root: Path):
     v, a = run_check(root)
+    for ln in getattr(run_check, "covered", []):
+        print(ln)
     for ln in a:
         print(ln)
     for ln in v:
@@ -183,6 +201,10 @@ def self_test():
         expect("(b) covering receipt passes", mk(td, annot, receipt=rcpt(True)), False)
     with tempfile.TemporaryDirectory() as td:
         expect("(c) non-covering receipt fails", mk(td, annot, receipt=rcpt(False)), True)
+    with tempfile.TemporaryDirectory() as td:
+        expect("(e) launch_rows receipt passes", mk(td, annot, receipt={**rcpt(True), "row_key": "launch_rows"}), False)
+    with tempfile.TemporaryDirectory() as td:
+        expect("(f) unknown row_key fails", mk(td, annot, receipt={**rcpt(True), "row_key": "tokens"}), True)
     with tempfile.TemporaryDirectory() as td:
         expect("(d) stale baseline line fails",
                mk(td, "const OTHER: usize = 1;\n", baseline="crates/x/src/a.rs FOO_MIN_N\n"), True)

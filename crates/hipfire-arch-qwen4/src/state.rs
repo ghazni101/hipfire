@@ -30,7 +30,7 @@ use rdna_compute::tensor_ops::{
     CopyRegion, GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen,
     QsaKvFormat, QsaStateLayout,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -334,7 +334,7 @@ fn validate_gdn_session_tag(
 }
 
 fn validate_gdn_profile(config: &Qwen4Config, format: GdnStateFormat) -> Result<(), StateError> {
-    if config.profile.is_ar_only() && format.has_residual() {
+    if config.profile.is_stock_fp8() && format.has_residual() {
         return Err(StateError::Config(
             "qwen4: stock-FP8 pins F32 GDN state; q8_ef is refused".into(),
         ));
@@ -780,8 +780,7 @@ fn grow_context_arena(
             "grow_context_arena",
         );
     }
-    gpu.hip
-        .memset(&view.buf, 0, view.buf.size())
+    gpu.memset_stream_ordered(&view.buf, 0, view.buf.size())
         .map_err(StateError::Hip)?;
     if gpu.flags.qwen4_qsa_extent_check {
         gpu.qsa_extent_post_launch(
@@ -864,7 +863,7 @@ fn resolve_qsa_format_for_arch(
 /// `q8` is refused.
 pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStateFormat, String> {
     let request = request.trim().to_ascii_lowercase();
-    if config.profile.is_ar_only() {
+    if config.profile.is_stock_fp8() {
         return match request.as_str() {
             "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
             "q8" | "int8" | "q8_ef" => Err(format!(
@@ -916,7 +915,7 @@ fn resolve_gdn_format_for_arch(
     let auto = matches!(request.trim().to_ascii_lowercase().as_str(), "" | "auto");
     if auto
         && arch == "gfx1151"
-        && !config.profile.is_ar_only()
+        && !config.profile.is_stock_fp8()
         && GdnStateFormat::Q8.supports(config.linear_key_head_dim, config.linear_value_head_dim)
     {
         return Ok(GdnStateFormat::F32);
@@ -1896,6 +1895,127 @@ pub(crate) fn vmm_context_arena_mapped_bytes(
         .ok()
 }
 
+/// `HIPFIRE_QWEN4_CAPTURE_RING_COMPACT` (developer, default ON, exact `0` is
+/// the kill switch back to the double ring): lay the GDN
+/// verify capture ring out as `rows + 1` state slots per layer instead of
+/// `2 * rows`. The ring is only ever written at ONE slot per half (the
+/// capture kernel and the rollback kernel both leave the last row's state in
+/// slot `rows - 1` of the view they are handed), so the other `rows - 1`
+/// slots of each half were never touched. The logical slot numbering
+/// (`gdn_live`, halves, digests) is unchanged; [`capture_ring_slot`] maps it
+/// onto the compact storage.
+pub(crate) const CAPTURE_RING_COMPACT_ENV: &str = "HIPFIRE_QWEN4_CAPTURE_RING_COMPACT";
+
+/// Whether new capture rings use the compact layout (unset or `1`; `0` off).
+pub(crate) fn compact_capture_ring() -> bool {
+    hipfire_config::developer_bool(CAPTURE_RING_COMPACT_ENV, true)
+}
+
+/// State slots one layer's capture ring of `rows` rows holds.
+pub(crate) fn capture_ring_slots(compact: bool, rows: usize) -> Option<usize> {
+    if compact {
+        rows.checked_add(1)
+    } else {
+        rows.checked_mul(2)
+    }
+}
+
+/// Physical ring slot of logical slot `logical` (`0..2 * rows`). The lower
+/// logical half (`< rows`) lands in physical slot `rows - 1`, the upper half
+/// in `rows`: exactly the slots a capture or rollback of the half writes
+/// when its view starts at [`capture_view_start`].
+pub(crate) fn capture_ring_slot(compact: bool, rows: usize, logical: usize) -> usize {
+    if !compact {
+        logical
+    } else if logical < rows {
+        rows - 1
+    } else {
+        rows
+    }
+}
+
+/// First physical slot of the `n`-row view a capture or rollback into the
+/// half starting at logical slot `base` hands the kernel: the kernel leaves
+/// the result in view slot `n - 1`, which must be the half's physical slot.
+pub(crate) fn capture_view_start(compact: bool, rows: usize, base: usize, n: usize) -> usize {
+    if !compact {
+        base
+    } else {
+        capture_ring_slot(true, rows, base) + 1 - n
+    }
+}
+
+/// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the
+/// kill switch back to one ring allocation per GDN layer): the compact
+/// capture ring of every GDN layer is a window of ONE shared pool allocation
+/// ([`capture_ring_pool_slots`]) instead of `rows + 1` slots per layer.
+///
+/// Why this is the same bytes, kernels and row math. A layer's ring is only
+/// ever touched at its two write targets, physical slots `rows - 1` and
+/// `rows` of its window ([`capture_ring_slot`]): the capture kernels
+/// (`gated_delta_step_persistent256_body<kCapture>` and its `_lanes`
+/// variant) read only the live state slot and write only view slot `n - 1`
+/// (`(rows - 1) * slot`, `kernels/src/tensor_ops.hip`), the rollback kernels
+/// (`gated_delta_rollback_layers_*`) read slot `from` (a target) and write
+/// slot `to + keep - 1` (a target), and `gdn_rows_lane_ranges` already treats
+/// that one slot as the only ring range a lane chain writes. The other
+/// `rows - 1` slots of the window exist only so the `n`-row views the kernels
+/// are handed (`capture_view_start`) stay inside the allocation; no kernel
+/// reads or writes them. Layer `L`'s window therefore starts
+/// [`CAPTURE_POOL_STRIDE`] `* L` slots into the pool: its two targets
+/// (`2 L + rows - 1`, `2 L + rows`) are distinct from every other layer's
+/// (`2 L' + rows - 1`, `2 L' + rows`), and the windows overlap only in slots
+/// nobody touches. The kernels, the pointer table, the logical slot numbering
+/// (`gdn_live`, halves) and every view are unchanged; only the allocation
+/// behind the window pointers is shared. Requires the compact layout (the
+/// double ring writes every slot of its half).
+pub(crate) fn lane_reserve_trim() -> bool {
+    hipfire_config::qwen4_lane_reserve_trim()
+}
+
+/// Slots between the windows of two consecutive GDN layers in the shared
+/// capture-ring pool: the layer's two write targets, nothing else.
+pub(crate) const CAPTURE_POOL_STRIDE: usize = 2;
+
+/// State slots of the shared capture-ring pool of `gdn_layers` layers holding
+/// `rows`-row blocks: the last layer's window ends the pool, so
+/// `CAPTURE_POOL_STRIDE * (gdn_layers - 1) + rows + 1`. `None` for no layer
+/// or on overflow.
+pub(crate) fn capture_ring_pool_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
+    gdn_layers
+        .checked_sub(1)?
+        .checked_mul(CAPTURE_POOL_STRIDE)?
+        .checked_add(rows.checked_add(1)?)
+}
+
+/// Ring state slots a whole state allocates across its `gdn_layers` GDN
+/// layers for `rows`-row blocks: the shared pool when `compact` and `trim`,
+/// else `capture_ring_slots` per layer. `None` on overflow.
+pub(crate) fn capture_ring_total_slots(
+    compact: bool,
+    trim: bool,
+    rows: usize,
+    gdn_layers: usize,
+) -> Option<usize> {
+    if gdn_layers == 0 {
+        Some(0)
+    } else if compact && trim {
+        capture_ring_pool_slots(rows, gdn_layers)
+    } else {
+        gdn_layers.checked_mul(capture_ring_slots(compact, rows)?)
+    }
+}
+
+/// [`capture_ring_total_slots`] under the process configuration.
+pub(crate) fn current_capture_ring_total_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
+    capture_ring_total_slots(
+        compact_capture_ring(),
+        lane_reserve_trim(),
+        rows,
+        gdn_layers,
+    )
+}
+
 /// The snapshot-arena mirror allocation (elements, dtype) of one state
 /// tensor, `None` for state a snapshot does not copy (QSA full/pooled/F16
 /// arenas, the live EF residual). Mirrors [`Qwen4StateSnapshotArena::new`]:
@@ -2144,9 +2264,16 @@ pub struct Qwen4State {
     /// GDN value width) and the per-layer (recurrence, ring) device pointer
     /// table the one-launch re-run reads.
     row_capture_output: Option<(GpuTensor, GpuTensor)>,
+    /// The one allocation the per-layer capture-ring windows of `row_capture`
+    /// are views of ([`lane_reserve_trim`], [`capture_ring_pool_slots`]);
+    /// `None`: every layer's ring in `row_capture` is its own allocation.
+    row_capture_pool: Option<GpuTensor>,
     /// Rows a verify may capture (0 = none allocated); the ring holds twice
     /// as many slots.
     row_capture_rows: usize,
+    /// The ring was allocated in the compact `rows + 1`-slot layout
+    /// ([`capture_ring_slots`]); fixed per allocation.
+    row_capture_compact: bool,
     /// Live ring slot of every GDN layer's recurrent state.
     gdn_live: usize,
     /// Storage of every GDN layer's recurrent state (and its ring slots).
@@ -2512,7 +2639,9 @@ impl Qwen4State {
             snapshot_arena,
             row_capture: Vec::new(),
             row_capture_output: None,
+            row_capture_pool: None,
             row_capture_rows: 0,
+            row_capture_compact: false,
             gdn_live: 0,
             gdn_format: format.gdn,
             gdn_value_heads: config.linear_num_value_heads,
@@ -2658,6 +2787,23 @@ impl Qwen4State {
             .checked_mul(gdn_layers)?
             .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
             .checked_add(per_request)
+    }
+
+    /// Device bytes the whole-model QSA context arenas of one state commit under
+    /// `context` (every QSA layer's [`Qwen4ContextCommit::committed_layer_bytes`]): the
+    /// pages `ensure_mapped_capacity` has mapped once the state holds `context.tokens`
+    /// tokens, at the VMM granule. It is the very term [`Self::device_bytes_with_mirror`]
+    /// adds per QSA layer, so a lane's planned page growth between two token counts is
+    /// the difference of two calls and cannot differ from what the census charges. The
+    /// lane page budget ([`crate::lane::pages`]) prices admissions with it.
+    pub(crate) fn context_commit_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+    ) -> Option<u64> {
+        let (_, qsa_layers) = scope_layer_counts(config, &Qwen4BandScope::single(config));
+        let per_layer = context.committed_layer_bytes(config, format.layout())?;
+        u64::try_from(per_layer.checked_mul(qsa_layers)?).ok()
     }
 
     /// Every device allocation [`Self::device_bytes`] counts, one entry per
@@ -2878,7 +3024,28 @@ impl Qwen4State {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        self.reset_inner(gpu, true)
+        self.reset_synced(gpu, true)
+    }
+
+    /// [`Self::reset`] that only enqueues its zero-fills into `batch`: the caller
+    /// owns the one wait ([`Gpu::memset_batch_sync`], also after a failed reset) and
+    /// keeps the state alive until then. A lane admission resets the trunk state, the
+    /// MTP head and the pending hidden under one wait.
+    pub(crate) fn reset_into(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), StateError> {
+        self.reset_inner(gpu, true, batch)
+    }
+
+    /// One reset with its own wait: every fill enqueued, then a single stream wait, and
+    /// a wait owed for fills already in flight is paid even when the reset fails.
+    fn reset_synced(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
+        let mut batch = MemsetBatch::default();
+        let reset = self.reset_inner(gpu, clear_rows, &mut batch);
+        let synced = gpu.memset_batch_sync(&mut batch).map_err(StateError::Hip);
+        reset.and(synced)
     }
 
     /// Cold reset of a side request: every fixed byte and every metadata
@@ -2887,7 +3054,7 @@ impl Qwen4State {
     /// keys) are left untouched, so rows a main conversation wrote stay
     /// byte-exact beneath the side request's writes.
     pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        self.reset_inner(gpu, false)
+        self.reset_synced(gpu, false)
     }
 
     /// Per-stream row ends of a side request writing tokens `[0, through)`,
@@ -2902,16 +3069,19 @@ impl Qwen4State {
         rows
     }
 
-    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
+    fn reset_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        clear_rows: bool,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
         self.reset_gdn_residual(gpu, GdnResidualTransition::Reset)?;
         for layer in &self.gdn {
-            gpu.hip
-                .memset(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
+            gpu.memset_batched(batch, &layer.recurrent.buf, 0, layer.recurrent.buf.size())
                 .map_err(StateError::Hip)?;
-            gpu.hip
-                .memset(&layer.conv.buf, 0, layer.conv.buf.size())
+            gpu.memset_batched(batch, &layer.conv.buf, 0, layer.conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         // VMM context arenas expose only their mapped prefix: nothing past
@@ -2955,10 +3125,11 @@ impl Qwen4State {
                         "Qwen4State::reset",
                     );
                 }
-                gpu.hip
-                    .memset(&tensor.buf, 0, tensor.buf.size())
+                gpu.memset_batched(batch, &tensor.buf, 0, tensor.buf.size())
                     .map_err(StateError::Hip)?;
                 if gpu.flags.qwen4_qsa_extent_check {
+                    // The post-launch check reads the fill's result: wait for it here.
+                    gpu.memset_batch_sync(batch).map_err(StateError::Hip)?;
                     gpu.qsa_extent_post_launch(
                         "qsa_reset_memset",
                         tensor,
@@ -2977,13 +3148,11 @@ impl Qwen4State {
             layer.position = 0;
         }
         if let Some(ple_conv) = &self.ple_conv {
-            gpu.hip
-                .memset(&ple_conv.buf, 0, ple_conv.buf.size())
+            gpu.memset_batched(batch, &ple_conv.buf, 0, ple_conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         if let Some(hyper_feedback) = &self.hyper_feedback {
-            gpu.hip
-                .memset(&hyper_feedback.buf, 0, hyper_feedback.buf.size())
+            gpu.memset_batched(batch, &hyper_feedback.buf, 0, hyper_feedback.buf.size())
                 .map_err(StateError::Hip)?;
         }
         self.ple_history.reset();
@@ -3708,8 +3877,15 @@ impl Qwen4State {
         if let Some(hyper_feedback) = self.hyper_feedback {
             free(hyper_feedback);
         }
+        // With a shared pool the per-layer rings are views of it.
+        let pooled = self.row_capture_pool.is_some();
+        if let Some(pool) = self.row_capture_pool {
+            free(pool);
+        }
         for (ring, inputs, recurrence) in self.row_capture {
-            free(ring);
+            if !pooled {
+                free(ring);
+            }
             free(inputs);
             free(recurrence);
         }
@@ -3752,16 +3928,39 @@ impl Qwen4State {
     }
 
     /// [`Self::row_capture_bytes`] per allocation of
-    /// [`Self::ensure_row_capture`], in its allocation order: per GDN layer
-    /// the two-half recurrent ring (storage format), the F32 input rows and
-    /// the F32 recurrence inputs, then the one F32 output block and the
-    /// pointer table. Empty below two rows or for a band with no GDN layer
-    /// (nothing is allocated); `None` on overflow.
+    /// [`Self::ensure_row_capture`], in its allocation order: with the shared
+    /// pool ([`lane_reserve_trim`], default) the pool first, then per GDN layer
+    /// the F32 input rows and the F32 recurrence inputs; with it off per GDN
+    /// layer the recurrent-state ring (storage format), the inputs and the
+    /// recurrence inputs; then the one F32 output block and the pointer table.
+    /// Empty below two rows or for a band with no GDN layer (nothing is
+    /// allocated); `None` on overflow.
     pub(crate) fn row_capture_allocation_sizes_scoped(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
+    ) -> Option<Vec<u64>> {
+        Self::row_capture_allocation_sizes_layout(
+            config,
+            gdn,
+            rows,
+            gdn_layers,
+            compact_capture_ring(),
+            lane_reserve_trim(),
+        )
+    }
+
+    /// [`Self::row_capture_allocation_sizes_scoped`] for an explicit ring
+    /// layout: `compact` ([`compact_capture_ring`]) and `trim`
+    /// ([`lane_reserve_trim`], effective only with `compact`).
+    pub(crate) fn row_capture_allocation_sizes_layout(
+        config: &Qwen4Config,
+        gdn: GdnStateFormat,
+        rows: usize,
+        gdn_layers: usize,
+        compact: bool,
+        trim: bool,
     ) -> Option<Vec<u64>> {
         if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
             return None;
@@ -3779,11 +3978,17 @@ impl Qwen4State {
                 config.linear_key_head_dim.checked_add(4)?
             }
         };
-        let ring = value_heads
+        let slot_bytes = value_heads
             .checked_mul(config.linear_value_head_dim)?
             .checked_mul(key_units)?
-            .checked_mul(gdn.storage().dtype().size())?
-            .checked_mul(rows.checked_mul(2)?)?;
+            .checked_mul(gdn.storage().dtype().size())?;
+        let ring = slot_bytes.checked_mul(capture_ring_slots(compact, rows)?)?;
+        // One shared pool for every layer's window (`lane_reserve_trim`).
+        let pool = if compact && trim {
+            Some(slot_bytes.checked_mul(capture_ring_pool_slots(rows, gdn_layers)?)?)
+        } else {
+            None
+        };
         let qkv = config
             .linear_num_key_heads
             .checked_mul(2)?
@@ -3808,9 +4013,19 @@ impl Qwen4State {
             .checked_mul(layer)?
             .checked_add(output)?
             .checked_add(table)?;
-        let mut sizes = Vec::with_capacity(3 * gdn_layers + 2);
-        for _ in 0..gdn_layers {
-            sizes.extend([ring, inputs, recurrence]);
+        let mut sizes = Vec::with_capacity(3 * gdn_layers + 3);
+        match pool {
+            Some(pool) => {
+                sizes.push(pool);
+                for _ in 0..gdn_layers {
+                    sizes.extend([inputs, recurrence]);
+                }
+            }
+            None => {
+                for _ in 0..gdn_layers {
+                    sizes.extend([ring, inputs, recurrence]);
+                }
+            }
         }
         sizes.extend([output, table]);
         sizes
@@ -3901,74 +4116,123 @@ impl Qwen4State {
                 .checked_mul(DType::F32.size())
                 .ok_or_else(overflow)?;
         }
+        let compact = compact_capture_ring();
+        let ring_slots = capture_ring_slots(compact, rows).ok_or_else(overflow)?;
+        let initial_slot = capture_ring_slot(compact, rows, 0);
+        // Every GDN layer's slot has one geometry (the rollback launch relies
+        // on it too); a pool needs it to carve equal windows.
+        let (pool_state, pool_dtype) = (self.gdn[0].recurrent.numel(), self.gdn[0].recurrent.dtype);
+        let pooled = compact
+            && lane_reserve_trim()
+            && self.gdn.iter().all(|layer| {
+                layer.recurrent.numel() == pool_state && layer.recurrent.dtype == pool_dtype
+            });
+        let pool_elements = if pooled {
+            let slots = capture_ring_pool_slots(rows, self.gdn.len()).ok_or_else(overflow)?;
+            let elements = slots.checked_mul(pool_state).ok_or_else(overflow)?;
+            elements
+                .checked_mul(pool_dtype.size())
+                .ok_or_else(overflow)?;
+            elements
+        } else {
+            0
+        };
         // Stage all allocations, following the snapshot arena's cleanup
         // convention. Allocation/copy/upload failure leaves live pointers,
-        // ticket generation, and capacities untouched.
-        let mut allocated = Vec::with_capacity(3 * self.gdn.len() + 2);
+        // ticket generation, and capacities untouched. `rings` holds owned
+        // per-layer rings, or (pooled) non-owning windows of `pool`.
+        let mut pool: Option<GpuTensor> = None;
+        let mut rings: Vec<GpuTensor> = Vec::with_capacity(self.gdn.len());
+        let mut inputs_all: Vec<GpuTensor> = Vec::with_capacity(self.gdn.len());
+        let mut recurrence_all: Vec<GpuTensor> = Vec::with_capacity(self.gdn.len());
+        let mut tail: Vec<GpuTensor> = Vec::with_capacity(2);
         let staged = (|| -> Result<(), StateError> {
-            for layer in &self.gdn {
-                let state = layer.recurrent.numel();
-                allocated.push(
-                    gpu.zeros(&[2 * rows * state], layer.recurrent.dtype)
+            if pooled {
+                pool = Some(
+                    gpu.zeros(&[pool_elements], pool_dtype)
                         .map_err(StateError::Hip)?,
                 );
+            }
+            for (index, layer) in self.gdn.iter().enumerate() {
+                let state = layer.recurrent.numel();
+                match pool.as_ref() {
+                    Some(pool) => rings.push(
+                        pool.sub_offset(CAPTURE_POOL_STRIDE * index * state, ring_slots * state),
+                    ),
+                    None => rings.push(
+                        gpu.zeros(&[ring_slots * state], layer.recurrent.dtype)
+                            .map_err(StateError::Hip)?,
+                    ),
+                }
                 gpu.copy_d2d(
                     &layer.recurrent,
-                    &allocated.last().expect("ring").sub_offset(0, state),
+                    &rings
+                        .last()
+                        .expect("ring")
+                        .sub_offset(initial_slot * state, state),
                     layer.recurrent.byte_size(),
                 )
                 .map_err(StateError::Hip)?;
                 let qkv = layer.conv.numel() / conv_history;
-                allocated.push(
+                inputs_all.push(
                     gpu.zeros(&[rows * qkv], DType::F32)
                         .map_err(StateError::Hip)?,
                 );
-                allocated.push(
+                recurrence_all.push(
                     gpu.zeros(&[rows * (qkv + 2 * self.gdn_value_heads)], DType::F32)
                         .map_err(StateError::Hip)?,
                 );
             }
-            let pointers: Vec<u8> = allocated
-                .chunks_exact(3)
-                .flat_map(|layer| [layer[2].buf.as_ptr(), layer[0].buf.as_ptr()])
+            let pointers: Vec<u8> = recurrence_all
+                .iter()
+                .zip(&rings)
+                .flat_map(|(recurrence, ring)| [recurrence.buf.as_ptr(), ring.buf.as_ptr()])
                 .flat_map(|pointer| (pointer as u64).to_ne_bytes())
                 .collect();
-            allocated.push(
+            tail.push(
                 gpu.zeros(&[output_elements], DType::F32)
                     .map_err(StateError::Hip)?,
             );
-            allocated.push(
+            tail.push(
                 gpu.zeros(&[table_bytes], DType::Raw)
                     .map_err(StateError::Hip)?,
             );
-            gpu.memcpy_htod_auto(&allocated.last().expect("pointer table").buf, &pointers)
+            gpu.upload_stream_ordered(&tail.last().expect("pointer table").buf, &pointers)
                 .map_err(StateError::Hip)?;
             Ok(())
         })();
         if let Err(error) = staged {
-            for tensor in allocated.into_iter().rev() {
+            let owned_rings = if pool.is_some() { Vec::new() } else { rings };
+            for tensor in pool
+                .into_iter()
+                .chain(owned_rings)
+                .chain(inputs_all)
+                .chain(recurrence_all)
+                .chain(tail)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
                 let _ = gpu.free_tensor(tensor);
             }
             return Err(error);
         }
-        let mut allocated = allocated.into_iter();
-        let next: Vec<_> = (0..self.gdn.len())
-            .map(|_| {
-                (
-                    allocated.next().expect("ring"),
-                    allocated.next().expect("inputs"),
-                    allocated.next().expect("recurrence"),
-                )
-            })
+        let mut tail = tail.into_iter();
+        let output = tail.next().expect("discard output");
+        let table = tail.next().expect("pointer table");
+        let next: Vec<_> = rings
+            .into_iter()
+            .zip(inputs_all)
+            .zip(recurrence_all)
+            .map(|((ring, inputs), recurrence)| (ring, inputs, recurrence))
             .collect();
-        let output = allocated.next().expect("discard output");
-        let table = allocated.next().expect("pointer table");
         // Captured graphs may bake the recurrent pointers replaced below: drop
         // captured execution state before publishing the new ring (real growth
         // only; no-ops returned above, staged failure never reaches here).
         gpu.invalidate_for_scratch_growth();
         self.snapshot_arena.invalidate();
         let previous_output = self.row_capture_output.replace((output, table));
+        let previous_pool = std::mem::replace(&mut self.row_capture_pool, pool);
         let previous = std::mem::replace(&mut self.row_capture, next);
         let ringed = !previous.is_empty();
         let mut old_states = Vec::new();
@@ -3976,28 +4240,35 @@ impl Qwen4State {
             let state = layer.recurrent.numel();
             let old = std::mem::replace(
                 &mut layer.recurrent,
-                self.row_capture[index].0.sub_offset(0, state),
+                self.row_capture[index]
+                    .0
+                    .sub_offset(initial_slot * state, state),
             );
             if !ringed {
                 old_states.push(old);
             }
         }
         self.row_capture_rows = rows;
+        self.row_capture_compact = compact;
         self.gdn_live = 0;
         // Publish a complete coherent ring before releasing previous storage.
-        for tensor in old_states
-            .into_iter()
-            .chain(
-                previous
-                    .into_iter()
-                    .flat_map(|(ring, inputs, recurrence)| [ring, inputs, recurrence]),
-            )
-            .chain(
-                previous_output
-                    .into_iter()
-                    .flat_map(|(output, table)| [output, table]),
-            )
-        {
+        // A previous pool owns its windows; otherwise each layer's ring is owned.
+        let previous_rings_owned = previous_pool.is_none();
+        let mut stale = old_states;
+        stale.extend(previous_pool);
+        for (ring, inputs, recurrence) in previous {
+            if previous_rings_owned {
+                stale.push(ring);
+            }
+            stale.push(inputs);
+            stale.push(recurrence);
+        }
+        stale.extend(
+            previous_output
+                .into_iter()
+                .flat_map(|(output, table)| [output, table]),
+        );
+        for tensor in stale {
             gpu.free_tensor(tensor).map_err(StateError::Hip)?;
         }
         #[cfg(feature = "lab")]
@@ -4023,9 +4294,10 @@ impl Qwen4State {
     /// Point every GDN layer's `recurrent` at ring slot `slot`.
     fn set_gdn_live(&mut self, slot: usize) {
         self.gdn_live = slot;
+        let physical = capture_ring_slot(self.row_capture_compact, self.row_capture_rows, slot);
         for (layer, (ring, _, _)) in self.gdn.iter_mut().zip(&self.row_capture) {
             let state = layer.recurrent.numel();
-            layer.recurrent = ring.sub_offset(slot * state, state);
+            layer.recurrent = ring.sub_offset(physical * state, state);
         }
     }
 
@@ -4041,7 +4313,11 @@ impl Qwen4State {
         self.row_capture
             .get(slot)
             .map(|(ring, inputs, recurrence)| GdnRowCapture {
-                states: ring.sub_offset(base * state, rows * state),
+                states: ring.sub_offset(
+                    capture_view_start(self.row_capture_compact, self.row_capture_rows, base, rows)
+                        * state,
+                    rows * state,
+                ),
                 inputs,
                 recurrence,
             })
@@ -4203,8 +4479,17 @@ impl Qwen4State {
                     layers: self.gdn.len(),
                     rows,
                     keep,
-                    from: before,
-                    to: base,
+                    from: capture_ring_slot(
+                        self.row_capture_compact,
+                        self.row_capture_rows,
+                        before,
+                    ),
+                    to: capture_view_start(
+                        self.row_capture_compact,
+                        self.row_capture_rows,
+                        base,
+                        keep,
+                    ),
                     qkv_width: qkv,
                     key_heads: (qkv - value_heads * GDN_HEAD_DIM) / (2 * GDN_HEAD_DIM),
                     value_heads,
@@ -4509,6 +4794,181 @@ impl std::error::Error for StateError {}
 mod tests {
     use super::*;
 
+    /// The compact capture ring (`rows + 1` slots) is observationally the
+    /// `2 * rows`-slot ring: replaying random verify commits and rollbacks
+    /// on both layouts, with the kernels modeled as "write only view slot
+    /// n - 1", the live value always matches, no write touches the live or
+    /// the rollback-source slot, and every view stays inside the ring.
+    #[test]
+    fn compact_capture_ring_matches_the_double_ring() {
+        for rows in 2..=hipfire_config::QWEN4_VERIFY_MAX_ROWS.min(16) {
+            assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
+            assert_eq!(capture_ring_slots(true, rows), Some(rows + 1));
+            let mut rings = [vec![0u64; 2 * rows], vec![0u64; rows + 1]];
+            let compact = [false, true];
+            // Initial live slot 0 holds value 1 in both layouts.
+            let mut live = [0usize; 2];
+            for k in 0..2 {
+                let slot = capture_ring_slot(compact[k], rows, 0);
+                rings[k][slot] = 1;
+            }
+            let capture_base = |live: usize| if live < rows { rows } else { 0 };
+            let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ rows as u64;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for step in 0..400u64 {
+                let value = 1000 + step;
+                let verify_rows = 2 + (next() as usize) % (rows - 1);
+                let rollback = next() % 2 == 0 && verify_rows > 2;
+                let keep = 1 + (next() as usize) % (verify_rows - 1);
+                let before = live[0];
+                assert_eq!(live[0], live[1]);
+                let base = capture_base(before);
+                for k in 0..2 {
+                    let n = verify_rows;
+                    let start = capture_view_start(compact[k], rows, base, n);
+                    assert!(start + n <= rings[k].len(), "view out of ring");
+                    let written = start + n - 1;
+                    assert_ne!(written, capture_ring_slot(compact[k], rows, before));
+                    rings[k][written] = value;
+                }
+                let after_verify = base + verify_rows - 1;
+                for k in 0..2 {
+                    live[k] = after_verify;
+                }
+                if rollback {
+                    // Rollback re-runs `keep` rows from the pre-verify slot
+                    // `before` into the half `base`.
+                    for k in 0..2 {
+                        let from = capture_ring_slot(compact[k], rows, before);
+                        let to = capture_view_start(compact[k], rows, base, keep);
+                        assert!(to + keep <= rings[k].len());
+                        let written = to + keep - 1;
+                        assert_ne!(written, from);
+                        rings[k][written] = rings[k][from] + 7;
+                        live[k] = base + keep - 1;
+                    }
+                }
+                for k in 0..2 {
+                    let slot = capture_ring_slot(compact[k], rows, live[k]);
+                    assert_eq!(
+                        rings[k][slot],
+                        rings[1 - k][capture_ring_slot(compact[1 - k], rows, live[1 - k])]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The shared capture-ring pool (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`) is observationally the
+    /// per-layer compact ring: replaying random verify commits and rollbacks over every layer of
+    /// a state with the kernels modeled as "read the live / source slot, write only view slot
+    /// n - 1", each layer's live value matches its own private ring, every layer's views stay
+    /// inside the pool, and no pool slot is ever written by two layers (so no layer's live or
+    /// rollback-source slot can be clobbered by another layer's write).
+    #[test]
+    fn shared_capture_pool_matches_per_layer_rings() {
+        for layers in [1usize, 2, 7, 36] {
+            for rows in 2..=hipfire_config::QWEN4_VERIFY_MAX_ROWS.min(16) {
+                let window = capture_ring_slots(true, rows).unwrap();
+                let pool_slots = capture_ring_pool_slots(rows, layers).unwrap();
+                assert_eq!(pool_slots, CAPTURE_POOL_STRIDE * (layers - 1) + rows + 1);
+                assert_eq!(
+                    capture_ring_total_slots(true, true, rows, layers),
+                    Some(pool_slots)
+                );
+                assert_eq!(
+                    capture_ring_total_slots(true, false, rows, layers),
+                    Some(layers * window)
+                );
+                assert_eq!(
+                    capture_ring_total_slots(false, true, rows, layers),
+                    Some(layers * 2 * rows),
+                    "the double ring is never pooled"
+                );
+                assert!(pool_slots <= layers * window);
+                let mut pool = vec![0u64; pool_slots];
+                let mut writer: Vec<Option<usize>> = vec![None; pool_slots];
+                let mut private: Vec<Vec<u64>> = (0..layers).map(|_| vec![0u64; window]).collect();
+                let at = |layer: usize, slot: usize| {
+                    assert!(slot < window, "window slot in the layer window");
+                    CAPTURE_POOL_STRIDE * layer + slot
+                };
+                let tag = |layer: usize, value: u64| value * 100 + layer as u64;
+                let mut live = 0usize;
+                for layer in 0..layers {
+                    let slot = capture_ring_slot(true, rows, 0);
+                    private[layer][slot] = tag(layer, 1);
+                    pool[at(layer, slot)] = tag(layer, 1);
+                    writer[at(layer, slot)] = Some(layer);
+                }
+                let capture_base = |live: usize| if live < rows { rows } else { 0 };
+                let mut rng = 0xD1B5_4A32_D192_ED03u64 ^ (rows * 131 + layers) as u64;
+                let mut next = move || {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng
+                };
+                for step in 0..300u64 {
+                    let value = 1000 + step;
+                    let verify_rows = 2 + (next() as usize) % (rows - 1);
+                    let rollback = next() % 2 == 0 && verify_rows > 2;
+                    let keep = 1 + (next() as usize) % (verify_rows - 1);
+                    let before = live;
+                    let base = capture_base(before);
+                    for layer in 0..layers {
+                        // The n-row view starts at `start`, ends inside the window, so inside the
+                        // pool; the kernel writes only its last slot.
+                        let start = capture_view_start(true, rows, base, verify_rows);
+                        assert!(start + verify_rows <= window, "view out of window");
+                        assert!(
+                            CAPTURE_POOL_STRIDE * layer + start + verify_rows <= pool_slots,
+                            "view out of pool"
+                        );
+                        let written = start + verify_rows - 1;
+                        let src = capture_ring_slot(true, rows, before);
+                        assert_ne!(written, src);
+                        let abs = at(layer, written);
+                        assert!(writer[abs].is_none_or(|owner| owner == layer));
+                        writer[abs] = Some(layer);
+                        // The live source slot still holds this layer's own value.
+                        assert_eq!(pool[at(layer, src)], private[layer][src]);
+                        private[layer][written] = tag(layer, value);
+                        pool[abs] = tag(layer, value);
+                    }
+                    live = base + verify_rows - 1;
+                    if rollback {
+                        for layer in 0..layers {
+                            let from = capture_ring_slot(true, rows, before);
+                            let to = capture_view_start(true, rows, base, keep);
+                            assert!(to + keep <= window);
+                            assert!(CAPTURE_POOL_STRIDE * layer + to + keep <= pool_slots);
+                            let written = to + keep - 1;
+                            assert_ne!(written, from);
+                            assert_eq!(pool[at(layer, from)], private[layer][from]);
+                            let abs = at(layer, written);
+                            assert!(writer[abs].is_none_or(|owner| owner == layer));
+                            writer[abs] = Some(layer);
+                            let result = private[layer][from] + 7;
+                            private[layer][written] = result;
+                            pool[abs] = result;
+                        }
+                        live = base + keep - 1;
+                    }
+                    for layer in 0..layers {
+                        let slot = capture_ring_slot(true, rows, live);
+                        assert_eq!(pool[at(layer, slot)], private[layer][slot]);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn gdn_q8ef_reset_lifecycle() {
         let config = crate::config::compact_test_config();
@@ -4707,6 +5167,36 @@ mod tests {
         let error = validate_gdn_profile(&stock, GdnStateFormat::Q8Ef).unwrap_err();
         assert!(error.to_string().contains("stock-FP8") && error.to_string().contains("q8_ef"));
         assert!(validate_gdn_profile(&stock, GdnStateFormat::F32).is_ok());
+    }
+
+    /// U3: the headed stock-FP8 profile keeps the F32 GDN pin and the q8 refusals.
+    #[test]
+    fn stock_mtp_profile_pins_f32_gdn_state_too() {
+        let stock = crate::config::compact_test_config()
+            .into_stock_mtp()
+            .unwrap();
+        for request in ["", "auto", " AUTO ", "fp32", "f32"] {
+            assert_eq!(
+                resolve_gdn_format(request, &stock).unwrap(),
+                GdnStateFormat::F32,
+                "{request:?}"
+            );
+        }
+        for request in ["q8", "Q8", "int8"] {
+            let error = resolve_gdn_format(request, &stock).unwrap_err();
+            assert!(
+                error.contains("stock-FP8") && error.contains("F32"),
+                "{error}"
+            );
+        }
+        assert!(resolve_gdn_format("bf16", &stock).is_err());
+        for arch in ["gfx1151", "gfx942", "gfx1201"] {
+            assert_eq!(
+                resolve_gdn_format_for_arch("auto", &stock, arch, false),
+                Ok(GdnStateFormat::F32),
+                "{arch}"
+            );
+        }
     }
 
     /// The AR-only (stock-FP8) profile pins the F32 GDN recurrent state:
@@ -5227,22 +5717,38 @@ mod tests {
                     assert!(sizes.is_empty());
                     continue;
                 }
-                assert_eq!(sizes.len(), 3 * layers + 2);
-                let (ring, inputs, recurrence) = (
-                    (2 * rows
-                        * gdn.storage().state_bytes(
-                            value_heads,
-                            config.linear_key_head_dim,
-                            config.linear_value_head_dim,
-                        )) as u64,
+                let slot_bytes = gdn.storage().state_bytes(
+                    value_heads,
+                    config.linear_key_head_dim,
+                    config.linear_value_head_dim,
+                ) as u64;
+                let (inputs, recurrence) = (
                     (rows * qkv * 4) as u64,
                     (rows * (qkv + 2 * value_heads) * 4) as u64,
                 );
-                for layer in sizes[..3 * layers].chunks(3) {
-                    assert_eq!(layer, [ring, inputs, recurrence], "{gdn:?} {rows}");
-                }
+                let pooled = compact_capture_ring() && lane_reserve_trim();
+                let per_layer = if pooled {
+                    // One shared pool, then (inputs, recurrence) per layer.
+                    assert_eq!(sizes.len(), 2 * layers + 3);
+                    assert_eq!(
+                        sizes[0],
+                        capture_ring_pool_slots(rows, layers).unwrap() as u64 * slot_bytes
+                    );
+                    for layer in sizes[1..1 + 2 * layers].chunks(2) {
+                        assert_eq!(layer, [inputs, recurrence], "{gdn:?} {rows}");
+                    }
+                    1 + 2 * layers
+                } else {
+                    assert_eq!(sizes.len(), 3 * layers + 2);
+                    let ring = capture_ring_slots(compact_capture_ring(), rows).unwrap() as u64
+                        * slot_bytes;
+                    for layer in sizes[..3 * layers].chunks(3) {
+                        assert_eq!(layer, [ring, inputs, recurrence], "{gdn:?} {rows}");
+                    }
+                    3 * layers
+                };
                 assert_eq!(
-                    sizes[3 * layers..],
+                    sizes[per_layer..],
                     [
                         (rows * value_heads * GDN_HEAD_DIM * 4) as u64,
                         (layers * 16) as u64
@@ -5858,7 +6364,9 @@ mod tests {
             snapshot_arena: arena,
             row_capture: Vec::new(),
             row_capture_output: None,
+            row_capture_pool: None,
             row_capture_rows: 0,
+            row_capture_compact: false,
             gdn_live: 0,
             gdn_format: GdnStateFormat::F32,
             gdn_value_heads: config.linear_num_value_heads,
@@ -6265,7 +6773,7 @@ mod tests {
 
     /// Source audit (CPU): the Qwen4 QSA arena paths never unmap, release or
     /// reallocate a live VMM owner. `reset_inner` clears in place with
-    /// `memset` (a VMM owner's buffer is its mapped prefix); growth is one
+    /// `memset_batched` (a VMM owner's buffer is its mapped prefix); growth is one
     /// `grow_vmm_tensor` forward map plus a memset of exactly the new bytes;
     /// hipMemUnmap is not called anywhere in this crate.
     #[test]
@@ -6299,7 +6807,47 @@ mod tests {
         for token in forbidden.into_iter().chain(["grow_vmm_tensor"]) {
             assert!(!reset.contains(token), "reset_inner contains `{token}`");
         }
-        assert!(reset.contains(".memset("), "reset clears arenas in place");
+        assert!(
+            reset.contains(".memset_batched("),
+            "reset clears arenas in place"
+        );
+        // One lane reset enqueues every fill and waits once: no per-buffer wait between
+        // the fills (the extent check's post-launch wait is the one developer exception).
+        assert!(
+            !reset.contains(".memset_stream_ordered("),
+            "reset_inner must not wait per buffer"
+        );
+        assert_eq!(
+            reset.matches("memset_batch_sync(").count(),
+            1,
+            "reset_inner waits only for the extent post-launch check"
+        );
+        let synced = code(src, "    fn reset_synced(", "\n    }\n");
+        assert_eq!(synced.matches("memset_batch_sync(").count(), 1);
+        // The kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) is today's per-buffer wait.
+        let dispatch = include_str!("../../rdna-compute/src/dispatch.rs");
+        let batched = code(dispatch, "    pub fn memset_batched(", "\n    }\n");
+        assert!(
+            batched.contains("!self.flags.lane_reset_batch")
+                && batched.contains("return self.memset_stream_ordered("),
+            "memset_batched falls back to memset_stream_ordered under the kill switch"
+        );
+        // The whole lane reset (trunk, head, pending hidden) shares one batch.
+        let lane = include_str!("lane.rs");
+        let cell = code(lane, "fn reset_cell_into(", "\n}\n");
+        assert!(cell.contains(".reset_into(gpu, batch)") && !cell.contains("memset"));
+        let spec = code(
+            lane,
+            "    fn reset_into(&mut self, gpu: &mut Gpu, batch",
+            "\n    }\n",
+        );
+        assert!(spec.contains(".memset_batched(") && !spec.contains("memset_stream_ordered"));
+        let admit = code(
+            lane,
+            "                    Some(cell) => {\n                        // Trunk state",
+            "                        Ok(None)",
+        );
+        assert_eq!(admit.matches("memset_batch_sync(").count(), 1);
 
         let ensure = code(src, "    pub fn ensure_mapped_capacity(", "\n    }\n");
         for token in forbidden.into_iter().chain(["memset", "grow_vmm_tensor"]) {
@@ -6552,21 +7100,105 @@ mod tests {
     #[test]
     fn row_capture_bytes_charge_the_gdn_storage_dtype() {
         let config = crate::config::compact_test_config();
-        // 36 GDN layers x (2R ring slots + F32 inputs 4R x 10240 and
-        // recurrence 4R x 10336) + 4R x 6144 F32 output + 36 x 16 table.
+        // 36 GDN layers x (F32 inputs 4R x 10240 and recurrence 4R x 10336) + the ring slots
+        // (the shared pool 2 * 35 + R + 1 = 75 slots by default; 36 x (R + 1) with
+        // HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0, 36 x 2R with the compact kill switch)
+        // + 4R x 6144 F32 output + 36 x 16 table.
+        assert_eq!(capture_ring_slots(false, 4), Some(8));
+        assert_eq!(capture_ring_slots(true, 4), Some(5));
+        assert_eq!(capture_ring_slots(compact_capture_ring(), 4), Some(5));
+        assert_eq!(capture_ring_pool_slots(4, 36), Some(75));
+        let (f32_bytes, q8_bytes) = if lane_reserve_trim() {
+            (247_880_256, 72_776_256)
+        } else {
+            (578_181_696, 157_932_096)
+        };
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, 4),
-            Some(917_920_320)
+            Some(f32_bytes)
         );
         // Q8 slots are 48 x 128 x 132 bytes, not 3 MiB of F32.
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4),
-            Some(245_520_960)
+            Some(q8_bytes)
         );
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 1),
             Some(0)
         );
+    }
+
+    /// The rank-local TP2 trunk-shard config (24 value / 8 key GDN heads) sizes the GDN state
+    /// from its own head counts: the recurrent slot of every format, its live F16 residual, the
+    /// 3-row conv ring and the verify ring all halve against the global config while the QSA
+    /// arenas (KV replicated) and everything else stay byte-for-byte, and the global config's
+    /// figures are unchanged.
+    #[test]
+    fn trunk_shard_local_config_halves_the_gdn_state_and_the_verify_ring() {
+        let global = crate::config::compact_test_config()
+            .into_ar_only()
+            .expect("ar-only");
+        let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
+        // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype`.
+        let trim = lane_reserve_trim();
+        assert_eq!(
+            Qwen4State::row_capture_bytes(&global, GdnStateFormat::F32, 4),
+            Some(if trim { 247_880_256 } else { 578_181_696 })
+        );
+        assert_eq!(
+            Qwen4State::row_capture_bytes(&global, GdnStateFormat::Q8, 4),
+            Some(if trim { 72_776_256 } else { 157_932_096 })
+        );
+        for local in &locals {
+            // 36 x (F32 inputs 4R x 5120 and recurrence 4R x 5168) + the ring slots (the shared
+            // 75-slot pool; 36 x (R+1) with HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0) + 4R x 3072 F32
+            // output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::F32, 4),
+                Some(if trim { 123_940_416 } else { 289_091_136 })
+            );
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 4),
+                Some(if trim { 36_388_416 } else { 78_966_336 })
+            );
+            assert_eq!(
+                Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 1),
+                Some(0)
+            );
+        }
+        let (heads, key_heads) = (
+            locals[0].linear_num_value_heads,
+            locals[0].linear_num_key_heads,
+        );
+        assert_eq!((heads, key_heads), (24, 8));
+        let conv = (2 * key_heads * GDN_HEAD_DIM + heads * GDN_HEAD_DIM)
+            * locals[0].linear_conv_kernel_dim.saturating_sub(1)
+            * std::mem::size_of::<f32>();
+        for (name, format) in allocation_formats() {
+            let slot = format
+                .gdn
+                .storage()
+                .state_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
+            let residual = format.gdn.residual_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
+            // Recurrent + conv, doubled by the snapshot mirror, plus the live-only residual.
+            let gdn_layer = 2 * (slot + conv) + residual;
+            for context in allocation_contexts() {
+                let whole = Qwen4State::device_bytes(&global, format, &context).expect("global");
+                for local in &locals {
+                    let part = Qwen4State::device_bytes(local, format, &context).expect("local");
+                    assert_eq!(
+                        whole - part,
+                        local.n_linear_layers() * gdn_layer,
+                        "{name} {context:?}"
+                    );
+                }
+                assert_eq!(
+                    Qwen4State::device_bytes(&locals[0], format, &context),
+                    Qwen4State::device_bytes(&locals[1], format, &context),
+                    "{name} {context:?}: the ranks hold equal state"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6586,8 +7218,7 @@ mod tests {
                     let expected = if n < 2 || layers == 0 {
                         0
                     } else {
-                        let ring = 2
-                            * n
+                        let ring = current_capture_ring_total_slots(n, layers).unwrap()
                             * format.state_bytes(
                                 config.linear_num_value_heads,
                                 config.linear_key_head_dim,
@@ -6595,7 +7226,7 @@ mod tests {
                             );
                         let inputs = 4 * n * (2 * qkv + 2 * config.linear_num_value_heads);
                         let discard = 4 * n * config.linear_num_value_heads * GDN_HEAD_DIM;
-                        layers * (ring + inputs) + discard + 16 * layers
+                        ring + layers * inputs + discard + 16 * layers
                     };
                     assert_eq!(
                         Qwen4State::row_capture_bytes_scoped(&config, format, n, layers),
@@ -6960,6 +7591,13 @@ mod tests {
                 advance_history(&mut gpu, &mut reference, row);
                 expected.push(capture_semantic_digest(&reference, &mut gpu));
             }
+            // The ring layout this allocation took (`HIPFIRE_QWEN4_CAPTURE_RING_COMPACT`, default
+            // on: `rows + 1` slots, logical slots mapped by `capture_ring_slot`; `=0` is the
+            // double ring where logical == physical). Run the test under both settings.
+            let compact = candidate.row_capture_compact;
+            let ring_slot = |state: &Qwen4State, logical: usize| {
+                capture_ring_slot(state.row_capture_compact, rows, logical)
+            };
             for base in [0, rows] {
                 for keep in 0..=rows {
                     candidate.set_gdn_live(if base == 0 { 2 * rows - 1 } else { rows - 1 });
@@ -6969,34 +7607,74 @@ mod tests {
                     let old_bytes = gpu
                         .download_raw_bytes(&candidate.gdn[0].recurrent)
                         .expect("old live bytes");
-                    let destination = candidate.row_capture[0]
-                        .0
-                        .sub_offset(base * state_units, rows * state_units);
-                    gpu.hip
-                        .memset(&destination.buf, 0xa5, destination.byte_size())
-                        .expect("poison free half");
+                    if compact {
+                        // Poison every physical slot but the old live one (the old state must
+                        // survive the capture), the compact ring's equivalent of the free half.
+                        for physical in 0..=rows {
+                            if physical == ring_slot(&candidate, old_live) {
+                                continue;
+                            }
+                            let slot = candidate.row_capture[0]
+                                .0
+                                .sub_offset(physical * state_units, state_units);
+                            gpu.hip
+                                .memset(&slot.buf, 0xa5, slot.byte_size())
+                                .expect("poison free slot");
+                        }
+                    } else {
+                        let destination = candidate.row_capture[0]
+                            .0
+                            .sub_offset(base * state_units, rows * state_units);
+                        gpu.hip
+                            .memset(&destination.buf, 0xa5, destination.byte_size())
+                            .expect("poison free half");
+                    }
                     candidate.row_capture_armed = true;
                     let ticket = candidate.snapshot(&mut gpu).expect("armed snapshot");
                     capture(&mut gpu, &mut candidate, 0, rows);
                     assert_eq!(candidate.gdn_live, base + rows - 1);
                     let old_slot = candidate.row_capture[0]
                         .0
-                        .sub_offset(old_live * state_units, state_units);
+                        .sub_offset(ring_slot(&candidate, old_live) * state_units, state_units);
                     assert_eq!(
                         gpu.download_raw_bytes(&old_slot).expect("old slot"),
                         old_bytes
                     );
-                    for slot in [base, base + rows - 2] {
-                        let intermediate = candidate.row_capture[0]
-                            .0
-                            .sub_offset(slot * state_units, state_units);
-                        assert!(
-                            gpu.download_raw_bytes(&intermediate)
-                                .expect("uncaptured slot")
-                                .iter()
-                                .all(|byte| *byte == 0xa5),
-                            "intermediate state was materialized"
-                        );
+                    if compact {
+                        // Compact ring: only the captured slot and the old live slot hold
+                        // state; every other physical slot is still the poison byte.
+                        let written = [
+                            ring_slot(&candidate, candidate.gdn_live),
+                            ring_slot(&candidate, old_live),
+                        ];
+                        for physical in 0..=rows {
+                            if written.contains(&physical) {
+                                continue;
+                            }
+                            let slot = candidate.row_capture[0]
+                                .0
+                                .sub_offset(physical * state_units, state_units);
+                            assert!(
+                                gpu.download_raw_bytes(&slot)
+                                    .expect("uncaptured slot")
+                                    .iter()
+                                    .all(|byte| *byte == 0xa5),
+                                "intermediate state was materialized (physical slot {physical})"
+                            );
+                        }
+                    } else {
+                        for slot in [base, base + rows - 2] {
+                            let intermediate = candidate.row_capture[0]
+                                .0
+                                .sub_offset(slot * state_units, state_units);
+                            assert!(
+                                gpu.download_raw_bytes(&intermediate)
+                                    .expect("uncaptured slot")
+                                    .iter()
+                                    .all(|byte| *byte == 0xa5),
+                                "intermediate state was materialized"
+                            );
+                        }
                     }
                     candidate.row_capture_armed = false;
                     if keep == 0 {
