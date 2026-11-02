@@ -710,3 +710,74 @@ inherent to this draft/verify shape, not a kernel gap. DFlash therefore stays
 Decode at ctx128 is 45.2 tok/s under `hipfire bench` (46.3 before C17; within
 the ±3% session spread). Remaining prefill split at pp8192 (rocprof, wide):
 w4a4 set/add 61%, IU8 wo 16%, GDN 8%, attention 5%, producers 7%.
+
+## C18 — accelerator audit and gap-closure attempts (2026-11-02)
+
+Read `rdna3-isa-condensed.md` against the shipped kernels, unbundled the cached
+gfx1100 code objects (`clang-offload-bundler` + `llvm-objdump -d --mcpu=gfx1100`)
+and used the radiowave inspection metadata for VGPR/spill/instruction counts.
+Method: fresh-process `hipfire bench --matrix --spec off`, rocprofv3 kernel
+traces, FILE header FLOP accounting.
+
+### What the hardware can offer, and what we use
+
+- RDNA3 WMMA is 16x16x16 for F16/BF16/IU8/IU4; IU4/IU8 issue the same 8192
+  FLOP/instr as F16, so their peak is the model's 122.9 TFLOPS (7900 XTX).
+- 27B IU4P = 26.899 B params, 25.622 B matmul params (qt57 22.841 B, qt59
+  4.053 B, qt1/qt3 0.006 B). 2048-token prefill = 104.9 TFLOP.
+- IU4 W4A4 tile: 64 WMMA, 95 VOPD, 1,131 static instructions, 96 VGPR, 0
+  spills, LDS 30,720 B/CTA (2 CTAs/CU of 64 KiB). 80.8 TFLOPS on the qt57
+  matmul = **66% of F16 WMMA peak**. MQ4V2 twin: 64 WMMA, 94 VOPD, 1,151
+  static, same 96 VGPR = 75.4 TFLOPS (61%).
+- qt59 wo GEMM: F16 WMMA fed by int8->f16 dequant; mb4m2 body 16 WMMA, 182
+  VGPR, 0 spills. 15.3 TFLOPS = **12% of peak**. `V_WMMA_I32_16X16X16_IU8`
+  is not used in production; per-32 scales would need int32 accumulators
+  scaled per K32, which trades the weight dequant for an equal count of
+  accumulator converts, and the existing opt-in W4A8 route measured slower.
+- Decode: f32 FMAC/FMA (VOPD present but limited by pairing rules), 14.82 GB
+  of weights per token / 23.03 ms = **643 GB/s = 67% of 960 GB/s** (76% of a
+  realistic ~850 GB/s). `fused_iu4g256_rows` is the best stream (~874 GB/s);
+  qt59 wo ~623 GB/s.
+- No hot kernel sets `SLC`/`DLC`; every load is default LRU.
+
+### IU4 vs MQ4 (why speeds match)
+
+Same quant math and bpw; layout differs. qt44 group = 8 B header + 128 B codes
+interleaved (136 B/256); qt57 = 128 B code plane + 8 B header plane per group,
+so code reads are 128 B-aligned. qt59 = `[K int8 codes][K/32 f16 scales]`
+(planar Q8_0 relayout). The twin proof is byte-exact; the prefill kernels are
+the same source under `HIPFIRE_MMQ_IU4L` and differ by 20 static instructions
+of addressing. Identical-settings bench:
+
+| model | pp512 | pp2048 | pp8192 | tg@128 | tg@4096 |
+|---|---|---|---|---|---|
+| IU4P | 1,672 | 1,669 | 1,607 | 45.21 | 44.70 |
+| MQ4P | 1,580 | 1,574 | 1,519 | 45.69 | 45.22 |
+
+### Attempts that lost (kept out of the tree)
+
+- qt59 mb8 fanout (16 rows x 128 tokens): pp2048 1,560 vs 1,669 (-6.5%);
+  X traffic doubles and the 157-VGPR body gained nothing.
+- qt59 mb8m2 fanout (32 rows x 128 tokens): pp2048 1,687 vs 1,665 (+1.3%)
+  and pp8192 1,627 vs 1,607, but it needs 256 VGPR and spills 8 registers;
+  not worth defaulting.
+- Non-temporal (`__builtin_nontemporal_load` -> `global_load_b128 ...
+  slc dlc`) weight loads in the qt59 decode GEMV: 46.38/46.27 tok/s vs
+  46.38/46.49, i.e. noise. Removed.
+- DFlash block 4 / 8 at 21,580-token context (IU4P, registry draft): 23.4 /
+  26.7 tok/s, tau 1.7 / 2.1, vs AR 40.3. Block 16 was 29.2. Long-context
+  verification is KV-traffic bound, not block-size bound.
+
+### Remaining ceilings
+
+- qt59 GEMM is format-bound at this tile level (12% peak). The next real
+  step is an MMQ-style 128x128 LDS-staged Q8 GEMM that reuses dequantized
+  weights across 128 tokens; the fanout sweeps above show the current
+  register-only geometry is within ~1% of its tradeoff frontier.
+- W4A4 sits at 66% because its 128-K `block_i4_128` tile fixes a 30,720 B
+  LDS footprint (2 CTAs/CU). Beating it needs a new activation layout
+  (K64), not a dispatch knob.
+- GDN (7.8% of prefill) has no chunk-scan route on gfx1100; the WMMA chunk
+  scan is admitted on gfx1200/gfx1201 only.
+- Decode is at the HBM wall for this weight set; the only large lever left
+  is speculation, whose long-context arm is measured dead.
