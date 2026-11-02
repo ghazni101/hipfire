@@ -591,3 +591,27 @@ xp1 wins in all 6 pairs, but the gain is under 0.5%. So X misalignment is not wh
 offset b128 loads cost almost nothing here. The default stays off: the default prefill is a4, so this only matters for the a8 path or role overrides.
 27B gate with a8 + XPLANAR=1 (hash,code,math,ctx4k x2): 15c387bfc1cf / c0425548b9e4 / a21ee78300f1 / a60387026fc6 == c13_27a8; unstable 0, conc_mismatch 0, errors 0.
 Not measured: an ISA diff of the xp kernel (llvm-objdump), a 4B gate on the xp path, and clock-pinned timing.
+
+## Chunk 5:30 PM — C16 slots port + batched decode IU4P vs MQ4P (13:30-13:45 UTC = 17:30-17:45 Dubai)
+Steer: int8 work deprioritised. a8 GEMM-gap investigation and WMMA iu8 microbench DROPPED (wm.hip compiled+ISA-checked, never run).
+Future work (untested hypotheses): a8 gap = weight-unpack ALU + 2x X LDS bytes, not WMMA rate (static ISA: a4 lf16_col 64 iu4 WMMA/955 instr/96 VGPR; a8x 32 iu8 WMMA/1072 instr/118 VGPR, not per-tile normalised). qt59 (IU8G32) int8 rotation: not started.
+
+C16 (89d74ab2f): forward_slots admits IU4G256 (proj + rotated), IU8G32 lm_head + residual (gfx1100/1151, k%32==0); Uniform IU4 groups (qkvza x2, qkv x2, gate_up) + residual/w_down via gemm_iu4g256_multi on x_rot. Builds clean.
+**C16 is compiled but NOT exercised**: the only daemon consumer (serve.vmm_batch, HIPFIRE_SERVE_VMM_BATCH=1) refuses Qwen3.5-4B for BOTH formats:
+"VMM continuous batch unsupported for this model: exact VMM route: layer 0 is not a dense uniform-MQ4G256V2 layer". Legacy SlotEngine (serve.multi_slot) not tried. vmm_iu4 c15 vs c16 hashes identical (aeff3a104d...) = singleton route, nothing changed. saddle-lab test_forward_slots_golden on IU4P not run -> C16 numerics/coherence UNTESTED.
+
+Batched decode that actually runs today = default `--continuous-batch-size 8` route (qwen35::forward_decode_batch), already IU4-capable. ct.py, 8 prompts, 128 tok, T=0, 3 rounds alternating c-order, median agg tok/s:
+| route / model (4B) | c1 | c4 | c8 |
+|---|---|---|---|
+| singleton (vmm_batch=1 falls back) IU4P | 186.1 | 186.4 | 186.6 |
+| singleton MQ4P | 187.7 | 188.1 | 188.2 |
+| cb IU4P a4 (default) | 28.5 | 110.9 | 217.7 |
+| cb IU4P a8 (HIPFIRE_IU4_PREFILL_ACT=a8) | 35.7 | 138.8 | 272.3 |
+| cb IU4P HIPFIRE_IU4_PREFILL=0 | 28.5 | 110.9 | 217.7 |
+| cb MQ4P | 48.3 | 188.3 | 372.4 |
+- cb step time is ~flat in lanes for both models (IU4 a4 ~36 ms/step, a8 ~29, MQ4P ~21 ms/step) vs ~5.4 ms singleton: cb route has a large fixed per-step cost (both formats; untested hypothesis: un-graphed launch overhead / fixed lane padding). IU4 adds ~15 ms/step over MQ4P (a4). Not investigated (time).
+- IU4P cb c8 = 0.58x MQ4P cb c8; cb beats singleton only at c8 for IU4P (217.7 vs 186.6); MQ4P ties at c4 and wins at c8 (372.4 vs 188.2).
+- Determinism: all hashes identical across 3 rounds and across c1/c4/c8 for the same prompt (both routes, all configs).
+- Byte-identity to singleton: MQ4P cb == MQ4P singleton (0b3f35bf4a...). IU4P cb a4 (5cacd738a8) != IU4P singleton (aeff3a104d): batched decode uses the a4 W4A4 GEMM (quantised activations) instead of the f32 decode GEMV. HIPFIRE_IU4_PREFILL=0 gives the same hash as a4 -> that knob does not reach forward_decode_batch (untested why). Open gap: IU4P batched decode is not the f32-decode numerics; KL of the cb path vs MQ4P not measured.
+- fl_iu4_c16 (C16 daemon, cb route) == c15 a4 numbers and hashes (28.5/110.9/217.7, 5cacd738a8...): C16 is a no-op on the default route, as expected.
+- Gate c16_vmm4b (HIPFIRE_SERVE_VMM_BATCH=1, --continuous-batch-size 4, keys hash/code/math/ctx4k, 2 rounds): unstable 0, conc_mismatch 0, errors 0, klog 0. NB this exercised the singleton fallback, not forward_slots.
