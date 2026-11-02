@@ -355,3 +355,11 @@ GPU idle-gated, klog=0 every run. Median of 3 rounds (tok/s); logs ~/work/logs/a
 
 a4 vs C9: +29.8% pp512, +27.3% pp2048; vs MQ4P −6.0% / −6.1% (remaining gap, unprofiled). Small-M WMMA vs MMQ: +3.2% / +3.1% (a4).
 a8 (W4A8 at C10) vs C9: +3.8% / +3.6% (small-M WMMA only). Decode unchanged (±0.3%), still +2% over MQ4P.
+
+### Gates 3/4, 4B (gs.sh, 10:45–10:50 UTC = 14:45–14:50 Dubai)
+w4 (C10 a4 solo serve), w4cb (`--continuous-batch-size 4`), w4a8 (a8): each `unstable 0 conc_mismatch 0 errors 0`, klog 0
+(solo twice-identical per key = determinism; solo vs 4-way concurrent identical = EQ4K-style check). ctx4k needle
+answered correctly (BLUE-4471 / Dr. Okafor) in w4 and w4cb; code/story text coherent. Greedy hashes differ from C9 for
+hash/math/story/ctx1k/ctx4k (prefill numerics changed: W4A8 -> W4A4); `code` equal to C9 in solo. The cb4 server's
+greedy text differs from the solo server's (code diverges at "Assumes both input lists" vs "Assumes list1 and list2");
+C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predates C10. Root cause not investigated (untested).
