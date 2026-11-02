@@ -97,13 +97,70 @@ fn main() {
             }
             _ => panic!("{usage}"),
         },
-        "score" => {
+        "score" | "pref" | "pscore" => {
             let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
             let t: Vec<u32> = r["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
             (t, r["start"].as_u64().unwrap() as usize, None)
         }
         _ => panic!("{usage}"),
     };
+    // Prefill-path oracle: `pref <model> <tokens-ref.json> <out.json>` and
+    // `pscore <model> <ref.json> <out.json>` run ONE batched prompt prefill
+    // (`forward_prefill_batch_capture_hidden`, production prompt route) over
+    // the reference tokens and take every row's logits from the lm_head GEMV
+    // on the captured hidden rows, so the prefill GEMMs are what is measured.
+    if mode == "pref" || mode == "pscore" {
+        let n = tokens.len();
+        let hidden = gpu.alloc_tensor(&[n, config.dim], rdna_compute::DType::F32).unwrap();
+        qwen35::forward_prefill_batch_capture_hidden(&mut gpu, &weights, &config, &tokens, 0, &mut kv, &mut dn, &scratch, &hidden).expect("prefill");
+        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
+        let (mut same_hash, mut top1, mut nll_sum, mut kl_sum, mut kl_max, mut n_sc) = (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
+        let mut first_div: Option<usize> = None;
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let nsteps_ref = r["steps"].as_array().unwrap().len();
+        for i in (start - 1)..(n - 1) {
+            let step = i + 1 - start;
+            if step >= nsteps_ref { break; }
+            let row = hidden.sub_offset(i * config.dim, config.dim);
+            let ctx = llama::DispatchCtx::new(&gpu);
+            let _ = llama::gemv_family().run_auto(&ctx, &mut gpu, &weights.output.dispatch_ref(), &row, &scratch.logits).expect("lm_head");
+            let logits = gpu.download_f32(&scratch.logits).unwrap();
+            let logits = &logits[..config.vocab_size];
+            let am = llama::argmax(logits);
+            let lp = log_softmax(logits);
+            let h = fnv(logits);
+            if mode == "pscore" {
+                let rr = &r["steps"][step];
+                if rr["hash"].as_str() == Some(h.as_str()) { same_hash += 1; }
+                if rr["argmax"].as_u64() == Some(am as u64) { top1 += 1; } else if first_div.is_none() { first_div = Some(step); }
+                let mut kl = 0f64; let (mut pin, mut qin) = (0f64, 0f64);
+                for e in rr["top"].as_array().unwrap() {
+                    let id = e[0].as_u64().unwrap() as usize; let lpr = e[1].as_f64().unwrap();
+                    let p = lpr.exp(); kl += p * (lpr - lp[id]); pin += p; qin += lp[id].exp();
+                }
+                let (pr, qr) = ((1.0 - pin).max(1e-300), (1.0 - qin).max(1e-300));
+                kl += pr * (pr.ln() - qr.ln());
+                kl_sum += kl; kl_max = kl_max.max(kl);
+            } else {
+                let t = topk(&lp, TOPK);
+                rows.push(serde_json::json!({"argmax": am, "hash": h, "top": t.iter().map(|(i, v)| serde_json::json!([i, v])).collect::<Vec<_>>()}));
+            }
+            n_sc += 1;
+            nll_sum += -lp[tokens[i + 1] as usize];
+        }
+        let ppl = (nll_sum / n_sc.max(1) as f64).exp();
+        let secs = t0.elapsed().as_secs_f64();
+        let out = if mode == "pscore" {
+            serde_json::json!({"model": model_path, "ref": a[3], "mode": "prefill", "steps": n_sc,
+                "logit_rows_bit_identical": same_hash, "top1_agree": top1, "first_divergence": first_div,
+                "mean_kl_top64": kl_sum / n_sc.max(1) as f64, "max_kl_top64": kl_max, "ppl": ppl, "secs": secs})
+        } else {
+            serde_json::json!({"model": model_path, "mode": "prefill", "start": start, "tokens": tokens, "steps": rows, "ppl": ppl, "secs": secs})
+        };
+        std::fs::write(&a[4], out.to_string()).unwrap();
+        if mode == "pscore" { println!("{out}"); } else { println!("{{\"steps\":{n_sc},\"ppl\":{ppl},\"secs\":{secs}}}"); }
+        return;
+    }
     let mut tokens = tokens;
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let refj: Option<serde_json::Value> = if mode == "score" {
