@@ -363,3 +363,41 @@ answered correctly (BLUE-4471 / Dr. Okafor) in w4 and w4cb; code/story text cohe
 hash/math/story/ctx1k/ctx4k (prefill numerics changed: W4A8 -> W4A4); `code` equal to C9 in solo. The cb4 server's
 greedy text differs from the solo server's (code diverges at "Assumes both input lists" vs "Assumes list1 and list2");
 C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predates C10. Root cause not investigated (untested).
+
+### C10 follow-ups (2026-11-02 10:51-11:20 UTC = 14:51-15:20 Dubai)
+- 27B prefill-path KL (iu4_kld pscore, 511 steps):
+  | run | ref | mean KL top64 | top-1 | PPL |
+  |---|---|---|---|---|
+  | MQ4P prefill | MQ4P decode | 0.0179 | 477 | 6.0610 |
+  | C10 a4 | MQ4P prefill | 0.0344 | 459 | 5.9183 |
+  | C10 a8 | MQ4P prefill | 0.0175 | 478 | 5.8249 |
+  | C10 a4 | MQ4P decode (PPL 5.8400) | 0.0204 | 480 | 5.9183 |
+  | C10 a8 | MQ4P decode | 0.00061 | 506 | 5.8249 |
+  (first a8_vsdec attempt OOMed at 10:56 UTC, VRAM of the previous run not yet freed; rerun 11:17 UTC with a VRAM<2000 MB gate.)
+- 27B A/B in chW27 is INVALID except round 1 (p27_1 pp128 29.00 / tg 29.33; h1_27_1 pp512 1028.7, pp2048 1028.0, tg@128 46.77, tg@4096 45.19).
+  From 10:58:50 UTC every bench died at once: "FATAL: GPU ... already reserved by holder PID 686978" (holder gone by 11:20; most likely the
+  h1_27_1 daemon still tearing down - idle() gated only on GFX%, not VRAM; hypothesis). Then chX.sh, which waited on grep "DONE",
+  matched "ABDONE" and started at 10:59:14, overlapping the w4cb27 gate (errors 8) with dv_mq_solo (errors 12). Both are my scheduling bugs.
+  w4s27 (11:05, alone) = unstable 0 / conc 0 / errors 0. Clean reruns queued in chR.sh, now gated on GFX<10% AND VRAM<2500 MB.
+- Prefill gap profile (rocprofv3, ppdrive.py, 4B, 5x pp2048 incl. 1 warm, 11:17 UTC, GPU alone): C10 1145.0 ms vs MQ4P 1077.1 ms kernel time (+68 ms, 6.3%).
+  | bucket | C10 ms | MQ4P ms | delta |
+  |---|---|---|---|
+  | act rotate+int4 quant | 92.8 (quantize_int4_mmq_ds128 68.3 + fused_silu_mul_mq_rotate 14.3 + fused_rmsnorm_mq_rotate 10.2) | 41.8 (fused_*_rotate_i4{,_b8} 22.3+19.5) | +51.0 |
+  | LA wo | gemm_iu8g32_residual_wmma 180.6 | gemm_q8_0_residual_wmma 146.1 | +34.5 |
+  | W4A4 MMQ set+add | 470.5 | 487.0 | -16.5 |
+  | everything else | ~equal (attention 154, GDN 132, conv 48.6) | | ~0 |
+  => gap fully explained: (1) IU4 path quantizes x in a separate kernel instead of MQ4P's fused rotate->int4 kernels (same FWHT seeds,
+  so the _i4 fused kernels should be reusable: candidate C11, untested); (2) IU8G32 wo layout 24% slower than Q8_0 WMMA (as seen before).
+- batch-4 vs solo divergence (4B, gate.py solo phase; shas per key code/ctx1k/ctx4k/hash/math/story):
+  | label | server | shas |
+  |---|---|---|
+  | dv_c10_cb1 | C10 IU4P cb1 | 166f783c 8e3f23e5 a8398834 6dbe5cb4 c101d4fb d4eed6f4 (= w4_iu4p4b) |
+  | dv_c10_cb4_hip | C10 IU4P cb4, REPLAY_BACKEND=hip | b4408528 a7e12605 0ca372b6 1fe51a95 2ca2ea0f fe1d7775 (= w4cb_iu4p4b) |
+  | dv_c10_cb4_auto | cb4, REPLAY_BACKEND=auto | identical to cb4_hip |
+  | dv_c10_cb4_ch4k | cb4, PREFILL_CHUNK=4096 | identical to cb4_hip |
+  | dv_mq_solo | MQ4P cb1 | 166f783c 23210b84 65ce263d 507cb95b dce45d88 5f291a9a |
+  | dv_mq_cb4 | MQ4P cb4 | 166f783c 23210b84 65ce263d d5deb4c5 dce45d88 56f72465 |
+  Each config deterministic (unstable 0). Serve log: KV backend=legacy (not VMM), so replay backend does not change anything here.
+  => NOT the VMM chunk-boundary class: prompts are <1024 tok except ctx4k, and pinning chunk 4096 changes nothing. It is the cb>1 server
+  taking a different (multi-slot) kernel path even for a lone request. MQ4P has the same effect on 2/6 keys; IU4P on 6/6. Which kernels
+  differ (slot GEMM vs solo GEMV, f16 X small-M) is untested.
