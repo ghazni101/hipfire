@@ -525,3 +525,41 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
   - Still missing: IU4G256/IU8G32 in slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key and lm_head_slots_admissible, plus the slots-side producer and pending-x wiring.
   - chZ (slots) does not run on IU4 until that port lands. NOT STARTED.
 - qt59 rotation: last item, untouched.
+
+## Chunk 4:38 PM — items (3) 27B C13 gate, (2) per-role a8 (C14)
+
+### (3) 27B gate on C13 (chF, 12:38–12:47 UTC)
+- c13_27 default (a4all): hash=57040570c7bf code=c0425548b9e4 math=80e54e58e52e ctx4k=1c373245e97a — identical to c27all (a4all on c11b). unstable 0, conc_mismatch 0, errors 0.
+- c13_27a8 (PREFILL_ACT=a8): 15c387bfc1cf / c0425548b9e4 / a21ee78300f1 / a60387026fc6 — identical to b27a8.
+- c13_27cb (cb4, 2 rounds): 4aae6a25ebc9 / 689db6c41ce1 / 54c324ce92c9 / 4897a51473a0, stable, conc_mismatch 0 (no prior cb4 ref to compare).
+- Note: C14 cargo build ran (nice -19) during the c13_27 gate's 2nd half; gate is hash-only, so not a correctness concern.
+
+### (2) C14 commit 82672f514: per-role/layer a8 override
+- Gpu fields iu4_role (u8, MAX=none) and iu4_layer (idx, n_layers); role set at entry of the 6 projection fns
+  (full-attn in/out, deltanet in/out, ffn gate_up/down); layer set (+role reset) at the top of both prefill.rs layer loops.
+- Gpu::iu4_act_eff() replaces the global act in iu4_fused_x_act (producer) and gemm_iu4g256_multi (consumer), so producer+consumer agree.
+- Env: HIPFIRE_IU4_A8_ROLES=aqkv,ao,dqkv,do,gu,dn,all ; HIPFIRE_IU4_A8_LAYERS=firstN,lastN,a-b,a. Only when base act is a4. Both unset = off.
+- Sanity: default KL bitwise = C13 (0.03875639474581316); ROLES=all KL = a8 bitwise (4B 3.897451151503087e-4).
+- `do` is a no-op: KL bitwise = default on both models (DeltaNet wo in these IU4P models is IU8G32 (C12), not IU4 — inference from C12, consistent with the result).
+- KL vs decode ref (mean_kl_top64; 4B 1023 steps / 27B 511 steps, one text each), and pp2048 tok/s (sp.py: plain daemon bench_prefill 2048, 1 warm + 2, interleaved rounds; 4B n=4-10, 27B n=6, medians; spreads <1.5%):
+
+| config | 4B KL | 4B pp2048 | 27B KL | 27B pp2048 |
+|---|---|---|---|---|
+| default a4all | 0.03876 | ~7610 | 0.01794 | ~1614 |
+| aqkv | 0.04005 | – | 0.01749 | – |
+| ao | 0.03486 | – | 0.02564 | – |
+| dqkv | 0.03329 | ~7250 (−4.7%) | 0.01335 | ~1530 (−5.2%) |
+| do | = default (no-op) | – | = default | – |
+| gu | 0.02365 | ~6952 (−8.6%) | 0.01091 | ~1389 (−14.0%) |
+| dn | 0.03500 | – | 0.01497 | – |
+| first4 (all roles) | 0.04071 | – | 0.01644 | – |
+| last4 (all roles) | 0.03116 | – | 0.01483 | – |
+| gu,dn | 0.01979 | ~6692 (−12.1%) | 0.00630 | ~1295 (−19.8%) |
+| gu,dqkv | 0.01908 | – | 0.00663 | – |
+| gu,dqkv,dn | 0.00686 | ~6360 (−16.4%) | 0.00255 | ~1237.5 (−23.3%) |
+| aqkv,ao,dqkv | 0.02709 | – | 0.01522 | – |
+| all (=a8) | 3.897e-4 | ~6328 (−16.8%) | 1.108e-4 | ~1219 (−24.5%) |
+
+- Finding: the a4 KL is NOT concentrated in a few roles. Single switches are non-additive (some raise KL: 4B aqkv/first4, 27B ao), and recovering most of it needs gu+dqkv+dn, which costs ~all of a8's speed. Cheapest useful point: gu only (KL −39% on both, −8.6%/−14% pp2048). Knob kept as C14 (default off); no default change.
+- Caveats: one eval text per model; single-role deltas of ~±10% are within what non-additivity/noise could produce (untested with more text). r1 of the 4B chH speed sweep was invalid (sp.py key bug, fixed) and excluded.
+- Not started this chunk: (1) aligned int8 layout, (4) slots port, (5) qt59.
