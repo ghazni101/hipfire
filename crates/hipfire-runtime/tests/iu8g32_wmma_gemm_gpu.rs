@@ -225,3 +225,134 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
     }
     eprintln!("iu8g32 wmma: {cases} cases, worst rel vs f64 = {worst:.3e}");
 }
+
+/// Nibble-pair permutation applied to each 128-weight block, matching
+/// `block_i8_128`'s qs byte order.
+fn permute_128(w: &[i8], out: &mut [i8]) {
+    for g in 0..16 {
+        let b = 8 * g;
+        out[b] = w[b];
+        out[b + 1] = w[b + 2];
+        out[b + 2] = w[b + 4];
+        out[b + 3] = w[b + 6];
+        out[b + 4] = w[b + 1];
+        out[b + 5] = w[b + 3];
+        out[b + 6] = w[b + 5];
+        out[b + 7] = w[b + 7];
+    }
+}
+
+fn w8a8_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
+    let stride = k + k / 64;
+    let mut out = vec![0u8; m * stride];
+    for r in 0..m {
+        for kb in 0..k / 128 {
+            let sc = 0.001 + 0.02 * rng.f().abs();
+            let off = r * stride + k + kb * 2;
+            out[off..off + 2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
+            let w: Vec<i8> = (0..128).map(|_| (rng.next() % 255) as i8).collect();
+            let mut p = [0i8; 128];
+            permute_128(&w, &mut p);
+            for j in 0..128 {
+                out[r * stride + kb * 128 + j] = p[j] as u8;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore]
+fn w8a8_lds_min_matches_reference_and_times() {
+    use std::time::Instant;
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP — no GPU ({e:?}).");
+            return;
+        }
+    };
+    let mut rng = Rng(0x1357_9BDF_2468_ACE0);
+    // Correctness case.
+    let (m, k, n) = (64usize, 512usize, 32usize);
+    let w8 = w8a8_weights(&mut rng, m, k);
+    let wd = gpu.upload_raw(&w8, &[w8.len()]).unwrap();
+    let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
+    let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
+    let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
+    let yd = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    gpu.gemm_iu8g32_w8a8_min(&wd, xq, &yd, m, k, n, false)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let got = gpu.download_f32(&yd).unwrap();
+    let xq_len = (k / 128) * n * 136;
+    let xt = gpu.upload_raw(&vec![0u8; xq_len], &[xq_len]).unwrap();
+    unsafe {
+        gpu.hip
+            .memcpy_dtod_raw(xt.buf.as_ptr(), xq, xq_len)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let xqb = gpu.download_raw_bytes(&xt).unwrap();
+    let stride = k + k / 64;
+    let mut want = vec![0f32; n * m];
+    for t in 0..n {
+        for r in 0..m {
+            let mut acc = 0f32;
+            for kb in 0..k / 128 {
+                let blk = &xqb[(kb * n + t) * 136..(kb * n + t + 1) * 136];
+                let d = f32::from_le_bytes(blk[0..4].try_into().unwrap());
+                let sc = f16::from_bits(u16::from_le_bytes([
+                    w8[r * stride + k + kb * 2],
+                    w8[r * stride + k + kb * 2 + 1],
+                ]))
+                .to_f32();
+                let mut dot = 0i64;
+                for j in 0..128 {
+                    dot += (w8[r * stride + kb * 128 + j] as i8) as i64 * (blk[8 + j] as i8) as i64;
+                }
+                acc = (sc * d).mul_add(dot as f32, acc);
+            }
+            want[t * m + r] = acc;
+        }
+    }
+    let max_ref = want
+        .iter()
+        .fold(0f64, |a, v| a.max(v.abs() as f64))
+        .max(1e-30);
+    let rel = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .fold(0f64, f64::max)
+        / max_ref;
+    eprintln!("w8a8 min: m={m} k={k} n={n} worst rel={rel:.3e}");
+    assert!(rel < 1e-5, "w8a8 min rel {rel:.3e}");
+
+    // WO-shape timing (K=6144 is the 27B LA out_proj).
+    let (tm, tk, tn) = (5120usize, 6144usize, 512usize);
+    let tw = w8a8_weights(&mut rng, tm, tk);
+    let twd = gpu.upload_raw(&tw, &[tw.len()]).unwrap();
+    let tx: Vec<f32> = (0..tn * tk).map(|_| rng.f() * 2.0).collect();
+    let txd = gpu.upload_f32(&tx, &[tn * tk]).unwrap();
+    let txq = gpu.ensure_int8_mmq_x(&txd, tn, tk).unwrap();
+    let ty = gpu.upload_f32(&vec![0.0f32; tn * tm], &[tn * tm]).unwrap();
+    for _ in 0..2 {
+        gpu.gemm_iu8g32_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let t0 = Instant::now();
+    for _ in 0..8 {
+        gpu.gemm_iu8g32_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / 8.0;
+    let flops = 2.0 * (tm as f64) * (tk as f64) * (tn as f64);
+    eprintln!(
+        "w8a8 min wo shape M={tm} K={tk} N={tn}: {ms:.3} ms ({:.1} TFLOPS)",
+        flops / 1e9 / ms
+    );
+}

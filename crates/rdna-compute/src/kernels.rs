@@ -7911,6 +7911,12 @@ pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC: &str =
 /// second 16-row M tile sharing the same X fragments.
 pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu8g32_residual_wmma_mb4m2.hip");
+/// Minimal LDS-tiled W8A8 GEMM for the planar int8-per-128 weight format.
+pub const GEMM_IU8G32_W8A8_MIN_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_iu8g32_w8a8_min.hip")
+);
 
 // gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)

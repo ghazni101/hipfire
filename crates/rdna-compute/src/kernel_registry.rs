@@ -4965,6 +4965,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["gemm_iu8g32_residual_wmma_mb4m2"]
         );
         add!(
+            "gemm_iu8g32_w8a8_min",
+            kernels::GEMM_IU8G32_W8A8_MIN_SRC,
+            ["gemm_iu8g32_w8a8_min_set", "gemm_iu8g32_w8a8_min_add"]
+        );
+        add!(
             "gemm_gate_up_q8_0_wmma",
             kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
             ["gemm_gate_up_q8_0_wmma"]

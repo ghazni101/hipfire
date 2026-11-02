@@ -199,6 +199,93 @@ fn check(
     }
 }
 
+/// WO-shape timing probe for the two candidate paths on the qt59 bucket:
+/// the existing W4A8 int8-WMMA LDS MMQ (int4 weights, int8 X) and the
+/// shipped qt59 f16-WMMA register GEMM. The W4A8 number is an upper bound
+/// for a future int8-weight LDS kernel (its weight plane is 2x smaller).
+#[test]
+#[ignore]
+fn wo_shape_int_lds_vs_f16_register_timing() {
+    use std::time::Instant;
+    let mut gpu = match Gpu::init() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("SKIP — no GPU ({e:?}).");
+            return;
+        }
+    };
+    if !gpu.iu4g256_mmq_eligible(256, 64) {
+        eprintln!("SKIP — IU4 MMQ not eligible on this arch / env.");
+        return;
+    }
+    let shapes = [
+        (5120usize, 6144usize, 512usize),
+        (5120usize, 5120usize, 512usize),
+        (5120usize, 5120usize, 2048usize),
+    ];
+    for (m, k, n) in shapes {
+        let mut rng = Rng(0xA5A5_1234_9E37_79B9);
+
+        // int4 weights for the W4A8 LDS path.
+        let mq = mq4v2_random(&mut rng, m, k);
+        let iu = repack_mq4v2(&mq, m, k, Layout::Iu4).unwrap();
+        let wi = gpu.upload_raw(&iu, &[iu.len()]).unwrap();
+        let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
+        let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
+        let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
+        let y_int = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
+
+        // qt59 weights: [K i8][K/32 f16 scales] per row.
+        let g32 = k / 32;
+        let stride = k + g32 * 2;
+        let mut q59 = vec![0u8; m * stride];
+        for r in 0..m {
+            for i in 0..k {
+                q59[r * stride + i] = (rng.next() & 0xff) as u8;
+            }
+            for g in 0..g32 {
+                let sc = f16::from_f32(0.01 + 0.002 * (g % 5) as f32);
+                q59[r * stride + k + g * 2..r * stride + k + g * 2 + 2]
+                    .copy_from_slice(&sc.to_bits().to_le_bytes());
+            }
+        }
+        let w59 = gpu.upload_raw(&q59, &[q59.len()]).unwrap();
+        let y_f16 = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
+
+        let flops = 2.0 * (m as f64) * (k as f64) * (n as f64);
+        for _ in 0..2 {
+            gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
+                .unwrap();
+            gpu.gemm_iu8g32_residual_wmma(&w59, &xd, &y_f16, m, k, n)
+                .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..8 {
+            gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
+                .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let int_ms = t0.elapsed().as_secs_f64() * 1000.0 / 8.0;
+        let t1 = Instant::now();
+        for _ in 0..8 {
+            gpu.gemm_iu8g32_residual_wmma(&w59, &xd, &y_f16, m, k, n)
+                .unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let f16_ms = t1.elapsed().as_secs_f64() * 1000.0 / 8.0;
+        eprintln!(
+        "wo shape M={m} K={k} N={n}: W4A8-LDS-int4 {int_ms:.3} ms ({:.1} TFLOPS); qt59 f16-register {f16_ms:.3} ms ({:.1} TFLOPS); speedup {:.2}x",
+        flops / 1e9 / int_ms,
+        flops / 1e9 / f16_ms,
+        f16_ms / int_ms
+    );
+        for t in [wi, xd, y_int, w59, y_f16] {
+            gpu.free_tensor(t).ok();
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn iu4_w4a8_i8_is_bit_exact_to_twin_and_emulation() {

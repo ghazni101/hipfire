@@ -781,3 +781,39 @@ of addressing. Identical-settings bench:
   scan is admitted on gfx1200/gfx1201 only.
 - Decode is at the HBM wall for this weight set; the only large lever left
   is speculation, whose long-context arm is measured dead.
+
+## C19 — design-3 prototype: int8-per-128 + LDS + WMMA-IU8 (2026-11-02)
+
+The W4A8 LDS MMQ (`gemm_mq4g256v2_residual_mmq_i8`) run on the 27B LA
+out-proj shape (M=5120, K=6144, N=512) is the int-core upper bound:
+**0.507 ms / 63.6 TFLOPS**. The shipped qt59 f16-register kernel on the same
+shape is **1.320 ms / 24.4 TFLOPS**. So the int matrix core plus 128x128 LDS
+reuse has ~2.6x of headroom before any format change; the work is to give it
+int8 weights with a scale cadence it can accumulate across.
+
+Prototype (`kernels/src/gemm_iu8g32_w8a8_min.hip` +
+`Gpu::gemm_iu8g32_w8a8_min`):
+
+- Weight format: `[K signed int8 in block_i8_128 qs order][K/128 f16 scale]`
+  per row (8.125 bpw, zero = 0). For this prototype the 128 codes are the
+  nibble-pair permutation of `block_i8_128`, so the weight side pairs with the
+  existing activation plane without a K-loop shuffle.
+- Kernel: 128x128 tile, 512 threads / 16 waves, X and W staged in LDS
+  (16 KiB each), one WMMA-IU8 accumulation over the whole K128, one
+  `sc_w * d_x` fold. No double buffer/raster yet.
+- Correctness: a synthetic m=64 k=512 n=32 case matches a CPU emulation of
+  the same fold **bit for bit** (worst rel 0.0e0).
+- Speed at the real wo shape: **0.847 ms / 38.0 TFLOPS** vs 1.320 ms / 24.4
+  for the shipped f16 path, **1.56x**, with no pipeline/raster.
+
+Projected model effect: the qt59 prefill bucket is 338 ms/pass at the model's
+N=512 chunks (192 calls); 0.847 ms/call gives ~163 ms, so pp2048 1,822 ->
+~2,010 tok/s (+10%) before the production kernel's double buffering. The
+remaining gap to the 0.507 ms W4A8 bound is the int8 weight plane (2x bytes)
+and the prototype's lack of a slot pipeline.
+
+Not yet wired (no route change): the loader still needs the qt59 -> int8-per-128
+requantization (per-32 scales folded to one scale per 128, lossy), a decode
+GEMV for the same format (f32 x, one scale per 128), and the claim-scoped KL
+gate. Activation cost for prefill is the existing W8A8 KL (~1.0e-4 on 27B
+decode); the weight requant is the new quality term.

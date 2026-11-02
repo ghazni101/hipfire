@@ -128,4 +128,69 @@ impl Gpu {
         }
         result
     }
+
+    /// Minimal LDS-tiled W8A8 launch for a planar int8-per-128 weight row
+    /// `[K codes][K/128 f16 scales]` and `block_i8_128` activations. The
+    /// caller supplies the pre-quantized X pointer. Diagnostic/microbenchmark
+    /// entry until the format and loader land.
+    pub fn gemm_iu8g32_w8a8_min(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if m == 0 || n == 0 || k % 128 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_iu8g32_w8a8_min needs M>0, N>0, K%128==0 and K%256==0",
+            ));
+        }
+        let module = "gemm_iu8g32_w8a8_min";
+        let entry = if add {
+            "gemm_iu8g32_w8a8_min_add"
+        } else {
+            "gemm_iu8g32_w8a8_min_set"
+        };
+        self.ensure_kernel(module, kernels::GEMM_IU8G32_W8A8_MIN_SRC, entry)?;
+        let mut a_p = a.buf.as_ptr();
+        let mut xq_p = xq;
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xq_p as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
+        let lds = 33_792u32;
+        let bytes = m * (k + k / 64) + n * k + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
+        let result = self.launch_maybe_blob(entry, grid, [512, 1, 1], lds, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_p);
+            b.push_ptr(xq_p);
+            b.push_ptr(y_p);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(n_val);
+            b.push_i32(add_val);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 }
