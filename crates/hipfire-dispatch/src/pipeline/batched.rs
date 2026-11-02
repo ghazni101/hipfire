@@ -1825,6 +1825,7 @@ fn swiglu_ffn_gate_up_batched(
     f1lite: bool,
     math: DenseBatchMath,
 ) -> HipResult<FfnGateOutput> {
+    gpu.iu4_role = Gpu::IU4_ROLE_GU;
     let _ = fusion;
     let math = math.resolve(gpu, "swiglu_ffn_gate_up_batched")?;
     if math == DenseBatchMath::SingletonWmma {
@@ -2362,6 +2363,7 @@ fn swiglu_ffn_down_batched(
     h_source: FfnGateOutput,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    gpu.iu4_role = Gpu::IU4_ROLE_DN;
     let math = math.resolve(gpu, "swiglu_ffn_down_batched")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2("swiglu_ffn_down_batched", &[layer.w_down.dtype])?;

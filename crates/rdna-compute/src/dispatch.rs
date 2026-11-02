@@ -1752,6 +1752,10 @@ pub struct Gpu {
     /// C11b: sidecar a fused IU4 producer wrote for the next
     /// `gemm_iu4g256_multi` over `(x_rot ptr, n, k)`; taken by that call.
     pub iu4_pending_x: Option<crate::gemm_iu4::Iu4PendingX>,
+    /// C14: projection role of the IU4 GEMMs being issued (`Gpu::IU4_ROLE_*`, `u8::MAX` = none).
+    pub iu4_role: u8,
+    /// C14: (layer index, n_layers) of the layer being issued.
+    pub iu4_layer: (usize, usize),
     /// Set only around a batched DFlash draft forward (and its head GEMM):
     /// lets `gemm_mq4g256v2_overwrite_gfx12_dflash` admit exactly 64 rows
     /// (the batch-tile `_vt4` overwrite kernel, per-row identical to the
@@ -3032,6 +3036,8 @@ impl Gpu {
             fp8_verify_scope: false,
             iu4_verify_scope: false,
             iu4_pending_x: None,
+            iu4_role: u8::MAX,
+            iu4_layer: (0, 0),
             draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,

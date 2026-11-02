@@ -108,6 +108,86 @@ fn iu4_smallm_wmma() -> bool {
     })
 }
 
+/// C14 per-role a8 override of the a4 default. `HIPFIRE_IU4_A8_ROLES`: comma
+/// list of `aqkv` (full-attn q/k/v), `ao` (full-attn o), `dqkv` (DeltaNet
+/// in_proj qkv/z/beta/alpha), `do` (DeltaNet out), `gu` (FFN gate/up), `dn`
+/// (FFN down), `all`. `HIPFIRE_IU4_A8_LAYERS`: comma list of `firstN`,
+/// `lastN`, `a-b`, `a`. Either unset = every role / every layer; both unset
+/// = off. Only applies when `HIPFIRE_IU4_PREFILL_ACT` is `a4`.
+fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
+    static V: std::sync::OnceLock<Option<(u8, Vec<(u8, usize, usize)>)>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let roles = std::env::var("HIPFIRE_IU4_A8_ROLES").ok().filter(|v| !v.is_empty());
+        let layers = std::env::var("HIPFIRE_IU4_A8_LAYERS").ok().filter(|v| !v.is_empty());
+        if roles.is_none() && layers.is_none() {
+            return None;
+        }
+        let mut mask = 0u8;
+        match roles {
+            None => mask = 0x3f,
+            Some(r) => {
+                for t in r.split(',').map(str::trim) {
+                    mask |= match t {
+                        "aqkv" => 1 << Gpu::IU4_ROLE_AQKV,
+                        "ao" => 1 << Gpu::IU4_ROLE_AO,
+                        "dqkv" => 1 << Gpu::IU4_ROLE_DQKV,
+                        "do" => 1 << Gpu::IU4_ROLE_DO,
+                        "gu" => 1 << Gpu::IU4_ROLE_GU,
+                        "dn" => 1 << Gpu::IU4_ROLE_DN,
+                        "all" => 0x3f,
+                        _ => panic!("HIPFIRE_IU4_A8_ROLES: unknown role {t:?}"),
+                    };
+                }
+            }
+        }
+        let mut sel = Vec::new();
+        for t in layers.as_deref().unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let bad = || panic!("HIPFIRE_IU4_A8_LAYERS: bad item {t:?}");
+            if let Some(v) = t.strip_prefix("first") {
+                sel.push((1, v.parse().unwrap_or_else(|_| bad()), 0));
+            } else if let Some(v) = t.strip_prefix("last") {
+                sel.push((2, v.parse().unwrap_or_else(|_| bad()), 0));
+            } else if let Some((a, b)) = t.split_once('-') {
+                sel.push((0, a.parse().unwrap_or_else(|_| bad()), b.parse().unwrap_or_else(|_| bad())));
+            } else {
+                let a = t.parse().unwrap_or_else(|_| bad());
+                sel.push((0, a, a));
+            }
+        }
+        Some((mask, sel))
+    })
+}
+
+impl Gpu {
+    pub const IU4_ROLE_AQKV: u8 = 0;
+    pub const IU4_ROLE_AO: u8 = 1;
+    pub const IU4_ROLE_DQKV: u8 = 2;
+    pub const IU4_ROLE_DO: u8 = 3;
+    pub const IU4_ROLE_GU: u8 = 4;
+    pub const IU4_ROLE_DN: u8 = 5;
+
+    /// The prefill activation format for the GEMM being issued: the global
+    /// `HIPFIRE_IU4_PREFILL_ACT`, with the C14 per-role/layer a8 override.
+    fn iu4_act_eff(&self) -> Iu4PrefillAct {
+        let base = iu4_prefill_act();
+        if base != Iu4PrefillAct::A4 || self.iu4_role >= 6 {
+            return base;
+        }
+        let Some((mask, layers)) = iu4_a8_sel() else { return base };
+        if mask & (1u8 << self.iu4_role) == 0 {
+            return base;
+        }
+        let (li, nl) = self.iu4_layer;
+        let hit = layers.is_empty()
+            || layers.iter().any(|&(kind, a, b)| match kind {
+                0 => li >= a && li <= b,
+                1 => li < a,
+                _ => nl > 0 && li + a >= nl,
+            });
+        if hit { Iu4PrefillAct::A8 } else { base }
+    }
+}
+
 const W4A4_MODULE: &str = "gemm_iu4g256_w4a4";
 const MWL_MODULE: &str = "gemm_iu4g256_mwl";
 
@@ -130,7 +210,7 @@ impl Gpu {
         if !self.iu4g256_mmq_eligible(k, n) {
             return None;
         }
-        match iu4_prefill_act() {
+        match self.iu4_act_eff() {
             Iu4PrefillAct::A4 if f4 => Some(false),
             Iu4PrefillAct::A8 if f8 => Some(true),
             _ => None,
@@ -301,7 +381,8 @@ impl Gpu {
                 self.iu4_pending_x = None;
                 return Ok(());
             }
-            if iu4_prefill_a4() {
+            let act = self.iu4_act_eff();
+            if act == Iu4PrefillAct::A4 {
                 let xq = match self.iu4_take_pending(x, n, k, false) {
                     Some(p) => p,
                     None => self.ensure_int4_mmq_x(x, n, k)?,
@@ -311,7 +392,7 @@ impl Gpu {
                 }
                 return Ok(());
             }
-            if iu4_prefill_act() == Iu4PrefillAct::A8 {
+            if act == Iu4PrefillAct::A8 {
                 let xq = match self.iu4_take_pending(x, n, k, true) {
                     Some(p) => p,
                     None => self.ensure_int8_mmq_x(x, n, k)?,

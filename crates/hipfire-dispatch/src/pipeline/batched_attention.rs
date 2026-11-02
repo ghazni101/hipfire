@@ -403,6 +403,7 @@ pub fn batch_chunk_full_attn_input_projection(
     fusion: DflashFusionCtx,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    gpu.iu4_role = Gpu::IU4_ROLE_AQKV;
     let _ = fusion;
     let math = math.resolve(gpu, "batch_chunk_full_attn_input_projection")?;
     if math == DenseBatchMath::SingletonWmma {
@@ -1247,6 +1248,7 @@ pub fn batch_chunk_full_attn_output_projection(
     a4_epi: Option<rdna_compute::Int4MmqPrepared>,
     math: DenseBatchMath,
 ) -> HipResult<()> {
+    gpu.iu4_role = Gpu::IU4_ROLE_AO;
     let math = math.resolve(gpu, "batch_chunk_full_attn_output_projection")?;
     if math == DenseBatchMath::Iu4Verify && (fa_gate_in_place || a4_epi.is_some()) {
         // The DFlash chain verify never takes the fp8q FA prep (in-place gate
