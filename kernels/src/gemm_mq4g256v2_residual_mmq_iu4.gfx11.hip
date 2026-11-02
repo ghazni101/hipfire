@@ -149,7 +149,12 @@ static __device__ __forceinline__ void load_iu4_tile(
     for (int i0 = 0; i0 < IU4_MMQ_Y; i0 += IU4_MMQ_NWARPS) {
         const int i = i0 + threadIdx.y;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+#ifdef HIPFIRE_IU4_PLANAR
+        // qt57 planar row [K/2 codes][8 B header x G]: payload-form base - 8.
+        const char* gp = A + (long long)row * groups_per_row * 136 + (long long)kb * 128 - 8;
+#else
         const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+#endif
         x_qs[i * IU4_TILE_X_K + txi] = *(const int*)(gp + 8 + txi * 4);
     }
 
@@ -158,7 +163,12 @@ static __device__ __forceinline__ void load_iu4_tile(
         const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
         if (i < IU4_MMQ_Y) {
             const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+#ifdef HIPFIRE_IU4_PLANAR
+            const char* gp = A + (long long)row * groups_per_row * 136
+                + (long long)groups_per_row * 128 + (long long)kb * 8;
+#else
             const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+#endif
             const int ksc = threadIdx.x & 1;
             const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
             const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
@@ -418,10 +428,22 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
     #pragma unroll 1
     for (int p = 0; p < 2; ++p) {
         const int base = p * 64 + w;
+#ifdef HIPFIRE_IU4_PLANAR
+        // Uniform (SGPR) column base + 32-bit per-row offset (< 4 GiB):
+        // keeps the per-row address math in one VGPR like the MQ4V2 form.
+        const char* ak = A + (long long)kb * 128 - 8;
+        const unsigned int rb = (unsigned int)groups_per_row * 136u;
+        const unsigned int ro = (unsigned int)(row0 + base) * rb;
+        const char* gp0 = ak + ro;
+        const char* gp1 = ak + (ro + 16u * rb);
+        const char* gp2 = ak + (ro + 32u * rb);
+        const char* gp3 = ak + (ro + 48u * rb);
+#else
         const char* gp0 = A + ((long long)(row0 + base) * groups_per_row + kb) * 136;
         const char* gp1 = A + ((long long)(row0 + base + 16) * groups_per_row + kb) * 136;
         const char* gp2 = A + ((long long)(row0 + base + 32) * groups_per_row + kb) * 136;
         const char* gp3 = A + ((long long)(row0 + base + 48) * groups_per_row + kb) * 136;
+#endif
         const int v0 = *(const int*)(gp0 + 8 + lane * 4);
         const int v1 = *(const int*)(gp1 + 8 + lane * 4);
         const int v2 = *(const int*)(gp2 + 8 + lane * 4);
@@ -443,8 +465,14 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
         const int ksc = lane & 1;
         int adj = 4 * ksc - 4 * lane;
         asm volatile("" : "+v"(adj) : "r"(kb));
+#ifdef HIPFIRE_IU4_PLANAR
+        const char* pld = (A + (long long)groups_per_row * 128 + (long long)kb * 8)
+            + (4u * (unsigned int)lane
+               + (unsigned int)(row0 + i) * ((unsigned int)groups_per_row * 136u));
+#else
         const char* pld = A + 4 * lane
             + ((long long)(row0 + i) * groups_per_row + kb) * 136;
+#endif
         const unsigned int hs =
             *(const unsigned int*)(pld + adj);
         const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));

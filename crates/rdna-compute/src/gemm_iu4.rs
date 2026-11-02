@@ -36,6 +36,35 @@ fn iu4_prefill_gemv() -> bool {
     })
 }
 
+/// `HIPFIRE_IU4_PREFILL_ACT`: activation format of the MMQ prefill path.
+/// `a4` (default): `block_i4_128` int4 X (FWHT-rotated, the MQ4P W4A4 recipe)
+/// into the planar-addressed lf16 iu4 WMMA kernel. `a8`: `block_q8_1_mmq` X
+/// into the W4A8 MMQ kernel (C2).
+fn iu4_prefill_a4() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_IU4_PREFILL_ACT").ok().as_deref(),
+            Some("a8")
+        )
+    })
+}
+
+/// `HIPFIRE_IU4_SMALLM=mmq`: keep M < 128 projections on the MMQ path
+/// instead of the f16 MW4-LDS WMMA residual (default `wmma`).
+fn iu4_smallm_wmma() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_IU4_SMALLM").ok().as_deref(),
+            Some("mmq")
+        )
+    })
+}
+
+const W4A4_MODULE: &str = "gemm_iu4g256_w4a4";
+const MWL_MODULE: &str = "gemm_iu4g256_mwl";
+
 impl Gpu {
     /// True when the IU4 MMQ path serves this call.
     pub fn iu4g256_mmq_eligible(&self, k: usize, n: usize) -> bool {
@@ -76,12 +105,45 @@ impl Gpu {
         }
         if self.iu4g256_mmq_eligible(k, n) {
             self.bind_thread()?;
+            let smallm = iu4_smallm_wmma();
+            let mut big: Vec<Iu4Proj<'_>> = Vec::with_capacity(projs.len());
+            // f16 X converted once per call, uncached: the pointer-keyed
+            // fp16 cache can serve stale data when a buffer is reused.
+            let mut x16: Option<*mut c_void> = None;
+            for &(a, y, m) in projs {
+                if smallm && m < 128 {
+                    if !add {
+                        self.iu4_zero_y(y, n * m)?;
+                    }
+                    let xp = match x16 {
+                        Some(p) => p,
+                        None => {
+                            let p = self.iu4_fp16_x(x, n * k)?;
+                            x16 = Some(p);
+                            p
+                        }
+                    };
+                    self.gemm_iu4g256_mwl_residual_f16(a, xp, y, m, k, n)?;
+                } else {
+                    big.push((a, y, m));
+                }
+            }
+            if big.is_empty() {
+                return Ok(());
+            }
+            if iu4_prefill_a4() {
+                let xq = self.ensure_int4_mmq_x(x, n, k)?;
+                for &(a, y, m) in &big {
+                    self.gemm_iu4g256_w4a4_prequant(a, xq, y, m, k, n, add)?;
+                }
+                return Ok(());
+            }
             let xq = if self.flags.gfx11_mmq_x128_enabled() {
                 self.ensure_q8_1_mmq_x128(x, n, k)?
             } else {
                 self.ensure_q8_1_mmq_x(x, n, k)?
             };
-            for &(a, y, m) in projs {
+            for &(a, y, m) in &big {
                 self.gemm_iu4g256_mmq_prequant(a, xq, y, m, k, n, add)?;
             }
             return Ok(());
@@ -193,6 +255,172 @@ impl Gpu {
                 b
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    fn iu4_zero_y(&mut self, y: &GpuTensor, elems: usize) -> HipResult<()> {
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, elems * 4, stream),
+            None => self.hip.memset(&y.buf, 0, elems * 4),
+        }
+    }
+
+    /// `Y += W X` for a small-M IU4G256 matrix: f16 X, the planar-addressed
+    /// MW4-LDS f16 WMMA residual (the MQ4V2 small-M prefill route).
+    pub fn gemm_iu4g256_mwl_residual(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(1, "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0"));
+        }
+        self.bind_thread()?;
+        let xp = self.iu4_fp16_x(x, n * k)?;
+        self.gemm_iu4g256_mwl_residual_f16(a, xp, y, m, k, n)
+    }
+
+    /// f32 -> f16 X conversion that never trusts the pointer-keyed cache,
+    /// then drops the cache key (the scratch it describes was overwritten).
+    fn iu4_fp16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        let p = self.convert_fp16_x_uncached(x, n_elems)?;
+        self.invalidate_fp16_cache();
+        Ok(p)
+    }
+
+    /// MW4-LDS residual on an already-converted f16 X (`n * k` halves).
+    pub fn gemm_iu4g256_mwl_residual_f16(
+        &mut self,
+        a: &GpuTensor,
+        x_f16_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        if m == 0 || n == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(1, "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0"));
+        }
+        const NAME: &str = "gemm_iu4g256_residual_wmma_gfx11_mw4_lds";
+        self.ensure_kernel(MWL_MODULE, kernels::GEMM_IU4G256_MWL_SRC, NAME)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        const WAVES: usize = 4;
+        let grid = [m.div_ceil(16) as u32, n.div_ceil(16 * WAVES) as u32, 1];
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * k * 2 + n * m * 8;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", NAME, bytes);
+        let result = self.launch_maybe_blob(NAME, grid, [(32 * WAVES) as u32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(n_val);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The IU4 W4A4 launch over a pre-quantized `block_i4_128` X (the layout
+    /// of `ensure_int4_mmq_x`). Full tiles: the lf16 16-wave column entry
+    /// (grid [N/128, M/128]); otherwise the guarded generic entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iu4g256_w4a4_prequant(
+        &mut self,
+        a: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(1, "IU4 W4A4 MMQ requires exact gfx1100/gfx1151"));
+        }
+        if m == 0 || k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(1, "IU4 W4A4 MMQ requires M > 0 and K % 256 == 0"));
+        }
+        self.bind_thread()?;
+        let full = m % 128 == 0 && batch_size % 128 == 0;
+        let kernel_name = match (full, add) {
+            (true, false) => "gemm_iu4g256_w4a4_full_set_lf16_col",
+            (true, true) => "gemm_iu4g256_w4a4_full_add_lf16_col",
+            (false, _) => "gemm_iu4g256_w4a4",
+        };
+        self.ensure_kernel(W4A4_MODULE, kernels::GEMM_IU4G256_W4A4_SRC, kernel_name)?;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut xq_ptr = x_i4_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        // Same tile geometry as the MQ4V2 IU4 family: LDS = (128*18 + 128*42)*4.
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_Y_K: usize = 18;
+        const MMQ_TILE_X_K: usize = 42;
+        let row_tiles = m.div_ceil(MMQ_Y);
+        let batch_tiles = batch_size.div_ceil(MMQ_X);
+        let shared_mem =
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        let (grid, block) = if full {
+            ([batch_tiles as u32, row_tiles as u32, 1], [32, 16, 1])
+        } else {
+            ([row_tiles as u32, batch_tiles as u32, 1], [32, 8, 1])
+        };
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(xq_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(n_val);
+            b.push_i32(add_val);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

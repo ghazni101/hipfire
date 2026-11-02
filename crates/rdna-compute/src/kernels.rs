@@ -5334,6 +5334,29 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the shared
 // block_i4_128 quant recipe (standalone quantize_int4_mmq_ds128 + C2
 // producer sidecars). Opt-in through HIPFIRE_IU4_PREFILL on gfx1100/gfx1151.
+// IU4G256 (qt57) W4A4 twin of the gfx11 MQ4V2 IU4 MMQ family:
+// `-DHIPFIRE_IU4_PLANAR=1` swaps only the generic and lf16 tile loaders'
+// address math for the planar IU4 row ([K/2 codes][8 B header x G]). The
+// arithmetic (iu4 WMMA, IU4_FOLD_RN) is the MQ4V2 kernel's, so a qt57 tensor
+// that is the relayout of a qt44 tensor gives bit-identical Y for the same
+// `block_i4_128` X. Only the renamed entries are ever looked up.
+pub const GEMM_IU4G256_W4A4_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_PLANAR 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_iu4g256_w4a4\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 gemm_iu4g256_w4a4_full_set_lf16_col\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151 gemm_iu4g256_w4a4_full_add_lf16_col\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
+);
+// IU4G256 (qt57) twin of the gfx11 MW-LDS f16 WMMA residual (`Y += W X`) for
+// small-M projections: `-DHIPFIRE_MWL_IU4L=1` swaps the A address math for
+// the planar IU4 row; decode and WMMA are the MQ4V2 entry's.
+pub const GEMM_IU4G256_MWL_SRC: &str = concat!(
+    "#define HIPFIRE_MWL_IU4L 1\n",
+    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds gemm_iu4g256_residual_wmma_gfx11_mw4_lds\n",
+    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds gemm_iu4g256_residual_wmma_gfx11_mw8_lds\n",
+    include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")

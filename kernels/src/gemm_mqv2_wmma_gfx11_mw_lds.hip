@@ -38,6 +38,21 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+// Residual-entry A addressing. Default: V2 group-major ([8 B header][payload]
+// per group). HIPFIRE_MWL_IU4L (4-bit only): qt57 planar row
+// [K/2 codes][8 B header x G]; gp is the group's payload base - 8 so the
+// shared `gp + 8` payload expression is unchanged.
+#ifdef HIPFIRE_MWL_IU4L
+#define MWL_GP(A, row, g, gpr, GB) \
+    ((A) + (long long)(row) * (gpr) * 136 + (long long)(g) * 128 - 8)
+#define MWL_HDR(gp, A, row, g, gpr) \
+    ((A) + (long long)(row) * (gpr) * 136 + (long long)(gpr) * 128 + (long long)(g) * 8)
+#else
+#define MWL_GP(A, row, g, gpr, GB) \
+    ((A) + (long long)(row) * (gpr) * (GB) + (long long)(g) * (GB))
+#define MWL_HDR(gp, A, row, g, gpr) (gp)
+#endif
+
 #if defined(__gfx1100__) || defined(__gfx1151__)
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
@@ -199,11 +214,11 @@ __device__ __forceinline__ half16_t decode_tile(const unsigned char* __restrict_
                 const int row = job / 8;                                                       \
                 const int segment = job % 8;                                                   \
                 const int safe_row = (row_start + row < M) ? (row_start + row) : (M - 1);       \
-                const char* gp = A + (long long)safe_row * groups_per_row * GROUP_BYTES +      \
-                                 (long long)g * GROUP_BYTES;                                   \
+                const char* gp = MWL_GP(A, safe_row, g, groups_per_row, GROUP_BYTES);          \
                 /* One relevant dual-half V2 header for this segment's K half. */              \
                 const unsigned int h =                                                         \
-                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));                      \
+                    *(const unsigned int*)(MWL_HDR(gp, A, safe_row, g, groups_per_row) +       \
+                                           ((segment < 4) ? 0 : 4));                           \
                 const _Float16 sc_h =                                                          \
                     (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));    \
                 const _Float16 zp_h =                                                          \
@@ -246,6 +261,11 @@ __device__ __forceinline__ half16_t decode_tile(const unsigned char* __restrict_
         }                                                                                      \
     }
 
+#ifdef HIPFIRE_MWL_IU4L
+// IU4 twin: only the 4-bit residual entries are meaningful.
+GEN_RESID_MW_LDS(4, 4)
+GEN_RESID_MW_LDS(4, 8)
+#else
 // Instantiations: BITS ∈ {3,4,5,6} × NW ∈ {4,8} — 16 extern-C symbols.
 GEN_GATE_UP_MW_LDS(3, 4)
 GEN_GATE_UP_MW_LDS(3, 8)
@@ -264,5 +284,6 @@ GEN_RESID_MW_LDS(5, 4)
 GEN_RESID_MW_LDS(5, 8)
 GEN_RESID_MW_LDS(6, 4)
 GEN_RESID_MW_LDS(6, 8)
+#endif // HIPFIRE_MWL_IU4L
 
 #endif // __gfx1100__ || __gfx1151__
