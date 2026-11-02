@@ -23,7 +23,9 @@ fn bytes_at(gpu: &mut Gpu, p: *mut c_void, len: usize) -> Vec<u8> {
     let t = gpu.upload_raw(&vec![0u8; len], &[len]).unwrap();
     gpu.hip.device_synchronize().unwrap();
     unsafe {
-        gpu.hip.memcpy_dtod_raw(t.buf.as_ptr(), p as *const c_void, len).unwrap();
+        gpu.hip
+            .memcpy_dtod_raw(t.buf.as_ptr(), p as *const c_void, len)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let v = gpu.download_raw_bytes(&t).unwrap();
@@ -50,13 +52,27 @@ fn diff(a: &[u8], b: &[u8]) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prod(gpu: &mut Gpu, which: u8, xp: bool, a: &GpuTensor, b: &GpuTensor, w: &GpuTensor, awq: Option<&GpuTensor>, k: usize, n: usize) -> Vec<u8> {
+fn prod(
+    gpu: &mut Gpu,
+    which: u8,
+    xp: bool,
+    a: &GpuTensor,
+    b: &GpuTensor,
+    w: &GpuTensor,
+    awq: Option<&GpuTensor>,
+    k: usize,
+    n: usize,
+) -> Vec<u8> {
     let xr = gpu.upload_f32(&vec![0.0; n * k], &[n * k]).unwrap();
     let res = gpu.reserve_int8_mmq(k, n).unwrap();
     gpu.i8_xplanar_emit = xp;
     let h = match which {
-        0 => gpu.fused_rmsnorm_rotate_mq_i8_batched(a, w, awq, Some(&xr), res, k, 1e-6, n).unwrap(),
-        1 => gpu.fused_silu_mul_rotate_mq_i8_batched(a, b, Some(&xr), res, k, n).unwrap(),
+        0 => gpu
+            .fused_rmsnorm_rotate_mq_i8_batched(a, w, awq, Some(&xr), res, k, 1e-6, n)
+            .unwrap(),
+        1 => gpu
+            .fused_silu_mul_rotate_mq_i8_batched(a, b, Some(&xr), res, k, n)
+            .unwrap(),
         _ => gpu.rotate_x_mq_i8_batched(a, Some(&xr), res, k, n).unwrap(),
     };
     gpu.i8_xplanar_emit = false;
@@ -122,7 +138,10 @@ fn iu4_i8_xplanar_bit_exact() {
                     if dd != 0 || !det {
                         bad += 1;
                     }
-                    eprintln!("prod{which} awq={} k={k:<6} n={n:<5} bytediff={dd} det={det}", use_awq as u8);
+                    eprintln!(
+                        "prod{which} awq={} k={k:<6} n={n:<5} bytediff={dd} det={det}",
+                        use_awq as u8
+                    );
                 }
             }
             for t in [a, b, w, s] {
@@ -132,8 +151,25 @@ fn iu4_i8_xplanar_bit_exact() {
     }
     // GEMM: legacy X + legacy kernel vs XPLANAR X + XPLANAR kernel.
     // (m, k, n): small grids pick t128, big ones t256 (HIPFIRE_IU4_I8_TILE auto).
-    for &(m, k, n) in &[(256usize, 256usize, 1usize), (512, 2560, 7), (1024, 2560, 64), (2048, 9728, 333), (4096, 2560, 2048), (17408, 5120, 2048), (512, 768, 130)] {
-        let wb: Vec<u8> = (0..m * (k / 256) * 136).map(|i| { let r = rng.next() as u8; if i % 2 == 1 { 0x30 + r % 12 } else { r } }).collect();
+    for &(m, k, n) in &[
+        (256usize, 256usize, 1usize),
+        (512, 2560, 7),
+        (1024, 2560, 64),
+        (2048, 9728, 333),
+        (4096, 2560, 2048),
+        (17408, 5120, 2048),
+        (512, 768, 130),
+    ] {
+        let wb: Vec<u8> = (0..m * (k / 256) * 136)
+            .map(|i| {
+                let r = rng.next() as u8;
+                if i % 2 == 1 {
+                    0x30 + r % 12
+                } else {
+                    r
+                }
+            })
+            .collect();
         let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
         let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
         let wt = gpu.upload_raw(&wb, &[wb.len()]).unwrap();
@@ -143,20 +179,37 @@ fn iu4_i8_xplanar_bit_exact() {
             let yx = gpu.upload_f32(&seed, &[n * m]).unwrap();
             let yx2 = gpu.upload_f32(&seed, &[n * m]).unwrap();
             let ql = gpu.ensure_int8_mmq_x_layout(&xd, n, k, false).unwrap();
-            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, ql, &yl, m, k, n, add, false).unwrap();
+            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, ql, &yl, m, k, n, add, false)
+                .unwrap();
             let qx = gpu.ensure_int8_mmq_x_layout(&xd, n, k, true).unwrap();
-            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, qx, &yx, m, k, n, add, true).unwrap();
-            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, qx, &yx2, m, k, n, add, true).unwrap();
+            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, qx, &yx, m, k, n, add, true)
+                .unwrap();
+            gpu.gemm_iu4g256_w4a8_prequant_layout(&wt, qx, &yx2, m, k, n, add, true)
+                .unwrap();
             gpu.hip.device_synchronize().unwrap();
-            let bits = |gpu: &mut Gpu, t: &GpuTensor| gpu.download_f32(t).unwrap().iter().map(|v| v.to_bits()).collect::<Vec<u32>>();
-            let (a, b, c) = (bits(&mut gpu, &yl), bits(&mut gpu, &yx), bits(&mut gpu, &yx2));
+            let bits = |gpu: &mut Gpu, t: &GpuTensor| {
+                gpu.download_f32(t)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u32>>()
+            };
+            let (a, b, c) = (
+                bits(&mut gpu, &yl),
+                bits(&mut gpu, &yx),
+                bits(&mut gpu, &yx2),
+            );
             let nd = a.iter().zip(&b).filter(|(p, q)| p != q).count();
             let nan = a.iter().filter(|v| f32::from_bits(**v).is_nan()).count();
             let det = b == c;
             if nd != 0 || !det {
                 bad += 1;
             }
-            eprintln!("gemm m={m:<6} k={k:<6} n={n:<5} add={} bitdiff={nd}/{} det={det} nan_in_ref={nan}", add as u8, a.len());
+            eprintln!(
+                "gemm m={m:<6} k={k:<6} n={n:<5} add={} bitdiff={nd}/{} det={det} nan_in_ref={nan}",
+                add as u8,
+                a.len()
+            );
             for t in [yl, yx, yx2] {
                 gpu.free_tensor(t).ok();
             }

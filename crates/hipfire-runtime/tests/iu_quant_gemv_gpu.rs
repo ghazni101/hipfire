@@ -117,7 +117,8 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             gpu.upload_f32(&x, &[k]).expect("upload x"),
         );
         let yd = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
-        gpu.gemv_iu4g256_dot8(&w, &xd, &yd, m, k, false).expect("iu4 gemv");
+        gpu.gemv_iu4g256_dot8(&w, &xd, &yd, m, k, false)
+            .expect("iu4 gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
         let rel = max_rel(&got, &want);

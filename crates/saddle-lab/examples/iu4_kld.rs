@@ -43,7 +43,9 @@ fn main() {
     }
     fn topk(lp: &[f64], k: usize) -> Vec<(u32, f64)> {
         let mut idx: Vec<u32> = (0..lp.len() as u32).collect();
-        idx.select_nth_unstable_by(k, |&a, &b| lp[b as usize].partial_cmp(&lp[a as usize]).unwrap());
+        idx.select_nth_unstable_by(k, |&a, &b| {
+            lp[b as usize].partial_cmp(&lp[a as usize]).unwrap()
+        });
         let mut t: Vec<(u32, f64)> = idx[..k].iter().map(|&i| (i, lp[i as usize])).collect();
         t.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         t
@@ -59,7 +61,8 @@ fn main() {
     let model_path = &a[2];
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
+    let tok =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu");
     let weights = {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
@@ -68,7 +71,14 @@ fn main() {
     }
     .expect("load");
     let max_seq = 8192usize;
-    let mut kv = KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap();
+    let mut kv = KvCache::new_gpu_q8(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_seq,
+    )
+    .unwrap();
     let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
     let t0 = std::time::Instant::now();
@@ -82,9 +92,20 @@ fn main() {
                 let p = a[6..].join(" ");
                 let enc = |s: &str| tok.encode(s);
                 let mut t = Vec::new();
-                for s in ["<|im_start|>", "user", "\n"] { t.extend(enc(s)); }
+                for s in ["<|im_start|>", "user", "\n"] {
+                    t.extend(enc(s));
+                }
                 t.extend(enc(&p));
-                for s in ["<|im_end|>", "\n", "<|im_start|>", "assistant", "\n", "<think>\n</think>\n\n"] { t.extend(enc(s)); }
+                for s in [
+                    "<|im_end|>",
+                    "\n",
+                    "<|im_start|>",
+                    "assistant",
+                    "\n",
+                    "<think>\n</think>\n\n",
+                ] {
+                    t.extend(enc(s));
+                }
                 let s = t.len();
                 (t, s, Some(n))
             }
@@ -98,8 +119,14 @@ fn main() {
             _ => panic!("{usage}"),
         },
         "score" | "pref" | "pscore" => {
-            let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
-            let t: Vec<u32> = r["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let r: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
+            let t: Vec<u32> = r["tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
             (t, r["start"].as_u64().unwrap() as usize, None)
         }
         _ => panic!("{usage}"),
@@ -111,19 +138,36 @@ fn main() {
     // on the captured hidden rows, so the prefill GEMMs are what is measured.
     if mode == "pref" || mode == "pscore" {
         let n = tokens.len();
-        let hidden = gpu.alloc_tensor(&[n, config.dim], rdna_compute::DType::F32).unwrap();
-        qwen35::forward_prefill_batch_capture_hidden(&mut gpu, &weights, &config, &tokens, 0, &mut kv, &mut dn, &scratch, &hidden).expect("prefill");
-        let r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
-        let (mut same_hash, mut top1, mut nll_sum, mut kl_sum, mut kl_max, mut n_sc) = (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
+        let hidden = gpu
+            .alloc_tensor(&[n, config.dim], rdna_compute::DType::F32)
+            .unwrap();
+        qwen35::forward_prefill_batch_capture_hidden(
+            &mut gpu, &weights, &config, &tokens, 0, &mut kv, &mut dn, &scratch, &hidden,
+        )
+        .expect("prefill");
+        let r: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&a[3]).unwrap()).unwrap();
+        let (mut same_hash, mut top1, mut nll_sum, mut kl_sum, mut kl_max, mut n_sc) =
+            (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
         let mut first_div: Option<usize> = None;
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let nsteps_ref = r["steps"].as_array().unwrap().len();
         for i in (start - 1)..(n - 1) {
             let step = i + 1 - start;
-            if step >= nsteps_ref { break; }
+            if step >= nsteps_ref {
+                break;
+            }
             let row = hidden.sub_offset(i * config.dim, config.dim);
             let ctx = llama::DispatchCtx::new(&gpu);
-            let _ = llama::gemv_family().run_auto(&ctx, &mut gpu, &weights.output.dispatch_ref(), &row, &scratch.logits).expect("lm_head");
+            let _ = llama::gemv_family()
+                .run_auto(
+                    &ctx,
+                    &mut gpu,
+                    &weights.output.dispatch_ref(),
+                    &row,
+                    &scratch.logits,
+                )
+                .expect("lm_head");
             let logits = gpu.download_f32(&scratch.logits).unwrap();
             let logits = &logits[..config.vocab_size];
             let am = llama::argmax(logits);
@@ -131,16 +175,28 @@ fn main() {
             let h = fnv(logits);
             if mode == "pscore" {
                 let rr = &r["steps"][step];
-                if rr["hash"].as_str() == Some(h.as_str()) { same_hash += 1; }
-                if rr["argmax"].as_u64() == Some(am as u64) { top1 += 1; } else if first_div.is_none() { first_div = Some(step); }
-                let mut kl = 0f64; let (mut pin, mut qin) = (0f64, 0f64);
+                if rr["hash"].as_str() == Some(h.as_str()) {
+                    same_hash += 1;
+                }
+                if rr["argmax"].as_u64() == Some(am as u64) {
+                    top1 += 1;
+                } else if first_div.is_none() {
+                    first_div = Some(step);
+                }
+                let mut kl = 0f64;
+                let (mut pin, mut qin) = (0f64, 0f64);
                 for e in rr["top"].as_array().unwrap() {
-                    let id = e[0].as_u64().unwrap() as usize; let lpr = e[1].as_f64().unwrap();
-                    let p = lpr.exp(); kl += p * (lpr - lp[id]); pin += p; qin += lp[id].exp();
+                    let id = e[0].as_u64().unwrap() as usize;
+                    let lpr = e[1].as_f64().unwrap();
+                    let p = lpr.exp();
+                    kl += p * (lpr - lp[id]);
+                    pin += p;
+                    qin += lp[id].exp();
                 }
                 let (pr, qr) = ((1.0 - pin).max(1e-300), (1.0 - qin).max(1e-300));
                 kl += pr * (pr.ln() - qr.ln());
-                kl_sum += kl; kl_max = kl_max.max(kl);
+                kl_sum += kl;
+                kl_max = kl_max.max(kl);
             } else {
                 let t = topk(&lp, TOPK);
                 rows.push(serde_json::json!({"argmax": am, "hash": h, "top": t.iter().map(|(i, v)| serde_json::json!([i, v])).collect::<Vec<_>>()}));
@@ -158,7 +214,11 @@ fn main() {
             serde_json::json!({"model": model_path, "mode": "prefill", "start": start, "tokens": tokens, "steps": rows, "ppl": ppl, "secs": secs})
         };
         std::fs::write(&a[4], out.to_string()).unwrap();
-        if mode == "pscore" { println!("{out}"); } else { println!("{{\"steps\":{n_sc},\"ppl\":{ppl},\"secs\":{secs}}}"); }
+        if mode == "pscore" {
+            println!("{out}");
+        } else {
+            println!("{{\"steps\":{n_sc},\"ppl\":{ppl},\"secs\":{secs}}}");
+        }
         return;
     }
     let mut tokens = tokens;
@@ -168,14 +228,25 @@ fn main() {
     } else {
         None
     };
-    let (mut same_hash, mut top1, mut nll_sum, mut kl_sum, mut kl_max, mut n_sc) = (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
+    let (mut same_hash, mut top1, mut nll_sum, mut kl_sum, mut kl_max, mut n_sc) =
+        (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
     let mut first_div: Option<usize> = None;
     let mut pos = 0usize;
     loop {
         if pos >= tokens.len() || pos >= max_seq - 1 {
             break;
         }
-        qwen35::forward_scratch(&mut gpu, &weights, &config, tokens[pos], pos, &mut kv, &mut dn, &scratch).expect("fwd");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            tokens[pos],
+            pos,
+            &mut kv,
+            &mut dn,
+            &scratch,
+        )
+        .expect("fwd");
         pos += 1;
         if pos < start {
             continue;
@@ -184,7 +255,9 @@ fn main() {
         let am = llama::argmax(&logits);
         if let Some(n) = gen {
             if pos == tokens.len() {
-                if pos - start >= n { break; }
+                if pos - start >= n {
+                    break;
+                }
                 tokens.push(am);
             }
         }
@@ -197,24 +270,40 @@ fn main() {
         let step = rows.len().max(n_sc);
         if let Some(r) = &refj {
             let rr = &r["steps"][step];
-            if rr.is_null() { break; }
-            if rr["hash"].as_str() == Some(h.as_str()) { same_hash += 1; }
-            if rr["argmax"].as_u64() == Some(am as u64) { top1 += 1; } else if first_div.is_none() { first_div = Some(step); }
-            let mut kl = 0f64; let (mut pin, mut qin) = (0f64, 0f64);
+            if rr.is_null() {
+                break;
+            }
+            if rr["hash"].as_str() == Some(h.as_str()) {
+                same_hash += 1;
+            }
+            if rr["argmax"].as_u64() == Some(am as u64) {
+                top1 += 1;
+            } else if first_div.is_none() {
+                first_div = Some(step);
+            }
+            let mut kl = 0f64;
+            let (mut pin, mut qin) = (0f64, 0f64);
             for e in rr["top"].as_array().unwrap() {
-                let id = e[0].as_u64().unwrap() as usize; let lpr = e[1].as_f64().unwrap();
-                let p = lpr.exp(); kl += p * (lpr - lp[id]); pin += p; qin += lp[id].exp();
+                let id = e[0].as_u64().unwrap() as usize;
+                let lpr = e[1].as_f64().unwrap();
+                let p = lpr.exp();
+                kl += p * (lpr - lp[id]);
+                pin += p;
+                qin += lp[id].exp();
             }
             let (pr, qr) = ((1.0 - pin).max(1e-300), (1.0 - qin).max(1e-300));
             kl += pr * (pr.ln() - qr.ln());
-            kl_sum += kl; kl_max = kl_max.max(kl);
+            kl_sum += kl;
+            kl_max = kl_max.max(kl);
             n_sc += 1;
         } else {
             let t = topk(&lp, TOPK);
             rows.push(serde_json::json!({"argmax": am, "hash": h, "top": t.iter().map(|(i, v)| serde_json::json!([i, v])).collect::<Vec<_>>()}));
         }
         nll_sum += -lp[next as usize];
-        if gen.is_some() && (am == config.eos_token) && refj.is_none() { break; }
+        if gen.is_some() && (am == config.eos_token) && refj.is_none() {
+            break;
+        }
     }
     let nsteps = if refj.is_some() { n_sc } else { rows.len() };
     let ppl = (nll_sum / nsteps.max(1) as f64).exp();
@@ -230,7 +319,11 @@ fn main() {
         let text = tok.decode(&tokens[start..]);
         let out = serde_json::json!({"model": model_path, "start": start, "tokens": tokens, "steps": rows, "text": text, "ppl": ppl, "secs": secs});
         std::fs::write(&a[3], out.to_string()).unwrap();
-        println!("{{\"steps\":{},\"ppl\":{ppl},\"secs\":{secs},\"text_sha\":\"{}\"}}", rows.len(), fnv(&text.bytes().map(|b| b as f32).collect::<Vec<_>>()));
+        println!(
+            "{{\"steps\":{},\"ppl\":{ppl},\"secs\":{secs},\"text_sha\":\"{}\"}}",
+            rows.len(),
+            fnv(&text.bytes().map(|b| b as f32).collect::<Vec<_>>())
+        );
         eprintln!("TEXT<<<{text}>>>");
     }
 }

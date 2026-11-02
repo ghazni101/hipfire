@@ -312,6 +312,7 @@ pub(crate) fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bo
     matches!(
         dtype,
         rdna_compute::DType::Q8_0
+            | rdna_compute::DType::IU8G32
             | rdna_compute::DType::HFQ4G256
             | rdna_compute::DType::MQ4G256
             | rdna_compute::DType::MQ4G256V2
@@ -347,6 +348,19 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
     match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
+        }
+        rdna_compute::DType::IU8G32 => {
+            // qt59 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
+            // WMMA residual kernel, so seed the slice the residual adds to.
+            gpu.hip.memset(&logits_batch.buf, 0, b * vocab * 4)?;
+            gpu.gemm_iu8g32_residual_wmma(
+                &w_out.buf,
+                final_hidden,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
         }
         rdna_compute::DType::HFQ4G256 => {
             run_spec_gemm_key(
@@ -7714,6 +7728,9 @@ fn draft_dflash_forward_rank(
                 llama::EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
                 }
+                llama::EmbeddingFormat::IU8G32 => {
+                    gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
+                }
                 llama::EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
                 }
@@ -7781,6 +7798,17 @@ pub(crate) fn draft_lmhead_batched(
     match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, hidden_rows, logits_batch, batch)?;
+        }
+        rdna_compute::DType::IU8G32 => {
+            gpu.hip.memset(&logits_batch.buf, 0, batch * w_out.m * 4)?;
+            gpu.gemm_iu8g32_residual_wmma(
+                &w_out.buf,
+                hidden_rows,
+                logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?;
         }
         rdna_compute::DType::HFQ4G256 => {
             run_spec_gemm_key(
@@ -7934,20 +7962,7 @@ pub fn draft_dflash_block_rank(
     )?;
     let mut drafted: Vec<u32> = vec![seed_token];
     let w_out = &target_weights.output;
-    let use_batched_gemm = matches!(
-        w_out.gpu_dtype,
-        rdna_compute::DType::Q8_0
-            | rdna_compute::DType::HFQ4G256
-            | rdna_compute::DType::MQ4G256
-            | rdna_compute::DType::MQ4G256V2
-            | rdna_compute::DType::MQ6G256V2
-            | rdna_compute::DType::MQ5G256V2
-            | rdna_compute::DType::MQ3G256V2
-            | rdna_compute::DType::MQ2G256V2
-            | rdna_compute::DType::MQ3G256
-            | rdna_compute::DType::HFQ6G256
-            | rdna_compute::DType::MQ6G256,
-    );
+    let use_batched_gemm = dflash_batched_lm_head_supported(w_out.gpu_dtype);
     let selector_mode = draft_weights.has_candidate_selector();
     let batch = b - 1;
     if use_batched_gemm {
@@ -9426,20 +9441,7 @@ pub fn spec_step_dflash_with_railgun(
         // for later rejection acceptance. The greedy GPU-argmax path is kept
         // intact for temp == 0 so we don't regress that case.
         let w_out = &target.weights.output;
-        let use_batched_gemm = matches!(
-            w_out.gpu_dtype,
-            rdna_compute::DType::Q8_0
-                | rdna_compute::DType::HFQ4G256
-                | rdna_compute::DType::MQ4G256
-                | rdna_compute::DType::MQ4G256V2
-                | rdna_compute::DType::MQ6G256V2
-                | rdna_compute::DType::MQ5G256V2
-                | rdna_compute::DType::MQ3G256V2
-                | rdna_compute::DType::MQ2G256V2
-                | rdna_compute::DType::MQ3G256
-                | rdna_compute::DType::HFQ6G256
-                | rdna_compute::DType::MQ6G256,
-        );
+        let use_batched_gemm = dflash_batched_lm_head_supported(w_out.gpu_dtype);
         if use_batched_gemm {
             // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
             // download just (B-1) × 4 bytes of indices.

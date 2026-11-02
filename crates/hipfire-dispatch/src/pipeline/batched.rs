@@ -227,7 +227,15 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
     reject_typed_only_format(next_linear.dtype)?;
     // C11b: IU4 consumers take the producer-fused MMQ X sidecar.
     if next_linear.dtype == DType::IU4G256
-        && gpu.iu4_fused_rmsnorm_rotate(x, norm_weight, next_linear.awq_scale, x_rot, k, eps, batch_size)?
+        && gpu.iu4_fused_rmsnorm_rotate(
+            x,
+            norm_weight,
+            next_linear.awq_scale,
+            x_rot,
+            k,
+            eps,
+            batch_size,
+        )?
     {
         return Ok(());
     }
@@ -302,7 +310,14 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
 ) -> HipResult<()> {
     reject_typed_only_format(down_proj_weight.dtype)?;
     if down_proj_weight.dtype == DType::IU4G256
-        && gpu.iu4_fused_silu_mul_rotate(gate, up, down_proj_weight.awq_scale, x_rot, k, batch_size)?
+        && gpu.iu4_fused_silu_mul_rotate(
+            gate,
+            up,
+            down_proj_weight.awq_scale,
+            x_rot,
+            k,
+            batch_size,
+        )?
     {
         return Ok(());
     }

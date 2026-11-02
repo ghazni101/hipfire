@@ -35,7 +35,8 @@ fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
         }
         for b in 0..g {
             let sc = 0.001 + 0.02 * rng.f().abs();
-            row[k + 2 * b..k + 2 * b + 2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
+            row[k + 2 * b..k + 2 * b + 2]
+                .copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
         }
     }
     out
@@ -50,7 +51,8 @@ fn reference(iu: &[u8], x: &[f32], m: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
         let row = &iu[r * rb..(r + 1) * rb];
         let (mut s, mut a) = (0f64, 0f64);
         for b in 0..g {
-            let sc = f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]])).to_f64();
+            let sc =
+                f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]])).to_f64();
             for i in 0..32 {
                 let v = sc * (row[b * 32 + i] as i8) as f64 * x[b * 32 + i] as f64;
                 s += v;
@@ -69,7 +71,15 @@ const V2: [(&str, &str); 3] = [
     ("gemv_iu8g32_v2_r4", "gemv_iu8g32_v2_residual_r4"),
 ];
 
-fn run(gpu: &mut Gpu, f: &'static str, w: &rdna_compute::GpuTensor, x: &rdna_compute::GpuTensor, seed: &[f32], m: usize, k: usize) -> Vec<f32> {
+fn run(
+    gpu: &mut Gpu,
+    f: &'static str,
+    w: &rdna_compute::GpuTensor,
+    x: &rdna_compute::GpuTensor,
+    seed: &[f32],
+    m: usize,
+    k: usize,
+) -> Vec<f32> {
     let y = gpu.upload_f32(seed, &[m]).unwrap();
     gpu.gemv_iu8g32_named(f, w, x, &y, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
@@ -96,24 +106,49 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], m: usize, k: usize, rng: &mut Rn
     let w = gpu.upload_raw(iu, &[iu.len()]).unwrap();
     let xd = gpu.upload_f32(&x, &[k]).unwrap();
     let (want, l1) = reference(iu, &x, m, k);
-    let v1 = rel_of(&run(gpu, "gemv_iu8g32", &w, &xd, &zero, m, k), &zero, false, &want, &l1);
-    let v1r = rel_of(&run(gpu, "gemv_iu8g32_residual", &w, &xd, &seed, m, k), &seed, true, &want, &l1);
+    let v1 = rel_of(
+        &run(gpu, "gemv_iu8g32", &w, &xd, &zero, m, k),
+        &zero,
+        false,
+        &want,
+        &l1,
+    );
+    let v1r = rel_of(
+        &run(gpu, "gemv_iu8g32_residual", &w, &xd, &seed, m, k),
+        &seed,
+        true,
+        &want,
+        &l1,
+    );
     let mut worst = 0f64;
     let aligned = (k + k / 16) % 16 == 0;
     if aligned {
         for (p, r) in V2 {
             let a = run(gpu, p, &w, &xd, &zero, m, k);
             let a2 = run(gpu, p, &w, &xd, &zero, m, k);
-            assert!(a.iter().zip(&a2).all(|(u, v)| u.to_bits() == v.to_bits()), "{label} {p}: nondeterministic");
+            assert!(
+                a.iter().zip(&a2).all(|(u, v)| u.to_bits() == v.to_bits()),
+                "{label} {p}: nondeterministic"
+            );
             let rp = rel_of(&a, &zero, false, &want, &l1);
             let rr = rel_of(&run(gpu, r, &w, &xd, &seed, m, k), &seed, true, &want, &l1);
             for (n, v, base) in [(p, rp, v1), (r, rr, v1r)] {
-                assert!(v < 1e-4 && v <= f64::max(4.0 * base, 2e-6), "{label} m={m} k={k} {n}: rel {v:.3e} (v1 {base:.3e})");
+                assert!(
+                    v < 1e-4 && v <= f64::max(4.0 * base, 2e-6),
+                    "{label} m={m} k={k} {n}: rel {v:.3e} (v1 {base:.3e})"
+                );
                 worst = worst.max(v);
             }
         }
     }
-    eprintln!("{label:<28} m={m:<7} k={k:<5} v1={v1:.3e} v1r={v1r:.3e} v2_worst={worst:.3e}{}", if aligned { "" } else { " (v2 n/a: unaligned rows -> v1)" });
+    eprintln!(
+        "{label:<28} m={m:<7} k={k:<5} v1={v1:.3e} v1r={v1r:.3e} v2_worst={worst:.3e}{}",
+        if aligned {
+            ""
+        } else {
+            " (v2 n/a: unaligned rows -> v1)"
+        }
+    );
     gpu.free_tensor(w).ok();
     gpu.free_tensor(xd).ok();
     (v1.max(v1r), worst)
@@ -158,7 +193,14 @@ fn iu8g32_v2_gemv_matches_reference() {
                 continue;
             }
             let ib = ib.to_vec();
-            let (a, b) = check(&mut gpu, &format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]), &ib, m, k, &mut rng);
+            let (a, b) = check(
+                &mut gpu,
+                &format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]),
+                &ib,
+                m,
+                k,
+                &mut rng,
+            );
             w1 = w1.max(a);
             w2 = w2.max(b);
             cases += 1;
@@ -176,7 +218,9 @@ fn a8_contract(iu: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f64> {
     let mut qx = vec![0i32; k];
     let mut dx = vec![0f32; g];
     for b in 0..g {
-        let amax = x[b * 32..b * 32 + 32].iter().fold(0f32, |a, v| a.max(v.abs()));
+        let amax = x[b * 32..b * 32 + 32]
+            .iter()
+            .fold(0f32, |a, v| a.max(v.abs()));
         dx[b] = amax * (1.0 / 127.0);
         let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
         for i in 0..32 {
@@ -188,8 +232,12 @@ fn a8_contract(iu: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f64> {
             let row = &iu[r * rb..(r + 1) * rb];
             (0..g)
                 .map(|b| {
-                    let sc = f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]])).to_f32();
-                    let dot: i32 = (0..32).map(|i| (row[b * 32 + i] as i8) as i32 * qx[b * 32 + i]).sum();
+                    let sc =
+                        f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]]))
+                            .to_f32();
+                    let dot: i32 = (0..32)
+                        .map(|i| (row[b * 32 + i] as i8) as i32 * qx[b * 32 + i])
+                        .sum();
                     ((sc * dx[b]) * dot as f32) as f64
                 })
                 .sum()
@@ -240,29 +288,54 @@ fn iu8g32_a8_gemv_matches_contract() {
             let m = ti.shape[0] as usize;
             let k: usize = ti.shape[1..].iter().map(|&s| s as usize).product();
             if seen.insert((k, m)) {
-                shapes.push((format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]), ib.to_vec(), m, k));
+                shapes.push((
+                    format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]),
+                    ib.to_vec(),
+                    m,
+                    k,
+                ));
             }
         }
     }
     for (label, iu, m, k) in &shapes {
         let (m, k) = (*m, *k);
         for heavy in [false, true] {
-            let x: Vec<f32> = (0..k).map(|i| rng.f() * if heavy && i % 64 == 5 { 30.0 } else { 1.0 }).collect();
+            let x: Vec<f32> = (0..k)
+                .map(|i| rng.f() * if heavy && i % 64 == 5 { 30.0 } else { 1.0 })
+                .collect();
             let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
             let zero = vec![0f32; m];
             let w = gpu.upload_raw(iu, &[iu.len()]).unwrap();
             let xd = gpu.upload_f32(&x, &[k]).unwrap();
             let (want, l1) = reference(iu, &x, m, k);
             let con = a8_contract(iu, &x, m, k);
-            let v2 = rel_of(&run(&mut gpu, "gemv_iu8g32_v2_r1", &w, &xd, &zero, m, k), &zero, false, &want, &l1);
+            let v2 = rel_of(
+                &run(&mut gpu, "gemv_iu8g32_v2_r1", &w, &xd, &zero, m, k),
+                &zero,
+                false,
+                &want,
+                &l1,
+            );
             let (mut rc, mut ra) = (0f64, 0f64);
             for (p, r) in A8 {
                 let a = run(&mut gpu, p, &w, &xd, &zero, m, k);
                 let a2 = run(&mut gpu, p, &w, &xd, &zero, m, k);
-                assert!(a.iter().zip(&a2).all(|(u, v)| u.to_bits() == v.to_bits()), "{label} {p}: nondeterministic");
+                assert!(
+                    a.iter().zip(&a2).all(|(u, v)| u.to_bits() == v.to_bits()),
+                    "{label} {p}: nondeterministic"
+                );
                 let c = rel_of(&a, &zero, false, &con, &l1);
-                let cr = rel_of(&run(&mut gpu, r, &w, &xd, &seed, m, k), &seed, true, &con, &l1);
-                assert!(c < 1e-5 && cr < 1e-5, "{label} m={m} k={k} {p}: vs contract {c:.3e} resid {cr:.3e}");
+                let cr = rel_of(
+                    &run(&mut gpu, r, &w, &xd, &seed, m, k),
+                    &seed,
+                    true,
+                    &con,
+                    &l1,
+                );
+                assert!(
+                    c < 1e-5 && cr < 1e-5,
+                    "{label} m={m} k={k} {p}: vs contract {c:.3e} resid {cr:.3e}"
+                );
                 rc = rc.max(c.max(cr));
                 ra = ra.max(rel_of(&a, &zero, false, &want, &l1));
             }

@@ -59,13 +59,20 @@ fn reference(iu4: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f64> {
 }
 
 fn err(got: &[f32], want: &[f64]) -> (f64, f64) {
-    let max_abs = got.iter().zip(want).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);
+    let max_abs = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (*a as f64 - b).abs())
+        .fold(0.0, f64::max);
     let scale = want.iter().fold(0.0f64, |a, b| a.max(b.abs())).max(1e-12);
     (max_abs, max_abs / scale)
 }
 
 fn bits_equal(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
 struct Case<'a> {
@@ -97,14 +104,19 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
         "{:<28} m={m:<6} k={k:<6} plain   bitdiff_vs_mq4v2={diff} max_abs={ea:.3e} max_rel={er:.3e}",
         c.label
     );
-    assert_eq!(diff, 0, "{} plain: {diff} rows differ from gemv_mq4g256v2", c.label);
+    assert_eq!(
+        diff, 0,
+        "{} plain: {diff} rows differ from gemv_mq4g256v2",
+        c.label
+    );
     assert!(er < 1e-4, "{} plain rel {er:.3e}", c.label);
 
     // Residual: seed both outputs with the same values.
     let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let r_mq = gpu.upload_f32(&seed, &[m]).unwrap();
     let r_iu = gpu.upload_f32(&seed, &[m]).unwrap();
-    gpu.gemv_hfq4g256_residual_mq4v2(&wm, &xd, &r_mq, m, k).unwrap();
+    gpu.gemv_hfq4g256_residual_mq4v2(&wm, &xd, &r_mq, m, k)
+        .unwrap();
     gpu.gemv_iu4g256_residual(&wi, &xd, &r_iu, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&r_mq).unwrap();
@@ -116,16 +128,26 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
         "{:<28} m={m:<6} k={k:<6} resid   bitdiff_vs_mq4v2={diff} max_abs={ea:.3e} max_rel={er:.3e}",
         c.label
     );
-    assert_eq!(diff, 0, "{} residual differs from the mq4v2 residual", c.label);
+    assert_eq!(
+        diff, 0,
+        "{} residual differs from the mq4v2 residual",
+        c.label
+    );
 
     // Fused rows: split M into up to 3 parts plus the full matrix again.
     let plain = gpu.download_f32(&y_iu).unwrap();
-    let parts: Vec<usize> = if m >= 3 { vec![m / 3, m / 3, m - 2 * (m / 3)] } else { vec![m] };
+    let parts: Vec<usize> = if m >= 3 {
+        vec![m / 3, m / 3, m - 2 * (m / 3)]
+    } else {
+        vec![m]
+    };
     let mut off = 0;
     let mut views = Vec::new();
     let row_b = (k / 256) * 136;
     for &p in &parts {
-        let w = gpu.upload_raw(&c.iu[off * row_b..(off + p) * row_b], &[p * row_b]).unwrap();
+        let w = gpu
+            .upload_raw(&c.iu[off * row_b..(off + p) * row_b], &[p * row_b])
+            .unwrap();
         let y = gpu.alloc_tensor(&[p], DType::F32).unwrap();
         views.push((w, y, p, off));
         off += p;
@@ -142,7 +164,10 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     for (_, y, p, o) in &views {
         fused_diff += bits_equal(&gpu.download_f32(y).unwrap(), &plain[*o..o + p]);
     }
-    eprintln!("{:<28} m={m:<6} k={k:<6} fused   bitdiff_vs_plain={fused_diff}", c.label);
+    eprintln!(
+        "{:<28} m={m:<6} k={k:<6} fused   bitdiff_vs_plain={fused_diff}",
+        c.label
+    );
     assert_eq!(fused_diff, 0, "{} fused rows differ from plain", c.label);
 
     for (w, y, _, _) in views {
@@ -167,11 +192,24 @@ fn iu4_f32_gemv_is_bit_exact_to_mq4v2_and_matches_reference() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut worst = 0.0f64;
     for &m in &[1usize, 7, 129] {
-        for &k in &[256usize, 512, 768, 1024, 1280, 2048, 2304, 5120, 6144, 17408] {
+        for &k in &[
+            256usize, 512, 768, 1024, 1280, 2048, 2304, 5120, 6144, 17408,
+        ] {
             let mq = mq4v2_random(&mut rng, m, k);
             let iu = repack_mq4v2(&mq, m, k, Layout::Iu4).unwrap();
             let x: Vec<f32> = (0..k).map(|_| rng.f() * 3.0).collect();
-            check(&mut gpu, &Case { label: "random", mq: &mq, iu: &iu, x: &x, m, k }, &mut worst);
+            check(
+                &mut gpu,
+                &Case {
+                    label: "random",
+                    mq: &mq,
+                    iu: &iu,
+                    x: &x,
+                    m,
+                    k,
+                },
+                &mut worst,
+            );
         }
     }
 
@@ -193,8 +231,29 @@ fn iu4_f32_gemv_is_bit_exact_to_mq4v2_and_matches_reference() {
             }
             let (_, mb) = mq_f.tensor_data(&t.name).unwrap();
             let x: Vec<f32> = (0..k).map(|_| rng.f()).collect();
-            let label = format!("real:{}", t.name.chars().rev().take(26).collect::<String>().chars().rev().collect::<String>());
-            check(&mut gpu, &Case { label: &label, mq: mb, iu: ib, x: &x, m, k }, &mut worst);
+            let label = format!(
+                "real:{}",
+                t.name
+                    .chars()
+                    .rev()
+                    .take(26)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+            check(
+                &mut gpu,
+                &Case {
+                    label: &label,
+                    mq: mb,
+                    iu: ib,
+                    x: &x,
+                    m,
+                    k,
+                },
+                &mut worst,
+            );
             done += 1;
             if done >= 8 {
                 break;

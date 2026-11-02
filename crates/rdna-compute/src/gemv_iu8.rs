@@ -132,15 +132,26 @@ fn iu8g32_v1_forced() -> bool {
 /// 0 = v2, 1 = v1, 2 = dot4. Read once.
 fn iu8g32_mode() -> u8 {
     static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *V.get_or_init(|| match hipfire_config::developer_var("HIPFIRE_IU8_GEMV").ok().as_deref() {
-        Some("v1") => 1,
-        Some("dot4") => 2,
-        _ => 0,
+    *V.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_IU8_GEMV")
+            .ok()
+            .as_deref()
+        {
+            Some("v1") => 1,
+            Some("dot4") => 2,
+            _ => 0,
+        }
     })
 }
 
 /// v2 (R rows/wave, dwordx4 code loads) when rows and `x` are 16B aligned.
-fn iu8g32_pick(func: &'static str, x: &GpuTensor, a: &GpuTensor, m: usize, k: usize) -> &'static str {
+fn iu8g32_pick(
+    func: &'static str,
+    x: &GpuTensor,
+    a: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> &'static str {
     let row_bytes = k + k / 16;
     let aligned = row_bytes % 16 == 0
         && (x.buf.as_ptr() as usize) % 16 == 0
@@ -149,7 +160,13 @@ fn iu8g32_pick(func: &'static str, x: &GpuTensor, a: &GpuTensor, m: usize, k: us
         return func;
     }
     let add = func == "gemv_iu8g32_residual";
-    let r = if m >= 32768 { 4 } else if m >= 4096 { 2 } else { 1 };
+    let r = if m >= 32768 {
+        4
+    } else if m >= 4096 {
+        2
+    } else {
+        1
+    };
     if iu8g32_mode() == 2 {
         return match (add, r) {
             (false, 4) => "gemv_iu8g32_a8_r4",
@@ -171,7 +188,15 @@ fn iu8g32_pick(func: &'static str, x: &GpuTensor, a: &GpuTensor, m: usize, k: us
 }
 
 fn iu8g32_geometry(func: &str, m: usize) -> ([u32; 3], [u32; 3]) {
-    let r = if func.ends_with("_r4") { 4 } else if func.ends_with("_r2") { 2 } else if func.ends_with("_r1") { 1 } else { 0 };
+    let r = if func.ends_with("_r4") {
+        4
+    } else if func.ends_with("_r2") {
+        2
+    } else if func.ends_with("_r1") {
+        1
+    } else {
+        0
+    };
     if r == 0 {
         return ([m as u32, 1, 1], [32, 1, 1]);
     }

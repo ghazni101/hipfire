@@ -38,7 +38,10 @@ pub enum Iu4DecodeMode {
 pub fn iu4_decode_mode() -> Iu4DecodeMode {
     static V: std::sync::OnceLock<Iu4DecodeMode> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_IU4_DECODE").ok().as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_IU4_DECODE")
+            .ok()
+            .as_deref()
+        {
             Some("dot8") => Iu4DecodeMode::Dot8,
             Some("dot4") => Iu4DecodeMode::Dot4,
             _ => Iu4DecodeMode::F32,
@@ -120,7 +123,11 @@ impl Gpu {
         k: usize,
         residual: bool,
     ) -> HipResult<()> {
-        let func = if residual { "gemv_iu4g256_dot4_residual" } else { "gemv_iu4g256_dot4" };
+        let func = if residual {
+            "gemv_iu4g256_dot4_residual"
+        } else {
+            "gemv_iu4g256_dot4"
+        };
         self.gemv_iu4g256_launch(func, a, x, y, m, k)
     }
 
@@ -138,7 +145,11 @@ impl Gpu {
     ) -> HipResult<()> {
         check_shape("gemv_iu4g256_dot4q", m, k)?;
         let qp = self.iu4_quant_x_a8(x.buf.as_ptr(), k)?;
-        let func = if residual { "gemv_iu4g256_dot4q_residual" } else { "gemv_iu4g256_dot4q" };
+        let func = if residual {
+            "gemv_iu4g256_dot4q_residual"
+        } else {
+            "gemv_iu4g256_dot4q"
+        };
         self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), qp, y.buf.as_ptr(), m, k)
     }
 
@@ -146,10 +157,16 @@ impl Gpu {
     /// return its pointer (valid until the next call on this stream).
     fn iu4_quant_x_a8(&mut self, xp: *mut c_void, k: usize) -> HipResult<*mut c_void> {
         if !self.arch_caps.has_iu4_wmma() {
-            return Err(hip_bridge::HipError::new(0, "iu4 dot4: RDNA3/RDNA4 integer dot only"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "iu4 dot4: RDNA3/RDNA4 integer dot only",
+            ));
         }
         if k * 2 > IU4_A8_SCRATCH_BYTES {
-            return Err(hip_bridge::HipError::new(0, "iu4 dot4: K exceeds the fixed x scratch"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "iu4 dot4: K exceeds the fixed x scratch",
+            ));
         }
         self.bind_thread()?;
         if self.scratch.iu4_a8_x_scratch.is_none() {
@@ -197,7 +214,11 @@ impl Gpu {
         k: usize,
         residual: bool,
     ) -> HipResult<()> {
-        let func = if residual { "gemv_iu4g256_dot8_residual" } else { "gemv_iu4g256_dot8" };
+        let func = if residual {
+            "gemv_iu4g256_dot8_residual"
+        } else {
+            "gemv_iu4g256_dot8"
+        };
         self.gemv_iu4g256_launch(func, a, x, y, m, k)
     }
 
@@ -218,7 +239,10 @@ impl Gpu {
         let total: usize = mats.iter().map(|m| m.2).sum();
         check_shape("fused_iu4g256_rows", total, k)?;
         if total > u32::MAX as usize {
-            return Err(hip_bridge::HipError::new(0, "fused_iu4g256_rows: grid overflow"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_iu4g256_rows: grid overflow",
+            ));
         }
         let dot4 = iu4_decode_mode() == Iu4DecodeMode::Dot4;
         self.fused_iu4g256_rows_impl(mats, x, k, dot4)
@@ -234,12 +258,23 @@ impl Gpu {
         dot4: bool,
     ) -> HipResult<()> {
         if mats.is_empty() || mats.len() > 4 {
-            return Err(hip_bridge::HipError::new(0, "fused_iu4g256_rows: 1..=4 matrices"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_iu4g256_rows: 1..=4 matrices",
+            ));
         }
         let total: usize = mats.iter().map(|m| m.2).sum();
         check_shape("fused_iu4g256_rows", total, k)?;
-        let fname: &'static str = if dot4 { "fused_iu4g256_dot4q_rows" } else { "fused_iu4g256_rows" };
-        let xp = if dot4 { self.iu4_quant_x_a8(x.buf.as_ptr(), k)? } else { x.buf.as_ptr() };
+        let fname: &'static str = if dot4 {
+            "fused_iu4g256_dot4q_rows"
+        } else {
+            "fused_iu4g256_rows"
+        };
+        let xp = if dot4 {
+            self.iu4_quant_x_a8(x.buf.as_ptr(), k)?
+        } else {
+            x.buf.as_ptr()
+        };
         self.bind_thread()?;
         self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, fname)?;
         let mut ap = [std::ptr::null_mut::<c_void>(); 4];
@@ -344,19 +379,22 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
         ];
         // The f32 residual kernel is the two-rows-per-block MQ4V2 residual port.
-        let grid = if func == "gemv_iu4g256_residual" { (m as u32).div_ceil(2) } else { m as u32 };
+        let grid = if func == "gemv_iu4g256_residual" {
+            (m as u32).div_ceil(2)
+        } else {
+            m as u32
+        };
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
-        let result =
-            self.launch_maybe_blob(func, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mv);
-                b.push_i32(kv);
-                b
-            });
+        let result = self.launch_maybe_blob(func, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

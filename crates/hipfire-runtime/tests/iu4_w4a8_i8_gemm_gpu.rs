@@ -51,9 +51,11 @@ fn mq4v2_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 }
 
 fn bits_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
-
 
 /// CPU emulation of the i8 fold. `xq` is the raw `block_i8_128` plane
 /// [K/128][N] x 136 B (f32 d, i32 s, 128 qs in nibble-pair order: byte
@@ -105,7 +107,18 @@ struct Worst {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n: usize, rng: &mut Rng, w: &mut Worst, emu: bool) {
+fn check(
+    gpu: &mut Gpu,
+    label: &str,
+    mq: &[u8],
+    iu: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    rng: &mut Rng,
+    w: &mut Worst,
+    emu: bool,
+) {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let wm = gpu.upload_raw(mq, &[mq.len()]).unwrap();
@@ -116,7 +129,11 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         .flat_map(|t| {
             let xr = &x[t * k..(t + 1) * k];
             let wd = &wd;
-            (0..m).map(move |r| (0..k).map(|c| wd[r * k + c] as f64 * xr[c] as f64).sum::<f64>())
+            (0..m).map(move |r| {
+                (0..k)
+                    .map(|c| wd[r * k + c] as f64 * xr[c] as f64)
+                    .sum::<f64>()
+            })
         })
         .collect();
     let sc = want.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-12);
@@ -124,14 +141,19 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         let up = |gpu: &mut Gpu| gpu.upload_f32(&seed, &[n * m]).unwrap();
         let (y_mq, y_iu, y_iu2) = (up(gpu), up(gpu), up(gpu));
         let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
-        gpu.gemm_mq4g256v2_asym_i8_prequant(&wm, xq, &y_mq, m, k, n, add).unwrap();
-        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu, m, k, n, add).unwrap();
-        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu2, m, k, n, add).unwrap();
+        gpu.gemm_mq4g256v2_asym_i8_prequant(&wm, xq, &y_mq, m, k, n, add)
+            .unwrap();
+        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu, m, k, n, add)
+            .unwrap();
+        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu2, m, k, n, add)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let xq_len = (k / 128) * n * 136;
         let xq_t = gpu.upload_raw(&vec![0u8; xq_len], &[xq_len]).unwrap();
         unsafe {
-            gpu.hip.memcpy_dtod_raw(xq_t.buf.as_ptr(), xq as *const std::ffi::c_void, xq_len).unwrap();
+            gpu.hip
+                .memcpy_dtod_raw(xq_t.buf.as_ptr(), xq as *const std::ffi::c_void, xq_len)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let xq_host = gpu.download_raw_bytes(&xq_t).unwrap();
@@ -141,9 +163,17 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         for t in [y_mq, y_iu, y_iu2] {
             gpu.free_tensor(t).ok();
         }
-        let wv: Vec<f64> =
-            if add { want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect() } else { want.clone() };
-        let rel = b.iter().zip(&wv).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max) / sc;
+        let wv: Vec<f64> = if add {
+            want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect()
+        } else {
+            want.clone()
+        };
+        let rel = b
+            .iter()
+            .zip(&wv)
+            .map(|(a, b)| (*a as f64 - b).abs())
+            .fold(0.0, f64::max)
+            / sc;
         let (dtwin, ddet) = (bits_diff(&a, &b), bits_diff(&b, &b2));
         let demu = if emu {
             let e = emulate(mq, &xq_host, m, k, n, if add { Some(&seed) } else { None });
@@ -156,7 +186,10 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
             "{label:<26} m={m:<6} k={k:<6} n={n:<4} {} twin_bitdiff={dtwin} emu_bitdiff={demu} rel={rel:.3e} det_diff={ddet}",
             if add { "add" } else { "set" }
         );
-        assert_eq!(dtwin, 0, "{label} m={m} k={k} n={n} add={add}: IU4 W4A8 differs from the MQ4V2 asym twin");
+        assert_eq!(
+            dtwin, 0,
+            "{label} m={m} k={k} n={n} add={add}: IU4 W4A8 differs from the MQ4V2 asym twin"
+        );
         assert_eq!(ddet, 0, "{label}: not deterministic");
         assert!(rel < 0.05, "{label} rel {rel:.3e}");
     }
@@ -187,7 +220,9 @@ fn iu4_w4a8_i8_is_bit_exact_to_twin_and_emulation() {
             let mq = mq4v2_random(&mut rng, m, k);
             let iu = repack_mq4v2(&mq, m, k, Layout::Iu4).unwrap();
             for &n in &[1usize, 63, 64, 65, 130, 257] {
-                check(&mut gpu, "random", &mq, &iu, m, k, n, &mut rng, &mut w, true);
+                check(
+                    &mut gpu, "random", &mq, &iu, m, k, n, &mut rng, &mut w, true,
+                );
             }
         }
     }
@@ -196,7 +231,18 @@ fn iu4_w4a8_i8_is_bit_exact_to_twin_and_emulation() {
         let (m, k, n) = (4096usize, 2560usize, 2048usize);
         let mq = mq4v2_random(&mut rng, m, k);
         let iu = repack_mq4v2(&mq, m, k, Layout::Iu4).unwrap();
-        check(&mut gpu, "random-large", &mq, &iu, m, k, n, &mut rng, &mut w, false);
+        check(
+            &mut gpu,
+            "random-large",
+            &mq,
+            &iu,
+            m,
+            k,
+            n,
+            &mut rng,
+            &mut w,
+            false,
+        );
     }
     if let (Ok(iu_path), Ok(mq_path)) = (std::env::var("IU4_REAL"), std::env::var("MQ_REAL")) {
         use hipfire_runtime::hfq::HfqFile;
@@ -215,8 +261,17 @@ fn iu4_w4a8_i8_is_bit_exact_to_twin_and_emulation() {
                 continue;
             }
             let (_, mb) = mq_f.tensor_data(&t.name).unwrap();
-            let label: String =
-                format!("real:{}", t.name.chars().rev().take(21).collect::<String>().chars().rev().collect::<String>());
+            let label: String = format!(
+                "real:{}",
+                t.name
+                    .chars()
+                    .rev()
+                    .take(21)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
             for &n in &[1usize, 77, 512] {
                 check(&mut gpu, &label, mb, ib, m, k, n, &mut rng, &mut w, n <= 77);
             }

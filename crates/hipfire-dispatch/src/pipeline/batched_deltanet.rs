@@ -1004,8 +1004,13 @@ pub fn batch_chunk_delta_net_input_projection(
             layer.wqkv.k,
             n,
         )?;
-    } else if [layer.wqkv.dtype, layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
-        .contains(&DType::IU4G256)
+    } else if [
+        layer.wqkv.dtype,
+        layer.wz.dtype,
+        layer.w_beta.dtype,
+        layer.w_alpha.dtype,
+    ]
+    .contains(&DType::IU4G256)
     {
         if ![layer.wz.dtype, layer.w_beta.dtype, layer.w_alpha.dtype]
             .iter()

@@ -24,7 +24,9 @@ fn bytes_at(gpu: &mut Gpu, p: *mut c_void, len: usize) -> Vec<u8> {
     let t = gpu.upload_raw(&vec![0u8; len], &[len]).unwrap();
     gpu.hip.device_synchronize().unwrap();
     unsafe {
-        gpu.hip.memcpy_dtod_raw(t.buf.as_ptr(), p as *const c_void, len).unwrap();
+        gpu.hip
+            .memcpy_dtod_raw(t.buf.as_ptr(), p as *const c_void, len)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let v = gpu.download_raw_bytes(&t).unwrap();
@@ -33,7 +35,11 @@ fn bytes_at(gpu: &mut Gpu, p: *mut c_void, len: usize) -> Vec<u8> {
 }
 
 fn f32_bits(gpu: &mut Gpu, t: &GpuTensor) -> Vec<u32> {
-    gpu.download_f32(t).unwrap().iter().map(|v| v.to_bits()).collect()
+    gpu.download_f32(t)
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,20 +69,36 @@ fn run(
     let len = (k / 128) * n * if a8 { 136 } else { 72 };
     let side = if !fused {
         match (prod, awq) {
-            (Prod::Norm, Some(s)) => gpu.fused_rmsnorm_rotate_mq_awq_batched(a, w, s, &xr, k, eps, n).unwrap(),
-            (Prod::Norm, None) => gpu.fused_rmsnorm_rotate_mq_batched(a, w, &xr, k, eps, n).unwrap(),
-            (Prod::Silu, Some(s)) => gpu.fused_silu_mul_rotate_mq_awq_batched(a, b, s, &xr, k, n).unwrap(),
-            (Prod::Silu, None) => gpu.fused_silu_mul_rotate_mq_batched(a, b, &xr, k, n).unwrap(),
+            (Prod::Norm, Some(s)) => gpu
+                .fused_rmsnorm_rotate_mq_awq_batched(a, w, s, &xr, k, eps, n)
+                .unwrap(),
+            (Prod::Norm, None) => gpu
+                .fused_rmsnorm_rotate_mq_batched(a, w, &xr, k, eps, n)
+                .unwrap(),
+            (Prod::Silu, Some(s)) => gpu
+                .fused_silu_mul_rotate_mq_awq_batched(a, b, s, &xr, k, n)
+                .unwrap(),
+            (Prod::Silu, None) => gpu
+                .fused_silu_mul_rotate_mq_batched(a, b, &xr, k, n)
+                .unwrap(),
             (Prod::Rot, Some(s)) => gpu.rotate_x_mq_awq_batched(a, s, &xr, k, n).unwrap(),
             (Prod::Rot, None) => gpu.rotate_x_mq_batched(a, &xr, k, n).unwrap(),
         }
-        let p = if a8 { gpu.ensure_int8_mmq_x(&xr, n, k).unwrap() } else { gpu.ensure_int4_mmq_x(&xr, n, k).unwrap() };
+        let p = if a8 {
+            gpu.ensure_int8_mmq_x(&xr, n, k).unwrap()
+        } else {
+            gpu.ensure_int4_mmq_x(&xr, n, k).unwrap()
+        };
         bytes_at(gpu, p, len)
     } else if a8 {
         let res = gpu.reserve_int8_mmq(k, n).unwrap();
         let h = match prod {
-            Prod::Norm => gpu.fused_rmsnorm_rotate_mq_i8_batched(a, w, awq, Some(&xr), res, k, eps, n).unwrap(),
-            Prod::Silu => gpu.fused_silu_mul_rotate_mq_i8_batched(a, b, Some(&xr), res, k, n).unwrap(),
+            Prod::Norm => gpu
+                .fused_rmsnorm_rotate_mq_i8_batched(a, w, awq, Some(&xr), res, k, eps, n)
+                .unwrap(),
+            Prod::Silu => gpu
+                .fused_silu_mul_rotate_mq_i8_batched(a, b, Some(&xr), res, k, n)
+                .unwrap(),
             Prod::Rot => gpu.rotate_x_mq_i8_batched(a, Some(&xr), res, k, n).unwrap(),
         };
         let p = gpu.int8_mmq_prepared_ptr(&h, k, n).unwrap();
@@ -84,9 +106,15 @@ fn run(
     } else {
         let res = gpu.reserve_int4_mmq(k, n).unwrap();
         let h = match prod {
-            Prod::Norm => gpu.fused_rmsnorm_rotate_mq_i4_batched(a, w, awq, Some(&xr), res, k, eps, n).unwrap(),
-            Prod::Silu => gpu.fused_silu_mul_rotate_mq_i4_batched(a, b, awq, Some(&xr), res, k, n).unwrap(),
-            Prod::Rot => gpu.rotate_x_mq_i4_batched(a, awq, Some(&xr), res, k, n).unwrap(),
+            Prod::Norm => gpu
+                .fused_rmsnorm_rotate_mq_i4_batched(a, w, awq, Some(&xr), res, k, eps, n)
+                .unwrap(),
+            Prod::Silu => gpu
+                .fused_silu_mul_rotate_mq_i4_batched(a, b, awq, Some(&xr), res, k, n)
+                .unwrap(),
+            Prod::Rot => gpu
+                .rotate_x_mq_i4_batched(a, awq, Some(&xr), res, k, n)
+                .unwrap(),
         };
         let p = gpu.int4_mmq_prepared_ptr(&h, k, n).unwrap();
         bytes_at(gpu, p, len)

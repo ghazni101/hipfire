@@ -615,3 +615,98 @@ Batched decode that actually runs today = default `--continuous-batch-size 8` ro
 - Byte-identity to singleton: MQ4P cb == MQ4P singleton (0b3f35bf4a...). IU4P cb a4 (5cacd738a8) != IU4P singleton (aeff3a104d): batched decode uses the a4 W4A4 GEMM (quantised activations) instead of the f32 decode GEMV. HIPFIRE_IU4_PREFILL=0 gives the same hash as a4 -> that knob does not reach forward_decode_batch (untested why). Open gap: IU4P batched decode is not the f32-decode numerics; KL of the cb path vs MQ4P not measured.
 - fl_iu4_c16 (C16 daemon, cb route) == c15 a4 numbers and hashes (28.5/110.9/217.7, 5cacd738a8...): C16 is a no-op on the default route, as expected.
 - Gate c16_vmm4b (HIPFIRE_SERVE_VMM_BATCH=1, --continuous-batch-size 4, keys hash/code/math/ctx4k, 2 rounds): unstable 0, conc_mismatch 0, errors 0, klog 0. NB this exercised the singleton fallback, not forward_slots.
+
+## C17 — 27B gfx1100 prefill/TTFT/TG pass (2026-11-02, feat/iu4-iu8-quant-family)
+
+Host/container: RX 7900 XTX (gfx1100), ROCm 10.1 / HIP 7.16 / clang 24, model
+`qwen3.8-27b.iu4p` (qt57 body, qt59 embed/lm_head/LA out_proj, 64 layers, 16
+full-attention, 5120 hidden, 248320 vocab). All numbers are fresh-process,
+`--kv-mode q8`, `--spec off` unless stated.
+
+### C17a — IU8G32 prefill GEMM fanout (mb4, mb4m2)
+
+`gemm_iu8g32_residual_wmma` repeated its weight dequantization and global
+re-read once per 16-token tile (128x at N=2048). Two bit-exact fanouts:
+
+- `gemm_iu8g32_residual_wmma_mb4`: one 16-row wave covers four 16-token batch
+  tiles (64 tokens), one dequant/read per tile.
+- `gemm_iu8g32_residual_wmma_mb4m2`: two 16-row M tiles share the same four X
+  fragments (32 rows x 64 tokens per wave), halving X re-reads. 184 VGPR,
+  0 spills.
+
+Both are bit-identical to the base kernel on the twin test
+(`iu8g32_wmma_gemm_gpu`: 112 cases, `bitdiff_vs_q8_0_wmma=0`, worst rel vs f64
+1.478e-4; n=77/512 exercise the fanouts). Per-pass kernel time at pp2048:
+base 214 ms -> mb4 193 ms -> mb4m2 180 ms.
+
+`hipfire bench --matrix --pp 512,2048 --ctx 128,4096 --tg 64`, 2 rounds
+interleaved (tok/s medians):
+
+| build | pp512 | pp2048 | tg@128 | tg@4096 |
+|---|---|---|---|---|
+| branch tip (base, 512-row prefill) | 1628 | 1626 | 46.3 | 44.7 |
+| + mb4 | 1699 | 1697 | 46.3 | 44.8 |
+| + mb4 + mb4m2 | 1822 | 1822 | 45.2 | — |
+
+`gemm_iu8g32_residual_wmma_mb4m2` is default for M>=32, N>=64; `HIPFIRE_IU8G32_M2=0`
+and `HIPFIRE_IU8G32_MB4=0` are A/B controls.
+
+### C17b — IU4 dense widened prefill (opt-in `HIPFIRE_IU4_WIDE_PREFILL=1`)
+
+`ordinary_prefill_static_ceiling` admitted only uniform MQ4G256V2 / native
+MQ4G256 dense models to the widened chunks; IU4 dense stayed on the 512-row
+legacy cadence. The IU4 family (all projections IU4G256, or IU8G32 in the LA
+out role) is now admitted when the env opt-in is set. The route keeps its
+512-row commit seams, so it is the same per-row arithmetic grouped into larger
+chunks.
+
+`hipfire bench --matrix --pp 2048,8192 --ctx 128 --tg 16`, 2 interleaved
+rounds (pp tok/s): legacy 1690/1686 and 1629/1626; wide 1774/1772 and
+1747/1742. (+5.0% pp2048, +7.2% pp8192.) Decode is unchanged (45.2 vs 45.3).
+
+Serve-path cold TTFT (`HIPFIRE_QWEN_PROMPT_CACHE=0`, 200k ctx, 3 runs,
+medians): 8140-token prompt 5.170 s wide vs 5.173 s legacy (tie); 21580-token
+prompt 14.021 s wide vs 14.526 s legacy (-3.5%). Greedy output on the 8140-token
+prompt is byte-identical between the two routes (reasoning text, 96 tokens).
+The container enables the opt-in; it stays opt-in in code until more artifacts
+are pinned.
+
+### C17c — DFlash on qt59 (IU8G32) targets
+
+DFlash was refused for qt59 (`batched lm_head admission ... unsupported`).
+The IQ8G32 lm_head is the qt59 relayout of Q8_0, and C17a gives a batched
+gfx11 WMMA GEMM for it, so:
+
+- loader admission admits qt59 on exact gfx1100/gfx1151
+  (`dflash_lm_head_quant_supported`), unit-tested for both accept and
+  gfx1200/gfx1201/gfx1030/gfx942 refusal;
+- `dflash_batched_lm_head_supported` includes IU8G32; the verify head and the
+  draft head zero the logits slice and run `gemm_iu8g32_residual_wmma`
+  (natural-basis X, no rotation);
+- the DFlash noise-embedding paths (planned and scalar) read the qt59
+  embedding via `embedding_lookup_iu8g32`;
+- the duplicated head-dtype allowlists in `draft_dflash_block_rank` and the
+  sampled draft path now call the shared predicate.
+
+Measured with the registry 27B MQ4 DFlash draft (md5
+`013395583cd04206c8aa68f4d061983d`) on the IU4P trunk, serve 200k ctx, greedy,
+128-token decode: 1129-token prompt 44.6 tok/s (τ 4.29) vs AR 44.9; 8140-token
+prose 47.9 vs AR 43.6 (+10%); 21580-token code 29.2 vs AR 40.2 (-27%). The
+long-context loss is the 16-row verify re-reading the KV span per cycle; it is
+inherent to this draft/verify shape, not a kernel gap. DFlash therefore stays
+**off** in the container default; it is an opt-in (`speculation.dflash=on` plus
+`developer.dflash_draft`) for short-context code turns.
+
+### Final container numbers (serve, 200k ctx, q8, as deployed)
+
+`/v1/chat/completions`, greedy, no prompt cache, medians of 3:
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s (128 generated) |
+|---|---|---|---|
+| 1129 | 0.44 s (warm cache) / 0.83 s cold | ~1390-1500 | 44.9 |
+| 8140 | 5.17 s | 1574 | 43.6 |
+| 21580 | 14.02 s | 1539 | 40.2 |
+
+Decode at ctx128 is 45.2 tok/s under `hipfire bench` (46.3 before C17; within
+the ±3% session spread). Remaining prefill split at pp8192 (rocprof, wide):
+w4a4 set/add 61%, IU8 wo 16%, GDN 8%, attention 5%, producers 7%.

@@ -327,6 +327,63 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
         })
 }
 
+/// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G32 projection
+/// family (qt 57 + qt 59 wo) to the widened ordinary-prefill chunks. The
+/// widened route keeps its 512-row commit seams and runs the same per-layer
+/// kernels on larger n; it is opt-in until its prefill output is pinned
+/// against the legacy 512-row cadence on real IU4 artifacts.
+fn iu4_wide_prefill_requested() -> bool {
+    static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_IU4_WIDE_PREFILL")
+                .ok()
+                .as_deref(),
+            Some("1")
+        )
+    });
+    *V
+}
+
+/// Every dense projection of an IU4-family artifact: qt 57 (IU4G256)
+/// projections with the qt 59 (IU8G32) out projection, no MoE layers.
+fn dense_layers_have_iu4_family(weights: &Qwen35Weights) -> bool {
+    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G32);
+    !weights.layers.is_empty()
+        && weights.layers.iter().all(|layer| match layer {
+            LayerWeights::DeltaNet(layer) => [
+                &layer.wqkv,
+                &layer.wz,
+                &layer.w_alpha,
+                &layer.w_beta,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .iter()
+            .all(|weight| iu(weight.gpu_dtype)),
+            LayerWeights::FullAttn(layer) => [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .iter()
+            .all(|weight| iu(weight.gpu_dtype)),
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
+        })
+}
+
+fn iu4_wide_prefill_route(gpu: &Gpu, weights: &Qwen35Weights) -> bool {
+    iu4_wide_prefill_requested()
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && gpu.flags.iu4_prefill_enabled()
+        && dense_layers_have_iu4_family(weights)
+}
+
 fn native_mq4_widened_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX1100_MQ4_WIDE_PREFILL")
         .ok()
@@ -552,7 +609,8 @@ fn ordinary_prefill_static_ceiling(
         return None;
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 {
+    let iu4_wide = iu4_wide_prefill_route(gpu, weights);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !iu4_wide {
         return None;
     }
     // gfx1201 keeps all four FP8 projection routes. gfx11 substitutes the
@@ -4244,9 +4302,8 @@ pub fn qwen35_layer_batch_admissible(
             ] {
                 // qt59 IU8G32 is admitted only as the DeltaNet `wo` (natural
                 // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
-                let iu8g32_wo = name == "wo"
-                    && dt == DType::IU8G32
-                    && matches!(arch, "gfx1100" | "gfx1151");
+                let iu8g32_wo =
+                    name == "wo" && dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151");
                 if !iu8g32_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
                         0,

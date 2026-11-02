@@ -361,7 +361,22 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gemv_iu8g32",
         kernels::GEMV_IU8G32_SRC,
-        ["gemv_iu8g32", "gemv_iu8g32_residual", "gemv_iu8g32_v2_r1", "gemv_iu8g32_v2_residual_r1", "gemv_iu8g32_v2_r2", "gemv_iu8g32_v2_residual_r2", "gemv_iu8g32_v2_r4", "gemv_iu8g32_v2_residual_r4", "gemv_iu8g32_a8_r1", "gemv_iu8g32_a8_residual_r1", "gemv_iu8g32_a8_r2", "gemv_iu8g32_a8_residual_r2", "gemv_iu8g32_a8_r4", "gemv_iu8g32_a8_residual_r4"]
+        [
+            "gemv_iu8g32",
+            "gemv_iu8g32_residual",
+            "gemv_iu8g32_v2_r1",
+            "gemv_iu8g32_v2_residual_r1",
+            "gemv_iu8g32_v2_r2",
+            "gemv_iu8g32_v2_residual_r2",
+            "gemv_iu8g32_v2_r4",
+            "gemv_iu8g32_v2_residual_r4",
+            "gemv_iu8g32_a8_r1",
+            "gemv_iu8g32_a8_residual_r1",
+            "gemv_iu8g32_a8_r2",
+            "gemv_iu8g32_a8_residual_r2",
+            "gemv_iu8g32_a8_r4",
+            "gemv_iu8g32_a8_residual_r4"
+        ]
     );
     add!(
         "gemv_iu8g256",
@@ -371,7 +386,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gemv_iu4g256",
         kernels::GEMV_IU4G256_SRC,
-        ["gemv_iu4g256", "gemv_iu4g256_residual", "fused_iu4g256_rows", "gemv_iu4g256_dot8", "gemv_iu4g256_dot8_residual", "gemv_iu4g256_dot4", "gemv_iu4g256_dot4_residual", "iu4_quant_x_a8", "gemv_iu4g256_dot4q", "gemv_iu4g256_dot4q_residual", "fused_iu4g256_dot4q_rows"]
+        [
+            "gemv_iu4g256",
+            "gemv_iu4g256_residual",
+            "fused_iu4g256_rows",
+            "gemv_iu4g256_dot8",
+            "gemv_iu4g256_dot8_residual",
+            "gemv_iu4g256_dot4",
+            "gemv_iu4g256_dot4_residual",
+            "iu4_quant_x_a8",
+            "gemv_iu4g256_dot4q",
+            "gemv_iu4g256_dot4q_residual",
+            "fused_iu4g256_dot4q_rows"
+        ]
     );
     add!(
         "gemv_mq4g256",
@@ -4919,6 +4946,23 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_q8_0_residual_wmma",
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
             ["gemm_q8_0_residual_wmma"]
+        );
+        // qt 59 (IU8G32) relayout of the Q8_0 residual GEMM, base and the
+        // four-batch-tile fanout used at N >= 64.
+        add!(
+            "gemm_iu8g32_residual_wmma",
+            kernels::GEMM_IU8G32_RESIDUAL_WMMA_SRC,
+            ["gemm_iu8g32_residual_wmma"]
+        );
+        add!(
+            "gemm_iu8g32_residual_wmma_mb4",
+            kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC,
+            ["gemm_iu8g32_residual_wmma_mb4"]
+        );
+        add!(
+            "gemm_iu8g32_residual_wmma_mb4m2",
+            kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC,
+            ["gemm_iu8g32_residual_wmma_mb4m2"]
         );
         add!(
             "gemm_gate_up_q8_0_wmma",

@@ -30,7 +30,9 @@ fn iu4_prefill_gemv() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         matches!(
-            hipfire_config::developer_var("HIPFIRE_IU4_PREFILL").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_IU4_PREFILL")
+                .ok()
+                .as_deref(),
             Some("gemv")
         )
     })
@@ -52,7 +54,10 @@ enum Iu4PrefillAct {
 fn iu4_prefill_act() -> Iu4PrefillAct {
     static V: std::sync::OnceLock<Iu4PrefillAct> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_IU4_PREFILL_ACT").ok().as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_IU4_PREFILL_ACT")
+            .ok()
+            .as_deref()
+        {
             Some("a8") => Iu4PrefillAct::A8,
             Some("a8q") => Iu4PrefillAct::A8Q,
             _ => Iu4PrefillAct::A4,
@@ -69,11 +74,13 @@ fn iu4_prefill_act() -> Iu4PrefillAct {
 fn iu4_fused_x() -> (bool, bool) {
     use std::sync::OnceLock;
     static V: OnceLock<(bool, bool)> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("HIPFIRE_IU4_FUSED_X").as_deref() {
-        Ok("0") => (false, false),
-        Ok("1") | Ok("a8") => (true, false),
-        _ => (true, true),
-    })
+    *V.get_or_init(
+        || match hipfire_config::developer_var("HIPFIRE_IU4_FUSED_X").as_deref() {
+            Ok("0") => (false, false),
+            Ok("1") | Ok("a8") => (true, false),
+            _ => (true, true),
+        },
+    )
 }
 
 /// Sidecar a fused producer emitted for one `X` (C11b).
@@ -102,7 +109,9 @@ fn iu4_smallm_wmma() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         !matches!(
-            hipfire_config::developer_var("HIPFIRE_IU4_SMALLM").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_IU4_SMALLM")
+                .ok()
+                .as_deref(),
             Some("mmq")
         )
     })
@@ -118,14 +127,26 @@ fn iu4_i8_xplanar() -> bool {
     // C15 `HIPFIRE_IU4_I8_XPLANAR=1`: the IU4 W4A8 X sidecar in the
     // `I8_XPLANAR` layout (128 B-aligned qs plane + (d, s) plane per K128).
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("HIPFIRE_IU4_I8_XPLANAR").ok().as_deref(), Some("1")))
+    *V.get_or_init(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_IU4_I8_XPLANAR")
+                .ok()
+                .as_deref(),
+            Some("1")
+        )
+    })
 }
 
 fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
-    static V: std::sync::OnceLock<Option<(u8, Vec<(u8, usize, usize)>)>> = std::sync::OnceLock::new();
+    static V: std::sync::OnceLock<Option<(u8, Vec<(u8, usize, usize)>)>> =
+        std::sync::OnceLock::new();
     V.get_or_init(|| {
-        let roles = std::env::var("HIPFIRE_IU4_A8_ROLES").ok().filter(|v| !v.is_empty());
-        let layers = std::env::var("HIPFIRE_IU4_A8_LAYERS").ok().filter(|v| !v.is_empty());
+        let roles = hipfire_config::developer_var("HIPFIRE_IU4_A8_ROLES")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let layers = hipfire_config::developer_var("HIPFIRE_IU4_A8_LAYERS")
+            .ok()
+            .filter(|v| !v.is_empty());
         if roles.is_none() && layers.is_none() {
             return None;
         }
@@ -148,14 +169,24 @@ fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
             }
         }
         let mut sel = Vec::new();
-        for t in layers.as_deref().unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        for t in layers
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             let bad = || panic!("HIPFIRE_IU4_A8_LAYERS: bad item {t:?}");
             if let Some(v) = t.strip_prefix("first") {
                 sel.push((1, v.parse().unwrap_or_else(|_| bad()), 0));
             } else if let Some(v) = t.strip_prefix("last") {
                 sel.push((2, v.parse().unwrap_or_else(|_| bad()), 0));
             } else if let Some((a, b)) = t.split_once('-') {
-                sel.push((0, a.parse().unwrap_or_else(|_| bad()), b.parse().unwrap_or_else(|_| bad())));
+                sel.push((
+                    0,
+                    a.parse().unwrap_or_else(|_| bad()),
+                    b.parse().unwrap_or_else(|_| bad()),
+                ));
             } else {
                 let a = t.parse().unwrap_or_else(|_| bad());
                 sel.push((0, a, a));
@@ -180,7 +211,9 @@ impl Gpu {
         if base != Iu4PrefillAct::A4 || self.iu4_role >= 6 {
             return base;
         }
-        let Some((mask, layers)) = iu4_a8_sel() else { return base };
+        let Some((mask, layers)) = iu4_a8_sel() else {
+            return base;
+        };
         if mask & (1u8 << self.iu4_role) == 0 {
             return base;
         }
@@ -191,7 +224,11 @@ impl Gpu {
                 1 => li < a,
                 _ => nl > 0 && li + a >= nl,
             });
-        if hit { Iu4PrefillAct::A8 } else { base }
+        if hit {
+            Iu4PrefillAct::A8
+        } else {
+            base
+        }
     }
 }
 
@@ -225,7 +262,12 @@ impl Gpu {
     }
 
     fn iu4_set_pending(&mut self, x: &GpuTensor, n: usize, k: usize, kind: Iu4PendingXKind) {
-        self.iu4_pending_x = Some(Iu4PendingX { x: x.buf.as_ptr() as usize, n, k, kind });
+        self.iu4_pending_x = Some(Iu4PendingX {
+            x: x.buf.as_ptr() as usize,
+            n,
+            k,
+            kind,
+        });
     }
 
     /// RMSNorm+FWHT for an IU4G256 consumer, also emitting the MMQ X
@@ -250,7 +292,16 @@ impl Gpu {
             Some(true) => {
                 let res = self.reserve_int8_mmq(k, n)?;
                 self.i8_xplanar_emit = iu4_i8_xplanar();
-                let p = self.fused_rmsnorm_rotate_mq_i8_batched(x, weight, awq, Some(x_rot), res, k, eps, n);
+                let p = self.fused_rmsnorm_rotate_mq_i8_batched(
+                    x,
+                    weight,
+                    awq,
+                    Some(x_rot),
+                    res,
+                    k,
+                    eps,
+                    n,
+                );
                 self.i8_xplanar_emit = false;
                 let p = p?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
@@ -258,7 +309,16 @@ impl Gpu {
             }
             Some(false) => {
                 let res = self.reserve_int4_mmq(k, n)?;
-                let p = self.fused_rmsnorm_rotate_mq_i4_batched(x, weight, awq, Some(x_rot), res, k, eps, n)?;
+                let p = self.fused_rmsnorm_rotate_mq_i4_batched(
+                    x,
+                    weight,
+                    awq,
+                    Some(x_rot),
+                    res,
+                    k,
+                    eps,
+                    n,
+                )?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I4(p));
                 Ok(true)
             }
@@ -288,7 +348,15 @@ impl Gpu {
             }
             Some(false) => {
                 let res = self.reserve_int4_mmq(k, n)?;
-                let p = self.fused_silu_mul_rotate_mq_i4_batched(gate, up, awq, Some(x_rot), res, k, n)?;
+                let p = self.fused_silu_mul_rotate_mq_i4_batched(
+                    gate,
+                    up,
+                    awq,
+                    Some(x_rot),
+                    res,
+                    k,
+                    n,
+                )?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I4(p));
                 Ok(true)
             }
@@ -327,7 +395,13 @@ impl Gpu {
 
     /// Take the pending sidecar if it mirrors `x` at `(n, k)` and is still
     /// live (generation-checked); any other call drops it.
-    fn iu4_take_pending(&mut self, x: &GpuTensor, n: usize, k: usize, a8: bool) -> Option<*mut c_void> {
+    fn iu4_take_pending(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+        a8: bool,
+    ) -> Option<*mut c_void> {
         let p = self.iu4_pending_x.take()?;
         if p.x != x.buf.as_ptr() as usize || p.n != n || p.k != k {
             return None;
@@ -414,7 +488,16 @@ impl Gpu {
                     None => self.ensure_int8_mmq_x_layout(x, n, k, iu4_i8_xplanar())?,
                 };
                 for &(a, y, m) in &big {
-                    self.gemm_iu4g256_w4a8_prequant_layout(a, xq, y, m, k, n, add, iu4_i8_xplanar())?;
+                    self.gemm_iu4g256_w4a8_prequant_layout(
+                        a,
+                        xq,
+                        y,
+                        m,
+                        k,
+                        n,
+                        add,
+                        iu4_i8_xplanar(),
+                    )?;
                 }
                 return Ok(());
             }
@@ -442,7 +525,11 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        let func = if add { "gemv_iu4g256_residual" } else { "gemv_iu4g256" };
+        let func = if add {
+            "gemv_iu4g256_residual"
+        } else {
+            "gemv_iu4g256"
+        };
         let xp = x.buf.as_ptr() as *mut u8;
         for &(a, y, m) in projs {
             let yp = y.buf.as_ptr() as *mut u8;
@@ -475,10 +562,16 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
-            return Err(hip_bridge::HipError::new(1, "IU4 Q8_1 MMQ requires exact gfx1100/gfx1151"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 Q8_1 MMQ requires exact gfx1100/gfx1151",
+            ));
         }
         if m == 0 || k == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(1, "IU4 Q8_1 MMQ requires M > 0 and K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 Q8_1 MMQ requires M > 0 and K % 256 == 0",
+            ));
         }
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
@@ -564,7 +657,10 @@ impl Gpu {
             return Ok(());
         }
         if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
-            return Err(hip_bridge::HipError::new(1, "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
+            ));
         }
         self.bind_thread()?;
         let xp = self.iu4_fp16_x(x, n * k)?;
@@ -593,7 +689,10 @@ impl Gpu {
             return Ok(());
         }
         if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
-            return Err(hip_bridge::HipError::new(1, "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
+            ));
         }
         const NAME: &str = "gemm_iu4g256_residual_wmma_gfx11_mw4_lds";
         self.ensure_kernel(MWL_MODULE, kernels::GEMM_IU4G256_MWL_SRC, NAME)?;
@@ -615,16 +714,23 @@ impl Gpu {
         let grid = [m.div_ceil(16) as u32, n.div_ceil(16 * WAVES) as u32, 1];
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * k * 2 + n * m * 8;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", NAME, bytes);
-        let result = self.launch_maybe_blob(NAME, grid, [(32 * WAVES) as u32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(x_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_i32(n_val);
-            b
-        });
+        let result = self.launch_maybe_blob(
+            NAME,
+            grid,
+            [(32 * WAVES) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -646,10 +752,16 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
-            return Err(hip_bridge::HipError::new(1, "IU4 W4A4 MMQ requires exact gfx1100/gfx1151"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 W4A4 MMQ requires exact gfx1100/gfx1151",
+            ));
         }
         if m == 0 || k == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(1, "IU4 W4A4 MMQ requires M > 0 and K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 W4A4 MMQ requires M > 0 and K % 256 == 0",
+            ));
         }
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
@@ -691,17 +803,18 @@ impl Gpu {
         };
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(a_ptr);
-            b.push_ptr(xq_ptr);
-            b.push_ptr(y_ptr);
-            b.push_i32(m_val);
-            b.push_i32(k_val);
-            b.push_i32(n_val);
-            b.push_i32(add_val);
-            b
-        });
+        let result =
+            self.launch_maybe_blob(kernel_name, grid, block, shared_mem, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -714,7 +827,10 @@ impl Gpu {
 fn iu4_i8_tile() -> Option<usize> {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_IU4_I8_TILE").ok().as_deref() {
+        match hipfire_config::developer_var("HIPFIRE_IU4_I8_TILE")
+            .ok()
+            .as_deref()
+        {
             Some("128") => Some(128),
             Some("256") => Some(256),
             _ => None,
@@ -782,23 +898,63 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
-            return Err(hip_bridge::HipError::new(1, "IU4 W4A8 i8 MMQ requires gfx1100/gfx1151"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 W4A8 i8 MMQ requires gfx1100/gfx1151",
+            ));
         }
         if m == 0 || n == 0 || k == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(1, "IU4 W4A8 i8 MMQ requires M, N > 0 and K % 256 == 0"));
+            return Err(hip_bridge::HipError::new(
+                1,
+                "IU4 W4A8 i8 MMQ requires M, N > 0 and K % 256 == 0",
+            ));
         }
         self.bind_thread()?;
         let tile = iu4_i8_tile().unwrap_or_else(|| {
-            if m.div_ceil(256) * n.div_ceil(256) >= self.cu_count_or_default() { 256 } else { 128 }
+            if m.div_ceil(256) * n.div_ceil(256) >= self.cu_count_or_default() {
+                256
+            } else {
+                128
+            }
         });
         let xp = planar && xplanar;
         let (module, source, threads, lds): (&str, &str, u32, u32) = match (planar, tile) {
-            (true, 256) if xp => ("gemm_iu4g256_w4a8x_t256", kernels::GEMM_IU4G256_W4A8X_GFX11_T256_SRC, 1024, 57344),
-            (true, _) if xp => ("gemm_iu4g256_w4a8x", kernels::GEMM_IU4G256_W4A8X_GFX11_SRC, 512, 28672),
-            (true, 256) => ("gemm_iu4g256_w4a8_t256", kernels::GEMM_IU4G256_W4A8_GFX11_T256_SRC, 1024, 57344),
-            (true, _) => ("gemm_iu4g256_w4a8", kernels::GEMM_IU4G256_W4A8_GFX11_SRC, 512, 28672),
-            (false, 256) => ("gemm_mq4g256v2_asym_mmq_i8_t256", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_T256_SRC, 1024, 57344),
-            (false, _) => ("gemm_mq4g256v2_asym_mmq_i8", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_SRC, 512, 28672),
+            (true, 256) if xp => (
+                "gemm_iu4g256_w4a8x_t256",
+                kernels::GEMM_IU4G256_W4A8X_GFX11_T256_SRC,
+                1024,
+                57344,
+            ),
+            (true, _) if xp => (
+                "gemm_iu4g256_w4a8x",
+                kernels::GEMM_IU4G256_W4A8X_GFX11_SRC,
+                512,
+                28672,
+            ),
+            (true, 256) => (
+                "gemm_iu4g256_w4a8_t256",
+                kernels::GEMM_IU4G256_W4A8_GFX11_T256_SRC,
+                1024,
+                57344,
+            ),
+            (true, _) => (
+                "gemm_iu4g256_w4a8",
+                kernels::GEMM_IU4G256_W4A8_GFX11_SRC,
+                512,
+                28672,
+            ),
+            (false, 256) => (
+                "gemm_mq4g256v2_asym_mmq_i8_t256",
+                kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_T256_SRC,
+                1024,
+                57344,
+            ),
+            (false, _) => (
+                "gemm_mq4g256v2_asym_mmq_i8",
+                kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_SRC,
+                512,
+                28672,
+            ),
         };
         let kernel: &'static str = match (planar, add, tile) {
             (true, true, 256) if xp => "gemm_iu4g256_w4a8x_full_add_t256",

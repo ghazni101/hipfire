@@ -3301,7 +3301,11 @@ impl ScratchState {
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
         // The quantizer ships in each arch's A8 GEMM module (one compile).
-        let qk = if xplanar { "quantize_int8_mmq_ds128_xp" } else { "quantize_int8_mmq_ds128" };
+        let qk = if xplanar {
+            "quantize_int8_mmq_ds128_xp"
+        } else {
+            "quantize_int8_mmq_ds128"
+        };
         let (module, source) = if xplanar {
             ("gemm_iu4g256_w4a8x", kernels::GEMM_IU4G256_W4A8X_GFX11_SRC)
         } else if compiler.arch() == "gfx1201" {
@@ -3347,12 +3351,7 @@ impl ScratchState {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let grid = fold_rows_into_x(k.div_ceil(1024), n)?;
-        let timer = crate::profile::begin_timer(
-            hip,
-            "quantize",
-            qk,
-            n * k * 4 + needed,
-        );
+        let timer = crate::profile::begin_timer(hip, "quantize", qk, n * k * 4 + needed);
         launch_maybe_blob(
             hip,
             Some(&*compiler),

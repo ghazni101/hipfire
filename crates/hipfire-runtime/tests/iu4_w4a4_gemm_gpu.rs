@@ -52,7 +52,10 @@ fn mq4v2_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 }
 
 fn bits_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
 #[derive(Default)]
@@ -63,7 +66,17 @@ struct Worst {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n: usize, rng: &mut Rng, w: &mut Worst) {
+fn check(
+    gpu: &mut Gpu,
+    label: &str,
+    mq: &[u8],
+    iu: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    rng: &mut Rng,
+    w: &mut Worst,
+) {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let wm = gpu.upload_raw(mq, &[mq.len()]).unwrap();
@@ -74,7 +87,11 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         .flat_map(|t| {
             let xr = &x[t * k..(t + 1) * k];
             let wd = &wd;
-            (0..m).map(move |r| (0..k).map(|c| wd[r * k + c] as f64 * xr[c] as f64).sum::<f64>())
+            (0..m).map(move |r| {
+                (0..k)
+                    .map(|c| wd[r * k + c] as f64 * xr[c] as f64)
+                    .sum::<f64>()
+            })
         })
         .collect();
     let sc = want.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-12);
@@ -84,32 +101,50 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         let (y_mq, y_iu) = (up(gpu), up(gpu));
         let xq4 = gpu.ensure_int4_mmq_x(&xd, n, k).unwrap();
         if add {
-            gpu.gemm_mq4g256v2_mmq_add_prequant_iu4(&wm, xq4, &y_mq, m, k, n).unwrap();
+            gpu.gemm_mq4g256v2_mmq_add_prequant_iu4(&wm, xq4, &y_mq, m, k, n)
+                .unwrap();
         } else {
-            gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&wm, xq4, &y_mq, m, k, n).unwrap();
+            gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&wm, xq4, &y_mq, m, k, n)
+                .unwrap();
         }
-        gpu.gemm_iu4g256_w4a4_prequant(&wi, xq4, &y_iu, m, k, n, add).unwrap();
+        gpu.gemm_iu4g256_w4a4_prequant(&wi, xq4, &y_iu, m, k, n, add)
+            .unwrap();
         // 2. MW-LDS residual twin (Y += W X), seeded.
         let (z_mq, z_iu) = (up(gpu), up(gpu));
         gpu.invalidate_fp16_cache();
-        gpu.gemm_mqv2_residual_wmma_gfx11_mw_lds(4, 4, &wm, &xd, &z_mq, m, k, n).unwrap();
-        gpu.gemm_iu4g256_mwl_residual(&wi, &xd, &z_iu, m, k, n).unwrap();
+        gpu.gemm_mqv2_residual_wmma_gfx11_mw_lds(4, 4, &wm, &xd, &z_mq, m, k, n)
+            .unwrap();
+        gpu.gemm_iu4g256_mwl_residual(&wi, &xd, &z_iu, m, k, n)
+            .unwrap();
         // 3/4. Routed call, twice.
         let (r1, r2) = (up(gpu), up(gpu));
         gpu.gemm_iu4g256(&wi, &xd, &r1, m, k, n, add).unwrap();
         gpu.gemm_iu4g256(&wi, &xd, &r2, m, k, n, add).unwrap();
         gpu.hip.device_synchronize().unwrap();
         let d = |gpu: &mut Gpu, t: &rdna_compute::GpuTensor| gpu.download_f32(t).unwrap();
-        let (a, b, za, zb, ra, rb) =
-            (d(gpu, &y_mq), d(gpu, &y_iu), d(gpu, &z_mq), d(gpu, &z_iu), d(gpu, &r1), d(gpu, &r2));
+        let (a, b, za, zb, ra, rb) = (
+            d(gpu, &y_mq),
+            d(gpu, &y_iu),
+            d(gpu, &z_mq),
+            d(gpu, &z_iu),
+            d(gpu, &r1),
+            d(gpu, &r2),
+        );
         for t in [y_mq, y_iu, z_mq, z_iu, r1, r2] {
             gpu.free_tensor(t).ok();
         }
-        let wv: Vec<f64> =
-            if add { want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect() } else { want.clone() };
+        let wv: Vec<f64> = if add {
+            want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect()
+        } else {
+            want.clone()
+        };
         let wz: Vec<f64> = want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect();
         let rel = |g: &[f32], wv: &[f64]| {
-            g.iter().zip(wv).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max) / sc
+            g.iter()
+                .zip(wv)
+                .map(|(a, b)| (*a as f64 - b).abs())
+                .fold(0.0, f64::max)
+                / sc
         };
         let (ea4, emw, er) = (rel(&b, &wv), rel(&zb, &wz), rel(&ra, &wv));
         let (d4, dmw, ddet) = (bits_diff(&a, &b), bits_diff(&za, &zb), bits_diff(&ra, &rb));
@@ -123,8 +158,14 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
             "{label:<26} m={m:<6} k={k:<6} n={n:<4} {} a4_bitdiff={d4} a4_rel={ea4:.3e} mwl_bitdiff={dmw} mwl_rel={emw:.3e} routed={route} routed_rel={er:.3e} det_diff={ddet}",
             if add { "add" } else { "set" }
         );
-        assert_eq!(d4, 0, "{label} m={m} k={k} n={n} add={add}: IU4 W4A4 differs from MQ4V2 W4A4");
-        assert_eq!(dmw, 0, "{label} m={m} k={k} n={n}: IU4 MW-LDS differs from MQ4V2 MW-LDS");
+        assert_eq!(
+            d4, 0,
+            "{label} m={m} k={k} n={n} add={add}: IU4 W4A4 differs from MQ4V2 W4A4"
+        );
+        assert_eq!(
+            dmw, 0,
+            "{label} m={m} k={k} n={n}: IU4 MW-LDS differs from MQ4V2 MW-LDS"
+        );
         assert_eq!(ddet, 0, "{label}: routed call not deterministic");
         assert!(ea4 < 0.30, "{label} a4 rel {ea4:.3e}");
         assert!(emw < 1e-2, "{label} mwl rel {emw:.3e}");
@@ -177,8 +218,17 @@ fn iu4_w4a4_and_mwl_are_bit_exact_to_mq4v2() {
                 continue;
             }
             let (_, mb) = mq_f.tensor_data(&t.name).unwrap();
-            let label: String =
-                format!("real:{}", t.name.chars().rev().take(21).collect::<String>().chars().rev().collect::<String>());
+            let label: String = format!(
+                "real:{}",
+                t.name
+                    .chars()
+                    .rev()
+                    .take(21)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
             for &n in &[1usize, 77, 512] {
                 check(&mut gpu, &label, mb, ib, m, k, n, &mut rng, &mut w);
             }

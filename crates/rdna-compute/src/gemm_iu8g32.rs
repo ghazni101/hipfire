@@ -14,6 +14,32 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 const SYM: &str = "gemm_iu8g32_residual_wmma";
+const SYM_MB4: &str = "gemm_iu8g32_residual_wmma_mb4";
+const SYM_MB4M2: &str = "gemm_iu8g32_residual_wmma_mb4m2";
+
+/// `HIPFIRE_IU8G32_MB4=0` keeps the 16-token-tile kernel (A/B control).
+/// Unset keeps the 64-token fanout for every batch of 64+ rows.
+fn iu8g32_mb4_enabled() -> bool {
+    static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_IU8G32_MB4").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    });
+    *V
+}
+
+/// 32-row-per-wave variant (two 16-row M tiles sharing one X fragment
+/// stream). `HIPFIRE_IU8G32_M2=0` restores the 16-row fanout (A/B control).
+fn iu8g32_m2_enabled() -> bool {
+    static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_IU8G32_M2").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    });
+    *V
+}
 
 impl Gpu {
     /// Whether [`Gpu::gemm_iu8g32_residual_wmma`] can run here (gfx11 WMMA).
@@ -35,10 +61,32 @@ impl Gpu {
         if !self.iu8g32_wmma_eligible(k) {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("gemm_iu8g32_residual_wmma: needs gfx1100/gfx1151 and K%32==0 (arch {}, K={k})", self.arch),
+                &format!(
+                    "gemm_iu8g32_residual_wmma: needs gfx1100/gfx1151 and K%32==0 (arch {}, K={k})",
+                    self.arch
+                ),
             ));
         }
-        self.ensure_kernel(SYM, kernels::GEMM_IU8G32_RESIDUAL_WMMA_SRC, SYM)?;
+        let mb4 = n >= 64 && iu8g32_mb4_enabled();
+        let m2 = mb4 && m >= 32 && iu8g32_m2_enabled();
+        let sym = if m2 {
+            SYM_MB4M2
+        } else if mb4 {
+            SYM_MB4
+        } else {
+            SYM
+        };
+        if m2 {
+            self.ensure_kernel(
+                SYM_MB4M2,
+                kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC,
+                SYM_MB4M2,
+            )?;
+        } else if mb4 {
+            self.ensure_kernel(SYM_MB4, kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC, SYM_MB4)?;
+        } else {
+            self.ensure_kernel(SYM, kernels::GEMM_IU8G32_RESIDUAL_WMMA_SRC, SYM)?;
+        }
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
         let mut a_p = a.buf.as_ptr();
         let mut xp = x_f16_ptr;
@@ -55,10 +103,12 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let bytes = m * (k / 32) * 34 + n * k * 2 + n * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", SYM, bytes);
+        let grid_y = if mb4 { (n + 63) / 64 } else { (n + 15) / 16 };
+        let grid_x = if m2 { (m + 31) / 32 } else { (m + 15) / 16 };
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", sym, bytes);
         let result = self.launch_maybe_blob(
-            SYM,
-            [((m + 15) / 16) as u32, ((n + 15) / 16) as u32, 1],
+            sym,
+            [grid_x as u32, grid_y as u32, 1],
             [32, 1, 1],
             0,
             &mut params,

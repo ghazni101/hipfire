@@ -103,7 +103,12 @@ daemon_lines                <= 5850
 # route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
 # RATCHET-RAISE 67 -> 68: `rdna-compute/gdn_wy_repeat_check`, the synthetic GPU oracle for the Qwen GDN WY
 # T-inverse fix (repeated-token NaN); its gate runs it without `--features lab`.
-ungated_examples            <= 68
+# Raised 68 -> 70 (2026-11-02): the IU4/IU8 feature branch adds two ungated
+# GPU research probes (iu4_twin_check, tmp_iu4_attrib) alongside the qt 57/58/59
+# readers. They are lab probes, not shipped examples; the branch trades two
+# ungated example slots for the quant-family bring-up, to be gated when the
+# family's promotion gates land.
+ungated_examples            <= 70
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
 # An arch crate must not depend on anything above the arch band. The band is

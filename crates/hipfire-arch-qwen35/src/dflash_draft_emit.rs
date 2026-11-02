@@ -554,6 +554,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     }
     match target_weights.embd_format {
         llama::EmbeddingFormat::Q8_0
+        | llama::EmbeddingFormat::IU8G32
         | llama::EmbeddingFormat::HFQ4G256
         | llama::EmbeddingFormat::HFQ4G128 => {}
         other => {
@@ -566,6 +567,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     if !matches!(
         w_out.gpu_dtype,
         DType::Q8_0
+            | DType::IU8G32
             | DType::HFQ4G256
             | DType::MQ4G256
             | DType::MQ4G256V2
@@ -899,6 +901,9 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
                     }
                     llama::EmbeddingFormat::Q8_0 => {
                         gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
+                    }
+                    llama::EmbeddingFormat::IU8G32 => {
+                        gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
                     }
                     _ => unreachable!("admission checked the embedding format"),
                 }

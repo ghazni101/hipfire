@@ -514,6 +514,9 @@ pub fn dflash_slot_draft_step(
                 hipfire_runtime::llama::EmbeddingFormat::Q8_0 => gpu
                     .embedding_lookup_q8(&weights.token_embd, &dst, tok, h)
                     .map_err(|e| format!("noise embed: {e}"))?,
+                hipfire_runtime::llama::EmbeddingFormat::IU8G32 => gpu
+                    .embedding_lookup_iu8g32(&weights.token_embd, &dst, tok, h)
+                    .map_err(|e| format!("noise embed: {e}"))?,
                 hipfire_runtime::llama::EmbeddingFormat::F32 => gpu
                     .embedding_lookup(&weights.token_embd, &dst, tok, h)
                     .map_err(|e| format!("noise embed: {e}"))?,

@@ -52,11 +52,18 @@ fn mq4v2_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 }
 
 fn bits_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
 fn err(got: &[f32], want: &[f64]) -> (f64, f64) {
-    let max_abs = got.iter().zip(want).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);
+    let max_abs = got
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (*a as f64 - b).abs())
+        .fold(0.0, f64::max);
     let scale = want.iter().fold(0.0f64, |a, b| a.max(b.abs())).max(1e-12);
     (max_abs, max_abs / scale)
 }
@@ -69,7 +76,17 @@ struct Worst {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n: usize, rng: &mut Rng, w: &mut Worst) {
+fn check(
+    gpu: &mut Gpu,
+    label: &str,
+    mq: &[u8],
+    iu: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    rng: &mut Rng,
+    w: &mut Worst,
+) {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let wm = gpu.upload_raw(mq, &[mq.len()]).unwrap();
@@ -83,12 +100,15 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         // The oracle: MQ4V2 MMQ over the same quantized X.
         let xq = gpu.ensure_q8_1_mmq_x128(&xd, n, k).unwrap();
         if add {
-            gpu.gemm_mq4g256v2_mmq_add_prequant(&wm, xq, &y_mq, m, k, n).unwrap();
+            gpu.gemm_mq4g256v2_mmq_add_prequant(&wm, xq, &y_mq, m, k, n)
+                .unwrap();
         } else {
-            gpu.gemm_mq4g256v2_mmq_set_prequant(&wm, xq, &y_mq, m, k, n).unwrap();
+            gpu.gemm_mq4g256v2_mmq_set_prequant(&wm, xq, &y_mq, m, k, n)
+                .unwrap();
         }
         gpu.gemm_iu4g256(&wi, &xd, &y_iu, m, k, n, add).unwrap();
-        gpu.gemm_iu4g256_pertoken(&[(&wi, &y_tok, m)], &xd, k, n, add).unwrap();
+        gpu.gemm_iu4g256_pertoken(&[(&wi, &y_tok, m)], &xd, k, n, add)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let a = gpu.download_f32(&y_mq).unwrap();
         let b = gpu.download_f32(&y_iu).unwrap();
@@ -104,7 +124,11 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
         .flat_map(|t| {
             let xr = &x[t * k..(t + 1) * k];
             let wd = &wd;
-            (0..m).map(move |r| (0..k).map(|c| wd[r * k + c] as f64 * xr[c] as f64).sum::<f64>())
+            (0..m).map(move |r| {
+                (0..k)
+                    .map(|c| wd[r * k + c] as f64 * xr[c] as f64)
+                    .sum::<f64>()
+            })
         })
         .collect();
     // Per-token rows vs the single-row decode kernel (row 0 and last token).
@@ -138,11 +162,17 @@ fn check(gpu: &mut Gpu, label: &str, mq: &[u8], iu: &[u8], m: usize, k: usize, n
             "{label:<26} m={m:<6} k={k:<6} n={n:<4} {} bitdiff_vs_mq4v2_mmq={diff} mmq_abs={ea:.3e} mmq_rel={er:.3e} tok_abs={ta:.3e} tok_rel={tr:.3e}",
             if *add { "add" } else { "set" }
         );
-        assert_eq!(diff, 0, "{label} m={m} k={k} n={n} add={add}: IU4 MMQ differs from MQ4V2 MMQ");
+        assert_eq!(
+            diff, 0,
+            "{label} m={m} k={k} n={n} add={add}: IU4 MMQ differs from MQ4V2 MMQ"
+        );
         assert!(er < 3e-2, "{label} mmq rel {er:.3e}");
         assert!(tr < 1e-4, "{label} per-token rel {tr:.3e}");
     }
-    assert_eq!(tok_vs_gemv, 0, "{label}: per-token path differs from gemv_iu4g256");
+    assert_eq!(
+        tok_vs_gemv, 0,
+        "{label}: per-token path differs from gemv_iu4g256"
+    );
     w.cases += 1;
     for tt in [wm, wi, xd] {
         gpu.free_tensor(tt).ok();
@@ -191,7 +221,17 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
                 continue;
             }
             let (_, mb) = mq_f.tensor_data(&t.name).unwrap();
-            let label: String = format!("real:{}", t.name.chars().rev().take(21).collect::<String>().chars().rev().collect::<String>());
+            let label: String = format!(
+                "real:{}",
+                t.name
+                    .chars()
+                    .rev()
+                    .take(21)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
             for &n in &[1usize, 77, 512] {
                 check(&mut gpu, &label, mb, ib, m, k, n, &mut rng, &mut w);
             }

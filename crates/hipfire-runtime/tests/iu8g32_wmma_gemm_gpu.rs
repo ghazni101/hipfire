@@ -75,10 +75,23 @@ fn dequant_q8(q8: &[u8], m: usize, k: usize) -> Vec<f64> {
 }
 
 fn bits_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
-fn check(gpu: &mut Gpu, label: &str, q8: &[u8], iu: &[u8], m: usize, k: usize, n: usize, rng: &mut Rng, reference: bool) -> f64 {
+fn check(
+    gpu: &mut Gpu,
+    label: &str,
+    q8: &[u8],
+    iu: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    rng: &mut Rng,
+    reference: bool,
+) -> f64 {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let wq = gpu.upload_raw(q8, &[q8.len()]).unwrap();
@@ -90,7 +103,8 @@ fn check(gpu: &mut Gpu, label: &str, q8: &[u8], iu: &[u8], m: usize, k: usize, n
     let yq = gpu.upload_f32(&seed, &[n * m]).unwrap();
     let yi = gpu.upload_f32(&seed, &[n * m]).unwrap();
     gpu.gemm_q8_0_residual_wmma(&wq, &xd, &yq, m, k, n).unwrap();
-    gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &yi, m, k, n).unwrap();
+    gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &yi, m, k, n)
+        .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&yq).unwrap();
     let b = gpu.download_f32(&yi).unwrap();
@@ -110,7 +124,12 @@ fn check(gpu: &mut Gpu, label: &str, q8: &[u8], iu: &[u8], m: usize, k: usize, n
                 sc = sc.max(l1);
                 let e = (b[t * m + r] as f64 - (wx + seed[t * m + r] as f64)).abs();
                 if e > 1.0 && std::env::var("IU8_DBG").is_ok() {
-                    eprintln!("  bad t={t} r={r} got={} want={} seed={}", b[t * m + r], wx + seed[t * m + r] as f64, seed[t * m + r]);
+                    eprintln!(
+                        "  bad t={t} r={r} got={} want={} seed={}",
+                        b[t * m + r],
+                        wx + seed[t * m + r] as f64,
+                        seed[t * m + r]
+                    );
                 }
                 abs = f64::max(abs, e);
             }
@@ -118,7 +137,10 @@ fn check(gpu: &mut Gpu, label: &str, q8: &[u8], iu: &[u8], m: usize, k: usize, n
         rel = abs / sc;
     }
     eprintln!("{label:<30} m={m:<6} k={k:<6} n={n:<4} bitdiff_vs_q8_0_wmma={diff} abs={abs:.3e} rel={rel:.3e}");
-    assert_eq!(diff, 0, "{label} m={m} k={k} n={n}: IU8G32 WMMA differs from Q8_0 WMMA");
+    assert_eq!(
+        diff, 0,
+        "{label} m={m} k={k} n={n}: IU8G32 WMMA differs from Q8_0 WMMA"
+    );
     if reference && std::env::var("IU8_DBG").is_err() {
         assert!(rel < 1e-2, "{label} rel {rel:.3e}");
     }
@@ -151,7 +173,9 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
             let iu = relayout(&q8, m, k);
             for &n in &[1usize, 2, 15, 16, 17, 77, 512] {
                 let reference = m * k * n <= 256 * 4096 * 77;
-                worst = worst.max(check(&mut gpu, "random", &q8, &iu, m, k, n, &mut rng, reference));
+                worst = worst.max(check(
+                    &mut gpu, "random", &q8, &iu, m, k, n, &mut rng, reference,
+                ));
                 cases += 1;
             }
         }
@@ -172,10 +196,29 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
                 continue;
             }
             let (tq, qb) = q8_f.tensor_data(&t.name).unwrap();
-            assert_eq!(tq.quant_type, 3, "{}: twin is not Q8_0 (qt {})", t.name, tq.quant_type);
-            assert_eq!(relayout(qb, m, k), ib.to_vec(), "{}: qt59 is not the Q8_0 relayout", t.name);
+            assert_eq!(
+                tq.quant_type, 3,
+                "{}: twin is not Q8_0 (qt {})",
+                t.name, tq.quant_type
+            );
+            assert_eq!(
+                relayout(qb, m, k),
+                ib.to_vec(),
+                "{}: qt59 is not the Q8_0 relayout",
+                t.name
+            );
             for &n in &[1usize, 77, 512] {
-                check(&mut gpu, &format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]), qb, ib, m, k, n, &mut rng, n == 1);
+                check(
+                    &mut gpu,
+                    &format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]),
+                    qb,
+                    ib,
+                    m,
+                    k,
+                    n,
+                    &mut rng,
+                    n == 1,
+                );
                 cases += 1;
             }
         }

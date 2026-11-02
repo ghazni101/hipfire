@@ -5487,9 +5487,15 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (kernel, src) = if self.i8_xplanar_emit {
-            ("fused_silu_mul_mq_rotate_i8x_gfx11", FUSED_SILU_MUL_MQ_ROTATE_I8X_GFX11_SRC)
+            (
+                "fused_silu_mul_mq_rotate_i8x_gfx11",
+                FUSED_SILU_MUL_MQ_ROTATE_I8X_GFX11_SRC,
+            )
         } else {
-            ("fused_silu_mul_mq_rotate_i8_gfx11", FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC)
+            (
+                "fused_silu_mul_mq_rotate_i8_gfx11",
+                FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC,
+            )
         };
         self.ensure_kernel(kernel, src, kernel)?;
         let mut gp = gate.buf.as_ptr();
