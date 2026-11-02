@@ -66,17 +66,37 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
+#ifdef HIPFIRE_IU8G32L
+    // IU8G32 planar scales live K bytes past the codes, so a per-block 2 B
+    // scale read is a second scattered stream (one extra cache line per
+    // 16-row tile per block). Hoist: one 16 B load = 8 scales per lane every
+    // 8 blocks. Needs K % 256 == 0 (keeps row_base + K 16 B aligned: the row
+    // stride K*17/16 is then a multiple of 272); otherwise per-block reads.
+    // Same f16 math per element as the per-block path (bit-exact).
+    const bool sc_vec = (K & 255) == 0;
+    uint4 sc8 = make_uint4(0u, 0u, 0u, 0u);
+#endif
     for (int bi = 0; bi < blocks_per_row; bi++) {
 #ifdef HIPFIRE_IU8G32L
         // IU8G32 (qt59) row: [K int8 codes][K/32 f16 scales]; same bytes per
         // row as Q8_0 (34 B per 32), so row_stride is unchanged.
         const char* sp = row_base + K + bi * 2;
         const char* cp = row_base + bi * 32;
+        unsigned short s_bits;
+        if (sc_vec) {
+            if ((bi & 7) == 0) sc8 = *(const uint4*)(row_base + K + bi * 2);
+            const int j = bi & 7;
+            const unsigned int wd = (j < 2) ? sc8.x : (j < 4) ? sc8.y : (j < 6) ? sc8.z : sc8.w;
+            s_bits = (unsigned short)((j & 1) ? (wd >> 16) : (wd & 0xffffu));
+        } else {
+            __builtin_memcpy(&s_bits, sp, 2);
+        }
+        _Float16 sc;
+        __builtin_memcpy(&sc, &s_bits, 2);
 #else
         const char* bp = row_base + bi * 34;
         const char* sp = bp;
         const char* cp = bp + 2;
-#endif
 
         _Float16 sc;
         {
@@ -84,6 +104,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
             __builtin_memcpy(&s_bits, sp, 2);
             __builtin_memcpy(&sc, &s_bits, 2);
         }
+#endif
 
         const _Float16* x_base = X + (long long)safe_batch * K + bi * 32;
 
