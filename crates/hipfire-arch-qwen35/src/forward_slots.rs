@@ -475,6 +475,9 @@ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
+            // C16 qt57: uniform groups + residual only (no plain key, so a
+            // mixed group with an IU4 member is refused at plan time).
+            | DType::IU4G256
     );
     member && is_batchable_la(dt, arch)
 }
@@ -497,6 +500,7 @@ fn slots_weight_rotated(dt: DType) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
+            | DType::IU4G256
     )
 }
 
@@ -522,6 +526,9 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::MQ2G256V2
             | DType::HFQ3G256
             | DType::F16
+            // C16 qt59 lm_head of the iu4 files: Step::Gemv -> GemvIu8G32
+            // (same GEMV as the solo decode lm_head and `lm_head_batched`).
+            | DType::IU8G32
     )
 }
 
@@ -578,12 +585,33 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
     })
 }
 
+/// C16 qt59: IU8G32 residual projections (natural basis input) run
+/// `gemm_iu8g32_residual_wmma` on gfx11, as in the batched prefill.
+fn slots_iu8g32_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
+    dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151") && k % 32 == 0
+}
+
+/// C16 qt57: one IU4G256 launch set over a shared rotated X
+/// (`gemm_iu4g256_multi` quantizes X once, or takes the producer sidecar).
+fn slots_iu4_multi(
+    gpu: &mut Gpu,
+    projs: &[(&WeightTensor, &GpuTensor)],
+    x: &GpuTensor,
+    n: usize,
+    add: bool,
+) -> HipResult<()> {
+    let k = projs[0].0.k;
+    let v: Vec<_> = projs.iter().map(|(w, y)| (&w.buf, *y, w.m)).collect();
+    gpu.gemm_iu4g256_multi(&v, x, k, n, add)
+}
+
 /// Validate one weight for the residual-projection role (wo, w_down):
 /// Q8_0, an admitted rotated container, or any admitted container with a
 /// residual key. Names the projection in the error.
 fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipResult<()> {
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0
+        || slots_iu8g32_residual_ok(dt, w.k, arch)
         || (slots_proj_admissible(dt, arch)
             && (slots_weight_rotated(dt) || slots_residual_gemm_key(dt).is_some()))
     {
@@ -888,6 +916,10 @@ fn slots_residual_proj(
     if dt == DType::Q8_0 {
         return q8_residual_proj(gpu, w, x, y, q8_scratch, n, q8_wmma_arch);
     }
+    if slots_iu8g32_residual_ok(dt, w.k, gpu.arch.as_str()) {
+        let y_n = y.sub_offset(0, n * w.m);
+        return gpu.gemm_iu8g32_residual_wmma(&w.buf, x, &y_n, w.m, w.k, n);
+    }
     if slots_weight_rotated(dt) {
         return mq4_residual_proj(gpu, w, x, y, rot_scratch, n);
     }
@@ -955,6 +987,9 @@ fn mq4_residual_proj(
 ) -> HipResult<()> {
     rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
     let y_n = y.sub_offset(0, n * w.m);
+    if w.gpu_dtype == DType::IU4G256 {
+        return slots_iu4_multi(gpu, &[(w, &y_n)], scratch, n, true);
+    }
     let key = slots_residual_gemm_key(w.gpu_dtype).ok_or_else(|| {
         HipError::new(
             0,
@@ -1138,6 +1173,13 @@ fn dense_ffn_body_slots(
             n,
             q8_wmma_arch,
         )?,
+        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+            gpu,
+            &[(w_gate, &pbs.gate_ffn_batch), (w_up, &pbs.up_batch)],
+            &pbs.x_rot_batch,
+            n,
+            false,
+        )?,
         GroupPlan::Uniform(dt) => run_fused_gate_up_key(
             gpu,
             fused_gate_up_key_for(dt),
@@ -1177,8 +1219,11 @@ fn dense_ffn_body_slots(
             w_down.k,
             n,
         )?;
-        let key = slots_residual_gemm_key(dt).expect("rotated w_down has a residual key");
         let y = pbs.x_batch.sub_offset(0, n * w_down.m);
+        if dt == DType::IU4G256 {
+            return slots_iu4_multi(gpu, &[(w_down, &y)], &pbs.ffn_hidden_batch, n, true);
+        }
+        let key = slots_residual_gemm_key(dt).expect("rotated w_down has a residual key");
         run_residual_gemm_key(
             gpu,
             key,
@@ -1416,6 +1461,18 @@ where
                 n,
             )?;
         }
+        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+            gpu,
+            &[
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ],
+            &pbs.x_rot_batch,
+            n,
+            false,
+        )?,
         GroupPlan::Uniform(dt) => {
             let x = if slots_weight_rotated(dt) {
                 &pbs.x_rot_batch
@@ -1731,6 +1788,18 @@ where
                 n,
             )?;
         }
+        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+            gpu,
+            &[
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ],
+            &pbs.x_rot_batch,
+            n,
+            false,
+        )?,
         GroupPlan::Uniform(dt) => {
             let x = if slots_weight_rotated(dt) {
                 &pbs.x_rot_batch
@@ -2774,6 +2843,17 @@ fn run_fullattn_layer_slots(
                 n,
             )?;
         }
+        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+            gpu,
+            &[
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ],
+            &pbs.x_rot_batch,
+            n,
+            false,
+        )?,
         GroupPlan::Uniform(dt) => {
             let x = if slots_weight_rotated(dt) {
                 &pbs.x_rot_batch
@@ -3017,6 +3097,17 @@ fn run_fullattn_moe_layer_slots(
                 n,
             )?;
         }
+        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+            gpu,
+            &[
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ],
+            &pbs.x_rot_batch,
+            n,
+            false,
+        )?,
         GroupPlan::Uniform(dt) => {
             let x = if slots_weight_rotated(dt) {
                 &pbs.x_rot_batch
