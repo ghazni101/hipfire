@@ -302,3 +302,56 @@ Hypotheses (untested):
 - (a) Most of the set/add gap is the A8-vs-A4 WMMA work plus layout/tile efficiency.
 - (b) The small-M gap (+70 ms) is a tile shape that is poor for small N. MQ4P routes those matrices to a WMMA mw4_lds kernel instead.
 - (c) IU8G32 wo is 19% slower than Q8_0 WMMA for the same math.
+
+## C10 — IU4 W4A4 prefill + small-M WMMA (6d9af850d, test 3e2e7c795, iu4_kld pscore f5d172365)
+
+What: MQ4P's int4-activation MMQ kernels (`..._mmq_iu4_full_{set,add}_lf16_col`, generic tail) compiled with
+`HIPFIRE_IU4_PLANAR` planar qt57 loads -> `gemm_iu4g256_w4a4*`; m<128 projections -> `gemm_iu4g256_residual_wmma_gfx11_mw4_lds`
+(f16 X converted once per multi-GEMM, uncached convert + `invalidate_fp16_cache`, fixes a stale pointer-keyed cache).
+Knobs: `HIPFIRE_IU4_PREFILL_ACT=a4` (default) | `a8` (C7 W4A8 q8_1 path); `HIPFIRE_IU4_SMALLM=wmma` (default) | `mmq`.
+
+### Numerics (t1.out, 10:20–10:22 UTC = 14:20–14:22 Dubai)
+`cargo test -p hipfire-runtime --release --test iu4_w4a4_gemm_gpu -- --ignored` with IU4_REAL/MQ_REAL = 4B IU4P/MQ4P:
+490 cases, all `a4_bitdiff=0`, `mwl_bitdiff=0`, `det_diff=0` vs the MQ4G256V2 kernels on twin weights (random + real
+in_proj_a m=32, qkv m=8192, z m=4096, down k=9216, gate m=9216, k_proj m=1024, o_proj k=4096; N in {1,77,512}; odd/tail M).
+vs f32 reference: a4 worst rel 0.208 (random), 0.045–0.113 real (int4 activation noise, same as MQ4P); mwl worst rel 9.1e-4.
+
+### ISA (llvm-objdump / llvm-readelf --notes on ~/.hipfire_kernels/gfx1100, unbundled)
+- First version: `gemm_iu4g256_w4a4_full_{set,add}_lf16_col` 96 VGPR, **vgpr_spill_count=2, private 12 B** (MQ twin: 0).
+  Fix: uniform column base `A + kb*128 - 8` + 32-bit row offset `row*gpr*136` (header: `A + gpr*128 + kb*8` + 32-bit) ->
+  96 VGPR, 0 spills, 0 private. Test re-run after fix: 490/490 bitdiff=0.
+- `gemm_iu4g256_w4a4` (generic) 193 VGPR, 0 spills; `gemm_iu4g256_residual_wmma_gfx11_mw{4,8}_lds` 90 VGPR, 0 spills, 8 KiB LDS.
+- MQ code objects unchanged by the `#ifdef` patches: disassembly sha identical pre/post for
+  `gemm_mq4g256v2_residual_mmq_iu4` (0d0b9bd1bf21), `_gridspec` (a4f9db208282), `gemm_mqv2_wmma_gfx1100_mw_lds` (42ea4d2268d2).
+
+### Prefill-path KL/PPL, 4B (iu4_kld pref/pscore, 1023 tokens, 10:35–10:37 UTC = 14:35–14:37 Dubai)
+Refs: `ref4` = MQ4P per-token decode (PPL 4.6923); `refP4` = MQ4P prefill (W4A4, PPL 4.7699).
+
+| run | vs ref | mean KL top64 | max KL | top1 agree | PPL |
+|---|---|---|---|---|---|
+| MQ4P prefill | MQ4P decode | 0.0388 | 2.16 | 937/1023 | 4.7699 |
+| IU4P a4 (C10 default) | MQ4P decode | 0.0345 | 1.35 | 938/1023 | 4.8722 |
+| IU4P a8 (W4A8) | MQ4P decode | **0.0016** | 0.149 | **1007/1023** | **4.7058** |
+| IU4P a4 | MQ4P prefill | 0.0650 | 7.55 | 910/1023 | 4.8722 |
+| IU4P a8 | MQ4P prefill | 0.0471 | 5.91 | 933/1023 | 4.7058 |
+| IU4P a4 + SMALLM=mmq | MQ4P prefill | 0.0731 | 4.42 | 907/1023 | 4.9541 |
+| IU4P a8 + SMALLM=mmq | MQ4P prefill | 0.0461 | 5.83 | 939/1023 | 4.6923 |
+
+Determinism: a4 repeat run identical (same KL/PPL/top1/first_div). Reading: W4A4 activation quantization costs
+PPL (+0.10 vs decode-equivalent a8, +2.2%); W4A8 prefill is ~decode-exact (KL 0.0016 vs MQ4P decode), better than MQ4P's own
+W4A4 prefill (0.0388). Small-M WMMA (f16 X) beats small-M MMQ int4 on a4 (0.065 vs 0.073, PPL 4.87 vs 4.95).
+
+### Speed A/B, 4B, 3 interleaved rounds (chW4b, 10:41–10:45 UTC = 14:41–14:45 Dubai)
+`hipfire bench <model> --matrix --pp 512,2048 --ctx 128,4096 --tg 64 --runs 2 --warmups 2 --spec off`, HIPFIRE_DAEMON_BIN pinned,
+GPU idle-gated, klog=0 every run. Median of 3 rounds (tok/s); logs ~/work/logs/abW/<label>_<r>.log.
+
+| config | pp512 | pp2048 | tg64@128 | tg64@4096 |
+|---|---|---|---|---|
+| C9 (h1b6, W4A8 prefill, small-M MMQ) | 5864 | 5518 | 204.9 | 192.7 |
+| C10 a4 (default) | **7612** | **7025** | 205.5 | 193.2 |
+| C10 a8 | 6088 | 5718 | 205.3 | 192.9 |
+| C10 a4 + SMALLM=mmq | 7376 | 6815 | 204.4 | 192.4 |
+| MQ4P | 8102 | 7479 | 201.0 | 189.8 |
+
+a4 vs C9: +29.8% pp512, +27.3% pp2048; vs MQ4P −6.0% / −6.1% (remaining gap, unprofiled). Small-M WMMA vs MMQ: +3.2% / +3.1% (a4).
+a8 (W4A8 at C10) vs C9: +3.8% / +3.6% (small-M WMMA only). Decode unchanged (±0.3%), still +2% over MQ4P.
