@@ -749,6 +749,16 @@ const FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i8_gfx11\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+// C11b: gate/up SwiGLU+FWHT emitting `block_i8_128` (gfx11 A8 IU4 down
+// producer). Same body as `fused_silu_mul_mq_rotate_i4` via the emit aliases.
+const FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i8_gfx11\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
 const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
@@ -5417,6 +5427,85 @@ impl Gpu {
         }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
+    }
+    /// C11b: [`Self::fused_silu_mul_rotate_mq_i4_batched`] (no AWQ) emitting
+    /// `block_i8_128` into an int8 reservation; gfx1100/gfx1151 only.
+    pub fn fused_silu_mul_rotate_mq_i8_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int8MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int8MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_mul_rotate_mq_i8_batched: reservation (k,n) mismatch",
+            ));
+        }
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_mul_rotate_mq_i8_batched: gfx11 only",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let kernel = "fused_silu_mul_mq_rotate_i8_gfx11";
+        self.ensure_kernel(kernel, FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC, kernel)?;
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut i8p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i8p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let bytes = (k * 4 * 3 + 2 * 256 * 4 + (k / 128) * 136) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            folded_rows_grid(kernel, k / 256, batch_size)?,
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up_p);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i8p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
             reservation,
         ))
     }

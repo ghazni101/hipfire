@@ -1749,6 +1749,9 @@ pub struct Gpu {
     /// A4 producers + IU4 GEMMs, whose output rows do not depend on the row
     /// count. lm_head is untouched (F16). See [`Gpu::iu4_verify_enter`].
     pub iu4_verify_scope: bool,
+    /// C11b: sidecar a fused IU4 producer wrote for the next
+    /// `gemm_iu4g256_multi` over `(x_rot ptr, n, k)`; taken by that call.
+    pub iu4_pending_x: Option<crate::gemm_iu4::Iu4PendingX>,
     /// Set only around a batched DFlash draft forward (and its head GEMM):
     /// lets `gemm_mq4g256v2_overwrite_gfx12_dflash` admit exactly 64 rows
     /// (the batch-tile `_vt4` overwrite kernel, per-row identical to the
@@ -3028,6 +3031,7 @@ impl Gpu {
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,
+            iu4_pending_x: None,
             draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,

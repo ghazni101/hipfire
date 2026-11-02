@@ -435,3 +435,54 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
 - chZ: FAILED to measure. `bench --backend slots` on the IU4P model: "forward_batch_slots: embedding format
   IU8G32 has no batched lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128)". Gap: slots-path
   IU8G32 embedding lookup. (Serve --continuous-batch-size works: w4cb27 gate passed.)
+
+## C11b fused producer sidecars (11:50-12:16 UTC = 15:50-16:16 Dubai)
+- Design: the rmsnorm / silu*up / rotate producers emit the MMQ X sidecar next to the f32 x_rot and hand it to `gemm_iu4g256_multi` through `gpu.iu4_pending_x` (consumed only when ptr/n/k/kind match, generation-checked; otherwise falls back to ensure_int*_mmq_x). New `fused_silu_mul_mq_rotate_i8_gfx11` (block_i8_128 quant+emit prepended to the IU4_SIDECAR silu producer). Knob `HIPFIRE_IU4_FUSED_X`: 0 off; unset/1 = a8 fused (default); `all` = also a4.
+- a4 fusion is opt-in because the i4 producer emit uses the reduced MSE candidate set, so the sidecar is not bit-exact to `ensure_int4_mmq_x` (8 candidates); ~20% of sidecar bytes differ in t11b. Exact a4 would need the RUNTIME_CAND cand_mode=8 variant (not done).
+- RMSNorm producers that keep x_rot in LDS need (k+256)*4 <= 65536; larger k (17408) falls back (the f32 reference itself fails "invalid argument" there).
+- t11b (iu4_fused_x_producers_gpu, k {256,768,2560,9728,17408} x n {1,7,64,333,2048} x Norm/Silu/Rot x i4/i8 x awq): SUMMARY cases=224 bad=0 (x_rot bit-exact + deterministic everywhere, i8 sidecars bit-exact, i4 = candset only).
+- Model-level bitwise (iu4_kld pref with FUSED_X=0 vs pscore fused, twice): 4B a8 logit_rows_bit_identical 1023/1023 both runs (PPL 4.69521); 27B a8 511/511 both runs (PPL 5.84497). Fused == standalone, deterministic.
+- KL (mean top64; refP = MQ4P prefill W4A4, ref = MQ4P per-token decode):
+  | run | vs | mean KL | top1 | PPL |
+  |---|---|---|---|---|
+  | 4B a8 | refP | 0.04496 | 939/1023 | 4.6952 |
+  | 4B a8 tile128 | refP | 0.04496 (identical) | 939 | |
+  | 4B a8 | ref (decode) | 3.90e-4 | 1013/1023 | |
+  | 4B a4all | refP | 3.3e-13 | 1023 | |
+  | 4B a4all | ref | 0.03876 | 937 | |
+  | 4B a8q | ref | 1.64e-3 | 1007 | 4.7058 |
+  | 27B a8 | refP | 0.01724 | 477/511 | 5.8450 |
+  | 27B a8 | ref | 1.11e-4 | 511/511 | |
+  | 27B a4all | refP | 3.6e-13 | 511 | 6.0610 |
+- Speed (hipfire bench --pp 512,2048 --tg 64, 3 interleaved rounds, median of medians, 12:04-12:15 UTC, GPU alone, klog 0):
+  | 4B | pp512 | pp2048 | tg64 |
+  |---|---|---|---|
+  | a4 (C11b default) | 7607.85 | 7033.60 | 204.8 |
+  | a4all (fused a4) | 8004.30 (+5.2%) | 7365.15 (+4.7%) | 204.8 |
+  | a8 fused (C11b) | 6615.95 | 6169.95 | 204.5 |
+  | a8 C11a | 6568.15 | 6151.55 | 205.0 |
+  | MQ4P | 8116.15 | 7500.85 | 201.0 |
+  | 27B | pp512 | pp2048 | tg64 |
+  | a4 | 1468.60 | 1459.65 | 46.8 |
+  | a8 fused | 1165.40 | 1162.40 | 46.7 |
+  | a8 C11a | 1156.30 | 1154.60 | 46.7 |
+  | MQ4P | 1575.10 | 1572.65 | 46.8 |
+  - a8 fusion: +0.7%/+0.3% (4B), +0.8%/+0.7% (27B): small, the a8 gap is the matmul (step 3). a8 vs a4: -13% (4B), -21% (27B). a4all closes 4B to -1.4%/-1.8% of MQ4P.
+- chZ (batched decode): MQ4P 4B slots r1-3 rc=0; every IU4 slots run failed: embedding IU8G32 had no slots lookup. Step 5 finding: the embedding is not the only gap. forward_slots.rs admits no IU4G256/IU8G32 projection (slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key, lm_head_slots_admissible), so batched slots decode for IU4 needs a real port (KernelKey entries for the IU4 multi GEMM + IU8G32 residual, graph-capture-safe X prep). Embedding arm added (embed_lookup_slots + admit list, uses existing embedding_lookup_iu8g32_batched, device token ids => capture safe); slots lib tests 22/22 pass. Serve --continuous-batch-size (non-slots batched route) already works (w4cb27 gate).
+- Step 4 (IU8G32 wo gap) in progress: same ISA mix as Q8_0 (6 b128 + 8 b32 + 1 d16_b16, llvm-objdump/clang -S gfx1100); hypothesis (untested): the planar scale stream (K bytes past the codes) costs an extra scattered cache line per block. Change: hoist scales to one b128 load per 8 blocks when K%256==0 (IU8 ISA now 7 b128, 77 VGPR; Q8_0 ISA unchanged byte-for-byte except cuid). Needs bit-exact test + rocprof A/B.
+
+### C11b gates (chB, finished 16:21 Dubai)
+b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for every gate.
+
+### Step 4: IU8G32 wo WMMA scale hoist (C12)
+- Correctness: iu8g32_wmma_gemm_gpu passes 112 cases, worst rel vs f64 1.478e-4.
+- A/B: 4B IU4P bench_prefill 2048 x4 under rocprof kernel-trace, c11b vs c12, interleaved 3 rounds.
+  gemm_iu8g32_residual_wmma total over 384 calls: c11b 180.57 / 179.97 / 178.77 ms vs c12 141.22 / 140.07 / 140.58 ms, so -22%.
+  All kernels total: 1142.4 / 1139.2 / 1133.4 vs 1105.5 / 1096.8 / 1101.3 ms.
+- Q8_0 path ISA is identical apart from the cuid.
+
+### a4all KL vs MQ4P decode (refs from the same runs)
+| model | a4 (standalone quantizer) | a4all (fused, MQ4P math) |
+|---|---|---|
+| 4B mean KL | 0.03453 (top1 938/1023, ppl 4.8722) | 0.03876 (top1 937, ppl 4.7699); repeat 0.0387564 |
+| 27B mean KL | 0.02038 (top1 480/511, ppl 5.9183) | 0.01794 (top1 477, ppl 6.0610) |

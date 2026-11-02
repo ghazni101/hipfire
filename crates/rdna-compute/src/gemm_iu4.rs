@@ -60,6 +60,37 @@ fn iu4_prefill_act() -> Iu4PrefillAct {
     })
 }
 
+/// C11b `HIPFIRE_IU4_FUSED_X`: `0` = f32 producers + the standalone
+/// quantizer; unset/`1` = fuse the `a8` sidecar (bit-exact to the standalone
+/// `block_i8_128` quantizer); `all` = also fuse `a4`, whose producer emit uses
+/// the reduced MSE candidate set (not bit-exact to `ensure_int4_mmq_x`).
+/// Returns (fuse a8, fuse a4).
+fn iu4_fused_x() -> (bool, bool) {
+    use std::sync::OnceLock;
+    static V: OnceLock<(bool, bool)> = OnceLock::new();
+    *V.get_or_init(|| match std::env::var("HIPFIRE_IU4_FUSED_X").as_deref() {
+        Ok("0") => (false, false),
+        Ok("all") => (true, true),
+        _ => (true, false),
+    })
+}
+
+/// Sidecar a fused producer emitted for one `X` (C11b).
+#[derive(Debug)]
+pub enum Iu4PendingXKind {
+    I4(crate::scratch::Int4MmqPrepared),
+    I8(crate::scratch::Int8MmqPrepared),
+}
+
+/// [`Iu4PendingXKind`] keyed by the f32 `x_rot` it mirrors.
+#[derive(Debug)]
+pub struct Iu4PendingX {
+    x: usize,
+    n: usize,
+    k: usize,
+    kind: Iu4PendingXKind,
+}
+
 fn iu4_prefill_a4() -> bool {
     iu4_prefill_act() == Iu4PrefillAct::A4
 }
@@ -90,6 +121,127 @@ impl Gpu {
             && !iu4_prefill_gemv()
     }
 
+    /// C11b: `Some(true)` = fuse an int8 (`a8`) sidecar into the producer
+    /// for an IU4G256 consumer, `Some(false)` = int4 (`a4`), `None` = the
+    /// f32-only producer (route ineligible, `a8q`, or the knob off).
+    fn iu4_fused_x_act(&self, k: usize, n: usize) -> Option<bool> {
+        let (f8, f4) = iu4_fused_x();
+        if !self.iu4g256_mmq_eligible(k, n) {
+            return None;
+        }
+        match iu4_prefill_act() {
+            Iu4PrefillAct::A4 if f4 => Some(false),
+            Iu4PrefillAct::A8 if f8 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn iu4_set_pending(&mut self, x: &GpuTensor, n: usize, k: usize, kind: Iu4PendingXKind) {
+        self.iu4_pending_x = Some(Iu4PendingX { x: x.buf.as_ptr() as usize, n, k, kind });
+    }
+
+    /// RMSNorm+FWHT for an IU4G256 consumer, also emitting the MMQ X
+    /// sidecar when eligible. `Ok(false)`: nothing launched; run the f32
+    /// producer. Always writes the f32 `x_rot` (the small-M f16 route reads it).
+    pub fn iu4_fused_rmsnorm_rotate(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        n: usize,
+    ) -> HipResult<bool> {
+        // The x_rot-storing RMSNorm producers stage the row in LDS:
+        // (k + 256) * 4 bytes must fit the 64 KiB workgroup limit.
+        if (k + 256) * 4 > 65536 {
+            return Ok(false);
+        }
+        match self.iu4_fused_x_act(k, n) {
+            Some(true) => {
+                let res = self.reserve_int8_mmq(k, n)?;
+                let p = self.fused_rmsnorm_rotate_mq_i8_batched(x, weight, awq, Some(x_rot), res, k, eps, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
+                Ok(true)
+            }
+            Some(false) => {
+                let res = self.reserve_int4_mmq(k, n)?;
+                let p = self.fused_rmsnorm_rotate_mq_i4_batched(x, weight, awq, Some(x_rot), res, k, eps, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I4(p));
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// [`Self::iu4_fused_rmsnorm_rotate`] for `silu(gate)*up` + FWHT.
+    pub fn iu4_fused_silu_mul_rotate(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: &GpuTensor,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        match self.iu4_fused_x_act(k, n) {
+            Some(true) if awq.is_none() => {
+                let res = self.reserve_int8_mmq(k, n)?;
+                let p = self.fused_silu_mul_rotate_mq_i8_batched(gate, up, Some(x_rot), res, k, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
+                Ok(true)
+            }
+            Some(false) => {
+                let res = self.reserve_int4_mmq(k, n)?;
+                let p = self.fused_silu_mul_rotate_mq_i4_batched(gate, up, awq, Some(x_rot), res, k, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I4(p));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// [`Self::iu4_fused_rmsnorm_rotate`] for a plain FWHT of `x`.
+    pub fn iu4_fused_rotate_x(
+        &mut self,
+        x: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: &GpuTensor,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        match self.iu4_fused_x_act(k, n) {
+            Some(true) if awq.is_none() => {
+                let res = self.reserve_int8_mmq(k, n)?;
+                let p = self.rotate_x_mq_i8_batched(x, Some(x_rot), res, k, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
+                Ok(true)
+            }
+            Some(false) => {
+                let res = self.reserve_int4_mmq(k, n)?;
+                let p = self.rotate_x_mq_i4_batched(x, awq, Some(x_rot), res, k, n)?;
+                self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I4(p));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Take the pending sidecar if it mirrors `x` at `(n, k)` and is still
+    /// live (generation-checked); any other call drops it.
+    fn iu4_take_pending(&mut self, x: &GpuTensor, n: usize, k: usize, a8: bool) -> Option<*mut c_void> {
+        let p = self.iu4_pending_x.take()?;
+        if p.x != x.buf.as_ptr() as usize || p.n != n || p.k != k {
+            return None;
+        }
+        match (&p.kind, a8) {
+            (Iu4PendingXKind::I8(h), true) => self.int8_mmq_prepared_ptr(h, k, n).ok(),
+            (Iu4PendingXKind::I4(h), false) => self.int4_mmq_prepared_ptr(h, k, n).ok(),
+            _ => None,
+        }
+    }
+
     /// `Y = W X` (or `Y += W X` when `add`) for one IU4G256 matrix.
     pub fn gemm_iu4g256(
         &mut self,
@@ -114,10 +266,12 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
+        let pending = self.iu4_pending_x.take();
         if n == 0 || projs.is_empty() {
             return Ok(());
         }
         if self.iu4g256_mmq_eligible(k, n) {
+            self.iu4_pending_x = pending;
             self.bind_thread()?;
             let smallm = iu4_smallm_wmma();
             let mut big: Vec<Iu4Proj<'_>> = Vec::with_capacity(projs.len());
@@ -143,22 +297,30 @@ impl Gpu {
                 }
             }
             if big.is_empty() {
+                self.iu4_pending_x = None;
                 return Ok(());
             }
             if iu4_prefill_a4() {
-                let xq = self.ensure_int4_mmq_x(x, n, k)?;
+                let xq = match self.iu4_take_pending(x, n, k, false) {
+                    Some(p) => p,
+                    None => self.ensure_int4_mmq_x(x, n, k)?,
+                };
                 for &(a, y, m) in &big {
                     self.gemm_iu4g256_w4a4_prequant(a, xq, y, m, k, n, add)?;
                 }
                 return Ok(());
             }
             if iu4_prefill_act() == Iu4PrefillAct::A8 {
-                let xq = self.ensure_int8_mmq_x(x, n, k)?;
+                let xq = match self.iu4_take_pending(x, n, k, true) {
+                    Some(p) => p,
+                    None => self.ensure_int8_mmq_x(x, n, k)?,
+                };
                 for &(a, y, m) in &big {
                     self.gemm_iu4g256_w4a8_prequant(a, xq, y, m, k, n, add)?;
                 }
                 return Ok(());
             }
+            self.iu4_pending_x = None;
             let xq = if self.flags.gfx11_mmq_x128_enabled() {
                 self.ensure_q8_1_mmq_x128(x, n, k)?
             } else {
