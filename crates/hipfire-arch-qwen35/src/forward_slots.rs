@@ -826,12 +826,13 @@ pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()>
         EmbeddingFormat::Q8_0
         | EmbeddingFormat::F32
         | EmbeddingFormat::HFQ4G256
-        | EmbeddingFormat::HFQ4G128 => Ok(()),
+        | EmbeddingFormat::HFQ4G128
+        | EmbeddingFormat::IU8G32 => Ok(()),
         other => Err(HipError::new(
             0,
             &format!(
                 "forward_batch_slots: embedding format {other:?} has no batched \
-                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128)"
+                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128, IU8G32)"
             ),
         )),
     }
@@ -857,6 +858,9 @@ pub(crate) fn embed_lookup_slots(
         }
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32_batched(table, output, token_ids, n, dim)
         }
         other => Err(HipError::new(
             0,
