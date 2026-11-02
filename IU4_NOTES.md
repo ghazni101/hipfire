@@ -486,3 +486,42 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
 |---|---|---|
 | 4B mean KL | 0.03453 (top1 938/1023, ppl 4.8722) | 0.03876 (top1 937, ppl 4.7699); repeat 0.0387564 |
 | 27B mean KL | 0.02038 (top1 480/511, ppl 5.9183) | 0.01794 (top1 477, ppl 6.0610) |
+
+### C12 model-level checks (c12 build, chD, 16:30-16:31 Dubai)
+- 4B IU4P a4 default: KL vs MQ4P decode 0.03453435172173479, top1 938. That is bit-for-bit the same as c11b, and a repeat gives the same value.
+- Gate c12a4: unstable 0, conc 0, errors 0. All 6 greedy shas match b4a4 (hash 6dbe5cb43ee4, code 166f783cdca7, math c101d4fb84d0, story d4eed6f4386f, ctx1k 8e3f23e5a295, ctx4k a8398834af83).
+
+### a4all decision evidence
+- Gates: c4all (solo), c4allcb (cb4) and c27all all show unstable 0, conc 0, errors 0.
+- The c4all shas differ from b4a4, as expected because it uses a different quantizer. The c4all story ran to the 1024-token cap where b4a4 stopped at 924. Its text is coherent, with a max 8-gram repeat of 1.
+- 27B kernel-trace totals (bench_prefill 2048 x2, one run each): a4 2587.8 ms vs a4all 2480.1 ms (-4.2%; the quantize_int4_mmq_ds128 130 ms disappears).
+- 4B: pp512 +5.2%, pp2048 +4.7% (from C11b).
+- KL vs decode is mixed: 4B 0.0345 -> 0.0388, 27B 0.0204 -> 0.0179. a4all is bit-exact to MQ4P prefill on both models (KL 3e-13).
+- Decision: a4all becomes the default (C13). `HIPFIRE_IU4_FUSED_X=1` or `a8` keeps the old behaviour.
+
+### Step 3: a8 vs a4 prefill matmul, 4B IU4P, bench_prefill 2048 x4, rocprof kernel-trace (c11b)
+| kernel | calls | ms | VGPR | WG |
+|---|---|---|---|---|
+| gemm_iu4g256_w4a8_full_set (t128) | 2176 | 489.11 | 120 | 512 |
+| gemm_iu4g256_w4a4_full_set_lf16_col | 2176 | 331.52 | 96 | 512 |
+| MQ4P gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col | 2176 | 343.91 | 96 | 512 |
+
+- CORRECTION: the runtime a4 kernel is gemm_iu4g256_w4a4_* (the mmq_iu4 gfx11 file, v_wmma_i32_16x16x16_iu4), not GEMM_IU4G256_MMQ_SRC (iu8 WMMA). The earlier static-ISA "a4 also uses iu8 WMMA" note was about the wrong kernel. So a4 vs a8 is iu4 WMMA vs iu8 WMMA, plus data movement.
+- `HIPFIRE_GFX11_A8_PREFILL=1` on MQ4P did not engage MQ4P's a8 kernel: the trace shows the same mmq_iu4 kernels. a8_prefill_active also requires mq4v2_symmetric, and this MQ4P model apparently is not (untested inference). So there is no runtime comparison against MQ4P's iu8 kernel. The static ISA comparison stands: IU4 t128 has 1062 instructions vs MQ4P's 917, with 32 WMMAs each.
+- PMC (rocprofv3 --pmc, 4 counters per pass) is unreliable here. SQ_INSTS_LDS, SQ_INSTS_VALU, SQ_WAVE_CYCLES and SQ_INST_CYCLES_VMEM read 0. The same MQ4P kernel gives SQC_LDS_BANK_CONFLICT 5.49e8 in one pass and 2.74e8 in another, with IDX_ACTIVE 0 vs 8.2e8. Only SQ_WAVES (3554 per dispatch for both) and SQ_BUSY_CYCLES (a8/a4 = 1.39) look plausible. No bank-conflict claim is made.
+- Tile 128 vs 256 (c12, x2):
+  - 4B: full_set 246.7 vs 324.0 ms, full_add 97.1 vs 173.0 ms; t128 wins, and the default already picks it.
+  - 27B: full_set 1752.8 vs 1767.7 ms, full_add 764.4 vs 703.2 ms; total 3491.6 vs 3346.6 ms, but gemm_iu8g32 also moved 482.6 vs 428.4 ms, so clocks/power differed. One run only, inconclusive.
+- Global-load pattern (from source):
+  - Per K128 per t128 CTA, a8 stages X 128 tok x 128 B = 16 KB plus W 8 KB; the a4 kernel stages X 8 KB plus W 8 KB. That is 1.5x the bytes, close to the 1.475x kernel-time ratio.
+  - X rows are block_i8_128 at a 136 B stride with qs at +8. Each thread's b128 covers part of a 64 B token segment that is not 128 B aligned (8 + 136t + 64s), so a good share of the segments straddle two cache lines.
+  - HYPOTHESIS, untested: a planar i8 sidecar (qs at 128 B-aligned rows, d/s in a separate plane) would cut the TA/L2 requests per byte. The fused producer owns the layout now (C11b), so this is cheap to try next.
+- C13 verification (c13 build, 16:35-16:37 Dubai):
+  - Default KL is 0.03875639474581316, the same as the FUSED_X=all value.
+  - Gate c13def: all 6 shas match c4all.
+  - Gate c13x1 (FUSED_X=1): all 6 shas match b4a4.
+  - Both gates: unstable 0, conc 0, errors 0.
+- Slots step 5: only the IU8G32 embedding arm has been committed (74b59ff5a).
+  - Still missing: IU4G256/IU8G32 in slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key and lm_head_slots_admissible, plus the slots-side producer and pending-x wiring.
+  - chZ (slots) does not run on IU4 until that port lands. NOT STARTED.
+- qt59 rotation: last item, untouched.

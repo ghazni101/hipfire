@@ -60,18 +60,19 @@ fn iu4_prefill_act() -> Iu4PrefillAct {
     })
 }
 
-/// C11b `HIPFIRE_IU4_FUSED_X`: `0` = f32 producers + the standalone
-/// quantizer; unset/`1` = fuse the `a8` sidecar (bit-exact to the standalone
-/// `block_i8_128` quantizer); `all` = also fuse `a4`, whose producer emit uses
-/// the reduced MSE candidate set (not bit-exact to `ensure_int4_mmq_x`).
+/// C11b/C13 `HIPFIRE_IU4_FUSED_X`: `0` = f32 producers + the standalone
+/// quantizer; `1`/`a8` = fuse only the `a8` sidecar (bit-exact to the
+/// standalone `block_i8_128` quantizer); unset/`all` (C13 default) = also fuse
+/// `a4`, whose producer emit uses MQ4P's reduced MSE candidate set (bit-exact
+/// to MQ4P prefill math, KL 3e-13; not bit-exact to `ensure_int4_mmq_x`).
 /// Returns (fuse a8, fuse a4).
 fn iu4_fused_x() -> (bool, bool) {
     use std::sync::OnceLock;
     static V: OnceLock<(bool, bool)> = OnceLock::new();
     *V.get_or_init(|| match std::env::var("HIPFIRE_IU4_FUSED_X").as_deref() {
         Ok("0") => (false, false),
-        Ok("all") => (true, true),
-        _ => (true, false),
+        Ok("1") | Ok("a8") => (true, false),
+        _ => (true, true),
     })
 }
 
