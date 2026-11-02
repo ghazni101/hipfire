@@ -42,15 +42,31 @@ __global__ void HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL(
     float* rotate_values = corr_lut + max_tiles;
     __shared__ float global_max_shared;
     __shared__ float global_sum_shared;
+    __shared__ float wave_max[32];
 
-    if (tid == 0) {
-        float global_max = -1e30f;
-        for (int tile = 0; tile < n_tiles; tile++) {
+    // Global max: fmaxf is exact and order-independent, so every thread scans
+    // its own tile stripe and the block reduces through LDS. (The former
+    // single-thread scan walked n_tiles strided 1 KiB loads serially and was
+    // the reduce's whole cost at long context.) The published value is
+    // bit-identical to the increasing-tile scan it replaces.
+    {
+        float local_max = -1e30f;
+        for (int tile = tid; tile < n_tiles; tile += blockDim.x) {
             const float* p = partials + (h * max_tiles + tile) * stride;
             if (p[1] > 0.0f)
-                global_max = fmaxf(global_max, p[0]);
+                local_max = fmaxf(local_max, p[0]);
         }
-        global_max_shared = global_max;
+        for (int off = 16; off > 0; off >>= 1)
+            local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+        if ((tid & 31) == 0)
+            wave_max[tid >> 5] = local_max;
+        __syncthreads();
+        if (tid == 0) {
+            float global_max = -1e30f;
+            for (int w = 0; w < (int)(blockDim.x >> 5); w++)
+                global_max = fmaxf(global_max, wave_max[w]);
+            global_max_shared = global_max;
+        }
     }
     __syncthreads();
 

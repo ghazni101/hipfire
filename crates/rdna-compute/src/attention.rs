@@ -604,13 +604,14 @@ const Q8_DECODE_GQA_GFX1151: DecodeGqaPair = DecodeGqaPair {
     grid_y_cap: 512,
 };
 
-/// gfx1100 Q8_0 gated-AWQ decode attention through the GQA-shared tile and
-/// the load-ahead reduce (default on; `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0`
-/// restores `attention_flash_q8_0_tile` +
-/// `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100`). Both pairs
-/// write byte-identical partials and output. The tile's geometry is
-/// compile-time: head_dim 256, GQA group 6, tile 128, full causal (H2 decode).
-/// The reduce keeps 2 * max_tiles f32 of dynamic LDS.
+/// gfx1100 Q8_0 decode attention through the GQA-shared tile (default on;
+/// `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0` restores the per-head
+/// `attention_flash_q8_0_tile`). The tile is paired with whichever reducer
+/// the caller's epilogue needs: the gated MQ-rotate reducer (with or without
+/// `awq_scale`) or the plain shared reducer. Every pair writes byte-identical
+/// partials and output. The tile's geometry is compile-time: head_dim 256,
+/// GQA group 6, tile 128, full causal (H2 decode). The gated reduce keeps
+/// 2 * max_tiles f32 of dynamic LDS.
 fn q8_decode_attn_gqa_gfx1100_admitted(
     gpu: &Gpu,
     n_heads: usize,
@@ -11973,28 +11974,68 @@ impl Gpu {
             self.replay.is_recording(),
         );
 
-        if let (Some(gate), Some(awq_scale)) = (output_gate, output_awq_scale) {
+        if let Some(gate) = output_gate {
             if q8_decode_attn_gqa_gfx1100_admitted(
                 self, n_heads, n_kv_heads, head_dim, tile_size, max_tiles, window,
             ) {
-                return self.attention_flash_q8_0_gqa_gated_awq_gfx1100(
-                    q,
-                    k_cache,
-                    v_cache,
-                    out,
-                    gate,
-                    awq_scale,
-                    pos_buf,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    max_seq,
-                    partials,
-                    tile_size,
-                    max_tiles,
-                    launch_tiles,
-                );
+                return match output_awq_scale {
+                    Some(awq_scale) => self.attention_flash_q8_0_gqa_gated_awq_gfx1100(
+                        q,
+                        k_cache,
+                        v_cache,
+                        out,
+                        gate,
+                        awq_scale,
+                        pos_buf,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_seq,
+                        partials,
+                        tile_size,
+                        max_tiles,
+                        launch_tiles,
+                    ),
+                    None => self.attention_flash_q8_0_gqa_gated_gfx1100(
+                        q,
+                        k_cache,
+                        v_cache,
+                        out,
+                        gate,
+                        pos_buf,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        max_seq,
+                        partials,
+                        tile_size,
+                        max_tiles,
+                        launch_tiles,
+                    ),
+                };
             }
+        }
+
+        if output_gate.is_none()
+            && q8_decode_attn_gqa_gfx1100_admitted(
+                self, n_heads, n_kv_heads, head_dim, tile_size, max_tiles, window,
+            )
+        {
+            return self.attention_flash_q8_0_gqa_gfx1100(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                pos_buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                partials,
+                tile_size,
+                max_tiles,
+                launch_tiles,
+            );
         }
 
         if output_gate.is_none()
@@ -12750,6 +12791,207 @@ impl Gpu {
             timer.finish(&self.hip);
         }
         result
+    }
+
+    /// GQA-shared Q8_0 decode tile on gfx1100: one 256-thread workgroup per
+    /// (kv head, tile) serves all six q heads of its kv head, so each K/V tile
+    /// is read once per kv head instead of once per q head. Writes the same
+    /// `[n_heads, max_tiles, 2 + head_dim]` f32 partials as
+    /// `attention_flash_q8_0_tile` (byte-identical output), so either reducer
+    /// consumes them unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_gqa_tile_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        partials: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        tile_size: usize,
+        launch_tiles: usize,
+    ) -> HipResult<()> {
+        const TILE: &str = "attention_flash_q8_0_tile_gqa_gfx1100";
+        self.ensure_kernel(
+            TILE,
+            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            TILE,
+        )?;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let ts = tile_size as i32;
+        let wn = 0i32;
+        let es = 0i32;
+        let grid = [
+            n_kv_heads as u32,
+            launch_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP) as u32,
+            1,
+        ];
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &p_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &wn as *const _ as *mut c_void,
+            &es as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob_position_grid(
+            TILE,
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            1,
+            1,
+            tile_size as u32,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(ts);
+                b.push_i32(wn);
+                b.push_i32(es);
+                b
+            },
+        )
+    }
+
+    /// Gated Q8_0 decode attention on gfx1100 without an AWQ scale: the same
+    /// GQA-shared tile as [`Self::attention_flash_q8_0_gqa_gated_awq_gfx1100`]
+    /// followed by the existing gated MQ-rotate reducer with
+    /// `awq_scale = None`. Output is identical to the per-head tile route.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_gqa_gated_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        tile_size: usize,
+        max_tiles: usize,
+        launch_tiles: usize,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_gqa_tile_gfx1100(
+            q,
+            k_cache,
+            v_cache,
+            partials,
+            pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            tile_size,
+            launch_tiles,
+        )?;
+        self.attention_flash_reduce_gated_mq_rotate_gfx1100(
+            partials, out, gate, None, pos_buf, n_heads, head_dim, tile_size, max_tiles,
+        )
+    }
+
+    /// Ungated Q8_0 decode attention on gfx1100: GQA-shared tile followed by
+    /// the plain shared reducer. Bit-identical to the per-head
+    /// `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce` pair, with
+    /// one K/V read per kv head instead of one per q head.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_gqa_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        tile_size: usize,
+        max_tiles: usize,
+        launch_tiles: usize,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_gqa_tile_gfx1100(
+            q,
+            k_cache,
+            v_cache,
+            partials,
+            pos_buf,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            tile_size,
+            launch_tiles,
+        )?;
+        const REDUCE: &str = "attention_flash_q8_0_reduce";
+        self.ensure_kernel(REDUCE, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, REDUCE)?;
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let pos_ptr = pos_buf.as_ptr();
+        let ts = tile_size as i32;
+        let mt = max_tiles as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            REDUCE,
+            [n_heads as u32, 1, 1],
+            [256, 1, 1],
+            (max_tiles * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        )
     }
 
     /// Load the givens4/turbo-family kernel `func_name` for a descriptor-aware

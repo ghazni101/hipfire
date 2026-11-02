@@ -817,3 +817,105 @@ requantization (per-32 scales folded to one scale per 128, lossy), a decode
 GEMV for the same format (f32 x, one scale per 128), and the claim-scoped KL
 gate. Activation cost for prefill is the existing W8A8 KL (~1.0e-4 on 27B
 decode); the weight requant is the new quality term.
+
+## C20 — long-context decode: GQA-shared Q8 tile + parallel reducer max (2026-11-02, feat/iu4-iu8-quant-family)
+
+Goal: make growing context cost decode (tg) and prefill (pp) as little as
+possible on the 27B IU4P container. This section covers the decode arm; the
+prefill arm is measured and bounded, not yet moved (see "Remaining ceilings").
+
+Method. Fresh-process `bench_decode` / `bench_prefill` against one resident
+`target/release/daemon` (`HIPFIRE_GRAPH=0`, `HIPFIRE_AR_GRAPH=0`,
+`HIPFIRE_CASK_OFF=1`, `HIPFIRE_IU4_WIDE_PREFILL=1`), 12 steps per round, 2
+rounds; rocprofv3 `--kernel-trace --stats` on the same driver; and the
+container serve (`/v1/chat/completions`, greedy, `reasoning_effort=none`, no
+prompt cache, unique prefix per request).
+
+### Attribution (rocprofv3, decode at ctx 131072, 8 steps)
+
+Per step, before any change: `attention_flash_q8_0_tile` + its reduce = 11.8 ms
+of a 36.9 ms step. The tile kernel ran one 32-thread workgroup per **q head**
+(grid `[n_heads, max_tiles, 1]`), so each K/V tile was read six times — once
+per q head sharing a kv head — and the reducer found the global max with a
+single thread walking `n_tiles` records strided 1,032 B (25.4 MiB per layer at
+tile 128; 24 workgroups = 24 CUs).
+
+Every other decode kernel is context-independent: the weight stream
+(14.82 GB/step: `gemm_iu4g256_w4a4_*`, `gemm_iu8g32_residual_wmma_mb4m2`,
+`gemv_*`), GDN (`gated_delta_net_q8_fast`), the FA prep/norm/rope chain and the
+q8 KV row write.
+
+### Change
+
+- The **ungated** gfx1100 decode route (`output_gate = None`) is the one a qt59
+  `IU8G32` `wo` takes: the fused gate epilogue is admitted only for MQ4 `wo`, so
+  the model's `attn_output_gate` is applied outside attention. That route now
+  runs the existing GQA-shared `attention_flash_q8_0_tile_gqa_gfx1100` (one
+  256-thread workgroup per (kv head, tile) serves all six q heads; byte-identical
+  partials) with the plain shared reducer; the gated non-AWQ route uses the same
+  tile with the gated MQ-rotate reducer. `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0`
+  restores the per-head tile.
+- Both Q8 reducers (`attention_flash_q8_0_reduce`,
+  `attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100`) now scan the global max
+  across the block's tile stripes and reduce through LDS. `fmaxf` is exact and
+  order-independent, so the published maximum is bit-identical to the
+  single-thread increasing-tile scan.
+
+Output identity: the same 12,795-token prompt, greedy, emits the same 14 tokens
+with the GQA route on and off (`ab-gqa` container on :9002 vs the product
+container).
+
+### bench_decode (tok/s, medians of 2 rounds × 12 steps)
+
+| ctx | before | after | delta |
+|---|---|---|---|
+| 128 | 43.6 | 44.7 | +2.5% |
+| 8,192 | 42.2 | 43.2 | +2.4% |
+| 16,384 | 40.4 | 42.1 | +4.2% |
+| 32,768 | 36.8 | 40.5 | +10.1% |
+| 65,536 | 31.6 | 37.8 | +19.6% |
+| 131,072 | 24.7 | 32.4 | +31.2% |
+
+The KV read is now one pass per kv head per step: 4.56 GiB/step at 131k. The
+GQA tile streams it at ~660 GB/s (6.9 ms/step); the reducer is ~0.5 ms. A step
+at 131k is 30.5 ms against 22.3 ms at ctx 128, i.e. within ~5% of reading
+weights + KV once at the observed weight-stream bandwidth (~664 GB/s). Further
+decode gains need faster KV streaming or a smaller KV format, not a route
+change.
+
+### Container serve (200k ctx, q8, greedy)
+
+TTFT, prefill and decode (medians of 2, unique prefix, no prompt cache,
+128 generated tokens so the decode rate covers 127 intervals):
+
+| prompt tokens | TTFT | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| 951 | 0.75 s | 1,255 | 45.9 |
+| 6,534 | 3.92 s | 1,667 | 45.0 |
+| 17,240 | 10.84 s | 1,591 | 43.8 |
+| 26,150 | 18.19 s | 1,438 | 42.8 |
+| 52,248 | 41.88 s | 1,248 | 40.2 |
+| 104,446 | 104.86 s | 996 | 35.4 |
+
+C17 (previous container build) measured 44.9 tok/s at 1,129 prompt tokens, 43.6
+at 8,140 and 40.2 at 21,580. Decode at 104k is 35.4 tok/s against a
+weights+KV-once floor of ~36.0 tok/s at the 664 GB/s weight stream: the KV read
+itself is what remains.
+
+### Prefill attribution and remaining ceiling
+
+pp falls from ~1.67k tok/s at 6.5k to ~1.0k at 104k. rocprofv3 on pp32768
+(fresh, 4,096-row chunks) attributes 15.6% to `attention_q8_0_fa2_gqa_gfx1100`
+(3.19 s of 20.56 s), 67% to the IU4/IU8 projection GEMMs, 7.5% to GDN. The
+attention term is the only quadratic one, so it is ~32% of a 104k prefill.
+
+The FA2 body is at 54% of F16 WMMA peak (66 TFLOPS) and register-bound:
+255 VGPR / wave32 with 0 spills (`radiowave` inspection), i.e. 2 waves/SIMD =
+**one** workgroup per CU regardless of the 32 KiB LDS, so the 2-barrier
+fill/compute cadence cannot be hidden by a second resident workgroup. Its memory
+demand at peak compute (675 GB/s) is under HBM, so this is not a KV-traffic
+limit — a bigger q tile (Q32) would not help. `HIPFIRE_FA2_FILL=0` (all-wave
+fill) measured 1,139/1,229 tok/s against 1,312/1,350 with the fill path at a
+41.7k prompt, so the warp-specialized fill stays. Moving pp further needs an
+FA2 body under 128 VGPR (2 workgroups/CU) or a KT64 rebuild now that occupancy
+is register- rather than LDS-bound; both are kernel redesigns, not knobs.
