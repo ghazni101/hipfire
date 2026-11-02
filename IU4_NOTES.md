@@ -401,3 +401,37 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
   => NOT the VMM chunk-boundary class: prompts are <1024 tok except ctx4k, and pinning chunk 4096 changes nothing. It is the cb>1 server
   taking a different (multi-slot) kernel path even for a lone request. MQ4P has the same effect on 2/6 keys; IU4P on 6/6. Which kernels
   differ (slot GEMM vs solo GEMV, f16 X small-M) is untested.
+
+## C11a — IU4 W4A8 on the iu8 WMMA (checkpoint 2026-11-02 15:35 Dubai)
+
+- New: `HIPFIRE_IU4_PREFILL_ACT=a8` = `block_i8_128` X (ensure_int8_mmq_x) + `v_wmma_i32_16x16x16_iu8`
+  W4A8 (gemm_iu4g256_w4a8_*). Old q8_1 path renamed `a8q`. `HIPFIRE_IU4_I8_TILE=128|256` (auto: 256 when
+  ceil(m/256)*ceil(n/256) >= CUs).
+- Kernel = MQ4P's gfx11 i8 source + `I8_ASYM` (asym fold, IU4_FOLD_RN DAG: t1=RN(sc*d) p=RN(t1*C) t2=RN(zp*d)
+  sum+=fma(t2,s,p); zp plane in LDS, +1024 B / +2048 B) + `HIPFIRE_IU4_PLANAR` (codes at 0, stride 128, header
+  plane at gpr*128). Needed because MQ4P's A8 kernel is symmetric-only and both iu4p and mq4p files are asym.
+- MQ4V2 symmetric code objects unchanged (measured): clang-offload-bundler --unbundle, llvm-objdump -d sha:
+  t128 b8a765c9a764 = b8a765c9a764, t256 bf6cdeafe461 = bf6cdeafe461; v_wmma_i32_16x16x16_iu8 count 96 / 192.
+  (First attempt differed: `hdr_sp + I8_W_HDR()` with outer parens re-associated the pointer adds; fixed.)
+- Resources (hipcc -O3 gfx1151, before the paren fix): iu t128 118 VGPR, t256 187/188, 0 spill / 0 scratch.
+- Build: daemon release BRC=0, snapshot ~/work/iu4/c11a/. Test crates/hipfire-runtime/tests/iu4_w4a8_i8_gemm_gpu.rs
+  built (TRC=0); queued in chZ.sh after chR (GPU busy). UNTESTED until then: twin bit-exact, CPU fold emulation,
+  f64 rel, determinism, both tiles, model-level KL/speed.
+- Next (C11b, not started): route fused_rmsnorm/silu_hin/gated_norm_rotate_mq_i8 producers for IU4G256 (no
+  symmetric gate; i8 blocks are weight-independent) into gemm_iu4g256_w4a8_prequant; a4 producers for IU4G256.
+- C11a numerics (measured 11:40-11:41 UTC = 15:40-15:41 Dubai), test iu4_w4a8_i8_gemm_gpu, 4B real tensors:
+  tile 128 and tile 256 each: 260/260 calls twin_bitdiff=0 (IU4 planar == MQ4V2 asym interleaved twin),
+  244/244 emulated calls emu_bitdiff=0 (CPU fold emulation over the downloaded block_i8_128 X: bit-exact
+  contract; the 16 unemulated are m4096xk2560xn2048 and real n=512), 260/260 det_diff=0, worst rel vs f64
+  9.508e-3 (int8 X), m in {1,7,127,128,129,384,4096}, k in {256,768,1280,2560}, n in {1,63,64,65,130,257,512,2048}.
+- chR (27B, 3 interleaved rounds, medians, pp512 / pp2048 / tg64@128 / tg64@4096):
+  a4 (C10)   1460.1 / 1456.3 / 46.70 / 45.12
+  a8q (q8_1) 1053.2 / 1051.6 / 46.78 / 45.18
+  MQ4P       1578.1 / 1574.7 / 46.78 / 45.22
+  h1 (pre-C10 build) 1026.8 / 1026.8 / 46.75 / 45.17;  dot4 decode 1028.8 / 1026.7 / 46.16 / 44.61 (-1.3% tg)
+  pre (branch base) pp128 28.90, tg64@128 29.22
+  Verdict: no decode regression (C10 46.70 vs h1 46.75, within run spread 46.65-46.76); a4 prefill +42% vs h1,
+  -7.5% vs MQ4P; a8q -33% vs MQ4P. GATE w4cb27 (cb4 serve) unstable 0 conc_mismatch 0 errors 0.
+- chZ: FAILED to measure. `bench --backend slots` on the IU4P model: "forward_batch_slots: embedding format
+  IU8G32 has no batched lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128)". Gap: slots-path
+  IU8G32 embedding lookup. (Serve --continuous-batch-size works: w4cb27 gate passed.)

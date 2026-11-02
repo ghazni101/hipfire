@@ -40,14 +40,28 @@ fn iu4_prefill_gemv() -> bool {
 /// `a4` (default): `block_i4_128` int4 X (FWHT-rotated, the MQ4P W4A4 recipe)
 /// into the planar-addressed lf16 iu4 WMMA kernel. `a8`: `block_q8_1_mmq` X
 /// into the W4A8 MMQ kernel (C2).
-fn iu4_prefill_a4() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Iu4PrefillAct {
+    A4,
+    /// `block_i8_128` X into the iu8 WMMA W4A8 MMQ (C11).
+    A8,
+    /// `block_q8_1_mmq` X into the C2 W4A8 MMQ (`a8q`, the pre-C11 a8).
+    A8Q,
+}
+
+fn iu4_prefill_act() -> Iu4PrefillAct {
+    static V: std::sync::OnceLock<Iu4PrefillAct> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        !matches!(
-            hipfire_config::developer_var("HIPFIRE_IU4_PREFILL_ACT").ok().as_deref(),
-            Some("a8")
-        )
+        match hipfire_config::developer_var("HIPFIRE_IU4_PREFILL_ACT").ok().as_deref() {
+            Some("a8") => Iu4PrefillAct::A8,
+            Some("a8q") => Iu4PrefillAct::A8Q,
+            _ => Iu4PrefillAct::A4,
+        }
     })
+}
+
+fn iu4_prefill_a4() -> bool {
+    iu4_prefill_act() == Iu4PrefillAct::A4
 }
 
 /// `HIPFIRE_IU4_SMALLM=mmq`: keep M < 128 projections on the MMQ path
@@ -135,6 +149,13 @@ impl Gpu {
                 let xq = self.ensure_int4_mmq_x(x, n, k)?;
                 for &(a, y, m) in &big {
                     self.gemm_iu4g256_w4a4_prequant(a, xq, y, m, k, n, add)?;
+                }
+                return Ok(());
+            }
+            if iu4_prefill_act() == Iu4PrefillAct::A8 {
+                let xq = self.ensure_int8_mmq_x(x, n, k)?;
+                for &(a, y, m) in &big {
+                    self.gemm_iu4g256_w4a8_prequant(a, xq, y, m, k, n, add)?;
                 }
                 return Ok(());
             }
@@ -421,6 +442,130 @@ impl Gpu {
             b.push_i32(add_val);
             b
         });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
+/// `HIPFIRE_IU4_I8_TILE=128|256` pins the W4A8 i8 tile (default: 256 when
+/// the 256-tile grid fills the CUs, as the MQ4V2 A8 route).
+fn iu4_i8_tile() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_IU4_I8_TILE").ok().as_deref() {
+            Some("128") => Some(128),
+            Some("256") => Some(256),
+            _ => None,
+        }
+    })
+}
+
+impl Gpu {
+    /// IU4G256 W4A8 (`block_i8_128` X, iu8 WMMA): `Y = W X` / `Y += W X`.
+    pub fn gemm_iu4g256_w4a8_prequant(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.i8_asym_prequant(true, a, xq, y, m, k, n, add)
+    }
+
+    /// Interleaved-MQ4V2 twin of [`Self::gemm_iu4g256_w4a8_prequant`] (tests).
+    pub fn gemm_mq4g256v2_asym_i8_prequant(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.i8_asym_prequant(false, a, xq, y, m, k, n, add)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn i8_asym_prequant(
+        &mut self,
+        planar: bool,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+            return Err(hip_bridge::HipError::new(1, "IU4 W4A8 i8 MMQ requires gfx1100/gfx1151"));
+        }
+        if m == 0 || n == 0 || k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(1, "IU4 W4A8 i8 MMQ requires M, N > 0 and K % 256 == 0"));
+        }
+        self.bind_thread()?;
+        let tile = iu4_i8_tile().unwrap_or_else(|| {
+            if m.div_ceil(256) * n.div_ceil(256) >= self.cu_count_or_default() { 256 } else { 128 }
+        });
+        let (module, source, threads, lds): (&str, &str, u32, u32) = match (planar, tile) {
+            (true, 256) => ("gemm_iu4g256_w4a8_t256", kernels::GEMM_IU4G256_W4A8_GFX11_T256_SRC, 1024, 57344),
+            (true, _) => ("gemm_iu4g256_w4a8", kernels::GEMM_IU4G256_W4A8_GFX11_SRC, 512, 28672),
+            (false, 256) => ("gemm_mq4g256v2_asym_mmq_i8_t256", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_T256_SRC, 1024, 57344),
+            (false, _) => ("gemm_mq4g256v2_asym_mmq_i8", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_SRC, 512, 28672),
+        };
+        let kernel: &'static str = match (planar, add, tile) {
+            (true, true, 256) => "gemm_iu4g256_w4a8_full_add_t256",
+            (true, false, 256) => "gemm_iu4g256_w4a8_full_set_t256",
+            (true, true, _) => "gemm_iu4g256_w4a8_full_add",
+            (true, false, _) => "gemm_iu4g256_w4a8_full_set",
+            (false, true, 256) => "gemm_mq4g256v2_asym_mmq_i8_full_add_t256",
+            (false, false, 256) => "gemm_mq4g256v2_asym_mmq_i8_full_set_t256",
+            (false, true, _) => "gemm_mq4g256v2_asym_mmq_i8_full_add",
+            (false, false, _) => "gemm_mq4g256v2_asym_mmq_i8_full_set",
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let mut ap = a.buf.as_ptr();
+        let mut xp = xq;
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut nv = n as i32;
+        let mut av = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+        ];
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [m.div_ceil(tile) as u32, n.div_ceil(tile) as u32, 1],
+            [threads, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b.push_i32(av);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

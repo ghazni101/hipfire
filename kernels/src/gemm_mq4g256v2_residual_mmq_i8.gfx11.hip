@@ -93,10 +93,31 @@
 #define I8_DS_OFF (2 * I8_SLOT_BYTES)
 #define I8_DS_BYTES (I8_TILE * 8)
 #define I8_SZ_OFF (I8_DS_OFF + 2 * I8_DS_BYTES)
+// I8_ASYM (IU4G256 / asymmetric MQ4V2): the SZ plane carries sc[I8_TILE]
+// then zp[I8_TILE]; the DS seed slot carries the exact int s of the token.
+#ifdef I8_ASYM
+#define I8_SZ_BYTES (I8_TILE * 8)
+#define I8_LDS_EXPECT (I8_TILE == 256 ? 57344 : 28672)
+#else
 #define I8_SZ_BYTES (I8_TILE * 4)
+#define I8_LDS_EXPECT (I8_TILE == 256 ? 55296 : 27648)
+#endif
 #define I8_LDS_BYTES (I8_SZ_OFF + 2 * I8_SZ_BYTES)
-_Static_assert(I8_LDS_BYTES == (I8_TILE == 256 ? 55296 : 27648),
+_Static_assert(I8_LDS_BYTES == I8_LDS_EXPECT,
                "i8 gfx11 planes must match the host LDS contract");
+// Weight addressing. MQ4V2 row: groups of [8 B header][128 B codes].
+// HIPFIRE_IU4_PLANAR (qt57): row = [groups x 128 B codes][groups x 8 B headers].
+#ifdef HIPFIRE_IU4_PLANAR
+#define I8_W_CODE0 0u
+#define I8_W_GROUP_CODE_STRIDE 128
+// No outer parens: pointer + I8_W_HDR keeps the left-assoc pointer adds
+// of the original source (identical MQ4V2 code objects).
+#define I8_W_HDR(gpr, kb) (gpr) * 128 + ((kb) >> 1) * 8 + ((kb) & 1) * 4
+#else
+#define I8_W_CODE0 8u
+#define I8_W_GROUP_CODE_STRIDE 136
+#define I8_W_HDR(gpr, kb) ((kb) >> 1) * 136 + ((kb) & 1) * 4
+#endif
 _Static_assert(I8_LDS_BYTES <= 65536, "RDNA3 workgroup LDS limit");
 #define I8_MAGIC 0x4B400000
 
@@ -183,7 +204,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     // descriptor turns every load into a waterfall loop).
     const int st_wsrc = src_row((int)st_T);
     const unsigned st_woff =
-        (unsigned)(st_wsrc < M ? st_wsrc : (M - 1)) * (unsigned)groups_per_row * 136u + 8u + st_c * 8u;
+        (unsigned)(st_wsrc < M ? st_wsrc : (M - 1)) * (unsigned)groups_per_row * 136u + I8_W_CODE0 + st_c * 8u;
     // Packed W plane: row R's 8 bytes of K16 step c at R*32 + 8*(c ^ ((R >> 2) & 3)).
     const unsigned st_wlds = I8_A_SLAB_BYTES + st_T * 32u + ((st_c ^ ((st_T >> 2) & 3u)) << 3);
     const char* st_wbase = src_base(__builtin_amdgcn_readfirstlane((int)st_T));
@@ -226,7 +247,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
             (void*)(Xq + (long long)kb * N), 0, a_bytes, 0x31004000u);
         a_pf = __builtin_amdgcn_raw_buffer_load_b128(a_rsrc, st_aoff, (unsigned)(s * 64), 0);
         w_pf = __builtin_amdgcn_raw_buffer_load_b64(
-            w_rsrc, st_woff, (unsigned)((kb >> 1) * 136 + (kb & 1) * 64 + s * 32), 0);
+            w_rsrc, st_woff, (unsigned)((kb >> 1) * I8_W_GROUP_CODE_STRIDE + (kb & 1) * 64 + s * 32), 0);
     };
     auto publish_slab = [&](int slot) {
         char* base = LDS + slot * I8_SLOT_BYTES;
@@ -242,14 +263,19 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
             (void*)(Xq + (long long)kb * N), 0, a_bytes, 0x31004000u);
         hd_pf = __builtin_amdgcn_raw_buffer_load_b64(
             d_rsrc, (unsigned)(bs + hdr_i) * (unsigned)sizeof(block_i8_128), 0u, 0);
-        hs_pf = *(const unsigned*)(hdr_sp + (kb >> 1) * 136 + (kb & 1) * 4);
+        hs_pf = *(const unsigned*)(hdr_sp + I8_W_HDR(groups_per_row, kb));
     };
     auto publish_hdr = [&](int par) {
         // Tokens >= N read d = 0, s = 0 (descriptor bound).
         int* seed = (int*)(LDS + I8_DS_OFF + par * I8_DS_BYTES);
         float* dd = (float*)(LDS + I8_DS_OFF + par * I8_DS_BYTES + I8_TILE * 4);
         float* sz = (float*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES);
+#ifdef I8_ASYM
+        seed[hdr_ds] = (int)hd_pf.y;
+        sz[I8_TILE + hdr_i] = __half2float(__ushort_as_half((unsigned short)(hs_pf >> 16)));
+#else
         seed[hdr_ds] = I8_MAGIC - 8 * (int)hd_pf.y;
+#endif
         dd[hdr_ds] = __uint_as_float(hd_pf.x);
         sz[hdr_i] = __half2float(__ushort_as_half((unsigned short)(hs_pf & 0xFFFFu)));
     };
@@ -307,7 +333,18 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
         // The last block refetches itself into dead planes (no reader after
         // the final barrier): the body stays one basic block.
         const int kn = (kb + 1 == kblocks) ? kb : kb + 1;
-        // Chain seeds: I8_MAGIC - 8 * s per C row (token).
+        // Chain seeds: I8_MAGIC - 8 * s per C row (token); I8_ASYM: I8_MAGIC.
+#ifdef I8_ASYM
+        {
+            const int32x8_t sv = {I8_MAGIC, I8_MAGIC, I8_MAGIC, I8_MAGIC,
+                                  I8_MAGIC, I8_MAGIC, I8_MAGIC, I8_MAGIC};
+            #pragma unroll
+            for (int nb = 0; nb < I8_NB; nb++) {
+                cacc[nb][0] = sv;
+                cacc[nb][1] = sv;
+            }
+        }
+#else
         {
             const int* seed = (const int*)(LDS + I8_DS_OFF + par * I8_DS_BYTES)
                 + wave_tok0 + hi * 8;
@@ -320,6 +357,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
                 cacc[nb][1] = sv;
             }
         }
+#endif
         // Slab 0 (slot 0); prefetch slab 1 -> slot 1 and the next headers.
         fetch_slab(kb, 1);
         fetch_hdr(kn);
@@ -339,11 +377,20 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
             const float* sz = (const float*)(LDS + I8_SZ_OFF + par * I8_SZ_BYTES)
                 + wave_row0 + l16;
             const float sc[2] = {sz[0], sz[16]};
+#ifdef I8_ASYM
+            const float zp[2] = {sz[I8_TILE], sz[I8_TILE + 16]};
+            const int* sx = (const int*)(LDS + I8_DS_OFF + par * I8_DS_BYTES) + wave_tok0 + hi * 8;
+#endif
             #pragma unroll
             for (int nb = 0; nb < I8_NB; nb++) {
                 float d8[8];
                 *(float4*)(d8) = *(const float4*)(dd + nb * 16);
                 *(float4*)(d8 + 4) = *(const float4*)(dd + nb * 16 + 4);
+#ifdef I8_ASYM
+                int s8[8];
+                *(int4*)(s8) = *(const int4*)(sx + nb * 16);
+                *(int4*)(s8 + 4) = *(const int4*)(sx + nb * 16 + 4);
+#endif
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
                     #pragma unroll
@@ -353,7 +400,14 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
                         // of an ext-vector element lvalue to element 0.
                         const int c = cacc[nb][rg][l];
                         const float fc = __int_as_float(c) - 12582912.0f;
+#ifdef I8_ASYM
+                        // IU4_FOLD_RN DAG: sum + RN(RN(zp*d) * s + RN(RN(sc*d) * C)).
+                        const float p = __fmul_rn(t1, fc);
+                        const float t2 = __fmul_rn(zp[rg], d8[l]);
+                        acc[nb][rg][l] = __fadd_rn(acc[nb][rg][l], __fmaf_rn(t2, (float)s8[l], p));
+#else
                         acc[nb][rg][l] = __builtin_fmaf(t1, fc, acc[nb][rg][l]);
+#endif
                     }
                 }
             }

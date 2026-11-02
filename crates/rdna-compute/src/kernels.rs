@@ -5668,6 +5668,47 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
+// IU4G256 (qt57) W4A8 build of the gfx11 A8 MMQ (`v_wmma_i32_16x16x16_iu8`):
+// `I8_ASYM` folds the asymmetric MQ4V2 header (sc, zp) with the IU4_FOLD_RN
+// DAG (C = sum q*x8 on unsigned codes, s = exact int sum of x8), and
+// `HIPFIRE_IU4_PLANAR` swaps only the weight address math for the planar row.
+// X is the `block_i8_128` produced by `ensure_int8_mmq_x` / the fused
+// `*_rotate_mq_i8` producers. Only the renamed entries are looked up.
+pub const GEMM_IU4G256_W4A8_GFX11_SRC: &str = concat!(
+    "#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add gemm_iu4g256_w4a8_full_add\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set gemm_iu4g256_w4a8_full_set\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8 gemm_iu4g256_w4a8_gate_up_silu\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
+/// 256-tile build of [`GEMM_IU4G256_W4A8_GFX11_SRC`] (entries suffixed `_t256`).
+pub const GEMM_IU4G256_W4A8_GFX11_T256_SRC: &str = concat!(
+    "#define I8_TILE 256\n#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add_t256 gemm_iu4g256_w4a8_full_add_t256\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set_t256 gemm_iu4g256_w4a8_full_set_t256\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8_t256 gemm_iu4g256_w4a8_gate_up_silu_t256\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
+/// Test twin: the same asymmetric fold on the interleaved MQ4V2 row (the
+/// bit-exact reference for the planar addressing of the IU4 build).
+pub const GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_SRC: &str = concat!(
+    "#define I8_ASYM 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add gemm_mq4g256v2_asym_mmq_i8_full_add\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set gemm_mq4g256v2_asym_mmq_i8_full_set\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8 gemm_mq4g256v2_asym_gate_up_silu_mmq_i8\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
+pub const GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_T256_SRC: &str = concat!(
+    "#define I8_TILE 256\n#define I8_ASYM 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add_t256 gemm_mq4g256v2_asym_mmq_i8_full_add_t256\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set_t256 gemm_mq4g256v2_asym_mmq_i8_full_set_t256\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8_t256 gemm_mq4g256v2_asym_gate_up_silu_mmq_i8_t256\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
+);
 /// The 256x256-tile build of [`GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC`]
 /// (entries suffixed `_t256`, 1024 threads): half the L2/fabric bytes per MAC.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_T256_SRC: &str = concat!(
