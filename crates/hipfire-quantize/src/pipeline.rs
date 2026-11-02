@@ -6504,6 +6504,15 @@ fn handle_moe_expert_3d(
                         QuantType::MQ5G256,
                         256u32,
                     )
+                } else if supports_g256 && use_mq4v2 {
+                    // `--format mq4v2` must mean qt44 for routed experts with
+                    // AWQ too. The plain V2 arm below is unreachable while
+                    // `awq_scales` is set, so without this arm an AWQ MoE body
+                    // silently falls to the qt13 encoder.
+                    let q =
+                        quantize_mq4g256v2_selected(&scaled, inner_m, inner_k_e, &signs1, &signs2);
+                    let (q, qt, _) = stamp_mq4v2_body(q, inner_k_e, "MQ4G256V2");
+                    (q, qt, 256u32)
                 } else {
                     (
                         quantize_mq4g256(&scaled, &signs1, &signs2),

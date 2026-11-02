@@ -441,6 +441,8 @@ examples are in `crates/hipfire-arch-toy/src/arch.rs` and
 | [`hipfire-kernel-tuning`](.agents/skills/hipfire-kernel-tuning/) | Optimize an existing kernel — pick a lever (multi-row, K-tile depth, prefetch, wave64 port, WMMA/MFMA, fused projections, ISA flags) and validate the win across the supported arch matrix. |
 | [`hipfire-kernel-atlas`](.agents/skills/hipfire-kernel-atlas/) | Collect phase-aware Atlas measurements and render ISA Fit views (measurement evidence only). |
 | [`astrea`](.agents/skills/astrea/) | Quant calibration, KLD/PPL evaluation and format-selection experiments. |
+| [`hipfire-quantize`](.agents/skills/hipfire-quantize/) | Write HFQM artifacts with `hipfire quantize` / `hipfire-quantize` (format routing, tiers, PLE/vision/Qwen4). Quality stays with astrea. |
+| [`hipfire-container-serve`](.agents/skills/hipfire-container-serve/) | Serve a model through Docker/Podman compose, Containerfile images, container-gate, Halo overlay, or the VMM slot recipe. |
 | [`redline-retained-replay`](.agents/skills/redline-retained-replay/) | Discovery hook for retained AQL/PM4 (Redline) work; routes to [docs/REDLINE.md](docs/REDLINE.md) and [docs/VALIDATION.md](docs/VALIDATION.md). |
 | [`rebase-onto-modular`](.agents/skills/rebase-onto-modular/) | Porting a branch authored against pre-0.1.20 master onto the modular layout. |
 

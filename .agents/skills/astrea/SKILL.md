@@ -172,6 +172,8 @@ script or `--help` rather than trusting a skill-local table.
 
 ## Related skills
 
+- [hipfire-quantize](../hipfire-quantize/SKILL.md) — write HFQM files with `hipfire quantize` / `hipfire-quantize` (this skill does not write weights)
+- [hipfire-container-serve](../hipfire-container-serve/SKILL.md) — compose / container-gate serve of a written artifact
 - [hipfire-kernel-atlas](../hipfire-kernel-atlas/SKILL.md) — AR/DFlash rows, ISA fit, task/eval loop
 - [hipfire-kernel-tuning](../hipfire-kernel-tuning/SKILL.md) — kernel levers after a candidate is quality-clean
 - [hipfire-tester](../hipfire-tester/SKILL.md) — hardware bring-up / smoke matrix
