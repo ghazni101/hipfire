@@ -1754,6 +1754,8 @@ pub struct Gpu {
     pub iu4_pending_x: Option<crate::gemm_iu4::Iu4PendingX>,
     /// C14: projection role of the IU4 GEMMs being issued (`Gpu::IU4_ROLE_*`, `u8::MAX` = none).
     pub iu4_role: u8,
+    /// C15: the next gfx11 int8 producer emits the `I8_XPLANAR` layout.
+    pub i8_xplanar_emit: bool,
     /// C14: (layer index, n_layers) of the layer being issued.
     pub iu4_layer: (usize, usize),
     /// Set only around a batched DFlash draft forward (and its head GEMM):
@@ -3037,6 +3039,7 @@ impl Gpu {
             iu4_verify_scope: false,
             iu4_pending_x: None,
             iu4_role: u8::MAX,
+            i8_xplanar_emit: false,
             iu4_layer: (0, 0),
             draft_rows64_scope: false,
             iu4_verify_load: false,
@@ -5520,6 +5523,18 @@ impl Gpu {
         n: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
+        self.ensure_int8_mmq_x_layout(x, n, k, false)
+    }
+
+    /// [`Self::ensure_int8_mmq_x`] with an explicit layout (`xplanar`: C15
+    /// `I8_XPLANAR`, IU4 W4A8 only).
+    pub fn ensure_int8_mmq_x_layout(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+        xplanar: bool,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -5542,6 +5557,7 @@ impl Gpu {
             x,
             n,
             k,
+            xplanar,
         )
     }
 

@@ -41,9 +41,11 @@ static_assert(sizeof(block_i8_128) == 136, "bad block_i8_128 size");
 // Wave32-synchronous quant of one 128-element group. Lane l owns elements
 // 4l..4l+3 in xv[4]; lanes 2g and 2g+1 therefore own the 8-element group g.
 // Every lane writes one dword of qs; lane 0 publishes d and s.
-__device__ __forceinline__ void quantize_block_i8_128_wave(
+__device__ __forceinline__ void quantize_block_i8_128_wave_to(
     const float xv[4],
-    block_i8_128* __restrict__ out,
+    signed char* __restrict__ qs,
+    float* __restrict__ dp,
+    int* __restrict__ sp,
     int lane
 ) {
     float amax = fmaxf(fmaxf(fabsf(xv[0]), fabsf(xv[1])), fmaxf(fabsf(xv[2]), fabsf(xv[3])));
@@ -73,12 +75,27 @@ __device__ __forceinline__ void quantize_block_i8_128_wave(
     const bool odd = (lane & 1) != 0;
     const unsigned recv = (unsigned)__shfl_xor((int)(odd ? ev : od), 1, 32);
     const unsigned word = odd ? (recv | (od << 16)) : (ev | (recv << 16));
-    reinterpret_cast<unsigned*>(out->qs)[lane] = word;
+    reinterpret_cast<unsigned*>(qs)[lane] = word;
     if (lane == 0) {
-        out->d = d;
-        out->s = s;
+        *dp = d;
+        *sp = s;
     }
 }
+
+__device__ __forceinline__ void quantize_block_i8_128_wave(
+    const float xv[4],
+    block_i8_128* __restrict__ out,
+    int lane
+) {
+    quantize_block_i8_128_wave_to(xv, out->qs, &out->d, &out->s, lane);
+}
+
+// I8_XPLANAR (C15, IU4 W4A8 only): same bytes, re-laid per K128 block kb as
+// one N*136 B chunk at kb*N*136 = [N x 128 B qs plane][N x 8 B (d, s) plane],
+// so every token's qs starts 128 B aligned (given N % 16 == 0 and an aligned
+// base) instead of at 136*T + 8.
+#define I8X_QS(Y, kb, tok, N) ((signed char*)(Y) + (long long)(kb) * (N) * 136 + (long long)(tok) * 128)
+#define I8X_HDR(Y, kb, tok, N) ((char*)(Y) + (long long)(kb) * (N) * 136 + (long long)(N) * 128 + (long long)(tok) * 8)
 
 // Standalone quantizer: same (X, Y, K, N) contract as
 // quantize_int4_mmq_ds128 (block (256,1,1), each thread 4 floats). Folded
@@ -105,8 +122,13 @@ extern "C" __global__ void quantize_int8_mmq_ds128(
     const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
 
     const int kblock = i0 / 128;
+#ifdef I8_XPLANAR
+    char* hdr = I8X_HDR(Y, kblock, token, N);
+    quantize_block_i8_128_wave_to(xv, I8X_QS(Y, kblock, token, N), (float*)hdr, (int*)(hdr + 4), lane);
+#else
     block_i8_128* out = Y + (long long)kblock * N + token;
     quantize_block_i8_128_wave(xv, out, lane);
+#endif
 }
 #endif // HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE
 

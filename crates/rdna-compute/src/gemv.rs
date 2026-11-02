@@ -730,6 +730,37 @@ const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC: &str = concat!(
 // with the gfx11 IU4 producers' defines (the RMSNorm `_b8_gfx1151` drain/max8
 // Phase-1a, bit-identical to the plain batched one) under `_i8_gfx11`
 // symbols. Launch geometry equals the `_i8_gfx12` twins.
+// C15 `I8_XPLANAR` twins (IU4 W4A8 consumer only).
+const FUSED_RMSNORM_MQ_ROTATE_I8X_GFX11_SRC: &str = concat!(
+    "#define I8_XPLANAR 1\n",
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i8x_gfx11\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+const FUSED_RMSNORM_MQ_ROTATE_AWQ_I8X_GFX11_SRC: &str = concat!(
+    "#define I8_XPLANAR 1\n",
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n#define HIPFIRE_RMSNORM_P1A_DRAIN 1\n#define HIPFIRE_RMSNORM_P1A_MAX8 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i8x_gfx11\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+const FUSED_SILU_MUL_MQ_ROTATE_I8X_GFX11_SRC: &str = concat!(
+    "#define I8_XPLANAR 1\n",
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i8x_gfx11\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
 const FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
@@ -5455,8 +5486,12 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let kernel = "fused_silu_mul_mq_rotate_i8_gfx11";
-        self.ensure_kernel(kernel, FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC, kernel)?;
+        let (kernel, src) = if self.i8_xplanar_emit {
+            ("fused_silu_mul_mq_rotate_i8x_gfx11", FUSED_SILU_MUL_MQ_ROTATE_I8X_GFX11_SRC)
+        } else {
+            ("fused_silu_mul_mq_rotate_i8_gfx11", FUSED_SILU_MUL_MQ_ROTATE_I8_GFX11_SRC)
+        };
+        self.ensure_kernel(kernel, src, kernel)?;
         let mut gp = gate.buf.as_ptr();
         let mut up_p = up.buf.as_ptr();
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -7291,6 +7326,8 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let (source, kernel) = if self.arch == "gfx1201" {
             (kernels::MQ_ROTATE_X_I8_GFX12_SRC, "mq_rotate_x_i8_gfx12")
+        } else if self.i8_xplanar_emit {
+            (kernels::MQ_ROTATE_X_I8X_GFX11_SRC, "mq_rotate_x_i8x_gfx11")
         } else {
             (kernels::MQ_ROTATE_X_I8_GFX11_SRC, "mq_rotate_x_i8_gfx11")
         };
@@ -7884,6 +7921,14 @@ impl Gpu {
             (false, true) => (
                 FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i8_gfx12",
+            ),
+            (true, false) if self.i8_xplanar_emit => (
+                FUSED_RMSNORM_MQ_ROTATE_AWQ_I8X_GFX11_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i8x_gfx11",
+            ),
+            (false, false) if self.i8_xplanar_emit => (
+                FUSED_RMSNORM_MQ_ROTATE_I8X_GFX11_SRC,
+                "fused_rmsnorm_mq_rotate_i8x_gfx11",
             ),
             (true, false) => (
                 FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC,

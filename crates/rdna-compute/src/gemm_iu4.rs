@@ -114,6 +114,13 @@ fn iu4_smallm_wmma() -> bool {
 /// (FFN down), `all`. `HIPFIRE_IU4_A8_LAYERS`: comma list of `firstN`,
 /// `lastN`, `a-b`, `a`. Either unset = every role / every layer; both unset
 /// = off. Only applies when `HIPFIRE_IU4_PREFILL_ACT` is `a4`.
+fn iu4_i8_xplanar() -> bool {
+    // C15 `HIPFIRE_IU4_I8_XPLANAR=1`: the IU4 W4A8 X sidecar in the
+    // `I8_XPLANAR` layout (128 B-aligned qs plane + (d, s) plane per K128).
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| matches!(std::env::var("HIPFIRE_IU4_I8_XPLANAR").ok().as_deref(), Some("1")))
+}
+
 fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
     static V: std::sync::OnceLock<Option<(u8, Vec<(u8, usize, usize)>)>> = std::sync::OnceLock::new();
     V.get_or_init(|| {
@@ -242,7 +249,10 @@ impl Gpu {
         match self.iu4_fused_x_act(k, n) {
             Some(true) => {
                 let res = self.reserve_int8_mmq(k, n)?;
-                let p = self.fused_rmsnorm_rotate_mq_i8_batched(x, weight, awq, Some(x_rot), res, k, eps, n)?;
+                self.i8_xplanar_emit = iu4_i8_xplanar();
+                let p = self.fused_rmsnorm_rotate_mq_i8_batched(x, weight, awq, Some(x_rot), res, k, eps, n);
+                self.i8_xplanar_emit = false;
+                let p = p?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
                 Ok(true)
             }
@@ -269,7 +279,10 @@ impl Gpu {
         match self.iu4_fused_x_act(k, n) {
             Some(true) if awq.is_none() => {
                 let res = self.reserve_int8_mmq(k, n)?;
-                let p = self.fused_silu_mul_rotate_mq_i8_batched(gate, up, Some(x_rot), res, k, n)?;
+                self.i8_xplanar_emit = iu4_i8_xplanar();
+                let p = self.fused_silu_mul_rotate_mq_i8_batched(gate, up, Some(x_rot), res, k, n);
+                self.i8_xplanar_emit = false;
+                let p = p?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
                 Ok(true)
             }
@@ -295,7 +308,10 @@ impl Gpu {
         match self.iu4_fused_x_act(k, n) {
             Some(true) if awq.is_none() => {
                 let res = self.reserve_int8_mmq(k, n)?;
-                let p = self.rotate_x_mq_i8_batched(x, Some(x_rot), res, k, n)?;
+                self.i8_xplanar_emit = iu4_i8_xplanar();
+                let p = self.rotate_x_mq_i8_batched(x, Some(x_rot), res, k, n);
+                self.i8_xplanar_emit = false;
+                let p = p?;
                 self.iu4_set_pending(x_rot, n, k, Iu4PendingXKind::I8(p));
                 Ok(true)
             }
@@ -395,10 +411,10 @@ impl Gpu {
             if act == Iu4PrefillAct::A8 {
                 let xq = match self.iu4_take_pending(x, n, k, true) {
                     Some(p) => p,
-                    None => self.ensure_int8_mmq_x(x, n, k)?,
+                    None => self.ensure_int8_mmq_x_layout(x, n, k, iu4_i8_xplanar())?,
                 };
                 for &(a, y, m) in &big {
-                    self.gemm_iu4g256_w4a8_prequant(a, xq, y, m, k, n, add)?;
+                    self.gemm_iu4g256_w4a8_prequant_layout(a, xq, y, m, k, n, add, iu4_i8_xplanar())?;
                 }
                 return Ok(());
             }
@@ -718,7 +734,24 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        self.i8_asym_prequant(true, a, xq, y, m, k, n, add)
+        self.i8_asym_prequant(true, false, a, xq, y, m, k, n, add)
+    }
+
+    /// [`Self::gemm_iu4g256_w4a8_prequant`] with an explicit X layout
+    /// (`xplanar`: C15 `I8_XPLANAR`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_iu4g256_w4a8_prequant_layout(
+        &mut self,
+        a: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+        xplanar: bool,
+    ) -> HipResult<()> {
+        self.i8_asym_prequant(true, xplanar, a, xq, y, m, k, n, add)
     }
 
     /// Interleaved-MQ4V2 twin of [`Self::gemm_iu4g256_w4a8_prequant`] (tests).
@@ -732,13 +765,14 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        self.i8_asym_prequant(false, a, xq, y, m, k, n, add)
+        self.i8_asym_prequant(false, false, a, xq, y, m, k, n, add)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn i8_asym_prequant(
         &mut self,
         planar: bool,
+        xplanar: bool,
         a: &GpuTensor,
         xq: *mut c_void,
         y: &GpuTensor,
@@ -757,13 +791,20 @@ impl Gpu {
         let tile = iu4_i8_tile().unwrap_or_else(|| {
             if m.div_ceil(256) * n.div_ceil(256) >= self.cu_count_or_default() { 256 } else { 128 }
         });
+        let xp = planar && xplanar;
         let (module, source, threads, lds): (&str, &str, u32, u32) = match (planar, tile) {
+            (true, 256) if xp => ("gemm_iu4g256_w4a8x_t256", kernels::GEMM_IU4G256_W4A8X_GFX11_T256_SRC, 1024, 57344),
+            (true, _) if xp => ("gemm_iu4g256_w4a8x", kernels::GEMM_IU4G256_W4A8X_GFX11_SRC, 512, 28672),
             (true, 256) => ("gemm_iu4g256_w4a8_t256", kernels::GEMM_IU4G256_W4A8_GFX11_T256_SRC, 1024, 57344),
             (true, _) => ("gemm_iu4g256_w4a8", kernels::GEMM_IU4G256_W4A8_GFX11_SRC, 512, 28672),
             (false, 256) => ("gemm_mq4g256v2_asym_mmq_i8_t256", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_T256_SRC, 1024, 57344),
             (false, _) => ("gemm_mq4g256v2_asym_mmq_i8", kernels::GEMM_MQ4G256V2_ASYM_MMQ_I8_GFX11_SRC, 512, 28672),
         };
         let kernel: &'static str = match (planar, add, tile) {
+            (true, true, 256) if xp => "gemm_iu4g256_w4a8x_full_add_t256",
+            (true, false, 256) if xp => "gemm_iu4g256_w4a8x_full_set_t256",
+            (true, true, _) if xp => "gemm_iu4g256_w4a8x_full_add",
+            (true, false, _) if xp => "gemm_iu4g256_w4a8x_full_set",
             (true, true, 256) => "gemm_iu4g256_w4a8_full_add_t256",
             (true, false, 256) => "gemm_iu4g256_w4a8_full_set_t256",
             (true, true, _) => "gemm_iu4g256_w4a8_full_add",
