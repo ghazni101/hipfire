@@ -563,3 +563,31 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
 - Finding: the a4 KL is NOT concentrated in a few roles. Single switches are non-additive (some raise KL: 4B aqkv/first4, 27B ao), and recovering most of it needs gu+dqkv+dn, which costs ~all of a8's speed. Cheapest useful point: gu only (KL −39% on both, −8.6%/−14% pp2048). Knob kept as C14 (default off); no default change.
 - Caveats: one eval text per model; single-role deltas of ~±10% are within what non-additivity/noise could produce (untested with more text). r1 of the 4B chH speed sweep was invalid (sp.py key bug, fixed) and excluded.
 - Not started this chunk: (1) aligned int8 layout, (4) slots port, (5) qt59.
+
+## Chunk 5:06 PM — item (1) aligned int8 layout (C15, 8ddece8d7)
+
+Layout `I8_XPLANAR` (opt-in `HIPFIRE_IU4_I8_XPLANAR=1`, IU4 W4A8 only; MQ4 A8 route untouched):
+the same N*(K/128)*136 B, per K128 block kb one chunk at kb*N*136 = [N x 128 B qs plane][N x 8 B (d,s) plane].
+Every token's qs starts 128 B aligned (legacy layout: 136*T+8). The consumer's fetch_slab uses a qs-plane
+descriptor (bound N*128), and fetch_hdr uses a header-plane descriptor (bound N*8, offset 8*T). Twins were added for the
+standalone quantizer (quantize_int8_mmq_ds128_xp), the 3 gfx11 i8 producers (*_i8x_gfx11) and the
+w4a8 t128/t256 GEMMs (gemm_iu4g256_w4a8x_*).
+
+Bit-exactness (test `iu4_i8_xplanar_gpu`, run with TILE auto/128/256: bad=0 each):
+- standalone XP bytes == relayout(legacy bytes): 25 (K,N) cases, K∈{256..17408}, N∈{1,7,64,333,2048}
+- producers XP == relayout(legacy producer): 90 cases incl. AWQ rmsnorm, deterministic
+- GEMM legacy vs XP: bitdiff 0 on 7 shapes up to 17408x5120x2048, set+add, deterministic
+- model: a8 KL JSON (all fields except secs) identical xp0 vs xp1; 4B 3.897451151503087e-4 (== C14 all),
+  27B 1.1079767487187929e-4 (== C14 all)
+
+rocprof A/B (PREFILL_ACT=a8, pp2048, NB=2, 3 rounds interleaved, clocks NOT pinned):
+
+| model | w4a8 ms xp0 (r1,r2,r3) | xp1 | Δ | pp tok/s under rocprof xp0 → xp1 |
+|---|---|---|---|---|
+| 4B (t128) | 337.1 338.0 337.7 (337.6) | 336.3 336.7 337.2 (336.7) | -0.26% | 6306 → 6328 (+0.35%) |
+| 27B | 2401.7 2408.5 2409.8 (2406.7) | 2392.7 2396.3 2400.0 (2396.3) | -0.43% | 1223 → 1229 (+0.48%) |
+
+xp1 wins in all 6 pairs, but the gain is under 0.5%. So X misalignment is not what limits the W4A8 GEMM; the 8 B
+offset b128 loads cost almost nothing here. The default stays off: the default prefill is a4, so this only matters for the a8 path or role overrides.
+27B gate with a8 + XPLANAR=1 (hash,code,math,ctx4k x2): 15c387bfc1cf / c0425548b9e4 / a21ee78300f1 / a60387026fc6 == c13_27a8; unstable 0, conc_mismatch 0, errors 0.
+Not measured: an ISA diff of the xp kernel (llvm-objdump), a 4B gate on the xp path, and clock-pinned timing.
