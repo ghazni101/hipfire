@@ -405,6 +405,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_iu4g256_dot4q_rows"
         ]
     );
+    // Multi-slot decode GEMV: one weight pass for up to four activation
+    // vectors (`slots_iu4_multi`). Two modules because the epilogue macro is
+    // a compile-time fork, exactly like the MQ4V2 xbatch pair.
+    add!(
+        "gemv_iu4g256_xbatch",
+        kernels::GEMV_IU4G256_XBATCH_SRC,
+        ["gemv_iu4g256_xbatch"]
+    );
+    add!(
+        "gemv_iu4g256_xbatch_residual",
+        kernels::GEMV_IU4G256_XBATCH_RESIDUAL_SRC,
+        ["gemv_iu4g256_xbatch_residual"]
+    );
     add!(
         "gemv_mq4g256",
         kernels::GEMV_MQ4G256_SRC,

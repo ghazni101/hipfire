@@ -355,6 +355,81 @@ impl Gpu {
         self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr(), m, k)
     }
 
+    /// `y[b] = W·x[b]` (plain) or `y[b] += W·x[b]` (`residual`) for `batch`
+    /// activation columns sharing one IU4G256 weight pass (B <= 4). Each row
+    /// follows the scalar `gemv_iu4g256` / `gemv_iu4g256_residual`
+    /// accumulation order; the plain launch is bit-identical to running that
+    /// GEMV once per column, the residual one matches to f32 rounding (its
+    /// module compiles to a different FMA contraction).
+    ///
+    /// Multi-slot decode: the slot engine batches one token per slot, and a
+    /// per-token GEMV re-reads the whole projection weight matrix once per
+    /// slot. Here the weight pass is amortized over every column.
+    pub fn gemv_iu4g256_xbatch(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        if m == 0 || k == 0 || !k.is_multiple_of(256) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_iu4g256_xbatch: requires M > 0 and K % 256 == 0",
+            ));
+        }
+        if batch == 0 || batch > 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_iu4g256_xbatch: batch must be 1..=4",
+            ));
+        }
+        let (fname, src): (&'static str, &'static str) = if residual {
+            (
+                "gemv_iu4g256_xbatch_residual",
+                kernels::GEMV_IU4G256_XBATCH_RESIDUAL_SRC,
+            )
+        } else {
+            ("gemv_iu4g256_xbatch", kernels::GEMV_IU4G256_XBATCH_SRC)
+        };
+        self.bind_thread()?;
+        self.ensure_kernel(fname, src, fname)?;
+        let ap = a.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let bv = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &bv as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) * batch;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", fname, bytes);
+        let result =
+            self.launch_maybe_blob(fname, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(bv);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Raw-pointer form of [`Self::gemv_iu4g256_launch`] (the per-token
     /// prefill fallback walks `x`/`y` rows of a batch).
     pub(crate) fn gemv_iu4g256_launch_raw(

@@ -2782,6 +2782,23 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC: &str = concat!(
 /// nibble row. See `kernels/src/gemv_iu4.hip`.
 pub const GEMV_IU4G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.hip");
 
+/// x-batched IU4G256 decode GEMV (`y[b] = A . x[b]`, B <= 4): each weight row
+/// is decoded once per launch and every row follows the scalar kernel's
+/// accumulation order (f32 rounding, not bit-identical where codegen picks a
+/// different FMA contraction). For the multi-slot decode path.
+pub const GEMV_IU4G256_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_IU4G256_XBATCH_MAX 4\n",
+    "#define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch\n",
+    include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
+);
+/// Residual sibling of [`GEMV_IU4G256_XBATCH_SRC`] (`y[b] += A . x[b]`).
+pub const GEMV_IU4G256_XBATCH_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_IU4G256_XBATCH_MAX 4\n",
+    "#define HIPFIRE_IU4G256_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch_residual\n",
+    include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
+);
+
 /// IU8G32 (qt 59) decode GEMV: the Q8 grid with the scales at the row tail.
 /// `gemv_iu8g32` (SET) and `gemv_iu8g32_residual` (fused `y += W·x`).
 /// See `kernels/src/gemv_iu8g32.hip`.

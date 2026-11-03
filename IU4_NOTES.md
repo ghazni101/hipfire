@@ -979,3 +979,82 @@ improve. Enabled per-container; the code gate is `HIPFIRE_IU8_W8A8=1`.
 - Contract tests updated: `iu8g32_wmma_gemm_gpu` (f64 reference, 100 cases,
   worst rel 9.9e-5 incl. real lm_head/wo) and `iu8g32_v2_gemv_gpu` (v2/a8 vs
   the compact contract).
+
+## C21 — multi-slot decode: one weight pass for every live slot (2026-11-03)
+
+**Problem.** The paged 4-slot decode ran the IU4 projections through
+`gemm_iu4g256_multi`. Under retained PM4 recording that route is not
+MMQ-eligible (`replay.is_recording()`), so it fell to
+`gemm_iu4g256_pertoken`: one f32 GEMV launch per projection per live slot.
+Every decode step re-read the whole IU4 weight set once per slot. The engine
+is weight-bandwidth bound, and the numbers said exactly that: four lanes at
+61.8-65.5 tok/s aggregate = 14.82 GB x 64/s ≈ 950 GB/s, i.e. the HBM wall
+for four independent passes.
+
+**Change.** `gemv_iu4g256_xbatch` / `gemv_iu4g256_xbatch_residual`
+(`kernels/src/gemv_iu4g256_xbatch.hip`), the IU4 twin of the MQ4V2 xbatch
+GEMV: each weight row is decoded once per launch and dotted with up to four
+activation columns. `slots_iu4_multi` routes decode-width rows
+(`2..=FEW_ROW_ROUTE_ROWS`) through it, so qkvza / qkv / gate+up / w_down / wo
+each become one launch per step; `n = 1` and prefill keep the incumbent
+route. `gemv_iu4g256_xbatch` is bit-identical to `gemv_iu4g256` on every
+tested shape (random tails and the model's 2560/5120/6144/9216/17408-K
+projections). The residual variant follows the same expression order but is
+compiled in a different module, so the FMA contraction differs: measured
+<= 1.3e-7 relative against the per-token residual GEMV (same order as the
+accepted IU8 v2 reorder), and `iu4_xbatch_gemv_gpu` gates it at < 1e-6 plus
+determinism.
+
+**Measured** (gfx1100, Qwen3.8-27B IU4P, 4-slot paged VMM, q8 KV, retained
+PM4, prefill chunk 1024, 737-token prompts, 128 greedy tokens per stream,
+fresh process):
+
+| concurrent streams | decode tok/s before | after |
+|---|---:|---:|
+| 1 | 40.5 | 41.9-42.2 |
+| 2 | 55.0-55.1 | 49.0-69.9 (step-composition noise) |
+| 4 | 61.8 / 65.5 | **87.9 / 88.8** |
+
+Prefill/aggregate PP and TTFT are unchanged (decode-only change).
+
+**Remaining aggregate ceiling.** With the projections batched, the step is no
+longer purely HBM bound. Per-pass microbench (same kernel, model shapes):
+B=1 reaches 656-784 GB/s, B=4 only 336-477 GB/s, and B=4 buys 1.25x (M=5120
+K=5120) to 1.98x (lm_head shape) over four separate passes. The x columns are
+re-read per output row; amortizing them (R output rows per block) needs the
+quad-unrolled accumulator layout, not the naive R-loop prototype (which lost
+to B=1 everywhere). The other per-slot costs left: the qt59 lm_head runs
+`per_slot_head` (4 x 0.64 GB per step; an IU8G32 xbatch twin is the next
+~5-15%) and the qt59 `wo` runs the M=4 WMMA residual GEMM.
+
+### Paged-slot prefill/TTFT ceiling (measured, not changed)
+
+Same build, single stream, unique prompt per run:
+
+| prompt tokens | singleton PP tok/s | paged 4-slot PP tok/s |
+|---:|---:|---:|
+| 2064 | 1463 | 1490 |
+| 4107 | 1917 | 1480 |
+| 8193 | 1936 | 1360 |
+| 16362 | 1776 | 1108 |
+
+Fit `t = a*n + b*n^2`: the paged route's quadratic term is 3.6x the
+singleton's (20.4 vs 5.7 ns/token^2) with a ~15% higher linear term. The
+quadratic term is `attention_q8_0_flash_prefill_wmma_slots_vmm_paged`; the
+singleton runs `attention_q8_0_fa2_gqa_gfx1100`. `HIPFIRE_FLASH_PREFILL=0`
+(fallback) drops paged PP 1357 -> 748 at 8193, so the slots WMMA kernel is
+the fast available slots path; closing the rest needs an FA2-style
+descriptor-addressed prefill kernel. `multi_slot_prefill_chunk` 1024 -> 4096
+bought only +7% PP at 8193 (1263 -> 1357, TTFT 6.49 -> 6.04 s) while costing
+38% of the KV pool (1380 -> 855 pages, scratch +2.3 GiB), so the container
+stays at 1024.
+
+### KV pool vs the advertised per-slot context (observed)
+
+`--max-seq 262144` is not physically available on the 24 GB card: the auto
+pool is 1380 pages x 128 = 176,640 tokens for all slots together (one slot at
+262144 alone needs 2048 pages). A ~180k-token request is refused with a
+retryable `page demand exceeds pool: need 1409 pages`, and on the deployed
+container the daemon was observed spinning at ~99% GPU/CPU afterwards with
+later (small) requests unanswered until the container was restarted. The
+honest ceilings are ~176k tokens for one request and ~44k each for four.
