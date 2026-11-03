@@ -50,6 +50,8 @@ pub mod dspark_core;
 /// CPU arithmetic oracles for the E8P-on-IU4 route (decode, SWAR unpack, `2C+s` fold, epoch, writer guard).
 pub mod e8p_i4_reference;
 pub mod ep;
+#[cfg(test)]
+mod ep_barrier_faults;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
 pub mod eval_common;
@@ -134,6 +136,7 @@ pub mod weight_store;
 
 pub mod emit_text;
 pub mod eos_filter;
+pub mod prefill_progress;
 pub mod prompt_frame;
 pub mod semantic;
 pub mod session_table;

@@ -12,6 +12,7 @@ pub mod cdna;
 pub mod code_object;
 pub mod compile_jobs;
 mod compiler;
+pub mod device_counter;
 pub mod device_wait;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
@@ -31,6 +32,7 @@ pub mod expert_capabilities;
 pub mod fa_prefill_pm;
 pub mod fa_qprep_pm;
 pub mod feature_flags;
+pub mod ffn_activation;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
@@ -38,6 +40,12 @@ pub mod flux_fused;
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector_chunk;
+#[cfg(feature = "deltanet")]
+pub mod gated_delta_vector_pm;
 pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;
@@ -47,6 +55,9 @@ mod gemm_iu4;
 mod gemm_iu8g32;
 mod gemm_mq6_fp8;
 mod gemm_mq6_i8;
+mod gemm_q8_a8;
+mod gemm_q8_fp8;
+mod gemm_q8_mmq_gfx11;
 mod gemm_vt;
 mod gemma4_ext;
 mod gemma4_ops;
@@ -57,26 +68,43 @@ pub use gemv_iu4::{iu4_decode_dot8, iu4_decode_mode, iu4_decode_w4a4, Iu4DecodeM
 mod gemv_iu8;
 mod gemv_iu8g256;
 mod gemv_q8x;
+pub mod ggml_convert;
+pub mod ggml_mmvq;
+pub mod ggml_ops;
 #[cfg(test)]
 mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;
+pub mod head_lanes;
 pub mod iu4_c8_pm;
+mod kernel_abi;
 pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;
 pub mod kv_slots;
 pub mod lane_fa;
 pub mod lane_gdn;
+pub mod lane_proj;
 pub mod lane_rows_pm;
+pub mod latent_attention;
+pub mod latent_attention_absorb;
+pub mod latent_attention_decode;
+pub mod latent_attention_flash;
+pub mod latent_attention_tiled;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
+pub mod moe_decode_lanes;
 mod moe_few;
+pub mod moe_grouped_k2_pm;
+pub mod moe_grouped_qt44_iu4;
 pub mod moe_rotate_i4_pm;
 pub mod moe_slot_ops;
+pub mod norm_fold;
+pub mod residual_lanes;
 pub mod slab_admission;
+pub mod stream_mix;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
     SlabLayerCodecError,
@@ -89,8 +117,10 @@ pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
 pub mod plan_sink;
+pub mod pm4_ledger;
 pub mod pm_decode_twins;
 pub mod pm_mtp_gemm;
+pub mod pm_tune;
 pub mod pm_xbatch;
 pub mod pool;
 pub mod prefill_invariant;
@@ -116,6 +146,7 @@ pub mod slab_moe;
 pub mod spec_sampling_cpu_ar;
 pub mod tape_copy;
 pub mod verify_twins;
+pub mod vmm_page_pool;
 pub use gemm::F2GdnTargets;
 pub use gemm_fp8_verify::{
     fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget,
@@ -123,6 +154,9 @@ pub use gemm_fp8_verify::{
 };
 pub use gemm_mq6_fp8::Mq6Fp8Arm;
 pub use gemm_mq6_i8::{QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM};
+pub use gemm_q8_a8::{Q8A8Activations, Q8A8Sched, Q8A8Tile};
+pub use gemm_q8_fp8::Q8Fp8Activations;
+pub use gemm_q8_mmq_gfx11::{q8_mmq_gfx11_admits, q8_mmq_pick_tile, Q8MmqActivations, Q8MmqTile};
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation,
     Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,
@@ -130,6 +164,7 @@ pub use scratch::{
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
+pub mod tp_peer_push;
 pub mod trunk_mask;
 pub mod uma_memory;
 pub mod vae;
@@ -144,11 +179,12 @@ pub use compiler::KernelCompiler;
 pub use dispatch::LabKernelFaultReceipt;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
-    HostAllocLease, QsaExtentDepth, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove, GL_CB2, GL_CB3,
-    GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES, LLOYD_MQ3_GROUP_BYTES,
-    LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES,
-    MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES,
-    MQ6G256V2_GROUP_BYTES,
+    HostAllocLease, KvFitFloor, PlannedCapacity, QsaExtentDepth, VmmPrefixSet, VmmPrefixSpec,
+    VmmResourceMove, GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES,
+    GL_MQ3_GROUP_IDX_BYTES, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
+    MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES,
+    MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+    PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, PLANNED_CAPACITY_RESERVE_BYTES,
 };
 #[cfg(feature = "lab")]
 pub use dispatch::{

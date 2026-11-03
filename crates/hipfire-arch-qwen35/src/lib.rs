@@ -96,6 +96,14 @@ pub mod draft_vocab;
 /// for weight/config/scratch types, hence deltanet-gated like it.
 #[cfg(feature = "deltanet")]
 pub mod forward_slots;
+/// GGUF -> hipfire tensor-name map and hyper-parameters for the dense
+/// Qwen3.5 family (the GGUF-native carrier's per-arch block).
+#[cfg(feature = "deltanet")]
+pub mod gguf_map;
+/// GGUF-native weight source for the dense Qwen3.5 family: ggml block bytes
+/// as `DType::Ggml*` weights with the exporter's data edits undone.
+#[cfg(feature = "deltanet")]
+pub mod gguf_source;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
@@ -117,8 +125,14 @@ pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
-#[cfg(feature = "deltanet")]
 pub mod serve_engine;
+/// VMM KV storage for the multi-slot serve engine (`serve.multi_slot` with
+/// `kv_backend=vmm`): per-slot `KvCache` owners, descriptor staging, and the
+/// `_vmm` batched decode step. See `docs/plans/2026-10-22-vmm-kv-multislot-engine.md`.
+#[cfg(feature = "deltanet")]
+pub mod serve_vmm;
+/// Cross-session host-snapshot prefix cache for the VMM multi-slot route.
+#[cfg(feature = "deltanet")]
 /// Shared-weight host v1: typed export/import of a dense Qwen3.5 weight set
 /// as read-only POSIX-FD VMM allocations. Linux only.
 #[cfg(all(feature = "deltanet", target_os = "linux"))]

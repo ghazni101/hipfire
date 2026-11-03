@@ -1336,7 +1336,11 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         .map(Some)
 }
 
-fn validate_payload_extent(shape: &[usize], dtype: DType, actual: usize) -> Result<(), String> {
+pub(crate) fn validate_payload_extent(
+    shape: &[usize],
+    dtype: DType,
+    actual: usize,
+) -> Result<(), String> {
     if let Some(expected) = expected_payload_bytes(shape, dtype)? {
         if actual != expected {
             return Err(format!(

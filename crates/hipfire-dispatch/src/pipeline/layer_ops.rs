@@ -13,6 +13,7 @@
 //! validation; this module does not broaden that legacy contract.
 //! No operation owns a tensor or allocates execution-local storage.
 
+use super::projection_split::{is_split, split_projections};
 use crate::context::DispatchCtx;
 use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::WeightRef;
@@ -45,7 +46,8 @@ use rdna_compute::tensor_ops::{
     gated_delta_core_lanes, gated_delta_gate_batched_arena, gated_delta_gate_batched_rotate_arena,
     gated_delta_step_gate_wmma_arena, gated_delta_step_gate_wmma_qknormed_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
-    indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, Bf16Arena, GdnCoreLane,
+    indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, qsa_core_lanes,
+    Bf16Arena, GdnCoreLane, QsaCoreLane, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
@@ -189,15 +191,17 @@ fn project_weights_with_epilogues(
     // The chunked GDN in-projection group: BF16 qkv ahead of F32 a/b/z.
     let members = [false, true, true, true];
     let gdn_regions = projections.len() == 4 && projections[0].1.dtype == DType::BF16;
-    project_weights_inner(
-        gpu,
-        input,
-        rows,
-        rotation,
-        projections,
-        gdn_regions.then_some(&members[..]),
-        epilogues,
-    )
+    split_projections(gpu, rows, projections, |gpu, projections| {
+        project_weights_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            gdn_regions.then_some(&members[..]),
+            epilogues,
+        )
+    })
 }
 
 /// A QSA q / k projection's fused RMSNorm + RoPE epilogue request
@@ -629,8 +633,54 @@ fn project_trunk(
     )
 }
 
+/// [`project_trunk_masked_inner`] under the installed projection split
+/// ([`split_projections`]). The IU4 trunk (an `a4` member or a GDN `zba`
+/// fold, whose folded payload is the whole Z|beta|alpha) projects whole.
 #[allow(clippy::too_many_arguments)]
 fn project_trunk_masked(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: &GpuTensor,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    a4: &[bool],
+    zba: Option<ZbaFold<'_>>,
+    gdn_in_proj: bool,
+    covered: &[bool],
+    epilogues: &[Option<&NormRopeEpi<'_>>],
+) -> Result<(), DispatchError> {
+    if zba.is_some() || a4.iter().any(|&bit| bit) {
+        return project_trunk_masked_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            a4,
+            zba,
+            gdn_in_proj,
+            covered,
+            epilogues,
+        );
+    }
+    split_projections(gpu, rows, projections, |gpu, projections| {
+        project_trunk_masked_inner(
+            gpu,
+            input,
+            rows,
+            rotation,
+            projections,
+            a4,
+            None,
+            gdn_in_proj,
+            covered,
+            epilogues,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_trunk_masked_inner(
     gpu: &mut Gpu,
     input: &GpuTensor,
     rows: usize,
@@ -1438,11 +1488,17 @@ fn execute_hyper_read_inner(
         }
         let down = &op.input_mix_down;
         let act = Some(1.0 / op.branches as f32);
-        hip(if down.dtype == DType::Q8_0 {
-            gpu.gemv_q8_0_k8_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
-        } else {
-            gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, &low, down.m, down.k, act, op.rows)
-        })?;
+        // The rows a hook bands are its decision (the qwen4 hook leaves the
+        // row-tile twins past eight rows whole: they admit only full shapes).
+        let launch = |gpu: &mut Gpu, projections: &[(&WeightRef<'_>, &GpuTensor)]| {
+            let (down, low) = projections[0];
+            hip(if down.dtype == DType::Q8_0 {
+                gpu.gemv_q8_0_k8_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
+            } else {
+                gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
+            })
+        };
+        split_projections(gpu, op.rows, &[(down, &low)], launch)?;
         activated = true;
     } else {
         if !normalized_ready {
@@ -1751,6 +1807,8 @@ fn project_output_into_hyper_write(
         || gpu.flags.qwen4_hc_fuse_level() < 2
         || !covered
         || weight.m != write.hidden
+        // A split output projection is gathered before its HC write reads it.
+        || is_split(gpu, weight, rows)
         || write.branches != 4
         || write.rows != rows
         || write.input.dtype != DType::F32
@@ -3336,14 +3394,10 @@ fn execute_gated_delta_net_hc_impl(
     if let Some(xq) = fused_xq {
         // The gate emitted the A8 blocks: the INT8 route's GEMM, minus its producer.
         let output_batch = view(op.output_tensor, 0, op.rows * op.output.m);
-        return hip(gpu.gemm_mq6g256v2_i8_prequant(
-            op.output.buf,
-            xq,
-            &output_batch,
-            op.output.m,
-            op.output.k,
-            op.rows,
-        ));
+        return split_projections(gpu, op.rows, &[(&op.output, &output_batch)], |gpu, p| {
+            let (w, out) = p[0];
+            hip(gpu.gemm_mq6g256v2_i8_prequant(w.buf, xq, out, w.m, w.k, op.rows))
+        });
     }
     // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
     // projection's epilogue; the projection then never lands in `output_tensor`.
@@ -4019,6 +4073,191 @@ pub fn execute_indexed_attention_uncovered(
     covered: [bool; 4],
 ) -> Result<(), DispatchError> {
     execute_indexed_attention_hc_impl(gpu, op, None, &mut false, None, Some(covered))
+}
+
+/// The Core phase of several AR lanes' QSA mixers (consecutive
+/// `Step::IndexedAttention` Core steps of a lane step) through the multi-lane
+/// kernels: each lane gets exactly the per-lane Core branch's arguments for its
+/// rows (the one-launch decode prologue, the incremental pool when its rows
+/// reach a block, the fused select with the persistent mirror and the per-head
+/// attention), four launches for every lane together instead of four per lane.
+/// The lanes' host bookkeeping (`qsa_commits`, `next_lengths`) is the
+/// architecture's and never changes here. `Ok(false)`: the set does not take
+/// the route, nothing launched and `before_launch` was not called; run the ops
+/// one by one. `before_launch` runs exactly once, after every refusal check
+/// and before the first launch; its error is returned as is and nothing
+/// launches.
+pub fn execute_indexed_attention_core_lanes(
+    gpu: &mut Gpu,
+    ops: &[&IndexedAttentionOp<'_>],
+    before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
+) -> Result<bool, DispatchError> {
+    if ops.len() < 2 || ops.len() > QSA_CORE_LANES_MAX || !gpu.flags.qwen4_qsa_lanes_enabled() {
+        return Ok(false);
+    }
+    let i32_bytes = std::mem::size_of::<i32>();
+    // One lane's scratch views: rows of the lane's first row.
+    struct LaneViews {
+        index: GpuTensor,
+        qgate: GpuTensor,
+        k: GpuTensor,
+        v: GpuTensor,
+        output: GpuTensor,
+        selected: GpuTensor,
+        complete: usize,
+    }
+    let mut views = Vec::with_capacity(ops.len());
+    // Rows already placed in each shared selected scratch (by base address): the
+    // lanes run concurrently, so each gets its own rows of it.
+    let mut selected_used: Vec<(usize, usize)> = Vec::new();
+    for op in ops {
+        op.check_phase()?;
+        let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let q_width = op.heads * op.head_dim;
+        let kv_width = op.kv_heads * op.head_dim;
+        // The per-lane Core branch this twin replaces: Full mode, the one-launch
+        // prologue (not the batched fallbacks), no F16 arena or pooled mirror.
+        let prologue_rotary =
+            op.rotary_dim == op.head_dim.min(64) && op.rotary_dim == op.index_dim.min(64);
+        if op.phase != MixerPhase::Core
+            || !matches!(op.mode, IndexedAttentionMode::Full)
+            || !(1..=QSA_CORE_LANE_ROWS).contains(&op.rows)
+            || op.state.f16_arena.is_some()
+            || op.state.pooled_bf16.is_some()
+            || op.compress == 0
+            || gpu.route_rows(op.rows) > gpu.few_row_limit()
+            || op.index_dim > 256
+            || op.head_dim > 256
+            || !prologue_rotary
+        {
+            return Ok(false);
+        }
+        let Ok((_, _, complete, _, _)) = op.next_lengths() else {
+            return Ok(false);
+        };
+        let selected_bytes = op.rows * op.state.selected_capacity * i32_bytes;
+        let base = op.selected_scratch.buf.as_ptr() as usize;
+        let slot = match selected_used.iter().position(|(b, _)| *b == base) {
+            Some(slot) => slot,
+            None => {
+                selected_used.push((base, 0));
+                selected_used.len() - 1
+            }
+        };
+        let used = &mut selected_used[slot].1;
+        let selected_offset = *used * op.state.selected_capacity * i32_bytes;
+        if selected_offset + selected_bytes > op.selected_scratch.buf.size()
+            || op.index_scratch.numel() < op.rows * index_width
+            || op.qgate_scratch.numel() < op.rows * 2 * q_width
+            || op.k_scratch.numel() < op.rows * kv_width
+            || op.v_scratch.numel() < op.rows * kv_width
+            || op.qsa_output.numel() < op.rows * q_width
+        {
+            return Ok(false);
+        }
+        *used += op.rows;
+        views.push(LaneViews {
+            index: view(op.index_scratch, 0, op.rows * index_width),
+            qgate: view(op.qgate_scratch, 0, op.rows * 2 * q_width),
+            k: view(op.k_scratch, 0, op.rows * kv_width),
+            v: view(op.v_scratch, 0, op.rows * kv_width),
+            output: view(op.qsa_output, 0, op.rows * q_width),
+            selected: view(op.selected_scratch, selected_offset, selected_bytes),
+            complete,
+        });
+    }
+    let lanes: Vec<QsaCoreLane<'_>> = ops
+        .iter()
+        .zip(&views)
+        .map(|(op, v)| {
+            let index_kv_width = op.index_kv_heads * op.index_dim;
+            let initial_position = op.state.position;
+            let rows = op.rows;
+            let yarn = op.rope.yarn(op.rotary_dim);
+            let budget_blocks = op.budget / op.compress;
+            QsaCoreLane {
+                prologue: IndexedAttentionDecodePrologue {
+                    index_row: &v.index,
+                    qgate: &v.qgate,
+                    keys: &v.k,
+                    values: &v.v,
+                    full_keys: op.state.full_keys,
+                    full_values: op.state.full_values,
+                    raw_index_keys: op.state.raw_index_keys,
+                    index_q_norm: op.indexer_q_norm,
+                    q_norm: op.q_norm,
+                    k_norm: op.k_norm,
+                    index_heads: op.index_heads,
+                    index_dim: op.index_dim,
+                    index_kv_width,
+                    heads: op.heads,
+                    kv_heads: op.kv_heads,
+                    head_dim: op.head_dim,
+                    position: initial_position,
+                    rows,
+                    format: op.state.format,
+                    yarn,
+                },
+                pool: (v.complete > 0).then_some(IndexedAttentionPoolRope {
+                    raw_keys: op.state.raw_index_keys,
+                    pooled: op.state.pooled_keys,
+                    norm: Some(op.indexer_k_norm),
+                    block_count: v.complete,
+                    compress: op.compress,
+                    index_dim: index_kv_width,
+                    position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
+                        position_start: initial_position,
+                        rows,
+                    }),
+                    grid_bound: op.state.pooled_capacity,
+                    yarn,
+                }),
+                select: IndexedAttentionSelectBatch {
+                    query: &v.index,
+                    pooled: op.state.pooled_keys,
+                    pooled_bf16: None,
+                    pooled_bf16_valid_blocks: 0,
+                    selected: &v.selected,
+                    rows,
+                    query_row_stride: (op.index_heads + op.index_kv_heads) * op.index_dim,
+                    block_count: v.complete,
+                    index_heads: op.index_heads,
+                    index_dim: op.index_dim,
+                    budget_blocks,
+                    compress: op.compress,
+                    position_start: initial_position,
+                    capacity: op.state.selected_capacity,
+                    shape_blocks: op.state.pooled_capacity,
+                },
+                persistent_selection: op.state.selected_indices,
+                attention: IndexedAttentionAttentionBatch {
+                    q_with_gate: &v.qgate,
+                    full_keys: op.state.full_keys,
+                    full_values: op.state.full_values,
+                    selected: &v.selected,
+                    output: &v.output,
+                    rows,
+                    position_start: initial_position,
+                    n_heads: op.heads,
+                    n_kv_heads: op.kv_heads,
+                    head_dim: op.head_dim,
+                    budget_blocks,
+                    compress: op.compress,
+                    capacity: op.state.selected_capacity,
+                    full_capacity: op.state.full_capacity,
+                    format: op.state.format,
+                    shape_selected: op.state.selected_capacity,
+                },
+            }
+        })
+        .collect();
+    let Some(plan) = hip(qsa_core_lanes(gpu, &lanes))? else {
+        return Ok(false);
+    };
+    before_launch(gpu)?;
+    hip(plan.launch(gpu))?;
+    gpu.scratch.prerotated = None;
+    Ok(true)
 }
 
 fn qsa_norm_source(

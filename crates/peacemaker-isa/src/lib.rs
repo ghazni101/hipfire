@@ -20,6 +20,7 @@ pub mod author;
 pub mod cdna;
 pub mod emit;
 pub mod hazard;
+pub mod hip_twin;
 pub mod insn;
 pub mod lds;
 pub mod ledger;
@@ -333,6 +334,15 @@ impl Builder {
     }
     pub fn wait_all(&mut self) -> Result<(), String> {
         let required = self.ledger.clone().drain();
+        self.emit_required(required)
+    }
+    /// Emit now the waits an instruction defining `regs` would need (the hazards of loads still
+    /// in flight into them, of stores still reading them): the minimal counter waits of the
+    /// ledger, nothing when there is none. A caller about to open a clause settles its members'
+    /// destinations first, since a clause takes no waits inside.
+    pub fn settle_defs(&mut self, regs: &[reg::RegRef]) -> Result<(), String> {
+        let probe = Instruction::new("", regs.to_vec(), Vec::new());
+        let required = self.ledger.required(&probe);
         self.emit_required(required)
     }
     /// gfx12 `s_wait_alu depctr_vm_vsrc(0)`: every issued VMEM store has read its

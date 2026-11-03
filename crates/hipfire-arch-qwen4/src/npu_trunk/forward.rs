@@ -918,6 +918,10 @@ impl NpuForward {
                 );
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("npu trunk mode={mode} route={trunk_route}"),
+            );
             let rates = (mode == NpuTrunkMode::Auto && runtime.is_some()).then(|| {
                 coproc::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone())
             });

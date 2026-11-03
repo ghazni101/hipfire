@@ -18,11 +18,16 @@
 //! rank-generic over EP2..=EP8 (`attach_ep_mesh` admits `1 + peers` of 2..=8).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::ep_reserve::EpReserveMeshReceipt;
+use crate::ep_trunk_split::{
+    agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
+};
 use crate::gpu_forward::{
     Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
+use hipfire_dispatch::pipeline::projection_split::split_scope;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
 use hipfire_runtime::ep_tile_exchange::{EpTileExchange, EpTileExchangeSpec};
@@ -172,6 +177,7 @@ pub struct Qwen4EpPeer {
     mirrors: PeerMirrors,
     gather: Option<Arc<EpRowGather>>,
     tile: Option<Arc<EpTileExchange>>,
+    split: Option<TrunkSplitRank>,
 }
 
 impl Qwen4EpPeer {
@@ -197,6 +203,9 @@ impl Qwen4EpPeer {
                 tile.release(self.rank, &mut self.gpu)
                     .map_err(|error| format!("release tile exchange events: {error}")),
             );
+        }
+        if let Some(split) = self.split.take() {
+            note(split.release(&mut self.gpu));
         }
         note(
             self.bundle
@@ -265,20 +274,40 @@ impl BalancedOwners {
 }
 
 impl Qwen4EpRowGatherHook {
+    /// The static gather reads owner `e % ranks` in-kernel
+    /// (`EpSlotOwners::ExpertModulo`); `seal`'s ownership must be exactly that
+    /// placement over `QWEN4_EP_OWNER_EXPERTS` experts, and `rank` its rank.
     fn new(
         rank: usize,
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
         trunk_layers: usize,
         gather: Arc<EpRowGather>,
         buffer_ptrs: [usize; QWEN4_EP_GATHER_BUFFERS],
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        let owners = seal.seal.owner_ranks();
+        let ranks = seal.seal.ranks();
+        if rank != seal.rank
+            || owners.len() != QWEN4_EP_OWNER_EXPERTS
+            || owners
+                .iter()
+                .enumerate()
+                .any(|(expert, &owner)| owner != expert % ranks)
+        {
+            return Err(format!(
+                "qwen4 EP row gather: rank {rank} (sealed rank {}) ownership over {} experts is \
+                 not the expert-modulo placement the gather kernel reads",
+                seal.rank,
+                owners.len()
+            ));
+        }
+        Ok(Self {
             rank,
             trunk_layers,
             gather,
             buffer_ptrs,
             last_buffer: AtomicUsize::new(NO_BUFFER),
             balanced: OnceLock::new(),
-        }
+        })
     }
 
     /// Install the rank's balanced layers (once, after `attach_ep`).
@@ -348,23 +377,26 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
             .balanced
             .get()
             .filter(|balanced| balanced.layer(layer_idx, self.trunk_layers).is_some());
+        let layer = usize::from(layer_idx);
         let result = match balanced {
             Some(balanced) => {
                 let owners = lock(&balanced.slot_owner);
-                self.gather.exchange(
+                self.gather.exchange_layer(
                     gpu,
                     self.rank,
                     buffer,
                     EpSlotOwners::Explicit(&owners),
                     slots,
+                    layer,
                 )
             }
-            None => self.gather.exchange(
+            None => self.gather.exchange_layer(
                 gpu,
                 self.rank,
                 buffer,
                 EpSlotOwners::ExpertModulo(topk_indices, QWEN4_EP_OWNER_EXPERTS),
                 slots,
+                layer,
             ),
         };
         result.map_err(|error| {
@@ -541,26 +573,29 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
             .map_err(|error| error.to_string())
     }
 
-    fn host_barrier(&self) -> Result<(), String> {
-        self.tile.host_barrier().map_err(|error| error.to_string())
+    fn host_barrier(&self, what: u8, epoch: u32) -> Result<(), String> {
+        self.tile
+            .host_barrier(self.rank, what, epoch)
+            .map_err(|error| error.to_string())
     }
 
     fn exchange(
         &self,
         gpu: &mut Gpu,
-        _layer_idx: u16,
+        layer_idx: u16,
         tile_ids: &GpuTensor,
         y_down_grouped: &GpuTensor,
         tiles: usize,
     ) -> Result<(), String> {
         self.tile
-            .exchange(
+            .exchange_layer(
                 gpu,
                 self.rank,
                 &self.owner_table,
                 tile_ids,
                 y_down_grouped,
                 tiles,
+                usize::from(layer_idx),
             )
             .map_err(|error| error.to_string())
     }
@@ -573,7 +608,12 @@ pub struct Qwen4EpMesh {
     /// Owner-routed chunk MoE transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`); `None`
     /// when the lever is off or was not admitted on every rank.
     tile: Option<Arc<EpTileExchange>>,
+    /// Rank 0's trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`); `None` when off.
+    split: Option<TrunkSplitRank>,
     ranks: usize,
+    /// The EP reserve-sharing plan receipt every rank agreed on at attach;
+    /// `None` on an ordinary (non-reserve-sharing) load.
+    reserve: Option<EpReserveMeshReceipt>,
     device_ids: Vec<i32>,
     used_bytes: Vec<u64>,
 }
@@ -590,6 +630,12 @@ impl Qwen4EpMesh {
     /// HIP device id of every rank (rank 0 first).
     pub fn device_ids(&self) -> &[i32] {
         &self.device_ids
+    }
+
+    /// The agreed EP reserve-sharing receipt (`None`: ordinary load). A mesh
+    /// with a receipt refuses dynamic lane staging.
+    pub fn reserve_receipt(&self) -> Option<&EpReserveMeshReceipt> {
+        self.reserve.as_ref()
     }
 
     /// Device memory in use on every rank's GPU when the mesh was attached
@@ -615,23 +661,41 @@ impl Qwen4EpMesh {
         local: impl FnOnce() -> Result<R, String>,
         job: PeerJob<'_, R>,
     ) -> Result<Vec<R>, String> {
-        self.pool
-            .run_all_forced(local, &|_, peer: &mut Qwen4EpPeer| {
+        let local_split = self.split.as_ref().and_then(TrunkSplitRank::hook);
+        self.pool.run_all_forced(
+            || {
+                let _scope = local_split.map(|hook| split_scope(hook));
+                local()
+            },
+            &|_, peer: &mut Qwen4EpPeer| {
+                let hook = peer.split.as_ref().and_then(TrunkSplitRank::hook);
+                let _scope = hook.map(|hook| split_scope(hook));
                 job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
-            })
+            },
+        )
     }
 
     /// Run `job` on every peer while `local` runs rank 0 on the caller's
     /// thread. Results in rank order. Any rank's error or panic aborts the
     /// row-gather barrier, poisons the mesh, and is returned (the first one).
+    /// Every rank's trunk split hook is installed for the call.
     pub(crate) fn run<R: Send>(
         &self,
         local: impl FnOnce() -> Result<R, String>,
         job: PeerJob<'_, R>,
     ) -> Result<Vec<R>, String> {
-        self.pool.run_all(local, &|_, peer: &mut Qwen4EpPeer| {
-            job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
-        })
+        let local_split = self.split.as_ref().and_then(TrunkSplitRank::hook);
+        self.pool.run_all(
+            || {
+                let _scope = local_split.map(|hook| split_scope(hook));
+                local()
+            },
+            &|_, peer: &mut Qwen4EpPeer| {
+                let hook = peer.split.as_ref().and_then(TrunkSplitRank::hook);
+                let _scope = hook.map(|hook| split_scope(hook));
+                job(&mut peer.bundle, &mut peer.gpu, &mut peer.mirrors)
+            },
+        )
     }
 
     /// Run `job` on peer `rank` alone (rank 0 is not a peer).
@@ -645,7 +709,11 @@ impl Qwen4EpMesh {
     /// thread) and release rank 0's gather events. Always attempts every step.
     pub(crate) fn close(self, gpu: &mut Gpu) -> Result<(), String> {
         let Self {
-            pool, gather, tile, ..
+            pool,
+            gather,
+            tile,
+            split,
+            ..
         } = self;
         let mut first: Option<String> = None;
         let drained = pool.run_all_forced(|| sync_device(gpu), &|_, peer: &mut Qwen4EpPeer| {
@@ -663,6 +731,11 @@ impl Qwen4EpMesh {
         if let Some(tile) = tile {
             if let Err(error) = tile.release(0, gpu) {
                 first.get_or_insert(format!("rank 0: release tile exchange events: {error}"));
+            }
+        }
+        if let Some(split) = split {
+            if let Err(error) = split.release(gpu) {
+                first.get_or_insert(format!("rank 0: {error}"));
             }
         }
         first.map_or(Ok(()), Err)
@@ -832,6 +905,7 @@ impl Qwen4Bundle {
                         mirrors: PeerMirrors::default(),
                         gather: None,
                         tile: None,
+                        split: None,
                     };
                     let checked = peer
                         .check_seal(&seal)
@@ -899,12 +973,20 @@ impl Qwen4Bundle {
         let abort = gather.clone();
         pool.set_abort(move || abort.abort());
         let tile_slot: Mutex<Option<Arc<EpTileExchange>>> = Mutex::new(None);
+        let split_slot: Mutex<Option<TrunkSplitRank>> = Mutex::new(None);
+        let split_transport: Mutex<Option<Arc<EpRowGather>>> = Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
             if let Some(tile) = lock(&tile_slot).as_ref() {
                 tile.abort();
                 let _ = tile.release(0, gpu);
+            }
+            if let Some(transport) = lock(&split_transport).as_ref() {
+                transport.abort();
+            }
+            if let Some(split) = lock(&split_slot).take() {
+                let _ = split.release(gpu);
             }
             error
         };
@@ -984,8 +1066,106 @@ impl Qwen4Bundle {
             }
         }
 
+        // 2c. Trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`, #862): every rank's census of
+        // banded weights and its chunk rows must agree with rank 0's; each rank then registers
+        // two exchange buffers (allocated before P2P is enabled below) with one band transport.
+        let split_mode = match TrunkSplitMode::from_env() {
+            Ok(mode) => mode,
+            Err(error) => return Err(release_rank0(gpu, error)),
+        };
+        if split_mode.is_some() {
+            let layout = |bundle: &Qwen4Bundle| -> Result<(Vec<SplitWeight>, usize), String> {
+                let census = split_census(bundle)?;
+                let rows = bundle
+                    .execution
+                    .as_ref()
+                    .ok_or("the forward is not attached")?
+                    .prompt_chunk_rows();
+                Ok((census.into_iter().map(|(weight, _)| weight).collect(), rows))
+            };
+            let layouts = {
+                let me = &*self;
+                pool.run_all(|| layout(me), &|_, peer: &mut Qwen4EpPeer| {
+                    layout(&peer.bundle)
+                })
+            }
+            .and_then(|layouts| agree_layouts(&layouts).map(|()| layouts));
+            let layouts = match layouts {
+                Ok(layouts) => layouts,
+                Err(error) => return Err(release_rank0(gpu, error)),
+            };
+            let (census, chunk_rows) = &layouts[0];
+            let bytes = split_buffer_bytes(census, ranks, *chunk_rows).next_multiple_of(16);
+            let split_builder = Mutex::new(Some(EpRowGather::builder(EpRowGatherSpec {
+                ranks,
+                slots: 1,
+                row_bytes: bytes,
+            })));
+            let register_split = |rank: usize, gpu: &mut Gpu| -> Result<TrunkSplitRank, String> {
+                let split = TrunkSplitRank::allocate(rank, gpu, bytes)?;
+                let registered = match lock(&split_builder).as_mut() {
+                    Some(builder) => builder
+                        .register(rank, gpu, &split.buffers())
+                        .map_err(|error| format!("register trunk split buffers: {error}")),
+                    None => Err("trunk split builder already consumed".to_string()),
+                };
+                match registered {
+                    Ok(()) => Ok(split),
+                    Err(error) => {
+                        let _ = split.release(gpu);
+                        Err(error)
+                    }
+                }
+            };
+            let registered = {
+                let gpu0 = &mut *gpu;
+                pool.run_all(
+                    || {
+                        *lock(&split_slot) = Some(register_split(0, gpu0)?);
+                        Ok(())
+                    },
+                    &|rank, peer: &mut Qwen4EpPeer| {
+                        peer.split = Some(register_split(rank, &mut peer.gpu)?);
+                        Ok(())
+                    },
+                )
+            };
+            if let Err(error) = registered {
+                return Err(release_rank0(gpu, error));
+            }
+            let built = lock(&split_builder)
+                .take()
+                .ok_or_else(|| "trunk split builder already consumed".to_string())
+                .and_then(|builder| {
+                    builder
+                        .build()
+                        .map_err(|error| format!("build trunk split transport: {error}"))
+                });
+            match built {
+                Ok(transport) => {
+                    let aborts = (gather.clone(), lock(&tile_slot).clone(), transport.clone());
+                    pool.set_abort(move || {
+                        aborts.0.abort();
+                        if let Some(tile) = aborts.1.as_ref() {
+                            tile.abort();
+                        }
+                        aborts.2.abort();
+                    });
+                    *lock(&split_transport) = Some(transport);
+                }
+                Err(error) => return Err(release_rank0(gpu, error)),
+            }
+            eprintln!(
+                "qwen4 EP: trunk output split {split_mode:?} ({} weights banded over {ranks} \
+                 ranks, 2 x {:.1} MiB exchange buffers per rank)",
+                census.len(),
+                bytes as f64 / (1 << 20) as f64
+            );
+        }
+
         // 3. P2P after every load/allocation exists.
         let tile = lock(&tile_slot).clone();
+        let split_transport = lock(&split_transport).clone();
         let enable = |rank: usize, gpu: &mut Gpu| -> Result<(), String> {
             gather
                 .enable_peers(rank, gpu)
@@ -993,6 +1173,11 @@ impl Qwen4Bundle {
             if let Some(tile) = tile.as_ref() {
                 tile.enable_peers(rank, gpu)
                     .map_err(|error| format!("enable tile exchange peer access: {error}"))?;
+            }
+            if let Some(transport) = split_transport.as_ref() {
+                transport
+                    .enable_peers(rank, gpu)
+                    .map_err(|error| format!("enable trunk split peer access: {error}"))?;
             }
             Ok(())
         };
@@ -1006,6 +1191,29 @@ impl Qwen4Bundle {
         };
         if let Err(error) = enabled {
             return Err(release_rank0(gpu, error));
+        }
+
+        // 3b. Every rank's split hook over its own banded weights.
+        if let (Some(mode), Some(transport)) = (split_mode, split_transport.as_ref()) {
+            let install = |bundle: &Qwen4Bundle, split: Option<&mut TrunkSplitRank>| {
+                let census = split_census(bundle)?;
+                split.ok_or("trunk split buffers missing")?.install(
+                    mode,
+                    &census,
+                    transport.clone(),
+                );
+                Ok::<(), String>(())
+            };
+            let installed = {
+                let me = &*self;
+                pool.run_all(
+                    || install(me, lock(&split_slot).as_mut()),
+                    &|_, peer: &mut Qwen4EpPeer| install(&peer.bundle, peer.split.as_mut()),
+                )
+            };
+            if let Err(error) = installed {
+                return Err(release_rank0(gpu, error));
+            }
         }
 
         // 4. Compact expert sources of every rank.
@@ -1027,12 +1235,16 @@ impl Qwen4Bundle {
                 .as_ref()
                 .and_then(|forward| forward.ep_gather_buffers())
                 .ok_or("no EP gather buffers (the forward has no EP placement)")?;
+            let seal = bundle
+                .ep_seal()
+                .ok_or("the rank is not bound to an EP seal")?;
             let hook = Arc::new(Qwen4EpRowGatherHook::new(
                 rank,
+                seal,
                 trunk_layers,
                 gather.clone(),
                 buffers.map(|buffer| buffer.buf.as_ptr() as usize),
-            ));
+            )?);
             let mut forward = bundle
                 .execution
                 .take()
@@ -1132,6 +1344,23 @@ impl Qwen4Bundle {
             }
         }
 
+        // 5c. EP reserve sharing: every rank's plan receipt (source generation, logical plan
+        // digest, resident/donor boundaries, prompt and exchange capacity, S1/S2 bits) must
+        // be identical, and all ranks must be reserve-sharing or none. Any disagreement
+        // refuses publication: no rank falls back to the ordinary path after the reduced
+        // reserve was spent, and no rank may skip a restore rendezvous the others take.
+        let receipts = {
+            let me = &*self;
+            pool.run_all(
+                || Ok(rank_reserve_receipt(me)),
+                &|_, peer: &mut Qwen4EpPeer| Ok(rank_reserve_receipt(&peer.bundle)),
+            )
+        };
+        let reserve = match receipts.and_then(|receipts| agree_reserve_receipts(&receipts)) {
+            Ok(reserve) => reserve,
+            Err(error) => return Err(release_rank0(gpu, error)),
+        };
+
         // 6. Per-rank device memory in use.
         let used = |gpu: &Gpu| -> Result<u64, String> {
             let (free, total) = gpu
@@ -1148,10 +1377,33 @@ impl Qwen4Bundle {
             Err(error) => return Err(release_rank0(gpu, error)),
         };
         debug_assert_eq!(used_bytes.len(), ranks);
+        let split = lock(&split_slot).take();
+
+        // 7. The mesh is serviceable: every rank prints its header/rank receipt records once
+        // (`HIPFIRE_EP_RESERVE_RECEIPT=1`; host-only, a no-op otherwise). A reserve load prints
+        // its plan, an ordinary load its real resident-layer count.
+        {
+            let me = &*self;
+            let logged: Result<Vec<()>, String> = pool.run_all(
+                || {
+                    me.ep_receipt_log_rank();
+                    Ok(())
+                },
+                &|_, peer: &mut Qwen4EpPeer| {
+                    peer.bundle.ep_receipt_log_rank();
+                    Ok(())
+                },
+            );
+            if let Err(error) = logged {
+                return Err(release_rank0(gpu, error));
+            }
+        }
         Ok(Qwen4EpMesh {
             pool,
             gather,
             tile,
+            split,
+            reserve,
             ranks,
             device_ids,
             used_bytes,
@@ -1260,6 +1512,24 @@ impl Qwen4Bundle {
             None => Ok(()),
         }
     }
+
+    /// Per-rank body of a whole-prompt entry: this rank's prompt nesting is
+    /// opened before `body` and closed after it, so every rank restores the
+    /// borrowed reserve exactly once, at the outer completion
+    /// ([`bracket_prompt`]). Nested entries inside `body` (`prefill_final_from`,
+    /// `spec_advance_from`, the forward's own tiling) only deepen the nesting.
+    fn ep_prompt_rank<R>(
+        &mut self,
+        gpu: &mut Gpu,
+        body: impl FnOnce(&mut Self, &mut Gpu) -> Result<R, BundleError>,
+    ) -> Result<R, BundleError> {
+        bracket_prompt(
+            (self, gpu),
+            |(bundle, _)| bundle.share_prompt_begin(),
+            |(bundle, gpu)| body(bundle, gpu),
+            |(bundle, gpu), ok| bundle.share_prompt_end(gpu, ok),
+        )
+    }
 }
 
 /// The replicated forms of the daemon-facing bundle calls. Each runs the
@@ -1324,11 +1594,15 @@ impl Qwen4Bundle {
                    gpu: &mut Gpu,
                    logits: &GpuTensor,
                    top1: Option<&GpuTensor>| {
-            if final_row_only {
-                bundle.forward_chunk_final(gpu, tokens, logits, top1)
-            } else {
-                bundle.forward_chunk(gpu, tokens, logits, top1)
-            }
+            // A direct whole-call wrapper: the forward's internal tiles (and a
+            // 4096 + tail split) must not restore between forwards.
+            bundle.ep_prompt_rank(gpu, |bundle, gpu| {
+                if final_row_only {
+                    bundle.forward_chunk_final(gpu, tokens, logits, top1)
+                } else {
+                    bundle.forward_chunk(gpu, tokens, logits, top1)
+                }
+            })
         };
         self.ep_fanout(
             "forward_chunk",
@@ -1350,11 +1624,17 @@ impl Qwen4Bundle {
         let logits_spec = TensorSpec::of(logits);
         self.ep_fanout(
             "prefill_final",
-            |bundle| bundle.prefill_final(gpu, prompt, reused, logits),
+            |bundle| {
+                bundle.ep_prompt_rank(gpu, |bundle, gpu| {
+                    bundle.prefill_final(gpu, prompt, reused, logits)
+                })
+            },
             &|bundle, peer_gpu, mirrors| {
                 let (logits, _) = mirrors.pair(peer_gpu, &logits_spec, None)?;
                 bundle
-                    .prefill_final(peer_gpu, prompt, reused, logits)
+                    .ep_prompt_rank(peer_gpu, |bundle, gpu| {
+                        bundle.prefill_final(gpu, prompt, reused, logits)
+                    })
                     .map_err(|error| error.to_string())
             },
         )
@@ -1452,6 +1732,53 @@ impl Qwen4Bundle {
     }
 }
 
+/// Run a whole-prompt `body` between `begin` and `end` over one rank's state
+/// `state`. `end` always runs (`ok` says whether `body` succeeded) so the
+/// nesting is balanced on every path; the body's error wins over `end`'s.
+/// The rank-local half of the EP reserve protocol: the outermost `end` is the
+/// one that restores the borrowed donors and crosses the mesh rendezvous.
+pub(crate) fn bracket_prompt<S, R, E>(
+    mut state: S,
+    begin: impl FnOnce(&mut S),
+    body: impl FnOnce(&mut S) -> Result<R, E>,
+    end: impl FnOnce(&mut S, bool) -> Result<(), E>,
+) -> Result<R, E> {
+    begin(&mut state);
+    let result = body(&mut state);
+    let finish = end(&mut state, result.is_ok());
+    result.and_then(|value| finish.map(|()| value))
+}
+
+/// This rank's EP reserve-sharing plan receipt, `None` when its forward is not
+/// reserve-sharing (or not attached).
+fn rank_reserve_receipt(bundle: &Qwen4Bundle) -> Option<EpReserveMeshReceipt> {
+    bundle
+        .execution
+        .as_ref()
+        .and_then(|forward| forward.ep_reserve_plan_receipt())
+}
+
+/// Compare every rank's reserve receipt (rank order). All `None` is an ordinary
+/// load (`Ok(None)`); all `Some` and identical is the agreed receipt. A mixed
+/// set, or any differing field, is refused: the error names the ranks.
+pub(crate) fn agree_reserve_receipts<T: PartialEq + Clone + std::fmt::Debug>(
+    receipts: &[Option<T>],
+) -> Result<Option<T>, String> {
+    let Some(first) = receipts.first() else {
+        return Err("EP reserve receipts: no rank reported".to_string());
+    };
+    for (rank, other) in receipts.iter().enumerate().skip(1) {
+        if other != first {
+            return Err(format!(
+                "EP reserve receipt disagrees across ranks: rank 0 = {first:?}, rank {rank} = \
+                 {other:?}; publication refused (no rank may serve the ordinary path after the \
+                 reduced reserve was spent)"
+            ));
+        }
+    }
+    Ok(first.clone())
+}
+
 // ───────────────────────────────── fn-lanes ─────────────────────────────────
 
 use crate::lane::{LaneSpecConfig, LaneStoreReceipt, Qwen4LaneStore};
@@ -1492,7 +1819,10 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 /// Device bytes one rank's lane store commits, for `lanes` lanes at
 /// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
 /// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
-/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). An AR
+/// store's lane states hold no snapshot mirror
+/// ([`Qwen4LaneStore::state_mirror`]): the figure excludes it, exactly as
+/// `stage_lanes` allocates. The single
 /// source of the byte count: the loader's EP load reservation and
 /// `stage_rank_lanes` (and the single-device staging check) all call it, so
 /// planned and staged bytes cannot differ. `None` on overflow.
@@ -1829,6 +2159,52 @@ impl Qwen4Bundle {
             "force_lane_seed",
             |bundle| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
             &|bundle, _, _| bundle.force_lane_seed(epoch, token).map_err(bundle_text),
+        )
+        .map_err(BundleError::Forward)
+    }
+
+    /// [`Self::set_lanes_sampled`] on every rank's store (host only). Returns
+    /// nothing: a mesh failure or disagreement is logged (the mesh is
+    /// poisoned and the next replicated call reports it).
+    pub(crate) fn ep_set_lanes_sampled(&mut self, on: bool) {
+        let set = self.ep_lane_soft(
+            "set_lanes_sampled",
+            |bundle| {
+                bundle.set_lanes_sampled(on);
+                Ok(())
+            },
+            &|bundle, _, _| {
+                bundle.set_lanes_sampled(on);
+                Ok(())
+            },
+        );
+        if let Err(error) = set {
+            eprintln!("  qwen4 EP: set_lanes_sampled: {error}");
+        }
+    }
+
+    /// [`Self::set_lane_sampling`] on every rank: each rank's lane copy gets
+    /// the same sampler and the same RNG seed, and draws from its own state
+    /// in lockstep, so the ranks' host results (picks, advances) agree as
+    /// greedy picks do (`ep_lane_strict` compares them at `forward_step`). A
+    /// refusal every rank reports identically leaves the mesh usable.
+    pub(crate) fn ep_set_lane_sampling(
+        &mut self,
+        epoch: &RequestEpoch,
+        sampling: crate::lane::LaneSampling,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "set_lane_sampling",
+            |bundle| {
+                bundle
+                    .set_lane_sampling(epoch, sampling)
+                    .map_err(bundle_text)
+            },
+            &|bundle, _, _| {
+                bundle
+                    .set_lane_sampling(epoch, sampling)
+                    .map_err(bundle_text)
+            },
         )
         .map_err(BundleError::Forward)
     }
@@ -2268,6 +2644,86 @@ mod tests {
             None
         );
     }
+
+    /// The AR lane store a rank stages carries no snapshot mirror: the one
+    /// byte source the loader reserves and `stage_rank_lanes` checks shrinks
+    /// by exactly the mirror bytes of every lane, and an MTP store (never
+    /// staged by EP, but sized by the same call) keeps them.
+    #[test]
+    fn ep_lane_store_bytes_exclude_the_snapshot_mirror_of_ar_lanes() {
+        use crate::state::{Qwen4State, StateMirror};
+        use crate::weights::Qwen4BandScope;
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let (max_seq, chunk, granularity) = (16384usize, 256usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        assert_eq!(Qwen4LaneStore::state_mirror(None), StateMirror::Absent);
+        for gdn in [
+            crate::GdnStateFormat::F32,
+            crate::GdnStateFormat::Q8,
+            crate::GdnStateFormat::Q8Ef,
+        ] {
+            let format = Qwen4StateFormat {
+                qsa: crate::QsaKvFormat::Fp8,
+                gdn,
+                qsa_f16_arena: false,
+                qsa_pooled_bf16: false,
+            };
+            let with = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Snapshot,
+            )
+            .unwrap() as u64;
+            let without = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &context,
+                &single,
+                StateMirror::Absent,
+            )
+            .unwrap() as u64;
+            let mirror = with - without;
+            assert!(mirror > 0, "{gdn:?}");
+            let mut previous = 0u64;
+            for lanes in [1usize, 2, 4, 8] {
+                let budget = ep_lane_row_budget(4096, lanes);
+                let planned = ep_lane_store_device_bytes(
+                    &config,
+                    format,
+                    Qwen4KvBackend::Vmm,
+                    max_seq,
+                    chunk,
+                    granularity,
+                    lanes,
+                    budget,
+                    None,
+                )
+                .unwrap();
+                // Every lane charges its live state alone; the step buffers
+                // are the store's only other bytes.
+                let rows = 2 * lanes as u64;
+                let step = rows * (config.vocab_size as u64 * 4 + 4);
+                assert_eq!(planned, lanes as u64 * without + step, "{gdn:?} {lanes}");
+                // Lane by lane the saving over a snapshot-capable state.
+                assert_eq!(
+                    lanes as u64 * with + step - planned,
+                    lanes as u64 * mirror,
+                    "{gdn:?} {lanes}"
+                );
+                assert!(planned > previous);
+                previous = planned;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2310,5 +2766,363 @@ mod tile_verdict_tests {
         }
         assert!(agreed_tile_verdicts(&[]).is_none());
         assert!(agreed_tile_verdicts(&[Some(Vec::new()), Some(Vec::new())]).is_none());
+    }
+}
+
+/// P6 (EP reserve mesh entries): two-rank fake schedules over a real
+/// [`RankPool`] and an abortable fence standing in for the tile hook's host
+/// rendezvous. The fake follows DECISION.md §5: the first borrowed tile
+/// crosses the fence before any rank writes donors; the outermost prompt
+/// completion restores locally and crosses the fence before any rank reads
+/// restored (Full/clean) state; an aborted/forced end recovers locally
+/// without entering the fence.
+#[cfg(test)]
+mod reserve_schedule_tests {
+    use super::{agree_reserve_receipts, bracket_prompt};
+    use hipfire_runtime::rank_pool::{lock, RankPool};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    const RANKS: usize = 2;
+
+    /// Abortable all-rank rendezvous (the existing tile hook's host barrier).
+    struct Fence {
+        state: Mutex<(usize, u64, bool)>,
+        cv: Condvar,
+    }
+
+    impl Fence {
+        fn cross(&self) -> Result<(), String> {
+            let mut s = lock(&self.state);
+            if s.2 {
+                return Err("fence aborted".to_string());
+            }
+            s.0 += 1;
+            if s.0 == RANKS {
+                s.0 = 0;
+                s.1 += 1;
+                self.cv.notify_all();
+                return Ok(());
+            }
+            let generation = s.1;
+            while s.1 == generation && !s.2 {
+                s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            if s.1 == generation {
+                Err("fence aborted".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn abort(&self) {
+            lock(&self.state).2 = true;
+            self.cv.notify_all();
+        }
+    }
+
+    struct Mesh {
+        fence: Fence,
+        /// Ranks that have begun acquire (entered the initial fence).
+        entered: AtomicUsize,
+        resident: Mutex<[bool; RANKS]>,
+        restores: Mutex<[usize; RANKS]>,
+        fences_restore: Mutex<[usize; RANKS]>,
+        violations: Mutex<Vec<String>>,
+    }
+
+    impl Mesh {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                fence: Fence {
+                    state: Mutex::new((0, 0, false)),
+                    cv: Condvar::new(),
+                },
+                entered: AtomicUsize::new(0),
+                resident: Mutex::new([true; RANKS]),
+                restores: Mutex::new([0; RANKS]),
+                fences_restore: Mutex::new([0; RANKS]),
+                violations: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// First borrowed tile: peers must all be past their own last read of
+        /// the donor weights before any rank writes them.
+        fn acquire(&self, rank: usize) -> Result<(), String> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.fence.cross()?;
+            if self.entered.load(Ordering::SeqCst) != RANKS {
+                lock(&self.violations).push(format!("rank {rank} wrote before all entered"));
+            }
+            lock(&self.resident)[rank] = false;
+            Ok(())
+        }
+
+        /// `ep_reserve_require_resident`: a clean epoch is a no-op; otherwise
+        /// local restore, then the global fence, then a Full/clean reader may run.
+        fn require_resident(&self, rank: usize) -> Result<(), String> {
+            if lock(&self.resident)[rank] {
+                return Ok(());
+            }
+            lock(&self.resident)[rank] = true;
+            lock(&self.restores)[rank] += 1;
+            self.fence.cross()?;
+            lock(&self.fences_restore)[rank] += 1;
+            if lock(&self.resident).iter().any(|&clean| !clean) {
+                lock(&self.violations).push(format!("rank {rank} read before all restored"));
+            }
+            Ok(())
+        }
+
+        /// Failed/aborted end: local recovery only, never the aborted fence.
+        fn recover_local(&self, rank: usize) {
+            let mut resident = lock(&self.resident);
+            if !resident[rank] {
+                resident[rank] = true;
+                lock(&self.restores)[rank] += 1;
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Plan {
+        /// Nested whole-prompt entries per rank (outer wrapper + inner entries).
+        levels: usize,
+        /// Tiles that need the borrowed bank (0: tiny tail / resident-only).
+        borrowed_tiles: usize,
+        delay_acquire: [u64; RANKS],
+        delay_restore: [u64; RANKS],
+        /// `(rank, tile)` that fails.
+        fail: Option<(usize, usize)>,
+        panic_rank: Option<usize>,
+    }
+
+    impl Plan {
+        fn ar() -> Self {
+            Self {
+                levels: 3,
+                borrowed_tiles: 2,
+                delay_acquire: [0; RANKS],
+                delay_restore: [0; RANKS],
+                fail: None,
+                panic_rank: None,
+            }
+        }
+    }
+
+    fn nested(
+        mesh: &Mesh,
+        rank: usize,
+        depth: &mut usize,
+        levels: usize,
+        plan: Plan,
+    ) -> Result<(), String> {
+        bracket_prompt(
+            depth,
+            |depth| **depth += 1,
+            |depth| {
+                if levels > 1 {
+                    return nested(mesh, rank, depth, levels - 1, plan);
+                }
+                for tile in 0..plan.borrowed_tiles {
+                    if tile == 0 {
+                        std::thread::sleep(Duration::from_millis(plan.delay_acquire[rank]));
+                        mesh.acquire(rank)?;
+                    }
+                    if plan.panic_rank == Some(rank) {
+                        panic!("rank {rank} panicked in tile {tile}");
+                    }
+                    if plan.fail == Some((rank, tile)) {
+                        return Err(format!("rank {rank} tile {tile} failed"));
+                    }
+                }
+                Ok(())
+            },
+            |depth, ok| {
+                **depth -= 1;
+                if **depth != 0 {
+                    return Ok(());
+                }
+                if !ok {
+                    mesh.recover_local(rank);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(plan.delay_restore[rank]));
+                mesh.require_resident(rank)
+            },
+        )
+    }
+
+    struct Peer {
+        depth: usize,
+    }
+
+    fn pool(mesh: &Arc<Mesh>) -> RankPool<Peer> {
+        let inits = (1..RANKS)
+            .map(|_| {
+                Box::new(|_rank: usize| Ok(Peer { depth: 0 }))
+                    as Box<dyn FnOnce(usize) -> Result<Peer, String> + Send>
+            })
+            .collect();
+        let pool = RankPool::spawn("p6", inits, |_peer: Peer| Ok(())).expect("spawn");
+        let abort = mesh.clone();
+        pool.set_abort(move || abort.fence.abort());
+        pool
+    }
+
+    fn run(pool: &RankPool<Peer>, mesh: &Arc<Mesh>, plan: Plan) -> Result<Vec<()>, String> {
+        let mut depth0 = 0usize;
+        pool.run_all(
+            || nested(mesh, 0, &mut depth0, plan.levels, plan),
+            &|rank, peer: &mut Peer| nested(mesh, rank, &mut peer.depth, plan.levels, plan),
+        )
+    }
+
+    fn assert_clean(mesh: &Mesh) {
+        assert_eq!(*lock(&mesh.violations), Vec::<String>::new());
+    }
+
+    #[test]
+    fn delayed_rank_before_acquire_blocks_every_writer() {
+        for slow in 0..RANKS {
+            let mesh = Mesh::new();
+            let pool = pool(&mesh);
+            let mut plan = Plan::ar();
+            plan.delay_acquire[slow] = 60;
+            run(&pool, &mesh, plan).expect("prompt");
+            assert_clean(&mesh);
+            assert_eq!(*lock(&mesh.resident), [true; RANKS]);
+        }
+    }
+
+    #[test]
+    fn delayed_rank_before_restore_blocks_every_clean_reader() {
+        for slow in 0..RANKS {
+            let mesh = Mesh::new();
+            let pool = pool(&mesh);
+            let mut plan = Plan::ar();
+            plan.delay_restore[slow] = 60;
+            run(&pool, &mesh, plan).expect("prompt");
+            assert_clean(&mesh);
+            // Both ranks crossed the restore fence before returning.
+            assert_eq!(*lock(&mesh.fences_restore), [1; RANKS]);
+        }
+    }
+
+    #[test]
+    fn nested_entries_restore_once_at_the_outer_completion() {
+        let mesh = Mesh::new();
+        let pool = pool(&mesh);
+        // AR prefill_final over spec/MTP-style nesting: five nested entries.
+        let mut plan = Plan::ar();
+        plan.levels = 5;
+        plan.borrowed_tiles = 4;
+        run(&pool, &mesh, plan).expect("prompt");
+        assert_clean(&mesh);
+        assert_eq!(*lock(&mesh.restores), [1; RANKS]);
+        assert_eq!(*lock(&mesh.fences_restore), [1; RANKS]);
+        // The next prompt is a fresh epoch: its own acquire and exactly one
+        // more restore (depth balanced back to 0 on every rank).
+        mesh.entered.store(0, Ordering::SeqCst);
+        run(&pool, &mesh, plan).expect("second prompt");
+        assert_clean(&mesh);
+        assert_eq!(*lock(&mesh.restores), [2; RANKS]);
+    }
+
+    #[test]
+    fn tiny_tail_and_single_token_completion_are_clean() {
+        // A tail that never borrows: no acquire, no fence, resident throughout.
+        let mesh = Mesh::new();
+        let pool = pool(&mesh);
+        let mut plan = Plan::ar();
+        plan.borrowed_tiles = 0;
+        run(&pool, &mesh, plan).expect("tail");
+        assert_eq!(*lock(&mesh.restores), [0; RANKS]);
+        assert_eq!(*lock(&mesh.resident), [true; RANKS]);
+        // max_tokens = 1: one borrowed tile, restored before the entry returns
+        // (not deferred to a second token).
+        let mesh = Mesh::new();
+        let pool = self::pool(&mesh);
+        plan.borrowed_tiles = 1;
+        plan.levels = 1;
+        run(&pool, &mesh, plan).expect("one token");
+        assert_clean(&mesh);
+        assert_eq!(*lock(&mesh.resident), [true; RANKS]);
+        assert_eq!(*lock(&mesh.restores), [1; RANKS]);
+    }
+
+    #[test]
+    fn error_aborts_every_waiter_recovers_locally_and_stays_poisoned() {
+        for failing in 0..RANKS {
+            let mesh = Mesh::new();
+            let pool = pool(&mesh);
+            let mut plan = Plan::ar();
+            plan.fail = Some((failing, 1));
+            // The healthy rank would otherwise wait on the restore fence.
+            let error = run(&pool, &mesh, plan).expect_err("a rank failed");
+            assert!(error.contains("failed"), "{error}");
+            // Forced end recovery: every rank is back to resident, but no
+            // restore fence was crossed after the failure.
+            assert_eq!(*lock(&mesh.resident), [true; RANKS]);
+            assert_eq!(lock(&mesh.fences_restore)[failing], 0);
+            // Local recovery succeeded; the mesh stays poisoned.
+            assert!(pool.poisoned().is_some());
+            let again = run(&pool, &mesh, Plan::ar()).expect_err("poisoned");
+            assert!(again.contains("poisoned"), "{again}");
+            // Forced drains still reach the workers and do not unpoison.
+            pool.run_all_forced(|| Ok(()), &|_, _: &mut Peer| Ok(()))
+                .expect("forced run");
+            assert!(pool.poisoned().is_some());
+        }
+    }
+
+    #[test]
+    fn peer_panic_aborts_the_waiting_rank() {
+        let mesh = Mesh::new();
+        let pool = pool(&mesh);
+        let mut plan = Plan::ar();
+        plan.panic_rank = Some(1);
+        // Rank 0 reaches the restore... never: rank 1 dies after the acquire
+        // fence, so rank 0 must be released by the abort, not hang.
+        let error = run(&pool, &mesh, plan).expect_err("rank 1 panicked");
+        assert!(error.contains("panicked"), "{error}");
+        assert!(pool.poisoned().is_some());
+    }
+
+    #[test]
+    fn receipts_must_agree_or_all_be_absent() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct R {
+            digest: u64,
+            resident: usize,
+            chunk: usize,
+        }
+        let r = |digest, resident| R {
+            digest,
+            resident,
+            chunk: 4096,
+        };
+        // Ordinary load: nobody reserve-shares.
+        assert_eq!(agree_reserve_receipts::<R>(&[None, None]), Ok(None));
+        // Identical receipts publish.
+        assert_eq!(
+            agree_reserve_receipts(&[Some(r(7, 33)), Some(r(7, 33))]),
+            Ok(Some(r(7, 33)))
+        );
+        // Digest, boundary, or any-rank-absent disagreement refuses.
+        for receipts in [
+            [Some(r(7, 33)), Some(r(8, 33))],
+            [Some(r(7, 33)), Some(r(7, 32))],
+            [Some(r(7, 33)), None],
+            [None, Some(r(7, 33))],
+        ] {
+            let error = agree_reserve_receipts(&receipts).unwrap_err();
+            assert!(
+                error.contains("disagrees") && error.contains("rank 1"),
+                "{error}"
+            );
+        }
+        assert!(agree_reserve_receipts::<R>(&[]).is_err());
     }
 }

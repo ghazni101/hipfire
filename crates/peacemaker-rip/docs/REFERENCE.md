@@ -86,6 +86,8 @@ fn main() -> u32 { total(Pair { x: 4u32, y: 9u32 }) }
 
 `KernargLayout::new(size: u32) -> KernargLayout` sets total bytes, including padding; example `KernargLayout::new(16)`. `.pointer(name: str, offset: u32) -> KernargLayout` adds an eight-byte global pointer; example `.pointer("input", 0)`. `.hidden(name: str, offset: u32, size: u32, value_kind: str) -> KernargLayout` adds explicit-sized metadata; example `.hidden("count", 8, 4, "by_value")`. `.validate() -> Result<(), String>` checks layout bounds/overlap; example `layout.validate()?`. These are metadata, not argument loads; offsets and total size must match the host's packed argument bytes. Metadata kernarg alignment is eight bytes.
 
+For a shipped family, the host side of that agreement is not hand-packed: `crates/hipfire-kernel-abi` holds one `KernelAbiV1` per family layout (explicit fields and hidden words with offsets/widths/kinds, segment size/alignment, operand formats/access/alignment/extents, admitted domain, numeric contract, and per export: arch, pinned object SHA-256, block, dynamic and static LDS, grid). The `rdna-compute` launchers and `pm_loop` encode through `validate_invocation` → `encode_into`, which rejects a wrong arch/export/format/alignment/extent/domain/grid/block/LDS before enqueue; railgun builds its `LaunchRecord` from the same validated image and `railgun::contract::check_node` checks the authored node (and `KernelProgram::encode_kernarg_into` output) against the contract. `crates/rdna-compute/tests/kernel_abi_drift.rs` checks every contract against the generator's `KernelSpec`/`KernargLayout` and the committed object's metadata, with deliberately broken fixtures. Covered today: MQ6 int8 GEMM (PM and hipcc twins) and grouped symmetric-IU4 MoE (MQ4, E8P, W3). A contract is ABI agreement only, not numeric equivalence.
+
 `smem(b, dst: u8, len: u8, base: u8, off: u32) -> Result<(), String>` loads `len` dwords from the 64-bit pointer in `s[base:base+1]` plus byte offset `off`. Allowed widths are 1/2/4/8, emitting `s_load_b32/b64/b128/b256`; other widths return `SMEM width`. The **entire destination range must fit one live plan allocation**. Four separately planned SGPRs do not own a four-dword load.
 
 ```rip body
@@ -221,13 +223,14 @@ These signatures describe script values, which sometimes differ from the Rust ru
 | `join((r,s,...)) -> Result<Region>` | free-function spelling; `let rs = join((r,s))?;` |
 | `wg.split(r,first:usize) -> Result<(Region,Region)>` | split Free joined region at slot count, not byte offset; `let (r,s) = wg.split(rs,1)?;` |
 | `wg.ring(name,x,y) -> Result<Ring>` | consume distinct Free regions; `let g = wg.ring("pingpong",x,y)?;` |
-| `Ring::new(x,y) -> Ring` | ring construction over two Free regions (a bad region still errors, but the call returns the Ring itself: no `?`); `let g = Ring::new(x,y);` |
+| `Ring::new(x,y[,z[,w]]) -> Ring` | ring construction over two to four Free regions (depth 2, 3 or 4; a bad region still errors, but the call returns the Ring itself: no `?`); the first store goes to the first region; `let g = Ring::new(x,y);` or `let g = Ring::new(x,y,z);` |
 | `g.into_steady() -> Result<Ring>` | mark current buffer vacant for steady rotation; `let g = g.into_steady()?;` |
 | `wg.ring_steady(g) -> Result<Ring>` | same steady-ring operation; `let g = wg.ring_steady(g)?;` |
-| `g.cur_index(), g.next_index() -> usize` | current/next backing indices; `let i = g.cur_index();` |
+| `g.cur_index(), g.next_index(), g.depth() -> usize` | current/next backing indices (`next = (cur + depth - 1) % depth`) and the number of buffers; `let i = g.cur_index();` |
+| `g.starting_at(k) -> Ring` | on a fresh ring (nothing stored or published): buffer `k` takes the first store, so `next_index() == k`; refused (`before anything is published`) afterwards; `let g = g.starting_at(2);` |
 | `g.phases() -> (Phase,Phase)` | backing phases; `let phases = g.phases();` |
 | `r.phase() -> Phase` | Free/Writing/Published; `let phase = r.phase();` |
-| `prime(g[,d]), rotate(g[,d]), retire_cur(g[,d]) -> Transition` | ring barrier transitions; `let (g,) = wg.barrier((rotate(g,d),))?;` |
+| `prime(g[,d]), rotate(g[,d]), retire_cur(g[,d]), advance(g) -> Transition` | ring barrier transitions; `let (g,) = wg.barrier((rotate(g,d),))?;`. A depth-D ring (`D >= 3`) fills over `D - 1` barriers: `prime`, then `rotate` over the vacant current buffer (nothing to retire); a read of a vacant current buffer is refused. `advance(g)` stores nothing: it retires the current buffer and makes the published buffer after it current, and is refused unless one is published (a depth-2 ring never has one) |
 | `wg.relayout() -> Result<()>` | require all Free; invalidate old handles; `wg.relayout()?;` |
 
 Optional Drained tokens document the operation you waited for, but the driver also checks its tracked youngest store: old evidence cannot cover a newer store. Use the tokens returned by the latest operations. `signal/wait_arrived` are gfx1201 only; gfx11 has one `s_barrier`, so use `barrier`.
@@ -261,6 +264,7 @@ All closure methods below return Results. Closures return `Ok(...)` or propagate
 | `skip_if/skip_unless/wg_skip_if(c,label,state,\|w,st\| -> Result<S> {...}) -> Result<S>` | explicit script state input/output; `let st = wg.skip_if(c,".Lskip",st,\|w,st\| Ok(st))?;` |
 | `wg.exec_if(c,\|w\| -> Result<R> {...}) -> Result<R>` | EXEC all/none from SCC, then restored to all; wave scope; `wg.exec_if(c,\|w\| Ok(()))?;` |
 | `wg.if_else(c,else_label,join_label,then,els) -> Result<()>` | **true selects els**, false selects then; both receive w, return Result<()>; `wg.if_else(c,".Lelse",".Ljoin",\|w\| Ok(()),\|w\| Ok(()))?; wg.label(".Ljoin")?;` |
+| `wg.wg_if_else(c:WgCond,else_label,join_label,[state,]then,els) -> Result<S>` | workgroup-uniform two-way branch whose arms may hold barriers and change LDS ownership: **true selects els**, false selects then (which ends with `s_branch join`); each arm is `\|w[,st]\|`; the join label is placed by the call; both arms must end with the same LDS ownership shape and the same ring `cur` index and live buffers (else the call is refused, naming the difference); with `state` it returns the else arm's value; `let st = wg.wg_if_else(c,".Lelse",".Ljoin",st,\|w,st\| Ok(st),\|w,st\| Ok(st))?;` |
 | `wg.forward(\|w,fw\| -> Result<R> {...}) -> Result<R>` | forward-only wave branches; `wg.forward(\|w,fw\| { fw.goto(".Lf")?; fw.place(".Lf")?; Ok(()) })?;` |
 | `fw.branch_if(c,label), fw.branch_unless(c,label), fw.goto(label), fw.place(label) -> Result<()>` | every target placed once after branch; `fw.branch_if(c,".Lf")?;` |
 | `wg.loop_until(head,exit,\|w,brk\| -> Result<()> {...}) -> Result<()>` | wave-scope device loop; `wg.loop_until(".Lhead",".Lbreak",\|w,brk\| { let c = w.scmp(insn)?; w.break_if(c,brk) })?;` |
@@ -276,7 +280,7 @@ All closure methods below return Results. Closures return `Ok(...)` or propagate
 | `wg.handoff(readers:Cond,label,end,r,write,read) -> Result<R>` | final wave-role phase: write receives `(w,r)` and returns Result<()>; read receives `(w,r,exit)` and returns Result<R>; `wg.handoff(c,".Lread",end,r,\|w,r\| { let _ = w.begin_write(r); Ok(()) },\|w,r,exit\| Ok(()))?;` |
 | `wg.label(name:str) -> Result<()>` | straight-line lifetime boundary; `wg.label(".Lphase")?;` |
 
-Wave-scope bodies (`skip_if`, `exec_if`, `forward`, `if_else`, `loop_until`) cannot contain workgroup barriers or change the LDS ownership shape across joining paths. Workgroup-uniform skips must likewise restore the skipped path's ownership shape. Loops must have matching entry/back-edge ownership, including drain evidence; `loop_until` needs at least one `break_if`. `handoff` starts with a Free region, writers must leave it Writing, and the driver performs wait/publication, joins readers at the barrier and ends the kernel. Do not call `end` again after handoff.
+Wave-scope bodies (`skip_if`, `exec_if`, `forward`, `if_else`, `loop_until`) cannot contain workgroup barriers or change the LDS ownership shape across joining paths. Workgroup-uniform skips must likewise restore the skipped path's ownership shape; `wg_if_else` arms may instead change it, but must agree with each other at the join. Loops must have matching entry/back-edge ownership, including drain evidence; `loop_until` needs at least one `break_if`. `handoff` starts with a Free region, writers must leave it Writing, and the driver performs wait/publication, joins readers at the barrier and ends the kernel. Do not call `end` again after handoff.
 
 ```rip body
 sop(wg.isa(), "s_mov_b32 s12, 0", &[12], &[])?;
@@ -439,7 +443,7 @@ The [diagnostic reference](ERRORS.md) explains each stable code. R01xx is parsin
 
 ### Source map
 
-Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs`. Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
+Entry/evaluation: `src/lib.rs`, `interp.rs`, `ops.rs`, `builtin.rs`, `expand.rs`, `fmt.rs`, `preprocess.rs`. Script-native signatures: `src/native.rs` (production generators: `src/native_gen.rs`; the fine `iu4_gemm` K-loop natives: `src/native_kloop.rs`). Kernel/layout and ownership: `peacemaker-isa/src/plan.rs`, `reg.rs`, `emit.rs`. Instruction helpers and waits: `peacemaker-isa/src/kernels/common.rs`, `ledger.rs`. Driver state/control flow: `peacemaker-author/src/runtime.rs` (the typed-ring bridge `Lend`: `take`, `take_writing`, `give_writing`, `view`). Instruction spellings/operand widths: `peacemaker-ir/isa/gfx1100.tbl`, `gfx12.tbl`. ABI entry initialization: `peacemaker-ir/src/emu/mod.rs`.
 
 ## 13. Production generators: `iu4_gemm` and `qwen4_moe_sym`
 
@@ -447,11 +451,11 @@ The fast kernels are Rust generators. A script reaches them in two layers, neith
 
 ### Coarse natives
 
-The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, AddSigmoid, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}`, `Mma::{Dense, S24X64, S24X32}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
+The `Spec` enums are enum values, like a script's own unit enums: `Fold::{K128, K256Shared, K256Pow2}`, `Tile::{T128x128x8, T256x128x16}`, `Cacc::{One, Two}`, `Epi::{Set, Add, AddSigmoid, GateUpSilu, GateUpSiluBf16, QkvzaGdn}`, `ALayout::{Token, Slab}`, `Mma::{Dense, S24X64, S24X32}`, `RingDepth::{Two, Three}`, `FoldSched::{Paired, Chain}` (`iu4_gemm`) and `MoeKind::{GateUp, Down}`, `WeightCodec::{Mq4Sym, Mq3I4, E8pI4}` (`qwen4_moe_sym`; `MoeKind` is the Rust `qwen4_moe_sym::Kind`, renamed so it cannot clash with the `enum Kind` a script declares for its own variants). A script's own `enum Fold` (or any of these names) wins over the native one. `Arch` is the existing `Arch::Gfx1201`. The struct literals map one to one onto the Rust `Spec`; every field is required, and an unknown field is an error.
 
 | native | Rust | result |
 |---|---|---|
-| `Iu4Spec { fold, tile, cacc, epi, act, arch, mma }` | `iu4_gemm::Spec` | a spec value (`mma: Mma::Dense` is the shipped WMMA K-loop; `S24X64` / `S24X32` the 2:4-sparse SWMMAC K-loops) |
+| `Iu4Spec { fold, tile, cacc, epi, act, arch, mma [, ring] [, fold_sched] }` | `iu4_gemm::Spec` | a spec value (`mma: Mma::Dense` is the shipped WMMA K-loop; `S24X64` / `S24X32` the 2:4-sparse SWMMAC K-loops; the optional `ring: RingDepth::Two \| Three` is `Tune::ring`, the A/W payload rings' depth, default `Two`; the optional `fold_sched: FoldSched::Paired \| Chain` is `Tune::fold_sched`, default `Paired`: `Chain` makes `iu4::wmma` (fold) and `iu4::fold_scale` emit the chained fold and its `s_setprio 1`, for the dense k128 128x128x8 cacc1 K-loop at ring depth 2) |
 | `Iu4Gemm::emit(spec)` | `iu4_gemm::emit` | `Result<Emitted, String>` |
 | `Iu4Gemm::emit_module(fold, tile, cacc, act, arch)` | `iu4_gemm::emit_module` | `Result<(Vec<Emitted>, String, String), String>`: the symbols, the module text and its proof as JSON |
 | `MoeSymSpec { arch, kind, nt, rr, codec }` | `qwen4_moe_sym::Spec` | a spec value |
@@ -477,6 +481,7 @@ fn emit(spec: Spec) -> Result<Emitted, String> {
 | call | meaning |
 |---|---|
 | `gen.plan()?` | the kernel's `RegPlan` (a script may add ranges) |
+| `gen.payload_base(role, slot)?` | `u32`, the LDS byte offset of payload slab `slot` of the ring `role` (`PayloadRole::A` or `W`) names; refuses a slot the ring depth lacks (`payload_base(A, 2): the payload rings are 2 deep (slots 0..2)`, R0000) |
 | `gen.kernel_spec()` | the kernel's `KernelSpec` (symbol, kernargs, workgroup size) |
 | `gen.spec()` | the `Iu4Spec` |
 | `gen.reg("name")` | `Option<u8>`, the base of a physical register by name: `cacc acc magic d f0 f1 ds_nx sz_nx fr_a0 fr_a1 fr_w0 fr_w1 st_lds st_a meta_ds meta_sz ds_voff sz_voff sc_addr d_addr`, `a_pf<i> w_pf<i> st_w<i>`, SGPRs `karg srd_w srd_z srd_a0 srd_a1 srd_y step2 goff trips rs bs wave gpr136 mm1 hs tmp epi_s a_slab1`, kernel arguments `arg_a arg_u arg_gate arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy`; `None` for an unknown name or an absent optional register |
@@ -506,9 +511,66 @@ Each block is one checked `Driver::typed` call. The native takes the four rings 
 - any typed call under wave-uniform control (`skip_if`, `exec_if`, `if_else`, `forward`, `loop_until`), after a wave-uniform kernel exit, or on a target other than gfx1201 (the blocks are gfx1201-typed);
 - a typed body that leaves a taken ring out. After any `Err` from a typed call the lowering is dead, like any backend `Err`: stop at the first one.
 
-The fused per-WMMA fold stage stays inside `block`: it is interleaved within one instruction bundle. Exposing `fragments` / `bundle` / `publish_*` as separate natives is the next step if an experiment needs to change a block's inside; it uses the same bridge.
+A block's fold stage is two natives (`iu4::wmma(.., fold, ..)` interleaves stage 1 between the sub-block-1 WMMAs; `iu4::fold_scale` is stage 2): `iu4::block` is their composition with the fetches, publishes, waits and rendezvous in the generator's order, and the next section splits it.
 
 The committed twin [`iu4_gemm.rip`](../../peacemaker-isa/src/kernels/iu4_gemm.rip) composes `declare_lds`, `prologue`, a K-loop spelled out in script (`wg_skip_if` + `loop_carried` + `block` + `block_stepping` + `trip_end`, then the peeled pair) and `epilogue` / `gdn_epilogue`. Its variants are the shipped variant names (`k128-128x128x8-cacc1-slab-silu-bf16`; the grammar is in the file header). The sparse variants carry a trailing `-s24x64` / `-s24x32` (`k128-128x128x8-cacc1-set-s24x64`) and take the sparse blocks. A test (`tests/iu4_gemm_twin.rs`) requires its output to be byte-identical to `iu4_gemm::emit` for every valid spec, sparse included; [cookbook 11](cookbook/11-production-blocks.md) shows how to vary it.
+
+### `iu4_gemm` fine K-loop natives
+
+`iu4::block` and `iu4::sparse_block` are themselves compositions of finer typed steps, and a script can write the block with them ([cookbook 17](cookbook/17-iu4-kloop-natives.md); the committed [`iu4_gemm_fine.rip`](../../peacemaker-isa/src/kernels/iu4_gemm_fine.rip) writes the dense block (`fine_block`) and the 2:4-sparse blocks (`fine_sparse_block`) this way, the dense fragment loads as the script body `rip_fragments` over `iu4::fragments_body`, and emits the default-tune bytes for every variant; `WAIT = "window"` writes the 128x128x8 tile's rendezvous-window block the shipped 27B gate/up `_b1s` export runs). So the order of fetches, publishes, waits and WMMA groups is a script choice. The natives are the `iu4_gemm::blocks` functions `kloop::block_with` / `kloop::sparse_block_with` are composed of (`iu4::fragments_body` is the exception: it replays a script-built body); each takes `wg` and the generator first. Ring states are `[current, next]` per ring: `Published`/`Free` at a block boundary.
+
+| call | rings in -> out (A W DS SZ) | meaning |
+|---|---|---|
+| `iu4::block_begin(wg, gen, tag, h, end_label, entry_label, lds)?` | none changed | places the block's label (`entry_label`) and declares its register lifetimes (fragments, the fold's scale rows and products; `.Liu4_<tag>_s0` / `_s1` and `end_label` close them); refuses a plane the rings are not on (A current slot 0, DS current plane `h`) and a sparse spec; returns `lds` |
+| `iu4::fetch_slab1(wg, gen, h)?` | none | the slab-1 loads of block `h` into the prefetch registers |
+| `iu4::fetch_slab1_next_group(wg, gen)?` | none | the odd block's form: the next group's even block, before the group offset advances |
+| `iu4::fetch_next(wg, gen, h)?` | none | the next block's slab 0 into the prefetch registers |
+| `iu4::fetch_next_meta(wg, gen, h)?` | none | the next block's token scale and packed row header |
+| `iu4::publish_slab(wg, gen, lds)?` | A, W: `Published`/`Free` -> `Published`/`Writing`, pending | the weight sign flip and the LDS stores of the staged slab into the next buffers |
+| `iu4::publish_meta(wg, gen, lds)?` | DS, SZ: `Published`/`Free` -> `Published`/`Writing`, pending | the next block's token scale and converted row scale |
+| `iu4::wait(wg, lds, set)?` | `Writing`, pending -> `Writing`, drained | the counter wait for `"slab"` (A, W), `"meta"` (DS, SZ) or `"all"`; returns the tuple of `Drained` tokens in ring order |
+| `iu4::fragments_body(wg, gen, lds, loads)?` | A, W current `Published` (next both `Free` or both `Writing`, token preserved; depth 2 or 3), unchanged | replays the script's `loads` (a `Vec<NativeLoad>`) in order, each through the typed `ds_load_cur` of the ring its role names (dense spec; a sparse spec is refused) |
+| `iu4::d_loads(wg, gen, lds)?` | DS current `Published`, unchanged | phase B's token-scale loads |
+| `iu4::scale_loads(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s0`, then the first three row-scale loads (dense spec) |
+| `iu4::scale_tail(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s1`, then the last row-scale load (dense spec) |
+| `iu4::wmma(wg, gen, sb, first, fold, lds)?` | A, W current `Published`, unchanged | the eight WMMAs of 32-K sub-block `sb` (0 or 1); `first` seeds the accumulators, `fold` interleaves the fold's stage 1 (dense spec) |
+| `iu4::fold_scale(wg, gen)?` | none | the fold's stage 2 |
+| `iu4::publish_slab_set(wg, gen, set, lds)?` | as `publish_slab`; the current buffers may also be `Free` (a ring still filling) | `publish_slab` of prefetch set `set` (ring depth 3: set 0 holds the next block's slab 0, set 1 its slab 1) |
+| `iu4::fetch_ahead(wg, gen, h, slab)?` | none | ring depth 3: slab `slab` of the block one group on, plane `h`, into prefetch set `slab` |
+| `iu4::fetch_slab(wg, gen, set, slab, desc, woff)?` | none | slab `slab` of the block whose activation descriptor is `srd_a[desc]` and weight offset `woff` (from the group offset), into prefetch set `set` |
+| `iu4::setup(wg, gen, end)?` | none | ring depth 3: the prologue without its ring part (arguments .. block 0's three fetches, accumulators cleared) |
+| `iu4::split_trips(wg, gen)?`, `iu4::ring_cmp(wg, gen, v)?` | none | ring depth 3: `n = K/256 - 1` into `q = n / 3` loop trips and `r = n mod 3` leading groups; the `WgCond` `r != v` for `wg.wg_if_else` |
+| `iu4::group_end(wg, gen, count)?` | none | ring depth 3: a group's trip end (the group offset advances; `count` also drops the trip counter) |
+| `iu4::sparse_block_begin(wg, gen, tag, h, end_label, entry_label, lds)?` | none changed | `block_begin` of the 2:4-sparse K-loop: the label and the register lifetimes of the spec's SWMMAC form (x64: fragments end at `_s0`; x32: the W and index registers end at `_s1`); sparse spec only |
+| `iu4::sparse_fragments(wg, gen, lds)?` | A, W current `Published`, unchanged | `s24x64`: the W loads and the eight `ds_load_b64` B operands of the slab; `s24x32`: the dense fragment loads |
+| `iu4::sparse_wmma(wg, gen, sb, first, fold, lds)?` | A, W current `Published`, unchanged | the eight SWMMACs in bundle order: `s24x32` sub-block `sb` (0 or 1), `s24x64` the one K64 bundle (`sb = 0`; 1 is refused); `first` seeds each accumulator with `magic8`, `fold` interleaves the fold's stage 1 |
+| `iu4::sparse_scale_loads(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | places `.Liu4_<tag>_s0`, then the row-scale loads: `s24x64` all four (after its one bundle), `s24x32` the first two (between its sub-blocks) |
+| `iu4::sparse_scale_tail(wg, gen, tag, lds)?` | SZ current `Published`, unchanged | `s24x32` only: places `.Liu4_<tag>_s1`, then the last two row-scale loads; `s24x64` has no `_s1` and is refused |
+
+`iu4::step_descriptor(wg, gen, which)?` (above) is the descriptor step. The publishes, waits, fetches, `d_loads` and `fold_scale` do not depend on the matrix instruction and serve both K-loops; the `fragments_body` / `wmma` / `scale_*` / `block_begin` steps are paired with their `iu4::sparse_*` twins, and a dense step on a sparse spec (or the reverse) is refused before anything is emitted. The rendezvous is the generic driver's: `wg.barrier((rotate(lds[0], da), rotate(lds[1], dw)))?` rotates the drained slab (retires the current buffer, publishes the next one), `wg.signal((rotate(..), ..))?` / `wg.wait_arrived(arrived)?` split it. `fetch_*`, `fold_scale`, `wmma`, `sparse_wmma` and `step_descriptor` emit through the builder, so they may sit between `signal` and `wait_arrived`, where a `typed` call is refused.
+
+`PayloadRole::{A, W}` and `NativeLoad { role, insn }` are built-in (no declaration). `fragments_body` lends the A and W rings in their state, replays each load through the ring its role names (the role maps to the sealed `PayA` / `PayW` tag; a script cannot make a tagged ring) and gives them back. Its capability is a read of the payload rings: every `insn` must be an LDS load (a `ds_load*` mnemonic with `MemoryClass::DsLoad`) whose declared defs and uses cover the decoded operands (R0603), and every destination register needs a unique live owner in the plan (R0401). All refusals come before anything is emitted. The committed twin's `rip_fragments` is the dense body (six loads per block, built from `gen.payload_base`, `gen.reg("f0")` etc.): edit it, no rebuild.
+
+What the driver refuses, each a build error with a stable code ([ERRORS.md](ERRORS.md)):
+
+| rule | refusal | code | test |
+|---|---|---|---|
+| publish into a buffer that is not `Free` | `iu4::publish_slab: ring .. next buffer is Writing ..` | R0399 | `publish_into_a_non_free_buffer_is_refused` |
+| rotate before the wait | `barrier would publish .. with an undrained LDS store` | R0301 | `rotating_before_the_wait_is_refused` |
+| wait with no store in flight | `wait on ring ..: no store of this wave is in flight` | R0399 | `waiting_without_a_publish_is_refused` |
+| read or WMMA of an unpublished slot | `iu4::fragments_body: ring .. current buffer is Free, not published` (via `rip_fragments`) | R0303 | `reading_or_wmma_of_an_unpublished_slot_is_refused` |
+| a ring of the wrong kind / one the script made | the typed lend's tag check | R0399 | `a_ring_of_the_wrong_kind_is_refused_by_the_fine_natives`, `a_ring_the_script_made_cannot_enter_the_fine_natives` |
+| a fine step under wave-uniform control | `.. is workgroup scope` | R0304 | `a_fine_step_under_wave_uniform_control_is_refused` |
+| a loop trip that leaves a publish in flight | the driver's loop rule | R0399 | `a_trip_that_leaves_a_publish_in_flight_is_refused` |
+| a dense step on a sparse spec, a sparse step on a dense one | `iu4::fragments_body: the spec is s24x64: a dense step cannot run in the sparse K-loop ..` / `iu4::sparse_fragments: the spec is dense ..` | R0000 | `a_fine_step_of_the_other_mma_family_is_refused` |
+| a second sub-block (or `_s1` scale tail) of an `s24x64` block | `sparse wmma group: sub-block 1: .. covers the whole K64 slab` | R0000 | `an_x64_block_has_no_second_sub_block` |
+| a sparse read or SWMMAC group of an unpublished slot | `iu4::sparse_fragments: ring .. not published` | R0303 | `a_sparse_read_or_wmma_of_an_unpublished_slot_is_refused` |
+| payload rings in different states | `iu4::fragments_body: .. different states ..` | R0000 | `the_script_fragments_body_keeps_the_typed_refusals` |
+| a non-load in a body | `iu4::fragments_body: load i .. is not an LDS load: a fragments body only reads the payload rings` | R0399 | `a_fragments_body_outside_its_capability_is_refused` |
+| a load whose defs/uses miss a decoded operand | `iu4::fragments_body: load i: op declares defs ..` | R0603 | `a_fragments_body_outside_its_capability_is_refused` |
+| a destination register with no unique live owner | `v[240:243] at .Liu4_m0 has no unique live owner` | R0401 | `a_fragments_body_outside_its_capability_is_refused` |
+
+(The tests are in `tests/iu4_gemm_fine_twin.rs`; `the_fine_sparse_composition_emits_the_shipped_bytes` requires `fine_sparse_block` to emit the bytes and proof of `iu4_gemm::emit` for every sparse variant, and `the_fine_composition_emits_the_shipped_bytes` the dense ones.) The opaque `iu4::sparse_block` / `iu4::sparse_block_stepping` remain and call the same composition. A sparse spec admits the shipped wait placement only (`WaitPlace::AfterMma`) and ring depth 2 only. The payload rings are two deep by default; `const RING = 3` in the twin builds the dense depth-3 K-loop from these natives plus the typed ring's `starting_at`, `advance` and `wg.wg_if_else` ([cookbook 17](cookbook/17-iu4-kloop-natives.md#ring-depth-3)).
 
 ### 2:4-sparse weights (`Mma::S24X64`, `Mma::S24X32`)
 
@@ -528,15 +590,17 @@ Geometry (128 rows x 128 tokens x 8 waves), the LDS layout, the register map and
 
 | call | meaning |
 |---|---|
-| `Mq6Gemm::emit(Mq6Spec { epi, raster, tile, arch })?` | what `mq6_i8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only) |
+| `Mq6Gemm::emit(Mq6Spec { epi, raster, tile, arch[, ring] })?` | what `mq6_i8_gemm::emit` returns (`Emitted`); `Spec::validate` stays the gate (gfx1201 only) |
 | `Mq6Gemm::emit_module(arch)?` | `(Vec<Emitted>, text, proof_json)` of the product module (both epilogue symbols, banded raster) |
 | `Mq6Epi::{Set, SetBf16}`, `Raster::{Banded, Linear}`, `Mq6Tile::{T128x128, T256x128, T128x256}` | the spec enums (script enum values). `Linear` is the CPU-interpreter twin's raster. The tile is the CTA's weight rows x tokens: `T128x128` is the shipped 8-wave tile (256 threads, 36864 B LDS); the other two run 16 waves (512 threads, 55296 B LDS) of the same 32 x 64 per-wave tile, so they stay at the 192-VGPR ceiling |
 | `Mq6Gen::new(Mq6Spec { .. })?` | the generator of one valid spec: an opaque value with read-only accessors |
 | `gen.plan()?`, `gen.kernel_spec()`, `gen.spec()` | the `RegPlan`, the `KernelSpec`, the `Mq6Spec` |
+| `gen.depth()`, `gen.pf_set(0 or 1)?` | the A/W ring depth (2 or 3); the generator with raw prefetch set 0 / 1 in the `a_pf` / `w_pf` slots (set 1 exists at depth 3) |
 | `gen.a_rounds()`, `gen.w_rounds()` | staging rounds per 64-K slab of the tile's activations / weights: 2 / 2 on `T128x128`, 1 / 2 on `T256x128`, 2 / 1 on `T128x256`. A tile with one weight round has no second decode / store; `gen.reg("a_pf1")` / `reg("w_pf1")` are `None` for the round it lacks |
 | `gen.reg("name")` | `Option<u8>`, a physical register base by name: VGPRs `cacc acc f0 f1 tok msn a_pf0 a_pf1 w_pf0 w_pf1 ds_nx sz_nx fr_a fr_w st_alds st_wlds st_a st_w meta_lds ds_voff sz_voff sc_addr d_addr scratch fold_sc fold_zp fold_t`, SGPRs `karg srd_w srd_a0 srd_a1 srd_y step2 goff goff1 trips rs bs wave gpr200 omask tmp epi_s`, kernel arguments `arg_a arg_xq arg_y arg_m arg_k arg_n arg_bcx arg_bcy` |
-| `gen.slot("A0")` | `Option<(base, bytes)>` of an LDS slot: `A0 W0 A1 W1 DS0 DS1 SZ0 SZ1` |
-| `mq6::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END`, `mq6::GROUP_BYTES` | the label constants (strings) and the MQ6G256V2 group size (200) |
+| `gen.slot("A0")` | `Option<(base, bytes)>` of an LDS slot: `A0 W0 A1 W1 DS0 DS1 SZ0 SZ1` (and `A2 W2` at depth 3) |
+| `mq6::ring3_split`, `mq6::ring3_cmp_insn`, `mq6::group_end`, `mq6::trips_dec` | the depth-3 K split (`r` to `tmp`, `q` to the trip counter), its arm-selector compare, the group-offset move and the trip decrement |
+| `mq6::ENTRY K_BEGIN K_LOOP K_LOOP_END EPI END ARM12 ARM12_END ARM2 K_ARMS_END`, `mq6::GROUP_BYTES` | the label constants (strings) and the MQ6G256V2 group size (200) |
 | `mq6::label(tag)`, `mq6::tail_label(h)` | `.Lmq6i8_<tag>`, `.Lmq6i8_t<h>` |
 
 ### Blocks

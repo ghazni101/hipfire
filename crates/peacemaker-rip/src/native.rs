@@ -198,6 +198,7 @@ pub(crate) const COMMON_FNS: &[&str] = &[
     "rotate",
     "prime",
     "retire_cur",
+    "advance",
     "join",
 ];
 pub(crate) const ASSOC_FNS: &[&str] = &[
@@ -249,6 +250,7 @@ pub(crate) const WORKGROUP_METHODS: &[&str] = &[
     "exec_if",
     "forward",
     "if_else",
+    "wg_if_else",
     "loop_until",
     "break_if",
     "loop_carried",
@@ -1111,11 +1113,13 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
         }
         "Workgroup::new" => Err("`Workgroup::new(&mut b, arch)?` must be the initializer of a `let` statement: the rest of that block runs inside the driver scope".into()),
         "Ring::new" => {
-            need(2)?;
-            let (x, y) = (region_of(it, &a[0])?, region_of(it, &a[1])?);
+            if !(2..=4).contains(&a.len()) {
+                return Err(format!("`Ring::new` takes 2 to 4 LDS regions (a depth-2 to depth-4 ring), found {}", a.len()).into());
+            }
+            let regions: Vec<RegionId> = a.iter().map(|v| region_of(it, v)).collect::<Res<_>>()?;
             let d = driver(cx)?;
             let n = format!("ring@{}", d.position());
-            Ok(Value::Nat(Nat::Ring(d.ring(&n, x, y)?)))
+            Ok(Value::Nat(Nat::Ring(d.ring_n(&n, &regions)?)))
         }
         "join" => {
             let parts: Vec<RegionId> = if a.len() == 1 { handles(it, &a[0]).iter().map(|v| region_of(it, v)).collect::<Res<_>>()? } else { a.iter().map(|v| region_of(it, v)).collect::<Res<_>>()? };
@@ -1138,7 +1142,7 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             let r = region_of(it, &a[0])?;
             Ok(nat(Nat::Trans(if name == "ready" { Transition::Ready(r) } else { Transition::Retire(r) })))
         }
-        "rotate" | "prime" | "retire_cur" => {
+        "rotate" | "prime" | "retire_cur" | "advance" => {
             if a.is_empty() || a.len() > 2 {
                 return Err(format!("`{name}` takes a ring (and its Drained token)").into());
             }
@@ -1149,6 +1153,7 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             Ok(nat(Nat::Trans(match name {
                 "rotate" => Transition::Rotate(g),
                 "prime" => Transition::Prime(g),
+                "advance" => Transition::Advance(g),
                 _ => Transition::RetireCur(g),
             })))
         }
@@ -1612,6 +1617,15 @@ pub fn method<'a>(
             }
             "cur_index" => Some(Value::usize(driver(cx)?.cur_index(*g)?)),
             "next_index" => Some(Value::usize(driver(cx)?.next_index(*g)?)),
+            "depth" => Some(Value::usize(driver(cx)?.ring_depth(*g)?)),
+            "starting_at" => {
+                if a.len() != 1 {
+                    return Err("`ring.starting_at(k)` takes the index of the buffer that takes the first store".into());
+                }
+                let k = usize_of(it, &a[0], "ring.starting_at")?;
+                driver(cx)?.ring_start_at(*g, k).map_err(Ctl::Err)?;
+                Some(nat(Nat::Ring(*g)))
+            }
             "phases" => {
                 let (c, nx) = driver(cx)?.ring_phases(*g)?;
                 Some(Value::Tuple(vec![nat(Nat::Phase(c)), nat(Nat::Phase(nx))]))
@@ -1939,6 +1953,49 @@ fn wg_method<'a>(
             drop(cb_cell);
             return finish_cb(cb, r, Value::Unit).map(Some);
         }
+        "wg_if_else" => {
+            if !(5..=6).contains(&a.len()) {
+                return Err(
+                    "`wg_if_else(cond, else_label, join, [state,] |w[, st]| then, |w[, st]| els)`"
+                        .into(),
+                );
+            }
+            let (c, el, jn) = (
+                wgcond_of(&a[0])?,
+                str_of(it, &a[1], "else label")?,
+                str_of(it, &a[2], "join label")?,
+            );
+            let state = (a.len() == 6).then(|| a[3].clone());
+            let (t, e) = (a[a.len() - 2].clone(), a[a.len() - 1].clone());
+            let mut cb = Cb { fail: None };
+            let cb_cell = RefCell::new(&mut cb);
+            let out = RefCell::new(Value::Unit);
+            let args_of = || {
+                let mut v = vec![wgv()];
+                v.extend(state.clone());
+                v
+            };
+            let r = driver(cx)?.wg_if_else(
+                c,
+                &el,
+                &jn,
+                &mut |d| {
+                    run_cb(it, &t, args_of(), d, None, None, &mut cb_cell.borrow_mut()).map(|_| ())
+                },
+                &mut |d| {
+                    let v = run_cb(it, &e, args_of(), d, None, None, &mut cb_cell.borrow_mut())?;
+                    *out.borrow_mut() = v;
+                    Ok(())
+                },
+            );
+            drop(cb_cell);
+            let keep = if state.is_some() {
+                out.into_inner()
+            } else {
+                Value::Unit
+            };
+            return finish_cb(cb, r, keep).map(Some);
+        }
         "loop_until" => {
             need!(3);
             let (head, exit, f) = (
@@ -2091,8 +2148,9 @@ fn wg_method<'a>(
 fn transition_result<'a>(t: &Transition) -> Value<'a> {
     match *t {
         Transition::Ready(r) | Transition::Retire(r) => nat(Nat::Region(r)),
-        Transition::Rotate(g) | Transition::Prime(g) | Transition::RetireCur(g) => {
-            nat(Nat::Ring(g))
-        }
+        Transition::Rotate(g)
+        | Transition::Prime(g)
+        | Transition::RetireCur(g)
+        | Transition::Advance(g) => nat(Nat::Ring(g)),
     }
 }

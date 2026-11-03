@@ -13,6 +13,10 @@ path = "src/bin/peacemaker.rs"
 required-features = ["toolchain"]
 
 [[example]]
+name = "hip_twin"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]
 
@@ -46,6 +50,10 @@ required-features = ["toolchain"]
 
 [[example]]
 name = "mq_i4_moe_gemv_mq4only_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq6_resid_gfx1100_emit"
 required-features = ["toolchain"]
 
 # gfx1100 research probes / fixture emitters (native writer only, no ROCm tools): opt-in `--features lab`.

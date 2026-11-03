@@ -1126,6 +1126,10 @@ impl KernelKey {
             // RDNA3/RDNA4 parts as integer WMMA. qt 58/59 still have no kernel.
             IU4G256 => ArchPredicate::HasWmma,
             IU8G256 | IU8G32 => ArchPredicate::Always,
+            // ggml block formats (GGUF-native, no kernel yet): no key resolves
+            // them, so resolution fails with MissingImpl; explicit so a future
+            // ggml route has to decide its arch gate.
+            GgmlQ4K | GgmlQ5K | GgmlQ6K | GgmlQ8_0 | GgmlIQ4XS => ArchPredicate::Always,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

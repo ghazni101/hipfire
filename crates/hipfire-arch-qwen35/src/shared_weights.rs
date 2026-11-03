@@ -189,18 +189,24 @@ dtype_table! {
     FP8E4M3PT = 52,
     MQ3I4G128R256 = 53, MQ3I4G128R128 = 54, MQ2I4G128R256 = 55, MQ2I4G128R128 = 56,
     E8PI4G128R256 = 57, E8PI4G128R128 = 58, ParoQ4G64 = 59,
-    IU4G256 = 60, IU8G256 = 61, IU8G32 = 62,
+    // GGUF block formats (additive tags; no export route produces them yet).
+    GgmlQ4K = 60, GgmlQ5K = 61, GgmlQ6K = 62, GgmlQ8_0 = 63, GgmlIQ4XS = 64,
+    // IU integer operand layouts (feature branch; distinct from GGUF tags).
+    IU4G256 = 65, IU8G256 = 66, IU8G32 = 67,
 }
 
-fn embd_tag(f: EmbeddingFormat) -> u8 {
-    match f {
+fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
+    Ok(match f {
         EmbeddingFormat::F32 => 1,
         EmbeddingFormat::Q4K => 2,
         EmbeddingFormat::HFQ4G256 => 3,
         EmbeddingFormat::HFQ4G128 => 4,
         EmbeddingFormat::Q8_0 => 5,
         EmbeddingFormat::IU8G32 => 6,
-    }
+        EmbeddingFormat::Ggml(_) => return Err(SharedWeightError::unsupported(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
+    })
 }
 
 fn embd_from_tag(tag: u8) -> Option<EmbeddingFormat> {
@@ -305,6 +311,7 @@ pub fn resolve_dense_flags(gpu: &Gpu, config: &Qwen35Config) -> SwResult<DenseRe
 pub fn apply_source_dispatch_flags(gpu: &mut Gpu, hfq: &HfqFile) -> bool {
     let symmetric = hfq.mq4v2_symmetric();
     gpu.mq4v2_symmetric = symmetric;
+    gpu.mq3v2_symmetric = hfq.mq3v2_symmetric();
     symmetric
 }
 
@@ -603,7 +610,7 @@ pub fn encode_dense_seal(flags: &DenseRecipeFlags, seal: &Qwen35RankSeal) -> SwR
     e.bool(flags.gdn_fold_gfx12);
     e.bool(flags.gdn_fold_gfx11);
     e.bool(flags.lm_head_f32);
-    e.u8(embd_tag(seal.embd_format));
+    e.u8(embd_tag(seal.embd_format)?);
     e.bool(seal.lm_head_aliases_embd);
     e.gtd(&seal.token_embd)?;
     e.gtd(&seal.output_norm)?;
@@ -2654,6 +2661,9 @@ fn import_inner(
     let meta = decode_dense_seal(&manifest.dispatch_metadata)?;
     // Same stamp model_load applies before a load; predicates read it.
     gpu.mq4v2_symmetric = meta.flags.mq4v2_symmetric;
+    // The dense recipe carries no qt49 provenance: imported weights run with
+    // the symmetric MQ3V25 A4/A8 route closed (matches the hydrated marker).
+    gpu.mq3v2_symmetric = false;
     let plan = plan_import(gpu, config, manifest, lease.allocation_fds().len(), meta)?;
 
     // ── map: one allocation per unique owner ──

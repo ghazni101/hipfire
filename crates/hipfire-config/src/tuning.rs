@@ -399,7 +399,7 @@ pub fn plan(preset: Preset, ctx: &ArchCtx, env: &PlanEnv) -> TuningPlan {
                 }
                 None => {}
             }
-            if matches!(arch, "gfx1151" | "gfx1201") {
+            if matches!(arch, "gfx1151" | "gfx1201" | "gfx1100") {
                 lines.push(experts_line(arch, a8));
             }
             if arch == "gfx1151" {
@@ -1235,9 +1235,24 @@ mod tests {
                 &["kernel.iu4_prefill", sym],
                 &[EFFORT_KEY],
             ),
-            ("gfx1100", NotLanded, &["kernel.iu4_prefill"], &[EFFORT_KEY]),
-            ("gfx1100", OptIn, &["kernel.iu4_prefill"], &[EFFORT_KEY]),
-            ("gfx1100", DefaultOn, &["kernel.iu4_prefill"], &[EFFORT_KEY]),
+            (
+                "gfx1100",
+                NotLanded,
+                &["kernel.iu4_prefill", sym],
+                &[EFFORT_KEY],
+            ),
+            (
+                "gfx1100",
+                OptIn,
+                &["kernel.iu4_prefill", sym],
+                &[EFFORT_KEY],
+            ),
+            (
+                "gfx1100",
+                DefaultOn,
+                &["kernel.iu4_prefill", sym],
+                &[EFFORT_KEY],
+            ),
             ("gfx1030", NotLanded, &[], &[EFFORT_KEY]),
             ("gfx1030", OptIn, &[], &[EFFORT_KEY]),
             ("gfx1030", DefaultOn, &[], &[EFFORT_KEY]),

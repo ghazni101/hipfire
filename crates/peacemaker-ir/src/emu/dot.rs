@@ -34,7 +34,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
             m.op_sel, m.op_sel_hi
         ));
     }
-    let mut out = [None::<u32>; 32];
+    let mut out = [None::<u32>; 64];
     match name {
         "v_dot4_i32_iu8" | "v_dot8_i32_iu4" => {
             // GFX1201 probe: NEG[2] and NEG_HI have no effect on the integer dots; unmeasured elsewhere.
@@ -55,7 +55,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
                     v
                 }
             };
-            for lane in (0..32).filter(|l| s.exec >> l & 1 != 0) {
+            for lane in (0..s.lanes).filter(|l| s.exec >> l & 1 != 0) {
                 let (a, b, c) = (
                     s.read(&o[1], lane, 0)?,
                     s.read(&o[2], lane, 0)?,
@@ -107,7 +107,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
                 }
                 e
             };
-            for lane in (0..32).filter(|l| s.exec >> l & 1 != 0) {
+            for lane in (0..s.lanes).filter(|l| s.exec >> l & 1 != 0) {
                 let (a, b, mut c) = (
                     s.read(&o[1], lane, 0)?,
                     s.read(&o[2], lane, 0)?,
@@ -187,7 +187,9 @@ mod tests {
         let mut st = State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            nan_loose: false,
             exec: 1,
             vcc: 0,
             scc: false,
@@ -196,6 +198,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         };
         (st.v[1][0], st.v[2][0], st.v[3][0]) = (s0, s1, c);
         st.v[0][1] = 0x1234; // inactive lane keeps its destination
@@ -321,7 +324,9 @@ mod tests {
         let mut st = State {
             s: [0; 106],
             t: [0; 16],
-            v: Box::new([[0; 32]; 256]),
+            v: Box::new([[0; 64]; 256]),
+            lanes: 32,
+            nan_loose: false,
             exec: 1,
             vcc: 0,
             scc: false,
@@ -330,6 +335,7 @@ mod tests {
             ended: false,
             barrier: None,
             signals: 0,
+            scratch: Vec::new(),
         };
         (st.v[1][0], st.v[2][0], st.v[3][0]) = (s0, s1, c);
         execute(arch, name, &i, &mut st).map(|_| st.v[0][0])

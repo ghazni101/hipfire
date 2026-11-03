@@ -159,6 +159,7 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
         EmbeddingFormat::Q8_0 => DType::Q8_0,
         EmbeddingFormat::IU8G32 => DType::IU8G32,
         EmbeddingFormat::F32 => DType::F32,
+        EmbeddingFormat::Ggml(dtype) => dtype,
         EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
     }
 }
@@ -814,6 +815,13 @@ pub(crate) fn decode_raw_codec(
                 &format!("{error} (caller: {name}){BLOB_FIX}"),
             ));
         }
+    }
+    if codec.dtype == DType::HFQ4G128 {
+        // Same per-row extent the weight_store manifest paths enforce: a
+        // pre-`b4846285e` file packs groups across rows and decodes to NaN.
+        crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
+            |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
+        )?;
     }
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;

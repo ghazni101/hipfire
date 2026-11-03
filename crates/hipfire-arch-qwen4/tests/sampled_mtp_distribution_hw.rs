@@ -105,9 +105,10 @@
 //! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm.
 //! These arms follow the product switch: `copy` is
 //! `hipfire_config::mtp_ngram_copy_enabled_for_arch` of the loaded GPU
-//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by default:
-//! the native-MTP n-gram takeover; `HIPFIRE_MTP_NGRAM_COPY=on` runs them on
-//! the copy lane). The mode is recorded as `copy_lane` in every arm's config,
+//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`; `auto` is the
+//! copy lane on gfx1151 / gfx1201 and the native-MTP 5/3/3 takeover elsewhere;
+//! `HIPFIRE_MTP_NGRAM_COPY=off` runs them on the 5/3/3 pool, `on` on the copy
+//! lane). The mode is recorded as `copy_lane` in every arm's config,
 //! and the parent resolves it from each arm's receipt GPU, so ids of one mode
 //! are never reused as the other's:
 //!
@@ -253,6 +254,82 @@
 //! run `sampled_mtp_late_arm` directly per shard / per arm (`late_ar`,
 //! `late_adaptive`) to fit fabric holds, then the aggregate test reuses every
 //! config-verified shard and runs only the missing ranges.
+//!
+//! # PP2 topology arms (sampled Leviathan MTP under `topology.pp`)
+//!
+//! `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2` runs the four short arms (`ar`,
+//! `batched`, `interleaved`, `adaptive`) of the chi-square above on a two-card
+//! pipeline mesh instead of one card, so sampled Leviathan MTP on `topology.pp`
+//! is compared with AR sampling in distribution (unset or `single` keeps the
+//! one-card arms, byte for byte unchanged). Both arms of the comparison load
+//! the SAME artifact through the product loader (`hipfire_loader::load_model`
+//! with `pp = 2`, the daemon's own mesh load, native MTP head attached on every
+//! arm so placement and reserves match): the `ar` arm is PP AR (`pp_prefill_final`
+//! / `pp_forward_token_or_argmax` logits on the output band's card, the
+//! production host sampler `sample_cpu`, per-trial `reset_cpu_sampler_rng`);
+//! the MTP arms drive `pp_mtp_reset` / `pp_mtp_prefill` / `pp_mtp_step`, the
+//! entries the daemon's spec loop calls. A 2xR9700 box cannot hold the
+//! mq3-xts / mq4-xts artifact on one card, so the PP2 `ar` arm is the
+//! reference there (AR on one mesh and AR on one card are the same target law;
+//! compare the PP2 AR arm with the one-card `ar` arm on the gptq3 artifact
+//! separately if that cross-check is wanted). Everything else is the file's
+//! own machinery: shards (`HIPFIRE_SAMPLED_MTP_SHARD`), merge
+//! (`sampled_mtp_merge_short_shards`), per-position marginals and (t1, t2)
+//! joint chi-square at `ALPHA`, evidence/coverage checks, config sidecars and
+//! the replay of the first `REPLAYS` seeds on the forced floor-off arms (the
+//! PP verify is deterministic, so a replay mismatch is a finding).
+//!
+//! The model is whatever `HIPFIRE_MTP_IDENTITY_MODEL` names (the 2xR9700
+//! mq3-xts or mq4-xts artifact, or the gptq3 mq4 one); the topology and
+//! `HIPFIRE_PP_LAYERS` (band layer counts in logical band order, summing to
+//! the trunk layer count; unset = the loader's uniform split) are `HIPFIRE_*`
+//! variables, so they are part of every arm's recorded identity and a result
+//! produced under another split or topology is a hard config mismatch, never
+//! reused. Only the four short arms take a PP2 topology (every other arm fails
+//! naming the variable). The PP2 arms run neutral penalties only (penalized
+//! sampled requests decode AR under PP and `HIPFIRE_MTP_SAMPLED_MODE=naive` is
+//! refused there); do not set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` (the PP load
+//! refuses host-mapped experts), and leave both cards visible (no
+//! `ROCR_VISIBLE_DEVICES=0` restriction). Run from the repository root:
+//!
+//! ```sh
+//! export MODEL=/path/to/qwen3.8-flash-next.mq3-xts   # or the mq4-xts / gptq3 mq4 artifact
+//! export OUT=/tmp/pp2-sampled
+//! export HIPFIRE_MTP_IDENTITY_MODEL="$MODEL" HIPFIRE_SAMPLED_MTP_OUT="$OUT"
+//! export HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2
+//! # export HIPFIRE_PP_LAYERS=24,24      # optional band split, logical band order
+//! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
+//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS
+//! T="cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw"
+//! # Per arm, per shard (disjoint START..END ranges covering 0..2000; seeds are global):
+//! export HIPFIRE_SAMPLED_MTP_SHARD=0..100
+//! export HIPFIRE_SAMPLED_MTP_ARM=ar
+//! unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=batched HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=interleaved HIPFIRE_MTP_INCREMENTAL=1 HIPFIRE_MTP_AR_FLOOR=0
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=adaptive; unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! $T sampled_mtp_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! # ... repeat the four arms for every shard range, then (CPU only) join the shards:
+//! unset HIPFIRE_SAMPLED_MTP_ARM HIPFIRE_SAMPLED_MTP_SHARD
+//! $T sampled_mtp_merge_short_shards -- --exact --ignored --nocapture
+//! # The verdict (reuses the merged, config-verified whole-arm files):
+//! $T sampled_mtp_matches_ar_distribution_on_flash_next -- --exact --ignored --nocapture
+//! ```
+//!
+//! Expected artifacts in `$OUT`, per arm and shard `<arm>.<START>-<END>`:
+//! `.ids.json` (one `TOKENS`-id row per trial), `.ids.config.json` (config
+//! with the PP identity: `HIPFIRE_SAMPLED_MTP_TOPOLOGY`, `HIPFIRE_PP_LAYERS`,
+//! executable and model hashes), `.ids.receipt.json` (output card's GPU
+//! identity) and, for the MTP arms, `.evidence.json` and `.text.txt`; after the
+//! merge the same names without the range, and `report.txt` from the verdict
+//! test (per-arm marginal and joint chi-square lines; every p-value must exceed
+//! `ALPHA`, coverage failures are reported separately). Run unsharded
+//! (`HIPFIRE_SAMPLED_MTP_SHARD` unset) and the parent test alone spawns the
+//! four arms in fresh processes.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
@@ -298,6 +375,7 @@ const FLOOR_ENV: &str = "HIPFIRE_MTP_AR_FLOOR";
 const SHARD_ENV: &str = "HIPFIRE_SAMPLED_MTP_SHARD";
 const LATE_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_LATE_TOKENS";
 const LATE_ARM_TEST: &str = "sampled_mtp_late_arm";
+const TOPOLOGY_ENV: &str = "HIPFIRE_SAMPLED_MTP_TOPOLOGY";
 /// Harness-control variables: they differ between a parent and each child
 /// without changing what the arm computes, so identities exclude them.
 const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, SHARD_ENV];
@@ -1101,28 +1179,7 @@ impl Loaded {
 
     /// [`render`](Self::render) with the thinking switch given.
     fn render_with(&self, text: &str, thinking: bool) -> Result<Vec<u32>, String> {
-        let user = Message {
-            role: Role::User,
-            content: text.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_plan: String::new(),
-        };
-        let rendered = JinjaChatFrame {
-            tokenizer: &self.tokenizer,
-            template: &self.template,
-            system: None,
-            user: text,
-            enable_thinking: thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort: None,
-        }
-        .render_messages(&[user], None, None)?;
-        Ok(self.tokenizer.encode(&rendered))
+        render_prompt(&self.tokenizer, &self.template, text, thinking)
     }
 
     /// Seeded AR from a cold state with the production host sampler: up to
@@ -1359,6 +1416,9 @@ fn new_drafter_with_max_seq(
 
 fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     require_arm_env(arm, "leviathan")?;
+    if topology_from_env()? == Topology::Pp2 {
+        return run_arm_pp(arm, model, dir);
+    }
     let DistSettings {
         trials,
         temp,
@@ -1377,7 +1437,18 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         (temp, top_p, top_k, min_p),
         trials,
     );
-    let ids_path = dir.join(format!("{arm}.ids.json"));
+    // `HIPFIRE_SAMPLED_MTP_SHARD=START..END` runs a slice of the global trial
+    // indices (seeds stay global) and writes `<arm>.<START>-<END>.*`; unset
+    // keeps the whole-arm `<arm>.*` files. `sampled_mtp_merge_short_shards`
+    // joins shards into the whole-arm files the parent comparison reads.
+    let (start, end) = shard_range(arm, trials)?;
+    let sharded = (start, end) != (0, trials);
+    let stem = if sharded {
+        format!("{arm}.{start}-{end}")
+    } else {
+        arm.to_string()
+    };
+    let ids_path = dir.join(format!("{stem}.ids.json"));
     if ids_path.exists() {
         check_config(&ids_path, &settings_config)?;
     }
@@ -1399,14 +1470,14 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     );
     println!("ARM {arm} config {settings_config}");
     let started = std::time::Instant::now();
-    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(trials);
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
     if arm == "ar" {
         let logits = loaded
             .gpu
             .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
             .map_err(|e| e.to_string())?;
         let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
-        for trial in 0..trials {
+        for trial in start..end {
             let seed = trial_seed(0xA11, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
@@ -1419,7 +1490,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
         };
-        for trial in 0..trials {
+        for trial in start..end {
             let seed = trial_seed(0x5EC, trial);
             let result = run(&mut loaded, seed)?;
             evidence.observe(
@@ -1435,28 +1506,27 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         // Only a forced floor-off route replays byte for byte; the adaptive
         // route's choices depend on wall-clock prices.
         if hw_identity::forced_floor_off(&env) {
-            for trial in 0..REPLAYS.min(trials) {
+            let replays = REPLAYS.min(end - start);
+            for local in 0..replays {
+                let trial = start + local;
                 let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
-                if replay.ids != samples[trial] {
+                if replay.ids != samples[local] {
                     return Err(format!(
                         "seed {} replayed {:?}, first run {:?}",
                         trial + 1,
                         replay.ids,
-                        samples[trial]
+                        samples[local]
                     ));
                 }
             }
-            println!(
-                "ARM {arm} replayed {} seeds identically",
-                REPLAYS.min(trials)
-            );
+            println!("ARM {arm} replayed {replays} seeds identically");
         } else {
             println!(
                 "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
                 hw_identity::route_class(&env)
             );
         }
-        evidence.write(dir, arm, budget, LATE_MARGINALS[0])?;
+        evidence.write(dir, &stem, budget, LATE_MARGINALS[0])?;
         Box::new(drafter).mtp_free(&mut loaded.gpu);
     }
     // Positions after an EOS read as EOS.
@@ -1464,7 +1534,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         ids.resize(TOKENS, eos);
     }
     println!(
-        "ARM {arm} {trials} trials in {:.1}s; first sample: {:?}",
+        "ARM {arm} trials {start}..{end} in {:.1}s; first sample: {:?}",
         started.elapsed().as_secs_f64(),
         loaded.tokenizer.decode(&samples[0])
     );
@@ -1479,6 +1549,540 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         .bundle
         .free_gpu(&mut loaded.gpu)
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// PP2 topology arms (`HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`)
+// ---------------------------------------------------------------------------
+
+/// Where the short arms run. `Single` is the historical one-card load of
+/// [`load`]; `Pp2` is a two-card pipeline mesh loaded through the product
+/// loader (`HIPFIRE_PP_LAYERS` picks the band split).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Topology {
+    Single,
+    Pp2,
+}
+
+/// The pipeline degree of [`Topology::Pp2`].
+const PP_DEGREE: usize = 2;
+
+fn topology_from_env() -> Result<Topology, String> {
+    match std::env::var(TOPOLOGY_ENV).as_deref() {
+        Err(_) | Ok("") | Ok("single") => Ok(Topology::Single),
+        Ok("pp2") => Ok(Topology::Pp2),
+        Ok(other) => Err(format!(
+            "{TOPOLOGY_ENV}={other:?}: expected `single` or `pp2`"
+        )),
+    }
+}
+
+/// `text` as one user message, thinking as given, rendered as `hipfire serve`
+/// renders it.
+fn render_prompt(
+    tokenizer: &Tokenizer,
+    template: &str,
+    text: &str,
+    thinking: bool,
+) -> Result<Vec<u32>, String> {
+    let user = Message {
+        role: Role::User,
+        content: text.to_string(),
+        reasoning_content: None,
+        name: None,
+        rendered_name: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_plan: String::new(),
+    };
+    let rendered = JinjaChatFrame {
+        tokenizer,
+        template,
+        system: None,
+        user: text,
+        enable_thinking: thinking,
+        bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: None,
+    }
+    .render_messages(&[user], None, None)?;
+    Ok(tokenizer.encode(&rendered))
+}
+
+/// The native MTP drafter behind the load's speculator, for the mesh entries.
+fn pp_drafter(
+    speculator: &mut dyn hipfire_runtime::spec::Speculator,
+) -> Result<&mut Qwen4MtpDrafter, String> {
+    speculator
+        .drafter_any_mut()
+        .and_then(|any| any.downcast_mut::<Qwen4MtpDrafter>())
+        .ok_or_else(|| "the load's speculator is not the native Qwen4 MTP drafter".to_string())
+}
+
+/// The mesh's output band device (logits, the MTP head and the sampled verify's
+/// reads live there) with the calling thread bound to it.
+fn pp_owner(gpus: &mut hipfire_runtime::multi_gpu::Gpus) -> Result<&mut Gpu, String> {
+    let owner = gpus
+        .mesh_output_owner()
+        .ok_or("the PP mesh has no output owner")?;
+    let gpu = gpus
+        .devices
+        .get_mut(owner)
+        .ok_or("the PP output owner is not a mesh device")?;
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    Ok(gpu)
+}
+
+/// A Flash-Next target loaded across a PP2 mesh by the product loader, with
+/// its tokenizer, chat template and native MTP drafter (loaded on every arm,
+/// used by the MTP arms only).
+struct PpLoaded {
+    model: hipfire_loader::LoadedModel,
+    speculator: Box<dyn hipfire_runtime::spec::Speculator>,
+    tokenizer: Tokenizer,
+    template: String,
+    state: String,
+    /// The daemon-side `Gpu` the load was given; it outlives the model.
+    _gpu: Gpu,
+}
+
+impl PpLoaded {
+    fn load(model: &Path) -> Result<Self, String> {
+        let path = model
+            .to_str()
+            .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
+        let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        let (state_request, _) = hw_identity::gdn_test_state_quant()?;
+        let cask = hipfire_runtime::loader_api::CaskConfig::default();
+        let mut spec = hipfire_runtime::loader_api::SpecLoadCfg::default();
+        // The native head is attached on every arm so placement and reserves
+        // are identical across the arms of one comparison.
+        spec.mtp = Some(true);
+        let mut loaded = hipfire_loader::load_model(
+            path,
+            MAX_SEQ,
+            None,
+            None,
+            None,
+            Some(state_request),
+            &cask,
+            PP_DEGREE,
+            spec,
+            &mut gpu,
+        )?;
+        if loaded.pp != PP_DEGREE {
+            return Err(format!(
+                "the product load resolved pp = {} but {TOPOLOGY_ENV}=pp2 needs {PP_DEGREE}",
+                loaded.pp
+            ));
+        }
+        let tokenizer = loaded.tokenizer.take().ok_or("the load has no tokenizer")?;
+        let template = loaded
+            .chat_template
+            .take()
+            .ok_or("the artifact has no chat template")?;
+        let mut speculator = loaded
+            .speculator
+            .take()
+            .ok_or("the load attached no speculator (is the native MTP head present?)")?;
+        {
+            let drafter = pp_drafter(speculator.as_mut())?;
+            if !drafter.supports_temp_verify() {
+                return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+            }
+            if drafter.sampled_mode_is_naive() {
+                return Err(
+                    "HIPFIRE_MTP_SAMPLED_MODE=naive is refused under topology.pp; use leviathan"
+                        .into(),
+                );
+            }
+        }
+        {
+            let (bundle, _) = loaded
+                .qwen4_mesh_mut()
+                .ok_or("the PP2 load has no Qwen4 mesh bundle")?;
+            if !bundle.pp_mesh_active() {
+                return Err("the PP2 load has no active pipeline mesh".into());
+            }
+        }
+        Ok(Self {
+            model: loaded,
+            speculator,
+            tokenizer,
+            template,
+            state: format!("state_quant={state_request} (product loader, pp={PP_DEGREE})"),
+            _gpu: gpu,
+        })
+    }
+
+    fn parts(
+        &mut self,
+    ) -> Result<(&mut Qwen4Bundle, &mut hipfire_runtime::multi_gpu::Gpus), String> {
+        self.model
+            .qwen4_mesh_mut()
+            .ok_or_else(|| "the PP2 model lost its Qwen4 mesh".to_string())
+    }
+
+    fn render(&self, text: &str) -> Result<Vec<u32>, String> {
+        render_prompt(&self.tokenizer, &self.template, text, false)
+    }
+
+    /// One vocabulary-wide F32 logits row on the output band's device.
+    fn alloc_logits(&mut self) -> Result<rdna_compute::GpuTensor, String> {
+        let (bundle, gpus) = self.parts()?;
+        let vocab = bundle.config.vocab_size;
+        pp_owner(gpus)?
+            .zeros(&[vocab], DType::F32)
+            .map_err(|e| e.to_string())
+    }
+
+    fn free_logits(&mut self, logits: rdna_compute::GpuTensor) -> Result<(), String> {
+        let (_, gpus) = self.parts()?;
+        pp_owner(gpus)?
+            .free_tensor(logits)
+            .map_err(|e| e.to_string())
+    }
+
+    fn receipt(&mut self, model: &Path) -> Result<Value, String> {
+        let (_, gpus) = self.parts()?;
+        Ok(hw_identity::receipt(pp_owner(gpus)?, model))
+    }
+
+    /// [`Loaded::ar_ids`] on the mesh: seeded AR from a cold state with the
+    /// production host sampler over the output band's logits row.
+    fn ar_ids(
+        &mut self,
+        logits: &rdna_compute::GpuTensor,
+        prompt: &[u32],
+        cfg: &SamplerConfig,
+        seed: u32,
+        tokens: usize,
+    ) -> Result<Vec<u32>, String> {
+        let (bundle, gpus) = self.parts()?;
+        let eos = bundle.config.eos_token_id;
+        hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
+        // A cold prefill (`reused == 0`) resets every band.
+        bundle
+            .pp_prefill_final(gpus, prompt, 0, logits)
+            .map_err(|e| e.to_string())?;
+        let mut history = prompt.to_vec();
+        let mut ids = Vec::with_capacity(tokens);
+        loop {
+            let mut row = pp_owner(gpus)?
+                .download_f32(logits)
+                .map_err(|e| e.to_string())?;
+            let token = sample_cpu(&mut row, &history, cfg);
+            ids.push(token);
+            history.push(token);
+            if ids.len() == tokens || token == eos {
+                return Ok(ids);
+            }
+            bundle
+                .pp_forward_token_or_argmax(gpus, Some(token), logits)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    /// [`Loaded::mtp_request`] on the mesh: the drafter's mesh entries with the
+    /// model's `Gpus`, exactly as the daemon's spec loop drives them.
+    fn mtp_request(
+        &mut self,
+        prompt: &[u32],
+        cfg: SpecRequestConfig,
+        tokens: usize,
+    ) -> Result<MtpRun, String> {
+        let (bundle, gpus) = self
+            .model
+            .qwen4_mesh_mut()
+            .ok_or_else(|| "the PP2 model lost its Qwen4 mesh".to_string())?;
+        let drafter = pp_drafter(self.speculator.as_mut())?;
+        let eos = bundle.config.eos_token_id;
+        bundle.pp_reset(gpus).map_err(|e| e.to_string())?;
+        drafter.pp_mtp_reset(gpus, bundle)?;
+        drafter.configure_request(cfg);
+        let mut seed_token = drafter
+            .pp_mtp_prefill(gpus, bundle, prompt, prompt, 0, false, &|| false)?
+            .into_first_token()?;
+        let mut ids = vec![seed_token];
+        let (mut drafted, mut accepted) = (0, 0);
+        let mut windows = Vec::new();
+        while ids.len() < tokens && seed_token != eos {
+            let position = bundle.state.position;
+            let k = MTP_K.min(tokens - ids.len());
+            let before = StatsSnap::of(&drafter.request_stats());
+            let started = Counters::now();
+            let window = drafter.pp_mtp_step(gpus, bundle, position, seed_token, &ids, k, eos)?;
+            let counters = Counters::now().since(started);
+            windows.push(WindowRec {
+                index: ids.len(),
+                position_before: position,
+                position_after: bundle.state.position,
+                k_budget: k,
+                drafts: window.drafts_generated,
+                accepted: window.accepted,
+                committed: window.committed.len(),
+                before,
+                after: StatsSnap::of(&drafter.request_stats()),
+                counters,
+            });
+            drafted += window.drafts_generated;
+            accepted += window.accepted;
+            seed_token = *window.committed.last().ok_or("empty MTP window")?;
+            ids.extend_from_slice(&window.committed);
+        }
+        ids.truncate(tokens);
+        Ok(MtpRun {
+            ids,
+            drafted,
+            accepted,
+            stats: drafter.request_stats(),
+            windows,
+        })
+    }
+}
+
+/// [`run_arm`] on a PP2 mesh: the same trials, seeds, shard files, config,
+/// evidence and replay, with the PP load and the mesh decode loops. The load
+/// is not freed (the arm is a fresh process that exits right after).
+fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    let DistSettings {
+        trials,
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        fixture,
+    } = DistSettings::from_env()?;
+    if spec_request(temp, top_p, top_k, min_p, 0, &pen).penalties_active() {
+        return Err(
+            "the PP2 arms run neutral penalties only: penalized sampled MTP is refused under \
+             topology.pp (the GPU penalty prepass refuses the mesh; such requests decode AR)"
+                .into(),
+        );
+    }
+    let env = own_env(&CONTROL_ENV);
+    let settings_config = dist_config(
+        arm,
+        &own_identity(model, dir, &CONTROL_ENV)?,
+        &pen,
+        fixture,
+        (temp, top_p, top_k, min_p),
+        trials,
+    );
+    let (start, end) = shard_range(arm, trials)?;
+    let sharded = (start, end) != (0, trials);
+    let stem = if sharded {
+        format!("{arm}.{start}-{end}")
+    } else {
+        arm.to_string()
+    };
+    let ids_path = dir.join(format!("{stem}.ids.json"));
+    if ids_path.exists() {
+        check_config(&ids_path, &settings_config)?;
+    }
+    let mut loaded = PpLoaded::load(model)?;
+    let prompt = loaded.render(&fixture.text())?;
+    fixture.check_prompt(prompt.len(), &pen)?;
+    let eos = loaded.parts()?.0.config.eos_token_id;
+    println!(
+        "ARM {arm} topology=pp{PP_DEGREE} pp_layers={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} fixture={} state={} route_class={}",
+        std::env::var("HIPFIRE_PP_LAYERS").unwrap_or_else(|_| "default".to_string()),
+        prompt.len(),
+        fixture.name(),
+        loaded.state,
+        hw_identity::route_class(&env)
+    );
+    println!("ARM {arm} config {settings_config}");
+    let started = std::time::Instant::now();
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
+    if arm == "ar" {
+        let logits = loaded.alloc_logits()?;
+        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+        for trial in start..end {
+            let seed = trial_seed(0xA11, trial) as u32;
+            samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
+        }
+        loaded.free_logits(logits)?;
+    } else {
+        let budget = floor_probe_budget()?;
+        let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
+        for trial in start..end {
+            let seed = trial_seed(0x5EC, trial);
+            let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
+            let result = loaded.mtp_request(&prompt, cfg, TOKENS)?;
+            evidence.observe(
+                trial,
+                seed,
+                &result,
+                &loaded.tokenizer,
+                budget,
+                LATE_MARGINALS[0],
+            );
+            samples.push(result.ids);
+        }
+        // Only a forced floor-off route replays byte for byte; the adaptive
+        // route's choices depend on wall-clock prices.
+        if hw_identity::forced_floor_off(&env) {
+            let replays = REPLAYS.min(end - start);
+            for local in 0..replays {
+                let trial = start + local;
+                let cfg = spec_request(temp, top_p, top_k, min_p, trial_seed(0x5EC, trial), &pen);
+                let replay = loaded.mtp_request(&prompt, cfg, TOKENS)?;
+                if replay.ids != samples[local] {
+                    return Err(format!(
+                        "seed {} replayed {:?}, first run {:?}",
+                        trial + 1,
+                        replay.ids,
+                        samples[local]
+                    ));
+                }
+            }
+            println!("ARM {arm} replayed {replays} seeds identically");
+        } else {
+            println!(
+                "ARM {arm} replay not asserted (route class {}): its routing depends on wall-clock prices",
+                hw_identity::route_class(&env)
+            );
+        }
+        evidence.write(dir, &stem, budget, LATE_MARGINALS[0])?;
+    }
+    // Positions after an EOS read as EOS.
+    for ids in &mut samples {
+        ids.resize(TOKENS, eos);
+    }
+    println!(
+        "ARM {arm} trials {start}..{end} in {:.1}s; first sample: {:?}",
+        started.elapsed().as_secs_f64(),
+        loaded.tokenizer.decode(&samples[0])
+    );
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &settings_config)?;
+    let receipt = loaded.receipt(model)?;
+    write_receipt(&ids_path, &receipt)
+}
+
+/// Joins the shards of each short arm (`<arm>.<START>-<END>.*` written by
+/// `sampled_mtp_distribution_arm` under `HIPFIRE_SAMPLED_MTP_SHARD`) into the
+/// whole-arm files the parent comparison reuses: ids concatenated in trial
+/// order, the (identical) config and receipt of the first shard, evidence
+/// counters summed and per-trial rows / texts concatenated. CPU only: no GPU,
+/// no model read. Shards must cover `0..trials` exactly once and carry equal
+/// configs; the parent still checks the merged config against the current
+/// environment, so a stale or mixed shard set fails there.
+#[test]
+#[ignore = "CPU only: merges shards written by sampled_mtp_distribution_arm; needs HIPFIRE_SAMPLED_MTP_OUT"]
+fn sampled_mtp_merge_short_shards() {
+    let dir = out_dir();
+    let trials: usize = env_or(TRIALS_ENV, 2000);
+    for arm in ARMS {
+        let shards = late_shards(&dir, arm).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!shards.is_empty(), "{arm}: no shards in {}", dir.display());
+        let gaps = shard_gaps(&shards, trials).unwrap_or_else(|e| panic!("{arm}: {e}"));
+        assert!(
+            gaps.is_empty(),
+            "{arm}: shards leave {gaps:?} of 0..{trials} uncovered"
+        );
+        let ids_file = |r: (usize, usize), ext: &str| late_file(&dir, arm, r, ext);
+        let mut ids: Vec<Vec<u32>> = Vec::new();
+        let config =
+            read_json(&ids_file(shards[0], "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+        for &r in &shards {
+            let c = read_json(&ids_file(r, "ids.config.json")).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                c, config,
+                "{arm}: shard {r:?} was produced under a different config"
+            );
+            let part: Vec<Vec<u32>> =
+                serde_json::from_slice(&fs::read(ids_file(r, "ids.json")).expect("shard ids"))
+                    .expect("shard ids json");
+            assert_eq!(
+                part.len(),
+                r.1 - r.0,
+                "{arm}: shard {r:?} holds {} trials",
+                part.len()
+            );
+            ids.extend(part);
+        }
+        assert_eq!(ids.len(), trials);
+        let whole = dir.join(format!("{arm}.ids.json"));
+        fs::write(&whole, serde_json::to_vec(&ids).unwrap()).unwrap();
+        write_config(&whole, &config).unwrap_or_else(|e| panic!("{e}"));
+        let receipt =
+            read_json(&ids_file(shards[0], "ids.receipt.json")).unwrap_or_else(|e| panic!("{e}"));
+        write_receipt(&whole, &receipt).unwrap_or_else(|e| panic!("{e}"));
+        if arm != "ar" {
+            let mut merged = read_json(&dir.join(format!(
+                "{arm}.{}-{}.evidence.json",
+                shards[0].0, shards[0].1
+            )))
+            .unwrap_or_else(|e| panic!("{e}"));
+            let mut text = String::new();
+            for (i, &r) in shards.iter().enumerate() {
+                let stem = format!("{arm}.{}-{}", r.0, r.1);
+                text.push_str(
+                    &fs::read_to_string(dir.join(format!("{stem}.text.txt"))).unwrap_or_default(),
+                );
+                if i == 0 {
+                    continue;
+                }
+                let e = read_json(&dir.join(format!("{stem}.evidence.json")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                for key in [
+                    "trials",
+                    "no_window_trials",
+                    "calibration_ok_trials",
+                    "retired_trials",
+                    "full_trials",
+                    "late_full_trials",
+                    "mtp_windows",
+                    "ar_windows",
+                    "ngram_windows",
+                    "steps",
+                    "drafted",
+                    "accepted",
+                    "post_retirement_ar_steps",
+                ] {
+                    merged[key] =
+                        json!(merged[key].as_u64().unwrap_or(0) + e[key].as_u64().unwrap_or(0));
+                }
+                for key in ["retire_steps", "per_trial"] {
+                    let extra = e[key].as_array().cloned().unwrap_or_default();
+                    merged[key].as_array_mut().expect(key).extend(extra);
+                }
+                let counters = merged["counters"].as_object_mut().expect("counters");
+                for (name, total) in counters.iter_mut() {
+                    *total = json!(
+                        total.as_u64().unwrap_or(0) + e["counters"][name].as_u64().unwrap_or(0)
+                    );
+                }
+                assert_eq!(
+                    merged["probe_budget"], e["probe_budget"],
+                    "{arm}: probe budget differs"
+                );
+                if merged["first_full_trial"].is_null() {
+                    merged["first_full_trial"] = e["first_full_trial"].clone();
+                }
+            }
+            assert_eq!(
+                merged["trials"].as_u64(),
+                Some(trials as u64),
+                "{arm}: merged evidence trials"
+            );
+            write_json(&dir.join(format!("{arm}.evidence.json")), &merged)
+                .unwrap_or_else(|e| panic!("{e}"));
+            fs::write(dir.join(format!("{arm}.text.txt")), text).unwrap();
+        }
+        eprintln!(
+            "{arm}: merged {} shards into {}",
+            shards.len(),
+            whole.display()
+        );
+    }
 }
 
 const ID_ARM_TEST: &str = "sampled_mtp_identity_arm";
@@ -1759,6 +2363,13 @@ fn require_arm_env(arm: &str, mode: &'static str) -> Result<(), String> {
     // An unknown test mode (or q8_ef) is refused before the overrides below
     // resolve it.
     hw_identity::gdn_test_state_quant()?;
+    // The topology switch is read by the four short leviathan arms only; every
+    // other arm loads one card, so a stale pp2 setting would mislabel it.
+    if (!ARMS.contains(&arm) || mode != "leviathan") && topology_from_env()? != Topology::Single {
+        return Err(format!(
+            "{TOPOLOGY_ENV} is set but arm {arm} (mode {mode}) runs on one card only: only the {ARMS:?} leviathan arms take a PP2 topology; unset {TOPOLOGY_ENV}"
+        ));
+    }
     for (name, want) in arm_overrides(arm, mode) {
         let have = std::env::var(name).ok();
         if have.as_deref() != want {

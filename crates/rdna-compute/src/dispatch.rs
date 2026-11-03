@@ -548,27 +548,43 @@ impl GpuTensor {
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.
+    ///
+    /// Panics when the view does not fit. Serve paths that must fail closed
+    /// (swap capture/restore) use [`Self::try_sub_offset`] instead.
     pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
+        self.try_sub_offset(offset_elems, len_elems)
+            .expect("tensor sub-view exceeds accessible buffer prefix")
+    }
+
+    /// [`Self::sub_offset`] that returns the overflow or bounds failure
+    /// instead of panicking the caller.
+    pub fn try_sub_offset(
+        &self,
+        offset_elems: usize,
+        len_elems: usize,
+    ) -> Result<GpuTensor, String> {
         let element_size = self.dtype.size();
         let byte_off = offset_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view offset overflow");
+            .ok_or_else(|| "tensor sub-view offset overflow".to_string())?;
         let byte_len = len_elems
             .checked_mul(element_size)
-            .expect("tensor sub-view length overflow");
+            .ok_or_else(|| "tensor sub-view length overflow".to_string())?;
         let byte_end = byte_off
             .checked_add(byte_len)
-            .expect("tensor sub-view range overflow");
-        assert!(
-            byte_end <= self.buf.size(),
-            "tensor sub-view exceeds accessible buffer prefix"
-        );
+            .ok_or_else(|| "tensor sub-view range overflow".to_string())?;
+        if byte_end > self.buf.size() {
+            return Err(format!(
+                "tensor sub-view exceeds accessible buffer prefix ({byte_end} > {})",
+                self.buf.size()
+            ));
+        }
         let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
-        GpuTensor {
+        Ok(GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
-        }
+        })
     }
 
     /// Full-buffer non-owning alias (the whole-tensor form of `sub_offset`).
@@ -966,6 +982,22 @@ pub enum DType {
     E8PI4G128R256,
     /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
     E8PI4G128R128,
+    /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
+    /// Distinct from the legacy llama `Q4K` until that path is cut over to the
+    /// ggml kernels. Consumed only by the GGUF-native route (decode mmvq GEMV,
+    /// dequantising prefill GEMM, embedding gather; see `ggml_ops`): every other
+    /// execution site must refuse it by name ([`DType::ggml_name`]), never
+    /// reinterpret it as another dtype. `K % 256 == 0`.
+    GgmlQ4K,
+    /// ggml Q5_K (GGUF type 13): 176 B per 256 elements, 5.5 bpw. `K % 256 == 0`.
+    GgmlQ5K,
+    /// ggml Q6_K (GGUF type 14): 210 B per 256 elements, 6.5625 bpw. `K % 256 == 0`.
+    GgmlQ6K,
+    /// ggml Q8_0 (GGUF type 8): 34 B per 32 elements, 8.5 bpw. `K % 32 == 0`.
+    GgmlQ8_0,
+    /// ggml IQ4_XS (GGUF type 23): 136 B per 256 elements, 4.25 bpw (non-linear
+    /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
+    GgmlIQ4XS,
 }
 
 impl DType {
@@ -1031,7 +1063,12 @@ impl DType {
             | DType::E8PI4G128R128
             | DType::IU4G256
             | DType::IU8G256
-            | DType::IU8G32 => 1, // byte-level
+            | DType::IU8G32
+            | DType::GgmlQ4K
+            | DType::GgmlQ5K
+            | DType::GgmlQ6K
+            | DType::GgmlQ8_0
+            | DType::GgmlIQ4XS => 1, // byte-level
         }
     }
 
@@ -1075,6 +1112,12 @@ impl DType {
                 .map(|scales| scales & !15)?
                 .checked_add(blocks.checked_mul(16)?)?
                 .checked_add(16),
+            // ggml block formats: whole blocks per row.
+            DType::GgmlQ4K => grouped(256, 144),
+            DType::GgmlQ5K => grouped(256, 176),
+            DType::GgmlQ6K => grouped(256, 210),
+            DType::GgmlQ8_0 => grouped(32, 34),
+            DType::GgmlIQ4XS => grouped(256, 136),
             // MQ-I4 is planar (codes plane, then scale plane): no per-row
             // stride exists, and the size needs M as well as K.
             DType::MQ3I4G128R256
@@ -1277,7 +1320,55 @@ impl DType {
                 | DType::MQ2G256V2
                 | DType::IU4G256
                 | DType::IU8G256
+                | DType::GgmlQ4K
+                | DType::GgmlQ5K
+                | DType::GgmlQ6K
+                | DType::GgmlIQ4XS
         )
+    }
+
+    /// Whether this is one of the ggml-format dtypes that carry GGUF block
+    /// bytes as-is (`Ggml*`). Distinct from the legacy llama `Q4K`/`Q6K`/`Q8_0`.
+    /// No kernel consumes them yet, so execution sites refuse them with
+    /// [`DType::ggml_refusal`] instead of falling through to another dtype.
+    pub fn is_ggml(self) -> bool {
+        self.ggml_name().is_some()
+    }
+
+    /// Canonical ggml type name of a `Ggml*` dtype; `None` for every other dtype.
+    pub fn ggml_name(self) -> Option<&'static str> {
+        match self {
+            DType::GgmlQ4K => Some("Q4_K"),
+            DType::GgmlQ5K => Some("Q5_K"),
+            DType::GgmlQ6K => Some("Q6_K"),
+            DType::GgmlQ8_0 => Some("Q8_0"),
+            DType::GgmlIQ4XS => Some("IQ4_XS"),
+            _ => None,
+        }
+    }
+
+    /// `(elements per block, bytes per block)` of a `Ggml*` dtype.
+    pub fn ggml_block(self) -> Option<(usize, usize)> {
+        match self {
+            DType::GgmlQ4K => Some((256, 144)),
+            DType::GgmlQ5K => Some((256, 176)),
+            DType::GgmlQ6K => Some((256, 210)),
+            DType::GgmlQ8_0 => Some((32, 34)),
+            DType::GgmlIQ4XS => Some((256, 136)),
+            _ => None,
+        }
+    }
+
+    /// Refusal text for an execution site that has no GGUF-native path and was
+    /// handed a `Ggml*` dtype; `None` for every other dtype.
+    pub fn ggml_refusal(self) -> Option<String> {
+        self.ggml_name().map(|name| {
+            format!(
+                "this route has no ggml kernel for GGUF {name} weights: GGUF-native serving \
+                 (HIPFIRE_GGUF_NATIVE=1) runs the decode GEMV and the dequantising prefill GEMM \
+                 only; use an MQ or HFQ model for this feature"
+            )
+        })
     }
 }
 
@@ -1639,6 +1730,10 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Memory the admitted context still needs, set by the loader after a
+    /// measured post-load fit so optional per-request allocations (DeltaNet
+    /// checkpoints beyond the charged one) yield to it. `None` = no floor.
+    pub kv_fit_floor: Option<KvFitFloor>,
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
@@ -1683,12 +1778,18 @@ pub struct Gpu {
     /// device address. Read after each step by
     /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
     device_wait: Option<crate::device_wait::DeviceWaitMapping>,
+    /// Device wait timeouts read (and so cleared) since the multi-GPU step
+    /// check last collected them; see [`Gpu::take_unreported_device_wait_timeouts`].
+    device_wait_unreported: std::sync::atomic::AtomicU32,
     /// Host-mapped router non-finite fault word (`crate::router_fault`), allocated
     /// at `Gpu` init and kept for the `Gpu`'s lifetime because captured graphs bake
     /// in its device address. Folded into [`Gpu::take_device_wait_error`].
     router_fault: Option<crate::router_fault::RouterFaultMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Host-mapped coherent buffer the S1 count barrier's copy kernel writes (two arrays),
+    /// reserved at load by `reserve_slowlink_count_host`.
+    pub slowlink_count_host: Option<hip_bridge::MappedHostBuffer>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
     /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
     /// every successful launch so `sync_with_deadline` can name the suspect
@@ -1775,6 +1876,10 @@ pub struct Gpu {
     pub qwen4_trunk_iu4: bool,
     /// Armed only by the noncompact Qwen4 eager prefill wrapper.
     pub qwen4_trunk_iu4_prefill_scope: bool,
+    /// Artifact-level MQ3V2 (qt49) symmetric grid contract. Set by the model
+    /// loader from HFQ `mq3v2.symmetric` metadata after group validation;
+    /// false for legacy/asymmetric artifacts.
+    pub mq3v2_symmetric: bool,
     /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
@@ -1888,6 +1993,15 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+}
+
+/// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvFitFloor {
+    /// The published (admitted) context in tokens.
+    pub admitted_tokens: usize,
+    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -2106,6 +2220,38 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// `hipErrorInvalidValue`: the code for a null device alias that HIP reported as success.
+const HOST_ALIAS_INVALID_CODE: u32 = 1;
+
+/// Resolve the GPU-addressable alias of a freshly `hipHostMalloc`'d mapping, failing closed.
+///
+/// A non-null alias is returned unchanged (it may differ from `host_ptr`). A lookup error or
+/// a null success frees `host_ptr` exactly once through `free_host` and returns an error;
+/// the host pointer is never substituted for the alias, because HIP documents it as invalid
+/// for kernels and the result would read as zeros or garbage rather than fail. A lookup
+/// error keeps its original code, with any cleanup failure appended as context.
+fn resolve_host_mapped_alias(
+    host_ptr: *mut c_void,
+    get_alias: impl FnOnce(*mut c_void) -> HipResult<*mut c_void>,
+    free_host: impl FnOnce(*mut c_void) -> HipResult<()>,
+) -> HipResult<*mut c_void> {
+    let mut error = match get_alias(host_ptr) {
+        Ok(alias) if !alias.is_null() => return Ok(alias),
+        Ok(_) => HipError::new(
+            HOST_ALIAS_INVALID_CODE,
+            "hipHostGetDevicePointer returned a null device alias for a host-mapped allocation",
+        ),
+        Err(error) => error,
+    };
+    if let Err(cleanup) = free_host(host_ptr) {
+        error.message.push_str(&format!(
+            "; additionally hipHostFree of the unaliased host allocation failed: {}",
+            cleanup.message
+        ));
+    }
+    Err(error)
+}
+
 impl Gpu {
     /// Diagnostic: trace multi-slot session continuation matching.
     pub fn slot_trace(&self) -> bool {
@@ -2204,6 +2350,41 @@ impl Gpu {
             )
         })?;
         Ok(self.emu_cap_mem_info(free.min(usize::MAX as u64) as usize, total))
+    }
+
+    /// Capacity an auto admission may plan against: device total minus this
+    /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
+    /// minus this process's MEASURED unledgered residency (code objects, PM4/
+    /// graph pools, driver state: the process's own `drm-memory-vram` from
+    /// `/proc/self/fdinfo` less the ledger; [`own_vram_from_fdinfo`]) minus a
+    /// small fixed [`PLANNED_CAPACITY_RESERVE_BYTES`] margin. Unlike
+    /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
+    /// process transiently allocates, so a route chosen from it is stable
+    /// across loads. Callers MUST still verify the real allocation and fall to
+    /// a smaller rung only when it truly fails. UMA parts and `HIPFIRE_EMU`
+    /// profiles share host memory / a capped ledger, so there the capped free
+    /// figure stays authoritative.
+    pub fn planned_capacity(&self) -> HipResult<PlannedCapacity> {
+        let (free, total) = self.device_mem_info()?;
+        let own = self.hip.own_device_bytes();
+        let stable = !self.is_uma() && self.emu.is_none();
+        let cap = PlannedCapacity::new(free, total, own, stable);
+        if !stable {
+            return Ok(cap);
+        }
+        // The process's own footprint is read from the kernel's per-client
+        // accounting, so a foreign process's allocation never enters it. When
+        // the accounting is unreadable, fall back to the conservative measured
+        // post-load residency.
+        let measured = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .ok()
+            .and_then(|bdf| own_vram_from_fdinfo(&bdf));
+        Ok(match measured {
+            Some(vram) => cap.with_unledgered(vram.saturating_sub(own), true),
+            None => cap.with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
+        })
     }
 
     /// Install a real stream if launches are still going to the null stream.
@@ -2927,6 +3108,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            kv_fit_floor: None,
             dflash_gdn_replay_scratch: HashMap::new(),
             vmm_arenas: HashMap::new(),
             vmm_generations: HashMap::new(),
@@ -2935,8 +3117,10 @@ impl Gpu {
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
+            device_wait_unreported: std::sync::atomic::AtomicU32::new(0),
             router_fault: None,
             active_stream: None,
+            slowlink_count_host: None,
             last_kernel: None,
             #[cfg(feature = "lab")]
             lab_kernel_fault: LabKernelFaultCountdown::default(),
@@ -2970,6 +3154,7 @@ impl Gpu {
                 gdn_pair_counters: None,
                 mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
+                ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
                 paro_x_scratch: None,
@@ -2990,6 +3175,7 @@ impl Gpu {
                 fp8_x_source_ptr: std::ptr::null_mut(),
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
+                q8_1_mmq_x_generation: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
                 iu4_a8_x_scratch: None,
@@ -2998,6 +3184,9 @@ impl Gpu {
                 int4_mmq_down_scratch_bytes: 0,
                 int4_mmq_down_generation: 0,
                 int4_mmq_slab_generation: None,
+                q8_a8_x_scratch: None,
+                q8_a8_x_scratch_bytes: 0,
+                q8_a8_x_generation: 0,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
@@ -3045,6 +3234,7 @@ impl Gpu {
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
             qwen4_trunk_iu4_prefill_scope: false,
+            mq3v2_symmetric: false,
             residual_fold_arm: None,
             residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
@@ -4099,6 +4289,34 @@ impl Gpu {
     /// Helper: launch a kernel using the blob path during graph capture,
     /// or the normal kernelParams path otherwise. The `blob_builder` closure
     /// constructs the KernargBlob; it's only called when capturing.
+    /// `HIPFIRE_LAUNCH_DUMP=N` prints the first `N` launch names, in order,
+    /// from this funnel. Developer diagnostic only: the eager body and the
+    /// retained recorder both pass here, so two dumps of the same step diff
+    /// into the exact launch where a retained route diverges from eager.
+    /// Unset prints nothing.
+    fn launch_dump_budget() -> usize {
+        static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_LAUNCH_DUMP")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    fn launch_dump_note(func_name: &str, grid: [u32; 3], block: [u32; 3]) {
+        let budget = Self::launch_dump_budget();
+        if budget == 0 {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        let index = SEEN.fetch_add(1, Ordering::Relaxed);
+        if index < budget {
+            eprintln!("[launch-dump] {index} {func_name} grid={grid:?} block={block:?}");
+        }
+    }
+
     pub(crate) fn launch_maybe_blob(
         &mut self,
         func_name: &str,
@@ -4196,6 +4414,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        Self::launch_dump_note(func_name, grid, block);
         self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
@@ -4221,6 +4440,8 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.active_stream.as_ref());
         let result: HipResult<()> = if record
             || observe
             || self.graphs.capture_mode
@@ -4301,6 +4522,9 @@ impl Gpu {
                 )
             }
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.active_stream.as_ref());
+        }
         if result.is_ok() {
             #[cfg(feature = "lab")]
             if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
@@ -4456,10 +4680,15 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.stream_ref());
         let result = unsafe {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.stream_ref());
+        }
         #[cfg(feature = "lab")]
         if result.is_ok() {
             self.lab_kernel_fault.launched_successfully();
@@ -4533,6 +4762,8 @@ impl Gpu {
         self.lab_kernel_fault
             .before_launch()
             .map_err(|e| e.with_kernel(func_name))?;
+        let launch_timer =
+            crate::profile::begin_launch_timer(&self.hip, func_name, self.stream_ref());
         let result = if self.graphs.capture_mode {
             // Retain the exact bytes for graph instantiation: HIP records the
             // blob pointer, so graph-owned storage must outlive the capture.
@@ -4577,6 +4808,9 @@ impl Gpu {
                 )
             }
         };
+        if let Some(t) = launch_timer {
+            t.finish(&self.hip, self.stream_ref());
+        }
         if result.is_ok() {
             #[cfg(feature = "lab")]
             if let Err(e) = self.lab_observe_launch(func_name, grid, block, shared_mem) {
@@ -4997,12 +5231,16 @@ impl Gpu {
     }
 
     /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
-    /// VMM owner: gfx1151 or gfx1201 (the arches with evidence for it), a
+    /// VMM owner: gfx1151, gfx1201, or gfx1100 unless
+    /// `HIPFIRE_QWEN4_VMM_GFX1100=0` (the arches with evidence for it), a
     /// platform the VMM KV backend is certified on (not native Windows, not
     /// WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
     pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
-        (self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+        (self.arch_caps.is_gfx1151()
+            || self.arch_caps.is_gfx1201()
+            || (self.arch_caps.is_gfx1100()
+                && hipfire_config::devices::qwen4_vmm_gfx1100_enabled()))
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }
@@ -5029,16 +5267,20 @@ impl Gpu {
             return self.qsa_gather_legacy(reserve_bytes).map(drop);
         }
         let reserve_bytes = reserve_bytes.max(1);
-        if self
-            .scratch
-            .qsa_gather_vmm
-            .as_ref()
-            .is_some_and(|workspace| workspace.byte_size() >= reserve_bytes)
-        {
+        let action = crate::scratch::qsa_gather_reserve_action(
+            self.scratch
+                .qsa_gather_vmm
+                .as_ref()
+                .map(GpuTensor::byte_size),
+            reserve_bytes,
+        );
+        if action == crate::scratch::QsaGatherReserve::Keep {
             return Ok(());
         }
         self.refuse_qsa_gather_growth_while_armed(reserve_bytes)?;
-        if self.scratch.qsa_gather_vmm.is_some() {
+        if action == crate::scratch::QsaGatherReserve::ReplaceRetiring {
+            // Never unmap/remap the live VA in place: release retires it (the
+            // range stays reserved) and the allocation below takes a new one.
             self.invalidate_for_scratch_growth();
             self.release_qsa_gather_workspace()?;
         }
@@ -5580,6 +5822,49 @@ impl Gpu {
             k,
             xplanar,
             linear,
+        )
+    }
+
+    /// Quantize f32 activations into the gfx1201 `block_fp8_128` (e4m3) sidecar consumed by
+    /// [`Gpu::gemm_mq4g256v2_moe_grouped_fp8_sym`]. Shares the `ensure_int8_mmq_x` scratch, so it
+    /// overwrites a live int8 sidecar; gfx1201 only, `k % 128 == 0`.
+    pub fn ensure_fp8_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "ensure_fp8_mmq_x: gfx1201 only",
+            ));
+        }
+        if k == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(0, "ensure_fp8_mmq_x: k % 128"));
+        }
+        let needed = crate::scratch::int8_mmq_x_needed(k, n);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.int8_mmq_x_scratch_bytes,
+            self.scratch.int8_mmq_x_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.ensure_fp8_mmq_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.replay,
+            self.device_id,
+            x,
+            n,
+            k,
         )
     }
 
@@ -6589,6 +6874,49 @@ impl Gpu {
         self.f16_shadow_arena.root_capacities(DeviceBuffer::size)
     }
 
+    /// Reserve VA for a VMM-backed tensor without mapping any physical
+    /// memory. The caller maps granules with [`Self::vmm_map_at`] and must
+    /// refresh the owner's safe size with [`Self::refresh_vmm_owner_size`]
+    /// before any whole-tensor copy/read checks.
+    pub unsafe fn reserve_vmm_tensor(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        access_devices: &[i32],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+            .ok_or_else(|| HipError::new(0, "VMM tensor element count overflowed"))?;
+        let byte_size = numel
+            .checked_mul(dtype.size())
+            .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
+        let arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // `access_devices` is applied by the first `vmm_map_at`; reserve has
+        // no mapped range to set access on yet.
+        let _ = access_devices;
+        self.register_vmm_arena(arena, byte_size, shape, dtype)
+    }
+
+    /// Rebuild the owning descriptor after the arena's mapped prefix
+    /// changed. The base address is stable; only the safe byte length moves.
+    pub fn refresh_vmm_owner_size(&mut self, tensor: &mut GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let logical_bytes = tensor.byte_size();
+        let arena = self.vmm_arenas.get(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        // SAFETY: exactly one owner descriptor replaces the previous owner
+        // for the same registered arena; the old descriptor never freed it.
+        tensor.buf = unsafe { arena.owner_buffer(logical_bytes)? };
+        Ok(())
+    }
+
     /// Reserve a dense virtual tensor and optionally map its initial prefix.
     /// The returned tensor follows the normal kernel ABI, but its ownership is
     /// registered separately so `free_tensor` releases VMM handles instead of
@@ -6861,27 +7189,13 @@ impl Gpu {
             })?;
         // The device alias is what kernels are handed; the host pointer is what
         // hipHostFree needs. They coincide on large-BAR boxes but need not.
-        let dev_ptr = match self.hip.host_get_device_pointer(host_ptr, 0) {
-            Ok(p) if !p.is_null() => p,
-            other => {
-                // Loud, once: HIP documents that the mapped device pointer differs
-                // from the host pointer on discrete GPUs and that
-                // `hipHostGetDevicePointer` is *required* to obtain the one a kernel
-                // may dereference (hipHostMallocDefault alone does not map). Falling
-                // back to the host pointer therefore hands kernels a pointer HIP
-                // calls invalid, which reads as zeros or garbage rather than an
-                // error -- indistinguishable from a bad weight downstream.
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!(
-                        "[host-mapped] hipHostGetDevicePointer failed ({other:?}); using the host \
-                         pointer as the device alias -- GPU reads of these bytes are undefined \
-                         (CPU reads via host_bytes stay correct, so the two disagree silently)"
-                    );
-                });
-                host_ptr
-            }
-        };
+        // Fail closed: a missing alias frees the allocation and refuses the load; the
+        // host pointer is never handed to kernels in its place.
+        let dev_ptr = resolve_host_mapped_alias(
+            host_ptr,
+            |host| self.hip.host_get_device_pointer(host, 0),
+            |host| self.hip.host_free(host),
+        )?;
         let key = dev_ptr as usize;
         if self.host_mapped.insert(key, host_ptr as usize).is_some() {
             self.host_mapped.remove(&key);
@@ -6993,9 +7307,24 @@ impl Gpu {
     /// with this.
     pub fn take_device_wait_timeout(&self) -> Option<crate::device_wait::DeviceWaitTimeout> {
         // bind_thread: skip — reads host memory only, touches no device state.
-        self.device_wait
+        let timeout = self
+            .device_wait
             .as_ref()
-            .and_then(|mapping| mapping.take(self.device_id))
+            .and_then(|mapping| mapping.take(self.device_id));
+        if timeout.is_some() {
+            self.device_wait_unreported
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        timeout
+    }
+
+    /// Timeouts this GPU's wait block reported since the last call, whoever
+    /// read them: a `download_*` reader clears the record on its own rank, so
+    /// the multi-GPU step check (`Gpus::take_device_wait_errors`) would
+    /// otherwise never learn the step failed and skip the TP state reset.
+    pub fn take_unreported_device_wait_timeouts(&self) -> u32 {
+        self.device_wait_unreported
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Fail if a bounded device spin wait on this GPU stopped on its deadline
@@ -7165,6 +7494,60 @@ impl Gpu {
         access_devices: &[i32],
     ) -> HipResult<usize> {
         self.grow_vmm_tensor_impl(tensor, additional_bytes, access_devices, true)
+    }
+
+    /// Map `size` fresh bytes at a granularity-aligned `offset` in a VMM
+    /// owner's reservation. Used by the multi-slot KV page pool; unlike
+    /// [`Self::grow_vmm_tensor`], it may leave holes and does not change the
+    /// tensor's logical size.
+    pub fn vmm_map_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        if !self.vmm_arenas.contains_key(&key) {
+            return Err(HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            ));
+        }
+        self.vmm_pool_headroom(size);
+        let arena = self.vmm_arenas.get_mut(&key).expect("checked above");
+        arena.map_at(&self.hip, offset, size, access_devices)
+    }
+
+    /// True when the arena registered at this tensor's base can never be
+    /// mapped again (a failed `map_at` left it `releasing`). The shared paged
+    /// mapper poisons itself on this so a permanently unmappable pool reports
+    /// a mapping fault instead of a retryable capacity refusal forever.
+    pub fn vmm_arena_unmappable(&self, tensor: &GpuTensor) -> bool {
+        let key = tensor.buf.as_ptr() as usize;
+        self.vmm_arenas
+            .get(&key)
+            .is_some_and(|arena| arena.unmappable())
+    }
+
+    /// Unmap and release one pool page previously mapped with
+    /// [`Self::vmm_map_at`]. Synchronizes every access device first.
+    pub fn vmm_unmap_at(
+        &mut self,
+        tensor: &GpuTensor,
+        offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        let arena = self.vmm_arenas.get_mut(&key).ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("tensor at 0x{key:x} is not a registered VMM owner"),
+            )
+        })?;
+        arena.unmap_at(&self.hip, offset, size)
     }
 
     fn grow_vmm_tensor_impl(
@@ -8369,6 +8752,47 @@ impl Gpu {
         Ok(data)
     }
 
+    /// [`Self::download_f32`] for a decode loop that replays a graph on
+    /// [`Self::active_stream`]: the copy is ordered on that stream and the host
+    /// waits on that stream alone. The plain readback is a blocking copy on the
+    /// legacy null stream, which makes the runtime synchronize the null queue
+    /// with the decode stream's queue before every token; that cross-queue hop
+    /// costs a few percent in the good case and doubles the per-token time in
+    /// the bad one (R9700: queue placement / a second context on the card).
+    /// With no active stream this is exactly [`Self::download_f32`].
+    pub fn download_f32_stream_ordered(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
+        let Some(stream) = self.active_stream.as_ref() else {
+            return self.download_f32(tensor);
+        };
+        self.bind_thread()?;
+        let numel = tensor.numel();
+        let mut data = vec![0.0f32; numel];
+        // SAFETY: `data` holds exactly `numel` f32s; any byte pattern is a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
+        self.hip
+            .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?;
+        self.hip.stream_synchronize(stream)?;
+        self.take_device_wait_error()?;
+        Ok(data)
+    }
+
+    /// Write one `u32` into the first word of `buf`, ordered on
+    /// [`Self::active_stream`] (the legacy stream when none is set) without
+    /// blocking the host: the value is the immediate of a `hipMemsetD32Async`,
+    /// so a decode loop restages its token id through the queue that replays
+    /// the graph instead of a blocking null-stream copy
+    /// (see [`Self::download_f32_stream_ordered`]).
+    pub fn write_u32_stream_ordered(
+        &self,
+        buf: &hip_bridge::DeviceBuffer,
+        value: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.hip
+            .memset_d32_async(buf, value as i32, 1, self.active_stream.as_ref())
+    }
+
     /// [`Self::download_f32`] into a caller-owned buffer (resized to the
     /// tensor), so a per-row reader reuses one host allocation.
     pub fn download_f32_into(&self, tensor: &GpuTensor, out: &mut Vec<f32>) -> HipResult<()> {
@@ -8379,6 +8803,46 @@ impl Gpu {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, numel * 4) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()
+    }
+
+    /// Append each `parts[i].0` tensor's F32 contents to `parts[i].1` (the
+    /// vector grows by the tensor's element count; callers wanting a
+    /// replacement `clear` it first, so a reused buffer keeps its allocation),
+    /// enqueueing every copy on [`Self::active_stream`] and waiting on that
+    /// stream ONCE: one host round trip for a token's feature row and its
+    /// logits, with no legacy-stream hop ([`Self::download_f32_stream_ordered`]).
+    /// The tensors must have been written by work on the active stream (a
+    /// decode graph replay or the eager forward). With no active stream the
+    /// device is drained once and each part is a blocking copy.
+    pub fn download_f32_stream_ordered_append(
+        &self,
+        parts: &mut [(&GpuTensor, &mut Vec<f32>)],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        if stream.is_none() {
+            self.hip.device_synchronize()?;
+        }
+        for (tensor, out) in parts.iter_mut() {
+            let numel = tensor.numel();
+            let start = out.len();
+            out.resize(start + numel, 0.0);
+            // SAFETY: `out[start..]` holds exactly `numel` f32s; any byte pattern is a
+            // valid f32. No part's vector is resized again before the copies finish.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(out[start..].as_mut_ptr() as *mut u8, numel * 4)
+            };
+            match stream {
+                Some(stream) => self
+                    .hip
+                    .memcpy_dtoh_async(bytes, &tensor.buf, Some(stream))?,
+                None => self.hip.memcpy_dtoh(bytes, &tensor.buf)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
         self.take_device_wait_error()
     }
 
@@ -10216,6 +10680,81 @@ mod lab_fn_carve_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_alias_lookup_error_frees_once_and_propagates_original() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |p| {
+                assert_eq!(p, h);
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_null_is_explicit_error_never_host_pointer() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let r = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(std::ptr::null_mut()),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        );
+        let err = r.unwrap_err();
+        assert!(err.message.contains("null device alias"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_cleanup_failure_keeps_original_cause_and_context() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let err = super::resolve_host_mapped_alias(
+            h,
+            |_| Err(hip_bridge::HipError::new(700, "alias lookup")),
+            |_| {
+                frees.set(frees.get() + 1);
+                Err(hip_bridge::HipError::new(1, "free refused"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 700);
+        assert!(err.message.contains("alias lookup"));
+        assert!(err.message.contains("hipHostFree"));
+        assert!(err.message.contains("free refused"));
+        assert_eq!(frees.get(), 1);
+    }
+
+    #[test]
+    fn host_alias_distinct_from_host_is_returned_without_cleanup() {
+        let h = 0x1000 as *mut std::ffi::c_void;
+        let a = 0x9000 as *mut std::ffi::c_void;
+        let frees = std::cell::Cell::new(0);
+        let got = super::resolve_host_mapped_alias(
+            h,
+            |_| Ok(a),
+            |_| {
+                frees.set(frees.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, a);
+        assert_ne!(got, h);
+        assert_eq!(frees.get(), 0);
+    }
+
     #[cfg(feature = "lab")]
     #[test]
     fn lab_kernel_fault_counts_successes_then_fails_once_and_disarms() {
@@ -10437,14 +10976,56 @@ mod tests {
         assert!(DType::IU4G256.is_iu_quant());
         assert!(!DType::MQ4G256V2.is_iu_quant());
         assert!(!DType::IU4G256.is_mq_i4());
-        // qt=59 is the Q8 grid, group 32, not the K%256 MQ4 repack.
-        assert_eq!(DType::IU8G32.row_bytes(32), Some(34));
-        assert_eq!(DType::IU8G32.row_bytes(256), Some(272));
-        assert_eq!(DType::IU8G32.row_bytes(31), None);
+        // qt=59 is the compact Q8 grid, one scale per 128, not K%256.
+        assert_eq!(DType::IU8G32.row_bytes(128), Some(130));
+        assert_eq!(DType::IU8G32.row_bytes(256), Some(260));
+        assert_eq!(DType::IU8G32.row_bytes(32), None);
+        assert_eq!(DType::IU8G32.row_bytes(127), None);
         assert!(!DType::IU8G32.requires_k_mod_256());
         assert!(!DType::IU8G32.supports_awq_sidecar());
-        assert_eq!(DType::IU8G32.iu_quant_name(), Some("IU8G32"));
+        assert_eq!(DType::IU8G32.iu_quant_name(), Some("IU8G128"));
         assert!(DType::IU8G32.is_iu_quant());
+    }
+
+    /// The ggml dtypes carry GGUF block bytes as-is: distinct from the legacy
+    /// llama `Q4K`/`Q6K`/`Q8_0`, exact per-row bytes, and a named refusal for
+    /// every execution site (no ggml kernel exists yet).
+    #[test]
+    fn ggml_dtypes_are_distinct_byte_level_and_refused_by_name() {
+        for (dt, name, elems, bytes) in [
+            (DType::GgmlQ4K, "Q4_K", 256, 144),
+            (DType::GgmlQ5K, "Q5_K", 256, 176),
+            (DType::GgmlQ6K, "Q6_K", 256, 210),
+            (DType::GgmlQ8_0, "Q8_0", 32, 34),
+            (DType::GgmlIQ4XS, "IQ4_XS", 256, 136),
+        ] {
+            assert_eq!(dt.size(), 1, "{name}");
+            assert!(dt.is_ggml());
+            assert_eq!(dt.ggml_name(), Some(name));
+            assert_eq!(dt.ggml_block(), Some((elems, bytes)));
+            assert_eq!(dt.row_bytes(elems * 20), Some(20 * bytes), "{name}");
+            let refusal = dt.ggml_refusal().expect("refusal text");
+            assert!(
+                refusal.contains(name) && refusal.contains("no ggml kernel"),
+                "{refusal}"
+            );
+            assert_eq!(dt.requires_k_mod_256(), elems == 256, "{name}");
+        }
+        // never aliases a legacy dtype.
+        assert_ne!(DType::GgmlQ4K, DType::Q4K);
+        assert_ne!(DType::GgmlQ6K, DType::Q6K);
+        assert_ne!(DType::GgmlQ8_0, DType::Q8_0);
+        for legacy in [
+            DType::Q4K,
+            DType::Q6K,
+            DType::Q8_0,
+            DType::MQ4G256V2,
+            DType::F16,
+        ] {
+            assert!(!legacy.is_ggml());
+            assert_eq!(legacy.ggml_refusal(), None);
+            assert_eq!(legacy.ggml_block(), None);
+        }
     }
 
     #[test]
@@ -12356,5 +12937,206 @@ mod tests {
         drop(fd);
         assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (0, 0));
         gpu.ensure_vmm_cleaned().expect("exporter clean");
+    }
+}
+
+/// Fixed margin a planned admission leaves on top of the measured own
+/// footprint (lazy kernel/code-object loads and graph pools that appear after
+/// the admission, allocator rounding).
+pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
+
+/// Unledgered residency assumed when the kernel's per-process VRAM accounting
+/// cannot be read. Measured after load: ~3.5 GiB (A3B R9700), ~4.0 GiB (Raon
+/// R9700), ~4.9 GiB (Raon 7900 XTX); the smallest is used so the fallback is not
+/// itself the cause of a placement regression.
+pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 3584 << 20;
+
+/// This process's VRAM on the device at PCI address `bdf`, in bytes: the sum of
+/// `drm-memory-vram` over its distinct DRM clients for that device
+/// (`/proc/self/fdinfo`). It counts everything the process holds, ledgered or
+/// not, and nothing a foreign process holds. `None` when no client for the
+/// device reports it.
+pub fn own_vram_from_fdinfo(bdf: &str) -> Option<usize> {
+    let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
+    let mut clients: std::collections::HashMap<String, usize> = Default::default();
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some((id, kib)) = parse_drm_fdinfo(&text, bdf) {
+            clients.insert(id, kib);
+        }
+    }
+    if clients.is_empty() {
+        return None;
+    }
+    Some(clients.values().sum::<usize>().saturating_mul(1024))
+}
+
+/// `(drm-client-id, drm-memory-vram KiB)` of one fdinfo text when it belongs to
+/// the device at `bdf`.
+fn parse_drm_fdinfo(text: &str, bdf: &str) -> Option<(String, usize)> {
+    let (mut pdev, mut id, mut vram) = (None, None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "drm-pdev" => pdev = Some(value),
+            "drm-client-id" => id = Some(value),
+            "drm-memory-vram" => {
+                vram = value.split_whitespace().next().and_then(|v| v.parse().ok())
+            }
+            _ => {}
+        }
+    }
+    if !pdev?.eq_ignore_ascii_case(bdf) {
+        return None;
+    }
+    Some((id?.to_string(), vram?))
+}
+
+/// Result of [`Gpu::planned_capacity`]; `Display` is the load-log input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlannedCapacity {
+    /// Bytes the admission plans against.
+    pub bytes: usize,
+    pub total: usize,
+    /// Live device bytes in this process's allocation ledger.
+    pub own: usize,
+    /// Residency this process holds outside the ledger (measured, or the
+    /// conservative fallback).
+    pub unledgered: usize,
+    /// The unledgered figure was measured from the kernel accounting.
+    pub unledgered_measured: bool,
+    pub reserve: usize,
+    /// Instantaneous free at query time (observation only when `planned`).
+    pub free_now: usize,
+    /// `bytes` is `total - own - unledgered - reserve`; false = free figure
+    /// used (UMA/emu).
+    pub planned: bool,
+}
+
+impl PlannedCapacity {
+    pub fn new(free_now: usize, total: usize, own: usize, planned: bool) -> Self {
+        Self {
+            bytes: 0,
+            total,
+            own,
+            unledgered: 0,
+            unledgered_measured: false,
+            reserve: PLANNED_CAPACITY_RESERVE_BYTES,
+            free_now,
+            planned,
+        }
+        .recomputed()
+    }
+
+    /// Account `bytes` of this process's residency outside the ledger.
+    pub fn with_unledgered(mut self, bytes: usize, measured: bool) -> Self {
+        self.unledgered = bytes;
+        self.unledgered_measured = measured;
+        self.recomputed()
+    }
+
+    fn recomputed(mut self) -> Self {
+        self.bytes = if self.planned {
+            self.total
+                .saturating_sub(self.own)
+                .saturating_sub(self.unledgered)
+                .saturating_sub(self.reserve)
+        } else {
+            self.free_now
+        };
+        self
+    }
+
+    /// The capacity before the fixed reserve: device total minus this
+    /// process's own live allocations when planned, the free figure under
+    /// UMA/emu. For a caller that carries its own measured runtime reserve in
+    /// its census (the Qwen4 expert-parallel plan: historical floor, 1408 MiB
+    /// of it HIP runtime residency), where [`Self::bytes`] would count the
+    /// runtime residency twice. Stable against a foreign process's transient
+    /// allocation like [`Self::bytes`].
+    pub fn before_reserve(&self) -> usize {
+        if self.planned {
+            self.total.saturating_sub(self.own)
+        } else {
+            self.bytes
+        }
+    }
+}
+
+impl std::fmt::Display for PlannedCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let m = |b: usize| b as f64 / (1024.0 * 1024.0);
+        if self.planned {
+            write!(
+                f,
+                "planned={:.0} MiB (total {:.0} - own {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                m(self.bytes),
+                m(self.total),
+                m(self.own),
+                m(self.unledgered),
+                if self.unledgered_measured { "measured, fdinfo" } else { "fallback" },
+                m(self.reserve),
+                m(self.free_now)
+            )
+        } else {
+            write!(
+                f,
+                "capacity={:.0} MiB (free figure: UMA/emu)",
+                m(self.bytes)
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod planned_capacity_tests {
+    use super::*;
+    const G: usize = 1 << 30;
+    #[test]
+    fn foreign_allocation_does_not_change_planned_capacity() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 24 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+        // Measured unledgered residency is charged once, and is foreign-proof too.
+        let a = a.with_unledgered(4 * G, true);
+        let b = b.with_unledgered(4 * G, true);
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes, 20 * G - PLANNED_CAPACITY_RESERVE_BYTES);
+    }
+    #[test]
+    fn fdinfo_parse_counts_only_the_named_device() {
+        let t = "pos:\t0\ndrm-driver:\tamdgpu\ndrm-pdev:\t0000:C3:00.0\ndrm-client-id:\t7\ndrm-memory-vram:\t1192100 KiB\ndrm-memory-gtt: 8240 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(t, "0000:c3:00.0"),
+            Some(("7".to_string(), 1192100))
+        );
+        assert_eq!(parse_drm_fdinfo(t, "0000:03:00.0"), None);
+        assert_eq!(parse_drm_fdinfo("pos: 0\n", "0000:c3:00.0"), None);
+    }
+    #[test]
+    fn uma_uses_free() {
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).bytes,
+            5 * G
+        );
+    }
+    #[test]
+    fn before_reserve_is_total_minus_own_and_ignores_foreign_allocations() {
+        let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let b = PlannedCapacity::new(6 * G, 32 * G, 8 * G, true); // 14 GiB foreign
+        assert_eq!(a.before_reserve(), 24 * G);
+        assert_eq!(a.before_reserve(), b.before_reserve());
+        assert_eq!(a.before_reserve(), a.bytes + PLANNED_CAPACITY_RESERVE_BYTES);
+        // UMA / emu: the free figure stays authoritative.
+        assert_eq!(
+            PlannedCapacity::new(5 * G, 32 * G, 8 * G, false).before_reserve(),
+            5 * G
+        );
     }
 }

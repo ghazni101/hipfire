@@ -27,6 +27,7 @@
 //! (see [`copy`]); where inside each resource the accesses land is the
 //! table's content, which `prepare` bounds-checks entry by entry
 //! ([`Via::Slot`]).
+pub mod contract;
 pub mod copy;
 pub mod index_bind;
 pub mod kernel;

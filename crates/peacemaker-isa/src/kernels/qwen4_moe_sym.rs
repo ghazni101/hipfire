@@ -20,7 +20,8 @@
 //!
 //! Every wave is independent: operands are loaded straight into registers
 //! (the next K128 epoch prefetched while the current one is consumed), no
-//! LDS and no barrier. The tile of 16 grouped slots is `blockIdx.y`; a tile
+//! LDS and no barrier (except the gfx1201 NT8 `gate_up` entry, which holds its four waves to one
+//! workgroup barrier per K128 epoch in the K loop, and the NT4 / NT8 `gate_up` hand-off). The tile of 16 grouped slots is `blockIdx.y`; a tile
 //! past `m_total` or with an expert id outside `[0, n_experts)` (the -1 sentinel, or a
 //! corrupt id) returns before any load or store.
 //! Each lane loads its slot `s = sorted[16*tile + lane%16]`; a padding slot
@@ -1888,6 +1889,20 @@ mod nt {
         fn streamed(&self) -> bool {
             self.buffered < self.nt()
         }
+        /// The gfx1201 MQ4 NT8 `gate_up` entry rendezvouses its four waves twice per K-loop trip
+        /// (one workgroup barrier per K128 epoch: at the top of the trip and between the
+        /// descriptor step and the second epoch's weight loads), keeping their activation
+        /// gathers aligned. Every other entry, and every experimental or streamed schedule,
+        /// has no barrier in its K loop.
+        fn epoch_lock(&self) -> bool {
+            self.spec.arch == Arch::Gfx1201
+                && self.spec.codec == WeightCodec::Mq4Sym
+                && self.spec.kind == Kind::GateUp
+                && self.spec.nt == 8
+                && self.rr() == 1
+                && !self.streamed()
+                && !self.experimental()
+        }
         fn buffered_tiles(&self) -> u8 {
             self.buffered
         }
@@ -3181,9 +3196,15 @@ mod nt {
         wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
             wg.loop_carried(&head, (), |wg, ()| {
                 if g.prefetch {
+                    if g.epoch_lock() {
+                        wg.barrier(())?;
+                    }
                     load_w(wg.isa(), g, 1)?;
                     compute(wg, g, 0, "l0", Some(SRD_X[1]))?;
                     advance(wg.isa(), g.streamed())?;
+                    if g.epoch_lock() {
+                        wg.barrier(())?;
+                    }
                     load_w(wg.isa(), g, 0)?;
                     compute(wg, g, 1, "l1", Some(SRD_X[0]))?;
                     if g.streamed() {

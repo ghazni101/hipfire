@@ -1001,10 +1001,11 @@ pub trait MoeStepHooks {
     /// At the top of the interpreter's loop, before `step` is dispatched by
     /// whatever route takes it (fused, CPU or plain): every earlier step has
     /// run, `step` has not. A step consumed inside an earlier step's fused
-    /// launch is never announced, except the members of a multi-lane GDN Core
-    /// group (fn-lanes): each is announced exactly once, in program order,
-    /// right before the group's launches (its members write only per-lane
-    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// launch is never announced, except the members of a multi-lane GDN or
+    /// QSA Core group (fn-lanes): each is announced exactly once, in program
+    /// order, right before the group's launches (its members write only
+    /// per-lane scratch, so the state seen is the one sequential dispatch
+    /// would show).
     /// Default: nothing (no fusion changes).
     fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
         Ok(())
@@ -1154,6 +1155,46 @@ fn execute_window<'a>(
             {
                 i += group;
                 continue;
+            }
+        }
+        // fn-lanes: consecutive QSA Core steps of one layer (one per AR lane,
+        // 1..=8 rows each) run as one multi-lane launch per kernel (prologue,
+        // pool, select, attention) under `HIPFIRE_QWEN4_QSA_LANES`; announced
+        // and refused exactly like the GDN group above.
+        if let Step::IndexedAttention(first) = &steps[i] {
+            if first.phase == MixerPhase::Core
+                && !cpu_exec::cpu_exec_enabled()
+                && gpu.flags.qwen4_qsa_lanes_enabled()
+            {
+                let ops: Vec<_> = steps[i..end]
+                    .iter()
+                    .take(rdna_compute::tensor_ops::QSA_CORE_LANES_MAX)
+                    .map_while(|s| match s {
+                        Step::IndexedAttention(op)
+                            if op.phase == MixerPhase::Core
+                                && op.q_norm.buf.as_ptr() == first.q_norm.buf.as_ptr() =>
+                        {
+                            Some(op)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let group = ops.len();
+                if group >= 2
+                    && crate::pipeline::layer_ops::execute_indexed_attention_core_lanes(
+                        gpu,
+                        &ops,
+                        |gpu| {
+                            for step in &steps[i..i + group] {
+                                hooks.before_step(gpu, step)?;
+                            }
+                            Ok(())
+                        },
+                    )?
+                {
+                    i += group;
+                    continue;
+                }
             }
         }
         hooks.before_step(gpu, &steps[i])?;
@@ -1748,6 +1789,23 @@ fn launch_gemv<'a>(
             )
         }
         (GemvInput::Raw(x), Some(residual)) => {
+            // GGUF-native weights: the mmvq accumulate export adds `W·x` into
+            // the residual stream in the same launch (no scratch, no add).
+            if w.dtype.is_ggml() {
+                return gemv.run(
+                    ctx,
+                    gpu,
+                    &GemvParams {
+                        w,
+                        x,
+                        y: residual,
+                        variant: GemvVariant::WithResidual,
+                        residual: None,
+                        gate: None,
+                        up: None,
+                    },
+                );
+            }
             // A row-restricted raw-residual step would need a row-offset scratch and
             // a row-offset accumulate for the non-fused fallback below; refuse rather
             // than launch a whole-tensor add into a row view. (The pass-back's gate
@@ -2083,7 +2141,16 @@ fn launch_fused<'a>(
     key: KernelKey,
     steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
-    // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
+    // Step 0 is always RmsnormAutomatic. The exact-gfx1201 MQ4G256V2 mixer
+    // windows fold it into the projection launch (`HIPFIRE_A3B_NORM_FOLD`).
+    if matches!(
+        key,
+        KernelKey::FusedQkvMq4G256V2 | KernelKey::FusedQkvzaMq4G256V2
+    ) && super::norm_fold::launch_mixer_window(gpu, steps)?
+    {
+        return Ok(());
+    }
+    // Run it to fill the activated buffer.
     launch_op(gpu, ctx, &steps[0])?;
     let activated = rmsnorm_out(&steps[0]);
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);

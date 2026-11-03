@@ -122,11 +122,12 @@ def parse_axes_line(text):
     return fields
 
 
-def summarize(walk):
+def summarize(walk, accept_partial=False):
     """(arch, hip, embedded, direct, policy, facts, command) observed by one walk.
     `facts` is the Qwen3.5 axes line's fields, None for a Flash-Next walk."""
     result = json.loads((walk / "result.json").read_text())
-    if not result["ok"]:
+    partial = accept_partial and result.get("partial") and result["errors"] == 0
+    if not result["ok"] and not partial:
         raise SystemExit(f"{walk}: walk not ok (rc={result['rc']}, errors={result['errors']})")
     pending = None
     handles = {}
@@ -288,6 +289,9 @@ def main():
                                        "its tensors join the trunk's in the native-MTP layout")
     ap.add_argument("--sealed-replay", action="append", default=[],
                     help="ROUTE=DIR: a route_plan_walk.py --sealed run of the checked-in plan; seals that route")
+    ap.add_argument("--accept-partial", action="store_true",
+                    help="take a walk the walker recorded as partial (`partial: true` in result.json: the daemon was "
+                         "killed by a timeout after N error-free requests); its audit is a valid, smaller walk")
     ap.add_argument("--no-verify-walk-model", action="store_true",
                     help="skip hashing each Qwen3.5 walk's model header against the plan layout")
     a = ap.parse_args()
@@ -302,7 +306,7 @@ def main():
         if route not in SPEC_OF_ROUTE:
             raise SystemExit(f"unknown route {route}")
         walk = pathlib.Path(path)
-        w_arch, hip, emb, direct, policy, facts, command = summarize(walk)
+        w_arch, hip, emb, direct, policy, facts, command = summarize(walk, a.accept_partial)
         if arch not in (None, w_arch):
             raise SystemExit("walks span two architectures")
         arch = w_arch

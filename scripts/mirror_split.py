@@ -120,6 +120,7 @@ PEACEMAKER_KERNELS = [
     "qwen4_moe_iu4_sym_w3_pm_gfx1201",
     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1_control",
     "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+    "gemm_mq6g256v2_residual_pm_gfx1100",
     "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151",
     "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151",
     "mq4_verify_pm_gfx1201",

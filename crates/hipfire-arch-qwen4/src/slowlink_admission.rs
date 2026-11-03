@@ -21,7 +21,7 @@
 //!
 //! 1. a single-device, whole-model, auto-placed discrete load: no expert
 //!    parallelism, bands, hot set, `whole-first`, explicit expert layer count,
-//!    `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out, or CPU expert splice;
+//!    `HIPFIRE_QWEN4_EXPERT_STAGE=0` opt-out;
 //! 2. a context long enough to hold a multi-chunk window;
 //! 3. the measured host link ([`link_verdict`]): discrete and **below**
 //!    16 GB/s. A fast link, unified memory and an unmeasured link never select
@@ -79,18 +79,36 @@ pub const S1_PRIMITIVE_TILE_ROWS: usize = 512;
 /// Prompt rows one S1 window admits. A longer prompt runs several windows
 /// (each its own expert sweep) and is receipted as such; it never claims one
 /// sweep per prompt.
-pub const S1_WINDOW_ROWS: usize = 16384;
+///
+/// Whole product tiles: the planner closes a window before the tile that would
+/// pass it, so a window of `S1_WINDOW_TILES` 768-row tiles carries every row.
+/// 21 tiles (16,128 rows) left a 32,780-row prompt a 524-row third window that
+/// still paid a full expert sweep; 22 tiles (16,896 rows) makes it two. The
+/// window is also a whole number of the 1536-row and 512-row tiles (11 and 33).
+pub const S1_WINDOW_TILES: usize = 22;
+pub const S1_WINDOW_ROWS: usize = S1_WINDOW_TILES * S1_PRODUCT_TILE_ROWS;
+
+/// Device memory an [`admit_grown`] profile leaves free beyond every charge,
+/// the 512 MiB safety margin and its own
+/// [`SlowlinkProfile::device_snapshot_budget_bytes`]: the quote it is judged on
+/// is the actual free minus this, so the session cache's device snapshots
+/// never reach it either. A grown load therefore never leaves less than this
+/// (plus the margin) free after placement.
+pub const S1_GROWN_FREE_HOLD_BYTES: u64 = 1 << 30;
+
+/// Most whole tiles an [`admit_grown`] window ever holds (49,152 rows at the
+/// 768-row product tile). The window's HC-stream elements stay at about
+/// 5e8, a quarter of the 32-bit element index space the row-major kernels
+/// address, however much free memory a larger card leaves; nothing above
+/// this size has been run.
+pub const S1_GROWN_WINDOW_MAX_TILES: usize = 64;
 
 /// Fewest request rows S1 runs when forced: one row past a tile, the first
 /// genuinely multi-chunk request (a request of at most one tile is a named
-/// bypass). The automatic selector starts at [`S1_MIN_AUTO_REQUEST_ROWS`].
+/// bypass). The automatic selector starts one row past the ADMITTED tile
+/// ([`qualify_request`]): on a 768-row-tile load a 769..=1536-row request is
+/// already two incumbent chunks, each re-streaming every host layer's experts.
 pub const S1_MIN_FORCED_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
-
-/// Fewest request rows the automatic selector sends to S1: one row past the
-/// tile, the first genuinely multi-chunk request. Requests of at most one
-/// tile are a named bypass; the 1,400 tok/s target is not generalised to
-/// shorter prompts.
-pub const S1_MIN_AUTO_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
 
 /// Preferred resident trunk layers of an S1 load beside its own charges.
 /// INFORMATION ONLY: placement keeps the largest count that fits
@@ -338,6 +356,15 @@ pub enum SlowlinkDecline {
     ShortContext {
         max_seq: usize,
     },
+    /// The window (`min(S1_WINDOW_ROWS, max_seq)` rows) is smaller than the route's worst-case
+    /// cohort bound: the dispatch layout needs `k1_rows + tail_rows <= rows`
+    /// ([`check_window_cohort`]). An incumbent decline, never a capacity refusal: the bound is
+    /// the route's own constants, so no free memory makes the window legal.
+    WindowTooSmall {
+        rows: usize,
+        k1_rows: usize,
+        tail_rows: usize,
+    },
     /// Measured discrete link at or above 16 GB/s.
     FastLink {
         gbps: f64,
@@ -381,6 +408,14 @@ impl fmt::Display for SlowlinkDecline {
             Self::ShortContext { max_seq } => write!(
                 f,
                 "context {max_seq} is shorter than the {S1_MIN_FORCED_REQUEST_ROWS}-row minimum multi-chunk window"
+            ),
+            Self::WindowTooSmall {
+                rows,
+                k1_rows,
+                tail_rows,
+            } => write!(
+                f,
+                "window too small for its cohort rows: rows {rows} < k1 {k1_rows} + tail {tail_rows}"
             ),
             Self::FastLink { gbps } => write!(
                 f,
@@ -506,9 +541,10 @@ pub struct SymIu4RouteFacts {
     /// The device has a symmetric IU4 MoE kernel descriptor for MQ4 experts
     /// (`Gpu::qwen4_moe_sym_kernel`).
     pub descriptor: bool,
-    /// `Gpu::qwen4_moe_sym_iu4_requested`: the typed flag requested the route (gfx1100: explicit
-    /// `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only, `=0` kills), the C2 candidate set holds and a descriptor
-    /// exists.
+    /// `Gpu::qwen4_moe_sym_iu4_requested`: the typed flag requested the route (unset follows the
+    /// arch descriptor's `default_requested`, true on gfx1100, gfx1151 and gfx1201, so the S1 window
+    /// and the regular prefill agree; `HIPFIRE_QWEN4_MOE_SYM_IU4=0` kills), the C2 candidate set
+    /// holds and a descriptor exists.
     pub requested: bool,
     /// The MoE recipe's BF16 round trip ([`QWEN4_MOE_RECIPE_BF16_ROUND_TRIP`]).
     pub recipe_bf16_round_trip: bool,
@@ -1023,6 +1059,27 @@ pub fn route_dims(
         },
         route: geometry.route,
     }
+}
+
+/// Whether a window of `rows` rows can hold the cohort capacities [`route_dims`] charges
+/// (`k1_rows + tail_rows <= rows`, the same bound `PromptRouteLayout::new` enforces), so a window
+/// too small for them is a named incumbent decline before the census instead of a layout error
+/// at load. Only the aggregate routes charge tail rows: the slab route's 48 K1 rows always fit a
+/// window of at least [`S1_MIN_FORCED_REQUEST_ROWS`] rows.
+pub fn check_window_cohort(geometry: &ModelGeometry, rows: usize) -> Result<(), SlowlinkDecline> {
+    let dims = route_dims(geometry, rows);
+    if dims
+        .k1_rows
+        .checked_add(dims.tail_rows)
+        .is_none_or(|cohort| cohort > rows)
+    {
+        return Err(SlowlinkDecline::WindowTooSmall {
+            rows,
+            k1_rows: dims.k1_rows,
+            tail_rows: dims.tail_rows,
+        });
+    }
+    Ok(())
 }
 
 /// Device bytes of the dispatch crate's `PromptRouteStorage` for a window of
@@ -1584,7 +1641,9 @@ pub struct SlowlinkProfile {
     pub arena: PromptArenaLayout,
     pub census: SlowlinkCensus,
     /// Layers the charged placement keeps resident: the largest count that
-    /// fits ([`PlacementBudget::largest_fitting_layers`]), possibly zero,
+    /// fits ([`PlacementBudget::largest_fitting_layers`]) of the quote it was
+    /// admitted on (the actual free memory, or for an [`admit_grown`] profile
+    /// that actual free less [`S1_GROWN_FREE_HOLD_BYTES`]), possibly zero,
     /// possibly above [`S1_PREFERRED_RESIDENT_LAYERS`]; always below the trunk
     /// layer count (a fully resident load takes the incumbent).
     pub resident_layers: usize,
@@ -1647,10 +1706,12 @@ impl SlowlinkProfile {
         })
     }
 
-    /// Windows a request of `rows` rows runs ([`S1_WINDOW_ROWS`] each, the
-    /// last possibly short).
+    /// Windows a request of `rows` rows runs: the planner packs whole tiles,
+    /// so a window holds `window_rows / tile_rows` of them (the last possibly
+    /// short). Session cuts may close more windows; this is the cut-free count.
     pub fn windows_for(&self, rows: usize) -> usize {
-        rows.div_ceil(self.window_rows)
+        let tiles_per_window = (self.window_rows / self.tile_rows).max(1);
+        rows.div_ceil(self.tile_rows).div_ceil(tiles_per_window)
     }
 
     /// The dispatch crate's route-storage dimensions at this window
@@ -1676,9 +1737,34 @@ impl SlowlinkProfile {
         self.pages.host_staging_bytes
     }
 
+    /// Device bytes left free beyond every charge and the safety margin at the
+    /// admitted resident layers on the REAL free memory: the quote's own slack
+    /// plus whatever the quote held back ([`S1_GROWN_FREE_HOLD_BYTES`] for a
+    /// grown profile, 0 otherwise).
+    pub fn remaining_slack_bytes(&self, actual_free_bytes: u64) -> u64 {
+        self.device_snapshot_budget_bytes
+            .saturating_add(actual_free_bytes.saturating_sub(self.placement.memory.free_bytes))
+    }
+
+    /// [`Self::describe`] extended with the chosen window (rows and tiles), the
+    /// resident layers and the remaining slack on `actual_free_bytes`, the free
+    /// hold included. The S1 load line.
+    pub fn describe_against(&self, actual_free_bytes: u64) -> String {
+        format!(
+            "{}; window {} rows = {} tiles, {} resident layers, {} B slack remaining of {} B actual free ({} B free hold included)",
+            self.describe(),
+            self.window_rows,
+            self.window_rows / self.tile_rows,
+            self.resident_layers,
+            self.remaining_slack_bytes(actual_free_bytes),
+            actual_free_bytes,
+            actual_free_bytes.saturating_sub(self.placement.memory.free_bytes),
+        )
+    }
+
     /// The placement log line.
     pub fn describe(&self) -> String {
-        // Only the opt-in IU4 route names itself: every other load logs byte for byte as before.
+        // Only the IU4 route names itself: every other load logs byte for byte as before.
         let route = match self.geometry.route {
             WindowRoute::AggregateSymIu4 => {
                 format!(", window route {}", WindowRoute::AggregateSymIu4.label())
@@ -1821,6 +1907,7 @@ pub fn project_at_tile(
             "slow-link prefill tile {tile_rows} is not a legal rung"
         )));
     }
+    check_window_cohort(&inputs.geometry, inputs.window_rows)?;
     let (pages, arena, census) =
         census_at_tile(inputs, tile_rows).map_err(SlowlinkDecline::Geometry)?;
     let granule =
@@ -1918,6 +2005,101 @@ fn granule_charge(
 /// `inputs.base_reserve` must be the census at that tile.
 pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDecline> {
     admit_at_tile(inputs, purpose_tile_rows(inputs.purpose))
+}
+
+/// [`admit`] with the window sized at load from the actual free device bytes,
+/// never leaving less than [`S1_GROWN_FREE_HOLD_BYTES`] of device memory free.
+///
+/// The base profile is the ordinary admission at `inputs.window_rows` (the
+/// [`S1_WINDOW_ROWS`] floor) on the real free memory: its refusals are
+/// returned unchanged. Growth is judged on a quote that holds
+/// [`S1_GROWN_FREE_HOLD_BYTES`] back from the actual free bytes, so a grown
+/// profile leaves that much free beyond every charge, the 512 MiB safety
+/// margin and its own [`SlowlinkProfile::device_snapshot_budget_bytes`]. The
+/// held-back quote is the profile's placement quote, so it is internally
+/// consistent and the loader places exactly its resident count.
+///
+/// A context whose covering window (`max_seq` rounded UP to a tile) is at most
+/// [`S1_GROWN_WINDOW_MAX_TILES`] runs every request in one window, so the
+/// window takes priority over extra resident layers: the covering window is
+/// tried first, then a binary search down to the largest whole-tile window
+/// above the floor that admits on the held-back quote, each candidate with its
+/// own resident-layer verdict. A longer context runs several windows anyway:
+/// the floor admission's resident count is kept and the window grows (to at
+/// most the cap) only with the memory left at that count. The KV charge is
+/// that of the load's `max_seq` (`inputs.base_reserve`). Nothing is decided at
+/// request time. If no window above the floor admits, the base profile is
+/// returned unchanged (growth never refuses a load).
+///
+/// Every term is the same pure census the base used, so charge ==
+/// allocation; [`S1_F32_STREAM_ROWS`], the boundary snapshot cap and the
+/// checkpoint stride are window independent.
+pub fn admit_grown(
+    inputs: &AdmissionInputs,
+    max_seq: usize,
+) -> Result<SlowlinkProfile, SlowlinkDecline> {
+    let base = admit(inputs)?;
+    let tile = base.tile_rows;
+    let ceiling_rows = max_seq.div_ceil(tile).saturating_mul(tile);
+    let (floor_tiles, ceiling_tiles) = (
+        base.window_rows / tile,
+        (ceiling_rows / tile).min(S1_GROWN_WINDOW_MAX_TILES),
+    );
+    // A window that is not a whole number of tiles (a context shorter than the
+    // floor) already holds every row the context can.
+    if base.window_rows % tile != 0 || ceiling_tiles <= floor_tiles {
+        return Ok(base);
+    }
+    let held = |tiles: usize| AdmissionInputs {
+        window_rows: tiles * tile,
+        memory: AdmissionMemory {
+            pre_init_free_bytes: inputs
+                .memory
+                .pre_init_free_bytes
+                .map(|free| free.saturating_sub(S1_GROWN_FREE_HOLD_BYTES)),
+            free_bytes: inputs
+                .memory
+                .free_bytes
+                .saturating_sub(S1_GROWN_FREE_HOLD_BYTES),
+        },
+        ..*inputs
+    };
+    // A context whose covering window is within the cap runs every request in
+    // one window: the window outranks resident layers, each candidate with its
+    // own layer verdict. A longer context runs several windows anyway: the
+    // floor admission's resident count is kept and the window grows only with
+    // the memory left at that count.
+    let covering = ceiling_rows / tile;
+    let one_window = covering <= S1_GROWN_WINDOW_MAX_TILES;
+    let fits = |tiles: usize| {
+        admit(&held(tiles))
+            .ok()
+            .filter(|profile| one_window || profile.resident_layers == base.resident_layers)
+    };
+    if one_window {
+        // The max_seq-covering window first.
+        if let Some(profile) = fits(ceiling_tiles) {
+            return Ok(profile);
+        }
+    }
+    // Slack only falls as the window grows, so "fits" is monotone in tiles.
+    let top = if one_window {
+        ceiling_tiles - 1
+    } else {
+        ceiling_tiles
+    };
+    let (mut lo, mut hi, mut best) = (floor_tiles, top, None);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        match fits(mid) {
+            Some(profile) => {
+                best = Some(profile);
+                lo = mid;
+            }
+            None => hi = mid - 1,
+        }
+    }
+    Ok(best.unwrap_or(base))
 }
 
 /// [`admit`] at an explicit legal tile ([`legal_tile_rungs`]) through the same
@@ -2293,15 +2475,22 @@ pub fn select_profile(
         Err(decline) => decline,
         Ok(()) => match link_verdict(link())
             .and_then(inputs)
-            .and_then(|inputs| admit(&inputs))
-            .and_then(|profile| match explicit_chunk_rows(shape.chunk_rows_env) {
-                Some(rows) if rows != profile.tile_rows => Err(SlowlinkDecline::ExplicitChunk {
-                    rows,
-                    tile: Some(profile.tile_rows),
-                }),
-                _ => Ok(profile),
-            }) {
-            Ok(profile) => {
+            .and_then(|inputs| {
+                admit_grown(&inputs, shape.max_seq)
+                    .map(|profile| (profile, inputs.memory.free_bytes))
+            })
+            .and_then(
+                |(profile, free)| match explicit_chunk_rows(shape.chunk_rows_env) {
+                    Some(rows) if rows != profile.tile_rows => {
+                        Err(SlowlinkDecline::ExplicitChunk {
+                            rows,
+                            tile: Some(profile.tile_rows),
+                        })
+                    }
+                    _ => Ok((profile, free)),
+                },
+            ) {
+            Ok((profile, free)) => {
                 // A non-front switch value names WHICH layers are resident;
                 // resolve it now so an invalid value fails the load before
                 // placement. Unset or `front` is the incumbent line.
@@ -2319,9 +2508,12 @@ pub fn select_profile(
                 };
                 match set {
                     Some(set) => {
-                        eprintln!("  qwen4 {} resident_layer_set={set:?}", profile.describe())
+                        eprintln!(
+                            "  qwen4 {} resident_layer_set={set:?}",
+                            profile.describe_against(free)
+                        )
                     }
-                    None => eprintln!("  qwen4 {}", profile.describe()),
+                    None => eprintln!("  qwen4 {}", profile.describe_against(free)),
                 }
                 return Ok(Some(profile));
             }
@@ -2708,6 +2900,9 @@ pub enum RequestBypass {
     },
     /// The profile's tile is not a valid chunk for this request.
     NoRows,
+    /// SP is armed, the request is a single window of 5..=tile rows, and that
+    /// window is not SP-qualified: the incumbent runs.
+    Sp(crate::slowlink_sp::SpBypass),
 }
 
 /// Judge a request against the frozen profile, before any mutation or S1
@@ -2720,7 +2915,7 @@ pub fn qualify_request(
 ) -> Result<RequestVerdict, RequestBypass> {
     let minimum = match mode {
         SlowlinkMode::Off => return Err(RequestBypass::KillSwitch),
-        SlowlinkMode::Auto => S1_MIN_AUTO_REQUEST_ROWS,
+        SlowlinkMode::Auto => profile.tile_rows.saturating_add(1),
         SlowlinkMode::Force => S1_MIN_FORCED_REQUEST_ROWS,
     };
     if request.rows == 0 {
@@ -2749,10 +2944,56 @@ pub fn qualify_request(
     })
 }
 
+/// [`qualify_request`] with SP armed (HOOK-DESIGN §5.1, per request).
+///
+/// A request of `SP_MIN_ROWS ..= profile.tile_rows` rows is one window of one
+/// tile, below S1's own multi-chunk floor: S1 admits it **only if that window
+/// is SP-qualified** ([`crate::slowlink_sp::qualify_sp_shape`]); otherwise the
+/// incumbent runs, with the named reason. Every other request (off, shorter,
+/// or longer than one tile) is exactly [`qualify_request`], with SP decided per
+/// window by the runtime.
+pub(crate) fn qualify_request_sp(
+    mode: SlowlinkMode,
+    profile: &SlowlinkProfile,
+    sp: &crate::slowlink_sp::SpProfile,
+    request: &RequestShape,
+) -> Result<RequestVerdict, RequestBypass> {
+    let single_tile = (crate::slowlink_sp::SP_MIN_ROWS..=profile.tile_rows).contains(&request.rows);
+    if mode == SlowlinkMode::Off || !single_tile {
+        return qualify_request(mode, profile, request);
+    }
+    match request.capture {
+        CaptureKind::None | CaptureKind::Bounded => {}
+        CaptureKind::AllRows => return Err(RequestBypass::AllRowCapture),
+        CaptureKind::External => return Err(RequestBypass::ExternalCapture),
+    }
+    // One window of one tile of `rows` routing rows (rows >= 5: never a one-row
+    // tile); K1 rows are the one-row decode tiles, none here.
+    crate::slowlink_sp::qualify_sp_shape(
+        sp,
+        request.rows,
+        request.session_cuts,
+        None,
+        0,
+        request.capture,
+    )
+    .map_err(RequestBypass::Sp)?;
+    Ok(RequestVerdict {
+        rows: request.rows,
+        windows: 1,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::expert_residency::{auto_placement_layers, PlacementCharges};
+    /// The 16,384-row window the pinned j1778/j1786 reference ledgers were
+    /// measured at. The product window is [`S1_WINDOW_ROWS`] (22 tiles); the
+    /// reference fixtures keep their historical window so their slack pins stay
+    /// real measurements, and the window change is pinned as a delta in
+    /// `slowlink_admission_window_charge_delta_is_pinned`.
+    const REFERENCE_WINDOW_ROWS: usize = 16_384;
 
     const GIB: u64 = 1 << 30;
     const MIB: u64 = 1 << 20;
@@ -2801,7 +3042,7 @@ mod tests {
             base_runtime_reserved_bytes: 0,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS,
+            window_rows: REFERENCE_WINDOW_ROWS,
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
             sym_iu4_source_symmetric: None,
@@ -3272,7 +3513,7 @@ mod tests {
         let geometry = geometry();
         let arena = PromptArenaLayout::new(&geometry, S1_WINDOW_ROWS, S1_TILE_ROWS).unwrap();
         assert_eq!(arena.tiles, 11);
-        assert_eq!(arena.rows, 16384);
+        assert_eq!(arena.rows, S1_WINDOW_ROWS);
         let wide = (geometry.hc_count * geometry.hidden) as u64;
         let rows = S1_WINDOW_ROWS as u64;
         // Saved prepared input, route maps and accumulator belong to the
@@ -3327,20 +3568,21 @@ mod tests {
     /// the state, forward and workspace census of that tile PLUS the F16 weight
     /// shadow cold bound of the real artifact through the shared predicate.
     fn j1778_reserve_at(tile: usize) -> crate::expert_residency::AutoReserve {
+        j1778_reserve_for(tile, J1778_MAX_SEQ)
+    }
+
+    /// [`j1778_reserve_at`] for a load of `max_seq` tokens (the KV charge).
+    fn j1778_reserve_for(tile: usize, max_seq: usize) -> crate::expert_residency::AutoReserve {
         use crate::expert_residency as residency;
         use crate::gpu_forward::Qwen4ForwardScratchMode::Full;
         let config = crate::config::compact_test_config();
         let format = j1778_state_format();
-        let context = crate::Qwen4ContextCommit::new(
-            crate::Qwen4KvBackend::Legacy,
-            J1778_MAX_SEQ,
-            J1778_MAX_SEQ,
-            1,
-        );
+        let context =
+            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Legacy, max_seq, max_seq, 1);
         let reserve_context = crate::Qwen4ContextCommit::for_expert_reserve(
             crate::Qwen4KvBackend::Legacy,
             false,
-            J1778_MAX_SEQ,
+            max_seq,
             tile,
             1,
         );
@@ -3437,7 +3679,7 @@ mod tests {
             base_runtime_reserved_bytes: reserve.census.runtime,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS.min(J1778_MAX_SEQ),
+            window_rows: REFERENCE_WINDOW_ROWS.min(J1778_MAX_SEQ),
             link_gbps: 7.09,
             purpose,
             sym_iu4_source_symmetric: None,
@@ -3496,7 +3738,7 @@ mod tests {
         -59_717_028,
         229_640_668,
     ];
-    /// The N=10 slack of each rung on the opt-in symmetric IU4 aggregate route: the F16
+    /// The N=10 slack of each rung on the symmetric IU4 aggregate route: the F16
     /// aggregate slack less the route's own census delta (both A4 sidecars charged,
     /// 82,575,360 B at the 16K window, minus the window F16 input and slot map the IU4
     /// layout drops, 83,886,080 + 2,048 * 4 B of region: net −1,318,912 B). Every other
@@ -3790,7 +4032,7 @@ mod tests {
             assert_eq!(profile.purpose, purpose, "{label}");
             assert_eq!(profile.tile_rows, tile, "{label}");
             assert_eq!(profile.tile_rows, purpose_tile_rows(purpose), "{label}");
-            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS, "{label}");
             assert_eq!(profile.resident_layers, 10, "{label}");
             assert_eq!(profile.pages.total_pages(), 18, "{label}");
             assert_eq!(profile.arena.tile_rows, tile, "{label}");
@@ -4031,11 +4273,11 @@ mod tests {
                     assert!(point.tile_rows >= S1_MIN_TILE_ROWS);
                     assert_eq!(
                         point.tiles_per_window,
-                        S1_WINDOW_ROWS.div_ceil(point.tile_rows)
+                        REFERENCE_WINDOW_ROWS.div_ceil(point.tile_rows)
                     );
                     assert_eq!(
                         point.final_tile_rows + (point.tiles_per_window - 1) * point.tile_rows,
-                        S1_WINDOW_ROWS
+                        REFERENCE_WINDOW_ROWS
                     );
                     if point.final_tile_rows < S1_MIN_TILE_ROWS {
                         assert!(point.final_tile_rows <= S1_F32_TILE_ROWS_MAX);
@@ -4275,7 +4517,7 @@ mod tests {
                 base_runtime_reserved_bytes: reserve.census.runtime,
                 granule: GranuleInputs::default(),
                 checkpoint_stride_rows: 8192,
-                window_rows: S1_WINDOW_ROWS,
+                window_rows: REFERENCE_WINDOW_ROWS,
                 link_gbps: 7.09,
                 purpose: AdmissionPurpose::Product,
                 sym_iu4_source_symmetric: None,
@@ -4408,7 +4650,7 @@ mod tests {
             base_runtime_reserved_bytes: 0,
             granule: GranuleInputs::default(),
             checkpoint_stride_rows: 8192,
-            window_rows: S1_WINDOW_ROWS.min(max_seq),
+            window_rows: REFERENCE_WINDOW_ROWS.min(max_seq),
             link_gbps: 7.09,
             purpose: AdmissionPurpose::Product,
             sym_iu4_source_symmetric: None,
@@ -4744,7 +4986,7 @@ mod tests {
         assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
         assert_eq!(profile.purpose, AdmissionPurpose::Product);
         assert!(profile.tile_rows <= S1_TILE_ROWS);
-        assert_eq!(profile.window_rows, 16384);
+        assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS);
         // Seven owned terms then two budget terms, every one itemised in log order.
         let names: Vec<&str> = profile
             .census
@@ -4922,8 +5164,16 @@ mod tests {
             .is_err());
     }
 
+    fn product_window_inputs(free: u64) -> AdmissionInputs {
+        AdmissionInputs {
+            window_rows: S1_WINDOW_ROWS,
+            ..inputs(free)
+        }
+    }
+
+    /// The product profile: [`S1_WINDOW_ROWS`] window, ten layers resident.
     fn profile_at_ten() -> SlowlinkProfile {
-        admit(&inputs(free_for(&inputs(0), 10))).unwrap()
+        admit(&product_window_inputs(free_for(&inputs(0), 10))).unwrap()
     }
 
     #[test]
@@ -4959,17 +5209,17 @@ mod tests {
             })
         );
         assert_eq!(
-            qualify_request(SlowlinkMode::Force, &profile, &req(16384)),
+            qualify_request(SlowlinkMode::Force, &profile, &req(S1_WINDOW_ROWS)),
             Ok(RequestVerdict {
-                rows: 16384,
+                rows: S1_WINDOW_ROWS,
                 windows: 1
             })
         );
         // A prompt past the window runs superwindows and says so.
         assert_eq!(
-            qualify_request(SlowlinkMode::Force, &profile, &req(16385)),
+            qualify_request(SlowlinkMode::Force, &profile, &req(S1_WINDOW_ROWS + 1)),
             Ok(RequestVerdict {
-                rows: 16385,
+                rows: S1_WINDOW_ROWS + 1,
                 windows: 2
             })
         );
@@ -5043,13 +5293,16 @@ mod tests {
                 maximum: 4
             })
         );
-        // Automatic and forced share the 1537-row floor (one row past the
-        // tile): at most one tile is a named bypass on either selector.
-        assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 1537);
+        // At a 1536-row admitted tile automatic and forced share the 1537-row
+        // floor (one row past the tile): at most one tile is a named bypass.
         assert_eq!(S1_MIN_FORCED_REQUEST_ROWS, 1537);
+        let wide = SlowlinkProfile {
+            tile_rows: 1536,
+            ..profile
+        };
         for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
             assert_eq!(
-                qualify_request(mode, &profile, &req(1536)),
+                qualify_request(mode, &wide, &req(1536)),
                 Err(RequestBypass::TooShort {
                     rows: 1536,
                     minimum: 1537
@@ -5057,7 +5310,7 @@ mod tests {
                 "{mode:?}"
             );
             assert_eq!(
-                qualify_request(mode, &profile, &req(1537)),
+                qualify_request(mode, &wide, &req(1537)),
                 Ok(RequestVerdict {
                     rows: 1537,
                     windows: 1
@@ -5065,8 +5318,399 @@ mod tests {
                 "{mode:?}"
             );
         }
+        // A 768-row admitted tile (this profile, and the slow-link XTX
+        // Flash-Next load): the automatic floor follows the tile, so
+        // 769..=1536 rows (two incumbent chunks) run layer-major; the forced
+        // floor stays the legal-maximum one.
+        assert_eq!(profile.tile_rows, 768);
+        assert_eq!(
+            qualify_request(SlowlinkMode::Auto, &profile, &req(768)),
+            Err(RequestBypass::TooShort {
+                rows: 768,
+                minimum: 769
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Auto, &profile, &req(769)),
+            Ok(RequestVerdict {
+                rows: 769,
+                windows: 1
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Force, &profile, &req(1536)),
+            Err(RequestBypass::TooShort {
+                rows: 1536,
+                minimum: 1537
+            })
+        );
         assert_eq!(profile.windows_for(1), 1);
         assert_eq!(profile.windows_for(32768), 2);
+        // 22 x 768-row tiles per window: fills (cache on/off do not change the
+        // cut-free count) 8,192 / 32,768 / 32,780 / 131,084 / 250,012.
+        assert_eq!(S1_WINDOW_ROWS, 16_896);
+        assert_eq!(profile.tile_rows, 768);
+        for (rows, windows) in [
+            (8_192usize, 1usize),
+            (16_896, 1),
+            (16_897, 2),
+            (32_768, 2),
+            (32_780, 2),
+            (33_792, 2),
+            (33_793, 3),
+            (131_084, 8),
+            (250_012, 15),
+        ] {
+            assert_eq!(profile.windows_for(rows), windows, "{rows} rows");
+        }
+    }
+
+    /// The REAL planner's window and sweep counts at the 22-tile window: every
+    /// window is one expert sweep, so windows == sweeps. Cache off has no
+    /// session cuts; cache on cuts every 8192-row stride boundary.
+    #[test]
+    fn slowlink_admission_window_sweeps_at_the_tile_aligned_window() {
+        use crate::slowlink_prefill::{plan_prompt_verdict, PromptPlanInputs, TileRouting};
+        use hipfire_runtime::session_cache::stride_boundaries;
+        let profile = profile_at_ten();
+        assert_eq!(profile.tile_rows, S1_PRODUCT_TILE_ROWS);
+        assert_eq!(profile.window_rows, S1_WINDOW_TILES * S1_PRODUCT_TILE_ROWS);
+        let routing = |rows: usize| TileRouting {
+            route_rows: rows,
+            bf16_streams: rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+        };
+        let stride = profile.checkpoint_stride_rows;
+        for (rows, expect_off, expect_on) in [
+            (8_192usize, 1usize, 1usize),
+            (32_768, 2, 2),
+            (32_780, 2, 2),
+            (131_084, 8, 8),
+            (250_012, 15, 16),
+        ] {
+            for cache in [false, true] {
+                let cuts: Vec<usize> = if cache {
+                    stride_boundaries(stride, &[], None, 0, rows)
+                        .into_iter()
+                        .filter(|&b| b < rows)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let plan = plan_prompt_verdict(&PromptPlanInputs {
+                    profile: &profile,
+                    entry_pos: 0,
+                    rows,
+                    cuts: &cuts,
+                    routing: &routing,
+                    few_row_limit: 8,
+                })
+                .unwrap()
+                .expect("a qualified request plans");
+                let expect = if cache { expect_on } else { expect_off };
+                assert_eq!(plan.windows.len(), expect, "{rows} rows, cache {cache}");
+                assert_eq!(plan.windows.iter().map(|w| w.rows).sum::<usize>(), rows);
+                assert!(plan.windows.iter().all(|w| w.rows <= S1_WINDOW_ROWS));
+            }
+        }
+    }
+
+    /// Placement slack at the 22-tile product window of the two measured
+    /// 262,144-row XTX Flash-Next loads (F0 §2 less the +25,070,848-byte window
+    /// delta): AR-loaded keeps 6 resident layers, MTP-loaded 5.
+    const AR_SLACK_AT_22_TILES: u64 = 1_158_091_868 - 25_070_848;
+    const MTP_SLACK_AT_22_TILES: u64 = 488_382_532 - 25_070_848;
+    const FN_MAX_SEQ: usize = 262_144;
+
+    /// Inputs whose free memory keeps `layers` resident with exactly `slack`
+    /// bytes left at the 22-tile window.
+    fn grown_inputs(layers: u64, slack: u64) -> AdmissionInputs {
+        product_window_inputs(free_for(&product_window_inputs(0), layers) - 1 + slack)
+    }
+
+    fn plan_windows(profile: &SlowlinkProfile, rows: usize, cache: bool) -> Vec<usize> {
+        use crate::slowlink_prefill::{plan_prompt_verdict, PromptPlanInputs, TileRouting};
+        use hipfire_runtime::session_cache::stride_boundaries;
+        let routing = |rows: usize| TileRouting {
+            route_rows: rows,
+            bf16_streams: rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+        };
+        let cuts: Vec<usize> = if cache {
+            stride_boundaries(profile.checkpoint_stride_rows, &[], None, 0, rows)
+                .into_iter()
+                .filter(|&b| b < rows)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        plan_prompt_verdict(&PromptPlanInputs {
+            profile,
+            entry_pos: 0,
+            rows,
+            cuts: &cuts,
+            routing: &routing,
+            few_row_limit: 8,
+        })
+        .unwrap()
+        .expect("a qualified request plans")
+        .windows
+        .iter()
+        .map(|w| w.rows)
+        .collect()
+    }
+
+    /// The real-memory slack of a grown profile (its quote holds
+    /// [`S1_GROWN_FREE_HOLD_BYTES`] back from `real`).
+    fn real_slack(profile: &SlowlinkProfile, real: AdmissionMemory) -> u64 {
+        let budget = PlacementBudget {
+            memory: real,
+            ..profile.placement
+        };
+        u64::try_from(budget.slack_bytes_at(profile.resident_layers)).unwrap()
+    }
+
+    /// The AR-loaded measured 262,144-row Flash-Next load's inputs with the
+    /// KV charge of `max_seq`: `base_reserve` carries the load's KV (the
+    /// production census [`single_device_reserve`] charges
+    /// `for_expert_reserve(max_seq)` / `Qwen4ContextCommit::new(.., max_seq, ..)`),
+    /// so the reserve moves by the real helper's difference between `max_seq` and
+    /// the measured [`FN_MAX_SEQ`]; the free memory is the same card's.
+    fn fn_inputs_at(max_seq: usize) -> AdmissionInputs {
+        let inputs = grown_inputs(6, AR_SLACK_AT_22_TILES);
+        let at = |max_seq| {
+            i128::from(j1778_reserve_for(S1_PRODUCT_TILE_ROWS, max_seq).placement_bytes(true))
+        };
+        AdmissionInputs {
+            base_reserve: u64::try_from(
+                i128::from(inputs.base_reserve) + at(max_seq) - at(FN_MAX_SEQ),
+            )
+            .unwrap(),
+            ..inputs
+        }
+    }
+
+    /// The load line's numbers at `max_seq`: (window tiles, resident layers,
+    /// real remaining slack bytes, free hold included).
+    fn fn_load_at(max_seq: usize) -> (usize, usize, u64) {
+        let inputs = fn_inputs_at(max_seq);
+        let grown = admit_grown(&inputs, max_seq).unwrap();
+        let slack = grown.remaining_slack_bytes(inputs.memory.free_bytes);
+        println!(
+            "max_seq {max_seq}: tiles {} layers {} slack {slack}",
+            grown.window_rows / S1_PRODUCT_TILE_ROWS,
+            grown.resident_layers
+        );
+        (
+            grown.window_rows / S1_PRODUCT_TILE_ROWS,
+            grown.resident_layers,
+            slack,
+        )
+    }
+
+    /// The window is sized at load for the load's `max_seq` (KV charged for it)
+    /// and takes priority over extra resident layers; a 262,144-row load that
+    /// cannot afford growth keeps the 22-tile window.
+    #[test]
+    fn slowlink_admission_grown_window_follows_max_seq_on_flash_next() {
+        let tile = S1_PRODUCT_TILE_ROWS;
+        let long = fn_load_at(262_144);
+        let mid = fn_load_at(131_072);
+        let short = fn_load_at(33_024);
+        println!("(tiles, layers, slack): 262144 {long:?} 131072 {mid:?} 33024 {short:?}");
+        // A multi-window context keeps the floor's 6 layers and grows only
+        // with the memory left at that count above the hold: one tile here.
+        assert_eq!((long.0, long.1), (S1_WINDOW_TILES + 1, 6));
+        // 131,072 keeps its floor layers (8: less KV than 262,144); nothing
+        // above the hold is left for a tile, so it is the floor admission and
+        // its slack carries no hold.
+        assert_eq!((mid.0, mid.1), (S1_WINDOW_TILES, 8));
+        // A single-window context: window priority, 43 tiles, 8 layers.
+        assert_eq!((short.0, short.1), (43, 8));
+        assert!(long.2 >= S1_GROWN_FREE_HOLD_BYTES);
+        assert!(short.0 >= 43, "32,780 rows in one window");
+        // 43 is the covering tile count of a 32,780-row prompt: 42 tiles fall short.
+        assert!(42 * tile < 32_780 && 43 * tile >= 32_780);
+        assert!(short.2 >= S1_GROWN_FREE_HOLD_BYTES, "1 GiB held free");
+    }
+
+    /// Growth never refuses, never leaves less than the hold, and the window is
+    /// the largest whole-tile one that admits (maximal on the ladder).
+    #[test]
+    fn slowlink_admission_grown_window_never_exceeds_the_budget() {
+        let tile = S1_PRODUCT_TILE_ROWS;
+        for layers in [2u64, 6, 9] {
+            for slack_mib in [
+                0u64, 1, 200, 256, 300, 442, 700, 1_080, 1_279, 1_500, 4_000, 40_000,
+            ] {
+                let inputs = grown_inputs(layers, slack_mib * MIB);
+                let floor = admit(&inputs).unwrap();
+                let grown = admit_grown(&inputs, FN_MAX_SEQ).unwrap();
+                assert!(grown.window_rows >= S1_WINDOW_ROWS);
+                assert_eq!(grown.window_rows % tile, 0);
+                assert!(grown.window_rows <= S1_GROWN_WINDOW_MAX_TILES * tile);
+                if grown.window_rows == S1_WINDOW_ROWS {
+                    assert_eq!(grown, floor, "no room: the floor profile exactly");
+                } else {
+                    let real = real_slack(&grown, inputs.memory);
+                    assert!(
+                        real >= S1_GROWN_FREE_HOLD_BYTES,
+                        "{layers} layers {slack_mib} MiB"
+                    );
+                    assert_eq!(grown.remaining_slack_bytes(inputs.memory.free_bytes), real);
+                    let held = AdmissionInputs {
+                        window_rows: grown.window_rows,
+                        memory: AdmissionMemory::actual(
+                            inputs.memory.free_bytes - S1_GROWN_FREE_HOLD_BYTES,
+                        ),
+                        ..inputs
+                    };
+                    assert_eq!(admit(&held).unwrap(), grown);
+                    assert_eq!(grown.census.arena, grown.arena.total_bytes);
+                    assert_eq!(
+                        grown.census.route_storage,
+                        route_storage_bytes(&grown.geometry, grown.window_rows).unwrap()
+                    );
+                }
+                // Maximal on the held-back quote.
+                let next = grown.window_rows + tile;
+                if next <= S1_GROWN_WINDOW_MAX_TILES * tile {
+                    let held = AdmissionInputs {
+                        window_rows: next,
+                        memory: AdmissionMemory::actual(
+                            inputs.memory.free_bytes - S1_GROWN_FREE_HOLD_BYTES,
+                        ),
+                        ..inputs
+                    };
+                    // A multi-window context keeps the floor's layers: one more
+                    // tile must not admit at that count.
+                    assert!(
+                        admit(&held).map_or(true, |p| p.resident_layers != floor.resident_layers),
+                        "{layers} layers {slack_mib} MiB"
+                    );
+                }
+            }
+        }
+        // A context shorter than the floor window, or one that fits it, is not grown.
+        let inputs = grown_inputs(6, AR_SLACK_AT_22_TILES);
+        for max_seq in [S1_MIN_FORCED_REQUEST_ROWS, 8_204, S1_WINDOW_ROWS] {
+            let inputs = AdmissionInputs {
+                window_rows: S1_WINDOW_ROWS.min(max_seq),
+                ..inputs
+            };
+            assert_eq!(
+                admit_grown(&inputs, max_seq).unwrap().window_rows,
+                S1_WINDOW_ROWS.min(max_seq)
+            );
+        }
+        // A refusal of the base admission stays the base refusal.
+        let none = product_window_inputs(GIB);
+        assert_eq!(
+            admit_grown(&none, FN_MAX_SEQ).map(|_| ()),
+            admit(&none).map(|_| ())
+        );
+    }
+
+    /// Window and sweep counts (every window is one expert sweep) of the REAL
+    /// planner on the grown profiles at the depth-sweep prompts, cache off and
+    /// on (cuts at every 8,192-row stride boundary).
+    #[test]
+    fn slowlink_admission_grown_window_sweep_counts_at_the_depths() {
+        let ar = admit_grown(&grown_inputs(6, AR_SLACK_AT_22_TILES), FN_MAX_SEQ).unwrap();
+        let mtp = admit_grown(&grown_inputs(5, MTP_SLACK_AT_22_TILES), FN_MAX_SEQ).unwrap();
+        let floor = admit(&grown_inputs(6, AR_SLACK_AT_22_TILES)).unwrap();
+        assert_eq!(
+            (
+                ar.window_rows,
+                ar.resident_layers,
+                mtp.window_rows,
+                mtp.resident_layers
+            ),
+            (17_664, 6, S1_WINDOW_ROWS, 5)
+        );
+        // 262,144 is a multi-window context: the floor's layers are kept and
+        // the AR load's leftover above the hold buys one tile (23); the
+        // MTP-loaded load has none and keeps the floor.
+        for (rows, ar_sweeps, mtp_sweeps, floor_sweeps) in [
+            (8_204usize, 1usize, 1usize, 1usize),
+            (32_780, 2, 2, 2),
+            (131_084, 8, 8, 8),
+            (250_012, 15, 15, 15),
+        ] {
+            for cache in [false, true] {
+                for (label, profile, expect) in [
+                    ("AR", &ar, ar_sweeps),
+                    ("MTP", &mtp, mtp_sweeps),
+                    ("22-tile floor", &floor, floor_sweeps),
+                ] {
+                    let windows = plan_windows(profile, rows, cache);
+                    assert_eq!(windows.iter().sum::<usize>(), rows);
+                    assert!(windows.iter().all(|&w| w <= profile.window_rows));
+                    // Cuts may split a window (cache on); never fewer than the cut-free count.
+                    assert_eq!(profile.windows_for(rows), expect, "{label} {rows}");
+                    if cache {
+                        assert!(windows.len() >= expect, "{label} {rows}");
+                    } else {
+                        assert_eq!(windows.len(), expect, "{label} {rows}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Levelled windows: the same window count as the greedy packing, no
+    /// wire-bound sliver tail, never above the admitted window.
+    #[test]
+    fn slowlink_admission_windows_are_levelled_across_the_sweeps() {
+        let tile = S1_PRODUCT_TILE_ROWS;
+        let floor = admit(&grown_inputs(6, AR_SLACK_AT_22_TILES)).unwrap();
+        // 22 tiles + one row-tile: greedy was 16,896 + 768; levelled is 12 + 11 tiles.
+        let rows = S1_WINDOW_ROWS + tile;
+        assert_eq!(
+            plan_windows(&floor, rows, false),
+            vec![12 * tile, 11 * tile]
+        );
+        // 22 tiles + 1 row: 12 / 11 tiles, the last short by 767 rows.
+        let rows = S1_WINDOW_ROWS + 1;
+        assert_eq!(
+            plan_windows(&floor, rows, false),
+            vec![12 * tile, rows - 12 * tile]
+        );
+        // 32,780 at the floor: 22 + 21 tiles was already level.
+        let windows = plan_windows(&floor, 32_780, false);
+        assert_eq!(windows, vec![22 * tile, 32_780 - 22 * tile]);
+        // Levelled counts equal the greedy counts everywhere and never grow a window.
+        for rows in [
+            769usize, 5_000, 16_897, 17_000, 25_000, 40_000, 131_084, 250_012,
+        ] {
+            for cache in [false, true] {
+                let windows = plan_windows(&floor, rows, cache);
+                assert!(windows.iter().all(|&w| w <= floor.window_rows));
+                if !cache {
+                    assert_eq!(windows.len(), floor.windows_for(rows), "{rows}");
+                }
+                // The widest window is the even share of the tiles, rounded up.
+                if !cache && windows.len() > 1 {
+                    let share = rows.div_ceil(tile).div_ceil(windows.len()) * tile;
+                    assert_eq!(*windows.iter().max().unwrap(), share, "{rows}: {windows:?}");
+                }
+            }
+        }
+    }
+
+    /// The window change's whole charge, same fixture, 16,384 -> 16,896 rows.
+    #[test]
+    fn slowlink_admission_window_charge_delta_is_pinned() {
+        let free = free_for(&inputs(0), 10);
+        let old = admit(&inputs(free)).unwrap();
+        let new = admit(&product_window_inputs(free)).unwrap();
+        let delta = new.reserve_bytes().unwrap() - old.reserve_bytes().unwrap();
+        assert_eq!(new.census.arena - old.census.arena, 10_485_760);
+        assert_eq!(
+            new.census.route_storage - old.census.route_storage,
+            11_902_208
+        );
+        assert_eq!(new.census.a4_sidecars - old.census.a4_sidecars, 2_580_480);
+        assert_eq!(new.census.group_scatter - old.census.group_scatter, 102_400);
+        assert_eq!(delta, 25_070_848, "23.9 MiB");
     }
 
     #[test]
@@ -5096,10 +5740,11 @@ mod tests {
             profile.census.group_scatter,
             layout.group_scatter_bytes() as u64
         );
-        // Full window grouped-scatter scratch at N=16384 slots=163840, E=512:
-        // the 1536-tile's 309,248 B stays in the base reserve (replacement
-        // peak holds old + new), so the full figure is charged on top.
-        assert_eq!(profile.census.group_scatter, 3_278_848);
+        // Full window grouped-scatter scratch at N=16896 slots=168960, E=512
+        // (3,278,848 B at the former 16384-row window): the 1536-tile's
+        // 309,248 B stays in the base reserve (replacement peak holds old +
+        // new), so the full figure is charged on top.
+        assert_eq!(profile.census.group_scatter, 3_381_248);
     }
 
     #[test]
@@ -7140,7 +7785,7 @@ mod tests {
             "list N>T",
         );
     }
-    // ── symmetric IU4 window route (default OFF) ─────────────────────────
+    // ── symmetric IU4 window route (requested by default; HIPFIRE_QWEN4_MOE_SYM_IU4=0 kills) ──
 
     #[test]
     fn slowlink_admission_sym_iu4_route_resolution_truth_table() {
@@ -7280,7 +7925,7 @@ mod tests {
             let profile = admit(&inputs).unwrap();
             let label = format!("{purpose:?}");
             assert_eq!(profile.geometry.route, sym_route, "{label}");
-            assert_eq!(profile.window_rows, S1_WINDOW_ROWS, "{label}");
+            assert_eq!(profile.window_rows, REFERENCE_WINDOW_ROWS, "{label}");
             assert_eq!(profile.resident_layers, 10, "{label}");
             // Both A4 sidecars (78.75 MiB at 16K) and no window F16 input or F16 slot map.
             assert_eq!(profile.census.a4_sidecars, 82_575_360, "{label}");
@@ -7350,6 +7995,84 @@ mod tests {
         }
     }
 
+    /// A window smaller than the aggregate routes' worst-case cohort bound
+    /// (`k1 48 + tail 3066 = 3114` rows) is a named incumbent decline before the census, not a
+    /// layout error at load; every size that admits is untouched and builds a valid layout.
+    #[test]
+    fn slowlink_admission_window_smaller_than_its_cohort_rows_declines_by_name() {
+        use hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout;
+        let cohort = S1_K1_TAIL_ROWS + S1_AGGREGATE_TAIL_ROWS;
+        assert_eq!(cohort, 3114);
+        for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
+            for max_seq in [1536, 1537, 3113, 3114, S1_WINDOW_ROWS] {
+                let load = LoadShape { max_seq, ..shape() };
+                let pre = preflight(SlowlinkMode::Force, &load);
+                if max_seq < S1_MIN_FORCED_REQUEST_ROWS {
+                    assert_eq!(pre, Err(SlowlinkDecline::ShortContext { max_seq }));
+                    continue;
+                }
+                assert_eq!(pre, Ok(()), "{route:?} {max_seq}");
+                let inputs = AdmissionInputs {
+                    window_rows: S1_WINDOW_ROWS.min(max_seq),
+                    ..j1778_inputs(route, AdmissionPurpose::Product, J1778_PRELOAD_FREE)
+                };
+                let admitted = admit_grown(&inputs, max_seq);
+                if max_seq < cohort {
+                    let decline = SlowlinkDecline::WindowTooSmall {
+                        rows: max_seq,
+                        k1_rows: S1_K1_TAIL_ROWS,
+                        tail_rows: S1_AGGREGATE_TAIL_ROWS,
+                    };
+                    assert_eq!(
+                        admitted.map(|_| ()),
+                        Err(decline.clone()),
+                        "{route:?} {max_seq}"
+                    );
+                    assert!(!decline.is_capacity());
+                    assert_eq!(
+                        decline.to_string(),
+                        format!(
+                            "window too small for its cohort rows: rows {max_seq} < k1 48 + tail 3066"
+                        )
+                    );
+                    // The forced selector keeps the incumbent instead of failing the load.
+                    let selected = select_profile(
+                        SlowlinkMode::Force,
+                        &load,
+                        || HostLink::Discrete { gbps: 7.09 },
+                        |_| Ok(inputs.clone()),
+                    );
+                    assert_eq!(
+                        selected.map(|p| p.is_some()),
+                        Ok(false),
+                        "{route:?} {max_seq}"
+                    );
+                } else {
+                    let profile = admitted.unwrap_or_else(|d| panic!("{route:?} {max_seq}: {d}"));
+                    assert_eq!(profile.window_rows, S1_WINDOW_ROWS.min(max_seq));
+                    let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+                    assert_eq!(layout.total_bytes() as u64, profile.census.route_storage);
+                    assert_eq!(layout.dims().k1_rows, S1_K1_TAIL_ROWS);
+                    assert_eq!(layout.dims().tail_rows, S1_AGGREGATE_TAIL_ROWS);
+                }
+            }
+        }
+        // The slab route charges no tail rows: every legal context admits.
+        for max_seq in [1537, 3113, 3114, S1_WINDOW_ROWS] {
+            let inputs = AdmissionInputs {
+                window_rows: S1_WINDOW_ROWS.min(max_seq),
+                ..j1778_inputs(
+                    WindowRoute::SlabIu4,
+                    AdmissionPurpose::Product,
+                    J1778_PRELOAD_FREE,
+                )
+            };
+            let profile = admit_grown(&inputs, max_seq).unwrap();
+            let layout = PromptRouteLayout::new(&profile.route_dims()).unwrap();
+            assert_eq!((layout.dims().k1_rows, layout.dims().tail_rows), (48, 0));
+        }
+    }
+
     #[test]
     fn slowlink_admission_sym_iu4_route_dims_keep_the_aggregate_cohort_bounds() {
         let config = crate::config::compact_test_config();
@@ -7371,7 +8094,7 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_sym_iu4_profile_log_names_only_the_opt_in_route() {
+    fn slowlink_admission_sym_iu4_profile_log_names_only_the_sym_iu4_route() {
         let purpose = AdmissionPurpose::Product;
         let f16 = admit(&j1778_inputs(
             WindowRoute::Aggregate,
@@ -7393,8 +8116,10 @@ mod tests {
 
     #[test]
     fn slowlink_admission_sym_iu4_flag_off_profile_is_the_f16_aggregate_profile() {
-        // `HIPFIRE_QWEN4_MOE_SYM_IU4` unset/0 (not requested) resolves the incumbent layout
-        // route whatever else holds, so every byte, placement and selection of the current S1
+        // A route that is not requested (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, the kill switch; the
+        // flag unset is requested on gfx1100, gfx1151 and gfx1201 because the S1 window reads the
+        // same `Gpu::qwen4_moe_sym_iu4_requested` as the regular prefill) resolves the incumbent
+        // layout route whatever else holds, so every byte, placement and selection of the F16
         // Aggregate route is unchanged.
         let off = SymIu4RouteFacts {
             descriptor: true,
@@ -7417,5 +8142,186 @@ mod tests {
             assert_eq!(admit(&resolved).unwrap(), admit(&incumbent).unwrap());
             assert_eq!(census_of(&resolved).unwrap().2.a4_sidecars, 0);
         }
+    }
+
+    fn sp_facts_of(
+        profile: &SlowlinkProfile,
+        knob: bool,
+    ) -> crate::slowlink_sp::SpLoadFacts<'static> {
+        crate::slowlink_sp::SpLoadFacts {
+            knob,
+            touched_knob: false,
+            force_all: false,
+            pages: 18,
+            f16_route_ready: true,
+            window_rows: profile.window_rows,
+            s1_route: Some(profile.geometry.route),
+            arch: "gfx1100",
+            n_exp: 512,
+            cpu_gate_up_quant: true,
+            cpu_down_quant: true,
+            splice_workers: Some(16),
+            region_fit_rows: 5_593,
+            hidden: 2560,
+            pinned_budget_bytes: 1 << 30,
+            prefix_cache: false,
+        }
+    }
+
+    /// SP adds no VRAM and moves no layer: on the real j1778 fixtures, both
+    /// routes and purposes, the admitted profile (resident layers, every census
+    /// term, the placement quote) is identical before and after SP is armed
+    /// and admitted, and SP's own admission reads nothing the profile charges.
+    #[test]
+    fn slowlink_sp_armed_leaves_the_j1778_profiles_identical() {
+        use crate::slowlink_sp::{admit_sp, SpDecline};
+        for (route, purpose) in [
+            (WindowRoute::Aggregate, AdmissionPurpose::Product),
+            (WindowRoute::Aggregate, AdmissionPurpose::PrimitiveSelftest),
+            (WindowRoute::SlabIu4, AdmissionPurpose::Product),
+            (WindowRoute::SlabIu4, AdmissionPurpose::PrimitiveSelftest),
+        ] {
+            let label = format!("{route:?} {purpose:?}");
+            let inputs = j1778_inputs(route, purpose, J1778_PRELOAD_FREE);
+            let before = admit(&inputs).unwrap();
+            assert_eq!(before.resident_layers, 10, "{label}");
+            let total = before.census.total().unwrap();
+            let census = census_of(&inputs).unwrap().2;
+
+            let armed = admit_sp(&sp_facts_of(&before, true));
+            match route {
+                WindowRoute::Aggregate => {
+                    let sp = armed.unwrap_or_else(|d| panic!("{label}: {d}"));
+                    assert_eq!(sp.sp_max_rows, 5_376, "{label}");
+                }
+                _ => assert_eq!(
+                    armed.unwrap_err(),
+                    SpDecline::Route {
+                        route,
+                        mode: crate::slowlink_sp::SpMode::Hybrid
+                    },
+                    "{label}"
+                ),
+            }
+            let unarmed = admit_sp(&sp_facts_of(&before, false));
+            assert_eq!(unarmed.unwrap_err(), SpDecline::KnobOff, "{label}");
+
+            // The S1 admission after SP armed: bit-for-bit the same profile.
+            let after = admit(&inputs).unwrap();
+            assert_eq!(after, before, "{label}");
+            assert_eq!(after.resident_layers, before.resident_layers, "{label}");
+            assert_eq!(after.census.total().unwrap(), total, "{label}");
+            assert_eq!(census_of(&inputs).unwrap().2, census, "{label}");
+        }
+    }
+
+    #[test]
+    fn slowlink_sp_request_truth_table() {
+        use crate::slowlink_sp::{admit_sp, SpBypass};
+        let profile = profile_at_ten();
+        let sp = admit_sp(&crate::slowlink_sp::SpLoadFacts {
+            s1_route: Some(WindowRoute::Aggregate),
+            ..sp_facts_of(&profile, true)
+        })
+        .unwrap();
+        let tile = profile.tile_rows;
+        assert_eq!(tile, S1_PRODUCT_TILE_ROWS);
+        let req = |rows, cuts, capture| RequestShape {
+            rows,
+            entry_pos: 0,
+            session_cuts: cuts,
+            capture,
+        };
+        let sp_req =
+            |mode, rows| qualify_request_sp(mode, &profile, &sp, &req(rows, 0, CaptureKind::None));
+        for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
+            // 5..=tile rows: S1 admits one SP window below its own floor.
+            for rows in [5, 100, 512, tile] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    Ok(RequestVerdict { rows, windows: 1 }),
+                    "{mode:?} {rows}"
+                );
+            }
+            // Below SP's minimum, and above the tile, the request is exactly
+            // `qualify_request`.
+            for rows in [
+                0,
+                1,
+                4,
+                tile + 1,
+                1536,
+                1537,
+                3072,
+                S1_WINDOW_ROWS,
+                S1_WINDOW_ROWS + 1,
+            ] {
+                assert_eq!(
+                    sp_req(mode, rows),
+                    qualify_request(mode, &profile, &req(rows, 0, CaptureKind::None)),
+                    "{mode:?} {rows}"
+                );
+            }
+        }
+        // The kill switch wins everywhere.
+        assert_eq!(
+            sp_req(SlowlinkMode::Off, 512),
+            Err(RequestBypass::KillSwitch)
+        );
+        // A bounded capture qualifies; all-rows / external stay incumbent.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::Bounded)
+            ),
+            Ok(RequestVerdict {
+                rows: 512,
+                windows: 1
+            })
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::AllRows)
+            ),
+            Err(RequestBypass::AllRowCapture)
+        );
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 0, CaptureKind::External)
+            ),
+            Err(RequestBypass::ExternalCapture)
+        );
+        // An interior session cut makes the one window non-SP: the incumbent runs.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Auto,
+                &profile,
+                &sp,
+                &req(512, 1, CaptureKind::None)
+            ),
+            Err(RequestBypass::Sp(SpBypass::InteriorCuts { cuts: 1 }))
+        );
+        // Requests above one tile keep today's cut rule.
+        assert_eq!(
+            qualify_request_sp(
+                SlowlinkMode::Force,
+                &profile,
+                &sp,
+                &req(3072, 5, CaptureKind::None)
+            ),
+            qualify_request(
+                SlowlinkMode::Force,
+                &profile,
+                &req(3072, 5, CaptureKind::None)
+            )
+        );
     }
 }

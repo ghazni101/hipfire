@@ -65,6 +65,7 @@ v_add_f32_e32	vop2	0x3	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_add_f32_e3
 v_sub_f32_e32	vop2	0x4	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_sub_f32_e32 v174, v209, v173	095D5BD1	-
 v_mul_f32_e32	vop2	0x8	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_f32_e32 v194, s2, v3	11840602	-
 v_mul_u32_u24_e32	vop2	0xb	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_u32_u24_e32 v8, 0x408, v8	161010FF 00000408	-
+v_mul_hi_u32_u24_e32	vop2	0xc	VDST:32,SRC0:32,VSRC1:32,literal@last	VDST	SRC0,VSRC1	-	-	v_mul_hi_u32_u24_e32 v2, 36, v9	180412A4	-
 v_min_i32_e32	vop2	0x11	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_i32_e32 v8, s15, v8	2210100F	-
 v_max_i32_e32	vop2	0x12	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_i32_e32 v9, 0, v9	24121280	-
 v_min_u32_e32	vop2	0x13	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_u32_e32 v11, s15, v11	2616160F	-
@@ -284,6 +285,7 @@ v_mul_i32_i24_e32	vop2	0x9	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_mul_i3
 v_perm_b32	vop3	0x244	VDST:32,SRC0:32,SRC1:32,SRC2:32,literal@last	VDST	SRC0,SRC1,SRC2	-	-	v_perm_b32 v25, v19, v21, 0x504010c	D6440019 03FE2B13 0504010C	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
 v_pk_fma_f16	vop3p	0xe	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_pk_fma_f16 v12, v12, s3, s16	CC0E400C 1840070C	w0_extra:ignored:0x800000:0x0
 v_pk_mul_f16	vop3p	0x10	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_mul_f16 v33, v12, v33	CC104021 1A02430C	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_pk_lshrrev_b16	vop3p	0x5	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_pk_lshrrev_b16 v20, 8, v20 op_sel:[1,0] op_sel_hi:[0,0]	CC054814 02022888	w0_extra:ignored:0x800000:0x0,src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_rcp_iflag_f32_e32	vop1	0x2b	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rcp_iflag_f32_e32 v1, v1	7E025701	w0_extra:ignored:0x10000:0x0
 v_rsq_f32_e32	vop1	0x2e	VDST:32,SRC0:32	VDST	SRC0	-	-	v_rsq_f32_e32 v0, v0	7E005D00	w0_extra:ignored:0x10000:0x0
 v_trunc_f32_e32	vop1	0x21	VDST:32,SRC0:32	VDST	SRC0	-	-	v_trunc_f32_e32 v1, v22	7E024316	w0_extra:ignored:0x10000:0x0
@@ -336,9 +338,9 @@ ds_load_b96	ds	0xfe	VDST:96,ADDR:32	VDST	ADDR	-	Lgkm:1	ds_load_b96 v[16:18], v2 
 ds_load_u16_d16_hi	ds	0xa7	VDST:32,ADDR:32	VDST	ADDR,VDST	-	Lgkm:1	ds_load_u16_d16_hi v6, v2 offset:136	DA9C0088 06000002	w0_extra:ignored:0x30000:0x0
 ds_store_b16	ds	0x1f	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Lgkm:1	ds_store_b16 v3, v1 offset:64	D87C0040 00000103	w0_extra:ignored:0x30000:0x0
 ds_store_b16_d16_hi	ds	0xa1	ADDR:32,DATA0:32	-	ADDR,DATA0	-	Lgkm:1	ds_store_b16_d16_hi v3, v1 offset:192	DA8400C0 00000103	w0_extra:ignored:0x30000:0x0
-flat_load_d16_b16	flat	0x20	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR,VDST	-	Vm:1	flat_load_d16_b16 v42, v[10:11] offset:8	DC800008 2A7C000A	-
-flat_load_u16	flat	0x12	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_u16 v31, v[27:28] offset:16	DC480010 1F7C001B	-
-flat_load_u8	flat	0x10	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_u8 v32, v[29:30]	DC400000 207C001D	-
+flat_load_d16_b16	flat	0x20	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR,VDST	-	Vm:1,Lgkm:1	flat_load_d16_b16 v42, v[10:11] offset:8	DC800008 2A7C000A	-
+flat_load_u16	flat	0x12	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1,Lgkm:1	flat_load_u16 v31, v[27:28] offset:16	DC480010 1F7C001B	-
+flat_load_u8	flat	0x10	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1,Lgkm:1	flat_load_u8 v32, v[29:30]	DC400000 207C001D	-
 global_load_d16_hi_b16	global	0x23	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR,VDST	-	Vm:1	global_load_d16_hi_b16 v4, v[6:7], off	DC8E0000 047C0006	-
 s_and_b64	sop2	0x17	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_and_b64 vcc, s[4:5], vcc	8BEA6A04	-
 s_and_saveexec_b64	sop1	0x21	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_saveexec_b64 s[2:3], s[18:19]	BE822112	-
@@ -380,9 +382,9 @@ v_nop_e32	vop1	0x0	-	-	-	-	-	v_nop_e32	7E000000	-
 # railgun M0a (2026-09-29): rows for opcodes in the M0a decode sequences, derived from the named same-shape sibling row; sample/encoding from pinned llvm-mc.
 s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b64 s[4:5], -1	BE8423C1	-
 s_cmpk_lt_u32	sopk	0xd	SDST:32,SIMM16:16	-	SDST,SIMM16	scc:w	-	s_cmpk_lt_u32 s24, 0x100	B6980100	-
-flat_load_b32	flat	0x14	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b32 v33, v[1:2] offset:8	DC500008 217C0001	-
-flat_load_b64	flat	0x15	VDST:64,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b64 v[17:18], v[1:2]	DC540000 117C0001	-
-flat_load_b128	flat	0x17	VDST:128,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1	flat_load_b128 v[33:36], v[22:23]	DC5C0000 217C0016	-
+flat_load_b32	flat	0x14	VDST:32,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1,Lgkm:1	flat_load_b32 v33, v[1:2] offset:8	DC500008 217C0001	-
+flat_load_b64	flat	0x15	VDST:64,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1,Lgkm:1	flat_load_b64 v[17:18], v[1:2]	DC540000 117C0001	-
+flat_load_b128	flat	0x17	VDST:128,ADDR:64,SADDR:64	VDST	ADDR,SADDR	-	Vm:1,Lgkm:1	flat_load_b128 v[33:36], v[22:23]	DC5C0000 217C0016	-
 buffer_gl1_inv	buffer	0x2c	-	-	-	-	-	buffer_gl1_inv	E0B00000 00000000	-
 s_bcnt1_i32_b32	sop1	0x18	SDST:32,SSRC0:32	SDST	SSRC0	scc:w	-	s_bcnt1_i32_b32 s3, s6	BE831806	-
 v_cmp_u_f32_e64	vop3	0x18	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_cmp_u_f32_e64 s0, v4, v3	D4180000 02020704	src2_unused:ignored:0x1ff:0x00/0x80/0x101
@@ -467,3 +469,16 @@ v_cmpx_eq_u16_e32	vopc	0xba	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_cmpx_ne_u16_e32	vopc	0xbd	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u16_e32 0, v1.l	7D7A0280	-
 v_cmpx_lt_i64_e32	vopc	0xd1	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_lt_i64_e32 s[2:3], v[4:5]	7DA20802	-
 v_cmpx_eq_u64_e32	vopc	0xda	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_eq_u64_e32 s[2:3], v[4:5]	7DB40802	-
+v_cmpx_le_i32_e32	vopc	0xc3	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_i32_e32 s5, v2	7D860405	-
+v_cmpx_le_u32_e32	vopc	0xcb	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u32_e32 v6, v2	7D960506	-
+v_cmpx_le_f32_e64	vop3	0x93	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	exec:w	-	v_cmpx_le_f32_e64 0x48000000, |v6|	D493027E 02020CFF 48000000	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_ngt_f32_e64	vop3	0x9b	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	exec:w	-	v_cmpx_ngt_f32_e64 0x3f200000, |v54|	D49B027E 02026CFF 3F200000	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_bcnt_u32_b32	vop3	0x31e	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_bcnt_u32_b32 v16, v1, 0	D71E0010 02010101	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_sub_f32_e64	vop3	0x104	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_sub_f32_e64 v7, s11, s10	D5040007 0200140B	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_subrev_f32_e32	vop2	0x5	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_subrev_f32_e32 v6, s10, v6	0A0C0C0A	-
+buffer_load_i8	buffer	0x11	VDATA:32,VADDR:64,RSRC:128,SOFFSET:32	VDATA	VADDR,RSRC,SOFFSET	-	Vm:1	buffer_load_i8 v59, v10, s[36:39], s0 offen	E0440000 00493B0A	-
+v_alignbyte_b32	vop3	0x217	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_alignbyte_b32 v1, v2, v3, 2	D6170001 020A0702	neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+v_cmpx_gt_i64_e32	vopc	0xd4	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_i64_e32 s[6:7], v[2:3]	7DA80406	-
+v_cvt_u32_u16_e64	vop3	0x1eb	VDST:32,SRC0:16	VDST	SRC0	-	-	v_cvt_u32_u16_e64 v143, v2.l	D5EB008F 02010102	src1_unused:ignored:0x1ff:0x00/0x80/0x101,src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_min_i32_dpp	vop2_dpp	0x11	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_min_i32_dpp v0, v0, v0 row_xmask:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	220000FA FF096100	dpp_fi:honored:0x40000
+v_or_b32_dpp	vop2_dpp	0x1c	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_or_b32_dpp v5, v5, v5 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1	380A0AFA FF090105	dpp_fi:honored:0x40000

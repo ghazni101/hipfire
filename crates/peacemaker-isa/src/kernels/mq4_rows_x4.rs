@@ -125,14 +125,29 @@ impl Spec {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2 workgroup id (gfx11, the first system SGPR after
-// the two user SGPRs; gfx12 reads it from ttmp9).
+// s0:1 kernarg pointer; the workgroup ids (gfx11) are the system SGPRs after the declared user
+// SGPRs: s2/s3 on gfx1151, s14/s15 on gfx1100 (`FeatureUserSGPRInit16Bug`: user + system >= 16, so
+// the kernarg pointer is padded to 14 user SGPRs); gfx12 reads them from ttmp9/ttmp7.
 const KARG: u8 = 0;
-const WGIN: u8 = 2;
+const USER_SGPRS: u8 = 2;
+/// Workgroup X and Y (rowtile entry) system SGPRs.
+const SYSTEM_SGPRS: u8 = 2;
+/// First workgroup-id SGPR: the declared user SGPR count of the arch.
+const fn wgin(arch: Arch) -> u8 {
+    arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS)
+}
+/// First scalar of the `A0..A3` weight-pointer block: s[8:15] on gfx1151; the gfx1100 workgroup ids
+/// occupy s14/s15, so the block moves to s[80:87].
+const fn pa(arch: Arch) -> u8 {
+    if matches!(arch, Arch::Gfx1100) {
+        80
+    } else {
+        8
+    }
+}
 /// Weight buffer resource (base of the selected matrix).
 const SRD: u8 = 4;
-/// Kernargs: s[8:15] A0..A3, s[16:23] x y0 y1 y2, s[24:27] y3 M0 M1, s[28:31] M2 M3 K B.
-const PA: u8 = 8;
+/// Kernargs: s[pa:pa+7] A0..A3 (s[8:15], gfx1100 s[80:87]), s[16:23] x y0 y1 y2, s[24:27] y3 M0 M1, s[28:31] M2 M3 K B.
 const PXY: u8 = 16;
 const Y3M: u8 = 24;
 const M2KB: u8 = 28;
@@ -211,11 +226,11 @@ fn lbl(nb: u8, name: &str, rowtiles: bool) -> String {
 }
 
 fn plan(arch: Arch, rowtiles: bool) -> Result<RegPlan, String> {
-    let mut regs = RegPlan::new(128, 80)?;
+    let mut regs = RegPlan::new(128, if arch == Arch::Gfx1100 { 88 } else { 80 })?;
     let mut s_ranges: Vec<(&str, u8, u8)> = vec![
         ("kernarg", KARG, 2),
         ("weight_resource", SRD, 4),
-        ("weight_pointers", PA, 8),
+        ("weight_pointers", pa(arch), 8),
         ("x_y_pointers", PXY, 8),
         ("y3_m01", Y3M, 4),
         ("m23_k_b", M2KB, 4),
@@ -246,9 +261,9 @@ fn plan(arch: Arch, rowtiles: bool) -> Result<RegPlan, String> {
         ("column_bases1", XCOL + 8, 8),
     ];
     if !arch.gfx12() {
-        s_ranges.push(("workgroup_id", WGIN, 1));
+        s_ranges.push(("workgroup_id", wgin(arch), 1));
         if rowtiles {
-            s_ranges.push(("workgroup_id_y", WGIN + 1, 1));
+            s_ranges.push(("workgroup_id_y", wgin(arch) + 1, 1));
         }
     }
     if rowtiles {
@@ -396,14 +411,16 @@ pub fn emit_module(
 fn prologue(b: &mut Builder, rowtiles: bool) -> R {
     let a = b.spec.arch;
     let end = end_label(rowtiles);
-    smem(b, PA, 8, KARG, 0)?;
+    let pa0 = pa(a);
+    let wg0 = wgin(a);
+    smem(b, pa0, 8, KARG, 0)?;
     smem(b, PXY, 8, KARG, 32)?;
     smem(b, Y3M, 4, KARG, 64)?;
     smem(b, M2KB, 4, KARG, 80)?;
     if a.gfx12() {
         sop(b, format!("s_mov_b32 s{SW}, ttmp9"), &[SW], &[])?;
     } else {
-        sop(b, format!("s_mov_b32 s{SW}, s{WGIN}"), &[SW], &[WGIN])?;
+        sop(b, format!("s_mov_b32 s{SW}, s{wg0}"), &[SW], &[wg0])?;
     }
     if rowtiles {
         rowtile_domain(b)?;
@@ -436,13 +453,13 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
         format!(
             "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{}:{}]",
             SRD + 1,
-            PA + 4,
-            PA + 5,
-            PA + 6,
-            PA + 7
+            pa0 + 4,
+            pa0 + 5,
+            pa0 + 6,
+            pa0 + 7
         ),
         &[pair(SRD)],
-        &[pair(PA + 4), pair(PA + 6)],
+        &[pair(pa0 + 4), pair(pa0 + 6)],
     )?;
     op(
         b,
@@ -473,12 +490,12 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
         format!(
             "s_cselect_b64 s[{SRD}:{}], s[{}:{}], s[{SRD}:{}]",
             SRD + 1,
-            PA + 2,
-            PA + 3,
+            pa0 + 2,
+            pa0 + 3,
             SRD + 1
         ),
         &[pair(SRD)],
-        &[pair(PA + 2), pair(SRD)],
+        &[pair(pa0 + 2), pair(SRD)],
     )?;
     op(
         b,
@@ -507,13 +524,13 @@ fn prologue(b: &mut Builder, rowtiles: bool) -> R {
     op(
         b,
         format!(
-            "s_cselect_b64 s[{SRD}:{}], s[{PA}:{}], s[{SRD}:{}]",
+            "s_cselect_b64 s[{SRD}:{}], s[{pa0}:{}], s[{SRD}:{}]",
             SRD + 1,
-            PA + 1,
+            pa0 + 1,
             SRD + 1
         ),
         &[pair(SRD)],
-        &[pair(PA), pair(SRD)],
+        &[pair(pa0), pair(SRD)],
     )?;
     op(
         b,
@@ -756,9 +773,9 @@ fn rowtile_domain(b: &mut Builder) -> R {
     } else {
         sop(
             b,
-            format!("s_mov_b32 s{ROW_BASE}, s{}", WGIN + 1),
+            format!("s_mov_b32 s{ROW_BASE}, s{}", wgin(a) + 1),
             &[ROW_BASE],
-            &[WGIN + 1],
+            &[wgin(a) + 1],
         )?;
     }
     // Reject before shifting, so an excess grid cannot wrap onto a live tile.
@@ -1088,25 +1105,98 @@ fn fmac(b: &mut Builder, dst: u8, w: u8, x: u8) -> R {
 /// Pinned source-matched objects are recorded in PLAN's singleton-reference
 /// packet: Halo cache `gemv_mq4g256v2_mq4v2.92ecf66b777f981f` and XTX cache
 /// `gemv_mq4g256v2_rdna3_mq4v2.37cf66a5274c0003`. Their scalar fold is 01+32.
+///
+/// gfx11 VOPD dual-issues six of the eight terms across the two rows. Each
+/// row's own multiply/FMA sequence stays in this order, and the two `src1`
+/// registers of a packet sit in different VGPR banks, so the f32 bits match
+/// the scalar chain. The schedule (term index into `[1,0,2,3,4,5,6,7]`):
+/// row0:0, pair(row0:1, row1:0), row0:2, pair(row0:3, row1:1), row1:2,
+/// pair(row0:4, row1:3), pair(row0:5, row1:4), pair(row0:6, row1:5),
+/// pair(row0:7, row1:6), row1:7.
 fn scalar_dots(b: &mut Builder, x: u8, tail: bool) -> R {
-    for (r, &w) in W.iter().enumerate() {
-        let dst = DOT[r];
-        for (term, n) in [1, 0, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
-            let (lhs, rhs) = if tail { (x + n, w + n) } else { (w + n, x + n) };
-            if term == 0 {
-                valu(
-                    b,
-                    &format!("v_mul_f32_e32 v{dst}, v{lhs}, v{rhs}"),
-                    &[dst],
-                    &[lhs, rhs],
-                    &[],
-                )?;
-            } else {
-                fmac(b, dst, lhs, rhs)?;
-            }
+    const ORDER: [u8; 8] = [1, 0, 2, 3, 4, 5, 6, 7];
+    enum Step {
+        Row0(u8),
+        Row1(u8),
+        Pair(u8, u8),
+    }
+    const STEPS: [Step; 10] = [
+        Step::Row0(0),
+        Step::Pair(1, 0),
+        Step::Row0(2),
+        Step::Pair(3, 1),
+        Step::Row1(2),
+        Step::Pair(4, 3),
+        Step::Pair(5, 4),
+        Step::Pair(6, 5),
+        Step::Pair(7, 6),
+        Step::Row1(7),
+    ];
+    for step in STEPS {
+        match step {
+            Step::Row0(index) => scalar_one(b, x, tail, 0, index, ORDER)?,
+            Step::Row1(index) => scalar_one(b, x, tail, 1, index, ORDER)?,
+            Step::Pair(i0, i1) => scalar_pair(b, x, tail, i0, i1, ORDER)?,
         }
     }
     Ok(())
+}
+
+fn scalar_operands(x: u8, tail: bool, row: usize, n: u8) -> (u8, u8) {
+    let w = W[row] + n;
+    if tail {
+        (x + n, w)
+    } else {
+        (w, x + n)
+    }
+}
+
+fn scalar_one(b: &mut Builder, x: u8, tail: bool, row: usize, index: u8, order: [u8; 8]) -> R {
+    let n = order[index as usize];
+    let dst = DOT[row];
+    let (lhs, rhs) = scalar_operands(x, tail, row, n);
+    if index == 0 {
+        valu(
+            b,
+            &format!("v_mul_f32_e32 v{dst}, v{lhs}, v{rhs}"),
+            &[dst],
+            &[lhs, rhs],
+            &[],
+        )
+    } else {
+        fmac(b, dst, lhs, rhs)
+    }
+}
+
+fn scalar_pair(b: &mut Builder, x: u8, tail: bool, i0: u8, i1: u8, order: [u8; 8]) -> R {
+    let op = |index: u8| {
+        if index == 0 {
+            VopdF32::Mul
+        } else {
+            VopdF32::Fmac
+        }
+    };
+    let srcs = |row: usize, index: u8| {
+        let n = order[index as usize];
+        let (lhs, rhs) = scalar_operands(x, tail, row, n);
+        (Operand::V(lhs), rhs)
+    };
+    let (s0, s1) = srcs(0, i0);
+    let (t0, t1) = srcs(1, i1);
+    b.vopd(
+        VopdOp {
+            op: op(i0),
+            dst: DOT[0],
+            src0: s0,
+            src1: s1,
+        },
+        VopdOp {
+            op: op(i1),
+            dst: DOT[1],
+            src0: t0,
+            src1: t1,
+        },
+    )
 }
 
 fn columns(b: &mut Builder, nb: u8, s: u8, scalar_tail: Option<bool>) -> R {

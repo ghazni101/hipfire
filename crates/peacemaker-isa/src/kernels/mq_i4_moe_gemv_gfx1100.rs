@@ -74,9 +74,13 @@
 //!
 //! # What differs from gfx1201 (and only that)
 //!  * Workgroup ids are **system SGPRs**, not `ttmp`: with `user_sgpr_count = 2` (kernarg pointer)
-//!    and `system_sgpr_workgroup_id_y` set, x is `s2` and y is `s3` (`Arch::workgroup_ids`). Both
-//!    are declared in the register plan; `s3` is the whole y id (gfx1201's `ttmp7[15:0]` mask does
-//!    not exist here).
+//!    and `system_sgpr_workgroup_id_y` set they follow the DECLARED user SGPRs. gfx1100's
+//!    `FeatureUserSGPRInit16Bug` (LLVM `allocateSystemSGPRs`) requires user + system >= 16, so the
+//!    descriptor declares 14 user SGPRs (kernarg pointer + 12 dead pads) and x is `s14`, y is `s15`
+//!    (`Arch::workgroup_ids`); the `_t8` entries also enable z and declare 13, so x / y / z are
+//!    `s13` / `s14` / `s15`. All are declared in the register plan; the y id is the whole y id
+//!    (gfx1201's `ttmp7[15:0]` mask does not exist here). The kernarg pointer block that used to sit at
+//!    `s[8:15]` is `s[80:87]`.
 //!  * Scalar add/sub spellings are the gfx11 ones (`s_add_u32`/`s_addc_u32`/`s_add_i32`/`s_sub_i32`),
 //!    SMEM zero offset is `null`, and the raw buffer load soffset is `0`; all come from
 //!    `kernels::common`, which is arch-switched.
@@ -219,20 +223,30 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; s2 / s3 workgroup id x / y (system SGPRs after the two user SGPRs).
+// s0:1 kernarg pointer; the workgroup ids are the system SGPRs after the DECLARED user SGPRs. gfx1100's
+// `FeatureUserSGPRInit16Bug` pads the user SGPRs to user + system >= 16 (`Arch::declared_user_sgprs`), so the ids
+// are s14 / s15 (x / y; the plain entries) and s13 / s14 / s15 (x / y / z; the `_t8` entries).
 const KARG: u8 = 0;
-const WGX: u8 = USER_SGPRS;
-const WGY: u8 = USER_SGPRS + 1;
-const WGZ: u8 = USER_SGPRS + 2;
+/// First SGPR of the workgroup ids (`rowtiles` enables the z id too).
+const fn wg_x(rowtiles: bool) -> u8 {
+    Arch::Gfx1100.declared_user_sgprs(USER_SGPRS, if rowtiles { 3 } else { 2 })
+}
+const fn wg_y(rowtiles: bool) -> u8 {
+    wg_x(rowtiles) + 1
+}
+const fn wg_z() -> u8 {
+    wg_x(true) + 2
+}
 const TILE_SNEXP: u8 = 5;
 const TILE_WORKGROUP_SIZE: u32 = 256;
 const TILE_DESCRIPTOR_BYTES: u32 = 1928;
 const TILE_CAPACITY: u32 = 80;
-/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50).
-const WPTRS: u8 = 8;
-const EIDS: u8 = 10;
-const OFFS: u8 = 12;
-const SLOTS: u8 = 14;
+/// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50). The first block sits past the plan's other
+/// SGPRs, at s[80:87]: the workgroup ids occupy s13..15.
+const WPTRS: u8 = 80;
+const EIDS: u8 = WPTRS + 2;
+const OFFS: u8 = WPTRS + 4;
+const SLOTS: u8 = WPTRS + 6;
 const XROT: u8 = 16;
 const Y0: u8 = 18;
 const Y1: u8 = 20;
@@ -278,7 +292,7 @@ const MI: u8 = 77;
 const ROWM: u8 = 78;
 const ROWIN: u8 = 79;
 /// SGPRs the plan declares (the honest ceiling, `sgpr_max` of the contract).
-const SGPRS: u8 = 80;
+const SGPRS: u8 = WPTRS + 8;
 /// `n_experts@88`, the extent of the `expert_weight_ptrs` table: `s4`, the first SGPR after the system workgroup ids,
 /// which no other instruction of the entry touches (the plan's SGPR ceiling and the physical assignment of every
 /// other register are unchanged). An `expert_ids` entry at or past it is never used to index the table.
@@ -399,8 +413,8 @@ fn plan(l: &Lay, rowtiles: bool) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(u16::from(l.end), u16::from(SGPRS))?;
     for (name, base, len) in [
         ("kernarg", KARG, 2),
-        ("workgroup_id_x", WGX, 1),
-        ("workgroup_id_y", WGY, 1),
+        ("workgroup_id_x", wg_x(rowtiles), 1),
+        ("workgroup_id_y", wg_y(rowtiles), 1),
         ("kernel_arguments_ptrs", WPTRS, 8),
         ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4),
@@ -446,7 +460,7 @@ fn plan(l: &Lay, rowtiles: bool) -> Result<RegPlan, String> {
         declare(&mut regs, name, RKind::S, base, len)?;
     }
     if rowtiles {
-        declare(&mut regs, "workgroup_id_z", RKind::S, WGZ, 1)?;
+        declare(&mut regs, "workgroup_id_z", RKind::S, wg_z(), 1)?;
     }
     for (name, base, len) in [
         ("lane", LANE, 1),
@@ -624,10 +638,12 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
     let snexp = if rowtiles { TILE_SNEXP } else { SNEXP };
     smem(b, snexp, 1, KARG, 0x58)?;
     // gfx11 workgroup ids are system SGPRs (after the user SGPRs), not ttmp registers.
-    let ids = a.workgroup_ids(USER_SGPRS)?;
-    if (ids.x, ids.y) != (WgIdSource::Sgpr(WGX), WgIdSource::Sgpr(WGY)) {
+    let ids = b.spec.workgroup_ids(rowtiles)?;
+    let (wgx, wgy) = (wg_x(rowtiles), wg_y(rowtiles));
+    if (ids.x, ids.y) != (WgIdSource::Sgpr(wgx), WgIdSource::Sgpr(wgy)) {
         return Err(format!("unexpected workgroup id ABI {ids:?}"));
     }
+    let wgz = wg_z();
     if rowtiles {
         // v0 is the linear workitem id. Scalar registers are wave-private;
         // each wave runs the original complete K sweep for one output row.
@@ -644,7 +660,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
             &[s(TMP)],
             &[v(l.exch)],
         )?;
-        sop(b, format!("s_lshl_b32 s{ROW}, s{WGX}, 3"), &[ROW], &[WGX])?;
+        sop(b, format!("s_lshl_b32 s{ROW}, s{wgx}, 3"), &[ROW], &[wgx])?;
         sop(
             b,
             format!("s_add_u32 s{ROW}, s{ROW}, s{TMP}"),
@@ -670,26 +686,26 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay, rowtiles: bool) -> R {
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(b, format!("s_cmp_gt_u32 s{SC}, 64"), &[], &[SC])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-        sop(b, format!("s_cmp_ge_u32 s{WGZ}, 8"), &[], &[WGZ])?;
+        sop(b, format!("s_cmp_ge_u32 s{wgz}, 8"), &[], &[wgz])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
-        sop(b, format!("s_lshl_b32 s{TMP}, s{WGZ}, 3"), &[TMP], &[WGZ])?;
+        sop(b, format!("s_lshl_b32 s{TMP}, s{wgz}, 3"), &[TMP], &[wgz])?;
         sop(b, format!("s_cmp_ge_u32 s{TMP}, s{SC}"), &[], &[TMP, SC])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(b, format!("s_cmp_eq_u32 s{SDIV}, 0"), &[], &[SDIV])?;
         branch(b, &format!("s_cbranch_scc1 {exit}"))?;
         sop(
             b,
-            format!("s_mul_i32 s{TMP}, s{WGZ}, {}", lit(TILE_DESCRIPTOR_BYTES)),
+            format!("s_mul_i32 s{TMP}, s{wgz}, {}", lit(TILE_DESCRIPTOR_BYTES)),
             &[TMP],
-            &[WGZ],
+            &[wgz],
         )?;
         for ptr in [EIDS, OFFS, SLOTS] {
             add64(b, ptr, ptr, TMP)?;
         }
     } else {
-        sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+        sop(b, format!("s_mov_b32 s{ROW}, s{wgx}"), &[ROW], &[wgx])?;
     }
-    sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
+    sop(b, format!("s_mov_b32 s{UIDX}, s{wgy}"), &[UIDX], &[wgy])?;
     sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_ge_u32 s{UIDX}, s{SU}"), &[], &[UIDX, SU])?;
@@ -1645,7 +1661,8 @@ mod rowtile_tests {
             assert!(t.contains(".amdhsa_system_sgpr_workgroup_id_z 1"));
             assert!(t.contains("s_load_b32 s5, s[0:1], 0x58"));
             assert!(t.contains(&format!(
-                "s_mul_i32 s{TMP}, s{WGZ}, {}",
+                "s_mul_i32 s{TMP}, s{}, {}",
+                wg_z(),
                 lit(TILE_DESCRIPTOR_BYTES)
             )));
             assert!(t.contains(&format!("s_cmp_eq_u32 s{SU}, {}", lit(TILE_CAPACITY))));
@@ -1654,12 +1671,12 @@ mod rowtile_tests {
             assert!(t.contains(&format!("s_cmp_gt_u32 s{OFF1}, {}", lit(TILE_CAPACITY))));
             assert!(t.contains(&format!("s_cmp_ge_u32 s{EID}, s{TILE_SNEXP}")));
             assert!(t.contains(&format!("v_and_b32_e32 v{LANE}, 31, v{LANE}")));
-            assert!(t.contains(&format!("s_lshl_b32 s{ROW}, s{WGX}, 3")));
+            assert!(t.contains(&format!("s_lshl_b32 s{ROW}, s{}, 3", wg_x(true))));
             assert!(e
                 .proof
                 .reg_plan
                 .iter()
-                .any(|r| r.name.as_ref() == "workgroup_id_z" && r.base == WGZ));
+                .any(|r| r.name.as_ref() == "workgroup_id_z" && r.base == wg_z()));
             // Singleton and tile local labels must coexist in the same image.
             assert!(!t.contains(&format!(".Lmqi4moe_{}_exit:", spec.tag())));
             assert!(t.contains(&format!(".Lmqi4moe_{}_t8_exit:", spec.tag())));

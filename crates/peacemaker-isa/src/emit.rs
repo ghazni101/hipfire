@@ -91,7 +91,14 @@ pub(crate) fn sgpr_high_water(
     // gfx11 appends enabled system SGPRs after the user inputs. gfx12
     // delivers workgroup IDs in TTMPs instead. Keep legacy images unchanged
     // when the opt-in is unused, including their original SGPR metadata.
-    if workgroup_id_z && !spec.arch.gfx12() {
+    if spec.arch.min_user_system_sgprs() > 0 {
+        // The padded user SGPRs and the system SGPRs after them are live inputs
+        // (gfx1100 `FeatureUserSGPRInit16Bug`: user + system >= 16).
+        ns.max(
+            u16::from(spec.declared_user_sgprs(workgroup_id_z))
+                + u16::from(spec.system_sgprs(workgroup_id_z)),
+        )
+    } else if workgroup_id_z && !spec.arch.gfx12() {
         ns.max(u16::from(spec.user_sgpr_count) + 2 + u16::from(spec.system_sgpr_workgroup_id_y))
     } else {
         ns
@@ -131,7 +138,10 @@ fn kernel_assembly(
         ("group_segment_fixed_size", spec.group_segment_fixed_size),
         ("private_segment_fixed_size", 0),
         ("kernarg_size", spec.kernargs.size),
-        ("user_sgpr_count", spec.user_sgpr_count as u32),
+        (
+            "user_sgpr_count",
+            u32::from(spec.declared_user_sgprs(workgroup_id_z)),
+        ),
         ("user_sgpr_dispatch_ptr", 0),
         ("user_sgpr_queue_ptr", 0),
         ("user_sgpr_kernarg_segment_ptr", 1),

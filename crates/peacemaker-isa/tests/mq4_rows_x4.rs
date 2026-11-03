@@ -325,7 +325,9 @@ fn rowtile_name_determinism_abi_and_fixed_eight_row_resources() {
             (".vgpr_spill_count:", 0),
             (".sgpr_spill_count:", 0),
             (".vgpr_count:", 121),
-            (".sgpr_count:", 82),
+            // gfx1100: the A0..A3 block s[80:87] clears the workgroup ids s14/s15
+            // (`FeatureUserSGPRInit16Bug`), so next_free_sgpr is 88.
+            (".sgpr_count:", if arch == Arch::Gfx1100 { 90 } else { 82 }),
         ] {
             assert_eq!(metadata_numbers(text, key), [expected], "{arch:?}: {key}");
         }
@@ -438,12 +440,14 @@ fn rowtile_arch_y_register_domain_guards_and_full_window_rebasing() {
             assert!(i < first_data_load, "{arch:?}: {guard} after data load");
         }
         assert!(at("s_and_b32 s45, s30, 0xff") < at("s_cmp_lg_u32 s45, 0"));
+        // gfx1100: the Y workgroup id follows the 14 declared user SGPRs (s15).
+        let y_id = if arch == Arch::Gfx1100 { 15 } else { 3 };
         let y_read = if arch.gfx12() {
-            "s_and_b32 s56, ttmp7, 0xffff"
+            "s_and_b32 s56, ttmp7, 0xffff".to_string()
         } else {
-            "s_mov_b32 s56, s3"
+            format!("s_mov_b32 s56, s{y_id}")
         };
-        assert!(at(y_read) < at("s_cmp_ge_u32 s56, 8"));
+        assert!(at(&y_read) < at("s_cmp_ge_u32 s56, 8"));
         assert!(at("s_cmp_ge_u32 s56, 8") < at("s_lshl_b32 s56, s56, 3"));
         assert!(at("s_lshl_b32 s56, s56, 3") < at("s_cmp_ge_u32 s56, s57"));
         assert!(at("s_cmp_gt_u32 s31, 8") < at("s_cselect_b32 s31, 8, s31"));
@@ -460,6 +464,7 @@ fn rowtile_arch_y_register_domain_guards_and_full_window_rebasing() {
         }
         if arch.gfx12() {
             assert!(!tile.s_text.contains("s_mov_b32 s56, s3"));
+            assert!(!tile.s_text.contains("s_mov_b32 s56, s15"));
         } else {
             assert!(!tile.s_text.contains("ttmp"));
             assert!(!tile.s_text.contains("scope:SCOPE"));
@@ -1361,6 +1366,34 @@ fn rowtile_emitted_halo_scalar_lm_full_row_strides_first_and_last_pairs() {
     }
 }
 
+/// One scalar or VOPD-half dot, tagged `mul`/`fmac` so a dual packet and a
+/// lone `v_*_f32_e32` compare as the same per-row chain.
+fn scalar_dot_text(line: &str) -> Option<(usize, String)> {
+    let (op, rest) = if let Some(rest) = line.strip_prefix("v_dual_mul_f32 ") {
+        ("mul", rest)
+    } else if let Some(rest) = line.strip_prefix("v_dual_fmac_f32 ") {
+        ("fmac", rest)
+    } else if let Some(rest) = line.strip_prefix("v_mul_f32_e32 ") {
+        ("mul", rest)
+    } else if let Some(rest) = line.strip_prefix("v_fmac_f32_e32 ") {
+        ("fmac", rest)
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let dst: usize = parts[0].trim_start_matches('v').parse().ok()?;
+    if dst != 24 && dst != 25 {
+        return None;
+    }
+    Some((
+        dst,
+        format!("{op} {}, {}, {}", parts[0], parts[1], parts[2]),
+    ))
+}
+
 #[test]
 fn rowtile_scalar_emission_keeps_object_order_orientation_streams_and_fold() {
     for arch in [Arch::Gfx1151, Arch::Gfx1100] {
@@ -1403,33 +1436,44 @@ fn rowtile_scalar_emission_keeps_object_order_orientation_streams_and_fold() {
                 assert!(main.contains("s_cmp_ge_u32 s50, s59"));
                 assert!(main.contains(&format!("s_cbranch_scc1 .Lmq4rxt8_b{label}_s{stream}_tail")));
                 for (is_tail, body) in [(false, main), (true, tail)] {
-                    let actual: Vec<&str> = body
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| {
-                            line.starts_with("v_mul_f32_e32 ")
-                                || line.starts_with("v_fmac_f32_e32 ")
-                        })
-                        .collect();
-                    let mut expected = Vec::new();
+                    let mut rows_ops = [Vec::new(), Vec::new()];
+                    for line in body.lines().map(str::trim) {
+                        let halves: Vec<&str> = if line.contains(" :: ") {
+                            line.split(" :: ").collect()
+                        } else if line.starts_with("v_mul_f32_e32 ")
+                            || line.starts_with("v_fmac_f32_e32 ")
+                        {
+                            vec![line]
+                        } else {
+                            continue;
+                        };
+                        for half in halves {
+                            if let Some((dst, text)) = scalar_dot_text(half) {
+                                rows_ops[dst - 24].push(text);
+                            }
+                        }
+                    }
                     for column in 0..rows {
                         let x = 105 + 8 * (column % 2);
                         for p in 0..2 {
                             let w = [16, 26][p];
                             let dst = 24 + p;
+                            let mut expected = Vec::new();
                             for (index, term) in [1, 0, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
                                 let (lhs, rhs) = if is_tail {
                                     (x + term, w + term)
                                 } else {
                                     (w + term, x + term)
                                 };
-                                let op = if index == 0 {
-                                    "v_mul_f32_e32"
-                                } else {
-                                    "v_fmac_f32_e32"
-                                };
+                                let op = if index == 0 { "mul" } else { "fmac" };
                                 expected.push(format!("{op} v{dst}, v{lhs}, v{rhs}"));
                             }
+                            let start = column * 8;
+                            assert_eq!(
+                                rows_ops[p][start..start + 8],
+                                expected,
+                                "{arch:?} b{label} stream{stream} tail={is_tail} row{p} col{column}"
+                            );
                         }
                         let a = 40 + column * 8 + stream * 2;
                         assert!(body.contains(&format!(
@@ -1438,10 +1482,6 @@ fn rowtile_scalar_emission_keeps_object_order_orientation_streams_and_fold() {
                             a + 1
                         )));
                     }
-                    assert_eq!(
-                        actual, expected,
-                        "{arch:?} b{label} stream{stream} tail={is_tail}"
-                    );
                 }
             }
             let fold = text

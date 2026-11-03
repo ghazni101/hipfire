@@ -566,6 +566,10 @@ impl Qwen4ExpertStage {
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("long-prefill expert staging off ({reason})"),
+            );
             Ok(None)
         };
         if let Some(lease) = bundle.weights.expert_tiers() {
@@ -904,6 +908,13 @@ impl Qwen4ExpertStage {
                 stage.min_rows_source.label()
             );
         }
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!(
+                "long-prefill expert staging on (>= {} rows)",
+                stage.min_rows
+            ),
+        );
         Ok(Some(stage))
     }
 
@@ -921,6 +932,10 @@ impl Qwen4ExpertStage {
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("long-prefill expert staging off ({reason})"),
+            );
             Ok(None)
         };
         if bundle.weights.ep_placement().is_some() {
@@ -1174,6 +1189,13 @@ impl Qwen4ExpertStage {
             sizes[1] >> 20,
             if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!(
+                "long-prefill expert staging on (>= {} rows)",
+                stage.min_rows
+            ),
         );
         Ok(Some(stage))
     }

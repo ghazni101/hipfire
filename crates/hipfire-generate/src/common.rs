@@ -199,6 +199,17 @@ pub fn production_fail_closed_rollback(
             return epilogue;
         }
     }
+    // A pipeline-mesh model that owns its lifecycle (`ArchModel::
+    // owns_mesh_lifecycle`) resets every rank through the PP epilogue.
+    if slot.is_none()
+        && spec.is_none()
+        && m.pp > 1
+        && m.state
+            .as_deref()
+            .is_some_and(|state| state.owns_mesh_lifecycle())
+    {
+        return production_pp_fail_closed_rollback(m, gpu);
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     fail_closed_reset_target_and_spec(m, gpu, slot, spec)
@@ -386,6 +397,17 @@ pub fn production_pp_fail_closed_rollback(
     if m.pp > 1 {
         match m.pp_gpus.as_mut() {
             Some(gpus) => {
+                // The mesh-owning model resets its ranks first (drained), then
+                // the per-device graph invalidation and sync below attest it.
+                if let Some(state) = m
+                    .state
+                    .as_deref_mut()
+                    .filter(|state| state.owns_mesh_lifecycle())
+                {
+                    if let Err(e) = state.reset_session_state_mesh(gpu, gpus) {
+                        push_reset_err(&mut first_err, "pp mesh reset", e);
+                    }
+                }
                 for (rank, dev) in gpus.devices.iter_mut().enumerate() {
                     if let Err(e) = dev.bind_thread() {
                         push_reset_err(
@@ -971,6 +993,24 @@ pub fn emit_committed_event(
     let _ = writeln!(stdout, "{}", envelope);
 }
 
+/// Emit one `prefill_progress` JSONL event after a prompt-prefill chunk.
+///
+/// `done`/`total` are prompt tokens this request prefills (a cache-hit prefix
+/// is in neither). Writes nothing once `done >= total`, so single-chunk prompts
+/// and the final chunk stay silent, and nothing at all under
+/// `HIPFIRE_PREFILL_PROGRESS=0`. Call it where the chunk loop already returned
+/// control to the host (next to `check_abort`), with the same writer the
+/// request's token events use. See [`hipfire_runtime::prefill_progress`].
+pub fn emit_prefill_progress(
+    stdout: &mut (impl std::io::Write + ?Sized),
+    id: &str,
+    attempt_id: Option<u64>,
+    done: usize,
+    total: usize,
+) {
+    hipfire_runtime::prefill_progress::emit_to(stdout, id, attempt_id, done, total);
+}
+
 /// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
 /// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
 /// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
@@ -1427,6 +1467,14 @@ pub fn fail_closed_reset_target_and_spec(
         if let Some(b) = m.cohere2moe_mut() {
             if let Err(e) = b.state.reset(gpu) {
                 push_reset_err(&mut first_err, "cohere2moe.reset", e);
+            }
+        }
+        if let Some(b) = m.raon_mut() {
+            // Zeroes RDA recurrent state + conv history and rewinds the MLA
+            // latent cursor: a failed/aborted turn never leaves future-state
+            // behind a truncated cache (PLAN 3.5).
+            if let Err(e) = b.reset(gpu) {
+                push_reset_err(&mut first_err, "raon.reset", e);
             }
         }
         if let Some(bundle) = m.gemma4_mut() {
@@ -2167,5 +2215,24 @@ mod tests {
             0,
             usize::MAX - 1
         ));
+    }
+
+    #[test]
+    fn prefill_progress_emits_one_escaped_line_only_below_total() {
+        let mut out: Vec<u8> = Vec::new();
+        super::emit_prefill_progress(&mut out, "r\"1\\x", Some(4), 1024, 4096);
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).expect("json");
+        assert_eq!(v["type"], "prefill_progress");
+        assert_eq!(v["id"], "r\"1\\x");
+        assert_eq!(v["attempt_id"], 4);
+        assert_eq!(v["done"], 1024);
+        assert_eq!(v["total"], 4096);
+
+        let mut none: Vec<u8> = Vec::new();
+        super::emit_prefill_progress(&mut none, "r1", Some(4), 4096, 4096);
+        super::emit_prefill_progress(&mut none, "r1", Some(4), 512, 512);
+        assert!(none.is_empty(), "no event at done == total");
     }
 }

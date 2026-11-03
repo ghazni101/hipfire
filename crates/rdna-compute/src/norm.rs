@@ -11,6 +11,38 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 
+/// 16-bit format of the dense TP partial-sum exchange (`HIPFIRE_TP_EXCHANGE`).
+/// Both round to nearest even; bf16 keeps the f32 range, f16 has three more
+/// mantissa bits but turns `|v| > 65504` into infinity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TpExchange16 {
+    Bf16,
+    F16,
+}
+
+impl TpExchange16 {
+    pub fn pack_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_pack16_bf16",
+            Self::F16 => "tp_pack16_f16",
+        }
+    }
+
+    pub fn fold_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_fold16_bf16",
+            Self::F16 => "tp_fold16_f16",
+        }
+    }
+
+    pub fn graph_reduce_kernel(self) -> &'static str {
+        match self {
+            Self::Bf16 => "tp_graph_signal_reduce16_bf16_gfx1100",
+            Self::F16 => "tp_graph_signal_reduce16_f16_gfx1100",
+        }
+    }
+}
+
 /// Monotonic per-launch counter feeding the Q8 GatedDeltaNet state
 /// stochastic-rounding dither. Supplies fresh, data-INDEPENDENT entropy each
 /// requant so the rounding is genuinely unbiased across the recurrence — the
@@ -627,6 +659,128 @@ impl Gpu {
                 bb
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Resolve the 16-bit TP exchange kernels (`tp_pack16_*`, `tp_fold16_*`)
+    /// so a later launch never JIT-compiles (graph capture and sealed route
+    /// plans refuse a post-ready compile).
+    pub fn ensure_tp_exchange16_kernels(&mut self, fmt: TpExchange16) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "tp_exchange16",
+            kernels::TP_EXCHANGE16_SRC,
+            fmt.pack_kernel(),
+        )?;
+        self.ensure_kernel(
+            "tp_exchange16",
+            kernels::TP_EXCHANGE16_SRC,
+            fmt.fold_kernel(),
+        )
+    }
+
+    /// Convert `count` f32 partials at `src` to 16-bit `fmt` at `dst`
+    /// (round-to-nearest-even). Both are device pointers on this device; the
+    /// destination holds `2 * count` bytes and is what peers read.
+    pub fn tp_pack16(
+        &mut self,
+        fmt: TpExchange16,
+        src: *const c_void,
+        dst: *mut c_void,
+        count: usize,
+    ) -> HipResult<()> {
+        self.ensure_tp_exchange16_kernels(fmt)?;
+        let count_val = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "tp_pack16 count exceeds i32"))?;
+        let mut params: Vec<*mut c_void> = vec![
+            &src as *const _ as *mut c_void,
+            &dst as *const _ as *mut c_void,
+            &count_val as *const _ as *mut c_void,
+        ];
+        let vec = count / 4;
+        let block = 256u32;
+        let grid = ((vec as u32).div_ceil(block)).max(1);
+        // 4 B read + 2 B write per element.
+        let bytes = count * 6;
+        let name = fmt.pack_kernel();
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(src);
+                bb.push_ptr(dst);
+                bb.push_i32(count_val);
+                bb
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Rank-ordered 16-bit fold: `sum = [r(first_f32)] + up(srcs[0]) + ...`
+    /// (left-associated, f32 adds), then `sum_out = sum` (when non-null) and
+    /// `x = x + sum` (when `x` is non-null). `first_f32` (null for none) is a
+    /// local f32 partial taken as term 0 through the 16-bit round trip;
+    /// `srcs` are 16-bit `fmt` buffers (up to four, any of them may be a
+    /// P2P-mapped peer buffer) holding `count` elements each. With
+    /// `first_f32` null and two sources this is `x + (r(p0) + r(p1))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tp_fold16(
+        &mut self,
+        fmt: TpExchange16,
+        sum_out: *mut c_void,
+        x: *mut c_void,
+        first_f32: *const c_void,
+        srcs: &[*const c_void],
+        count: usize,
+    ) -> HipResult<()> {
+        if srcs.is_empty() && first_f32.is_null() || srcs.len() > 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "tp_fold16 takes 1..=4 sources (plus an optional f32 first term)",
+            ));
+        }
+        self.ensure_tp_exchange16_kernels(fmt)?;
+        let count_val = i32::try_from(count)
+            .map_err(|_| hip_bridge::HipError::new(0, "tp_fold16 count exceeds i32"))?;
+        let nsrc = srcs.len() as i32;
+        let mut s = [std::ptr::null::<c_void>(); 4];
+        s[..srcs.len()].copy_from_slice(srcs);
+        let mut params: Vec<*mut c_void> = vec![
+            &sum_out as *const _ as *mut c_void,
+            &x as *const _ as *mut c_void,
+            &first_f32 as *const _ as *mut c_void,
+            &s[0] as *const _ as *mut c_void,
+            &s[1] as *const _ as *mut c_void,
+            &s[2] as *const _ as *mut c_void,
+            &s[3] as *const _ as *mut c_void,
+            &nsrc as *const _ as *mut c_void,
+            &count_val as *const _ as *mut c_void,
+        ];
+        let vec = count / 4;
+        let block = 256u32;
+        let grid = ((vec as u32).div_ceil(block)).max(1);
+        let bytes = count * (2 * srcs.len() + 8);
+        let name = fmt.fold_kernel();
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", name, bytes);
+        let result =
+            self.launch_maybe_blob(name, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(sum_out);
+                bb.push_ptr(x);
+                bb.push_ptr(first_f32);
+                bb.push_ptr(s[0]);
+                bb.push_ptr(s[1]);
+                bb.push_ptr(s[2]);
+                bb.push_ptr(s[3]);
+                bb.push_i32(nsrc);
+                bb.push_i32(count_val);
+                bb
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -3987,6 +4141,214 @@ impl Gpu {
                 },
             )
         };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// One launch for every live slot's Q8 GDN recurrence.
+    ///
+    /// Each table row is one independent sequence (disjoint S / scales / EF).
+    /// Q/K/V/gate/beta/output point at that slot's packed-batch rows. The
+    /// kernarg keeps the scalar `gated_delta_net_q8_fast` prefix so retained
+    /// PM4 patches the requant frame at offset 76. Lane 0 is those prefix
+    /// pointers (HIP Resource wait sees them). Lane 1 is nine explicit
+    /// pointer args at offset 96, 168 B total, inside the gfx11 256 B
+    /// preload. A by-value table hid lane-1 from alias analysis.
+    ///
+    /// All rows share `n_tokens` (decode is 1). `lanes.len()` is grid.z,
+    /// 1..=2. Byte-identical to one `gated_delta_net_q8_batch_seq` per row
+    /// over that row's views, with frames reserved once as
+    /// `n_tokens * n_lanes`.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_fast_slots(
+        &mut self,
+        lanes: &[crate::dflash_gdn_replay::GdnLayerTable],
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        const SLOTS_MAX: usize = 4;
+        if lanes.is_empty() || n_tokens == 0 {
+            return Ok(());
+        }
+        if !(1..=SLOTS_MAX).contains(&lanes.len()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gated_delta_net_q8_fast_slots: {} lanes outside 1..={SLOTS_MAX}",
+                    lanes.len()
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_q8_fast_slots",
+            kernels::GATED_DELTA_NET_Q8_FAST_SLOTS_SRC,
+            "gated_delta_net_q8_fast_slots",
+        )?;
+        let n_tiles = (128 / 4) as u32;
+        let empty = crate::dflash_gdn_replay::GdnLayerTable {
+            q: 0,
+            k: 0,
+            v: 0,
+            gate: 0,
+            beta: 0,
+            s_q8: 0,
+            s_scales: 0,
+            output: 0,
+            ef: 0,
+        };
+        let lane0 = lanes[0];
+        let lane1 = lanes.get(1).copied().unwrap_or(empty);
+        let lane2 = lanes.get(2).copied().unwrap_or(empty);
+        let lane3 = lanes.get(3).copied().unwrap_or(empty);
+        let mut qp = lane0.q as *mut c_void;
+        let mut kp = lane0.k as *mut c_void;
+        let mut vp = lane0.v as *mut c_void;
+        let mut gp = lane0.gate as *mut c_void;
+        let mut bp = lane0.beta as *mut c_void;
+        let mut sp = lane0.s_q8 as *mut c_void;
+        let mut scp = lane0.s_scales as *mut c_void;
+        let mut op = lane0.output as *mut c_void;
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames((n_tokens * lanes.len()) as u32) as i32;
+        let mut efp = lane0.ef as *mut c_void;
+        let mut qk_ratio = 1i32;
+        let mut q1 = lane1.q as *mut c_void;
+        let mut k1 = lane1.k as *mut c_void;
+        let mut v1 = lane1.v as *mut c_void;
+        let mut g1 = lane1.gate as *mut c_void;
+        let mut b1 = lane1.beta as *mut c_void;
+        let mut s1 = lane1.s_q8 as *mut c_void;
+        let mut sc1 = lane1.s_scales as *mut c_void;
+        let mut o1 = lane1.output as *mut c_void;
+        let mut ef1 = lane1.ef as *mut c_void;
+        let mut q2 = lane2.q as *mut c_void;
+        let mut k2 = lane2.k as *mut c_void;
+        let mut v2 = lane2.v as *mut c_void;
+        let mut g2 = lane2.gate as *mut c_void;
+        let mut b2 = lane2.beta as *mut c_void;
+        let mut s2 = lane2.s_q8 as *mut c_void;
+        let mut sc2 = lane2.s_scales as *mut c_void;
+        let mut o2 = lane2.output as *mut c_void;
+        let mut ef2 = lane2.ef as *mut c_void;
+        let mut q3 = lane3.q as *mut c_void;
+        let mut k3 = lane3.k as *mut c_void;
+        let mut v3 = lane3.v as *mut c_void;
+        let mut g3 = lane3.gate as *mut c_void;
+        let mut b3 = lane3.beta as *mut c_void;
+        let mut s3 = lane3.s_q8 as *mut c_void;
+        let mut sc3 = lane3.s_scales as *mut c_void;
+        let mut o3 = lane3.output as *mut c_void;
+        let mut ef3 = lane3.ef as *mut c_void;
+        let bytes =
+            crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim) * lanes.len();
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_fast_slots",
+            bytes,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
+            &mut qk_ratio as *mut _ as *mut c_void,
+            &mut q1 as *mut _ as *mut c_void,
+            &mut k1 as *mut _ as *mut c_void,
+            &mut v1 as *mut _ as *mut c_void,
+            &mut g1 as *mut _ as *mut c_void,
+            &mut b1 as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut sc1 as *mut _ as *mut c_void,
+            &mut o1 as *mut _ as *mut c_void,
+            &mut ef1 as *mut _ as *mut c_void,
+            &mut q2 as *mut _ as *mut c_void,
+            &mut k2 as *mut _ as *mut c_void,
+            &mut v2 as *mut _ as *mut c_void,
+            &mut g2 as *mut _ as *mut c_void,
+            &mut b2 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut sc2 as *mut _ as *mut c_void,
+            &mut o2 as *mut _ as *mut c_void,
+            &mut ef2 as *mut _ as *mut c_void,
+            &mut q3 as *mut _ as *mut c_void,
+            &mut k3 as *mut _ as *mut c_void,
+            &mut v3 as *mut _ as *mut c_void,
+            &mut g3 as *mut _ as *mut c_void,
+            &mut b3 as *mut _ as *mut c_void,
+            &mut s3 as *mut _ as *mut c_void,
+            &mut sc3 as *mut _ as *mut c_void,
+            &mut o3 as *mut _ as *mut c_void,
+            &mut ef3 as *mut _ as *mut c_void,
+        ];
+        let n_lanes = lanes.len() as u32;
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_fast_slots",
+            [n_heads as u32, n_tiles, n_lanes],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b.push_ptr(efp);
+                b.push_i32(qk_ratio);
+                b.push_ptr(q1);
+                b.push_ptr(k1);
+                b.push_ptr(v1);
+                b.push_ptr(g1);
+                b.push_ptr(b1);
+                b.push_ptr(s1);
+                b.push_ptr(sc1);
+                b.push_ptr(o1);
+                b.push_ptr(ef1);
+                b.push_ptr(q2);
+                b.push_ptr(k2);
+                b.push_ptr(v2);
+                b.push_ptr(g2);
+                b.push_ptr(b2);
+                b.push_ptr(s2);
+                b.push_ptr(sc2);
+                b.push_ptr(o2);
+                b.push_ptr(ef2);
+                b.push_ptr(q3);
+                b.push_ptr(k3);
+                b.push_ptr(v3);
+                b.push_ptr(g3);
+                b.push_ptr(b3);
+                b.push_ptr(s3);
+                b.push_ptr(sc3);
+                b.push_ptr(o3);
+                b.push_ptr(ef3);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

@@ -1129,6 +1129,30 @@ pub(crate) fn shared_down(
     {
         return Ok(());
     }
+    // Decode-width MQ4V2: one x-batch residual GEMV folds sigmoid(gate)*down
+    // into the residual. The incumbent is a temp GEMM plus
+    // `sigmoid_scaled_residual_add_batched_f32` (40 extra launches on a
+    // 4-slot retained tape). gfx1100 has no IU4 epilogue for n<=8; other
+    // arches keep the incumbent so their decode bytes stay unchanged.
+    if down.dtype == DType::MQ4G256V2
+        && gpu.arch_caps.is_gfx1100()
+        && hidden.dtype == DType::F32
+        && !p.recipe.bf16_round_trip()
+        && p.shared_down_out.is_none()
+        && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&p.batch_size)
+        && down.k.is_multiple_of(256)
+        && down.m == p.down_m
+    {
+        return hip(gpu.gemv_mq4g256v2_xbatch_residual_sigmoid(
+            down.buf,
+            &hidden,
+            target,
+            shared.scalar,
+            down.m,
+            down.k,
+            p.batch_size,
+        ));
+    }
     let out = f32_view(
         p.shared_down_out.unwrap_or(p.down_expanded),
         0,
@@ -1566,8 +1590,8 @@ fn shared_down_row_fold_gfx1201(
 /// experts were verified symmetric at load (the policy says so), the recipe
 /// keeps the BF16 boundaries the kernels implement, the activation is F32,
 /// and the device admits it (`HIPFIRE_QWEN4_MOE_SYM_IU4` through the arch's symmetric IU4
-/// descriptor: default on for gfx1151 and gfx1201, default OFF and explicit `=1` only on
-/// gfx1100; >= 512 rows, C2 producers). It replaces scatter,
+/// descriptor: default on for gfx1100, gfx1151 and gfx1201, `=0` off; >= 512 rows, C2
+/// producers). It replaces scatter,
 /// gate/up, unscatter/rotation and down; the combine reads its BF16 rows like
 /// the F16 WMMA arm's.
 fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {

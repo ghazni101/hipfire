@@ -906,11 +906,16 @@ Caveats that are part of the fixture, not trivia:
   teacher and seven primitive cases remain unchanged: a gfx1201 target is
   not a new teacher or cross-architecture greedy proof. Keep original KL
   limits (16K: 0.03948458079446915; 4K: 0.027284316982763658), not +0.010.
-  Symmetric IU4 remains requested ON by default on gfx1151/gfx1201; pending
-  qualification never justifies switching it OFF (`=0` is an isolated
+  Symmetric IU4 is requested ON by default on gfx1100, gfx1151 and gfx1201;
+  pending qualification never justifies switching it OFF (`=0` is an isolated
   control). Active execution still requires actual eligible headers,
   descriptor, row and resource admission; a request is not an active-route
-  receipt. The gfx1100 candidate remains default OFF. FP8 KV and FA2 are
+  receipt. The gfx1100 default (regular prefill and the S1 `aggregate-sym-iu4`
+  window read the same `Gpu::qwen4_moe_sym_iu4_requested`) was flipped on
+  with its numeric acceptance recorded in the CHANGELOG entry (S1 context-mean
+  KL within the limits above; WT2/code24 BF16-teacher KLD deltas +0.0293 /
+  +0.0296 vs gfx1201 +0.0306 / +0.0285, the code24 excess of 0.0011 waived by
+  Kaden 2026-10-29; pp8192/pp32768 A/B +1.2 / +1.4%). FP8 KV and FA2 are
   independent, stackable choices; A3B H16/KV2/D256 FA2 work is not an applied
   Flash-Next H24/KV2/D256 QSA FA2 port or a Flash-Next performance gain.
   **Widened byte/state/ID and performance qualification is pending.** Before
@@ -941,7 +946,10 @@ Caveats that are part of the fixture, not trivia:
   greedy requests with penalties run AR
   (`crates/hipfire-generate/src/ar.rs:1715–1734`).
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
-  (`crates/hipfire-generate/src/batch.rs:2767–2789`).** Each MTP
+  (`crates/hipfire-generate/src/batch.rs`, `qwen4_lane_request_supported`), but
+  batch sampled neutral-penalty requests under `serve.batch_sampled`: AR lanes
+  draw with the AR singleton sampler and request seed, MTP lanes verify sampled
+  windows with naive acceptance.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` (up to the `mtp_k` cap; `auto` for native Qwen4 MTP =
   `min(GPU row-exact verify rows, CPU-owned-expert window) − 1` resolved after
@@ -1052,8 +1060,10 @@ Caveats that are part of the fixture, not trivia:
   serves greedy and sampled requests, thinking on or off (Qwen4 and
   Qwen3.5/3.x). The Qwen4 proposal source is switched by
   `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
-  also `1`/`0`; default `auto`, which is **off on every GPU for now**; env
-  beats TOML beats default). **Off is beta's lane exactly.** On Qwen4 a pool
+  also `1`/`0`; default `auto`, which is **on for native Qwen4 MTP (arch 16)
+  on gfx1151 and gfx1201** and off on every other GPU; `off`/`0` is the kill
+  switch; env beats TOML beats default). **Off is the 5/3/3 pool lane
+  exactly.** On Qwen4 a pool
   hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
   from the full prompt every request, so earlier requests never influence
   candidates, and cleared after five low-acceptance windows) takes the window
@@ -1235,7 +1245,7 @@ Caveats that are part of the fixture, not trivia:
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
 | `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
-| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted one (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
+| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted ones (gfx1100, gfx1201) (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
 
 
 ---

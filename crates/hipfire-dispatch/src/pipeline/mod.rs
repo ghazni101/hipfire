@@ -26,13 +26,30 @@ pub use sealed_moe::{
     MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub mod q8_prefill;
 pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
 pub mod slab_route;
 pub mod slowlink_prefill;
+pub mod sp_layer;
+pub use moe_program::{
+    execute_gated_ffn, execute_grouped_moe, grouped_moe_iu4_shape_admits, grouped_moe_site_tiers,
+    CastPolicy, CombineOrder, FfnActivation, GatedFfnOp, GroupedMoeGroupedScratch,
+    GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted,
+    GroupedMoeRouter, GroupedMoeScratch, GroupedMoeScratchPlan, GroupedMoeShared,
+    GroupedMoeSharedScratch, GroupedMoeSiteTiers, RouterKind, SharedExpertPolicy,
+    GROUPED_MOE_IU4_MIN_ROWS,
+};
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub use q8_prefill::{
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_prefill_gemm, q8_0_prefill_gemm_prepared,
+    q8_0_prefill_prepare, q8_0_prefill_runs, q8_0_weight_admits, PrefillActTier, PreparedA8,
+    Q8PrefillRun, PREFILL_QUANT_MIN_ROWS,
+};
 pub(crate) mod draft_head;
+pub mod moe_capture;
 pub mod moe_dump;
+pub(crate) mod norm_fold;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub mod batched;
 #[cfg(feature = "deltanet")]
@@ -44,11 +61,14 @@ pub mod batched_moe;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
+pub mod latent_attention;
 pub(crate) mod layer_ops;
 pub mod mla;
+pub mod projection_split;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
+pub mod stream_mix;
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
     execute_gated_delta_net, execute_gated_delta_net_arena, execute_gated_delta_net_core_rows,
@@ -4894,6 +4914,30 @@ fn prefill_shared_down_stage(
             )
             .map_err(|e| DispatchError::Hip(e.to_string())),
         DType::MQ4G256V2 | DType::MQ6G256V2 | DType::Q8_0 | DType::F32 => {
+            // Decode-width MQ4V2: fold sigmoid(gate)*down into the residual
+            // GEMV. The incumbent writes a temp then launches
+            // `sigmoid_scaled_residual_add_batched_f32`. gfx1100 only: the
+            // retained slots tape this replaces launches there, and the fold
+            // is a different accumulation than the incumbent.
+            if down.dtype == DType::MQ4G256V2
+                && gpu.arch_caps.is_gfx1100()
+                && prepared.is_none()
+                && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&p.batch_size)
+                && down.k.is_multiple_of(256)
+                && down.m == dim
+            {
+                return gpu
+                    .gemv_mq4g256v2_xbatch_residual_sigmoid(
+                        down.buf,
+                        shared.rotated,
+                        p.x_batch,
+                        shared.scalar,
+                        down.m,
+                        down.k,
+                        p.batch_size,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()));
+            }
             // Fused epilogue (opt-in): the V3 IU4 ADD entry applies
             // `x_batch += sigmoid(scalar) * down` directly, so neither the temp
             // GEMM nor the separate gated add below runs. A declined or

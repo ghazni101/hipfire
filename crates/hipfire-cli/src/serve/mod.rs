@@ -86,6 +86,11 @@ pub(crate) struct ServeMeta {
     /// on the standard route, where the daemon sends none; cleared with
     /// `current_model` so a model switch never shows the previous engine.
     pub(crate) engine_stats: Option<hipfire_runtime::serve::EngineStats>,
+    /// GPU-memory spill detector for the resident model, baselined right
+    /// after its load ack; `None` while nothing is resident or when the
+    /// card's amdgpu counters are unreadable. Lives here so a finished
+    /// request can check it without the runtime lock a load holds.
+    pub(crate) spill: Option<crate::spill::SpillMonitor>,
 }
 
 impl ServeMeta {
@@ -105,6 +110,7 @@ impl ServeMeta {
             n_ctx: 0,
             loaded: LoadedInfo::default(),
             engine_stats: None,
+            spill: None,
         }
     }
 }
@@ -330,6 +336,11 @@ pub(crate) struct LoadedInfo {
     /// or before the first load ack. Published through `/health` without
     /// taking the runtime lock.
     pub(crate) swap: serde_json::Value,
+    /// The daemon's `load_summary` object from the load ack (`line`, `spec`,
+    /// `kv`, `context`, `placement`, `prefill`); `null` when the ack has none.
+    /// The daemon already prints the line to the stderr serve inherits, so
+    /// serve does not print it again.
+    pub(crate) load_summary: serde_json::Value,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -418,6 +429,10 @@ pub(crate) struct ServeRuntime {
     pub(crate) multi_slot_slots: u64,
     pub(crate) multi_slot_ctx: u64,
     pub(crate) multi_slot_prefill_chunk: u64,
+    /// Shared `PagePool` for the multi-slot engine; pages=0 auto-sizes.
+    pub(crate) multi_slot_paged: bool,
+    pub(crate) multi_slot_paged_pages: u64,
+    pub(crate) multi_slot_paged_backend: String,
     pub(crate) spawner: EngineSpawner,
     /// The `model` string the resident model was loaded under; reloaded after
     /// a daemon restart.
@@ -511,6 +526,9 @@ pub(crate) fn route_capabilities(
     multi_slot_slots: u64,
     multi_slot_ctx: u64,
     multi_slot_prefill_chunk: u64,
+    multi_slot_paged: bool,
+    multi_slot_paged_pages: u64,
+    multi_slot_paged_backend: &str,
     prefix_cache: bool,
     prefix_cache_max_bytes: u64,
     structured_jump_forward: bool,
@@ -535,6 +553,9 @@ pub(crate) fn route_capabilities(
         "multi_slot_slots": multi_slot_slots,
         "multi_slot_ctx": multi_slot_ctx,
         "multi_slot_prefill_chunk": multi_slot_prefill_chunk,
+        "multi_slot_paged": multi_slot_paged,
+        "multi_slot_paged_pages": multi_slot_paged_pages,
+        "multi_slot_paged_backend": multi_slot_paged_backend,
         "prefix_cache": prefix_cache,
         "prefix_cache_max_bytes": prefix_cache_max_bytes,
         "structured_output": structured_output,
@@ -561,15 +582,10 @@ pub(crate) fn route_capabilities(
         // spelled out separately.
         "refused_request_fields": if multi_slot {
             serde_json::json!([
-                "stop",
-                "logprobs",
-                "top_logprobs",
-                "n",
                 "best_of",
                 "logit_bias",
                 "echo",
                 "suffix",
-                "response_format:json_object",
                 "tools+image",
             ])
         } else {
@@ -1346,7 +1362,12 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     }
     if let Some(vision) = args.vision.as_ref() {
         if !vision.is_file() {
-            bail!("vision sidecar not found: {}", vision.display());
+            bail!(
+                "vision sidecar not found: {}\n  pass an existing --vision <path>, fetch the \
+                 model's vision tower with `hipfire pull <model>`, or disable vision: \
+                 HIPFIRE_VISION_MODE=off (hipfire config set vision.mode off)",
+                vision.display()
+            );
         }
     }
     let api_key = resolve_api_key(&args, &resolved)?;
@@ -1562,7 +1583,11 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                  stop that server or choose another port",
                 pid_path.display()
             ),
-            None => bail!("port {port} is in use by another process; choose another port"),
+            None => bail!(
+                "port {port} is in use by another process; choose another port: \
+                 `hipfire serve [model] {host} <port>` (default port: \
+                 `hipfire config set serve.port <port>`)"
+            ),
         }
     }
     let log = fs::OpenOptions::new()
@@ -1712,7 +1737,7 @@ pub(crate) fn serve_foreground(
     global: hipfire_config::ResolvedConfig,
     api_key: Option<BearerToken>,
 ) -> Result<()> {
-    let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = find_daemon(paths).ok_or_else(|| crate::daemon_not_found_error(paths))?;
     let registry = load_registry(&paths.registry).registry;
     // Swap budgets are deployment policy resolved by the daemon from the
     // process config. Apply the CLI overrides there rather than in the load
@@ -1773,6 +1798,59 @@ pub(crate) fn serve_foreground(
         .unwrap_or(config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192));
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Shared paged KV pool for the multi-slot engine. `--multi-slot-paged`,
+    // an explicit page count, the process config or the developer aliases
+    // select it; pages=0 auto-sizes from post-weight free VRAM. On the
+    // multi-slot route the prefix cache shares physical pages through the
+    // pool, so the engine selects it there as well — the flag on the wire
+    // must say so, because the daemon's KV diagnostic trusts it.
+    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    let env_paged_alias = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+        .ok()
+        .and_then(|v| match v.as_str() {
+            "1" | "on" | "true" => Some(true),
+            "0" | "off" | "false" => Some(false),
+            _ => None,
+        });
+    let env_pages_alias = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    let multi_slot_paged_pages = args
+        .multi_slot_paged_pages
+        .unwrap_or(config_u64(&global, "serve.multi_slot_paged_pages")?);
+    let mut multi_slot_paged = args.multi_slot_paged
+        || args.multi_slot_paged_pages.is_some()
+        || config_bool(&global, "serve.multi_slot_paged")?
+        || multi_slot_paged_pages > 0
+        || env_paged_alias == Some(true)
+        || env_pages_alias.is_some_and(|pages| pages > 0);
+    if prefix_cache && multi_slot_enabled {
+        // A prefix cache outside the multi-slot route belongs to that route,
+        // not to this pool, so never let it flip the flag on its own.
+        multi_slot_paged = true;
+    }
+    let multi_slot_paged_backend = config_string(&global, "serve.multi_slot_paged_backend")?;
+    // One resolver for the physical backend: `HIPFIRE_SLOTS_PAGED_BACKEND`
+    // wins, a padded/unknown spelling is an error, and `arena` is the default
+    // (`hipfire_config::select_paged_vmm_backend`, shared with the engine).
+    let paged_vmm = hipfire_config::select_paged_vmm_backend(
+        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+            .ok()
+            .as_deref(),
+        &multi_slot_paged_backend,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    if paged_vmm && !multi_slot_paged {
+        bail!("serve.multi_slot_paged_backend=vmm requires serve.multi_slot_paged=true");
+    }
+    if multi_slot_paged && !multi_slot_enabled {
+        bail!("--multi-slot-paged requires serve.multi_slot / HIPFIRE_SERVE_MULTI_SLOT=1");
+    }
+    // Downstream (capabilities, slot load params) advertises what the engine
+    // will actually run: the resolver's canonical `vmm`/`arena`, not the raw
+    // config spelling. Otherwise `/health` said `arena` while
+    // `HIPFIRE_SLOTS_PAGED_BACKEND=vmm` had selected the VMM pool.
+    let multi_slot_paged_backend = if paged_vmm { "vmm" } else { "arena" }.to_string();
     // Serving cache/scheduler contract keys (spec §9.1). The VMM batch route
     // consumes both (row budget and prefill quantum); other standard routes
     // read them for startup validation only.
@@ -1796,25 +1874,30 @@ pub(crate) fn serve_foreground(
     };
     // Cache/scheduler route flags (spec §9.1). Read with the SAME config
     // resolution the daemon applies so /health advertises the engine's
-    // actual build options.
-    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    // actual build options. `prefix_cache` is resolved above (it selects the
+    // shared paged pool on this route).
     let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
     let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
-    // Multi-slot scratch capacity is `prefill_chunk * n_slots` trunk rows. The
-    // built-in `serve.max_batch_tokens` default (4096) exceeds that for the
-    // documented slot counts (1..3 slots x 1024) and would refuse every such
-    // start. When the key is still the built-in default, clamp it to the
-    // scratch capacity rather than failing; a user-set value keeps the strict
-    // refuse (an explicit oversized budget is a real misconfiguration).
+    // Multi-slot uses one shared prefill scratch with a **total** row budget:
+    // a single slot may use the full `prefill_chunk`, and every slot's verify
+    // rows must fit. This mirrors `serve_engine::multi_slot_prefill_rows`; 64
+    // is the VMM reserve-slack upper bound per speculative slot. The built-in
+    // `serve.max_batch_tokens` default (4096) exceeds that for the documented
+    // slot counts (1..3 slots x 1024) and would refuse every such start. When
+    // the key is still the built-in default, clamp it rather than failing; a
+    // user-set value keeps the strict refuse (an explicit oversized budget is
+    // a real misconfiguration).
+    const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
     let max_batch_tokens = if multi_slot_enabled {
-        let scratch_rows = multi_slot_prefill_chunk.saturating_mul(multi_slot_slots);
+        let scratch_rows =
+            multi_slot_prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(multi_slot_slots));
         let is_builtin = global
             .get("serve.max_batch_tokens")
             .map(|v| matches!(v.source, ConfigSource::BuiltIn))
             .unwrap_or(true);
         if is_builtin && max_batch_tokens > scratch_rows {
             eprintln!(
-                "serve: built-in max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} ({multi_slot_slots} x {multi_slot_prefill_chunk}); clamping to {scratch_rows}"
+                "serve: built-in max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} (max(prefill_chunk {multi_slot_prefill_chunk}, 64 verify rows x {multi_slot_slots} slots)); clamping to {scratch_rows}"
             );
             scratch_rows
         } else {
@@ -1894,6 +1977,9 @@ pub(crate) fn serve_foreground(
         multi_slot_slots,
         multi_slot_ctx,
         multi_slot_prefill_chunk,
+        multi_slot_paged,
+        multi_slot_paged_pages,
+        &multi_slot_paged_backend,
         prefix_cache,
         prefix_cache_max_bytes,
         structured_jump_forward,
@@ -1936,6 +2022,9 @@ pub(crate) fn serve_foreground(
             multi_slot_slots,
             multi_slot_ctx,
             multi_slot_prefill_chunk,
+            multi_slot_paged,
+            multi_slot_paged_pages,
+            multi_slot_paged_backend,
             spawner,
             resident_model: None,
             request_policy,
@@ -2277,14 +2366,18 @@ impl ServeRuntime {
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
-        let path =
-            path.ok_or_else(|| ModelNotFound(format!("model not found locally: {model}")))?;
+        let path = path.ok_or_else(|| {
+            ModelNotFound(format!(
+                "model not found locally: {model}; run `hipfire pull {model}` on the server first"
+            ))
+        })?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if self.current_path.as_ref() != Some(&path) {
             if origin == ModelOrigin::Request && !self.request_may_load(&path, entry) {
                 return Err(ModelNotFound(format!(
                     "model not found: {model} (a request may name only installed models; \
-                     loading other files is off: serve.allow_request_paths)"
+                     loading other files is off: serve.allow_request_paths; enable with \
+                     `hipfire config set serve.allow_request_paths true`)"
                 ))
                 .into());
             }
@@ -2357,6 +2450,10 @@ impl ServeRuntime {
                 params["experimental_multi_slot_ctx"] = serde_json::json!(self.multi_slot_ctx);
                 params["experimental_multi_slot_prefill_chunk"] =
                     serde_json::json!(self.multi_slot_prefill_chunk);
+                params["multi_slot_paged"] = serde_json::json!(self.multi_slot_paged);
+                params["multi_slot_paged_pages"] = serde_json::json!(self.multi_slot_paged_pages);
+                params["multi_slot_paged_backend"] =
+                    serde_json::json!(self.multi_slot_paged_backend);
                 // Forward the resolved (possibly clamped-to-scratch) trunk-row
                 // budget so the daemon's slot engine does not re-read the
                 // unclamped OnceLock `serve.max_batch_tokens` default and
@@ -2463,6 +2560,10 @@ impl ServeRuntime {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
                 max_seq: loaded.get("max_seq").and_then(serde_json::Value::as_u64),
+                load_summary: loaded
+                    .get("load_summary")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 swap: loaded.get("swap").cloned().unwrap_or_else(|| {
                     configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled)
                 }),
@@ -2478,6 +2579,16 @@ impl ServeRuntime {
                 tag.unwrap_or_else(|| model.to_owned())
             };
             self.resident_model = Some(model.to_owned());
+            // Baseline the spill monitor now that the load (and any prewarm)
+            // is done, before taking the meta lock: it may ask the daemon
+            // which arch the card is.
+            let spill = crate::spill::attach_for_engine(
+                &self.engine,
+                self.spawner
+                    .process_config
+                    .legacy_value("HIPFIRE_DEVICES")
+                    .as_deref(),
+            );
             // The served facts land in `ServeMeta`, not `ServeRuntime`: this
             // method runs with the runtime lock held for the whole load, and
             // `/health` (100 ms readiness probes, the TUI's 450 ms poll,
@@ -2487,6 +2598,7 @@ impl ServeRuntime {
             meta.n_ctx = self.current_max_seq;
             meta.loaded = published;
             meta.engine_stats = None;
+            meta.spill = spill;
         }
         Ok(resolved)
     }
@@ -2553,6 +2665,7 @@ impl ServeRuntime {
         loaded.swap = configured_swap_json(&self.spawner.process_config, self.multi_slot_enabled);
         meta.loaded = loaded;
         meta.engine_stats = None;
+        meta.spill = None;
     }
 
     /// Replace a daemon that exited: reap it (freeing its GPU memory), then
@@ -2710,12 +2823,18 @@ pub(crate) fn validate_multi_slot_startup(
         return Err("serve.prefix_cache requires serve.prefix_cache_max_bytes > 0".to_owned());
     }
     if multi_slot_enabled {
-        let scratch_rows = prefill_chunk
-            .checked_mul(n_slots)
-            .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?;
+        // Same total-row budget as `serve_engine::multi_slot_prefill_rows`:
+        // one chunk for a single prefilling slot, or every slot's verify
+        // rows, whichever is larger. 64 is the per-slot verify upper bound.
+        const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
+        let scratch_rows = prefill_chunk.max(
+            MAX_VERIFY_ROWS_PER_SLOT
+                .checked_mul(n_slots)
+                .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?,
+        );
         if max_batch_tokens > scratch_rows {
             return Err(format!(
-                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = {n_slots} slots x {prefill_chunk} rows)"
+                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = max(prefill_chunk {prefill_chunk}, 64 verify rows x {n_slots} slots))"
             ));
         }
     }
@@ -4083,6 +4202,9 @@ mod tests {
             multi_slot_slots: 4,
             multi_slot_ctx: 8192,
             multi_slot_prefill_chunk: 1024,
+            multi_slot_paged: false,
+            multi_slot_paged_pages: 0,
+            multi_slot_paged_backend: "arena".into(),
             spawner: EngineSpawner {
                 daemon: daemon.clone(),
                 process_config,
@@ -4258,19 +4380,19 @@ mod tests {
         // Args: (multi_slot, continuous_batch_size, max_queue, max_batch_tokens, prefill_min_tokens)
         assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1, 1024, 4, false, 0).is_ok());
         assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1, 1024, 4, false, 0).is_ok());
-        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1, 1024, 4, false, 0).is_ok());
-        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        assert!(validate_multi_slot_startup(true, 1, 64, 1024, 1, 1024, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 2, 64, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
         let err =
-            validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4, false, 0).unwrap_err();
+            validate_multi_slot_startup(true, 16, 64, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
     #[test]
     fn multi_slot_startup_rejects_uncapped_queue() {
         // serve.max_queue=0 is uncapped historically; robust multi-slot rejects it.
-        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1, 1024, 4, false, 0).unwrap_err();
+        let err = validate_multi_slot_startup(true, 1, 0, 1024, 1, 1024, 4, false, 0).unwrap_err();
         assert!(err.contains("serve.max_queue"), "{err}");
         assert!(err.contains("non-zero"), "{err}");
         // Off multi-slot, an uncapped queue is still accepted (old behavior preserved).
@@ -4301,8 +4423,22 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_budget_above_scratch_rows() {
-        let err = validate_multi_slot_startup(true, 1, 64, 2049, 1, 1024, 2, false, 0).unwrap_err();
-        assert!(err.contains("scratch capacity (2048"), "{err}");
+        let err = validate_multi_slot_startup(true, 1, 64, 1025, 1, 1024, 2, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (1024"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_scratch_is_a_total_budget_not_slots_times_chunk() {
+        // 4 slots x 1024 rows would have allowed 4096; the shared PBS holds
+        // one full chunk (1024), not one per slot.
+        assert!(validate_multi_slot_startup(true, 1, 64, 1024, 1, 1024, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 1, 64, 1025, 1, 1024, 4, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (1024"), "{err}");
+
+        // A small chunk still admits every slot's verify rows (64 x 4).
+        assert!(validate_multi_slot_startup(true, 1, 64, 256, 1, 32, 4, false, 0).is_ok());
+        let err = validate_multi_slot_startup(true, 1, 64, 257, 1, 32, 4, false, 0).unwrap_err();
+        assert!(err.contains("scratch capacity (256"), "{err}");
     }
 
     #[test]
@@ -4562,6 +4698,9 @@ mod capabilities_tests {
             2,
             50000,
             1024,
+            /*multi_slot_paged*/ false,
+            0,
+            /*multi_slot_paged_backend*/ "arena",
             /*prefix_cache*/ true,
             536870912,
             /*jump_forward*/ true,
@@ -4598,18 +4737,19 @@ mod capabilities_tests {
         assert_eq!(caps["openai_compatible"], true);
         let refused = caps["refused_request_fields"].as_array().unwrap();
         assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
-        for field in [
-            "stop",
-            "logprobs",
-            "top_logprobs",
-            "n",
-            "best_of",
-            "logit_bias",
-            "echo",
-            "suffix",
-            "response_format:json_object",
-            "tools+image",
-        ] {
+        assert!(
+            !refused.iter().any(|v| v == "stop"),
+            "stop sequences are supported"
+        );
+        assert!(
+            !refused.iter().any(|v| v == "response_format:json_object"),
+            "json_object is enforced as a permissive object schema"
+        );
+        assert!(
+            !refused.iter().any(|v| v == "logprobs"),
+            "logprobs are supported (AR fallback)"
+        );
+        for field in ["best_of", "logit_bias", "echo", "suffix", "tools+image"] {
             assert!(
                 refused.iter().any(|v| v == field),
                 "refusal list must contain {field}"
@@ -4631,6 +4771,9 @@ mod capabilities_tests {
             4,
             8192,
             1024,
+            false,
+            0,
+            "arena",
             false,
             0,
             false,

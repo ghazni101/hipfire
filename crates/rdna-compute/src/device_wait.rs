@@ -64,10 +64,12 @@ pub enum DeviceWaitSite {
     RmsnormAwqWavegridArrivals = 6,
     RmsnormAwqWavegridReady = 7,
     HcControlRsqrtOnce = 8,
+    TpPeerPushGfx1201 = 9,
+    TpPeerPushNGfx1201 = 10,
 }
 
 impl DeviceWaitSite {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::TpSignalWait2Gfx1201,
         Self::TpSignalWait3Gfx1201,
         Self::TpSignalBarrierGfx1100,
@@ -76,6 +78,8 @@ impl DeviceWaitSite {
         Self::RmsnormAwqWavegridArrivals,
         Self::RmsnormAwqWavegridReady,
         Self::HcControlRsqrtOnce,
+        Self::TpPeerPushGfx1201,
+        Self::TpPeerPushNGfx1201,
     ];
 
     pub fn from_code(code: u32) -> Option<Self> {
@@ -93,6 +97,8 @@ impl DeviceWaitSite {
             Self::RmsnormAwqWavegridArrivals => "RMSNORM_AWQ_WAVEGRID_ARRIVALS",
             Self::RmsnormAwqWavegridReady => "RMSNORM_AWQ_WAVEGRID_READY",
             Self::HcControlRsqrtOnce => "HC_CONTROL_RSQRT_ONCE",
+            Self::TpPeerPushGfx1201 => "TP_PEER_PUSH_GFX1201",
+            Self::TpPeerPushNGfx1201 => "TP_PEER_PUSHN_GFX1201",
         }
     }
 
@@ -108,6 +114,8 @@ impl DeviceWaitSite {
                 "fused_rmsnorm_mq_rotate_awq_wavegrid"
             }
             Self::HcControlRsqrtOnce => "hc_compute_control_vec4_finalize (rsqrt_once)",
+            Self::TpPeerPushGfx1201 => "tp2_peer_push_reduce_gfx1201",
+            Self::TpPeerPushNGfx1201 => "tp_peer_pushn_reduce_bf16_gfx1201",
         }
     }
 
@@ -118,6 +126,9 @@ impl DeviceWaitSite {
             | Self::TpSignalWait3Gfx1201
             | Self::TpSignalBarrierGfx1100
             | Self::TpSignalReduceGfx1100 => "a peer TP rank's barrier signal",
+            Self::TpPeerPushGfx1201 | Self::TpPeerPushNGfx1201 => {
+                "a peer TP rank's tagged partial granules"
+            }
             Self::RmsnormWavegridReady
             | Self::RmsnormAwqWavegridReady
             | Self::RmsnormAwqWavegridArrivals => {
@@ -130,7 +141,10 @@ impl DeviceWaitSite {
     fn detail_label(self) -> &'static str {
         match self {
             Self::TpSignalWait2Gfx1201 | Self::TpSignalWait3Gfx1201 => "epoch",
-            Self::TpSignalBarrierGfx1100 | Self::TpSignalReduceGfx1100 => "generation",
+            Self::TpSignalBarrierGfx1100
+            | Self::TpSignalReduceGfx1100
+            | Self::TpPeerPushGfx1201
+            | Self::TpPeerPushNGfx1201 => "generation",
             Self::RmsnormAwqWavegridArrivals => "arrival",
             Self::RmsnormWavegridReady
             | Self::RmsnormAwqWavegridReady

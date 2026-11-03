@@ -79,6 +79,50 @@ impl Arch {
             &["s_barrier"]
         }
     }
+    /// Minimum number of initialised user + system (workgroup-id/info) SGPRs a wave32 compute kernel
+    /// must enable: LLVM `FeatureUserSGPRInit16Bug` ("Bug requiring at least 16 user+system SGPRs to
+    /// be enabled"), set for gfx1100 (`FeatureISAVersion11_0_0`), gfx1102 and generic gfx11, not for
+    /// gfx1101/gfx1103/gfx115x/gfx12. `SITargetLowering::allocateSystemSGPRs` satisfies it by padding
+    /// the user SGPRs (`addReservedUserSGPR`) until `user + system >= 16`; the private-segment wave
+    /// offset is not counted. Only gfx1100 is a builder target of those processors.
+    pub const fn min_user_system_sgprs(self) -> u8 {
+        match self {
+            Self::Gfx1100 => 16,
+            _ => 0,
+        }
+    }
+    /// The `.amdhsa_user_sgpr_count` to declare: `user` real user SGPRs (kernarg pointer, ...)
+    /// padded with dead user SGPRs, as LLVM does, so that `user + system >= 16` where `system` is
+    /// the number of enabled workgroup-id/info SGPRs. The system SGPRs follow the declared count,
+    /// so the padding moves them: `workgroup_ids(declared)` is where the hardware now puts them.
+    pub const fn declared_user_sgprs(self, user: u8, system: u8) -> u8 {
+        let pad = self.min_user_system_sgprs().saturating_sub(system);
+        if user > pad {
+            user
+        } else {
+            pad
+        }
+    }
+    /// The `FeatureUserSGPRInit16Bug` rule on a kernel descriptor: `COMPUTE_PGM_RSRC2.USER_SGPR_COUNT`
+    /// (bits 1..5) plus the enabled `ENABLE_SGPR_WORKGROUP_ID_X/Y/Z/INFO` (bits 7..10) must reach
+    /// [`Arch::min_user_system_sgprs`] (LLVM asserts `getNumPreloadedSGPRs() >= 16`; the private-segment
+    /// wave offset is not counted). Wave32 compute kernels only: every builder object is wave32.
+    pub fn check_user_system_sgprs(self, symbol: &str, rsrc2: u32) -> Result<(), String> {
+        let user = (rsrc2 >> 1) & 0x1f;
+        let system = (rsrc2 >> 7 & 1) + (rsrc2 >> 8 & 1) + (rsrc2 >> 9 & 1) + (rsrc2 >> 10 & 1);
+        let min = u32::from(self.min_user_system_sgprs());
+        if user + system < min {
+            return Err(format!(
+                "{symbol}: {} needs at least {min} user+system SGPRs (LLVM FeatureUserSGPRInit16Bug), \
+                 descriptor has {user} user + {system} system = {} (compute_pgm_rsrc2 {rsrc2:#x})",
+                self.name(),
+                user + system
+            ));
+        }
+        Ok(())
+    }
+    /// Workgroup ids at `user_sgpr_count` DECLARED user SGPRs (see [`Arch::declared_user_sgprs`]; use
+    /// `KernelSpec::workgroup_ids` for a kernel).
     pub fn workgroup_ids(self, user_sgpr_count: u8) -> Result<WgIds, String> {
         if self.gfx12() {
             Ok(WgIds {

@@ -14,12 +14,13 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::weights::{Qwen4EpPlacement, Qwen4Manifest, WeightError};
+use hipfire_dispatch::pipeline::{ExpertBindingCache, ExpertTable};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::{capture_file_identity, SourceIdentity};
 use hipfire_runtime::sealed_moe::{
-    plan_packed_expert_parallel, source_generation_fingerprint, ExpertExecutionPlan,
-    PackedExpertGroup,
+    adapt_expert_execution_plan, plan_packed_expert_parallel, source_generation_fingerprint,
+    ExpertExecutionPlan, PackedExpertGroup,
 };
 use hipfire_runtime::weight_store::WeightOrigin;
 use std::path::Path;
@@ -205,6 +206,15 @@ impl Qwen4EpSeal {
         }
         Ok(placement)
     }
+
+    /// Owner rank of every global expert, read from the sealed plans (every
+    /// group shares it: [`Self::placement`] proved the stride on each).
+    pub fn owner_ranks(&self) -> Vec<usize> {
+        let plan = &self.plans[0];
+        (0..plan.n_experts())
+            .map(|expert| plan.owner_rank(expert).expect("sealed owner"))
+            .collect()
+    }
 }
 
 /// A rank's binding to its load's seal (`Qwen4Bundle::bind_ep_seal`).
@@ -212,6 +222,65 @@ impl Qwen4EpSeal {
 pub struct Qwen4EpRankSeal {
     pub seal: Arc<Qwen4EpSeal>,
     pub rank: usize,
+}
+
+impl Qwen4EpRankSeal {
+    /// This rank's dispatch binding of routed group `group` (a trunk layer,
+    /// or the trunk layer count for the MTP head), adapted from the sealed
+    /// plan: real owner ranks and compact local slots under the owner-routed
+    /// EP contract. Refuses, before any table is published, a placement of
+    /// another rank or mesh, a plan of another mesh epoch, a cache sealed for
+    /// another device and a rank that owns no expert.
+    pub(crate) fn expert_binding(
+        &self,
+        group: usize,
+        placement: Qwen4EpPlacement,
+        device: i32,
+    ) -> Result<(ExpertTable, ExpertBindingCache), String> {
+        let sealed = Qwen4EpPlacement {
+            rank: self.rank,
+            ranks: self.seal.ranks(),
+        };
+        if placement != sealed {
+            return Err(format!(
+                "qwen4 EP binding: placement {placement:?} is not the sealed rank {sealed:?}"
+            ));
+        }
+        let plan = self
+            .seal
+            .plans
+            .iter()
+            .find(|plan| plan.layer() == Some(group))
+            .ok_or_else(|| format!("qwen4 EP binding: the seal has no expert group {group}"))?;
+        let (table, cache) = adapt_expert_execution_plan(plan, self.rank)?;
+        let contract = table
+            .execution_contract()
+            .ok_or("qwen4 EP binding: the adapted table carries no contract")?;
+        let epoch = self.seal.mesh().epoch().as_u64();
+        if contract.mesh_epoch() != epoch || !contract.is_owner_routed_ep() {
+            return Err(format!(
+                "qwen4 EP binding: group {group} contract (epoch {}, '{}') is not this seal's \
+                 owner-routed EP route (epoch {})",
+                contract.mesh_epoch(),
+                contract.execution(),
+                epoch
+            ));
+        }
+        if cache.physical_device() != device {
+            return Err(format!(
+                "qwen4 EP binding: rank {} is sealed to device {}, executing on {device}",
+                self.rank,
+                cache.physical_device()
+            ));
+        }
+        if cache.local_expert_ids().is_empty() {
+            return Err(format!(
+                "qwen4 EP binding: rank {} owns no expert of group {group}",
+                self.rank
+            ));
+        }
+        Ok((table, cache))
+    }
 }
 
 impl Qwen4Bundle {
@@ -324,6 +393,73 @@ mod tests {
         let a = Qwen4EpSeal::seal(&manifest, 48, 2, &[0, 1], &source, "g1").unwrap();
         let b = Qwen4EpSeal::seal(&manifest, 48, 2, &[0, 1], &source, "g1").unwrap();
         assert_ne!(a.origin(1), b.origin(1));
+    }
+
+    /// Every rank's dispatch binding carries the sealed owners and compact
+    /// slots (not a rank-0-of-1 stand-in) and is refused for another rank,
+    /// device or group; two seals of one shape bind different epochs.
+    #[test]
+    fn rank_binding_carries_sealed_owners_and_refuses_stale_bindings() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        let ranks = 3;
+        let devices = [4, 5, 6];
+        let seal =
+            Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+        let owners = seal.owner_ranks();
+        for rank in 0..ranks {
+            let placement = seal.placement(rank).unwrap();
+            assert_eq!(
+                owners.iter().filter(|&&owner| owner == rank).count(),
+                placement.local_count(owners.len())
+            );
+            let bound = Qwen4EpRankSeal {
+                seal: seal.clone(),
+                rank,
+            };
+            for group in [0, 47, 48] {
+                let (table, cache) = bound
+                    .expert_binding(group, placement, devices[rank])
+                    .unwrap();
+                assert_eq!((cache.local_rank(), cache.rank_count()), (rank, ranks));
+                for record in table.experts() {
+                    let expert = record.global_id();
+                    assert_eq!(record.owner_rank(), owners[expert]);
+                    assert_eq!(record.owner_rank(), expert % ranks);
+                    if record.owner_rank() == rank {
+                        assert_eq!(cache.local_slot(expert), Some(expert / ranks));
+                    }
+                }
+                let contract = table.execution_contract().unwrap();
+                assert!(contract.is_owner_routed_ep());
+                assert_eq!(contract.mesh_epoch(), seal.mesh().epoch().as_u64());
+            }
+        }
+        let bound = Qwen4EpRankSeal {
+            seal: seal.clone(),
+            rank: 1,
+        };
+        let placement = seal.placement(1).unwrap();
+        let wrong_rank = bound
+            .expert_binding(0, seal.placement(2).unwrap(), devices[1])
+            .unwrap_err();
+        assert!(wrong_rank.contains("not the sealed rank"), "{wrong_rank}");
+        let wrong_device = bound.expert_binding(0, placement, devices[0]).unwrap_err();
+        assert!(wrong_device.contains("sealed to device"), "{wrong_device}");
+        let no_group = bound.expert_binding(49, placement, devices[1]).unwrap_err();
+        assert!(no_group.contains("no expert group"), "{no_group}");
+        let other = Qwen4EpRankSeal {
+            seal: Arc::new(
+                Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap(),
+            ),
+            rank: 1,
+        };
+        let (a, _) = bound.expert_binding(0, placement, devices[1]).unwrap();
+        let (b, _) = other.expert_binding(0, placement, devices[1]).unwrap();
+        assert_ne!(
+            a.execution_contract().unwrap().contract_id(),
+            b.execution_contract().unwrap().contract_id()
+        );
     }
 
     /// The generation covers the trunk-overlay sidecar beside the model: one

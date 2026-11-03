@@ -966,6 +966,24 @@ impl ExpertExecutionContract {
                 )
             })
     }
+
+    /// Whether this contract authorizes the owner-routed EP route (the
+    /// Flash-Next exchange): EP parallelism and a nonempty schedule of EP
+    /// owner row gathers only. Every rank runs the whole MoE call against its
+    /// own view of the experts; the gather (or the tile exchange) copies
+    /// non-owned rows from their owner, so no reduction is involved.
+    pub fn is_owner_routed_ep(&self) -> bool {
+        self.parallelism == ContractParallelism::ExpertParallel
+            && !self.collective_rows.is_empty()
+            && self.collective_rows.iter().all(|row| {
+                matches!(
+                    row.hint,
+                    ContractCollectiveHint::OwnerRowGather {
+                        kind: ContractAxis::Ep
+                    }
+                )
+            })
+    }
 }
 
 /// Immutable, fully validated expert table. It owns CPU metadata only.
@@ -2265,15 +2283,7 @@ impl<'a> SealedMoeCall<'a> {
         }
         match &self.params {
             SealedParams::Decode(params) => match params.ep_mode {
-                MoeEpMode::None => {
-                    if self.experts.rank_count() != 1 || self.experts.local_rank() != 0 {
-                        return Err(invalid(format!(
-                            "sealed MoE execution requires Single rank (rank={}/{}); refusing before launch",
-                            self.experts.local_rank(),
-                            self.experts.rank_count()
-                        )));
-                    }
-                }
+                MoeEpMode::None => require_single_or_owner_routed(&self.experts)?,
                 MoeEpMode::RootRoutedPartial => {
                     if self.experts.rank_count() == 0
                         || self.experts.local_rank() >= self.experts.rank_count()
@@ -2305,6 +2315,15 @@ impl<'a> SealedMoeCall<'a> {
             SealedParams::Prefill(params) => {
                 if self.experts.rank_count() == 1 && self.experts.local_rank() == 0 {
                     // Single grouped prefill: unchanged.
+                } else if self
+                    .experts
+                    .execution_contract()
+                    .is_some_and(ExpertExecutionContract::is_owner_routed_ep)
+                {
+                    // Owner-routed EP chunk: the same grouped call on every
+                    // rank; non-owned rows come from the exchange (or from
+                    // the immutable peer view).
+                    require_single_or_owner_routed(&self.experts)?;
                 } else if self.experts.execution_contract().is_some() && params.routed_out.is_some()
                 {
                     // Compact EP prefill: the routed contribution targets the
@@ -2560,8 +2579,14 @@ pub(super) fn produce_prefill_route<'a>(
                     )
                 } else if Gpu::moe_router_fused_prefill_admitted(
                     // Explicit `1`/`0` wins on any wave32 arch; unset follows
-                    // `prefill_route_capabilities` qualification.
-                    moe_router_fused_prefill_on(&gpu.arch),
+                    // `prefill_route_capabilities` qualification. Decode-width
+                    // batches (1..=8) take the fused kernel on wave32 even
+                    // where gfx1201 qualification is unset: it is the same
+                    // `moe_topk_renorm_k8_batched` symbol in softmax-fuse
+                    // mode, byte-identical to softmax + topk, and it drops
+                    // the extra launch from the 4-slot PM4 tape.
+                    moe_router_fused_prefill_on(&gpu.arch)
+                        || (params.batch_size <= 8 && gpu.arch_caps.is_wave32()),
                     params.k_top,
                     params.n_exp,
                     gpu.arch_caps.is_wave32(),
@@ -2575,9 +2600,10 @@ pub(super) fn produce_prefill_route<'a>(
                     );
                     // Wave-per-row launch (unset on at exact gfx1201 by qualification), nested
                     // under the fused route's own flag and admission: top-8, 256 experts,
-                    // wave32, non-empty batch.
+                    // wave32, non-empty batch. Decode-width also takes it:
+                    // one wave32 per live slot is the right geometry.
                     if Gpu::moe_router_topk_multirow_admitted(
-                        moe_router_topk_multirow_on(&gpu.arch),
+                        moe_router_topk_multirow_on(&gpu.arch) || params.batch_size <= 8,
                         params.k_top,
                         params.n_exp,
                         params.batch_size,
@@ -3027,9 +3053,18 @@ fn prepare_decode<'a>(
         }
     }
     match params.ep_mode {
-        // Single (classic or deferred-combine experiment): exactly one rank,
-        // rank 0, no contract needed.
-        MoeEpMode::None => require_single_binding(experts)?,
+        // Single (classic or deferred-combine experiment), or an owner-routed
+        // EP rank whose row gather completes the non-owned rows.
+        MoeEpMode::None => {
+            require_single_or_owner_routed(experts)?;
+            // A rank's compact view names the zero dummy for every expert it
+            // does not own; only the row gather supplies those rows.
+            if experts.rank_count() > 1 && params.ep_row_gather.is_none() {
+                return Err(invalid(
+                    "owner-routed EP decode requires the EP row gather; refusing before launch",
+                ));
+            }
+        }
         // Root-routed EP: plan-bound compact owners under the root-routed
         // execution contract, decode-eligible on this GPU.
         MoeEpMode::RootRoutedPartial => {
@@ -3201,7 +3236,19 @@ fn prepare_prefill<'a>(
     router: MoeRouterInput,
 ) -> Result<(MoePrefillParams<'a>, MoeRouterInput), DispatchError> {
     require_context_device(ctx, experts)?;
-    require_single_binding(experts)?;
+    require_single_or_owner_routed(experts)?;
+    if let Some(tile) = params.ep_tile_exchange {
+        let (rank, _, n_experts) = tile.exchange.owners();
+        if rank != experts.local_rank() || n_experts != experts.n_experts() {
+            return Err(invalid(format!(
+                "EP tile exchange of rank {rank} over {n_experts} experts does not match the \
+                 binding (rank {}/{} over {} experts); refusing before launch",
+                experts.local_rank(),
+                experts.rank_count(),
+                experts.n_experts()
+            )));
+        }
+    }
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
             PrefillRouteMode::AdoptRoot { .. } => MoeRouterInput::PrecomputedSoftmaxTopK,
@@ -3349,12 +3396,42 @@ fn require_context_device(
     Ok(())
 }
 
-fn require_single_binding(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
-    if experts.rank_count() != 1 || experts.local_rank() != 0 {
+/// Admit a Single binding (rank 0 of 1) or an owner-routed EP rank: a binding
+/// adapted from a sealed plan whose contract is the owner-routed EP route,
+/// whose rank lies inside the plan's mesh and owns at least one expert.
+fn require_single_or_owner_routed(experts: &BoundMoeExperts<'_>) -> Result<(), DispatchError> {
+    if experts.rank_count() == 1 && experts.local_rank() == 0 {
+        return Ok(());
+    }
+    let Some(contract) = experts.execution_contract() else {
         return Err(invalid(format!(
-            "sealed MoE only admits Single rank (rank={}/{}); refusing before launch",
+            "sealed MoE rank {}/{} has no plan-bound execution contract; refusing before launch",
             experts.local_rank(),
             experts.rank_count()
+        )));
+    };
+    if !contract.is_owner_routed_ep() {
+        return Err(invalid(format!(
+            "sealed MoE rank {}/{} contract '{}' is not the owner-routed EP route; refusing before launch",
+            experts.local_rank(),
+            experts.rank_count(),
+            contract.execution()
+        )));
+    }
+    if experts.local_rank() >= experts.rank_count()
+        || contract.physical_devices().len() != experts.rank_count()
+    {
+        return Err(invalid(format!(
+            "owner-routed EP rank {}/{} is outside the sealed {}-rank mesh; refusing before launch",
+            experts.local_rank(),
+            experts.rank_count(),
+            contract.physical_devices().len()
+        )));
+    }
+    if experts.local_expert_ids().is_empty() {
+        return Err(invalid(format!(
+            "owner-routed EP rank {} owns no expert; refusing before launch",
+            experts.local_rank()
         )));
     }
     Ok(())
@@ -6978,6 +7055,58 @@ mod tests {
         .unwrap()
     }
 
+    /// An owner-routed rank (the Flash-Next EP route) runs the None-mode
+    /// sealed call; a rank without that contract, outside the sealed mesh or
+    /// owning no expert is refused before launch.
+    #[test]
+    fn owner_routed_ep_binding_admits_only_owning_ranks_of_its_contract() {
+        let dtype = DType::MQ4G256;
+        let admit = |n: usize, ranks: usize, rank: usize, devices: usize, hint| {
+            let table = ep_table(n, ranks, dtype);
+            let contract = ExpertExecutionContract::new(
+                "qwen4",
+                Some(0),
+                "fp",
+                7,
+                (0..devices as i32).collect(),
+                ContractParallelism::ExpertParallel,
+                ContractAssignment::Stride,
+                table.experts().iter().map(|r| r.owner_rank()).collect(),
+                table.experts().iter().map(|r| r.local_slot()).collect(),
+                "owner-routed",
+                vec![ContractCollectiveRow {
+                    name: "moe".into(),
+                    layer: 0,
+                    hint,
+                }],
+            )
+            .unwrap();
+            let table = table.with_execution_contract(contract).unwrap();
+            let mut cache = table.prepare_binding(rank, ranks, 0).unwrap();
+            let fixture = live_fixture(&table, 0x50_0000);
+            bind_fixture(&table, &mut cache, &fixture);
+            require_single_or_owner_routed(&BoundMoeExperts::from_cache(&table, &cache).unwrap())
+                .map_err(|error| format!("{error:?}"))
+        };
+        let gather = ContractCollectiveHint::OwnerRowGather {
+            kind: ContractAxis::Ep,
+        };
+        for rank in 0..4 {
+            admit(8, 4, rank, 4, gather).unwrap();
+        }
+        let reduce = ContractCollectiveHint::AllReduce {
+            kind: ContractAxis::Ep,
+        };
+        let error = admit(8, 2, 1, 2, reduce).unwrap_err();
+        assert!(error.contains("not the owner-routed EP route"), "{error}");
+        let error = admit(8, 2, 1, 3, gather).unwrap_err();
+        assert!(error.contains("outside the sealed"), "{error}");
+        // Three experts over four ranks: rank 3 owns nothing.
+        admit(3, 4, 2, 4, gather).unwrap();
+        let error = admit(3, 4, 3, 4, gather).unwrap_err();
+        assert!(error.contains("owns no expert"), "{error}");
+    }
+
     /// `RoutedExpertWeights` mirroring one rank's compact live binding: owned
     /// globals resolve to the fixture's local tensor identities, non-owned
     /// globals to the shared zero dummies — the same pointers the compact
@@ -8132,6 +8261,7 @@ mod tests {
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            norm_fold: false,
         })
     }
 
@@ -9225,7 +9355,7 @@ mod tests {
             unreachable!("lowering does not run stages")
         }
 
-        fn host_barrier(&self) -> Result<(), String> {
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
             unreachable!("lowering does not run stages")
         }
 

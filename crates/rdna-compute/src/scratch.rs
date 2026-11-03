@@ -358,6 +358,9 @@ pub struct ScratchState {
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.
     pub gemv_residual_tmp: Option<GpuTensor>,
+    /// GGUF-native route scratch (q8_1 activation row, prefill dequantisation
+    /// region); see [`crate::ggml_ops`].
+    pub ggml: crate::ggml_ops::GgmlScratch,
     /// Int8 activation scratch `(xq, dx)` of the opt-in exact-gfx1100
     /// small-batch verify GEMV (`gemv_q8x.rs`), allocated on first use.
     pub q8x_act: Option<(GpuTensor, GpuTensor)>,
@@ -410,6 +413,10 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Bumped by every writer of `q8_1_mmq_x_scratch` ([`Self::ensure_q8_1_mmq_x`], its x128 sibling,
+    /// [`Self::reserve_packed_mq4`]), so prepared Q8_1 activations (`gemm_q8_mmq_gfx11.rs`) can detect
+    /// that a later quantizer overwrote or reallocated them.
+    pub q8_1_mmq_x_generation: u64,
     /// Dedicated iu4-direct MMQ pre-pass X buffer (`block_i4_128`, 72 B per
     /// [K/128 block, batch]). Not shared with `q8_1_mmq_x_scratch` (144 B
     /// blocks): the iu4 consumer reads nibble headers the Q8_1 prelude
@@ -435,6 +442,13 @@ pub struct ScratchState {
     /// wrote (`HIPFIRE_IU4_SLAB` planes, read only by the `_b1s` GEMMs).
     /// Every other generation holds token-order `block_i4_128` records.
     pub int4_mmq_slab_generation: Option<u64>,
+    /// W8A8 Q8_0 sidecar: int8 [N, K] followed by F32 scales [K/32, N]
+    /// (`quantize_x_q8_blk32`), laid out by [`q8_a8_x_layout`].
+    pub q8_a8_x_scratch: Option<DeviceBuffer>,
+    pub q8_a8_x_scratch_bytes: usize,
+    /// Bumped by every [`Self::reserve_q8_a8_x`] (each producer launch rewrites the sidecar), so
+    /// prepared activations can detect that a later quantizer overwrote them.
+    pub q8_a8_x_generation: u64,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
@@ -1566,6 +1580,35 @@ pub(crate) fn vmm_prefix_growth(
         .checked_sub(mapped)
 }
 
+/// What [`crate::Gpu::qsa_gather_reserve`] does for a VMM gather workspace
+/// asking for `requested` bytes when `reserved` bytes of virtual extent are
+/// held (`None`: nothing reserved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QsaGatherReserve {
+    /// The held reservation already covers the request; nothing is touched.
+    Keep,
+    /// Nothing is held: reserve a fresh VA.
+    Reserve,
+    /// A smaller reservation is held. Its pages are never unmapped and
+    /// remapped in place (gfx1100: a remapped VA keeps translating to the old
+    /// backing): the old arena is released (VA retired, never reused) and a
+    /// fresh VA is reserved.
+    ReplaceRetiring,
+}
+
+/// See [`QsaGatherReserve`]. A reservation is never shrunk and never grown in
+/// place.
+pub(crate) fn qsa_gather_reserve_action(
+    reserved: Option<usize>,
+    requested: usize,
+) -> QsaGatherReserve {
+    match reserved {
+        Some(held) if held >= requested => QsaGatherReserve::Keep,
+        Some(_) => QsaGatherReserve::ReplaceRetiring,
+        None => QsaGatherReserve::Reserve,
+    }
+}
+
 /// Byte size of the `q8_1_mmq_x_scratch` slot for `(k, batch_size)`: one 144 B
 /// `block_q8_1_mmq` per [K/128 block, batch]. Shared by
 /// `ensure_q8_1_mmq_x` / `ensure_q8_1_mmq_x128` and their `Gpu` callers, which
@@ -1855,6 +1898,15 @@ pub fn qwen4_prefill_workspace_terms(
         term("gdn_dense_ef", gdn_ef)?,
         term("gdn_pair_counters", pair_counters)?,
     ])
+}
+
+/// Byte layout of the W8A8 Q8_0 activation sidecar for `(k, n)`:
+/// `(scales_offset, total_bytes)`. int8 `[n, k]` at 0, F32 scales
+/// `[k / 32, n]` at a 256-byte aligned offset.
+#[inline]
+pub(crate) fn q8_a8_x_layout(k: usize, n: usize) -> (usize, usize) {
+    let scales_off = (n * k).next_multiple_of(256);
+    (scales_off, scales_off + n * (k / 32) * 4)
 }
 
 #[inline]
@@ -2876,6 +2928,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -2963,6 +3016,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -3280,6 +3334,31 @@ impl ScratchState {
         (self.qwen4_moe_down_i4_generation, ptr)
     }
 
+    /// Grow the W8A8 Q8_0 activation sidecar to hold `(k, n)` and return
+    /// `(xq, xs)` device pointers (int8 `[n, k]` and F32 scales `[k/32, n]`).
+    /// Callers invalidate graphs before growth (see
+    /// `Gpu::ensure_q8_a8_x`); the producer overwrites every byte it reads.
+    pub(crate) fn reserve_q8_a8_x(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void)> {
+        let (scales_off, needed) = q8_a8_x_layout(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_a8_x_scratch,
+            &mut self.q8_a8_x_scratch_bytes,
+            needed,
+        )?;
+        self.q8_a8_x_generation = self.q8_a8_x_generation.wrapping_add(1);
+        let base = self.q8_a8_x_scratch.as_ref().unwrap().as_ptr();
+        Ok((
+            base,
+            (base as *mut u8).wrapping_add(scales_off) as *mut c_void,
+        ))
+    }
+
     /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_int8_mmq_x(
@@ -3384,6 +3463,94 @@ impl ScratchState {
         Ok(yp)
     }
 
+    /// Re-quantize f32 activations into the gfx1201 `block_fp8_128` (e4m3) sidecar. The sidecar
+    /// shares `int8_mmq_x_scratch` (same `[K/128, n] x 136 B` extent) and bumps the same
+    /// generation, so it overwrites any live int8 sidecar.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_fp8_mmq_x(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        crate::graph::bind_thread(hip, device_id)?;
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            &mut self.route_load,
+            self.pm_decode,
+            crate::moe_grouped_qt44_iu4::FP8_X_MODULE,
+            crate::moe_grouped_qt44_iu4::FP8_X_SRC,
+            "quantize_fp8_mmq_ds128",
+        )?;
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_x_scratch,
+            &mut self.int8_mmq_x_scratch_bytes,
+            needed,
+        )?;
+        self.int8_mmq_generation = self.int8_mmq_generation.wrapping_add(1);
+        let xp = x.buf.as_ptr();
+        let yp = self.int8_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let mut x_ptr = xp;
+        let mut y_ptr = yp;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = fold_rows_into_x(k.div_ceil(1024), n)?;
+        let timer = crate::profile::begin_timer(
+            hip,
+            "quantize",
+            "quantize_fp8_mmq_ds128",
+            n * k * 4 + needed,
+        );
+        launch_maybe_blob(
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "quantize_fp8_mmq_ds128",
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        if let Some(t) = timer {
+            t.finish(hip);
+        }
+        Ok(yp)
+    }
+
     /// Reserve the existing 144-byte DS4 slot without issuing a quantizer.
     /// Caller must invalidate graphs before growth and overwrite every block.
     pub(crate) fn reserve_packed_mq4(
@@ -3399,6 +3566,7 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        self.q8_1_mmq_x_generation = self.q8_1_mmq_x_generation.wrapping_add(1);
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
@@ -4294,6 +4462,150 @@ mod scratch_growth_tests {
         // Past the reservation, or without a granularity: refused.
         assert_eq!(vmm_prefix_growth(2 * G, 5 * G / 2, G, 5 * G / 2 + 1), None);
         assert_eq!(vmm_prefix_growth(0, 64 * G, 0, 1), None);
+    }
+
+    /// gfx1100 map-only discipline for the gather workspace: a held
+    /// reservation is kept when it covers the request, never shrunk, and a
+    /// larger request replaces it with a fresh VA (the old one is released and
+    /// retired by `VmmArena::release`), never grown or remapped in place.
+    #[test]
+    fn qsa_gather_reservation_is_never_shrunk_or_grown_in_place() {
+        use QsaGatherReserve::{Keep, ReplaceRetiring, Reserve};
+        assert_eq!(qsa_gather_reserve_action(None, 1), Reserve);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 100), Keep);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 1), Keep);
+        assert_eq!(qsa_gather_reserve_action(Some(100), 101), ReplaceRetiring);
+        // The two fixed decode reservations (F32 split-K 48 splits, q8 split-KV
+        // 32 splits) in either arrival order: at most one replacement, and the
+        // larger one then serves both.
+        let (small, large) = (32 * 1028 * 24 * 64, 48 * 1032 * 24 * 64);
+        let mut held = None;
+        let mut replacements = 0;
+        for request in [small, large, small, large, small] {
+            match qsa_gather_reserve_action(held, request) {
+                Keep => {}
+                Reserve => held = Some(request),
+                ReplaceRetiring => {
+                    replacements += 1;
+                    held = Some(request);
+                }
+            }
+        }
+        assert_eq!((held, replacements), (Some(large), 1));
+    }
+
+    /// Mapping the gather workspace (and, by the same rule, a QSA arena) only
+    /// advances the mapped frontier: every growth is a whole number of pages,
+    /// the prefix after it covers the request, and nothing ever asks for the
+    /// mapped prefix to shrink.
+    #[test]
+    fn vmm_prefix_growth_only_moves_the_frontier_forward() {
+        const G: usize = 2 << 20;
+        let reserved = 64 * G;
+        let mut mapped = 0usize;
+        for needed in [1, G, 5 * G + 3, 3 * G, 7, 64 * G, 64 * G - 1] {
+            let grow = vmm_prefix_growth(mapped, reserved, G, needed).unwrap();
+            assert_eq!(grow % G, 0, "growth must be whole pages");
+            let next = mapped + grow;
+            assert!(next >= mapped && next >= needed && next <= reserved);
+            if needed <= mapped {
+                assert_eq!(grow, 0, "a covered request maps nothing");
+            }
+            mapped = next;
+        }
+    }
+
+    /// Source audit (CPU) of the gfx1100 VMM growth path in `dispatch.rs`:
+    /// growth only calls the arena's forward map; the gather reserve's one
+    /// replacement path releases (retires) the old reservation before it
+    /// allocates a fresh VA; neither unmaps, remaps or frees on any other path.
+    /// hipMemUnmap is not called from this crate at all.
+    #[test]
+    fn gather_and_vmm_growth_paths_never_unmap_or_remap_a_live_va() {
+        fn code(source: &str, signature: &str, end: &str) -> String {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} not found"));
+            let rest = &source[start..];
+            let body = &rest[..rest.find(end).expect("end of function")];
+            body.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let src = include_str!("dispatch.rs");
+        let unmap = format!("{}{}", "mem_", "unmap");
+        let never = |body: &str, what: &str, extra: &[&str]| {
+            for token in [unmap.as_str(), "mem_release", "free_tensor", "release("]
+                .into_iter()
+                .chain(extra.iter().copied())
+            {
+                assert!(!body.contains(token), "{what} contains `{token}`");
+            }
+        };
+
+        let grow = code(src, "fn grow_vmm_tensor_impl(", "\n    }\n");
+        never(&grow, "grow_vmm_tensor_impl", &["alloc_vmm_tensor"]);
+        assert!(grow.contains(".map_next(") && grow.contains(".map_next_granules("));
+
+        let prefix = code(src, "fn map_qsa_gather_prefix(", "\n    }\n");
+        never(&prefix, "map_qsa_gather_prefix", &["alloc_vmm_tensor"]);
+        assert!(prefix.contains("grow_vmm_tensor("));
+
+        let scratch = code(src, "pub(crate) fn qsa_gather_scratch(", "\n    }\n");
+        never(&scratch, "qsa_gather_scratch", &["alloc_vmm_tensor"]);
+        assert!(scratch.contains("map_qsa_gather_prefix("));
+
+        let reserve = code(src, "pub(crate) fn qsa_gather_reserve(", "\n    }\n");
+        never(&reserve, "qsa_gather_reserve", &[]);
+        let replace = reserve
+            .find("QsaGatherReserve::ReplaceRetiring")
+            .expect("replacement branch");
+        let release = reserve
+            .find("release_qsa_gather_workspace()")
+            .expect("old reservation is released");
+        let alloc = reserve.find("alloc_vmm_tensor(").expect("fresh VA");
+        assert!(
+            replace < release && release < alloc,
+            "a replaced reservation must be released (VA retired) before the fresh one is reserved"
+        );
+        assert_eq!(reserve.matches("release_qsa_gather_workspace()").count(), 1);
+
+        // The release wrapper only frees the arena owner (VmmArena::release
+        // unmaps its own segments and retires the VA).
+        let wrapper = code(
+            src,
+            "pub(crate) fn release_qsa_gather_workspace(",
+            "\n    }\n",
+        );
+        assert!(wrapper.contains("free_tensor(workspace)"));
+        assert!(!wrapper.contains(unmap.as_str()));
+
+        // No hipMemUnmap in rdna-compute at all: the only unmapping is inside
+        // hip-bridge's VmmArena teardown.
+        fn scan(dir: &std::path::Path, needle: &str, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    scan(&path, needle, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    if text.contains(needle) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &format!(".{unmap}("),
+            &mut hits,
+        );
+        assert!(
+            hits.is_empty(),
+            "direct hipMemUnmap in rdna-compute: {hits:?}"
+        );
     }
 
     /// Geometry helpers shared by the ensure bodies and the `Gpu` guards:

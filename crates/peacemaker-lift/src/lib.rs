@@ -15,6 +15,7 @@
 //! lifter never spawns tools; the process drivers live in `peacemaker-front`.
 pub mod bundle;
 pub mod elf;
+pub mod hazards_gfx11;
 pub mod kd;
 pub mod layout;
 pub mod metadata;
@@ -33,7 +34,7 @@ use peacemaker_ir::inst::{
 use peacemaker_ir::operand::Operand;
 use peacemaker_ir::passes::{
     cfg::{build_blocks, CfgError},
-    windows::{check_windows, WindowError},
+    windows::{check_windows_with, WindowError},
 };
 use peacemaker_ir::provenance::{ObjectSha, Provenance, Source as Origin, TextSha};
 use peacemaker_ir::state::{LiftReport, Lifted, RoundTripProof, StreamProof};
@@ -350,7 +351,14 @@ fn lift_kernel(
             format!("symbol size {} is not a dword multiple", image.code.len()),
         ));
     }
-    let body = decode_body(&image.name, &image.code, image.entry_va, arch, object_sha)?;
+    let body = decode_body(
+        &image.name,
+        &image.code,
+        image.entry_va,
+        arch,
+        object_sha,
+        frontend,
+    )?;
     kd::validate(&image.descriptor, arch)
         .map_err(|e| kernel_error(image, slot.kd_va, Rule::Descriptor, e))?;
     metadata::check(&image.metadata.parsed, &image.name, &image.descriptor)
@@ -387,6 +395,7 @@ fn decode_body(
     entry_va: u64,
     arch: Arch,
     object_sha: [u8; 32],
+    frontend: Frontend,
 ) -> Result<Body, LiftError> {
     let words: Vec<u32> = code
         .chunks_exact(4)
@@ -445,7 +454,8 @@ fn decode_body(
         };
         rejected(name, va_at(index), rule, e)
     })?;
-    check_windows(&body).map_err(|e| {
+    // hipcc legally emits `s_delay_alu` hints whose consumer lies past a conditional branch; PM-authored code does not.
+    check_windows_with(&body, frontend == Frontend::Hipcc).map_err(|e| {
         let index = match e {
             WindowError::CrossesLeader { index, .. }
             | WindowError::ClauseLengthMissing { index }

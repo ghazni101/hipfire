@@ -38,6 +38,22 @@ pub fn install<R: Send>(cfg: SplicePoolConfig, f: impl FnOnce() -> R + Send) -> 
     splice_pool(cfg).install(f)
 }
 
+/// Run `f(i, chunk_i)` for every `chunk`-long piece of `data` in the current
+/// rayon pool (the splice pool when called inside [`install`]). The pieces are
+/// disjoint, so `f` may write its piece freely; this is how the arm's per-slot
+/// middle (SwiGLU + hidden rotation) joins the GEMV regions on the same
+/// workers instead of running serially on the calling worker.
+pub fn par_for_each_chunk_mut<T: Send>(
+    data: &mut [T],
+    chunk: usize,
+    f: impl Fn(usize, &mut [T]) + Sync + Send,
+) {
+    use rayon::prelude::*;
+    data.par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(i, c)| f(i, c));
+}
+
 fn build_pool(cfg: SplicePoolConfig) -> rayon::ThreadPool {
     let fallback_threads = || {
         let n = if cfg.threads > 0 {

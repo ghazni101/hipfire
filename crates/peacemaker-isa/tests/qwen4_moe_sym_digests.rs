@@ -160,7 +160,7 @@ const ENTRIES: &[(&str, &str)] = &[
     ),
     (
         "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
-        "3baebc60a656e7c5b7343887c6fde75813f080f4a9dfb1385e0bbc662b555901",
+        "904f6d5a54d1facb2a96e65095b7729eb764fc68eb8fa4a7a09e140f79c31c40",
     ),
     (
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -228,7 +228,7 @@ const R4: &[(&str, &str)] = &[
     ),
     (
         "r4_gate_up_nt8_c1_p1_g0",
-        "3baebc60a656e7c5b7343887c6fde75813f080f4a9dfb1385e0bbc662b555901",
+        "904f6d5a54d1facb2a96e65095b7729eb764fc68eb8fa4a7a09e140f79c31c40",
     ),
     (
         "r4_gate_up_nt8_c1_p1_g1",
@@ -378,7 +378,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     (
         "qwen4_moe_iu4_sym_pm_gfx1201",
-        "090eef8c1d73e25588f1cb5fc6e604eff3dbc57b6a0a94acbf92fb50ed3d493b",
+        "d234c9beb45dabf4a1f6b89a9ba2c289778f48e71efbc659e65e57bf6a9533a5",
     ),
     (
         "qwen4_moe_iu4_sym_w3_pm_gfx1151",

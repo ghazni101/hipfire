@@ -533,6 +533,7 @@ fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec
         raster: Raster::Banded,
         tile,
         arch,
+        tune: Default::default(),
     })?;
     Ok((
         e.s_text,

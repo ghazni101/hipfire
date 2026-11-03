@@ -117,6 +117,11 @@ fn m7_uncached(
     let instructions = peacemaker_lift::emit::insts(kernel, target)
         .map_err(|e| e.to_string())?
         .len();
+    // LLVM FeatureUserSGPRInit16Bug (gfx1100): the descriptor must enable >= 16 user+system SGPRs.
+    if let peacemaker_ir::inst::Abi::Hsa { descriptor, .. } = &kernel.abi {
+        arch.parse::<crate::arch::Arch>()?
+            .check_user_system_sgprs(symbol, descriptor.compute_pgm_rsrc2.0)?;
+    }
     let analysis = peacemaker_ir::edit::analyze(lifted.program.clone(), &kernel.symbol)
         .map_err(|e| e.to_string())?;
     let pairings = barriers::analyze(&kernel.body, target).map_err(|e| e.to_string())?;

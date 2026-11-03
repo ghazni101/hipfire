@@ -10,8 +10,9 @@
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    complete_request_cancellable, completion_json, gate_endpoint_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion, EndpointAdapterKind,
+    complete_request_cancellable, completion_json, completion_json_multi, completion_usage,
+    gate_endpoint_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks_usage,
+    request_choice_count, Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
 use crate::serve::{anthropic, responses};
@@ -248,6 +249,8 @@ impl ResponseEncoding {
                 created,
                 model: model.to_owned(),
                 include_usage,
+                index: 0,
+                usage_override: None,
             },
             Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
             Self::Responses(echo) => {
@@ -265,6 +268,10 @@ enum StreamEncoder {
         created: u64,
         model: String,
         include_usage: bool,
+        /// OpenAI choice index this encoder's frames carry.
+        index: usize,
+        /// Aggregate usage for the final choice of an `n > 1` stream.
+        usage_override: Option<serde_json::Value>,
     },
     Anthropic(anthropic::MessageStream),
     Responses(responses::ResponseStream),
@@ -276,13 +283,17 @@ impl StreamEncoder {
     fn preamble(&mut self) -> Vec<u8> {
         match self {
             Self::Chat {
-                id, created, model, ..
+                id,
+                created,
+                model,
+                index,
+                ..
             } => sse_data(&serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+                "choices": [{ "index": index, "delta": { "role": "assistant" }, "finish_reason": null }],
             })),
             Self::Anthropic(stream) => stream.preamble(),
             Self::Responses(stream) => stream.preamble(),
@@ -293,7 +304,11 @@ impl StreamEncoder {
     fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
         match self {
             Self::Chat {
-                id, created, model, ..
+                id,
+                created,
+                model,
+                index,
+                ..
             } => {
                 let delta = openai_stream_delta_for_event(event)?;
                 Some(sse_data(&serde_json::json!({
@@ -301,7 +316,7 @@ impl StreamEncoder {
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                    "choices": [{ "index": index, "delta": delta, "finish_reason": null }],
                 })))
             }
             Self::Anthropic(stream) => stream.event(event),
@@ -309,15 +324,43 @@ impl StreamEncoder {
         }
     }
 
-    /// The terminal frame: released tool calls, finish and usage.
-    fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
+    /// Set the OpenAI choice index this encoder emits. Only the chat wire has
+    /// more than one choice; the other adapters refuse `n > 1` at the route.
+    fn set_choice_index(&mut self, index: usize) {
+        if let Self::Chat { index: current, .. } = self {
+            *current = index;
+        }
+    }
+
+    fn set_usage_override(&mut self, usage: Option<serde_json::Value>) {
+        if let Self::Chat { usage_override, .. } = self {
+            *usage_override = usage;
+        }
+    }
+
+    /// The terminal frame: released tool calls, finish and usage. `done`
+    /// appends OpenAI's `[DONE]` sentinel; earlier choices in an `n > 1`
+    /// stream omit it so the same SSE body can carry every choice.
+    fn terminal(&mut self, completion: &Completion, done: bool) -> Vec<u8> {
         match self {
-            Self::Chat { include_usage, .. } => {
+            Self::Chat {
+                include_usage,
+                index,
+                usage_override,
+                ..
+            } => {
                 let mut bytes = Vec::new();
-                for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
+                for chunk in openai_stream_terminal_chunks_usage(
+                    completion,
+                    *include_usage && done,
+                    *index,
+                    usage_override.as_ref(),
+                ) {
                     bytes.extend_from_slice(&sse_data(&chunk));
                 }
-                bytes.extend_from_slice(b"data: [DONE]\n\n");
+                if done {
+                    bytes.extend_from_slice(b"data: [DONE]\n\n");
+                }
                 bytes
             }
             Self::Anthropic(stream) => stream.terminal(completion),
@@ -903,6 +946,11 @@ fn model_entry(
             }
             entry["architecture"] = architecture;
         }
+        // The daemon's one-line "what is on/off and why" for this load;
+        // absent when the ack predates it.
+        if loaded.load_summary.is_object() {
+            entry["load_summary"] = loaded.load_summary.clone();
+        }
     }
     entry
 }
@@ -1360,6 +1408,13 @@ async fn handle_generation(
         Ok(request) => request,
         Err(message) => return api.error_response(&message, 400),
     };
+    let choices = match request_choice_count(&body_val) {
+        Ok(n) => n,
+        Err(error) => return api.error_response(&error.to_string(), 400),
+    };
+    if choices > 1 && api != WireApi::ChatCompletions {
+        return api.error_response("n > 1 is only supported on /v1/chat/completions", 400);
+    }
 
     let (is_eligible, model_for_lease) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -2083,6 +2138,7 @@ async fn handle_streaming(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
+    let choices_total = request_choice_count(&body).unwrap_or(1) as usize;
     let mut encoder = encoding.stream(&id, created, &model);
     let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
@@ -2094,21 +2150,52 @@ async fn handle_streaming(
         created,
         encoder: RefCell::new(encoder),
         stall_timeout: shared.stream_stall_timeout,
+        choices_total,
+        usage_prompt: Cell::new(0),
+        usage_completion: Cell::new(0),
+        usage_details: RefCell::new(None),
     };
 
     let body_cancelled = Arc::clone(&cancelled);
     let worker_shared = Arc::clone(&shared);
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            complete_request_cancellable(
-                &worker_shared,
-                &body,
-                guard,
-                Some((sink.id.clone(), sink.created)),
-                &cancelled,
-                |event| sink.forward_event(event),
-                |completion| sink.deliver_terminal(completion),
-            )
+            let choices = choices_total;
+            let is_eligible = guard.is_eligible();
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let base_seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let mut first_guard = Some(guard);
+            for choice in 0..choices {
+                sink.begin_choice(choice)?;
+                let guard = match first_guard.take() {
+                    Some(guard) => guard,
+                    None => worker_shared
+                        .admission
+                        .acquire_for(is_eligible, model.as_deref())
+                        .map_err(|error| anyhow!("{}", error.message))?,
+                };
+                // The route's permit is consumed by the first choice; later
+                // choices wait for their own. Distinct seeds keep the choices
+                // independent while the response id stays the request's.
+                let mut choice_body = body.clone();
+                if choices > 1 {
+                    choice_body["n"] = serde_json::json!(1);
+                    choice_body["seed"] = serde_json::json!(base_seed + choice as u64);
+                }
+                complete_request_cancellable(
+                    &worker_shared,
+                    &choice_body,
+                    guard,
+                    Some((sink.id.clone(), sink.created)),
+                    &cancelled,
+                    |event| sink.forward_event(event),
+                    |completion| sink.deliver_terminal(completion, choice + 1 == choices),
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
         }));
         let result = outcome.unwrap_or_else(|payload| {
             Err(anyhow!(
@@ -2169,70 +2256,97 @@ async fn handle_nonstreaming(
     let shared_clone = Arc::clone(&shared);
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
-    let staged_tx_for_worker = Arc::clone(&staged_tx);
-    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
-            let terminal = |completion: &Completion| {
-                let bytes =
-                    serde_json::to_vec(&encoding.completion_body(completion)).map_err(|err| {
-                        hipfire_client::ClientError::Protocol(format!(
-                            "completion json serialize failed: {err}"
-                        ))
-                    })?;
-                if bytes.is_empty() {
-                    return Err(hipfire_client::ClientError::Protocol(
-                        "nonstream terminal body must be non-empty".into(),
-                    ));
+            let choices = request_choice_count(&body_for_worker)?;
+            let is_eligible = guard.is_eligible();
+            let model = body_for_worker
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let base_seed = body_for_worker
+                .get("seed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let mut first_guard = Some(guard);
+            let mut completions = Vec::with_capacity(choices as usize);
+            for choice in 0..choices {
+                // Choice 0 uses the route's permit. Later choices re-enter
+                // admission only after the previous permit drops, so the
+                // route never holds more than one slot for one logical
+                // request.
+                let guard = match first_guard.take() {
+                    Some(guard) => guard,
+                    None => shared_clone
+                        .admission
+                        .acquire_for(is_eligible, model.as_deref())
+                        .map_err(|error| anyhow!("{}", error.message))?,
+                };
+                // Mirror the streaming fan-out: with an explicit `seed` the
+                // daemon derives the sampler stream from it alone, so passing
+                // the request body unchanged made every non-streaming choice
+                // byte-identical.
+                let mut choice_body = body_for_worker.clone();
+                if choices > 1 {
+                    choice_body["n"] = serde_json::json!(1);
+                    choice_body["seed"] = serde_json::json!(base_seed + choice as u64);
                 }
-                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-                // Stage exactly one JSON frame and block for ack (RAII guard cancels while awaiting).
-                {
-                    let mut lock = staged_for_terminal
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if let Some(tx) = lock.take() {
-                        let _ = tx.send(Ok((bytes, ack_tx)));
-                    } else {
-                        return Err(hipfire_client::ClientError::Cancelled);
-                    }
-                }
-                match wait_flush_ack(&ack_rx, stall_timeout) {
-                    Ok(()) => Ok(()),
-                    Err(()) => Err(hipfire_client::ClientError::Cancelled),
-                }
-            };
-            complete_request_cancellable(
-                &shared_clone,
-                &body_for_worker,
-                guard,
-                None,
-                &cancelled,
-                |_event| Ok(()),
-                terminal,
-            )
+                let completion = complete_request_cancellable(
+                    &shared_clone,
+                    &choice_body,
+                    guard,
+                    None,
+                    &cancelled,
+                    |_event| Ok(()),
+                    |_completion| Ok(()),
+                )?;
+                completions.push(completion);
+            }
+            Ok::<_, anyhow::Error>(completions)
         }));
-        // If terminal was never staged, propagate preterminal error via staged channel.
         let mut lock = staged_tx_clone
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(tx) = lock.take() {
-            let failure = match outcome {
-                // Ok but terminal never called — report as error.
-                Ok(Ok(_completion)) => {
-                    RequestFailure::new("generation completed without a response body", 500)
+            match outcome {
+                Ok(Ok(completions)) => {
+                    let json = if completions.len() == 1 {
+                        encoding.completion_body(&completions[0])
+                    } else {
+                        completion_json_multi(&completions)
+                    };
+                    match serde_json::to_vec(&json) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            let (ack_tx, _ack_rx) = std::sync::mpsc::channel();
+                            let _ = tx.send(Ok((bytes, ack_tx)));
+                        }
+                        Ok(_) => {
+                            let _ = tx.send(Err(RequestFailure::new(
+                                "completion json serialized to an empty body",
+                                500,
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(RequestFailure::new(
+                                format!("completion json serialize failed: {error}"),
+                                500,
+                            )));
+                        }
+                    }
                 }
-                Ok(Err(error)) => RequestFailure::from_error(&error),
-                Err(payload) => RequestFailure::new(
-                    format!(
-                        "generation worker panicked: {}",
-                        panic_message(payload.as_ref())
-                    ),
-                    500,
-                ),
-            };
-            let _ = tx.send(Err(failure));
+                Ok(Err(error)) => {
+                    let _ = tx.send(Err(RequestFailure::from_error(&error)));
+                }
+                Err(payload) => {
+                    let _ = tx.send(Err(RequestFailure::new(
+                        format!(
+                            "generation worker panicked: {}",
+                            panic_message(payload.as_ref())
+                        ),
+                        500,
+                    )));
+                }
+            }
         }
     });
 
@@ -2378,6 +2492,13 @@ pub(crate) fn sse_event(name: &str, value: &serde_json::Value) -> Vec<u8> {
     bytes
 }
 
+/// The SSE comment frame announcing prefill progress (`: prefill 512/2048`).
+/// Conforming SSE parsers ignore it; `hipfire_client::read_openai_sse` turns
+/// it into `OpenAiSseEvent::PrefillProgress`.
+pub(crate) fn sse_prefill_comment(done: u64, total: u64) -> Vec<u8> {
+    format!(": prefill {done}/{total}\n\n").into_bytes()
+}
+
 /// The per-process part of a [`request_id`] (`chatcmpl-PID-N` → `PID-N`),
 /// from which the Anthropic `msg_…` and Responses `resp_…` ids derive.
 pub(crate) fn id_suffix(request_id: &str) -> &str {
@@ -2421,6 +2542,13 @@ struct SseSink {
     /// unflushed, before the request is aborted and its permit released.
     /// `None` (standard route) waits for as long as the connection lives.
     stall_timeout: Option<Duration>,
+    /// Number of choices this response carries (`n`). `1` keeps the
+    /// historical single-choice stream.
+    choices_total: usize,
+    /// Aggregate usage across choices, emitted once on the final choice.
+    usage_prompt: Cell<u64>,
+    usage_completion: Cell<u64>,
+    usage_details: RefCell<Option<serde_json::Value>>,
 }
 
 /// How often a stalled send re-checks the channel.
@@ -2487,20 +2615,100 @@ impl SseSink {
         }
     }
 
+    /// Switch the encoder to choice `index` and emit its role delta. Choice 0
+    /// already has its role chunk in the committed preamble.
+    fn begin_choice(&self, index: usize) -> Result<(), hipfire_client::ClientError> {
+        if index == 0 {
+            return Ok(());
+        }
+        let bytes = {
+            let mut encoder = self.encoder.borrow_mut();
+            encoder.set_choice_index(index);
+            encoder.preamble()
+        };
+        self.send(ResponseChunk::plain(bytes))
+    }
+
     /// Forward one logical generate event. Delta-bearing events serialize to
     /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
     /// terminal ack handles pure-tool delivery.
     fn forward_event(&self, event: &serde_json::Value) -> Result<(), hipfire_client::ClientError> {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("prefill_progress") {
+            return self.forward_progress(event);
+        }
         let Some(bytes) = self.encoder.borrow_mut().event(event) else {
             return Ok(());
         };
         self.send(ResponseChunk::plain(bytes))
     }
 
+    /// Forward daemon prefill progress as a `: prefill <done>/<total>` SSE
+    /// comment. Progress never commits the response: until the 200 is on the
+    /// wire (a pre-commit failure must still be a JSON error) it is dropped,
+    /// and nothing follows the terminal frame. Every frame it does send
+    /// restarts the keepalive timer like any other.
+    fn forward_progress(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), hipfire_client::ClientError> {
+        let (Some(done), Some(total)) = (
+            event.get("done").and_then(serde_json::Value::as_u64),
+            event.get("total").and_then(serde_json::Value::as_u64),
+        ) else {
+            return Ok(());
+        };
+        if self.terminal_sent.get() {
+            return Ok(());
+        }
+        if !self.committed.get() {
+            // The handler also commits on its own silence deadline, so the
+            // shared state, not only this worker's copy, says whether the
+            // 200 is out.
+            let state = self.commit.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*state, StreamCommit::Committed) {
+                return Ok(());
+            }
+            self.committed.set(true);
+        }
+        self.send(ResponseChunk::plain(sse_prefill_comment(done, total)))
+    }
+
     /// Serialize the terminal (released tool calls, finish, usage; chat adds
     /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
-    fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
-        let bytes = self.encoder.borrow_mut().terminal(completion);
+    fn deliver_terminal(
+        &self,
+        completion: &Completion,
+        last_choice: bool,
+    ) -> Result<(), hipfire_client::ClientError> {
+        if self.choices_total > 1 {
+            let usage = completion_usage(completion);
+            if self.usage_details.borrow().is_none() {
+                self.usage_prompt
+                    .set(usage["prompt_tokens"].as_u64().unwrap_or(0));
+                *self.usage_details.borrow_mut() = Some(usage["prompt_tokens_details"].clone());
+            }
+            self.usage_completion.set(
+                self.usage_completion
+                    .get()
+                    .saturating_add(usage["completion_tokens"].as_u64().unwrap_or(0)),
+            );
+            if last_choice {
+                let prompt = self.usage_prompt.get();
+                let completion_tokens = self.usage_completion.get();
+                self.encoder
+                    .borrow_mut()
+                    .set_usage_override(Some(serde_json::json!({
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt.saturating_add(completion_tokens),
+                        "prompt_tokens_details": self.usage_details.borrow().clone(),
+                    })));
+            }
+        }
+        let bytes = self.encoder.borrow_mut().terminal(completion, last_choice);
+        if !last_choice {
+            return self.send(ResponseChunk::plain(bytes));
+        }
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
@@ -2516,7 +2724,7 @@ impl SseSink {
     ///   event, then `[DONE]`).
     /// - Failure after the acknowledged terminal (e.g. the daemon commit):
     ///   nothing may follow it, so the body fails and the reader sees it torn.
-    fn finish(self, result: Result<Completion>, metrics: &Metrics) {
+    fn finish(self, result: Result<(), anyhow::Error>, metrics: &Metrics) {
         let Err(error) = result else {
             return;
         };
@@ -2747,6 +2955,172 @@ mod tests {
         assert!(next(&mut body).await.is_none());
     }
 
+    fn progress_event(done: u64, total: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "prefill_progress",
+            "id": "chatcmpl-1-1",
+            "attempt_id": 1,
+            "done": done,
+            "total": total,
+        })
+    }
+
+    fn token_event(text: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "token", "id": "chatcmpl-1-1", "attempt_id": 1, "text": text })
+    }
+
+    type TestSink = (
+        SseSink,
+        Arc<Mutex<StreamCommit>>,
+        tokio::sync::mpsc::Receiver<ResponseChunk>,
+    );
+
+    fn test_sink(encoding: ResponseEncoding) -> TestSink {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+        let sink = SseSink {
+            tx,
+            commit: Arc::clone(&commit),
+            committed: Cell::new(false),
+            terminal_sent: Cell::new(false),
+            id: "chatcmpl-1-1".to_owned(),
+            created: 0,
+            encoder: RefCell::new(encoding.stream("chatcmpl-1-1", 0, "m")),
+            stall_timeout: None,
+            choices_total: 1,
+            usage_prompt: Cell::new(0),
+            usage_completion: Cell::new(0),
+            usage_details: RefCell::new(None),
+        };
+        (sink, commit, rx)
+    }
+
+    /// Progress before the response commits is dropped: it sends nothing,
+    /// does not commit, and a failure right after it is still the worker's
+    /// ordinary pre-commit rejection (a JSON error, never a 200 stream).
+    #[test]
+    fn prefill_progress_before_commit_is_dropped_and_does_not_commit() {
+        let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&progress_event(512, 2048)).unwrap();
+        sink.forward_event(&progress_event(1024, 2048)).unwrap();
+        assert!(rx.try_recv().is_err(), "nothing may reach the wire");
+        assert!(!sink.committed.get());
+        assert!(matches!(*commit.lock().unwrap(), StreamCommit::Pending));
+        sink.finish(Err(anyhow!("model failed")), &Metrics::default());
+        assert!(
+            matches!(*commit.lock().unwrap(), StreamCommit::Rejected(_)),
+            "the failure must stay a pre-commit rejection"
+        );
+    }
+
+    /// After the first frame the comment goes out, exactly framed, in every
+    /// API's stream; the encoders never turn it into a delta or an event.
+    #[test]
+    fn prefill_progress_after_commit_is_a_comment_frame_in_every_api() {
+        let responses = responses::lower_request(&serde_json::json!({
+            "model": "m", "input": "hi", "stream": true
+        }))
+        .unwrap()
+        .echo;
+        for encoding in [
+            ResponseEncoding::Chat {
+                include_usage: false,
+            },
+            ResponseEncoding::Anthropic,
+            ResponseEncoding::Responses(responses),
+        ] {
+            let api = encoding.api();
+            let (sink, commit, mut rx) = test_sink(encoding);
+            assert!(
+                sink.encoder
+                    .borrow_mut()
+                    .event(&progress_event(1, 2))
+                    .is_none(),
+                "{api:?}: progress is not a delta"
+            );
+            sink.forward_event(&token_event("hi")).unwrap();
+            assert!(matches!(*commit.lock().unwrap(), StreamCommit::Committed));
+            let first = rx.try_recv().expect("token frame");
+            assert_ne!(first.bytes.first(), Some(&b':'), "{api:?}");
+            sink.forward_event(&progress_event(512, 2048)).unwrap();
+            let frame = rx.try_recv().expect("progress frame");
+            assert_eq!(frame.bytes, b": prefill 512/2048\n\n", "{api:?}");
+            assert!(!frame.last && frame.ack.is_none());
+            // Malformed progress is ignored, not framed.
+            sink.forward_event(&serde_json::json!({"type": "prefill_progress"}))
+                .unwrap();
+            assert!(rx.try_recv().is_err(), "{api:?}");
+        }
+    }
+
+    /// The handler also commits on its silence deadline while a long prefill
+    /// is still running; progress then flows even though no frame was sent.
+    #[test]
+    fn prefill_progress_flows_once_the_handler_has_committed() {
+        let (sink, commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&progress_event(512, 2048)).unwrap();
+        assert!(rx.try_recv().is_err());
+        commit_stream(&commit).unwrap();
+        sink.forward_event(&progress_event(1024, 2048)).unwrap();
+        assert_eq!(
+            rx.try_recv().expect("progress frame").bytes,
+            b": prefill 1024/2048\n\n"
+        );
+    }
+
+    /// Nothing follows the terminal frame, progress included.
+    #[test]
+    fn prefill_progress_never_follows_the_terminal_frame() {
+        let (sink, _commit, mut rx) = test_sink(ResponseEncoding::Chat {
+            include_usage: false,
+        });
+        sink.forward_event(&token_event("hi")).unwrap();
+        rx.try_recv().expect("token frame");
+        sink.terminal_sent.set(true);
+        sink.forward_event(&progress_event(2047, 2048)).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A progress frame is activity: the keepalive timer restarts from it.
+    #[tokio::test]
+    async fn prefill_progress_frame_restarts_the_keepalive_timer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = ChannelBody::new(
+            VecDeque::new(),
+            rx,
+            FlushAcks::new(),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(120),
+        );
+        let started = Instant::now();
+        tx.send(ResponseChunk::plain(sse_prefill_comment(512, 2048)))
+            .await
+            .unwrap();
+        let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame")
+            .expect("data frame")
+            .into_data()
+            .expect("data");
+        assert_eq!(frame, &b": prefill 512/2048\n\n"[..]);
+        let next = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("frame")
+            .expect("data frame")
+            .into_data()
+            .expect("data");
+        assert_eq!(next, SSE_KEEPALIVE);
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "keepalive fired {:?} after the progress frame",
+            started.elapsed()
+        );
+    }
+
     /// Every `/v1/embeddings` input-shape refusal is the caller's request, not
     /// a server fault: bare content arrays, list arity, marker/image count and
     /// a bad data URL all answer 400.
@@ -2948,6 +3322,36 @@ mod tests {
             ))),
             500
         );
+    }
+
+    #[test]
+    fn model_entry_publishes_the_load_summary_only_for_the_resident_model() {
+        let summary = serde_json::json!({
+            "line": "hipfire load summary: m (qwen3_5) | spec: off (no speculator armed)",
+            "spec": "off (no speculator armed)",
+            "kv": "fp8 (vmm, automatic)",
+            "context": "4096 (user-set; model 8192, card 8192)",
+            "placement": "fully resident",
+            "prefill": "per-prompt chunking",
+        });
+        let loaded = LoadedInfo {
+            n_embd: 2048,
+            load_summary: summary.clone(),
+            ..LoadedInfo::default()
+        };
+        let resident = model_entry("qwen3.5:2b", None, Some((&loaded, 4096)));
+        assert_eq!(resident["load_summary"], summary);
+        // A pre-summary daemon ack leaves the field absent, not null.
+        let old_ack = LoadedInfo {
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        assert!(model_entry("qwen3.5:2b", None, Some((&old_ack, 4096)))
+            .get("load_summary")
+            .is_none());
+        assert!(model_entry("qwen3.6:27b", None, None)
+            .get("load_summary")
+            .is_none());
     }
 
     #[test]

@@ -99,7 +99,8 @@ impl<'a> Qwen4Ops<'a> {
     }
 
     /// The device of a path that only exists on one card (n-gram takeover,
-    /// sampled verification): refused under a mesh.
+    /// derived K): refused under a mesh. Sampled Leviathan verification is not
+    /// one of them: it reads the output band's device through [`Self::gpu`].
     pub(crate) fn single(&mut self, what: &str) -> Result<&mut Gpu, String> {
         match self {
             Self::Single(gpu) => Ok(&mut **gpu),
@@ -506,6 +507,10 @@ pub fn window_to_spec_step(window: MtpWindow) -> Result<SpecStep, String> {
 pub struct Qwen4SpecScratch {
     block_size: usize,
     target_snapshot: Option<TargetTicket>,
+    /// The pre-window ticket of the last committed window (start, end)
+    /// kept for [`SpecTarget::repair_committed_prefix`]; the next snapshot,
+    /// reset or restore supersedes it.
+    retained: Option<(Qwen4StateSnapshot, usize, usize)>,
     #[cfg(feature = "reference-parity")]
     fault_after_snapshot: Option<usize>,
     #[cfg(feature = "reference-parity")]
@@ -517,7 +522,9 @@ pub struct Qwen4SpecScratch {
 }
 
 /// [`SpecTarget::spec_advance`] on one rank inside an EP fan-out (mesh
-/// detached, never aborting): the final row's argmax.
+/// detached, never aborting): the final row's argmax. This rank's prompt
+/// nesting spans the whole advance, so a borrowed EP reserve restores once, at
+/// its completion, on every rank (`spec_advance_from` nests inside).
 fn replica_spec_advance(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -525,10 +532,57 @@ fn replica_spec_advance(
     start_pos: usize,
     reset: bool,
 ) -> Result<u32, String> {
-    match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
-        SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-        SpecAdvance::Aborted => Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string()),
-    }
+    crate::ep::bracket_prompt(
+        (bundle, gpu),
+        |(bundle, _)| bundle.share_prompt_begin(),
+        |(bundle, gpu)| match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
+            SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
+            SpecAdvance::Aborted => {
+                Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string())
+            }
+        },
+        |(bundle, gpu), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// [`MtpDrafter::mtp_prefill`] on one rank inside an EP fan-out: the native-MTP
+/// fill is one whole-prompt entry on this rank, so the borrowed reserve is
+/// restored once, at its completion, after the last head continuation consumed
+/// the wide capture (`mtp_prefill_ops` nests inside).
+#[allow(clippy::too_many_arguments)]
+fn replica_mtp_prefill(
+    drafter: &mut Qwen4MtpDrafter,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+    fill_tokens: &[u32],
+    start_pos: usize,
+    cache_hit: bool,
+) -> Result<PrefillOutcome, String> {
+    crate::ep::bracket_prompt(
+        (drafter, (bundle, gpu)),
+        |(_, (bundle, _))| bundle.share_prompt_begin_mtp_fill(),
+        |(drafter, (bundle, gpu))| {
+            drafter.mtp_prefill(
+                &mut **gpu,
+                &mut **bundle,
+                prompt_tokens,
+                fill_tokens,
+                start_pos,
+                cache_hit,
+                &|| false,
+            )
+        },
+        |(_, (bundle, gpu)), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 impl SpecScratch for Qwen4SpecScratch {
@@ -548,6 +602,7 @@ impl SpecScratch for Qwen4SpecScratch {
 
     fn clear(&mut self) {
         self.target_snapshot = None;
+        self.retained = None;
     }
 }
 
@@ -1385,6 +1440,7 @@ impl Qwen4Bundle {
         Ok(Box::new(Qwen4SpecScratch {
             block_size,
             target_snapshot: None,
+            retained: None,
             #[cfg(feature = "reference-parity")]
             fault_after_snapshot: None,
             #[cfg(feature = "reference-parity")]
@@ -1792,18 +1848,22 @@ impl SpecTarget for Qwen4Bundle {
         let committed_end = position
             .checked_add(accept_len + 1)
             .ok_or_else(|| "Qwen4 commit position overflow".to_string())?;
-        let snapshot = scratch
+        let scratch = scratch
             .as_any_mut()
             .downcast_mut::<Qwen4SpecScratch>()
-            .ok_or("Qwen4 commit_prefix: scratch is not Qwen4SpecScratch")?
+            .ok_or("Qwen4 commit_prefix: scratch is not Qwen4SpecScratch")?;
+        scratch.retained = None;
+        let snapshot = scratch
             .target_snapshot
             .take()
             .ok_or("Qwen4 commit_prefix: target snapshot is not active")?
             .local()?;
         if accept_len == draft_len {
-            return self
-                .commit(gpu, snapshot)
-                .map_err(|error| error.to_string());
+            self.validate_commit(snapshot)
+                .map_err(|error| error.to_string())?;
+            self.retain_target_validated(snapshot);
+            scratch.retained = Some((snapshot, position, committed_end));
+            return Ok(());
         }
         // A verify that left per-row rollback points (row capture armed for
         // this block) drops the rejected suffix in place, as native MTP
@@ -1817,8 +1877,10 @@ impl SpecTarget for Qwen4Bundle {
                     Err(restore) => format!("{error}; target restore failed: {restore}"),
                 });
             }
-            self.commit(gpu, snapshot)
+            self.validate_commit(snapshot)
                 .map_err(|error| error.to_string())?;
+            self.retain_target_validated(snapshot);
+            scratch.retained = Some((snapshot, position, committed_end));
         } else {
             self.restore(gpu, snapshot)
                 .map_err(|error| error.to_string())?;
@@ -1829,6 +1891,7 @@ impl SpecTarget for Qwen4Bundle {
             self.spec_forward_rows(gpu, &block[..accept_len + 1], capture)
                 .map(|_| ())
                 .map_err(|error| error.to_string())?;
+            // No window retained: the restore consumed the ticket.
         }
         if self.state.position != committed_end {
             return Err(format!(
@@ -1837,6 +1900,56 @@ impl SpecTarget for Qwen4Bundle {
             ));
         }
         Ok(())
+    }
+
+    fn repair_committed_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut dyn SpecScratch,
+        position: usize,
+        replay: &[u32],
+    ) -> Result<bool, String> {
+        let Some((ticket, start, end)) = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 repair_committed_prefix: scratch is not Qwen4SpecScratch")?
+            .retained
+            .take()
+        else {
+            return Ok(false);
+        };
+        let live = self.validate_commit(ticket).is_ok();
+        if !live
+            || start != position
+            || replay.is_empty()
+            || start + replay.len() > end
+            || self.state.position != end
+        {
+            if live {
+                self.commit_validated(ticket);
+            }
+            return Ok(false);
+        }
+        let replayed = self
+            .restore_retain(gpu, ticket)
+            .map_err(|error| format!("Qwen4 terminal repair restore: {error}"))
+            .and_then(|()| {
+                // The drafter keeps the window's feature rows: no capture.
+                self.spec_forward_rows(gpu, replay, self.dflash.is_none())
+                    .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))
+            });
+        if self.validate_commit(ticket).is_ok() {
+            self.commit_validated(ticket);
+        }
+        replayed?;
+        if self.state.position != start + replay.len() {
+            return Err(format!(
+                "Qwen4 terminal repair ended at {}, expected {}",
+                self.state.position,
+                start + replay.len()
+            ));
+        }
+        Ok(true)
     }
 
     fn eos_token(&self) -> u32 {
@@ -5262,6 +5375,23 @@ impl Qwen4MtpDrafter {
     pub fn with_sampled_allowed(mut self, allowed: bool) -> Self {
         self.sampled_enabled &= allowed;
         self
+    }
+
+    /// `HIPFIRE_MTP_SAMPLED_MODE=naive` resolved at construction. Under
+    /// `topology.pp` that mode is refused (its draws come from the
+    /// process-wide AR sampler), so the router keeps such sampled requests on
+    /// the PP AR producer.
+    pub fn sampled_mode_is_naive(&self) -> bool {
+        matches!(self.sampled_mode, Ok(SampledMode::Naive))
+    }
+
+    /// The configured request carries a non-neutral repeat / presence /
+    /// frequency penalty (the router's definition: the window is not
+    /// consulted).
+    pub fn request_has_nonneutral_penalties(&self) -> bool {
+        self.request.repeat_penalty != 1.0
+            || self.request.presence_penalty != 0.0
+            || self.request.frequency_penalty != 0.0
     }
 
     /// A sampled request needs sampled verification enabled (and a valid
@@ -8919,19 +9049,44 @@ impl Qwen4MtpDrafter {
     }
 
     /// What a PP mesh does not serve, refused before any state changes:
-    /// sampled verification (its acceptance reads one card's logit rows and
-    /// the process-wide sampler) and the n-gram takeover (one-card route).
+    /// naive sampled verification (its draws come from the process-wide
+    /// sampler, not the request-seeded stream), a penalized sampled request
+    /// (the GPU penalty prepass refuses the mesh) and the n-gram takeover
+    /// (one-card route). Greedy requests and unpenalized Leviathan sampled
+    /// requests run: every device read of the verify (draft `q`, target rows,
+    /// bonus) goes through [`Qwen4Ops::gpu`], the output band's device.
     fn refuse_unsupported_under_pp(&self) -> Result<(), String> {
-        if self.sampled.is_some()
-            || !self.request.temp.is_finite()
-            || self.request.temp.abs() > 1.0e-6
-        {
+        if !self.request.temp.is_finite() {
             return Err(
-                "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only; \
-                 sampled MTP (speculation.mtp_sampled with temperature > 0) is unsupported \
-                 under the pipeline mesh"
+                "Qwen4 native MTP under qwen4 topology.pp needs a finite request temperature"
                     .to_string(),
             );
+        }
+        match self.sampled.as_ref() {
+            Some(sampled) if !sampled.draws_drafts() => {
+                return Err("Qwen4 native MTP under qwen4 topology.pp does not support \
+                     HIPFIRE_MTP_SAMPLED_MODE=naive (its draws come from the process-wide AR \
+                     sampler); use the default leviathan mode"
+                    .to_string());
+            }
+            Some(_) if self.request.penalties_active() => {
+                return Err(
+                    "Qwen4 native MTP under qwen4 topology.pp does not support sampled requests \
+                     with repeat/presence/frequency penalties (the GPU penalty prepass refuses \
+                     the pipeline mesh); such requests decode AR"
+                        .to_string(),
+                );
+            }
+            Some(_) => {}
+            None if self.request.temp.abs() > 1.0e-6 => {
+                return Err(
+                    "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only \
+                     while sampled verification is off (speculation.mtp_sampled / \
+                     HIPFIRE_MTP_SAMPLED=0)"
+                        .to_string(),
+                );
+            }
+            None => {}
         }
         if self.ngram_active {
             return Err(
@@ -8956,12 +9111,22 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        // The whole prompt is one decode-share prompt: the donor tail is
-        // restored once, after its last tile (`share_finish_prompt`). A mesh
-        // never takes decode-share.
+        // The whole prompt is one decode-share / EP-reserve prompt: the donor
+        // tail is restored once, after its last tile (`share_finish_prompt`).
+        // `!ops.is_mesh()` names the single-context route; it does not exclude
+        // per-rank EP execution (each EP rank runs this body on a `Single` context
+        // inside the fan-out). A PP mesh never takes decode-share or the EP
+        // reserve, and fails closed if one is somehow loaded.
         let single = !ops.is_mesh();
+        if !single && Self::bundle(target)?.ep_reserve_active() {
+            return Err(
+                "Qwen4 native-MTP prefill over a PP mesh cannot run on an EP \
+                        reserve-sharing load"
+                    .to_string(),
+            );
+        }
         if single {
-            Self::bundle(target)?.share_prompt_begin();
+            Self::bundle(target)?.share_prompt_begin_mtp_fill();
         }
         let result =
             self.mtp_prefill_tiles(ops, target, prompt_tokens, start_pos, cache_hit, abort);
@@ -9101,10 +9266,20 @@ impl Qwen4MtpDrafter {
         // session cut is published once its tile is appended, and the head and
         // `pending` are part of the transaction. The selector declining
         // (before any mutation) leaves the incumbent loop below untouched.
-        if !ops.is_mesh()
-            && start_pos < prompt_tokens.len()
-            && Self::bundle(target)?.slowlink_capture_eligible().is_ok()
-        {
+        let capture_eligible = if !ops.is_mesh() && start_pos < prompt_tokens.len() {
+            let eligible = Self::bundle(target)?.slowlink_capture_eligible();
+            if let Err(why) = eligible {
+                tracing::debug!(
+                    bypass_reason = why,
+                    prompt_rows = prompt_tokens.len() - start_pos,
+                    "qwen4 MTP prompt fill: slow-link capture bypassed",
+                );
+            }
+            eligible.is_ok()
+        } else {
+            false
+        };
+        if capture_eligible {
             let aborted = std::cell::Cell::new(false);
             let mut sink = |gpu: &mut Gpu,
                             bundle: &mut Qwen4Bundle,
@@ -9154,6 +9329,12 @@ impl Qwen4MtpDrafter {
                         .slowlink_publish_cut_mtp(gpu, pending)
                         .map_err(|error| error.to_string())?;
                 }
+                // `prefill_progress` (silent outside the request's prompt
+                // phase and past the last tile).
+                hipfire_runtime::prefill_progress::report(
+                    end - start_pos,
+                    prompt_tokens.len() - start_pos,
+                );
                 Ok(())
             };
             let outcome = Self::bundle(target)?.slowlink_try_capture(
@@ -9261,6 +9442,10 @@ impl Qwen4MtpDrafter {
                 first_token = pick;
             }
             pos = end;
+            hipfire_runtime::prefill_progress::report(
+                pos - start_pos,
+                prompt_tokens.len() - start_pos,
+            );
         }
         let pick = first_token.expect("non-empty MTP prefill produced no seed");
         // The seed is the first emitted token: sampled, it is drawn from the
@@ -9702,31 +9887,31 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 target.reset_recurrent(gpu)?;
                 return Ok(PrefillOutcome::Aborted);
             }
-            let never = || false;
+            // Inside the fan-out every rank runs never-abort (`replica_mtp_prefill`).
             return Self::bundle(target)?.ep_drafter_fanout(
                 "mtp_prefill",
                 gpu,
                 self,
                 |drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
                 &|drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
             );
@@ -10471,7 +10656,7 @@ pub fn native_mtp_device_bytes(
         batched_fill,
     )?;
     let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype, false)?;
     u64::try_from(resident)
         .ok()?
         .checked_add(u64::try_from(scratch).ok()?.max(request))
@@ -10698,7 +10883,7 @@ mod tests {
                 fill,
             )?;
             let (mut sizes, scratch) =
-                crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head)?;
+                crate::mtp_gpu::Qwen4MtpGpu::allocation_sizes(&config, context, head, false)?;
             sizes.extend(
                 if scratch.iter().sum::<u64>() > request.iter().sum::<u64>() {
                     scratch
@@ -10779,26 +10964,56 @@ mod tests {
     }
 
     #[test]
-    fn pp_serves_greedy_native_requests_without_the_ngram_pool_only() {
+    fn pp_serves_greedy_and_unpenalized_leviathan_requests_without_the_ngram_pool() {
+        let sampled = SpecRequestConfig {
+            temp: 0.8,
+            top_p: 0.9,
+            rng_seed: 7,
+            ..SpecRequestConfig::default()
+        };
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
-        assert!(drafter.refuse_unsupported_under_pp().is_ok());
-        // A sampled request needs one card's logit rows and the process-wide
-        // sampler: refused before any state changes.
         drafter.sampled_enabled = true;
-        drafter.request.temp = 0.8;
-        let sampled = drafter.refuse_unsupported_under_pp().unwrap_err();
-        assert!(sampled.contains("greedy"), "{sampled}");
-        // Never silently greedy: a nonzero temperature is refused with the
-        // sampling feature off too (the typed entry bypasses the AR gate).
+        drafter.sampled_mode = Ok(SampledMode::Leviathan);
+        assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // A sampled Leviathan request with neutral penalties runs on the mesh:
+        // every read of its verify goes through the output band's device.
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        assert!(drafter.sampled.is_some());
+        assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // Penalties need the GPU prepass, which refuses the mesh.
+        MtpDrafter::configure_request(
+            &mut drafter,
+            SpecRequestConfig {
+                repeat_penalty: 1.1,
+                repeat_window: 64,
+                ..sampled
+            },
+        );
+        let penalized = drafter.refuse_unsupported_under_pp().unwrap_err();
+        assert!(penalized.contains("penalties"), "{penalized}");
+        // Naive draws come from the process-wide sampler.
+        drafter.sampled_mode = Ok(SampledMode::Naive);
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        let naive = drafter.refuse_unsupported_under_pp().unwrap_err();
+        assert!(naive.contains("naive"), "{naive}");
+        // Never silently greedy: a nonzero temperature with sampled
+        // verification off is refused (the typed entry bypasses the AR gate).
+        drafter.sampled_mode = Ok(SampledMode::Leviathan);
         drafter.sampled_enabled = false;
+        MtpDrafter::configure_request(&mut drafter, sampled);
+        assert!(drafter.sampled.is_none());
         let disabled = drafter.refuse_unsupported_under_pp().unwrap_err();
         assert!(disabled.contains("greedy"), "{disabled}");
         // An ordinary greedy request is accepted with the flag on or off.
-        drafter.request.temp = 0.0;
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         assert!(drafter.refuse_unsupported_under_pp().is_ok());
         drafter.sampled_enabled = true;
         assert!(drafter.refuse_unsupported_under_pp().is_ok());
+        // A non-finite temperature is never admitted.
+        drafter.request.temp = f32::NAN;
+        assert!(drafter.refuse_unsupported_under_pp().is_err());
         // An armed n-gram pool is a one-card route.
+        drafter.request.temp = 0.0;
         drafter.ngram_active = true;
         let pool = drafter.refuse_unsupported_under_pp().unwrap_err();
         assert!(pool.contains("n-gram"), "{pool}");
