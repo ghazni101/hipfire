@@ -4196,6 +4196,52 @@ fn validate_embedding_info(
     Ok(())
 }
 
+#[cfg(test)]
+mod qt59_embedding_validation {
+    use super::*;
+
+    fn info(
+        quant_type: u8,
+        group_size: u32,
+        vocab: usize,
+        dim: usize,
+        data_size: usize,
+    ) -> HfqTensorInfo {
+        HfqTensorInfo {
+            name: "embed_tokens.weight".into(),
+            quant_type,
+            shape: vec![vocab as u32, dim as u32],
+            group_size,
+            data_offset: 0,
+            data_size,
+        }
+    }
+
+    /// qt59 is the compact `[K i8][K/128 f16]` row; the retired per-32 row and
+    /// a `K % 128 != 0` table are refused rather than misread.
+    #[test]
+    fn qt59_embedding_admits_only_the_compact_row() {
+        let (vocab, dim) = (7usize, 256usize);
+        let compact = vocab * (dim + (dim / 128) * 2);
+        validate_embedding_info(&info(59, 128, vocab, dim, compact), vocab, dim, "embed")
+            .expect("compact qt59 row");
+        // Old per-32 extent (same declared group tag).
+        validate_embedding_info(
+            &info(59, 128, vocab, dim, vocab * (dim + (dim / 32) * 2)),
+            vocab,
+            dim,
+            "embed",
+        )
+        .expect_err("old per-32 extent must be refused");
+        // Compact extent but the retired group tag.
+        validate_embedding_info(&info(59, 32, vocab, dim, compact), vocab, dim, "embed")
+            .expect_err("group_size 32 must be refused");
+        // K not a multiple of 128.
+        validate_embedding_info(&info(59, 128, vocab, 320, 0), vocab, 320, "embed")
+            .expect_err("K % 128 != 0 must be refused");
+    }
+}
+
 fn validate_awq_sidecar(hfq: &HfqFile, weight_cand: &str, k: usize) -> Result<(), String> {
     let stem = weight_cand.strip_suffix(".weight").unwrap_or(weight_cand);
     let sidecar = format!("{stem}.awq_scale.weight");

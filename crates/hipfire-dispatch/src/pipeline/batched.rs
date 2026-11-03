@@ -195,7 +195,7 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
         Err(HipError::new(
             0,
             &format!(
-                "this model uses the {} weight format (qt 58/59): an integer-matrix operand layout, and no GPU kernel reads it yet",
+                "this model uses the {} weight format (qt 58/59): an integer-matrix operand layout this generic batched route cannot consume (it needs a rotation input the IU operand does not take). qt 59 has its own unrotated GEMV, embedding and residual GEMM; qt 58 has decode GEMV only",
                 dtype.iu_quant_name().unwrap_or("IU")
             ),
         ))
@@ -1173,8 +1173,10 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
             n,
         );
     }
-    if w.dtype == DType::IU8G32 && k % 128 == 0 {
-        // In-place requantized qt59: one scale per 128, int8 W8A8 path.
+    if w.dtype == DType::IU8G32 && k % 256 == 0 {
+        // qt59 compact row (one scale per 128) through the W8A8 LDS GEMM.
+        // Its launcher requires `K % 256 == 0`, so a K%128-only matrix must
+        // take the f16-WMMA twin below instead of erroring out of the launcher.
         let xq = gpu.ensure_int8_mmq_linear_x(input, n, k)?;
         return match epilogue {
             BatchEpilogue::Residual => {

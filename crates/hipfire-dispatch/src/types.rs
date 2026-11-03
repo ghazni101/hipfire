@@ -182,8 +182,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 /// Refusal for the typed-qwen4-only planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134)
 /// on every generic GEMV/GEMM family resolution: they have no generic kernel.
 /// Refusal for an IU dtype this family does not run. qt 57 decode GEMV is
-/// `GemvIu4G256Prerotated`. qt 58, qt 59, and every GEMM of these layouts
-/// still land here.
+/// `GemvIu4G256Prerotated`; qt 59 plain GEMV is `GemvIu8G32`. qt 58 plain
+/// GEMV and every GEMM of these layouts still land here.
 pub(crate) fn reject_iu(dtype: DType, family: &'static str) -> DispatchError {
     DispatchError::UnsupportedVariant {
         family,

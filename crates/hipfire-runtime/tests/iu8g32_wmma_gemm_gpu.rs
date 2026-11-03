@@ -254,6 +254,23 @@ fn w8a8_lds_min_matches_reference_and_times() {
     eprintln!("w8a8 min: m={m} k={k} n={n} worst rel={rel:.3e}");
     assert!(rel < 1e-5, "w8a8 min rel {rel:.3e}");
 
+    // The residual epilogue (`add = true`) is the role both qt59 prefill
+    // bodies use; it must equal seed + the set result exactly.
+    let seed: Vec<f32> = (0..n * m).map(|i| 0.11 * (i % 13) as f32 - 0.7).collect();
+    let y_add = gpu.upload_f32(&seed, &[n * m]).unwrap();
+    gpu.gemm_iu8g32_w8a8_min(&wd, xq, &y_add, m, k, n, true)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let add = gpu.download_f32(&y_add).unwrap();
+    assert!(
+        add.iter()
+            .zip(&got)
+            .zip(&seed)
+            .all(|((a, s), b)| *a == *s + *b),
+        "w8a8 add epilogue != seed + set"
+    );
+    gpu.free_tensor(y_add).ok();
+
     let (tm, tk, tn) = (5120usize, 6144usize, 512usize);
     let tw = w8a8_weights(&mut rng, tm, tk);
     let twd = gpu.upload_raw(&tw, &[tw.len()]).unwrap();

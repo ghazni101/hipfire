@@ -84,7 +84,7 @@ extern "C" __global__ void gemv_iu8g32_residual(
 // takes 16-element chunk c = l, l+32, ... (chunk c lies in 32-block c>>1).
 // Reduction order differs from v1/gemv_q8_0 (not bit-identical to them);
 // contract is still dequant_q8 . x. Requires 16B-aligned rows
-// ((K + K/16) % 16 == 0) and 16B-aligned x; the launcher falls back to v1.
+// ((K + K/64) % 16 == 0) and 16B-aligned x; the launcher falls back to v1.
 __device__ __forceinline__ float iu8_dot16(uint4 w, float4 a, float4 b, float4 c, float4 e) {
     float s = 0.0f;
     const unsigned int ws[4] = {w.x, w.y, w.z, w.w};
@@ -168,6 +168,8 @@ IU8G32_V2(4)
 // (d_x = amax/127, the pair of lanes c, c^1 owns one 32-group) and reused
 // over the R rows. Per 16-element chunk: 4x V_DOT4_I32_IU8 with both sign bits set (RDNA3 ISA
 // §16.10 VOP3P opcode 22, signed x signed), then y += (d_w * d_x) * dot.
+// Requires 16B-aligned rows ((K + K/64) % 16 == 0) and 16B-aligned x; the
+// launcher falls back to v1.
 #if defined(__GFX11__) || defined(__GFX12__)
 __device__ __forceinline__ int iu8_pack4(float a, float b, float c, float d, float id) {
     const int qa = max(-127, min(127, (int)rintf(a * id)));

@@ -8444,6 +8444,9 @@ fn draft_dflash_forward_head_batched(
                     llama::EmbeddingFormat::Q8_0 => {
                         gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
                     }
+                    llama::EmbeddingFormat::IU8G32 => {
+                        gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
+                    }
                     llama::EmbeddingFormat::F32 => {
                         gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
                     }
@@ -11327,6 +11330,9 @@ fn run_dflash_draft_for_logits(
             hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::llama::EmbeddingFormat::IU8G32 => {
+                gpu.embedding_lookup_iu8g32(&target.weights.token_embd, &dst, tok, h)?
+            }
             hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -11658,6 +11664,9 @@ fn run_dflash_draft_for_topk_gpu(
             }
             hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::IU8G32 => {
+                gpu.embedding_lookup_iu8g32(&target.weights.token_embd, &dst, tok, h)?
             }
             hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?

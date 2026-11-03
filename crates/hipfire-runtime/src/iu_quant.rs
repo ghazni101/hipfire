@@ -36,10 +36,11 @@
 //! round trip.
 //!
 //! Decode GEMV for [`Layout::Iu4`] is `v_dot8_i32_iu4` on this plane
-//! ([`gemv_iu4_dot8`] is the CPU contract). Generic GEMM still refuses every
-//! IU dtype, and qt 58 / qt 59 still have no kernel. A kernel loads
-//! `row_bytes(k)` with the code plane at offset 0 (`code_bytes(k)` long)
-//! and the scales immediately after.
+//! ([`gemv_iu4_dot8`] is the CPU contract). qt 57 has a decode GEMV and a W4A4
+//! prefill GEMM; qt 59 has the GEMV/embedding/GEMM family described below.
+//! Generic GEMM still refuses every IU dtype, and qt 58 still has no prefill
+//! kernel. A kernel loads `row_bytes(k)` with the code plane at offset 0
+//! (`code_bytes(k)` long) and the scales immediately after.
 //!
 //! ## IU8G128 (qt 59), the int8 tier
 //!

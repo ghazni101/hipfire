@@ -4700,8 +4700,10 @@ pub fn qwen35_layer_batch_admissible(
             ] {
                 // qt59 IU8G32 is admitted only as the DeltaNet `wo` (natural
                 // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
-                let iu8g32_wo =
-                    name == "wo" && dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151");
+                let iu8g32_wo = name == "wo"
+                    && dt == DType::IU8G32
+                    && matches!(arch, "gfx1100" | "gfx1151")
+                    && l.wo.k % 128 == 0;
                 if !iu8g32_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
                         0,

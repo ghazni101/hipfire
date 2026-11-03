@@ -830,11 +830,13 @@ pub enum DType {
     /// (`K` code bytes, then the same scale plane). 8.25 bpw. The byte is the
     /// IU8 WMMA operand, not a new 8-bit grid. No GPU kernel yet.
     IU8G256,
-    /// IU8-G32 (qt=59): the Q8F16 grid (signed int8, one f16 scale per 32,
-    /// zero point 0, no FWHT) stored as a contiguous code plane. `K` code
-    /// bytes, then `(K/32)` little-endian f16 scales. `K % 32 == 0`, 8.5 bpw.
-    /// This is the signed operand of `v_wmma_i32_16x16x16_iu8`. Not qt=58:
-    /// those bytes are MQ4 nibbles. No GPU kernel yet. See
+    /// IU8-G128 (qt=59): the Q8 grid (signed int8, zero point 0, no FWHT)
+    /// with **one f16 scale per 128** stored as a compact row: `K` signed code
+    /// bytes, then `K/128` little-endian f16 scales (`K + K/64` bytes, 8.125
+    /// bpw). `K % 128 == 0`. This is the signed operand of
+    /// `v_wmma_i32_16x16x16_iu8`. Not qt=58: those bytes are MQ4 nibbles in a
+    /// byte. Readers: `gemv_iu8g32`, `embedding_iu8g32`, and the
+    /// `gemm_iu8g32_residual_wmma` / `gemm_iu8g32_w8a8_min` family. See
     /// `hipfire_runtime::iu_quant::repack_q8f16`.
     IU8G32,
     /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout

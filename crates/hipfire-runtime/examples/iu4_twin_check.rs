@@ -1,4 +1,6 @@
-//! iu4_twin_check <iu.hfq> <mq.hfq>: proves an IU file is a pure relayout of its MQ4V2/Q8F16 twin.
+//! iu4_twin_check <iu.hfq> <mq.hfq>: proves an IU file's body rows are a pure
+//! relayout of its MQ4V2 twin (qt 57) and its lifted qt 59 rows are the
+//! deterministic per-128 requant of the Q8F16 twin (`iu_quant::repack_q8f16`).
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::iu_quant::{self, Layout};
 use std::collections::BTreeMap;

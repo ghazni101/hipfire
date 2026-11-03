@@ -790,11 +790,22 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
     hipfire_dispatch::pipeline::batched::reject_typed_only_format(dtype)
 }
 
+/// qt 59 has a generic GEMV (`KernelKey::GemvIu8G32`), so the plain
+/// `weight_gemv` route must admit it. The rotation helpers keep the broader
+/// refusal above: qt 59 is unrotated and must never enter an FWHT path.
+#[inline]
+fn reject_unsupported_gemv_dtype(dtype: DType) -> HipResult<()> {
+    if dtype == DType::IU8G32 {
+        return Ok(());
+    }
+    reject_mq4g128v2(dtype)
+}
+
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
-    reject_mq4g128v2(w.gpu_dtype)?;
+    reject_unsupported_gemv_dtype(w.gpu_dtype)?;
     // Calibration tap: PRE-rotation input x (n=1, k=w.k). No-op when unarmed.
     gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
@@ -8657,6 +8668,16 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// qt 59 has a generic GEMV, so the plain `weight_gemv` gate must admit
+    /// it; the rotation helpers keep refusing the unrotated IU layout.
+    #[test]
+    fn weight_gemv_admits_qt59_but_not_typed_only_layouts() {
+        assert!(reject_unsupported_gemv_dtype(DType::IU8G32).is_ok());
+        assert!(reject_unsupported_gemv_dtype(DType::Q8_0).is_ok());
+        assert!(reject_unsupported_gemv_dtype(DType::MQ4G128V2).is_err());
+        assert!(reject_mq4g128v2(DType::IU8G32).is_err());
+    }
 
     /// The one-pass replacement gather `gather_pool` must reproduce slot for
     /// slot (values, ids, slot order, tie choice) and its max, bit for bit.
