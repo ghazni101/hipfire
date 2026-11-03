@@ -5,18 +5,19 @@
 //! Decode GEMV for [`crate::DType::IU8G32`] (qt 59), the lifted-role tier of
 //! an `iu4` / `iu8` file.
 //!
-//! The grid is Q8F16's — signed int8 codes, one fp16 scale per 32, zero point
-//! 0, no FWHT — with the scales moved to the row tail:
+//! The grid is the Q8 grid — signed int8 codes, zero point 0, no FWHT — with
+//! **one fp16 scale per 128** moved to the row tail:
 //!
 //! ```text
-//! [K signed codes][f16 scale] * (K / 32)
+//! [K signed codes][K/128 f16 scales]       (K + K/64 bytes, 8.125 bpw)
 //! ```
 //!
 //! The kernel (`gemv_iu8g32`, and the fused `gemv_iu8g32_residual`) folds
 //! element for element like `gemv_q8_0`: one wave per row, thread `t` takes
-//! element `t` of every 32-block and the warp reduces by shuffle. The numeric
-//! contract is `hipfire_runtime::iu_quant::dequant_q8` (the dot of the
-//! dequantized row with `x`), which is also the CPU oracle.
+//! element `t` of every 32-block (four blocks share one scale) and the warp
+//! reduces by shuffle. The numeric contract is
+//! `hipfire_runtime::iu_quant::dequant_q8` (the dot of the dequantized row
+//! with `x`), which is also the CPU oracle.
 //!
 //! No arch gate: the math is f16-scale × int8 × f32 `x`, available everywhere.
 

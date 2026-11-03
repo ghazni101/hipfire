@@ -130,8 +130,8 @@ Norms stay F16. The embedding table is a gather, not a matrix instruction. On th
 
 Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. The generic
 GEMM dispatcher refuses qt 57, 58, and 59; DFlash admits qt 59 on exact
-gfx1100/gfx1151 (its verify and draft heads run `gemm_iu8g32_residual_wmma`
-and its noise embedding runs `embedding_lookup_iu8g32`).
+gfx1100/gfx1151 (its verify head runs `gemm_iu8g32_residual_wmma` and its
+noise embedding runs `embedding_lookup_iu8g32`).
 
 ## What runs
 
@@ -140,7 +140,7 @@ and its noise embedding runs `embedding_lookup_iu8g32`).
 | decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` (per-128 f16 scale × int8, every arch; `_v2` and `_a8` variants) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g256_residual` | `gemv_iu8g32_residual` |
 | embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
-| prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`) | — | `gemm_iu8g32_w8a8_min` (IU8 WMMA, W8A8); `gemm_iu8g32_residual_wmma` + mb4/mb4m2 as the small-batch f16 fallback |
+| prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`) | — | `gemm_iu8g32_w8a8_min` (IU8 WMMA, W8A8, `K % 256 == 0`); the f16-WMMA residual GEMM (`gemm_iu8g32_residual_wmma` + mb4/mb4m2) otherwise and for sub-128-token slot chunks |
 | DFlash verify | — | — | qt 59 head via `gemm_iu8g32_residual_wmma` (gfx1100/gfx1151) |
 
 `hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57,

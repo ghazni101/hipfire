@@ -9,7 +9,7 @@
 //! The CPU contracts are `hipfire_runtime::iu_quant`:
 //! `gemv_iu4_dot8` (int4 activation, integer dot, per-128 `(scale, zero)`),
 //! `gemv_iu8_dot` (byte plane, same affine grid, f32), and `gemv_q8` (planar
-//! Q8 grid, natural basis). A wrong row stride, a scale read at the wrong
+//! Q8 grid, one f16 scale per 128, natural basis). A wrong row stride, a scale read at the wrong
 //! offset, a nibble-order flip or a sign error lands orders of magnitude
 //! outside the tolerance; the kernels' warp reduction explains the last bits.
 //!
@@ -170,7 +170,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
     }
 
     // ── qt 59 IU8G32 + gather ────────────────────────────────────────────
-    for k in [32usize, 256, 2688] {
+    for k in [128usize, 256, 2688] {
         let src = q8f16_blob(m, k);
         let packed = repack_q8f16(&src, m, k).expect("repack");
         let x = activation(k);

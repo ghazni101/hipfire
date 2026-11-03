@@ -163,15 +163,6 @@ fn stamp_mq4v2_body(
     }
 }
 
-/// Retag a finished Q8F16 blob when `--format iu4` / `iu8` is latched.
-///
-/// The grid is unchanged: signed int8, one f16 scale per 32, zero point 0,
-/// no FWHT. The scale moves from in front of each block to the tail of the
-/// row, so the code plane is a contiguous signed operand for
-/// `v_wmma_i32_16x16x16_iu8` (qt 59 `IU8G32`). This is not qt 58, which
-/// stores MQ4 nibbles `0..=15` in a byte. A row whose K is not a multiple
-/// of 32, or a tensor that is not a single row or a 2-D matrix, stays
-/// interleaved Q8F16.
 /// Product name for an iu file. The bare name is the normal rung.
 /// `xt` and `pro` use the suffixes the quant ladder already uses.
 fn iu_product_name(format: &str, tier: crate::model_filter::ProductTier) -> Option<String> {
@@ -260,6 +251,16 @@ fn iu_role_stays_on_body(name: &str) -> bool {
     iu_unlifted_role(crate::model_filter::q8_class_of(name), tier)
 }
 
+/// Retag a finished Q8F16 blob when `--format iu4` / `iu8` is latched.
+///
+/// The grid stays Q8 (signed int8, zero point 0, no FWHT), but the per-32
+/// source scales are folded to **one f16 scale per 128** and the codes are
+/// re-rounded (`d = amax/127` per 128), so the row becomes
+/// `[K signed codes][K/128 f16 scales]` — a contiguous signed operand for
+/// `v_wmma_i32_16x16x16_iu8` (qt 59 `IU8G32`/`IU8G128`). This is not qt 58,
+/// which stores MQ4 nibbles `0..=15` in a byte. A row whose K is not a
+/// multiple of 128, or a tensor that is not a single row or a 2-D matrix,
+/// stays interleaved Q8F16.
 fn emit_q8_or_iu8(bytes: Vec<u8>, shape: &[usize]) -> (Vec<u8>, QuantType, u32, &'static str) {
     if IU_STORAGE.get().copied().flatten().is_none() {
         return (bytes, QuantType::Q8F16, 32, "Q8_F16");
