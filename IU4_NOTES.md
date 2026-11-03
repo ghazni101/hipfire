@@ -1058,3 +1058,70 @@ retryable `page demand exceeds pool: need 1409 pages`, and on the deployed
 container the daemon was observed spinning at ~99% GPU/CPU afterwards with
 later (small) requests unanswered until the container was restarted. The
 honest ceilings are ~176k tokens for one request and ~44k each for four.
+
+## C22 — IU4/IU8 accelerator utilization on the multi-slot engine (2026-11-03)
+
+Audit of the RDNA3 IU4/IU8 units on the paged 4-slot route, and the one
+place they were being left idle.
+
+### What runs where
+
+| stage | route | unit | state |
+|---|---|---|---|
+| prefill, qt57 body | `gemm_iu4g256_multi` -> `gemm_iu4g256_w4a4_*` | `v_wmma_i32_16x16x16_iu4` | used, 66% of F16 peak (C18) |
+| prefill, qt57 A8 opt-in | `gemm_iu4g256_w4a8_*` | `v_wmma_i32_16x16x16_iu8` | opt-in, slower (C14/C15) |
+| prefill, qt59 wo | was `gemm_iu8g32_residual_wmma` | F16 WMMA + int8->f16 dequant | **idle IU8 core** |
+| prefill, qt59 wo (now) | `gemm_iu8g32_w8a8_min` (128x128 LDS) | `v_wmma_i32_16x16x16_iu8` | used |
+| decode, qt57 | `gemv_iu4g256_xbatch` (new) / `gemv_iu4g256` at n=1 | f32 FMAC | by design; see below |
+| decode, qt59 lm_head/wo | `gemv_iu8g32_v2_r*` | f32 FMAC | by design |
+| decode, integer opt-ins | `HIPFIRE_IU4_DECODE=dot4/dot8`, `HIPFIRE_IU8_GEMV=dot4` | `v_dot4_i32_iu8` / `v_dot8_i32_iu4` | off, measured slower/bad |
+
+Decode integer dots are not a lever here: the step is weight-bandwidth bound
+(one pass per token, or one pass per 4 tokens with the xbatch). C7/C8 measured
+W4A8 -22..-24% (loses the fused rows keys and adds an x quantize pass) and
+W4A4 dot8 costs +1.5% (27B) to +4.3% (4B) PPL. IU8's a8 dot was within noise
+on 4B. The xbatch (`C21`) is the correct decode utilization: one weight pass
+for every live slot, f32 math.
+
+### The gap fixed here: qt59 prefill never reached the IU8 core
+
+C16 admitted IU8G32 residuals to the slots body with the f16 twin before C9
+made the qt59 row compact (`[K i8][K/128 f16]`) and the singleton batched body
+unconditionally W8A8. The multi-slot body kept calling
+`gemm_iu8g32_residual_wmma` (f16 WMMA fed by int8->f16 dequant: 20 TFLOPS at
+the wo shape, ~12% of peak), so the IU8 matrix core never ran on this engine.
+
+`slots_residual_proj` now quantizes the activation once
+(`ensure_int8_mmq_linear_x`) and calls `gemm_iu8g32_w8a8_min(..., add=true)`
+for prompt chunks of at least one 128-row tile with `K % 256 == 0`; sub-tile
+chunks and decode rows keep the f16 twin. `HIPFIRE_SLOTS_IU8_W8A8=0` restores
+the twin for A/B.
+
+Kernel microbench (wo shape M=5120, K=6144, weights 2.78 GB):
+
+| rows | W8A8 | f16 twin | speedup |
+|---:|---:|---:|---:|
+| 128 | 0.430 ms (18.7 TF) | 0.477 ms (16.9 TF) | 1.11x |
+| 1024 | 1.824 ms (35.3 TF) | 3.208 ms (20.1 TF) | 1.76x |
+| 4096 | 3.422 ms (75.3 TF) | 12.633 ms (20.4 TF) | 3.69x |
+
+End-to-end, host multi-slot serve, one lane, two fresh-process interleaved
+rounds per arm:
+
+| prompt | f16 twin PP / TTFT | W8A8 PP / TTFT | delta |
+|---|---:|---:|---:|
+| 4107 | 1391 tok/s / 2.95 s | 1607 / 2.56 s | +15.5% / -13% |
+| 8193 | 1259 tok/s / 6.51 s | 1435 / 5.71 s | +14.0% / -12% |
+
+4-lane xbatch decode (C21) is untouched; n=1 decode unchanged.
+
+### Remaining accelerator / prefill ceiling
+
+- qt59 **decode** (lm_head 4 x 0.64 GB, wo) still runs f32 GEMVs per slot; the
+  lm_head is the last per-slot weight pass (~5-15% of the step). An IU8G32
+  xbatch twin would close it.
+- qt59 prefill **plain** roles (if a mixed tier ever puts one outside the
+  residual role) have no plain W8A8 entry; only residuals exist today.
+- The paged prefill attention remains `attention_q8_0_flash_prefill_wmma_slots`
+  (~3.6x the singleton FA2's quadratic coefficient, C21); that is the remaining
+  long-context TTFT/PP gap and needs an FA2-style descriptor-addressed kernel.

@@ -663,6 +663,21 @@ fn slots_iu8g32_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
     dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151") && k % 32 == 0
 }
 
+/// `HIPFIRE_SLOTS_IU8_W8A8=0` keeps the f16 qt59 prefill twin on the
+/// multi-slot route (diagnostic A/B). Default on: the singleton batched body
+/// already runs this W8A8 path.
+fn slots_iu8_w8a8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(
+            hipfire_config::developer_var("HIPFIRE_SLOTS_IU8_W8A8")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    });
+    *ON
+}
+
 /// C16 qt57: one IU4G256 launch set over a shared rotated X
 /// (`gemm_iu4g256_multi` quantizes X once, or takes the producer sidecar).
 fn slots_iu4_multi(
@@ -1003,6 +1018,21 @@ fn slots_residual_proj(
     }
     if slots_iu8g32_residual_ok(dt, w.k, gpu.arch.as_str()) {
         let y_n = y.sub_offset(0, n * w.m);
+        // Prompt rows: the singleton batched body runs qt59 residuals through
+        // the in-place int8-per-128 weights and the WMMA-IU8 LDS GEMM
+        // (`gemm_iu8g32_w8a8_min`) whenever K permits; this body still took
+        // the f16 twin, leaving the IU8 matrix core idle on the multi-slot
+        // route and making its prefill arithmetic differ from the singleton.
+        // The W8A8 tile is 128 rows wide, so sub-tile prompt chunks and
+        // decode-width rows keep the f16 twin.
+        if slots_iu8_w8a8_enabled() && n >= 128 && w.k % 256 == 0 {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                eprintln!("[slots] IU8 W8A8 prefill: k={} n={n} m={}", w.k, w.m);
+            });
+            let xq = gpu.ensure_int8_mmq_linear_x(x, n, w.k)?;
+            return gpu.gemm_iu8g32_w8a8_min(&w.buf, xq, &y_n, w.m, w.k, n, true);
+        }
         return gpu.gemm_iu8g32_residual_wmma(&w.buf, x, &y_n, w.m, w.k, n);
     }
     if slots_weight_rotated(dt) {
