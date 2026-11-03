@@ -1131,7 +1131,8 @@ rounds per arm:
 The qt59 format is **one f16 scale per 128**, not per 32 and not per 256:
 `[K signed i8 codes][K/128 f16 scales]`, row `K + K/64` bytes (260 B at
 K=256, 8.125 bpw). `iu_quant` calls it `IU8G128` (`Q8_SCALE_GROUP = 128`);
-the `IU8G32` DType name is historical. `convert_iu8g128` migrates the legacy
+the `IU8G32` DType name was historical (renamed `DType::IU8G128` /
+`EmbeddingFormat::IU8G128` after this audit; wire name and kernels keep `IU8G32`). `convert_iu8g128` migrates the legacy
 per-32 rows.
 
 Audited every writer/reader/guard:
@@ -1139,7 +1140,7 @@ Audited every writer/reader/guard:
 | site | expected | found |
 |---|---|---|
 | loader `validate_q8` / `q8_tensor_bytes` | M*(K + K/64) | correct |
-| `DType::IU8G32::row_bytes` | K + K/64 | correct (unit-tested: 130 @128, 260 @256, None @32) |
+| `DType::IU8G128::row_bytes` (was `IU8G32`) | K + K/64 | correct (unit-tested: 130 @128, 260 @256, None @32) |
 | quantizer `emit_q8_or_iu8` / `convert_iu8g128` | per-128 | correct |
 | `gemv_iu8g32` v1/v2/a8 | scale `bi>>2` / `c>>3` | correct; **guard was K%32** -> fixed to K%128 |
 | `embedding_iu8g32{,_batched}` | `dim/128` scales | correct; **no dim guard** -> K%128 added; comments fixed |

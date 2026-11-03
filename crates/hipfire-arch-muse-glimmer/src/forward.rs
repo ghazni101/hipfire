@@ -198,7 +198,7 @@ pub(crate) fn embed_lookup(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer: embed q8: {e:?}"))?,
-        EmbeddingFormat::IU8G32 => gpu
+        EmbeddingFormat::IU8G128 => gpu
             .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer: embed iu8g32: {e:?}"))?,
         EmbeddingFormat::F32 => gpu
@@ -257,7 +257,7 @@ fn embed_lookup_batched(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8_batched(&weights.embed_tokens, x, token_ids, b, dim)
             .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G32 => return Ok(false),
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G128 => return Ok(false),
         EmbeddingFormat::Ggml(_) => return Err(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
                 .to_string(),
@@ -480,7 +480,7 @@ pub fn embed_raw(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer embed_raw q8: {e:?}"))?,
-        EmbeddingFormat::IU8G32 => gpu
+        EmbeddingFormat::IU8G128 => gpu
             .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer embed_raw iu8g32: {e:?}"))?,
         EmbeddingFormat::F32 => gpu

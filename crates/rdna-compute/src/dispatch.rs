@@ -879,7 +879,7 @@ pub enum DType {
     /// byte. Readers: `gemv_iu8g32`, `embedding_iu8g32`, and the
     /// `gemm_iu8g32_residual_wmma` / `gemm_iu8g32_w8a8_min` family. See
     /// `hipfire_runtime::iu_quant::repack_q8f16`.
-    IU8G32,
+    IU8G128,
     /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
     /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
     /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
@@ -1127,7 +1127,7 @@ impl DType {
             | DType::E8PI4G128R128
             | DType::IU4G256
             | DType::IU8G256
-            | DType::IU8G32
+            | DType::IU8G128
             | DType::MQ4G256V2P
             | DType::MQ4G128V2P
             | DType::GgmlQ4K
@@ -1207,7 +1207,7 @@ impl DType {
                 }
             }
             // qt=59. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
-            DType::IU8G32 => {
+            DType::IU8G128 => {
                 if k % 128 != 0 {
                     None
                 } else {
@@ -1255,7 +1255,7 @@ impl DType {
         match self {
             DType::IU4G256 => Some("IU4G256"),
             DType::IU8G256 => Some("IU8G256"),
-            DType::IU8G32 => Some("IU8G128"),
+            DType::IU8G128 => Some("IU8G128"),
             _ => None,
         }
     }
@@ -11903,14 +11903,15 @@ mod tests {
         assert!(DType::IU4G256.is_iu_quant());
         assert!(!DType::MQ4G256V2.is_iu_quant());
         assert!(!DType::IU4G256.is_mq_i4());
-        // qt=59 is the Q8 grid, group 32, not the K%256 MQ4 repack.
-        assert_eq!(DType::IU8G32.row_bytes(32), Some(34));
-        assert_eq!(DType::IU8G32.row_bytes(256), Some(272));
-        assert_eq!(DType::IU8G32.row_bytes(31), None);
-        assert!(!DType::IU8G32.requires_k_mod_256());
-        assert!(!DType::IU8G32.supports_awq_sidecar());
-        assert_eq!(DType::IU8G32.iu_quant_name(), Some("IU8G32"));
-        assert!(DType::IU8G32.is_iu_quant());
+        // qt=59 is the compact Q8 grid, one scale per 128, not K%256.
+        assert_eq!(DType::IU8G128.row_bytes(128), Some(130));
+        assert_eq!(DType::IU8G128.row_bytes(256), Some(260));
+        assert_eq!(DType::IU8G128.row_bytes(32), None);
+        assert_eq!(DType::IU8G128.row_bytes(127), None);
+        assert!(!DType::IU8G128.requires_k_mod_256());
+        assert!(!DType::IU8G128.supports_awq_sidecar());
+        assert_eq!(DType::IU8G128.iu_quant_name(), Some("IU8G128"));
+        assert!(DType::IU8G128.is_iu_quant());
     }
 
     /// The ggml dtypes carry GGUF block bytes as-is: distinct from the legacy

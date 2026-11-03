@@ -293,7 +293,7 @@ impl GemmFamily {
             | DType::E8PI4G128R128 => {
                 return Err(reject_mq_i4(dtype, "gemm"));
             }
-            DType::IU4G256 | DType::IU8G256 | DType::IU8G32 => {
+            DType::IU4G256 | DType::IU8G256 | DType::IU8G128 => {
                 return Err(crate::types::reject_iu(dtype, "gemm"));
             }
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,

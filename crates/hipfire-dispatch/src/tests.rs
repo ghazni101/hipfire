@@ -811,7 +811,7 @@ const ALL_DTYPES: &[DType] = &[
     DType::E8PI4G128R128,
     DType::IU4G256,
     DType::IU8G256,
-    DType::IU8G32,
+    DType::IU8G128,
     DType::MQ4G256V2P,
     DType::MQ4G128V2P,
     DType::GgmlQ4K,
@@ -1556,7 +1556,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
     // qt 59 has no prerotated variant: it is rotation-free, admitted Plain.
     assert!(fam
         .resolve(
-            DType::IU8G32,
+            DType::IU8G128,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
@@ -1573,18 +1573,18 @@ fn iu8g32_gemv_resolves_plain_and_residual_on_every_arch() {
     let fam = GemvFamily::new();
     for ctx in [ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4()] {
         assert!(
-            fam.resolve(DType::IU8G32, GemvVariant::Plain, false, &ctx, None)
+            fam.resolve(DType::IU8G128, GemvVariant::Plain, false, &ctx, None)
                 .is_ok(),
-            "IU8G32 Plain must resolve"
+            "IU8G128 Plain must resolve"
         );
         assert!(
-            fam.resolve(DType::IU8G32, GemvVariant::WithResidual, false, &ctx, None)
+            fam.resolve(DType::IU8G128, GemvVariant::WithResidual, false, &ctx, None)
                 .is_ok(),
-            "IU8G32 WithResidual must resolve"
+            "IU8G128 WithResidual must resolve"
         );
     }
     // No fused SwiGLU-residual: a lifted role is never a gate/up projection.
-    assert!(KernelKey::for_gemv_swiglu_residual(DType::IU8G32).is_err());
+    assert!(KernelKey::for_gemv_swiglu_residual(DType::IU8G128).is_err());
 }
 
 #[test]

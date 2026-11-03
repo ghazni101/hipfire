@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Numerics gate for the IU8G32 (qt59) decode GEMV v2 (`gemv_iu8g32_v2_*`).
+//! Numerics gate for the IU8G128 (qt59) decode GEMV v2 (`gemv_iu8g32_v2_*`).
 //!
 //! Every v2 variant (R = 1, 2, 4; plain and residual) vs an f64 reference of
 //! the dequantized row dot f32 x, next to v1 on the same case:

@@ -600,7 +600,7 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::F16
             // C16 qt59 lm_head of the iu4 files: Step::Gemv -> GemvIu8G32
             // (same GEMV as the solo decode lm_head and `lm_head_batched`).
-            | DType::IU8G32
+            | DType::IU8G128
     )
 }
 
@@ -657,10 +657,10 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
     })
 }
 
-/// C16 qt59: IU8G32 residual projections (natural basis input) take the
+/// C16 qt59: IU8G128 residual projections (natural basis input) take the
 /// same qt59 GEMM selector as the batched prefill (`Gpu::iu8g32_gemm_route`).
 fn slots_iu8g32_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
-    dt == DType::IU8G32 && rdna_compute::iu8g32_gemm_admits(arch, k)
+    dt == DType::IU8G128 && rdna_compute::iu8g32_gemm_admits(arch, k)
 }
 
 /// C16 qt57: one IU4G256 launch set over a shared rotated X
@@ -940,12 +940,12 @@ pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()>
         | EmbeddingFormat::F32
         | EmbeddingFormat::HFQ4G256
         | EmbeddingFormat::HFQ4G128
-        | EmbeddingFormat::IU8G32 => Ok(()),
+        | EmbeddingFormat::IU8G128 => Ok(()),
         other => Err(HipError::new(
             0,
             &format!(
                 "forward_batch_slots: embedding format {other:?} has no batched \
-                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128, IU8G32)"
+                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128, IU8G128)"
             ),
         )),
     }
@@ -972,7 +972,7 @@ pub(crate) fn embed_lookup_slots(
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
         }
-        EmbeddingFormat::IU8G32 => {
+        EmbeddingFormat::IU8G128 => {
             gpu.embedding_lookup_iu8g32_batched(table, output, token_ids, n, dim)
         }
         other => Err(HipError::new(

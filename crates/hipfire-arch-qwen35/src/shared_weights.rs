@@ -196,7 +196,7 @@ dtype_table! {
     // Qwen4 HC8 sidecar weight (qt 57; exact gfx1201, never in a shared qwen35 weight file; additive tag).
     HC8E4M3Row = 67,
     // IU integer operand layouts (feature branch; distinct from the GGUF/planar tags).
-    IU4G256 = 68, IU8G256 = 69, IU8G32 = 70,
+    IU4G256 = 68, IU8G256 = 69, IU8G128 = 70,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
@@ -206,7 +206,7 @@ fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
         EmbeddingFormat::HFQ4G256 => 3,
         EmbeddingFormat::HFQ4G128 => 4,
         EmbeddingFormat::Q8_0 => 5,
-        EmbeddingFormat::IU8G32 => 6,
+        EmbeddingFormat::IU8G128 => 6,
         EmbeddingFormat::Ggml(_) => return Err(SharedWeightError::unsupported(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
         )),
@@ -220,7 +220,7 @@ fn embd_from_tag(tag: u8) -> Option<EmbeddingFormat> {
         3 => EmbeddingFormat::HFQ4G256,
         4 => EmbeddingFormat::HFQ4G128,
         5 => EmbeddingFormat::Q8_0,
-        6 => EmbeddingFormat::IU8G32,
+        6 => EmbeddingFormat::IU8G128,
         _ => return None,
     })
 }
