@@ -1283,20 +1283,16 @@ pub(crate) fn embed_lookup(
     out: &GpuTensor,
 ) -> Result<(), String> {
     let embed = w.embed_table()?;
-    let res = match w.embed_format {
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup_f32_batched(embed, out, &scratch.token_ids, rows, cfg.hidden)
-        }
-        other => {
-            return Err(format!(
-                "raon1_mini: embedding format {other:?} is not routed (expected Q8F16 or F32)"
-            ));
-        }
-    };
-    res.map_err(|e| format!("raon1_mini: embedding lookup: {e:?}"))
+    hipfire_runtime::llama::embedding_lookup_batched_dispatch(
+        gpu,
+        w.embed_format,
+        embed,
+        out,
+        &scratch.token_ids,
+        rows,
+        cfg.hidden,
+    )
+    .map_err(|e| format!("raon1_mini: embedding lookup: {e:?}"))
 }
 
 /// Embedding lookup of the first `rows` staged ids + stream broadcast. Device

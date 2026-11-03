@@ -180,6 +180,35 @@ pub fn decode_step_sampled(
     .map_err(|e| format!("glimmer: sample: {e:?}"))
 }
 
+/// Single-row lookup of the target table into `dst`. Q4K and GGUF-native
+/// tables are refused; every other format goes through the shared
+/// `embedding_lookup_dispatch`.
+fn embed_row(
+    gpu: &mut Gpu,
+    weights: &GlimmerWeights,
+    dst: &GpuTensor,
+    token_id: u32,
+    dim: usize,
+    label: &str,
+) -> Result<(), String> {
+    match weights.embd_format {
+        EmbeddingFormat::Q4K => Err(format!("glimmer {label}: Q4K embedding format unsupported")),
+        EmbeddingFormat::Ggml(_) => Err(
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
+                .to_string(),
+        ),
+        fmt => hipfire_runtime::llama::embedding_lookup_dispatch(
+            gpu,
+            fmt,
+            &weights.embed_tokens,
+            dst,
+            token_id,
+            dim,
+        )
+        .map_err(|e| format!("glimmer {label} {fmt:?}: {e:?}")),
+    }
+}
+
 pub(crate) fn embed_lookup(
     _cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
@@ -188,28 +217,7 @@ pub(crate) fn embed_lookup(
     token_id: u32,
 ) -> Result<(), String> {
     let dim = _cfg.dim;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer: embed hfq4g256: {e:?}"))?,
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer: embed hfq4g128: {e:?}"))?,
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer: embed q8: {e:?}"))?,
-        EmbeddingFormat::IU8G32 => gpu
-            .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer: embed iu8g32: {e:?}"))?,
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer: embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => return Err("glimmer: Q4K embedding format unsupported".to_string()),
-        EmbeddingFormat::Ggml(_) => return Err(
-            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
-                .to_string(),
-        ),
-    }
+    embed_row(gpu, weights, &state.x, token_id, dim, "embed")?;
     // Scale-less RMSNorm over the embedding.
     //
     // HF wraps the table in `MuseGlimmerTextNormedEmbedding`:
@@ -470,30 +478,7 @@ pub fn embed_raw(
     token_id: u32,
 ) -> Result<Vec<f32>, String> {
     let dim = cfg.dim;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer embed_raw hfq4g256: {e:?}"))?,
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer embed_raw hfq4g128: {e:?}"))?,
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer embed_raw q8: {e:?}"))?,
-        EmbeddingFormat::IU8G32 => gpu
-            .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer embed_raw iu8g32: {e:?}"))?,
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("glimmer embed_raw f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => {
-            return Err("glimmer embed_raw: Q4K unsupported".into());
-        }
-        EmbeddingFormat::Ggml(_) => return Err(
-            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
-                .into(),
-        ),
-    }
+    embed_row(gpu, weights, &state.x, token_id, dim, "embed_raw")?;
     let host = gpu
         .download_f32(&state.x)
         .map_err(|e| format!("glimmer embed_raw download: {e:?}"))?;

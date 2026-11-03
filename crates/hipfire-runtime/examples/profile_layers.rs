@@ -198,23 +198,15 @@ fn profile_token(
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())
         .unwrap();
-    match weights.embd_format {
-        llama::EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)
-            .unwrap(),
-        llama::EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)
-            .unwrap(),
-        llama::EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)
-            .unwrap(),
-        llama::EmbeddingFormat::Q4K => gpu
-            .embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)
-            .unwrap(),
-        llama::EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&weights.token_embd, &scratch.x, token, dim)
-            .unwrap(),
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        dim,
+    )
+    .unwrap();
     timings.embedding_us = sync_us(gpu, t);
 
     // Layers

@@ -1837,31 +1837,15 @@ pub fn prepare_decode_batch_inputs(
         std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, tokens_host.len() * 4)
     };
     gpu.hip.memcpy_htod(&state.pbs.tokens.buf, token_bytes)?;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-            &weights.token_embd,
-            &state.pbs.x_batch,
-            &state.pbs.tokens,
-            n,
-            config.dim,
-        )?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-            &weights.token_embd,
-            &state.pbs.x_batch,
-            &state.pbs.tokens,
-            n,
-            config.dim,
-        )?,
-        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(
-            &weights.token_embd,
-            &state.pbs.x_batch,
-            &state.pbs.tokens,
-            n,
-            config.dim,
-        )?,
-        // Unreachable: guarded above.
-        _ => unreachable!("embedding format pre-checked"),
-    }
+    llama::embedding_lookup_batched_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &state.pbs.x_batch,
+        &state.pbs.tokens,
+        n,
+        config.dim,
+    )?;
 
     let positions_host: Vec<i32> = positions.iter().map(|&position| position as i32).collect();
     let position_bytes: &[u8] = unsafe {

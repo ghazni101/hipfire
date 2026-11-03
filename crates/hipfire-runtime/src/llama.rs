@@ -693,6 +693,43 @@ pub fn embedding_lookup_dispatch(
     }
 }
 
+/// Batched embedding lookup: `n` rows gathered from `table` into `output`
+/// (`[n, dim]` F32), with the token ids read from the device buffer
+/// `token_ids` (i32 payload). The batched twin of
+/// [`embedding_lookup_dispatch`]; every format with a batched kernel is wired
+/// here once. Every arm reads the ids from device memory, so the call replays
+/// under graph capture. Q4K has no batched kernel and returns an error.
+pub fn embedding_lookup_batched_dispatch(
+    gpu: &mut Gpu,
+    format: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token_ids: &GpuTensor,
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    match format {
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup_batched(dtype, table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::Q4K => Err(hip_bridge::HipError::new(
+            0,
+            "embedding_lookup_batched_dispatch: Q4K has no batched lookup kernel",
+        )),
+    }
+}
+
 /// GPU-resident LLaMA model weights.
 pub struct LlamaWeights {
     pub token_embd: GpuTensor,
@@ -2841,49 +2878,25 @@ fn forward_prefill_chunk(
                 unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
         }
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            _ => unreachable!(),
-        }
+        embedding_lookup_batched_dispatch(
+            gpu,
+            weights.embd_format,
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            n,
+            dim,
+        )?;
     } else {
         for (i, &tok) in tokens.iter().enumerate() {
-            match weights.embd_format {
-                EmbeddingFormat::Q4K => {
-                    gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::IU8G32 => {
-                    gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Ggml(dtype) => {
-                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {
-                    unreachable!()
-                }
-            }
+            embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &s.x,
+                tok,
+                dim,
+            )?;
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
                 i * dim_row_bytes,

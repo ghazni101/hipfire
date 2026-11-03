@@ -229,28 +229,21 @@ pub fn spec_step_dflash_mtp(
     let dim_bytes = dim * 4;
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::Ggml(_) => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
-                )
-                .into())
-            }
-            _ => panic!("dflash_mtp: unsupported target embedding format"),
+        if let llama::EmbeddingFormat::Ggml(_) = target.weights.embd_format {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+            )
+            .into());
         }
+        llama::embedding_lookup_dispatch(
+            gpu,
+            target.weights.embd_format,
+            &target.weights.token_embd,
+            &dst,
+            tok,
+            h,
+        )?;
     }
 
     // Positions (no eviction support — this is a v1 path, no FlashCASK).
@@ -823,28 +816,21 @@ pub fn spec_step_dflash_mtp_tree(
     let dim_bytes = dim * 4;
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            llama::EmbeddingFormat::Ggml(_) => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
-                )
-                .into())
-            }
-            _ => panic!("dflash_mtp_tree: unsupported target embedding format"),
+        if let llama::EmbeddingFormat::Ggml(_) = target.weights.embd_format {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+            )
+            .into());
         }
+        llama::embedding_lookup_dispatch(
+            gpu,
+            target.weights.embd_format,
+            &target.weights.token_embd,
+            &dst,
+            tok,
+            h,
+        )?;
     }
 
     let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
