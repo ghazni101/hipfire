@@ -319,6 +319,14 @@ pub fn gemm_rows(
         DType::MQ6G256 => gpu
             .gemm_mq6g256_batched_lmhead(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
+        // One row is the AR singleton, and the MQ4V2 GEMV writes Y outright.
+        // The plain GEMM below is zero + residual WMMA, and that zeroing is a
+        // host `hipMemset(&y)` — host work inside a forward body, which a
+        // retained PM4 tape cannot replay (`effect-incomplete capture`) and
+        // which the slots MoE body paid three times per layer. This mirrors
+        // `layer_ops::project_rotated`, whose one-row arm already keeps the
+        // GEMV for exactly the same reason. Multi-row keeps the WMMA GEMM.
+        DType::MQ4G256V2 if rows == 1 => gpu.gemv_mq4g256v2(w.buf, x, y, w.m, w.k).map_err(hip),
         DType::MQ4G256V2 => gpu.gemm_mq4g256v2(w.buf, x, y, w.m, w.k, rows).map_err(hip),
         // BF16 teachers (calibration): stage the F32 input to BF16 for the
         // MFMA GEMM, which resolves only where the arch has one.
@@ -667,6 +675,8 @@ pub(super) fn rms_norm(
 pub enum RopeKind {
     /// Every channel pair of the head rotates.
     RotateHalf,
+    /// [`Self::RotateHalf`] with the Llama-3 inverse-frequency remap.
+    RotateHalfLlama3(rdna_compute::rope::RopeLlama3),
     /// The first `rot_pairs` pairs of each half rotate; the rest pass through.
     PartialHalved { rot_pairs: usize },
     /// Rotate-half over the first `rot_dim` channels of each head (pair
@@ -687,7 +697,7 @@ impl Rope {
     /// pairing is a prefix of the head.
     fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
         match self.kind {
-            RopeKind::RotateHalf => Some(head_dim / 2),
+            RopeKind::RotateHalf | RopeKind::RotateHalfLlama3(_) => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
             RopeKind::PrefixHalfSplit { .. } => None,
             RopeKind::NoPe => Some(0),
@@ -712,6 +722,9 @@ impl Rope {
             RopeKind::NoPe => Ok(()),
             RopeKind::RotateHalf => {
                 gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
+            }
+            RopeKind::RotateHalfLlama3(l3) => {
+                gpu.rope_scaled_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta, l3)
             }
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32(
                 q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_pairs, theta,
@@ -764,6 +777,9 @@ impl Rope {
             RopeKind::RotateHalf => {
                 gpu.rope_batched_f32(q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows)
             }
+            RopeKind::RotateHalfLlama3(l3) => gpu.rope_batched_scaled_f32(
+                q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows, l3,
+            ),
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),
@@ -853,8 +869,11 @@ pub struct DraftContext<'a> {
 ///     tiled     28.65  28.55  28.38  28.20  27.86  27.20
 /// ```
 ///
-/// Both kernels read the same cache with the same mask; the output is
-/// byte-identical on either side of the threshold.
+/// Both kernels read the same cache with the same mask but reduce in a
+/// different order, so the output is not byte-identical across the threshold:
+/// on gfx1151 most of the 4096 output floats differ, by at most about 6e-6
+/// (HIPF-249). A given position always takes the same kernel, so decode stays
+/// deterministic.
 pub const WINDOWED_Q8_TILED_MIN_SEQ: usize = 1280;
 
 /// F32 elements of the tiled kernel's partials for a cache of `cap` rows.

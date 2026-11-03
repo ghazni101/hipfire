@@ -13,7 +13,10 @@ do not carry that full identity manifest, so this page is **historical** only
 [Measured performance (v0.4.4)](../README.md#measured-performance-v044) table
 and the [CHANGELOG](../CHANGELOG.md) entries it cites. The tables below were
 taken on older builds, most with the since-deprecated `asym3` KV mode; they
-are not the current speed of any listed card or model.
+are not the current speed of any listed card or model. The v0.4.5 Flash-Next
+EP2 serve measurement (2x R9700, 2026-11-11) is the **measured** (not admitted)
+record [`perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md);
+it has no [`admissions.yml`](admissions.yml) row and is not a product floor.
 
 | Field | Value |
 |---|---|
@@ -143,6 +146,19 @@ proves a broader win. Enable globally with `hipfire config set dflash_mode auto`
 (dense Qwen 3.5+ on, A3B off unless overridden) or per model with
 `hipfire config qwen3.5:27b set dflash_mode on`. The numbers above were measured
 with DFlash forced on.
+
+## Historical: 7900 XTX small-model snapshot (hipfire only)
+
+**Truth state:** historical
+Same-machine snapshot of hipfire MQ4 with asym3 KV and FlashAttention at
+matched ~140-token and ~530-token prompts and 128-token generation. No
+per-row binary/model hash manifest on this page.
+
+| Model | hf pp128 | hf pp512 | hf decode |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B | **10,861** | **12,962** | **353** |
+| Qwen 3.5 4B | **3,304** | **3,321** | **165** |
+| Qwen 3.5 9B | **1,920** | 1,919 | **122** |
 
 ## Historical: other arches (decode tok/s)
 

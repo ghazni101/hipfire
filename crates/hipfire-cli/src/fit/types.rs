@@ -3,8 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Data shared by the `hipfire fit` stages: the machine facts (read from
-//! sysfs, `/proc` and the calibration record, never from HIP), the per-fact
-//! findings behind the verdict, and the weight placement a load would take.
+//! sysfs, `/proc` and the calibration record on Linux, from HIP and
+//! `GlobalMemoryStatusEx` on native Windows), the per-fact findings behind
+//! the verdict, and the weight placement a load would take.
 
 use serde::Serialize;
 
@@ -61,7 +62,7 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Finding {
     /// Stable id: `preflight`, `admission`, `vram`, `context`, `experts`,
-    /// `host_ram`, `gtt`, `weights`.
+    /// `host_ram`, `gtt`, `weights`, `draft`.
     pub id: &'static str,
     pub verdict: Verdict,
     /// What was found, with the numbers it was decided on.
@@ -124,7 +125,8 @@ pub(crate) struct LinkFacts {
     pub detail: String,
 }
 
-/// A GPU a load could use, from the KFD topology and amdgpu sysfs only.
+/// A GPU a load could use, from the KFD topology and amdgpu sysfs (native
+/// Windows: from HIP).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct FitDevice {
     /// Logical index in the set a load would use (0 = the device a
@@ -136,11 +138,27 @@ pub(crate) struct FitDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_total: Option<u64>,
     /// Free device bytes as `Gpu::device_mem_info` would report them before
-    /// the load, derived without HIP (see `fit/host.rs`).
+    /// the load, derived without HIP on Linux (see `fit/host.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkFacts>,
+    /// Tokens of context the model being fitted projects on this GPU (`0`: its
+    /// weights do not fit the free memory). Filled by the model analysis; absent
+    /// where no projection ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u64>,
+    /// `capacity` capped at the model's trained window (what the report shows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_shown: Option<u64>,
+    /// `HIP_VISIBLE_DEVICES` value that selects this GPU (UUID, else ROCr
+    /// ordinal). Report text only.
+    #[serde(skip)]
+    pub env_selector: String,
+    /// `hardware.devices` value that selects this GPU (UUID, else PCI
+    /// address). Report text only.
+    #[serde(skip)]
+    pub config_selector: String,
 }
 
 /// Host memory facts the admission gates read.

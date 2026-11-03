@@ -9,6 +9,7 @@ description = "Kernel Atlas: typed measurement schema + JSONL writer for hipfire
 regex = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 
 [[bin]]
 name = "hipfire-atlas"

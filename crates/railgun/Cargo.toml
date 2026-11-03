@@ -9,6 +9,8 @@ publish = false
 # A runtime crate: it must never reach peacemaker, dev-dependencies included
 # (checked by peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
 [dependencies]
+# `railgun::contract`: KernelAbiV1 node checks (layer 0; no peacemaker, no GPU).
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
 railgun-corpus = { path = "../railgun-corpus" }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
@@ -24,6 +26,8 @@ hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 redline-rocr = { path = "../redline-rocr" }
+# `tests/kernel_abi_contract.rs` certifies the committed PM objects (offline; dev edge only).
+railgun-cert = { path = "../railgun-cert" }
 serde_json.workspace = true
 sha2.workspace = true
 
@@ -39,6 +43,11 @@ cond-probe = []
 # `railgun::npu`: the XDNA2 / AIE2P NPU runtime (amdxdna DRM ioctls, BOs, submit, ring, tape, FCLK guard,
 # dlopen'd HIP interop). Experimental and dark: no hipfire runtime path enables it.
 npu = ["dep:parking_lot", "dep:hipfire-config"]
+# Lab-only admission state `lab: differential-verified, certificate pending`
+# (`railgun::admission`, `KernelProgram::admit_lab_pending`): a node whose only
+# missing certificate is a task-graph/arena one runs through the same pipeline
+# with the certificate slot marked pending. Never enabled by a product build.
+lab = []
 
 [[example]]
 name = "g4_probe"

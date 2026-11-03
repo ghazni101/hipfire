@@ -323,6 +323,13 @@ fn load_bundle(
     let trunk_overlay =
         hipfire_arch_qwen4::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
             .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+    let hc8_sidecar = hipfire_arch_qwen4::resolve_hc8_sidecar(
+        &hfq,
+        path,
+        gpu.flags.qwen4_hc8_enabled(),
+        &receipt.config,
+    )
+    .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
     let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
         gpu,
         &hfq,
@@ -414,6 +421,11 @@ fn load_bundle(
         bundle
             .attach_trunk_overlay(overlay)
             .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
+    }
+    if let Some(sidecar) = hc8_sidecar {
+        bundle
+            .attach_hc8_sidecar(sidecar)
+            .map_err(|e| format!("qwen4 hc8 sidecar: {e}"))?;
     }
     bundle
         .attach_forward(gpu, max_seq, scratch_mode)
@@ -1668,14 +1680,13 @@ mod tests {
 
     #[test]
     fn mq4r_default_arches_run_the_gate() {
-        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        assert!(route("gfx1201", "/m/flash-next.mq4r", false).default_route());
+        assert!(route("gfx1201", "/m/FLASH-NEXT.MQ4R", false).default_route());
+        // HIPF-254: Qwen4 is carved out of the MQ4R default on gfx1100/gfx1151.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
             assert!(
-                route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
+                !route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
                 "{gpu_arch}"
-            );
-            assert!(
-                route(gpu_arch, "/m/FLASH-NEXT.MQ4R", false).default_route(),
-                "{gpu_arch} upper-case extension"
             );
         }
     }

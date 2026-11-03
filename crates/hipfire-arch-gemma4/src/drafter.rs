@@ -387,6 +387,8 @@ fn load_wt(
             ))
         }
     };
+    hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, name)
+        .map_err(|e| format!("gemma4-drafter: {e:?}"))?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("gemma4-drafter: upload {name}: {e:?}"))?;
@@ -851,7 +853,10 @@ pub fn target_embedding_table(target: &Gemma4Weights) -> Option<GpuTensor> {
         EmbeddingFormat::Q8_0 => DType::Q8_0,
         EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G32 => return None,
+        EmbeddingFormat::F32
+        | EmbeddingFormat::Q4K
+        | EmbeddingFormat::Ggml(_)
+        | EmbeddingFormat::IU8G32 => return None,
     };
     Some(GpuTensor {
         // SAFETY: a view of the target-owned table for one step list.

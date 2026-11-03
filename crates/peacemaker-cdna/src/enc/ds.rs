@@ -43,6 +43,7 @@ op_table!(DsOp {
     ReadI16,
     WriteB8,
     WriteB16,
+    WriteB16D16Hi,
     WriteB32,
     WriteB64,
     WriteB96,
@@ -86,7 +87,7 @@ impl DsOp {
             Self::ReadB64 | Self::Read2B32 | Self::Read2st64B32 => (2, 0, 0),
             Self::ReadB96 => (3, 0, 0),
             Self::ReadB128 | Self::Read2B64 | Self::Read2st64B64 => (4, 0, 0),
-            Self::WriteB8 | Self::WriteB16 | Self::WriteB32 => (0, 1, 0),
+            Self::WriteB8 | Self::WriteB16 | Self::WriteB16D16Hi | Self::WriteB32 => (0, 1, 0),
             Self::WriteB64 => (0, 2, 0),
             Self::WriteB96 => (0, 3, 0),
             Self::WriteB128 => (0, 4, 0),
@@ -155,6 +156,7 @@ impl DsOp {
             | Self::ReadI16 => MemKind::DsLoad,
             Self::WriteB8
             | Self::WriteB16
+            | Self::WriteB16D16Hi
             | Self::WriteB32
             | Self::WriteB64
             | Self::WriteB96
@@ -426,8 +428,12 @@ fn swizzle_offset(imm: u16) -> String {
     format!(" offset:{imm}")
 }
 
-impl fmt::Display for Ds {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Ds {
+    pub(crate) fn fmt_assembly(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, true)
+    }
+
+    fn fmt_impl(&self, f: &mut fmt::Formatter<'_>, lossless: bool) -> fmt::Result {
         let (wv, w0, w1) = self.op.widths();
         f.write_str(self.op.name())?;
         let mut sep = " ";
@@ -449,7 +455,7 @@ impl fmt::Display for Ds {
             if self.offset1 != 0 {
                 write!(f, " offset1:{}", self.offset1)?
             }
-        } else if self.op == DsOp::SwizzleB32 {
+        } else if self.op == DsOp::SwizzleB32 && !lossless {
             f.write_str(&swizzle_offset(self.offset()))?;
         } else if self.offset() != 0 {
             write!(f, " offset:{}", self.offset())?;
@@ -458,6 +464,12 @@ impl fmt::Display for Ds {
             f.write_str(" gds")?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for Ds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, false)
     }
 }
 
@@ -483,6 +495,7 @@ impl DsOp {
                 Self::ReadI16 => 59,
                 Self::WriteB8 => 30,
                 Self::WriteB16 => 31,
+                Self::WriteB16D16Hi => 85,
                 Self::WriteB32 => 13,
                 Self::WriteB64 => 77,
                 Self::WriteB96 => 222,
@@ -522,6 +535,7 @@ impl DsOp {
             Self::ReadI16 => "ds_read_i16",
             Self::WriteB8 => "ds_write_b8",
             Self::WriteB16 => "ds_write_b16",
+            Self::WriteB16D16Hi => "ds_write_b16_d16_hi",
             Self::WriteB32 => "ds_write_b32",
             Self::WriteB64 => "ds_write_b64",
             Self::WriteB96 => "ds_write_b96",

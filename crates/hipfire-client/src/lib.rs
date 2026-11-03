@@ -70,6 +70,16 @@ pub mod error_class {
 pub enum ClientError {
     #[error("daemon binary not found: {0}")]
     MissingDaemon(PathBuf),
+    #[error(
+        "daemon at {path} reports build {daemon_commit} but this client was built from {client_commit}: \
+         a mixed install. Both binaries must come from one hipfire home - re-run `hipfire setup` \
+         or point HIPFIRE_HOME/PATH at a single install"
+    )]
+    DaemonBuildMismatch {
+        path: PathBuf,
+        daemon_commit: String,
+        client_commit: String,
+    },
     #[error("failed to spawn daemon {path}: {source}")]
     Spawn {
         path: PathBuf,
@@ -341,8 +351,38 @@ pub enum OpenAiSseEvent {
     },
     /// Separate `choices: []` usage chunk (never rides the finish choice).
     Usage { usage: Value },
+    /// Prefill progress from the `: prefill <done>/<total>` SSE comment frame
+    /// (sent only before the first token; never a delta).
+    PrefillProgress { done: u64, total: u64 },
     /// Literal `data: [DONE]` terminator.
     Done,
+}
+
+/// Whole-percent prefill completion (`done * 100 / total`, floored, capped at
+/// 100; 0 when `total` is 0).
+pub fn prefill_percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (u128::from(done.min(total)) * 100 / u128::from(total)) as u64
+}
+
+/// Seconds until prefill finishes at the rate observed so far (`done` tokens
+/// in `elapsed` since the request was sent). `None` until a rate exists.
+pub fn prefill_eta_secs(done: u64, total: u64, elapsed: Duration) -> Option<f64> {
+    let secs = elapsed.as_secs_f64();
+    if done == 0 || secs <= 0.0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(done) as f64;
+    Some(remaining * secs / done as f64)
+}
+
+/// Parse the exact `: prefill <done>/<total>` SSE comment line.
+fn parse_prefill_comment(line: &str) -> Option<(u64, u64)> {
+    let rest = line.strip_prefix(": prefill ")?;
+    let (done, total) = rest.split_once('/')?;
+    Some((done.parse().ok()?, total.parse().ok()?))
 }
 
 /// Deterministic SSE reader/parser seam over an already-open byte stream.
@@ -368,7 +408,10 @@ pub fn read_openai_sse(
             continue;
         }
         let Some(payload) = trimmed.strip_prefix("data:").map(str::trim) else {
-            // Ignore SSE comments / event: / id: / retry: lines.
+            if let Some((done, total)) = parse_prefill_comment(trimmed) {
+                on_event(OpenAiSseEvent::PrefillProgress { done, total })?;
+            }
+            // Ignore other SSE comments / event: / id: / retry: lines.
             continue;
         };
         if payload.is_empty() {
@@ -519,14 +562,88 @@ pub fn stream_openai_chat(
 }
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    use ureq::unversioned::{
+        resolver::DefaultResolver,
+        transport::{Connector, DefaultConnector},
+    };
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .timeout_recv_body(Some(Duration::from_secs(120)))
         .http_status_as_error(false)
         // Never forward the bearer to another origin.
         .max_redirects(0)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::new().chain(eintr::RetryInterrupted),
+        DefaultResolver::default(),
+    )
+}
+
+/// `read(2)` interrupted by a signal (EINTR) transfers no bytes and is safe to
+/// reissue, but std's `TcpStream::read` (used by ureq) surfaces it as an error.
+/// Any signal delivered to the process during a blocking response read would
+/// otherwise fail an in-flight request. Retrying only the interrupted syscall
+/// is not a client-side request retry: nothing is resent.
+mod eintr {
+    use ureq::unversioned::transport::{
+        Buffers, ConnectionDetails, Connector, NextTimeout, Transport,
+    };
+    use ureq::Error;
+
+    #[derive(Debug)]
+    pub(super) struct RetryInterrupted;
+
+    impl Connector<Box<dyn Transport>> for RetryInterrupted {
+        type Out = Box<dyn Transport>;
+
+        fn connect(
+            &self,
+            _: &ConnectionDetails,
+            chained: Option<Box<dyn Transport>>,
+        ) -> Result<Option<Self::Out>, Error> {
+            Ok(chained.map(|inner| Box::new(RetryTransport(inner)) as Box<dyn Transport>))
+        }
+    }
+
+    fn interrupted(error: &Error) -> bool {
+        matches!(error, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted)
+    }
+
+    #[derive(Debug)]
+    struct RetryTransport(Box<dyn Transport>);
+
+    impl Transport for RetryTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            self.0.buffers()
+        }
+
+        fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+            loop {
+                match self.0.transmit_output(amount, timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+            loop {
+                match self.0.await_input(timeout) {
+                    Err(e) if interrupted(&e) => continue,
+                    other => return other,
+                }
+            }
+        }
+
+        fn is_open(&mut self) -> bool {
+            self.0.is_open()
+        }
+
+        fn is_tls(&self) -> bool {
+            self.0.is_tls()
+        }
+    }
 }
 
 fn http_error_message(status: u16, text: &str) -> String {
@@ -581,6 +698,89 @@ struct EngineInner {
 /// process owns and nothing else on the machine.
 static OWNED_DAEMONS: Mutex<Vec<Weak<EngineInner>>> = Mutex::new(Vec::new());
 
+/// Workspace HEAD this client crate was compiled from (`build.rs` stamps it
+/// the same way `hipfire-cli` stamps its own; `unknown` outside a repo).
+const CLIENT_BUILD_COMMIT: &str = env!("HIPFIRE_BUILD_COMMIT");
+
+/// The commit from a `hipfire-daemon <version> <full build commit>` version
+/// line; `None` for anything else (the daemon answers `--version` with
+/// exactly this shape before any GPU or IPC work).
+fn daemon_commit_from_version_line(line: &str) -> Option<&str> {
+    let mut parts = line.trim().split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("hipfire-daemon"), Some(_version), Some(commit)) if !commit.is_empty() => {
+            Some(commit)
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a daemon binary from a different build before speaking to it.
+///
+/// A mixed install (a CLI from one tree driving a daemon from another) used to
+/// surface as an arbitrary daemon startup failure - on this reporting host, a
+/// newer CLI sent `serve.multi_slot_max_sessions` and the older daemon died
+/// with `FATAL: failed to resolve startup configuration: unknown
+/// configuration key`, naming neither the cause nor the fix. The probe runs
+/// the daemon's `--version` (answered before process init) and fails only on
+/// a positive mismatch: an unparseable answer, a spawn failure, or an
+/// `unknown` stamp on either side passes, so dev fixtures and override-built
+/// binaries are unaffected.
+fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
+    if CLIENT_BUILD_COMMIT == "unknown" {
+        return Ok(());
+    }
+    let mut child = match std::process::Command::new(daemon)
+        .arg("--version")
+        // A daemon fixture that reads stdin must see EOF, not this caller's
+        // pipes; the real daemon answers before touching stdin anyway.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Ok(()),
+    };
+    // The real daemon answers --version before any process init. Anything
+    // still running after the deadline is not a version answer (a fixture
+    // that ignores the flag), not evidence of skew: kill it and pass.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(());
+    }
+    // The child has exited, so reading its piped stdout cannot block.
+    let mut stdout = String::new();
+    let read = child.stdout.take().map_or(false, |mut pipe| {
+        std::io::Read::read_to_string(&mut pipe, &mut stdout).is_ok()
+    });
+    if !read {
+        return Ok(());
+    }
+    let commit = daemon_commit_from_version_line(&stdout).unwrap_or("");
+    if commit.is_empty() || commit == "unknown" || commit == CLIENT_BUILD_COMMIT {
+        return Ok(());
+    }
+    Err(ClientError::DaemonBuildMismatch {
+        path: daemon.to_owned(),
+        daemon_commit: commit.to_owned(),
+        client_commit: CLIENT_BUILD_COMMIT.to_owned(),
+    })
+}
+
 impl EngineInner {
     /// Kill the daemon if it still runs and reap it. `wait` returns only once
     /// the kernel has finished tearing the process down, and the daemon's
@@ -633,6 +833,7 @@ impl Engine {
         if !daemon.is_file() {
             return Err(ClientError::MissingDaemon(daemon.to_owned()));
         }
+        check_daemon_build_matches(daemon)?;
         let mut command = Command::new(daemon);
         command
             .stdin(Stdio::piped())
@@ -681,6 +882,7 @@ impl Engine {
                     ty,
                     "gen_start"
                         | "token"
+                        | "prefill_progress"
                         | "reasoning"
                         | "tool_calls"
                         | "committed"
@@ -1750,6 +1952,7 @@ fn reject_stale_lifecycle_event(
         "gen_start"
             | "token"
             | "reasoning"
+            | "prefill_progress"
             | "tool_calls"
             | "committed"
             | "commit_ready"
@@ -1910,6 +2113,47 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["r", "c", "f", "d"]);
+    }
+
+    #[test]
+    fn sse_prefill_comment_parsed_other_comments_ignored() {
+        let raw = format!(
+            ": keepalive\n\n: prefill 512/2048\n\n: prefill 1024/2048\n\n: prefill nope\n\n: prefill 1/\n\n{}{}",
+            sse_line(r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#),
+            sse_line(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+        ) + "data: [DONE]\n\n";
+        let events = collect_sse(&raw).unwrap();
+        assert_eq!(
+            events[..2],
+            [
+                OpenAiSseEvent::PrefillProgress {
+                    done: 512,
+                    total: 2048
+                },
+                OpenAiSseEvent::PrefillProgress {
+                    done: 1024,
+                    total: 2048
+                },
+            ]
+        );
+        assert!(matches!(events[2], OpenAiSseEvent::Content { .. }));
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn prefill_percent_and_eta_helpers() {
+        assert_eq!(prefill_percent(512, 2048), 25);
+        assert_eq!(prefill_percent(2047, 2048), 99);
+        assert_eq!(prefill_percent(5, 0), 0);
+        assert_eq!(prefill_percent(9, 4), 100);
+        let secs = prefill_eta_secs(512, 2048, Duration::from_secs(2)).unwrap();
+        assert!((secs - 6.0).abs() < 1e-9, "{secs}");
+        assert_eq!(prefill_eta_secs(0, 2048, Duration::from_secs(2)), None);
+        assert_eq!(prefill_eta_secs(1, 2, Duration::ZERO), None);
+        assert_eq!(
+            prefill_eta_secs(2048, 2048, Duration::from_secs(2)),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -2393,6 +2637,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2564,6 +2809,7 @@ mod tests {
             "gen_start",
             "token",
             "reasoning",
+            "prefill_progress",
             "tool_calls",
             "committed",
             "commit_ready",
@@ -2823,6 +3069,124 @@ done
         Engine::spawn_configured(daemon, &BTreeMap::new(), config, None).unwrap()
     }
 
+    #[test]
+    fn daemon_version_line_parses_commit_only_in_the_daemon_shape() {
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4 abc123def456"),
+            Some("abc123def456")
+        );
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4 unknown"),
+            Some("unknown")
+        );
+        // Not the daemon's line shape, or truncated.
+        assert_eq!(daemon_commit_from_version_line("hipfire 0.4.4 abc"), None);
+        assert_eq!(
+            daemon_commit_from_version_line("hipfire-daemon 0.4.4"),
+            None
+        );
+        assert_eq!(daemon_commit_from_version_line(""), None);
+    }
+
+    /// The client must stamp its build commit through the same build script as
+    /// `hipfire-cli` (which `hipfire-daemon` already shares). A divergent
+    /// script once watched only `.git/HEAD`, which still reads
+    /// `ref: refs/heads/...` after a commit, so the client kept the previous
+    /// commit while the daemon restamped on HEAD and index - and after a
+    /// commit that touched no client sources, every spawn would refuse as a
+    /// mixed install (review of this PR).
+    #[test]
+    fn client_shares_the_cli_build_stamp_source() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == "build = \"../hipfire-cli/build.rs\""),
+            "hipfire-client must share hipfire-cli's build script, not stamp its own commit"
+        );
+    }
+
+    /// A daemon that answers `--version` with a different build commit is the
+    /// mixed-install state; the spawn must name it instead of surfacing the
+    /// daemon's own startup failure later. Skipped when the client itself was
+    /// built outside a repo (`unknown` stamp passes everything by design).
+    #[cfg(unix)]
+    #[test]
+    fn mixed_build_daemon_is_refused_with_a_named_cause() {
+        if CLIENT_BUILD_COMMIT == "unknown" {
+            eprintln!("client built without a commit stamp; probe passes by design");
+            return;
+        }
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_mixed_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\nprintf 'hipfire-daemon 0.0.0 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\\n'\n",
+        );
+        let err = match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(err) => err,
+            Ok(_) => panic!("a daemon from a different build must be refused"),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("mixed install"), "{rendered}");
+        assert!(rendered.contains(daemon.to_str().unwrap()), "{rendered}");
+        assert!(rendered.contains("deadbeef"), "{rendered}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An unparseable `--version` answer is not evidence of skew: the probe
+    /// passes and the spawn proceeds to fail (or succeed) for its real reason.
+    /// A daemon that ignores `--version` entirely and blocks (a stdin-reading
+    /// fixture) is killed at the probe deadline and also passes.
+    #[cfg(unix)]
+    #[test]
+    fn unparseable_daemon_version_passes_the_build_probe() {
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_unparseable_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\ncase \"$1\" in --version) printf 'not a version line\\n';; esac\nexit 0\n",
+        );
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("an unparseable version answer must pass the probe")
+            }
+            _ => {}
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `--version` that never exits (a fixture that ignores the flag and
+    /// reads stdin forever) is killed at the deadline, not awaited forever.
+    #[cfg(unix)]
+    #[test]
+    fn blocking_daemon_version_probe_times_out_and_passes() {
+        let root = env::temp_dir().join(format!(
+            "hipfire_client_blocking_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let daemon = write_fake_daemon(&root, "#!/bin/sh\nwhile read line; do :; done\n");
+        let started = std::time::Instant::now();
+        match Engine::spawn(&daemon, &BTreeMap::new()) {
+            Err(ClientError::DaemonBuildMismatch { .. }) => {
+                panic!("a blocked version probe must pass, not report skew")
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "probe must not wait on a daemon that ignores --version"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn generate_commit_ready_sends_matching_commit() {
@@ -2898,6 +3262,61 @@ done
             !logged.contains(r#""type":"abort""#),
             "successful commit must not send abort: {logged}"
         );
+        engine.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_routes_prefill_progress_to_callback_non_terminal() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-prefill-progress-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      echo '{"type":"gen_start","id":"req-pp","attempt_id":3}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":512,"total":2048}'
+      echo '{"type":"prefill_progress","id":"req-pp","attempt_id":3,"done":1024,"total":2048}'
+      echo '{"type":"prefill_progress","id":"other","attempt_id":3,"done":1,"total":2}'
+      echo '{"type":"commit_ready","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*)
+      echo '{"type":"done","id":"req-pp","attempt_id":3,"finish_reason":"stop"}'
+      ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let mut engine = spawn_fake_engine(&daemon);
+        let mut progress = Vec::new();
+        engine
+            .generate(
+                &serde_json::json!({
+                    "type": "generate",
+                    "id": "req-pp",
+                    "attempt_id": 3,
+                    "prompt": "hi",
+                }),
+                |ev| {
+                    if ev.get("type").and_then(Value::as_str) == Some("prefill_progress") {
+                        progress.push((
+                            ev.get("done").and_then(Value::as_u64).unwrap(),
+                            ev.get("total").and_then(Value::as_u64).unwrap(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        // The peer-id progress line is quarantined, never delivered here.
+        assert_eq!(progress, vec![(512, 2048), (1024, 2048)]);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -4706,6 +5125,62 @@ done
             "{err}"
         );
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    extern "C" fn noop_signal_handler(_: libc::c_int) {}
+
+    /// Signals delivered (without SA_RESTART) while the client blocks reading
+    /// the response must not surface EINTR as an HTTP error.
+    #[cfg(unix)]
+    #[test]
+    fn http_requests_survive_signals_during_blocking_read() {
+        // SAFETY: installs a no-op handler for SIGUSR2 without SA_RESTART so
+        // blocking syscalls on the signalled thread return EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = noop_signal_handler as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let seen = read_request(&mut stream);
+            // Hold the response so the client sits in a blocking read.
+            thread::sleep(Duration::from_millis(400));
+            stream
+                .write_all(json_response("200 OK", r#"{"ok":true}"#).as_bytes())
+                .unwrap();
+            seen
+        });
+
+        // SAFETY: pthread_self has no preconditions.
+        let target = unsafe { libc::pthread_self() } as usize;
+        let done = Arc::new(AtomicBool::new(false));
+        let signaller = {
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    // SAFETY: the target thread outlives this loop (joined below).
+                    unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGUSR2) };
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
+        let result = http_get_json(&endpoint, "/health", Duration::from_secs(10));
+        done.store(true, Ordering::SeqCst);
+        signaller.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(result.unwrap()["ok"], true);
     }
 
     #[test]

@@ -1704,6 +1704,10 @@ pub(crate) struct RequestContract {
     /// default and only a ceiling; the daemon fits it to the context left
     /// after the prompt (wire `max_tokens_fit`).
     pub max_tokens_fit: bool,
+    /// vLLM-compatible `min_tokens` (0 = none): EOS and stop sequences stay
+    /// inactive until this many completion tokens are emitted. Never above
+    /// `max_tokens`.
+    pub min_tokens: u64,
     pub messages: serde_json::Value,
     /// Multi-slot only: normalized/default-system-projected messages before
     /// tool-choice prompt instructions are added. Slot ownership uses this
@@ -1768,11 +1772,17 @@ pub(crate) fn project_request_contract(
     if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
         bail_invalid!("max_tokens must be between 1 and 393216");
     }
+    let min_tokens = project_min_tokens(body, max_tokens)?;
     validate_single_choice(body)?;
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
     }
-    let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
+    // The singleton route renders an image at its message position (the
+    // daemon expands each slot); the experimental multi-slot route has no
+    // slot contract and keeps its text-only projection.
+    let mark_images = !multi_slot && !request_images_base64(body.get("messages"))?.is_empty();
+    let mut messages =
+        normalize_openai_messages_marked(body.get("messages"), include_reasoning, mark_images);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
     let conversation_messages = multi_slot.then(|| messages.clone());
@@ -1786,6 +1796,7 @@ pub(crate) fn project_request_contract(
     Ok(RequestContract {
         max_tokens,
         max_tokens_fit: explicit_max_tokens.is_none(),
+        min_tokens,
         messages,
         conversation_messages,
         tool_choice_policy,
@@ -1794,17 +1805,45 @@ pub(crate) fn project_request_contract(
     })
 }
 
-/// Every serve route returns one completion per request: `n` other than 1
-/// is refused rather than silently answered with a single choice.
-fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
-    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
-        if n.as_u64() != Some(1) {
-            bail_invalid!(
-                "n != 1 is not supported on this serve route (one completion per request)"
-            );
+/// OpenAI `n`: one request may ask for up to [`MAX_CHOICES`] independent
+/// completions. The HTTP layer fans them out; each choice is a separate
+/// daemon attempt with its own sampler stream. Values outside the bound and
+/// non-integers are typed 400s, never silently clamped.
+pub(crate) const MAX_CHOICES: u64 = 8;
+
+pub(crate) fn request_choice_count(body: &serde_json::Value) -> Result<u64> {
+    match body.get("n").filter(|n| !n.is_null()) {
+        None => Ok(1),
+        Some(n) => {
+            let Some(n) = n.as_u64() else {
+                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
+            };
+            if n == 0 || n > MAX_CHOICES {
+                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
+            }
+            Ok(n)
         }
     }
-    Ok(())
+}
+
+/// vLLM-compatible `min_tokens`: absent or `null` is 0; otherwise a
+/// non-negative integer no larger than `max_tokens` (400 otherwise, never a
+/// silent clamp).
+fn project_min_tokens(body: &serde_json::Value, max_tokens: u64) -> Result<u64> {
+    let Some(value) = body.get("min_tokens").filter(|v| !v.is_null()) else {
+        return Ok(0);
+    };
+    let Some(min_tokens) = value.as_u64() else {
+        bail_invalid!("min_tokens must be an integer >= 0");
+    };
+    if min_tokens > max_tokens {
+        bail_invalid!("min_tokens ({min_tokens}) must not exceed max_tokens ({max_tokens})");
+    }
+    Ok(min_tokens)
+}
+
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    request_choice_count(body).map(drop)
 }
 
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
@@ -1934,11 +1973,14 @@ pub(crate) fn validate_response_format(
         .ok_or_else(|| invalid_request!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            bail_invalid!(
-                "response_format type 'json_object' is not supported on this \
-                 serve route (no enforcement exists; only json_schema strict \
-                 output is supported)"
-            );
+            // OpenAI's permissive JSON mode: any JSON object, no schema.
+            // Enforce it with the same pre-sampling subset compiler by
+            // compiling `{"type":"object"}` — an unconstrained object is
+            // still a constraint (no prose, no array) and it is not a
+            // silent downgrade.
+            let schema = serde_json::json!({ "type": "object" });
+            validate_json_schema_subset(&schema, "$")?;
+            Ok(Some(ResponseFormat { schema, name: None }))
         }
         "json_schema" => {
             let js = value
@@ -2249,7 +2291,7 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    let images_base64 = request_images_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -2262,6 +2304,11 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
+        if !runtime.multi_slot_enabled && images_base64.len() > 1 {
+            return Err(invalid_request!(
+                "multiple images require experimental multi-slot serve"
+            ));
+        }
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
@@ -2308,10 +2355,21 @@ pub(crate) fn complete_request_attempt(
         let tool_choice_policy = contract.tool_choice_policy;
         let forwarded_tools = contract.forwarded_tools;
         let response_format = contract.response_format;
+        // The prompt-only field (what a single-image model without a chat
+        // template frames) never carries the image slots `messages` does.
+        let prompt = last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into());
+        let prompt = if images_base64.is_empty() {
+            prompt
+        } else {
+            use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+            prompt
+                .replace(&format!("{IMAGE_SLOT}\n"), "")
+                .replace(IMAGE_SLOT, "")
+        };
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": identity.0.clone(),
-            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "prompt": prompt,
             "messages": normalized_messages,
             "max_tokens": max_tokens,
             "attempt_id": attempt_id,
@@ -2319,8 +2377,21 @@ pub(crate) fn complete_request_attempt(
         if contract.max_tokens_fit {
             generate["max_tokens_fit"] = serde_json::Value::Bool(true);
         }
-        if let Some(image) = image_base64 {
-            generate["image_base64"] = serde_json::Value::String(image);
+        if contract.min_tokens > 0 {
+            generate["min_tokens"] = contract.min_tokens.into();
+        }
+        if runtime.multi_slot_enabled {
+            // The slot engine reads one `image_base64` and renders a
+            // single-turn VL prompt; more than one image cannot be honoured.
+            match images_base64.as_slice() {
+                [] => {}
+                [image] => generate["image_base64"] = serde_json::Value::String(image.clone()),
+                _ => bail_invalid!(
+                    "experimental multi-slot supports at most one image_url per request"
+                ),
+            }
+        } else if !images_base64.is_empty() {
+            generate["images_base64"] = serde_json::json!(images_base64);
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -2474,6 +2545,17 @@ pub(crate) fn complete_request_attempt(
 
     let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
+
+        // Prefill progress is a display hint, not part of the response
+        // contract: it skips the semantic fold and gate (so it can never fail
+        // a request or become a delta) and is dropped if it somehow precedes
+        // `gen_start`. The stream sink frames it as an SSE comment.
+        if event_type == Some("prefill_progress") {
+            if contract_gate.contract().is_some() {
+                event_callback(event)?;
+            }
+            return Ok(());
+        }
 
         // Staged terminal: commit_ready carries done fields with type != done.
         // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
@@ -2741,6 +2823,9 @@ pub(crate) fn complete_request_attempt(
         meta.engine_stats = serde_json::from_value(stats.clone()).ok();
     }
     meta.last_activity = Instant::now();
+    if let Some(message) = meta.spill.as_mut().and_then(|spill| spill.check()) {
+        crate::spill::emit(&message);
+    }
 
     if let Some(completion) = committed {
         return Ok(completion);
@@ -2864,26 +2949,23 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             "images and tools together are not supported in experimental multi-slot".to_owned(),
         );
     }
-    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is neutral —
-    // refusing it 400s a request that asks for nothing. Only a non-empty
-    // stop is refused (matches the daemon's `stop_nonempty` rule in
-    // slots.rs so the gateway and engine agree).
-    let stop_nonempty = match body.get("stop") {
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::String(t)) => !t.is_empty(),
-        Some(v) => !v.is_null(),
-        None => false,
-    };
-    if stop_nonempty {
-        return Err("stop sequences are not supported".to_owned());
-    }
-    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
-        || body
-            .get("top_logprobs")
-            .is_some_and(|value| !value.is_null())
+    // `stop` is supported on the slot engine: the emitter's streaming matcher
+    // withholds the stop bytes and ends the turn. Validate the wire shape
+    // here (string / array, count and character caps) so every route agrees
+    // on what is a 400; an empty stop remains neutral.
+    hipfire_runtime::stop_sequence::parse_stop_field(body.get("stop"))
+        .map_err(|e| e.to_string())?;
+    // `min_tokens` is a daemon decode-loop control; the slot engine has none.
+    if body
+        .get("min_tokens")
+        .is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))
     {
-        return Err("logprobs are not supported".to_owned());
+        return Err("min_tokens is not supported".to_owned());
     }
+    // logprobs/top_logprobs: the slot engine forces AR and attaches
+    // per-token values, so this is not a refusal. Re-validate here so a
+    // direct caller of this gate gets the same 400 as the HTTP path.
+    validate_logprobs_request(body).map_err(|e| e.to_string())?;
     // Penalties are supported end-to-end on the slot engine (in-kernel
     // repeat/presence/frequency over a per-slot recent-token window, min_p in
     // the top-p tail), so non-neutral values are forwarded, not refused or
@@ -3096,12 +3178,74 @@ pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String
     }
 }
 
-pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
-    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
-        return Ok(None);
+/// The chat role a raw OpenAI message normalizes to; `None` for a role the
+/// projection drops. Shared by [`normalize_openai_messages_marked`] and
+/// [`request_images_base64`] so the images a request forwards are exactly the
+/// ones whose slots survive in the projected messages.
+fn normalized_role(message: &serde_json::Value) -> Option<&str> {
+    match message.get("role").and_then(serde_json::Value::as_str)? {
+        "developer" => Some("system"),
+        "toolResult" | "tool_result" => Some("tool"),
+        role @ ("system" | "user" | "assistant" | "tool") => Some(role),
+        _ => None,
+    }
+}
+
+/// [`openai_content_text`] with each `image_url` part kept as an in-order
+/// [`IMAGE_SLOT`](hipfire_runtime::prompt_frame::IMAGE_SLOT) marker, so the
+/// daemon renders the image at its message position instead of the projection
+/// silently flattening it away. An image directly followed by a text part is
+/// followed by a newline (the image-then-question framing the vision prompt has
+/// always used). Text is stripped of the marker character, which the wire
+/// reserves for images.
+fn openai_content_text_marked(content: Option<&serde_json::Value>) -> String {
+    use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+    let part_type = |part: &serde_json::Value| {
+        part.get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     };
-    let mut image = None;
+    match content {
+        Some(serde_json::Value::String(text)) => text.replace(IMAGE_SLOT, ""),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for (index, part) in parts.iter().enumerate() {
+                match part_type(part).as_deref() {
+                    Some("text") => {
+                        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                            out.push_str(&text.replace(IMAGE_SLOT, ""));
+                        }
+                    }
+                    Some("image_url") => {
+                        out.push(IMAGE_SLOT);
+                        if parts.get(index + 1).and_then(part_type).as_deref() == Some("text") {
+                            out.push('\n');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        other => openai_content_text(other),
+    }
+}
+
+/// Every `image_url` payload of the request in message order (base64 of a PNG
+/// or JPEG data URI), across the whole conversation: clients resend an earlier
+/// image on every turn, and each one is part of the prompt at the position of
+/// its message. Only messages the projection keeps contribute, so the list
+/// lines up one-to-one with the slots in [`normalize_openai_messages_marked`].
+pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Result<Vec<String>> {
+    const MAX_IMAGES: usize = 8;
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut images = Vec::new();
     for message in messages {
+        if normalized_role(message).is_none() {
+            continue;
+        }
         let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
             continue;
         };
@@ -3130,12 +3274,13 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
             if payload.is_empty() {
                 bail_invalid!("image_url data URI has an empty base64 payload");
             }
-            if image.replace(payload.to_owned()).is_some() {
-                bail_invalid!("at most one image_url is supported per request");
+            if images.len() >= MAX_IMAGES {
+                bail_invalid!("at most {MAX_IMAGES} image_url parts are supported per request");
             }
+            images.push(payload.to_owned());
         }
     }
-    Ok(image)
+    Ok(images)
 }
 
 pub(crate) fn strip_inline_thinking(text: &str) -> String {
@@ -3213,19 +3358,31 @@ pub(crate) fn normalize_openai_messages(
     messages: Option<&serde_json::Value>,
     include_reasoning_content: bool,
 ) -> serde_json::Value {
+    normalize_openai_messages_marked(messages, include_reasoning_content, false)
+}
+
+/// [`normalize_openai_messages`], optionally keeping each `image_url` part as
+/// an in-order image slot in the message content (see
+/// [`openai_content_text_marked`]). Only a route that forwards the images to a
+/// vision-capable daemon may mark them; every other consumer gets the
+/// text-only projection it always had.
+pub(crate) fn normalize_openai_messages_marked(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+    mark_images: bool,
+) -> serde_json::Value {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
     let normalized = messages
         .iter()
         .filter_map(|message| {
-            let role = match message.get("role").and_then(serde_json::Value::as_str)? {
-                "developer" => "system",
-                "toolResult" | "tool_result" => "tool",
-                role @ ("system" | "user" | "assistant" | "tool") => role,
-                _ => return None,
+            let role = normalized_role(message)?;
+            let raw_content = if mark_images {
+                openai_content_text_marked(message.get("content"))
+            } else {
+                openai_content_text(message.get("content"))
             };
-            let raw_content = openai_content_text(message.get("content"));
             let mut entry = serde_json::json!({
                 "role": role,
                 "content": if role == "assistant" {
@@ -3466,6 +3623,41 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
+/// Serialize `n` independent completions as one OpenAI response. The first
+/// completion supplies the response id/timings envelope; every choice keeps
+/// its own message and finish reason. Prompt usage is counted once (the
+/// choices share one request), completion usage is summed.
+pub(crate) fn completion_json_multi(completions: &[Completion]) -> serde_json::Value {
+    debug_assert!(!completions.is_empty());
+    let mut out = completion_json(&completions[0]);
+    let mut choices = Vec::with_capacity(completions.len());
+    let mut completion_tokens = 0u64;
+    for (index, completion) in completions.iter().enumerate() {
+        let mut one = completion_json(completion);
+        let mut choice = one["choices"][0].take();
+        choice["index"] = serde_json::json!(index);
+        choices.push(choice);
+        completion_tokens = completion_tokens.saturating_add(
+            completion
+                .done
+                .get("tokens")
+                .or_else(|| completion.done.get("completion_tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    out["choices"] = serde_json::Value::Array(choices);
+    let first_usage = completion_usage(&completions[0]);
+    let prompt_tokens = first_usage["prompt_tokens"].as_u64().unwrap_or(0);
+    out["usage"] = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens.saturating_add(completion_tokens),
+        "prompt_tokens_details": first_usage["prompt_tokens_details"].clone(),
+    });
+    out
+}
+
 /// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
 /// tokens; drafted/rejected spec tokens never count). Terminator policy is
 /// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
@@ -3528,6 +3720,14 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "mtp_windows": done.get("mtp_windows"),
         "ar_windows": done.get("ar_windows"),
         "mtp_retired": done.get("mtp_retired"),
+        "mtp_drafts": done.get("mtp_drafts"),
+        "mtp_accepted": done.get("mtp_accepted"),
+        "mtp_depth_offered": done.get("mtp_depth_offered"),
+        "mtp_depth_reached": done.get("mtp_depth_reached"),
+        "mtp_depth_accepted": done.get("mtp_depth_accepted"),
+        "mtp_copy_windows": done.get("mtp_copy_windows"),
+        "mtp_copy_drafts": done.get("mtp_copy_drafts"),
+        "mtp_copy_accepted": done.get("mtp_copy_accepted"),
         "spec_retired": done.get("spec_retired"),
         "spec_retired_at": done.get("spec_retired_at"),
         "ar_tokens": done.get("ar_tokens"),
@@ -3661,6 +3861,27 @@ pub(crate) fn openai_stream_terminal_chunks(
     completion: &Completion,
     include_usage: bool,
 ) -> Vec<serde_json::Value> {
+    openai_stream_terminal_chunks_at(completion, include_usage, 0)
+}
+
+/// [`openai_stream_terminal_chunks`] for one choice index in an `n > 1`
+/// stream. The caller appends `[DONE]` only after the last choice.
+pub(crate) fn openai_stream_terminal_chunks_at(
+    completion: &Completion,
+    include_usage: bool,
+    index: usize,
+) -> Vec<serde_json::Value> {
+    openai_stream_terminal_chunks_usage(completion, include_usage, index, None)
+}
+
+/// [`openai_stream_terminal_chunks_at`] with an aggregate usage override for
+/// an `n > 1` stream's final choice.
+pub(crate) fn openai_stream_terminal_chunks_usage(
+    completion: &Completion,
+    include_usage: bool,
+    index: usize,
+    usage_override: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let finish_reason = openai_finish_reason(&completion.done);
     let mut chunks = Vec::new();
 
@@ -3675,7 +3896,7 @@ pub(crate) fn openai_stream_terminal_chunks(
             "created": completion.created,
             "model": completion.model,
             "choices": [{
-                "index": 0,
+                "index": index,
                 "delta": delta,
                 "finish_reason": null
             }],
@@ -3687,7 +3908,7 @@ pub(crate) fn openai_stream_terminal_chunks(
         "object": "chat.completion.chunk",
         "created": completion.created,
         "model": completion.model,
-        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+        "choices": [{ "index": index, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
         "hipfire": completion_hipfire(completion),
     }));
@@ -3699,7 +3920,7 @@ pub(crate) fn openai_stream_terminal_chunks(
             "created": completion.created,
             "model": completion.model,
             "choices": [],
-            "usage": completion_usage(completion),
+            "usage": usage_override.cloned().unwrap_or_else(|| completion_usage(completion)),
         }));
     }
 
@@ -4015,7 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_images_forward_one_base64_payload_and_reject_unsafe_shapes() {
+    fn openai_images_forward_every_base64_payload_in_message_order_and_reject_unsafe_shapes() {
         let messages = serde_json::json!([{
             "role": "user",
             "content": [
@@ -4024,17 +4245,111 @@ mod tests {
             ]
         }]);
         assert_eq!(
-            request_image_base64(Some(&messages)).unwrap().as_deref(),
-            Some("YWJj")
+            request_images_base64(Some(&messages)).unwrap(),
+            vec!["YWJj".to_owned()]
         );
         let remote = serde_json::json!([{
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(request_image_base64(Some(&remote))
+        assert!(request_images_base64(Some(&remote))
             .unwrap_err()
             .to_string()
             .contains("remote"));
+        // Clients resend an earlier image every turn: every image is kept, in
+        // message order, and a message the projection drops contributes none.
+        let image = |b64: &str| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/jpeg;base64,{b64}") }
+            })
+        };
+        let history = serde_json::json!([
+            { "role": "user", "content": [image("AAAA"), { "type": "text", "text": "first" }] },
+            { "role": "assistant", "content": "ok" },
+            { "role": "wizard", "content": [image("DROP")] },
+            { "role": "user", "content": [{ "type": "text", "text": "second" }, image("BBBB")] },
+        ]);
+        assert_eq!(
+            request_images_base64(Some(&history)).unwrap(),
+            vec!["AAAA".to_owned(), "BBBB".to_owned()]
+        );
+    }
+
+    #[test]
+    fn marked_messages_keep_each_image_at_its_message_position() {
+        use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+        let image = |b64: &str| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/png;base64,{b64}") }
+            })
+        };
+        let body = serde_json::json!({ "messages": [
+            { "role": "user", "content": [
+                image("AAAA"),
+                { "type": "text", "text": format!("remember purple hippo{IMAGE_SLOT}") },
+            ] },
+            { "role": "assistant", "content": "Got it." },
+            { "role": "user", "content": [{ "type": "text", "text": "and now?" }, image("BBBB")] },
+            { "role": "user", "content": "what was the code word?" },
+        ] });
+        let marked = normalize_openai_messages_marked(body.get("messages"), false, true);
+        // Image first, then a text part: the image is followed by a newline.
+        // The reserved character a client typed is not a slot.
+        assert_eq!(
+            marked[0]["content"],
+            format!("{IMAGE_SLOT}\nremember purple hippo")
+        );
+        assert_eq!(marked[1]["content"], "Got it.");
+        assert_eq!(marked[2]["content"], format!("and now?{IMAGE_SLOT}"));
+        assert_eq!(marked[3]["content"], "what was the code word?");
+        let slots = |messages: &serde_json::Value| {
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap().matches(IMAGE_SLOT).count())
+                .sum::<usize>()
+        };
+        assert_eq!(slots(&marked), 2);
+        // The unmarked projection (every other consumer) never carries a slot.
+        let plain = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(slots(&plain), 1, "only the client's own typed character");
+        assert_eq!(plain[2]["content"], "and now?");
+    }
+
+    #[test]
+    fn contract_marks_images_only_for_the_singleton_route() {
+        use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+        let resolved = contract_resolved_with_system("");
+        let body = serde_json::json!({
+            "max_tokens": 8,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                ] },
+                { "role": "assistant", "content": "seen" },
+                { "role": "user", "content": "and the colour?" },
+            ],
+        });
+        let single = project_request_contract(&body, &resolved, false, false).unwrap();
+        assert_eq!(
+            single.messages[0]["content"],
+            format!("look{IMAGE_SLOT}"),
+            "the history keeps the image slot"
+        );
+        assert_eq!(single.messages.as_array().unwrap().len(), 3);
+        let slot = project_request_contract(&body, &resolved, false, true).unwrap();
+        assert_eq!(slot.messages[0]["content"], "look");
+        // Text-only requests are untouched by the marking path.
+        let text_only = serde_json::json!({
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "a\u{fffc}b" }] }],
+        });
+        let projected = project_request_contract(&text_only, &resolved, false, false).unwrap();
+        assert_eq!(projected.messages[0]["content"], "a\u{fffc}b");
     }
 
     #[test]
@@ -4993,6 +5308,30 @@ mod tests {
             serde_json::json!(r#"{"path":"README.md"}"#)
         );
         assert_eq!(mapped[1]["function"]["name"], "write_file");
+    }
+
+    #[test]
+    fn completion_json_multi_indexes_choices_and_sums_completion_usage() {
+        let a = sample_completion("red", Vec::new(), "stop");
+        let b = sample_completion("blue", Vec::new(), "length");
+        let json = completion_json_multi(&[a, b]);
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][1]["index"], 1);
+        assert_eq!(json["choices"][0]["message"]["content"], "red");
+        assert_eq!(json["choices"][1]["message"]["content"], "blue");
+        assert_eq!(json["choices"][1]["finish_reason"], "length");
+        // Prompt is counted once; completion tokens are the per-choice sum.
+        assert_eq!(json["usage"]["prompt_tokens"], 3);
+        assert_eq!(json["usage"]["completion_tokens"], 10);
+        assert_eq!(json["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn openai_stream_terminal_chunks_carry_the_choice_index() {
+        let completion = sample_completion("red", Vec::new(), "stop");
+        let chunks = openai_stream_terminal_chunks_at(&completion, false, 3);
+        assert_eq!(chunks[0]["choices"][0]["index"], 3);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
@@ -7931,6 +8270,64 @@ mod tests {
         }
     }
 
+    /// vLLM-compatible `min_tokens`: absent/null/0 is neutral, an integer up
+    /// to `max_tokens` passes through, anything else (above `max_tokens`,
+    /// negative, fractional, string) is a typed 400.
+    #[test]
+    fn project_request_contract_validates_min_tokens() {
+        let resolved = contract_resolved_with_system("");
+        let project = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            project_request_contract(&body, &resolved, false, false)
+        };
+        for neutral in [
+            serde_json::json!({}),
+            serde_json::json!({ "min_tokens": null }),
+            serde_json::json!({ "min_tokens": 0 }),
+        ] {
+            assert_eq!(project(neutral).expect("neutral").min_tokens, 0);
+        }
+        for ok in [1u64, 8, 16] {
+            let contract = project(serde_json::json!({ "min_tokens": ok })).expect("in range");
+            assert_eq!(contract.min_tokens, ok);
+        }
+        let over = project(serde_json::json!({ "min_tokens": 17 })).expect_err("above max_tokens");
+        assert!(
+            over.to_string().contains("must not exceed max_tokens"),
+            "{over}"
+        );
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!([1]),
+        ] {
+            let err = project(serde_json::json!({ "min_tokens": bad })).expect_err("malformed");
+            assert!(
+                err.to_string().contains("min_tokens must be an integer"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// The slot engine has no EOS gate: `min_tokens > 0` is refused, zero and
+    /// null are neutral.
+    #[test]
+    fn multi_slot_refuses_min_tokens_but_not_zero() {
+        let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
+        assert!(ok(serde_json::json!({ "min_tokens": 0 })));
+        assert!(ok(serde_json::json!({ "min_tokens": null })));
+        let err = multi_slot_request_supported(&serde_json::json!({ "min_tokens": 4 }))
+            .expect_err("refused");
+        assert!(err.contains("min_tokens"), "{err}");
+    }
+
     /// A PRESENT-but-malformed max_tokens must be a typed 400, never a
     /// silent fallback to the config default (the gateway used to
     /// `.and_then(as_u64).unwrap_or(default)`, quietly re-typing -5 / 1.5 /
@@ -7958,13 +8355,13 @@ mod tests {
 
     /// Unsupported OpenAI request fields must be refused here — the daemon
     /// has typed refusals for them, but this gateway builds the generate
-    /// message from scratch and would strip the fields first (silent
-    /// semantic downgrade: `n: 2` returning one completion).
+    /// message from scratch and would strip the fields first (a silent
+    /// semantic downgrade). `n` is no longer in this set: the HTTP layer
+    /// fans it out and `request_choice_count` bounds it.
     #[test]
     fn project_request_contract_refuses_unsupported_fields() {
         let resolved = contract_resolved_with_system("");
         let cases = [
-            serde_json::json!({"n": 2}),
             serde_json::json!({"best_of": 2}),
             serde_json::json!({"logit_bias": {"5": 10}}),
             serde_json::json!({"echo": true}),
@@ -7985,7 +8382,7 @@ mod tests {
                 "unexpected error for {k}: {err}"
             );
         }
-        // n=1 is the only legal arity and must pass.
+        // n in range (and absent/null) must pass.
         let body = serde_json::json!({
             "max_tokens": 16, "n": 1,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -7993,15 +8390,16 @@ mod tests {
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
     }
 
-    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
-    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    /// `n` is parsed at the gateway: 1..=MAX_CHOICES is legal (the HTTP layer
+    /// fans it out), while zero, over-max and non-integers are typed 400s on
+    /// both routes.
     #[test]
-    fn project_request_contract_refuses_n_on_every_route() {
+    fn project_request_contract_bounds_n_on_every_route() {
         let resolved = contract_resolved_with_system("");
         for multi_slot in [false, true] {
             for bad in [
-                serde_json::json!(2),
                 serde_json::json!(0),
+                serde_json::json!(9),
                 serde_json::json!("1"),
             ] {
                 let body = serde_json::json!({
@@ -8015,7 +8413,11 @@ mod tests {
                     "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
                 );
             }
-            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+            for ok in [
+                serde_json::json!(1),
+                serde_json::json!(2),
+                serde_json::Value::Null,
+            ] {
                 let body = serde_json::json!({
                     "max_tokens": 16, "n": ok,
                     "messages": [{ "role": "user", "content": "hi" }]
@@ -8156,8 +8558,8 @@ mod tests {
         };
         let cases: Vec<(&str, Result<()>)> = vec![
             (
-                "experimental multi-slot does not support this request",
-                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+                "invalid stop: every entry must be a string",
+                require_multi_slot_support(&serde_json::json!({"stop": [1]})),
             ),
             (
                 "top_logprobs requires logprobs to be true",
@@ -8181,18 +8583,24 @@ mod tests {
             ),
             (
                 "remote image_url values are unsupported",
-                request_image_base64(Some(&serde_json::json!([
+                request_images_base64(Some(&serde_json::json!([
                     {"role": "user", "content": [image("https://x/y.png")]}
                 ])))
                 .map(drop),
             ),
             (
-                "at most one image_url",
-                request_image_base64(Some(&serde_json::json!([
-                    {"role": "user", "content": [
-                        image("data:image/png;base64,AA"),
-                        image("data:image/png;base64,AA")
-                    ]}
+                "at most 8 image_url",
+                request_images_base64(Some(&serde_json::json!([
+                    {"role": "user", "content":
+                        (0..9).map(|_| image("data:image/png;base64,AA")).collect::<Vec<_>>()
+                    }
+                ])))
+                .map(drop),
+            ),
+            (
+                "only base64 PNG and JPEG image_url data URIs",
+                request_images_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [image("data:image/gif;base64,AA")]}
                 ])))
                 .map(drop),
             ),
@@ -8201,8 +8609,8 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
             (
-                "n != 1",
-                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+                "n must be an integer",
+                contract(serde_json::json!({"max_tokens": 8, "n": 9})),
             ),
             (
                 "temperature must be within",
@@ -8213,9 +8621,9 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
             ),
             (
-                "response_format type 'json_object' is not supported",
+                "response_format.type 'yaml' is not supported",
                 contract(serde_json::json!({
-                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                    "max_tokens": 8, "response_format": {"type": "yaml"}
                 })),
             ),
             (
@@ -8309,10 +8717,27 @@ mod tests {
             }),
             "images and tools",
         );
-        err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
-        err_contains(serde_json::json!({ "stop": "END" }), "stop");
-        err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
-        err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
+        // Stop sequences are supported: both wire forms validate and pass.
+        assert!(ok(serde_json::json!({ "stop": ["\n\n"] })));
+        assert!(ok(serde_json::json!({ "stop": "END" })));
+        // Malformed stop shapes/limits are 400s with the shared parser text.
+        err_contains(serde_json::json!({ "stop": [1] }), "invalid stop");
+        err_contains(
+            serde_json::json!({ "stop": "x".repeat(65) }),
+            "invalid stop",
+        );
+        assert!(ok(serde_json::json!({ "logprobs": true })));
+        assert!(ok(
+            serde_json::json!({ "logprobs": true, "top_logprobs": 5 })
+        ));
+        err_contains(
+            serde_json::json!({ "top_logprobs": 5 }),
+            "requires logprobs",
+        );
+        err_contains(
+            serde_json::json!({ "logprobs": "yes" }),
+            "must be a boolean",
+        );
         // Non-neutral penalties are supported end-to-end on the slot engine
         // (in-kernel repeat/presence/frequency over a per-slot recent-token
         // window), so they are forwarded — no error here.
@@ -8343,14 +8768,12 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // json_object → REJECTED (typed error). This serve route has no
-        // json_object enforcement; silently dropping the requested
-        // constraint and returning success would be the "silent semantic
-        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
-        // None — an unconstrained 200.
-        assert!(
-            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
-        );
+        // json_object → enforced as the permissive object schema, not
+        // dropped as None and not rejected.
+        let jf = validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+            .expect("json_object is enforced")
+            .expect("json_object produces a schema");
+        assert_eq!(jf.schema, serde_json::json!({"type": "object"}));
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({

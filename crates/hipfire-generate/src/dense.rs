@@ -555,6 +555,7 @@ pub fn generate_deepseek4_spec(
             // The DSpark speculator keeps no one-row windows to retain.
             stop_sequences: false,
             logprobs: false,
+            penalty_generated_only: false,
         });
     }
 
@@ -596,6 +597,7 @@ pub fn generate_deepseek4_spec(
             tools: tools.map(|t| t.to_vec()),
             enable_grammar: tools.is_some(),
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
@@ -797,6 +799,7 @@ pub fn generate_deepseek4(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
+    request_seed: u32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -811,6 +814,7 @@ pub fn generate_deepseek4(
             temp,
             top_p,
             max_tokens,
+            request_seed,
             think_mode,
             tools,
             messages_history,
@@ -1193,15 +1197,12 @@ pub fn generate_deepseek4(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // request_seed honours the wire `seed` (greedy stays deterministic). The
+    // v0.4.x `HIPFIRE_DEEPSEEK4_SEED` developer override still wins when set.
     let seed: u64 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-        });
+        .unwrap_or(request_seed as u64);
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     // Track whether the decode loop saw a complete
@@ -1686,6 +1687,7 @@ pub fn generate_deepseek4_heterogeneous(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
+    request_seed: u32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -1817,7 +1819,7 @@ pub fn generate_deepseek4_heterogeneous(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let mut rng = deepseek4::sampling::Xorshift::new(0x1357_9bdf);
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
     let mut parser = match think_mode {
         ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
             deepseek4::dsml::StreamParser::new_in_think()
@@ -2922,6 +2924,7 @@ fn generate_gemma4_spec(
             tools: None,
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: max_think_tokens,
             assistant_prefix: AssistantPrefix::Plain,
             think_mode: if enable_thinking {
@@ -4356,6 +4359,7 @@ pub fn generate_muse_glimmer(
     reasoning_effort: Option<&str>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     let _ = think_mode;
     // max_think_tokens semantics: 1=no-think (ignored for Glimmer; strength from effort), 0=uncapped, N=cap N reasoning tokens then force-close.
@@ -4798,13 +4802,13 @@ pub fn generate_muse_glimmer(
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
+    // request_seed: the wire `seed` when given, else a fresh per-attempt seed.
+    let seed = request_seed as u64;
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    // A cache-cap stop cuts the answer like max_tokens does: report `length`.
+    let mut hit_cache_cap = false;
     let decode_t0 = Instant::now();
     let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
     // Multi-byte characters span tokens: decode incrementally, never per token.
@@ -4979,6 +4983,7 @@ pub fn generate_muse_glimmer(
                     break;
                 }
                 if bundle.state.n_tokens >= cache_cap {
+                    hit_cache_cap = true;
                     break;
                 }
                 // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
@@ -5207,6 +5212,7 @@ pub fn generate_muse_glimmer(
                     // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
                     // sample a NEW prediction from the returned logits and make it the next pending seed.
                     if bundle.state.n_tokens >= cache_cap {
+                        hit_cache_cap = true;
                         break;
                     }
                     if generated_count >= max_tokens {
@@ -5906,6 +5912,11 @@ pub fn generate_muse_glimmer(
                 // Push stop token to KV? No — mirror prior break-before-push for eos.
                 break;
             }
+            // Check before emitting: a token streamed here would never be counted.
+            if bundle.state.n_tokens >= cache_cap {
+                hit_cache_cap = true;
+                break;
+            }
 
             let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
             let (events, should_stop) = harmony_router.push(&frag);
@@ -5926,10 +5937,6 @@ pub fn generate_muse_glimmer(
             }
             glimmer_recorder.push(next_tok, &frag);
             if should_stop {
-                break;
-            }
-
-            if bundle.state.n_tokens >= cache_cap {
                 break;
             }
 
@@ -6031,7 +6038,7 @@ pub fn generate_muse_glimmer(
     } else {
         0.0
     };
-    let hit_length_cap = generated_count >= max_tokens;
+    let hit_length_cap = generated_count >= max_tokens || hit_cache_cap;
     let finish_reason = if hit_length_cap {
         "length"
     } else if !parsed_tool_calls.is_empty() {
@@ -6132,6 +6139,7 @@ pub fn generate_lfm2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -6414,11 +6422,7 @@ pub fn generate_lfm2moe(
     // Without this, the loop would run for the full `max_tokens` of wasted
     // work after the HTTP client has already timed out and sent `abort`.
     // ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     // LFM2.5 tool calls arrive inside dedicated special tokens
     // (\x3C\x7Ctool_call_start\x7C\x3E / \x3C\x7Ctool_call_end\x7C\x3E as
@@ -6697,6 +6701,7 @@ pub fn generate_minimax(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -7047,17 +7052,13 @@ pub fn generate_minimax(
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    // request_seed honours the wire `seed` (greedy stays deterministic). ──
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut text_stream = TokenTextStream::new();
+    let mut hit_eos = false;
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
         // immediately instead of running the full `max_tokens` of wasted work.
@@ -7072,6 +7073,7 @@ pub fn generate_minimax(
         // Sample next token from the most recent logits.
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if next_tok == eos_tok {
+            hit_eos = true;
             break;
         }
 
@@ -7139,6 +7141,7 @@ pub fn generate_minimax(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": if hit_eos { "stop" } else { "length" },
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -7176,6 +7179,7 @@ pub fn generate_cohere2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -7535,13 +7539,8 @@ pub fn generate_cohere2moe(
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    // request_seed honours the wire `seed` (greedy stays deterministic). ──
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
     // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
@@ -7930,10 +7929,12 @@ pub fn generate_cohere2moe(
     } else {
         0.0
     };
+    // Every stop exit (EOS, <PAD>, repeat guard) breaks before the count
+    // increments, so `generated_count == max_tokens` only on the budget cap.
     let finish_reason = if !held_tool_calls.is_empty() {
         "tool_calls"
     } else {
-        "stop"
+        crate::common::length_or_stop(generated_count, max_tokens, false)
     };
     let mut pending_done = serde_json::json!({
         "type": "done",
@@ -8145,6 +8146,7 @@ pub fn generate_qwen2(
         }
     };
     let mut text_stream = TokenTextStream::new();
+    let mut hit_eos = false;
 
     loop {
         // Decode-side abort check: a mid-decode client cancel stops the loop
@@ -8158,6 +8160,7 @@ pub fn generate_qwen2(
             break;
         }
         if eos_set.contains(&next_tok) {
+            hit_eos = true;
             break;
         }
         // Emit the text this token completed: one emoji or CJK character is
@@ -8198,6 +8201,7 @@ pub fn generate_qwen2(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "finish_reason": if hit_eos { "stop" } else { "length" },
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {

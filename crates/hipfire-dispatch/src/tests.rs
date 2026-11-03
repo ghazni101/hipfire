@@ -666,6 +666,35 @@ fn for_gemv_prerotated_falls_back_to_plain_for_non_rotated() {
     );
 }
 
+/// GGUF block formats have no kernel yet: no gemv key, and the generic
+/// execution gate refuses them by name instead of reinterpreting the bytes.
+#[test]
+fn ggml_dtypes_have_no_kernel_and_are_refused_by_name() {
+    for dtype in [
+        DType::GgmlQ4K,
+        DType::GgmlQ5K,
+        DType::GgmlQ6K,
+        DType::GgmlQ8_0,
+        DType::GgmlIQ4XS,
+    ] {
+        assert!(
+            KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_err(),
+            "{dtype:?} must have no plain gemv key"
+        );
+        assert!(KernelKey::for_gemv_prerotated(dtype).is_err(), "{dtype:?}");
+        let err = crate::pipeline::batched::reject_typed_only_format(dtype)
+            .expect_err("the execution gate must refuse a ggml dtype");
+        let text = err.to_string();
+        assert!(
+            text.contains(dtype.ggml_name().unwrap()) && text.contains("no ggml kernel"),
+            "{text}"
+        );
+    }
+    // the legacy llama dtypes are untouched by the new gate.
+    assert!(crate::pipeline::batched::reject_typed_only_format(DType::Q4K).is_ok());
+    assert!(crate::pipeline::batched::reject_typed_only_format(DType::Q8_0).is_ok());
+}
+
 #[test]
 fn for_gemv_residual_maps_hfq_and_mq() {
     let cases = [
@@ -772,6 +801,7 @@ const ALL_DTYPES: &[DType] = &[
     DType::ParoQ4G64,
     DType::FP8E4M3B128,
     DType::FP8E4M3PT,
+    DType::HC8E4M3Row,
     DType::Raw,
     DType::MQ3I4G128R256,
     DType::MQ3I4G128R128,
@@ -782,6 +812,13 @@ const ALL_DTYPES: &[DType] = &[
     DType::IU4G256,
     DType::IU8G256,
     DType::IU8G32,
+    DType::MQ4G256V2P,
+    DType::MQ4G128V2P,
+    DType::GgmlQ4K,
+    DType::GgmlQ5K,
+    DType::GgmlQ6K,
+    DType::GgmlQ8_0,
+    DType::GgmlIQ4XS,
 ];
 
 /// Registered keys that are KNOWN to have no dispatch arm today. Each entry is
@@ -3077,6 +3114,62 @@ fn moe_dtypes_paro() -> MoeDtypes<'static> {
     d
 }
 
+#[test]
+fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
+    use crate::families::gemm::mq3v25_route;
+    for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+        let mut flags = rdna_compute::FeatureFlags::for_test(arch);
+        flags.iu4_prefill = Some(true);
+        let default_on = arch == "gfx1201";
+        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), default_on, "{arch}");
+        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
+        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
+
+        flags.mq3v25_a4 = Some(true);
+        let forced_on = matches!(arch, "gfx1100" | "gfx1201");
+        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), forced_on, "{arch}");
+        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
+        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
+        if arch == "gfx1100" {
+            assert!(!mq3v25_route(&flags, true, 8192, 4100));
+            assert!(!mq3v25_route(&flags, true, 64, 4096));
+        }
+        if arch == "gfx1201" {
+            // Speculative-verify widths stay on the fp16 WMMA route; A4 from 17 rows.
+            for n in [2, 3, 4, 8, 16] {
+                assert!(!mq3v25_route(&flags, true, n, 4096), "n={n}");
+            }
+            for n in [17, 24, 64, 8192] {
+                assert!(mq3v25_route(&flags, true, n, 4096), "n={n}");
+            }
+        }
+
+        flags.mq3v25_a4 = Some(false);
+        assert!(!mq3v25_route(&flags, true, 8192, 4096), "{arch}");
+
+        flags.mq3v25_a4 = Some(true);
+        flags.iu4_prefill = Some(false);
+        assert!(!mq3v25_route(&flags, true, 8192, 4096), "{arch}");
+    }
+}
+
+#[test]
+fn mq3v25_a8_route_requires_flag_symmetric_multirow_and_exact_arch() {
+    use crate::families::gemm::mq3v25_a8_route;
+    for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+        let mut flags = rdna_compute::FeatureFlags::for_test(arch);
+        assert!(!mq3v25_a8_route(&flags, true, 8192), "{arch}");
+        flags.mq3v25_a8 = true;
+        assert_eq!(
+            mq3v25_a8_route(&flags, true, 8192),
+            arch == "gfx1201",
+            "{arch}"
+        );
+        assert!(!mq3v25_a8_route(&flags, false, 8192), "{arch}");
+        assert!(!mq3v25_a8_route(&flags, true, 1), "{arch}");
+    }
+}
+
 fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
     rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
 }
@@ -3521,6 +3614,35 @@ fn mq6_hfq6_gemv_resolves_on_rdna1_rdna2_and_keeps_prior_archs() {
         .is_err());
 }
 
+/// HIPF-222: `GemvHfq3G128` was gated on sdot4, so gfx1151/RDNA3 resolved
+/// MissingImpl and LLaMA hfq3 files failed at the first generate. The kernel is
+/// wave32 scalar: every wave32 arch resolves, CDNA wave64 stays excluded.
+#[test]
+fn hfq3g128_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for arch in ["gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_ok(), "HFQ3G128 must resolve on {arch}: {r:?}");
+    }
+    for arch in ["gfx906", "gfx942"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_err(), "HFQ3G128 must stay rejected on {arch}");
+    }
+}
+
 #[test]
 fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna1()));
@@ -3529,4 +3651,32 @@ fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna4()));
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_gfx906()));
     assert!(!ArchPredicate::HasHfq6Gemv.eval_arch(&DispatchCtx::for_test("gfx942")));
+}
+
+/// HIPF-241: `GemvHfq3G256` was gated on sdot4 + gfx110x, so gfx1151/gfx12
+/// resolved MissingImpl and LLaMA hfq3g256 files failed at the first prefill.
+/// The generic kernel is wave32 scalar: every wave32 arch resolves, CDNA wave64
+/// stays excluded.
+#[test]
+fn hfq3g256_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for (arch, ok) in [
+        ("gfx1010", true),
+        ("gfx1030", true),
+        ("gfx1100", true),
+        ("gfx1151", true),
+        ("gfx1201", true),
+        ("gfx906", false),
+        ("gfx942", false),
+    ] {
+        let r = fam.resolve(
+            DType::HFQ3G256,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert_eq!(r.is_ok(), ok, "HFQ3G256 on {arch}: {r:?}");
+    }
 }

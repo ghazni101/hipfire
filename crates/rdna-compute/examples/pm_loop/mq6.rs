@@ -32,7 +32,11 @@
 //! `[ceil(M/128), ceil(N/128), 1]`, 256 threads, 36864 B dynamic LDS, kernarg
 //! `A, Xq, Y` pointers then `M, K, N` and the PM image's seventh word (`0`); the
 //! other tiles' grid, block and LDS follow the spec (`Tile::{rows, tokens,
-//! threads, layout}`). The baseline is always the shipped `128x128` object and
+//! threads, layout}`). `ring` (`2`, the shipped, default | `3`) is the A/W ring depth
+//! (`Tune { ring }`, recorded in the candidate knobs only when non-default; the variant gains
+//! `-r3`): depth 3 fits the `128x128` tile only (53248 B of LDS; the other tiles are refused with
+//! the numbers) and keeps the depth-2 dynamic launch size, the third slab being the object's
+//! static LDS; `base-ring` sets the ring depth of a `--base-tile` / `--base-rip` baseline. The baseline is always the shipped `128x128` object and
 //! launches with its own geometry; the output is the same bits for every tile
 //! (exact integer dot, the same per-element fold order), so
 //! `identical_to_baseline` stays required.
@@ -45,6 +49,12 @@
 //! hipcc entry `mq6_i8_entry` is the non-admitted fallback and is not in this
 //! object). Selection file:line and the object sha256 go in
 //! `baseline.source`.
+//!
+//! `--base-shipped 128x256` (`128x128`, the default, | `128x256`) makes the baseline the shipped
+//! object's `_t128x256` entry (launched with the 128x256 geometry) instead: the entry the runtime
+//! takes for wide launches (`mq6_i8_pm_token_tile`). Use it when the runtime's selector picks the
+//! wide tile at the shape, so the incumbent and the code-identical control are the product's
+//! actual tile. Mutually exclusive with `--base-tile` / `--base-rip`.
 //!
 //! # Correctness
 //! The candidate must be bitwise equal to the shipped baseline (the driver
@@ -74,10 +84,15 @@
 //! float-reciprocal semantics, so the banded raster is refused with the
 //! emulator's own message: use `--raster linear`.
 
-use crate::common::{contains, dev_err, put_i32, put_ptr, sha256_hex};
+use crate::common::{contains, dev_err, sha256_hex};
 use crate::iu4::{abi_signature, max_diff, sample_rows};
 use crate::workload::{Arm, Knobs, Launch, Object, RefReport, Result, Workload};
-use peacemaker_isa::kernels::mq6_i8_gemm::{self, spec, Epi, Raster, Spec, Tile};
+use hipfire_kernel_abi::families::{find_export, mq6_i8 as mq6_abi};
+use hipfire_kernel_abi::{
+    check_export, eval, validate_invocation, Arch as AbiArch, ArgEvidence, Axis, Drift,
+    EvidenceSource, ExportEvidence, HiddenKind, InvocationV1, KernelAbiV1, OperandBinding,
+};
+use peacemaker_isa::kernels::mq6_i8_gemm::{self, Epi, Raster, RingDepth, Spec, Tile, Tune};
 use peacemaker_isa::Arch;
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
@@ -342,17 +357,129 @@ fn reference(
     out
 }
 
-/// Explicit kernarg: `A Xq Y` at 0/8/16, `M K N` at 24/28/32 and the PM image's
-/// seventh word `unused = 0` at 36 (`gemm_mq6g256v2_i8_prequant`).
-fn pack(a: u64, xq: u64, y: u64, m: usize, k: usize, n: usize) -> Vec<u8> {
-    let mut b = Vec::with_capacity(40);
-    for p in [a, xq, y] {
-        put_ptr(&mut b, p);
+/// The explicit kernarg of `spec`'s launch, encoded by the `hipfire-kernel-abi` contract of the
+/// PM entry with the same epilogue (`families::mq6_i8`), plus that contract.
+///
+/// `ops` is `(address, allocation bytes)` of `A, Xq, Y`; `geom` the launch's real
+/// `(grid, threads, dynamic LDS)`. A spec whose symbol is a contract export (the shipped
+/// `128x128` / `t128x256` entries) is validated with its own geometry. Any other spec
+/// (another tile or the linear raster) encodes through the same-epilogue product export, and its
+/// generator kernarg layout must agree with the contract on every argument and the segment;
+/// threads, LDS and symbol legitimately differ, anything else is an error before launch.
+fn contract_kernarg(
+    spec: Spec,
+    (m, k, n): (usize, usize, usize),
+    ops: [(u64, u64); 3],
+    geom: ([u32; 3], u32, u32),
+) -> Result<(Vec<u8>, &'static KernelAbiV1)> {
+    let exact = if spec.epi == Epi::SetNr {
+        None
+    } else {
+        find_export(AbiArch::Gfx1201, &spec.symbol())
+    };
+    let (abi, export) = match exact {
+        Some(found) => found,
+        None => {
+            let product = Spec::product(if spec.epi == Epi::SetBf16 {
+                Epi::SetBf16
+            } else {
+                Epi::Set
+            });
+            find_export(AbiArch::Gfx1201, &product.symbol())
+                .ok_or_else(|| format!("no kernel-abi contract export for {}", product.symbol()))?
+        }
+    };
+    let layout = spec.kernargs();
+    let evidence = ExportEvidence {
+        source: EvidenceSource::Generator,
+        arch: Some(AbiArch::Gfx1201),
+        symbol: export.symbol.to_owned(),
+        args: layout
+            .args
+            .iter()
+            .map(|a| ArgEvidence {
+                name: a.name.clone(),
+                offset: a.offset,
+                size: a.size,
+                value_kind: a.value_kind.clone(),
+                access: a.actual_access.clone(),
+            })
+            .collect(),
+        segment_bytes: Some(layout.size),
+        segment_align: None,
+        max_flat_workgroup_size: None,
+        threads: None,
+        dynamic_lds: None,
+        group_segment_fixed: None,
+        wave: None,
+        object_sha256: None,
+    };
+    let drift: Vec<String> = check_export(abi, export, &evidence)
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Drift::MissingArg { .. }
+                    | Drift::ExtraArg { .. }
+                    | Drift::ArgName { .. }
+                    | Drift::ArgWidth { .. }
+                    | Drift::ArgKind { .. }
+                    | Drift::ArgAccess { .. }
+                    | Drift::Segment { .. }
+                    | Drift::SegmentAlign { .. }
+            )
+        })
+        .map(|d| d.to_string())
+        .collect();
+    if !drift.is_empty() {
+        return Err(format!(
+            "{}: kernarg layout differs from contract {} ({}): {}",
+            spec.variant_name(),
+            abi.id,
+            export.symbol,
+            drift.join("; ")
+        ));
     }
-    for v in [m, k, n, 0] {
-        put_i32(&mut b, v as i32);
-    }
-    b
+    let params = [m as u64, k as u64, n as u64];
+    let y_format = if spec.epi == Epi::SetBf16 {
+        mq6_abi::FORMAT_BF16_N_M
+    } else {
+        mq6_abi::FORMAT_F32_N_M
+    };
+    let binds: [OperandBinding; 3] = [
+        (mq6_abi::FORMAT_MQ6G256V2_WEIGHTS, ops[0]),
+        (mq6_abi::FORMAT_BLOCK_I8_128_KB_N, ops[1]),
+        (y_format, ops[2]),
+    ]
+    .map(|(format, (address, bytes))| OperandBinding {
+        address,
+        bytes: Some(bytes),
+        format,
+    });
+    let (grid, block, dynamic_lds) = if exact.is_some() {
+        (geom.0, [geom.1, 1, 1], geom.2)
+    } else {
+        let mut grid = [0u32; 3];
+        for (g, e) in grid.iter_mut().zip(&export.grid) {
+            let v = eval(e, abi, export, &params).map_err(|e| format!("{}: {e}", abi.id))?;
+            *g = u32::try_from(v).map_err(|_| format!("{}: grid {v} exceeds u32", abi.id))?;
+        }
+        (grid, export.block, export.dynamic_lds)
+    };
+    let v = validate_invocation(
+        abi,
+        &InvocationV1 {
+            arch: AbiArch::Gfx1201,
+            symbol: export.symbol,
+            params: &params,
+            operands: &binds,
+            grid,
+            block,
+            dynamic_lds,
+        },
+    )
+    .map_err(|e| format!("{}: {e}", spec.variant_name()))?;
+    Ok((v.explicit().to_vec(), abi))
 }
 
 /// `full` or `sample:<n>` indices over `0..dim`.
@@ -383,6 +510,9 @@ pub struct Mq6 {
     /// `--base-tile` / `--base-rip`: the baseline is an emitted (or scripted) variant of this spec
     /// instead of the shipped object (hill-climbing against a tile's generator output).
     base: Option<(Spec, Option<(String, String)>)>,
+    /// `--base-shipped`: the baseline is the shipped PM object's entry of this tile (the entry the
+    /// runtime launches for the shape), not the `128x128` product entry.
+    base_shipped: Option<Tile>,
     rows: Vec<usize>,
     rows_desc: String,
     cols: Vec<usize>,
@@ -392,9 +522,23 @@ pub struct Mq6 {
     reference: OnceCell<Vec<u32>>,
 }
 
-fn parse_spec(epi: &str, raster: &str, tile: &str) -> Result<Spec> {
+/// The A/W ring depth an `mq6_i8_gemm` script declares (`const RING: u32 = N;`; `2` when absent).
+fn script_ring(text: &str) -> Result<&'static str> {
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix("const RING: u32 =") {
+            return match v.trim().trim_end_matches(';').trim() {
+                "2" => Ok("2"),
+                "3" => Ok("3"),
+                o => Err(format!("const RING = {o}: expected 2 or 3")),
+            };
+        }
+    }
+    Ok("2")
+}
+fn parse_spec(epi: &str, raster: &str, tile: &str, ring: &str) -> Result<Spec> {
     let epi: Epi = epi.parse()?;
     let tile: Tile = tile.parse().map_err(|e| format!("--tile: {e}"))?;
+    let ring: RingDepth = ring.parse().map_err(|e| format!("--ring: {e}"))?;
     let raster = match raster {
         "banded" => Raster::Banded,
         "linear" => Raster::Linear,
@@ -405,6 +549,7 @@ fn parse_spec(epi: &str, raster: &str, tile: &str) -> Result<Spec> {
         raster,
         tile,
         arch: Arch::Gfx1201,
+        tune: Tune { ring },
     };
     spec.validate()?;
     Ok(spec)
@@ -422,10 +567,50 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
         knobs.take_or("raster", "banded"),
         knobs.take_or("tile", "128x128"),
     );
-    let cand = parse_spec(&epi_k, &raster_k, &tile_k)?;
+    let mut ring_k = knobs.take_or("ring", "2");
+    // With `--rip` the ring depth is the script's own `const RING` (the twin has no ring knob);
+    // a conflicting `--ring` is refused.
+    if let Some(p) = rip {
+        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let script = script_ring(&text)?;
+        if ring_k != "2" && ring_k != script {
+            return Err(format!(
+                "--ring {ring_k} conflicts with {}: its `const RING` is {script}",
+                p.display()
+            ));
+        }
+        ring_k = script.to_owned();
+    }
+    let cand = parse_spec(&epi_k, &raster_k, &tile_k, &ring_k)?;
     let (base_tile, base_rip) = (knobs.take("base-tile"), knobs.take("base-rip"));
+    let base_shipped = match knobs.take("base-shipped") {
+        None => None,
+        Some(_) if base_tile.is_some() || base_rip.is_some() => {
+            return Err(
+                "--base-shipped selects a shipped entry; it excludes --base-tile/--base-rip".into(),
+            )
+        }
+        Some(t) => match t
+            .parse::<Tile>()
+            .map_err(|e| format!("--base-shipped: {e}"))?
+        {
+            t @ (Tile::T128x128 | Tile::T128x256) => Some(t),
+            _ => {
+                return Err(format!(
+                "--base-shipped {t}: the shipped object has the 128x128 and 128x256 entries only"
+            ))
+            }
+        },
+    };
     let base = if base_tile.is_some() || base_rip.is_some() {
-        let spec = parse_spec(&epi_k, &raster_k, base_tile.as_deref().unwrap_or(&tile_k))?;
+        // The baseline's ring depth is its own (default 2): `--base-ring`.
+        let base_ring = knobs.take_or("base-ring", "2");
+        let spec = parse_spec(
+            &epi_k,
+            &raster_k,
+            base_tile.as_deref().unwrap_or(&tile_k),
+            &base_ring,
+        )?;
         let rip = match &base_rip {
             Some(p) => Some((
                 p.clone(),
@@ -459,6 +644,7 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
         cand,
         rip,
         base,
+        base_shipped,
         rows,
         rows_desc,
         cols,
@@ -473,7 +659,9 @@ pub fn new(shape: &str, knobs: &mut Knobs, rip: Option<&Path>) -> Result<Box<dyn
 /// `mq6_i8_gemm::emit(spec)`; returns the ELF, symbol and the `candidate.rip`
 /// fields (`variant`, `sha256`, `identical_to_generator`).
 fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
-    let variant = spec.variant_name();
+    // The variant name the script is built under: the ring depth is the script's own `const RING`
+    // (the generator's `-r3` suffix is not part of the twin's variant grammar).
+    let variant = spec.with_tune(Default::default()).variant_name();
     let compiled = peacemaker_rip::compile(source, spec.arch, &variant)?;
     let generator = mq6_i8_gemm::emit(spec)?;
     let symbol = spec.symbol();
@@ -495,7 +683,7 @@ fn compile_rip(source: &str, spec: Spec) -> Result<(Vec<u8>, String, Value)> {
     Ok((elf, symbol, info))
 }
 
-/// `(grid, threads, dynamic LDS)` of `tile`'s launch at `M` rows and `N` tokens.
+/// `(grid, threads, dynamic LDS)` of `tile`'s launch at `M` rows and `N` tokens (depth-2 rings).
 fn geometry(m: usize, n: usize, tile: Tile) -> ([u32; 3], u32, u32) {
     (
         [
@@ -508,9 +696,48 @@ fn geometry(m: usize, n: usize, tile: Tile) -> ([u32; 3], u32, u32) {
     )
 }
 
+/// [`geometry`] of a spec (`Spec::launch_lds`: the depth-2 dynamic size at either ring depth).
+fn geometry_for(m: usize, n: usize, spec: Spec) -> ([u32; 3], u32, u32) {
+    let (grid, threads, _) = geometry(m, n, spec.tile);
+    (grid, threads, spec.launch_lds())
+}
+
 impl Mq6 {
     fn bf16(&self) -> bool {
         self.cand.epi == Epi::SetBf16
+    }
+
+    /// The spec `arm` launches: the shipped `128x128` product entry of the candidate's epilogue,
+    /// or the emitted `--base-tile` / `--base-rip` spec.
+    fn arm_spec(&self, arm: Arm) -> Spec {
+        match arm {
+            Arm::Baseline => self.base.as_ref().map_or_else(
+                || Spec {
+                    tile: self.base_shipped.unwrap_or(Tile::T128x128),
+                    ..Spec::product(self.cand.epi)
+                },
+                |(s, _)| *s,
+            ),
+            Arm::Candidate => self.cand,
+        }
+    }
+
+    /// `arm`'s explicit kernarg, from the contract, over the workload's live allocations.
+    fn kernarg(&self, arm: Arm) -> Result<Vec<u8>> {
+        let dev = self.dev.as_ref().ok_or("kernarg before setup")?;
+        let y = match arm {
+            Arm::Baseline => &dev.y[0],
+            Arm::Candidate => &dev.y[1],
+        };
+        let spec = self.arm_spec(arm);
+        let op = |b: &hip_bridge::DeviceBuffer| (b.as_ptr() as u64, b.size() as u64);
+        contract_kernarg(
+            spec,
+            (self.m, self.k, self.n),
+            [op(&dev.w), op(&dev.x), op(y)],
+            geometry_for(self.m, self.n, spec),
+        )
+        .map(|(k, _)| k)
     }
 
     fn width(&self) -> usize {
@@ -559,10 +786,15 @@ impl Mq6 {
     }
 
     fn knobs_json(&self) -> Value {
-        json!({"epi": self.cand.epi.name(), "raster": match self.cand.raster {
+        let mut v = json!({"epi": self.cand.epi.name(), "raster": match self.cand.raster {
             Raster::Banded => "banded",
             Raster::Linear => "linear",
-        }, "tile": self.cand.tile.name()})
+        }, "tile": self.cand.tile.name()});
+        // Only non-default generator knobs are recorded: every existing record keeps its bytes.
+        if self.cand.tune.ring != RingDepth::Two {
+            v["ring"] = json!(self.cand.tune.ring.name());
+        }
+        v
     }
 
     /// Run the candidate object on the emulator at a small shape and compare
@@ -577,7 +809,7 @@ impl Mq6 {
             },
         )
         .map_err(|e| format!("lift: {e:?}"))?;
-        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?;
+        let emu = Emulator::new(&lifted.program, &obj.launch_symbol)?.hw_model();
         let (m, n, k) = (132usize, 130usize, 512usize);
         let host = Host::synth(m, n, k);
         let (kva, ava, xva, yva) = (
@@ -591,10 +823,27 @@ impl Mq6 {
             m.div_ceil(tile.rows() as usize),
             n.div_ceil(tile.tokens() as usize),
         );
-        let mut kern = pack(ava, xva, yva, m, k, n);
+        let (mut kern, abi) = contract_kernarg(
+            self.cand,
+            (m, k, n),
+            [
+                (ava, host.w.len() as u64),
+                (xva, host.x.len() as u64),
+                (yva, (n * m * self.width()) as u64),
+            ],
+            geometry_for(m, n, self.cand),
+        )?;
         kern.resize(self.cand.kernargs().size as usize, 0);
-        for (off, v) in [(40, gx as u32), (44, gy as u32), (48, 1)] {
-            kern[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        for h in abi.hidden {
+            if let HiddenKind::BlockCount(axis) = h.kind {
+                let v = match axis {
+                    Axis::X => gx as u32,
+                    Axis::Y => gy as u32,
+                    Axis::Z => 1,
+                };
+                let off = h.offset as usize;
+                kern[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
         }
         let mut mem = Memory::default();
         mem.map("kernarg".into(), kva, kern)?;
@@ -615,7 +864,7 @@ impl Mq6 {
                         kernarg_ptr: kva,
                         workgroup: [x as u32, y as u32, 0],
                         block: [tile.threads(), 1, 1],
-                        dynamic_lds: tile.layout().launch,
+                        dynamic_lds: self.cand.launch_lds(),
                     },
                     &mut mem,
                 )?;
@@ -705,16 +954,17 @@ impl Workload for Mq6 {
             });
         }
         let bytes = rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201;
-        let symbol =
-            match self.cand.epi {
-                Epi::Set => "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
-                Epi::SetBf16 => "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201",
-                Epi::SetNr => return Err(
-                    "epi set_nr takes the QSA norm and RoPE-table kernel arguments, which this \
-                     harness does not pass: tests/qsa_norm_epi_oracle.rs checks and times it"
-                        .into(),
-                ),
-            };
+        if self.cand.epi == Epi::SetNr {
+            return Err(
+                "epi set_nr takes the QSA norm and RoPE-table kernel arguments, which this \
+                 harness does not pass: tests/qsa_norm_epi_oracle.rs checks and times it"
+                    .into(),
+            );
+        }
+        // The shipped entry of the baseline's tile: the product symbol (128x128) or its
+        // `_t128x256` sibling (`Spec::symbol` of the banded spec), the runtime's two PM entries.
+        let symbol = self.arm_spec(Arm::Baseline).symbol();
+        let symbol = symbol.as_str();
         if !contains(bytes, symbol.as_bytes()) {
             return Err(format!(
                 "symbol {symbol} is not in the shipped object {OBJECT}"
@@ -724,9 +974,9 @@ impl Workload for Mq6 {
             bytes: bytes.to_vec(),
             launch_symbol: symbol.to_owned(),
             exports: vec![symbol.to_owned()],
-            desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded"}}),
+            desc: json!({"artifact": OBJECT, "knobs": {"epi": self.cand.epi.name(), "raster": "banded", "tile": self.arm_spec(Arm::Baseline).tile.name()}}),
             source: json!({
-                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries); \
+                "source": "crates/rdna-compute/src/gemm_mq6_i8.rs MQ6_I8_PM_MODULE / MQ6_I8_PM_ENTRY_F32 / MQ6_I8_PM_ENTRY_BF16 (the 128x128 entries) or, with --base-shipped 128x256, the _T256 entries; \
                            entry choice mq6_i8_pm_launch / mq6_i8_pm_token_tile and embedded-module load (gemm_mq6g256v2_i8_prequant), \
                            admission mq6_i8_pm_admits, 128x128 launch (grid [ceil(M/128), ceil(N/128)], 256 threads, 36864 B LDS)",
                 "artifact": OBJECT,
@@ -754,6 +1004,10 @@ impl Workload for Mq6 {
         };
         self.host = Some(host);
         self.dev = Some(dev);
+        // Refuse a wrong layout / extent / alignment before any launch.
+        for arm in [Arm::Baseline, Arm::Candidate] {
+            self.kernarg(arm)?;
+        }
         for arm in [Arm::Baseline, Arm::Candidate] {
             self.reset(gpu, arm)?;
         }
@@ -761,21 +1015,13 @@ impl Workload for Mq6 {
     }
 
     fn launch(&self, arm: Arm) -> Launch {
-        let dev = self.dev.as_ref().expect("launch before setup");
-        let ptr = |b: &hip_bridge::DeviceBuffer| b.as_ptr() as u64;
-        let y = match arm {
-            Arm::Baseline => &dev.y[0],
-            Arm::Candidate => &dev.y[1],
-        };
-        // The baseline is the shipped 128x128 kernel whatever the candidate's tile is; each
-        // arm's grid, block and LDS follow its own tile.
-        let tile = match arm {
-            Arm::Baseline => self.base.as_ref().map_or(Tile::T128x128, |(s, _)| s.tile),
-            Arm::Candidate => self.cand.tile,
-        };
-        let (grid, threads, lds) = geometry(self.m, self.n, tile);
+        // Each arm's grid, block and LDS follow its own tile (see `arm_spec`).
+        let spec = self.arm_spec(arm);
+        let (grid, threads, lds) = geometry_for(self.m, self.n, spec);
         Launch {
-            kernarg: pack(ptr(&dev.w), ptr(&dev.x), ptr(y), self.m, self.k, self.n),
+            kernarg: self
+                .kernarg(arm)
+                .expect("kernarg contract is validated in setup"),
             grid,
             block: [threads, 1, 1],
             lds,
@@ -994,6 +1240,50 @@ mod tests {
     }
 
     #[test]
+    fn base_shipped_selects_the_shipped_wide_entry() {
+        for (epi, sym) in [
+            ("set", "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201_t128x256"),
+            (
+                "set_bf16",
+                "gemm_mq6g256v2_mmq_i8_pm_set_bf16_gfx1201_t128x256",
+            ),
+        ] {
+            let w = new(
+                "M=10240,N=4096,K=2560",
+                &mut knobs(&[
+                    ("epi", epi),
+                    ("tile", "128x256"),
+                    ("base-shipped", "128x256"),
+                ]),
+                None,
+            )
+            .unwrap();
+            let b = w.baseline().unwrap();
+            assert_eq!(b.launch_symbol, sym);
+            assert_eq!(b.source["artifact"], OBJECT);
+            // The generator twin of the same tile launches the same symbol.
+            assert_eq!(w.candidate().unwrap().launch_symbol, sym);
+        }
+        let w = new(
+            "M=128,N=128,K=256",
+            &mut knobs(&[("base-shipped", "128x128")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            w.baseline().unwrap().launch_symbol,
+            "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"
+        );
+        for bad in [
+            &[("base-shipped", "256x128")][..],
+            &[("base-shipped", "64x64")],
+            &[("base-shipped", "128x256"), ("base-tile", "128x128")],
+        ] {
+            assert!(new("M=128,N=128,K=256", &mut knobs(bad), None).is_err());
+        }
+    }
+
+    #[test]
     fn emitted_candidate_symbol_follows_spec() {
         let w = new(
             "M=128,N=128,K=256",
@@ -1010,14 +1300,131 @@ mod tests {
 
     #[test]
     fn launch_is_the_runtime_geometry() {
-        let mut w = new("M=260,N=130,K=256", &mut knobs(&[]), None).unwrap();
-        let _ = &mut w;
-        let b = pack(1, 2, 3, 260, 256, 130);
+        let (b, abi) = contract_kernarg(
+            Spec::product(Epi::Set),
+            (260, 256, 130),
+            [(0x1000, 52000), (0x2000, 35360), (0x3000, 135200)],
+            geometry(260, 130, Tile::T128x128),
+        )
+        .unwrap();
+        assert_eq!(abi.id, "mq6_i8_gemm.pm.set_f32");
         assert_eq!(b.len(), 40);
-        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 3);
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 0x3000);
         for (off, v) in [(24, 260), (28, 256), (32, 130), (36, 0)] {
             assert_eq!(i32::from_le_bytes(b[off..off + 4].try_into().unwrap()), v);
         }
+    }
+
+    /// An independent contract encoding (the explicit statics, `validate_invocation` +
+    /// `encode_into`) equals the workload's kernarg for canonical shapes, tiles and epilogues.
+    #[test]
+    fn mq6_kernarg_is_contract_encoding() {
+        use hipfire_kernel_abi::families::mq6_i8 as f;
+        use hipfire_kernel_abi::{encode_into, validate_invocation};
+        for (epi, abi, y_fmt, y_bytes_per) in [
+            (Epi::Set, &f::MQ6_I8_PM_SET_F32, f::FORMAT_F32_N_M, 4u64),
+            (
+                Epi::SetBf16,
+                &f::MQ6_I8_PM_SET_BF16,
+                f::FORMAT_BF16_N_M,
+                2u64,
+            ),
+        ] {
+            for (m, n, k) in [(260usize, 130usize, 256usize), (128, 128, 512), (4, 1, 256)] {
+                let ops = [
+                    (0x1000u64, (m * (k / 256) * 200) as u64),
+                    (0x2000, (n * (k / 128) * 136) as u64),
+                    (0x3000, n as u64 * m as u64 * y_bytes_per),
+                ];
+                let spec = Spec::product(epi);
+                let (got, got_abi) =
+                    contract_kernarg(spec, (m, k, n), ops, geometry(m, n, Tile::T128x128)).unwrap();
+                assert_eq!(got_abi.id, abi.id);
+                let formats = [
+                    f::FORMAT_MQ6G256V2_WEIGHTS,
+                    f::FORMAT_BLOCK_I8_128_KB_N,
+                    y_fmt,
+                ];
+                let binds: Vec<OperandBinding> = ops
+                    .iter()
+                    .zip(formats)
+                    .map(|(&(address, bytes), format)| OperandBinding {
+                        address,
+                        bytes: Some(bytes),
+                        format,
+                    })
+                    .collect();
+                let (grid, threads, lds) = geometry(m, n, Tile::T128x128);
+                let v = validate_invocation(
+                    abi,
+                    &InvocationV1 {
+                        arch: AbiArch::Gfx1201,
+                        symbol: &spec.symbol(),
+                        params: &[m as u64, k as u64, n as u64],
+                        operands: &binds,
+                        grid,
+                        block: [threads, 1, 1],
+                        dynamic_lds: lds,
+                    },
+                )
+                .unwrap();
+                let mut want = vec![0u8; abi.explicit_bytes as usize];
+                encode_into(&v, &mut want).unwrap();
+                assert_eq!(got, want, "{} M={m} N={n} K={k}", epi.name());
+                // Non-product tiles/rasters of the same epilogue share the product's image.
+                for (tile, raster) in [
+                    (Tile::T128x256, Raster::Banded),
+                    (Tile::T256x128, Raster::Banded),
+                    (Tile::T128x128, Raster::Linear),
+                ] {
+                    let s = Spec {
+                        epi,
+                        raster,
+                        tile,
+                        arch: Arch::Gfx1201,
+                        tune: Default::default(),
+                    };
+                    let (g, _) = contract_kernarg(s, (m, k, n), ops, geometry(m, n, tile)).unwrap();
+                    assert_eq!(g, want, "{} M={m} N={n} K={k}", s.variant_name());
+                }
+            }
+        }
+    }
+
+    /// A candidate whose generator kernarg layout differs from the contract (set_nr appends the
+    /// norm/RoPE pointers, renames word 36 and grows the segment) is refused before launch.
+    #[test]
+    fn mq6_wrong_candidate_layout_is_rejected_before_launch() {
+        let nr = Spec {
+            epi: Epi::SetNr,
+            raster: Raster::Banded,
+            tile: Tile::T256x128,
+            arch: Arch::Gfx1201,
+            tune: Default::default(),
+        };
+        let e = contract_kernarg(
+            nr,
+            (256, 256, 128),
+            [(0x1000, 51200), (0x2000, 34816), (0x3000, 131072)],
+            geometry(256, 128, Tile::T256x128),
+        )
+        .unwrap_err();
+        assert!(e.contains("kernarg layout"), "{e}");
+        assert!(e.contains("head_mask"), "{e}");
+    }
+
+    #[test]
+    fn mq6_contract_refuses_short_extent_and_misalignment() {
+        let g = geometry(260, 130, Tile::T128x128);
+        let s = Spec::product(Epi::Set);
+        let good = [(0x1000u64, 52000u64), (0x2000, 35360), (0x3000, 135200)];
+        assert!(contract_kernarg(s, (260, 256, 130), good, g).is_ok());
+        let mut short = good;
+        short[2].1 -= 4;
+        assert!(contract_kernarg(s, (260, 256, 130), short, g).is_err());
+        let mut odd = good;
+        odd[0].0 = 0x1001;
+        assert!(contract_kernarg(s, (260, 256, 130), odd, g).is_err());
     }
 
     #[test]
@@ -1089,7 +1496,7 @@ mod tests {
             ("set", "banded", "128x256"),
             ("set_bf16", "linear", "128x256"),
         ] {
-            let spec = parse_spec(epi, raster, tile).unwrap();
+            let spec = parse_spec(epi, raster, tile, "2").unwrap();
             let (_, symbol, info) = compile_rip(TWIN, spec).unwrap();
             assert_eq!(symbol, spec.symbol());
             assert_eq!(
@@ -1103,7 +1510,121 @@ mod tests {
 
     #[test]
     fn rip_garbage_is_refused() {
-        let spec = parse_spec("set", "banded", "128x128").unwrap();
+        let spec = parse_spec("set", "banded", "128x128", "2").unwrap();
         assert!(compile_rip("fn emit(", spec).is_err());
+    }
+
+    /// `--ring 3`: the candidate is the depth-3 kernel (`-r3` variant, the knob recorded only when
+    /// non-default), its launch carries the third A/W slab's LDS, and the shipped baseline stays
+    /// depth 2.
+    #[test]
+    fn ring_knob_selects_depth_3_and_the_launch_follows_it() {
+        let d2 = new("M=256,N=256,K=768", &mut knobs(&[]), None).unwrap();
+        assert!(d2.candidate_knobs().get("ring").is_none());
+        assert_eq!(d2.candidate_knobs()["variant"], "128x128x8-set");
+        let d3 = new("M=256,N=256,K=768", &mut knobs(&[("ring", "3")]), None).unwrap();
+        assert_eq!(d3.candidate_knobs()["ring"], "3");
+        assert_eq!(d3.candidate_knobs()["variant"], "128x128x8-set-r3");
+        let spec = parse_spec("set", "banded", "128x128", "3").unwrap();
+        // The depth-3 object keeps the depth-2 dynamic launch size (the third slab is static LDS).
+        assert_eq!(geometry_for(256, 256, spec).2, 36864);
+        assert_eq!(spec.static_lds() + spec.launch_lds(), 53248);
+        assert_eq!(geometry_for(256, 256, spec).0, [2, 2, 1]);
+        assert_eq!(
+            geometry_for(
+                256,
+                256,
+                parse_spec("set", "banded", "128x128", "2").unwrap()
+            )
+            .2,
+            36864
+        );
+        // The emitted candidate object is the depth-3 kernel (the dynamic LDS it launches with).
+        let obj = d3.candidate().unwrap();
+        assert_eq!(obj.launch_symbol, spec.symbol());
+        assert_eq!(
+            d3.baseline().unwrap().launch_symbol,
+            "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201"
+        );
+        assert!(new("M=256,N=256,K=768", &mut knobs(&[("ring", "4")]), None).is_err());
+    }
+
+    /// The wide tiles do not fit depth 3 (the third A+W slab takes the launch past 64 KiB, the
+    /// second prefetch set past the 192-VGPR plan): the refusal names the numbers.
+    #[test]
+    fn ring_3_is_refused_on_the_wide_tiles_with_the_numbers() {
+        for tile in ["128x256", "256x128"] {
+            let e = new(
+                "M=10240,N=4096,K=2560",
+                &mut knobs(&[("tile", tile), ("ring", "3")]),
+                None,
+            )
+            .err()
+            .expect(tile);
+            assert!(e.contains("ring depth 3 does not fit"), "{e}");
+            assert!(e.contains("79872 B") && e.contains("65536 B"), "{e}");
+        }
+    }
+
+    /// `--rip` of a `const RING = 3` copy of the twin at the FN prefill node's shape on the 128x128
+    /// tile: the ring depth comes from the script (no `--ring`), the candidate object is the
+    /// script's, identical to the depth-3 generator; a conflicting `--ring` is refused.
+    #[test]
+    fn rip_flag_reads_the_ring_from_the_script_at_the_fn_node_shape() {
+        let dir = std::env::temp_dir().join(format!("pm-loop-mq6-rip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ring3.rip");
+        std::fs::write(
+            &path,
+            TWIN.replace("const RING: u32 = 2;", "const RING: u32 = 3;"),
+        )
+        .unwrap();
+        let shape = "M=10240,N=4096,K=2560";
+        let w = new(
+            shape,
+            &mut knobs(&[("tile", "128x128"), ("base-shipped", "128x256")]),
+            Some(&path),
+        )
+        .unwrap();
+        assert_eq!(w.candidate_knobs()["ring"], "3");
+        assert_eq!(w.candidate_knobs()["variant"], "128x128x8-set-r3");
+        let obj = w.candidate().unwrap();
+        assert_eq!(obj.desc["rip"]["identical_to_generator"], true);
+        assert_eq!(obj.launch_symbol, "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201");
+        assert!(new(
+            shape,
+            &mut knobs(&[("tile", "128x128"), ("ring", "2")]),
+            Some(&path)
+        )
+        .is_ok());
+        // `--ring 3` with a depth-2 script, or the 128x256 tile with the depth-3 one, is refused.
+        let p2 = dir.join("ring2.rip");
+        std::fs::write(&p2, TWIN).unwrap();
+        let e = new(shape, &mut knobs(&[("ring", "3")]), Some(&p2))
+            .err()
+            .unwrap();
+        assert!(e.contains("conflicts"), "{e}");
+        let e = new(shape, &mut knobs(&[("tile", "128x256")]), Some(&path))
+            .err()
+            .unwrap();
+        assert!(e.contains("ring depth 3 does not fit"), "{e}");
+    }
+
+    /// The twin with `const RING = 3` is identical to the generator's depth-3 kernel.
+    #[test]
+    fn rip_ring3_twin_is_identical_to_the_depth_3_generator() {
+        let twin3 = TWIN.replace("const RING: u32 = 2;", "const RING: u32 = 3;");
+        assert_ne!(twin3, TWIN);
+        for (epi, raster) in [("set", "banded"), ("set_bf16", "linear")] {
+            let spec = parse_spec(epi, raster, "128x128", "3").unwrap();
+            let (_, symbol, info) = compile_rip(&twin3, spec).unwrap();
+            assert_eq!(symbol, spec.symbol());
+            assert_eq!(info["identical_to_generator"], true, "{epi} {raster}");
+        }
+        // The depth-2 script against a depth-3 spec is not the generator's program: its ABI
+        // (the kernel's static LDS) differs, and the comparison refuses it.
+        let spec = parse_spec("set", "banded", "128x128", "3").unwrap();
+        let e = compile_rip(TWIN, spec).unwrap_err();
+        assert!(e.contains("ABI mismatch"), "{e}");
     }
 }

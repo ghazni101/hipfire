@@ -33,8 +33,14 @@
 //! bit-identical to the hipcc kernel's.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
+use crate::kernel_abi;
 use crate::kernels;
 use hip_bridge::{HipError, HipResult};
+use hipfire_kernel_abi::families::mq6_i8::{
+    FORMAT_BF16_NORM_256, FORMAT_BF16_N_M, FORMAT_BLOCK_I8_128_KB_N, FORMAT_F32_N_M,
+    FORMAT_F32_ROPE_N_64, FORMAT_MQ6G256V2_WEIGHTS,
+};
+use hipfire_kernel_abi::{InvocationV1, MAX_FIELDS};
 use std::ffi::c_void;
 
 /// MQ6G256V2 group bytes (8 B header + 192 B 6-bit payload).
@@ -68,9 +74,6 @@ const MQ6_I8_PM_ENTRY_F32_NORM_ROPE: &str = "gemm_mq6g256v2_mmq_i8_pm_set_nr_gfx
 /// Rows per CTA and tokens per CTA of that entry, its threads and dynamic LDS.
 const MQ6_I8_PM_NR_ROWS: usize = 256;
 const MQ6_I8_PM_NR_TOKENS: usize = 128;
-/// Kernarg byte offsets of the entry's `norm` and `rope` pointers; the 40-byte
-/// explicit prefix is the other entries', the hidden block fills 40..296.
-const MQ6_I8_PM_NR_NORM_OFFSET: usize = 296;
 /// `HIPFIRE_QWEN4_QSA_NORM_EPI` (developer, kill switch): on unless `0`; acted on for exact gfx1201 only.
 static QWEN4_QSA_NORM_EPI: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_NORM_EPI", true));
@@ -414,6 +417,39 @@ impl Gpu {
                 tile,
             )
         };
+        // One typed contract per kernel (hipfire-kernel-abi): every operand
+        // format/alignment/extent, the launch geometry and the kernarg image
+        // are validated and encoded once, before the module is ensured.
+        let arch = kernel_abi::parse_arch(&self.arch)?;
+        let abi = kernel_abi::contract(&self.arch, kernel)?;
+        let y_format = if bf16 {
+            FORMAT_BF16_N_M
+        } else {
+            FORMAT_F32_N_M
+        };
+        let operands = [
+            kernel_abi::binding(a, FORMAT_MQ6G256V2_WEIGHTS),
+            kernel_abi::binding_raw(xq, self.int8_mmq_xq_bytes(xq), FORMAT_BLOCK_I8_128_KB_N),
+            kernel_abi::binding(y, y_format),
+        ];
+        let grid = [
+            m.div_ceil(tile_rows) as u32,
+            batch_size.div_ceil(tile_tokens) as u32,
+            1,
+        ];
+        let block = [threads, 1, 1];
+        let mut v = kernel_abi::validate(
+            abi,
+            &InvocationV1 {
+                arch,
+                symbol: kernel,
+                params: &[m as u64, k as u64, batch_size as u64],
+                operands: &operands,
+                grid,
+                block,
+                dynamic_lds: lds,
+            },
+        )?;
         if pm {
             self.ensure_embedded_kernel(
                 MQ6_I8_PM_MODULE,
@@ -423,52 +459,13 @@ impl Gpu {
         } else {
             self.ensure_kernel(module, source, kernel)?;
         }
-        let mut ap = a.buf.as_ptr();
-        let mut xp = xq;
-        let mut yp = y.buf.as_ptr();
-        let mut mv = m as i32;
-        let mut kv = k as i32;
-        let mut nv = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mv as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut nv as *mut _ as *mut c_void,
-        ];
-        // The PM image keeps K1's FullSet kernarg layout: a seventh explicit
-        // by-value word (`unused`, offset 36) precedes the hidden block counts.
-        let mut unused = 0i32;
-        if pm {
-            params.push(&mut unused as *mut _ as *mut c_void);
-        }
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
+        let nptrs = kernel_abi::kernel_params(&mut v, &mut ptrs)?;
         let bytes = weight_bytes + batch_size * (k / 128) * BLOCK_I8_128_BYTES + out_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
-        let result = self.launch_maybe_blob(
-            kernel,
-            [
-                m.div_ceil(tile_rows) as u32,
-                batch_size.div_ceil(tile_tokens) as u32,
-                1,
-            ],
-            [threads, 1, 1],
-            lds,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mv);
-                b.push_i32(kv);
-                b.push_i32(nv);
-                if pm {
-                    b.push_i32(unused);
-                }
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(kernel, grid, block, lds, &mut ptrs[..nptrs], || {
+            kernel_abi::blob(v.explicit())
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -568,31 +565,45 @@ impl Gpu {
             ));
         }
         let kernel = MQ6_I8_PM_ENTRY_F32_NORM_ROPE;
+        let arch = kernel_abi::parse_arch(&self.arch)?;
+        let abi = kernel_abi::contract(&self.arch, kernel)?;
+        let operands = [
+            kernel_abi::binding(a, FORMAT_MQ6G256V2_WEIGHTS),
+            kernel_abi::binding_raw(xq, self.int8_mmq_xq_bytes(xq), FORMAT_BLOCK_I8_128_KB_N),
+            kernel_abi::binding(y, FORMAT_F32_N_M),
+            kernel_abi::binding(norm, FORMAT_BF16_NORM_256),
+            kernel_abi::binding(rope_table, FORMAT_F32_ROPE_N_64),
+        ];
+        let grid = [
+            (m / MQ6_I8_PM_NR_ROWS) as u32,
+            batch_size.div_ceil(MQ6_I8_PM_NR_TOKENS) as u32,
+            1,
+        ];
+        let block = [MQ6_I8_PM_T256_THREADS, 1, 1];
+        let mut v = kernel_abi::validate(
+            abi,
+            &InvocationV1 {
+                arch,
+                symbol: kernel,
+                params: &[
+                    m as u64,
+                    k as u64,
+                    batch_size as u64,
+                    head_stride_rows as u64,
+                ],
+                operands: &operands,
+                grid,
+                block,
+                dynamic_lds: MQ6_I8_PM_T256_LDS_BYTES,
+            },
+        )?;
         self.ensure_embedded_kernel(
             MQ6_I8_PM_MODULE,
             kernels::GEMM_MQ6G256V2_MMQ_I8_PM_GFX1201,
             kernel,
         )?;
-        let mut ap = a.buf.as_ptr();
-        let mut xp = xq;
-        let mut yp = y.buf.as_ptr();
-        let mut mv = m as i32;
-        let mut kv = k as i32;
-        let mut nv = batch_size as i32;
-        let mut head_mask = (head_stride_rows - 1) as i32;
-        let mut normp = norm.buf.as_ptr();
-        let mut ropep = rope_table.buf.as_ptr();
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mv as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut nv as *mut _ as *mut c_void,
-            &mut head_mask as *mut _ as *mut c_void,
-            &mut normp as *mut _ as *mut c_void,
-            &mut ropep as *mut _ as *mut c_void,
-        ];
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
+        let nptrs = kernel_abi::kernel_params(&mut v, &mut ptrs)?;
         let bytes = weight_bytes
             + batch_size * (k / 128) * BLOCK_I8_128_BYTES
             + out_bytes
@@ -600,31 +611,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [
-                (m / MQ6_I8_PM_NR_ROWS) as u32,
-                batch_size.div_ceil(MQ6_I8_PM_NR_TOKENS) as u32,
-                1,
-            ],
-            [MQ6_I8_PM_T256_THREADS, 1, 1],
+            grid,
+            block,
             MQ6_I8_PM_T256_LDS_BYTES,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mv);
-                b.push_i32(kv);
-                b.push_i32(nv);
-                b.push_i32(head_mask);
-                // The hidden block (offsets 40..296) is the runtime's.
-                while b.len() < MQ6_I8_PM_NR_NORM_OFFSET {
-                    b.push_u32(0);
-                }
-                b.push_ptr(normp);
-                b.push_ptr(ropep);
-                b
-            },
+            &mut ptrs[..nptrs],
+            || kernel_abi::blob(v.explicit()),
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -965,5 +956,406 @@ mod tests {
                 "gemm_mq6g256v2_mmq_i8_gfx11"
             ]
         );
+    }
+
+    // ---- KernelAbiV1 contract coverage (pure CPU) ----
+
+    use hipfire_kernel_abi::{eval, families, AbiError, Arch, KernelAbiV1, OperandBinding};
+
+    const FAKE_BYTES: u64 = 1 << 40;
+
+    /// `expected` of the export `symbol` on `arch` against what the launcher
+    /// derives: block, dynamic LDS and every grid axis.
+    fn assert_export_matches(
+        arch: Arch,
+        symbol: &str,
+        threads: u32,
+        lds: u32,
+        grid: [u32; 3],
+        params: &[u64],
+    ) {
+        let (abi, export) = families::find_export(arch, symbol)
+            .unwrap_or_else(|| panic!("no contract export for {symbol} on {}", arch.name()));
+        assert_eq!(export.block, [threads, 1, 1], "{symbol} block");
+        assert_eq!(export.dynamic_lds, lds, "{symbol} dynamic LDS");
+        for axis in 0..3 {
+            assert_eq!(
+                eval(&export.grid[axis], abi, export, params).unwrap(),
+                u64::from(grid[axis]),
+                "{symbol} grid[{axis}] for {params:?}"
+            );
+        }
+    }
+
+    /// Every launch any selector can pick (PM entries on gfx1201, hipcc entries
+    /// on gfx1201 and gfx1151, F32 and BF16) names an export whose block, LDS
+    /// and grid are what the launcher passes.
+    #[test]
+    fn contract_covers_every_selectable_launch() {
+        let ms = [4usize, 48, 128, 129, 256, 2560, 10240, 248_320];
+        let ns = [1usize, 127, 128, 129, 255, 256, 257, 384, 4096, 16385];
+        let mut seen = std::collections::BTreeSet::new();
+        for arch in ["gfx1201", "gfx1151"] {
+            let parsed = kernel_abi::parse_arch(arch).unwrap();
+            for bf16 in [false, true] {
+                for cu in [20usize, 48, 64] {
+                    for &m in &ms {
+                        for &n in &ns {
+                            let params = [m as u64, 256, n as u64];
+                            let (_, _, threads, lds, tile) = mq6_i8_launch(arch, m, n, cu).unwrap();
+                            let entry = mq6_i8_entry(arch, tile, bf16);
+                            assert_export_matches(
+                                parsed,
+                                entry,
+                                threads,
+                                lds,
+                                [m.div_ceil(tile) as u32, n.div_ceil(tile) as u32, 1],
+                                &params,
+                            );
+                            seen.insert((arch, entry));
+                            if arch == "gfx1201" {
+                                let (entry, threads, lds, tile) = mq6_i8_pm_launch(m, n, cu, bf16);
+                                assert_export_matches(
+                                    parsed,
+                                    entry,
+                                    threads,
+                                    lds,
+                                    [
+                                        m.div_ceil(MQ6_I8_PM_ROWS) as u32,
+                                        n.div_ceil(tile) as u32,
+                                        1,
+                                    ],
+                                    &params,
+                                );
+                                seen.insert((arch, entry));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // PM: 2 tiles x {F32, BF16}; hipcc gfx12 x {F32, BF16}; hipcc gfx11 x 2 builds x {F32, BF16}.
+        assert_eq!(seen.len(), 4 + 2 + 4, "{seen:?}");
+        // The fused norm/RoPE entry.
+        for (m, n) in [(256usize, 1usize), (2560, 129), (5120, 4096)] {
+            assert_export_matches(
+                Arch::Gfx1201,
+                MQ6_I8_PM_ENTRY_F32_NORM_ROPE,
+                MQ6_I8_PM_T256_THREADS,
+                MQ6_I8_PM_T256_LDS_BYTES,
+                [
+                    (m / MQ6_I8_PM_NR_ROWS) as u32,
+                    n.div_ceil(MQ6_I8_PM_NR_TOKENS) as u32,
+                    1,
+                ],
+                &[m as u64, 256, n as u64, 256],
+            );
+        }
+    }
+
+    fn fake_bindings(abi: &KernelAbiV1) -> Vec<OperandBinding> {
+        abi.operands
+            .iter()
+            .enumerate()
+            .map(|(i, o)| OperandBinding {
+                address: 0x1000_0000 * (i as u64 + 1),
+                bytes: Some(FAKE_BYTES),
+                format: o.format,
+            })
+            .collect()
+    }
+
+    /// The kernarg tail the removed per-launcher packing appended after
+    /// `A, Xq, Y, M, K, N`.
+    #[derive(Clone, Copy)]
+    enum LegacyTail {
+        /// hipcc: nothing.
+        None,
+        /// PM SET: the seventh by-value word `unused`.
+        Unused,
+        /// PM NR: `head_mask`, the runtime's hidden block up to 296, `norm`, `rope`.
+        NormRope { head_mask: i32 },
+    }
+
+    /// Byte image exactly as the removed `KernargBlob` closures built it (fake
+    /// pointers `0x1000_0000 * (i + 1)`), tail-padded to 16.
+    fn legacy_image(tail: LegacyTail, [m, k, n]: [i32; 3]) -> Vec<u8> {
+        let ptr = |i: usize| (0x1000_0000usize * (i + 1)) as *const c_void;
+        let mut b = hip_bridge::KernargBlob::new();
+        b.push_ptr(ptr(0));
+        b.push_ptr(ptr(1));
+        b.push_ptr(ptr(2));
+        b.push_i32(m);
+        b.push_i32(k);
+        b.push_i32(n);
+        match tail {
+            LegacyTail::None => {}
+            LegacyTail::Unused => b.push_i32(0),
+            LegacyTail::NormRope { head_mask } => {
+                b.push_i32(head_mask);
+                while b.len() < 296 {
+                    b.push_u32(0);
+                }
+                b.push_ptr(ptr(3));
+                b.push_ptr(ptr(4));
+            }
+        }
+        b.pad_to(16);
+        b.as_bytes().to_vec()
+    }
+
+    /// Validate one launch through the contract and compare its encoded image
+    /// (and the `kernelParams` pointers) with the legacy packing.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_bytes_equal_legacy(
+        arch: Arch,
+        symbol: &str,
+        params: &[u64],
+        grid: [u32; 3],
+        threads: u32,
+        lds: u32,
+        tail: LegacyTail,
+        nparams: usize,
+    ) {
+        let abi = kernel_abi::contract(arch.name(), symbol).unwrap();
+        let operands = fake_bindings(abi);
+        let mut v = kernel_abi::validate(
+            abi,
+            &InvocationV1 {
+                arch,
+                symbol,
+                params,
+                operands: &operands,
+                grid,
+                block: [threads, 1, 1],
+                dynamic_lds: lds,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{symbol}: {e}"));
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
+        let n = kernel_abi::kernel_params(&mut v, &mut ptrs).unwrap();
+        assert_eq!(n, nparams, "{symbol} kernelParams count");
+        let mut blob = kernel_abi::blob(v.explicit());
+        blob.pad_to(16);
+        let legacy = legacy_image(tail, [params[0] as i32, params[1] as i32, params[2] as i32]);
+        assert_eq!(blob.as_bytes(), legacy.as_slice(), "{symbol} blob bytes");
+        // SAFETY: the pointers address `v`'s explicit image, live and unmoved here.
+        unsafe {
+            for (i, p) in ptrs[..3].iter().enumerate() {
+                assert_eq!(
+                    std::ptr::read_unaligned(*p as *const u64),
+                    0x1000_0000 * (i as u64 + 1),
+                    "{symbol} ptr {i}"
+                );
+            }
+            for (i, p) in ptrs[3..6].iter().enumerate() {
+                assert_eq!(
+                    std::ptr::read_unaligned(*p as *const i32) as u64,
+                    params[i],
+                    "{symbol} dim {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contract_bytes_equal_legacy_packing() {
+        let g = Arch::Gfx1201;
+        // PM F32: 128 x 128 tile and the t128x256 tile.
+        for (m, k, n, cu, wide) in [
+            (2560usize, 5120usize, 100usize, 64usize, false),
+            (10240, 2560, 4096, 64, true),
+        ] {
+            let (entry, threads, lds, tile) = mq6_i8_pm_launch(m, n, cu, false);
+            assert_eq!(tile == MQ6_I8_PM_TOKENS_256, wide);
+            assert_bytes_equal_legacy(
+                g,
+                entry,
+                &[m as u64, k as u64, n as u64],
+                [
+                    m.div_ceil(MQ6_I8_PM_ROWS) as u32,
+                    n.div_ceil(tile) as u32,
+                    1,
+                ],
+                threads,
+                lds,
+                LegacyTail::Unused,
+                7,
+            );
+        }
+        // PM BF16 (both tiles).
+        for (m, k, n, cu) in [
+            (48usize, 256usize, 1usize, 64usize),
+            (10240, 2560, 4096, 64),
+        ] {
+            let (entry, threads, lds, tile) = mq6_i8_pm_launch(m, n, cu, true);
+            assert_bytes_equal_legacy(
+                g,
+                entry,
+                &[m as u64, k as u64, n as u64],
+                [
+                    m.div_ceil(MQ6_I8_PM_ROWS) as u32,
+                    n.div_ceil(tile) as u32,
+                    1,
+                ],
+                threads,
+                lds,
+                LegacyTail::Unused,
+                7,
+            );
+        }
+        // PM norm/RoPE: head stride 256 (plain k rows) and 512 (q-gate rows).
+        for (m, k, n, hsr) in [
+            (2560usize, 2560usize, 300usize, 256usize),
+            (5120, 2560, 4096, 512),
+        ] {
+            assert_bytes_equal_legacy(
+                g,
+                MQ6_I8_PM_ENTRY_F32_NORM_ROPE,
+                &[m as u64, k as u64, n as u64, hsr as u64],
+                [
+                    (m / MQ6_I8_PM_NR_ROWS) as u32,
+                    n.div_ceil(MQ6_I8_PM_NR_TOKENS) as u32,
+                    1,
+                ],
+                MQ6_I8_PM_T256_THREADS,
+                MQ6_I8_PM_T256_LDS_BYTES,
+                LegacyTail::NormRope {
+                    head_mask: (hsr - 1) as i32,
+                },
+                9,
+            );
+        }
+        // hipcc: gfx1201 (F32, BF16), gfx1151 128-token build and t256 build.
+        for (arch, m, k, n, cu, bf16, t256) in [
+            (
+                "gfx1201", 2560usize, 5120usize, 100usize, 64usize, false, false,
+            ),
+            ("gfx1201", 2562, 2560, 4000, 64, true, false),
+            ("gfx1151", 2560, 2560, 256, 20, false, false),
+            ("gfx1151", 2560, 2560, 512, 20, false, true),
+            ("gfx1151", 2560, 2560, 256, 20, true, false),
+            ("gfx1151", 2560, 2560, 512, 20, true, true),
+        ] {
+            let (_, _, threads, lds, tile) = mq6_i8_launch(arch, m, n, cu).unwrap();
+            assert_eq!(tile == 256, t256, "{arch} {m}x{n}");
+            let entry = mq6_i8_entry(arch, tile, bf16);
+            assert_bytes_equal_legacy(
+                kernel_abi::parse_arch(arch).unwrap(),
+                entry,
+                &[m as u64, k as u64, n as u64],
+                [m.div_ceil(tile) as u32, n.div_ceil(tile) as u32, 1],
+                threads,
+                lds,
+                LegacyTail::None,
+                6,
+            );
+        }
+    }
+
+    /// The validator refuses, before any enqueue, the launches the legacy path
+    /// would have let through or caught only by the admission predicate.
+    #[test]
+    fn contract_rejects_unsafe_launches_before_enqueue() {
+        let abi = &families::mq6_i8::MQ6_I8_PM_SET_BF16;
+        let symbol = MQ6_I8_PM_ENTRY_BF16;
+        let (m, k, n) = (2560u64, 2560u64, 100u64);
+        let weight_bytes = m * (k / 256) * 200;
+        let run = |k: u64, a_bytes: u64, y_addr: u64, threads: u32, lds: u32| {
+            let operands = [
+                OperandBinding {
+                    address: 0x1000_0000,
+                    bytes: Some(a_bytes),
+                    format: FORMAT_MQ6G256V2_WEIGHTS,
+                },
+                OperandBinding {
+                    address: 0x2000_0000,
+                    bytes: None,
+                    format: FORMAT_BLOCK_I8_128_KB_N,
+                },
+                OperandBinding {
+                    address: y_addr,
+                    bytes: Some(FAKE_BYTES),
+                    format: FORMAT_BF16_N_M,
+                },
+            ];
+            hipfire_kernel_abi::validate_invocation(
+                abi,
+                &InvocationV1 {
+                    arch: Arch::Gfx1201,
+                    symbol,
+                    params: &[m, k, n],
+                    operands: &operands,
+                    grid: [20, 1, 1],
+                    block: [threads, 1, 1],
+                    dynamic_lds: lds,
+                },
+            )
+            .map(|v| v.unchecked_extents().map(|o| o.name).collect::<Vec<_>>())
+        };
+        // The admitted launch passes; the unbound Xq extent is recorded, not proven.
+        assert_eq!(
+            run(k, weight_bytes, 0x3000_0000, 256, MQ6_I8_GFX12_LDS_BYTES).unwrap(),
+            ["Xq"]
+        );
+        // BF16 Y at 4 mod 8: the quad stores are buffer_store_b64.
+        assert!(matches!(
+            run(k, weight_bytes, 0x3000_0004, 256, MQ6_I8_GFX12_LDS_BYTES),
+            Err(AbiError::Misaligned { operand: "Y", .. })
+        ));
+        // K not a multiple of 256 (2560 + 128).
+        assert!(matches!(
+            run(
+                2560 + 128,
+                weight_bytes,
+                0x3000_0000,
+                256,
+                MQ6_I8_GFX12_LDS_BYTES
+            ),
+            Err(AbiError::Domain { .. })
+        ));
+        // One byte short of the weight extent.
+        assert!(matches!(
+            run(
+                k,
+                weight_bytes - 1,
+                0x3000_0000,
+                256,
+                MQ6_I8_GFX12_LDS_BYTES
+            ),
+            Err(AbiError::Extent { operand: "A", .. })
+        ));
+        // Block and dynamic LDS of another entry.
+        assert!(matches!(
+            run(k, weight_bytes, 0x3000_0000, 512, MQ6_I8_GFX12_LDS_BYTES),
+            Err(AbiError::Launch { what: "block", .. })
+        ));
+        assert!(matches!(
+            run(
+                k,
+                weight_bytes,
+                0x3000_0000,
+                256,
+                MQ6_I8_GFX12_LDS_BYTES + 4
+            ),
+            Err(AbiError::Launch { .. })
+        ));
+        // The launcher-facing helper maps the rejection to a HipError naming the symbol.
+        let operands = fake_bindings(abi);
+        let err = kernel_abi::validate(
+            abi,
+            &InvocationV1 {
+                arch: Arch::Gfx1201,
+                symbol,
+                params: &[m, k, n],
+                operands: &operands,
+                grid: [20, 1, 1],
+                block: [128, 1, 1],
+                dynamic_lds: MQ6_I8_GFX12_LDS_BYTES,
+            },
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(err.to_string().contains(symbol), "{err}");
     }
 }

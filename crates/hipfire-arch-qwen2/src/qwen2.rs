@@ -1068,6 +1068,10 @@ pub fn forward_step(
             gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
 
     forward_step_after_x(gpu, weights, cfg, state, pos)
@@ -1134,6 +1138,10 @@ pub fn embed_token_row(
             gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
     gpu.download_f32(&state.x)
 }
@@ -1958,7 +1966,10 @@ fn forward_step_after_x_lowered(
     let knobs = DenseKnobs {
         attn_bias: true,
         qk_norm: false,
-        rope_theta: cfg.rope_theta,
+        rope: hipfire_dispatch::pipeline::sandwich::Rope {
+            kind: hipfire_dispatch::pipeline::sandwich::RopeKind::RotateHalf,
+            theta: cfg.rope_theta,
+        },
         norm_eps: cfg.rms_norm_eps,
         n_heads: cfg.num_attention_heads,
         n_kv_heads: cfg.num_key_value_heads,

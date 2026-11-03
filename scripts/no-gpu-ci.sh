@@ -49,7 +49,7 @@ PYTEST_PATHS=(
     scripts/test_registry_gen_ornith.py scripts/test_registry_gen_vision.py
     scripts/test_registry_gen_coverage.py scripts/test_registry_gen_decider.py
     scripts/test_lmx_corpus.py scripts/test_ck_runtime_bundle.py
-    scripts/test_check_changelog.py scripts/test_kernel_idproof.py
+    scripts/test_check_changelog.py scripts/test_check_conflict_markers.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
     scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
 )
@@ -64,6 +64,7 @@ fi
 python3 -m unittest tools.redline.tests.test_product_bench tools.redline.tests.test_golden tools.redline.tests.test_serve_diff tools.redline.tests.test_lower tools.redline.tests.test_dispatch_profile
 python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'
 python3 scripts/test_install_revision.py
+python3 scripts/test_client_build_stamp.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh
 bash scripts/test-fmt-sweep-rebase.sh
@@ -73,6 +74,10 @@ python3 scripts/check-env-docs.py
 
 echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
 python3 scripts/check-lifecycle.py
+
+echo "== MTP parity fixture bytes + ratchet self-test =="
+python3 scripts/check-mtp-parity-ratchet.py --self-test
+python3 scripts/check-mtp-parity-ratchet.py fixture
 
 echo "== Leaked hipfire processes =="
 # A test that execs a workspace-built hipfire/daemon must not leave it running.

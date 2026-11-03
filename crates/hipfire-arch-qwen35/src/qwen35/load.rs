@@ -251,6 +251,16 @@ fn load_weight_tensor_raw_with(
     k: usize,
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
+    let row_packed = match quant_type {
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        8 => Some(DType::HFQ6G256),
+        12 => Some(DType::HFQ3G128),
+        _ => None,
+    };
+    if let Some(dtype) = row_packed {
+        hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, "raw")?;
+    }
     match quant_type {
         6 => {
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
@@ -1126,6 +1136,14 @@ fn load_weight_tensor_raw(
     load_weight_tensor_raw_with(gpu, quant_type, data, m, k, target)
 }
 
+/// Prefix a load error with the tensor it came from.
+fn named(name: &str) -> impl FnOnce(HipError) -> HipError + '_ {
+    move |mut e| {
+        e.message = format!("{name}: {}", e.message);
+        e
+    }
+}
+
 pub fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1145,13 +1163,19 @@ pub fn load_weight_tensor(
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k, target)?);
+                wt = Some(
+                    load_weight_tensor_raw(gpu, qt, data, m, k, target)
+                        .map_err(named(&candidate))?,
+                );
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, target)?);
+                wt = Some(
+                    load_weight_tensor_raw(gpu, qt, &buf, m, k, target)
+                        .map_err(named(&candidate))?,
+                );
                 matched = Some(candidate);
                 break;
             }
@@ -1205,7 +1229,8 @@ pub fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)?;
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)
+            .map_err(named(&matched_name))?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
@@ -3008,9 +3033,11 @@ fn load_weights_inner(
         output,
         moe_has_mq6: layers_have_mq6_moe(&layers),
         layers,
+        mq3v2_symmetric: source.mq3v2_symmetric(),
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     // Model-level symmetric IU4 resolution for the qt53 artifact class (default
     // on by capability; typed refusal or explicit-kill warning; no-op for every
@@ -3038,7 +3065,15 @@ impl WeightSource for HfqSource<'_> {
     fn mq4v2_symmetric(&self) -> bool {
         self.hfq.mq4v2_symmetric()
     }
+    fn mq3v2_symmetric(&self) -> bool {
+        self.hfq.mq3v2_symmetric()
+    }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        if self.hfq.mq3v2_symmetric() {
+            self.hfq
+                .validate_mq3v2_symmetric_groups()
+                .map_err(|msg| hip_bridge::HipError::new(1, &msg))?;
+        }
         // Single early file-level qt53 (MQ4G128V2) admission: wrong role,
         // mixed tier, AWQ, bad K or an unsupported mode fails here, before the
         // first upload of any resident, host-mapped or per-expert path.
@@ -5105,9 +5140,11 @@ pub fn load_weights_dense_tp_rank(
             output,
             moe_has_mq6: false,
             layers,
+            mq3v2_symmetric: gpu.mq3v2_symmetric,
             pager: None,
             lm_head_aliases_embd,
             ep_shard: None,
+            moe_host_topk: Default::default(),
         })
     })();
     match res {
@@ -8185,9 +8222,11 @@ fn load_weights_ep_rank_inner(
         output: output.expect("staged EP output"),
         moe_has_mq6,
         layers,
+        mq3v2_symmetric: gpu.mq3v2_symmetric,
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     let fingerprint = match &weights.layers[0] {
         LayerWeights::DeltaNetMoe(layer) => layer.ffn.expert_execution_plan.execution_fingerprint(),

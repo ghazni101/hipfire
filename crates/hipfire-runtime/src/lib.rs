@@ -14,6 +14,7 @@
 //! [`arch::Architecture`] trait.
 
 pub mod admission;
+pub mod ar_hc_exchange;
 pub mod arch;
 pub mod arch_mapping;
 pub mod arch_model;
@@ -50,6 +51,8 @@ pub mod dspark_core;
 /// CPU arithmetic oracles for the E8P-on-IU4 route (decode, SWAR unpack, `2C+s` fold, epoch, writer guard).
 pub mod e8p_i4_reference;
 pub mod ep;
+#[cfg(test)]
+mod ep_barrier_faults;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
 pub mod eval_common;
@@ -63,6 +66,7 @@ pub mod iu_quant;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
+pub mod lane_draw;
 pub mod llama;
 pub mod llama_spec;
 pub mod lloyd_lut;
@@ -72,6 +76,10 @@ pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
+/// MQ4 drop-zero planar routed-expert layout (qt=137/138), the load-time repack of
+/// the symmetric MQ4-XTS experts (`HIPFIRE_QWEN4_EXPERT_DROP_ZERO`). CPU-only.
+pub mod mq4_planar;
+/// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
 pub mod mq_i4;
 /// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.
 pub mod mq_i4_reference;
@@ -109,6 +117,7 @@ pub mod sidecar;
 pub mod slot_batch;
 pub mod spec;
 
+pub mod hc8_sidecar;
 pub mod ngram_mod;
 pub mod offload;
 pub mod spec_economics;
@@ -134,6 +143,7 @@ pub mod weight_store;
 
 pub mod emit_text;
 pub mod eos_filter;
+pub mod prefill_progress;
 pub mod prompt_frame;
 pub mod semantic;
 pub mod session_table;

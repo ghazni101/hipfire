@@ -162,6 +162,12 @@ fn store_data(w: &Wave, src: Src, lane: usize, size: usize) -> SimResult<[u8; 16
     Ok(data)
 }
 
+fn store_hi16_data(w: &Wave, src: Src, lane: usize) -> SimResult<[u8; 16]> {
+    let mut data = store_data(w, src, lane, 4)?;
+    data.copy_within(2..4, 0);
+    Ok(data)
+}
+
 fn lds_range(addr: u64, size: usize, len: usize) -> SimResult<std::ops::Range<usize>> {
     let start =
         usize::try_from(addr).map_err(|_| SimError::Fault("LDS address overflow".into()))?;
@@ -405,7 +411,7 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
         ReadU8 | ReadI8 => (1, true, i.op == ReadI8, false, false, None),
         ReadU16 | ReadI16 => (2, true, i.op == ReadI16, false, false, None),
         WriteB8 => (1, false, false, false, false, None),
-        WriteB16 => (2, false, false, false, false, None),
+        WriteB16 | WriteB16D16Hi => (2, false, false, false, false, None),
         WriteB32 => (4, false, false, false, false, None),
         WriteB64 => (8, false, false, false, false, None),
         WriteB96 => (12, false, false, false, false, None),
@@ -487,12 +493,12 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
                         dst,
                     }
                 } else {
-                    Action::Store(store_data(
-                        w,
-                        required(if part == 0 { i.data0 } else { i.data1 }, "DS store data")?,
-                        lane,
-                        size,
-                    )?)
+                    let src = required(if part == 0 { i.data0 } else { i.data1 }, "DS store data")?;
+                    if i.op == WriteB16D16Hi {
+                        Action::Store(store_hi16_data(w, src, lane)?)
+                    } else {
+                        Action::Store(store_data(w, src, lane, size)?)
+                    }
                 };
                 accesses.push(Access {
                     lane,
@@ -522,7 +528,7 @@ fn global(w: &Wave, i: &Flat) -> SimResult<Prepared> {
         LoadDwordx3 => (12, true, false, None),
         LoadDwordx4 => (16, true, false, None),
         StoreByte => (1, false, false, None),
-        StoreShort => (2, false, false, None),
+        StoreShort | StoreShortD16Hi => (2, false, false, None),
         StoreDword => (4, false, false, None),
         StoreDwordx2 => (8, false, false, None),
         StoreDwordx3 => (12, false, false, None),
@@ -564,6 +570,12 @@ fn global(w: &Wave, i: &Flat) -> SimResult<Prepared> {
                     operand: w.read_v(required(i.data, "GLOBAL atomic data")?, lane, Ty::B32)?,
                     dst,
                 }
+            } else if i.op == StoreShortD16Hi {
+                Action::Store(store_hi16_data(
+                    w,
+                    required(i.data, "GLOBAL store data")?,
+                    lane,
+                )?)
             } else {
                 Action::Store(store_data(
                     w,

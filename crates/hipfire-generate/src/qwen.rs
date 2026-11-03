@@ -43,6 +43,7 @@ use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
+use hipfire_loader::bench_topology::EpKind;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
@@ -153,17 +154,22 @@ pub enum EpServeTarget {
     UnsupportedArch(u32),
 }
 
-/// EP serve dispatch by arch_id: the arch-level default. 5|6 default to the
-/// MoE server; a dense-TP load (`EpArch::Qwen35DenseTp`) is refined to its own
-/// server by the `EpArch` match in [`generate_ep`] — arch_id alone cannot
-/// distinguish them, and a MoE model must never enter the dense-TP server.
-/// Anything else is an explicit refusal, never a wrong-server fallthrough.
-pub fn ep_serve_target(arch_id: u32) -> EpServeTarget {
-    match arch_id {
-        10 => EpServeTarget::Minimax,
-        5 | 6 => EpServeTarget::Qwen35Moe,
-        9 => EpServeTarget::Deepseek4,
-        other => EpServeTarget::UnsupportedArch(other),
+/// EP serve dispatch by the loaded EP state's kind. The loaded `EpArch` alone
+/// selects the server (a dense-TP load and a MoE load of the same arch family
+/// are different kinds). No loaded EP state is an explicit refusal naming
+/// `arch_id`, never a wrong-server fallthrough.
+pub fn ep_serve_target(ep: Option<&EpArch>, arch_id: u32) -> EpServeTarget {
+    ep_serve_target_of(ep.map(EpArch::kind), arch_id)
+}
+
+/// Pure core of [`ep_serve_target`], keyed on the loaded [`EpKind`].
+fn ep_serve_target_of(kind: Option<EpKind>, arch_id: u32) -> EpServeTarget {
+    match kind {
+        Some(EpKind::Ds4) => EpServeTarget::Deepseek4,
+        Some(EpKind::Minimax) => EpServeTarget::Minimax,
+        Some(EpKind::Qwen35Moe) => EpServeTarget::Qwen35Moe,
+        Some(EpKind::Qwen35DenseTp) => EpServeTarget::Qwen35DenseTp,
+        None => EpServeTarget::UnsupportedArch(arch_id),
     }
 }
 
@@ -192,7 +198,8 @@ pub fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = match hipfire_loader::ep_prompt_route(m.arch_id) {
+    let prompt_route = hipfire_loader::ep_prompt_route(m.ep.as_ref().map(|ep| &ep.inner));
+    let prompt_ids: Vec<u32> = match prompt_route {
         hipfire_loader::EpPromptRoute::Dsml => {
             primed_think = false;
             let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -312,7 +319,7 @@ pub fn generate_ep(
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = match hipfire_loader::ep_eos_route(m.arch_id) {
+    let eos_tok = match hipfire_loader::ep_eos_route(m.ep.as_ref().map(|ep| &ep.inner)) {
         hipfire_loader::EpEosRoute::Minimax => {
             // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
             // None here — read the EP eos carried on LoadedModel (set at load).
@@ -321,20 +328,11 @@ pub fn generate_ep(
         hipfire_loader::EpEosRoute::Qwen35 => m.qwen35_eos_tok,
         hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
-    // Route by the loaded `EpArch`, never by arch_id alone: arch 5|6 covers
+    // Route by the loaded `EpArch` kind, never by arch_id: arch 5|6 covers
     // both the MoE server (`EpArch::Qwen35`) and the dense-TP server
     // (`EpArch::Qwen35DenseTp`), and a MoE model must never enter the
-    // dense-TP server (nor vice versa). `ep_serve_target` above is the
-    // arch-level default used when no EP state is loaded.
-    let serve_target = match m.ep.as_ref().map(|ep| &ep.inner) {
-        Some(EpArch::Minimax { .. }) => EpServeTarget::Minimax,
-        Some(EpArch::Qwen35 { .. }) => EpServeTarget::Qwen35Moe,
-        Some(EpArch::Qwen35DenseTp { .. } | EpArch::Qwen35MeshTp { .. }) => {
-            EpServeTarget::Qwen35DenseTp
-        }
-        Some(EpArch::Ds4 { .. }) => EpServeTarget::Deepseek4,
-        None => ep_serve_target(m.arch_id),
-    };
+    // dense-TP server (nor vice versa).
+    let serve_target = ep_serve_target(m.ep.as_ref().map(|ep| &ep.inner), m.arch_id);
     match serve_target {
         EpServeTarget::Minimax => ep_serve_minimax(
             m,
@@ -384,17 +382,16 @@ pub fn generate_ep(
             sampling,
         ),
         EpServeTarget::UnsupportedArch(arch) => {
-            // Fail closed: no EpArch exists for this arch_id (LFM2, Cohere2,
-            // anything new), so there is no correct server to call. Name the
-            // arch rather than running another arch's EP protocol against
-            // foreign weights.
+            // Fail closed: no EP state is loaded for this model (LFM2,
+            // Cohere2, anything new), so there is no correct server to call.
+            // Name the arch rather than running another arch's EP protocol
+            // against foreign weights.
             emit_active_attempt_error(
                 stdout,
                 Some(id),
                 &format!(
                     "EP generate not supported for arch_id={arch} \
-                     (only 9/DeepSeek4, 10/MiniMax and 5|6 Qwen3.5 \
-                     have an EP serve path)"
+                     (no loaded expert/tensor-parallel model)"
                 ),
                 "unsupported",
                 false,
@@ -900,6 +897,13 @@ pub fn ep_serve_qwen35_dense_tp(
             let _ = stdout.flush();
             return;
         }
+        crate::common::emit_prefill_progress(
+            stdout,
+            id,
+            Some(active_attempt_id()),
+            chunk_index * tp_prefill_chunk + chunk.len(),
+            prompt_ids.len(),
+        );
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
@@ -1237,7 +1241,16 @@ pub fn ep_serve_qwen35_moe(
         }
         let result = qwen35_moe_ep_prefill_window(m, prompt_ids, off);
         match result {
-            Ok(end) => off = end,
+            Ok(end) => {
+                off = end;
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    id,
+                    Some(active_attempt_id()),
+                    off,
+                    prompt_n,
+                );
+            }
             Err(message) => {
                 qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
                 let _ = stdout.flush();
@@ -2617,7 +2630,11 @@ fn qwen4_session_target(pp_mesh_active: bool, has_gpus: bool) -> Qwen4SessionTar
 /// mesh with its `Gpus` for the AR route; native MTP never reuses a session
 /// under a mesh, and a mesh without `Gpus` plans no reuse. Disjoint field
 /// borrows, as [`qwen4_bundle_and_mesh`].
-fn plan_qwen4_session(model: &mut LoadedModel, prompt: &[u32], route: SessionRoute) -> usize {
+pub(crate) fn plan_qwen4_session(
+    model: &mut LoadedModel,
+    prompt: &[u32],
+    route: SessionRoute,
+) -> usize {
     let LoadedModel { state, pp_gpus, .. } = model;
     let Some(state) = state.as_deref_mut() else {
         return 0;
@@ -2858,6 +2875,10 @@ pub fn plan_from_rendered(
                     rendered,
                 };
             }
+            eprintln!(
+                "[qwen-cache cold {trace_tag}] lcp={lcp} prior_len={prior_len} checkpoints={dflash_ckpt_positions:?}: none at or before lcp, cold-prefilling {} tokens",
+                rendered.len(),
+            );
         }
     }
     PromptCachePlan {
@@ -3272,6 +3293,7 @@ pub fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    min_tokens: usize,
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
     // historical DFlash posture). >0 → distribution-preserving spec decode.
     // MTP (name=="mtp") honors temp>0 including user-explicit sampling and min_p
@@ -3350,21 +3372,25 @@ pub fn generate_dflash(
         return true;
     }
 
-    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only (no
-    // n-gram takeover, DFlash/DSpark or sampled verify); anything else is
-    // refused here, before the prompt plan or any state mutation. Handled
-    // (true): the caller must not also emit an AR response.
+    // Qwen4 pipeline parallelism runs native MTP on the mesh only (greedy, or
+    // sampled with the Leviathan verify and neutral penalties; no n-gram
+    // takeover, DFlash/DSpark, naive sampled mode or penalties); anything
+    // else is refused here, before the prompt plan or any state mutation.
+    // Handled (true): the caller must not also emit an AR response.
     let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
     if pp_mesh {
-        let native_drafter = m
+        let native_naive = m
             .speculator
             .as_mut()
             .and_then(|s| s.drafter_any_mut())
-            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .map(|drafter| drafter.sampled_mode_is_naive());
         if let Some(refusal) = qwen4_pp_spec_refusal(
             spec_name,
-            native_drafter,
+            native_naive.is_some(),
             temp,
+            native_naive.unwrap_or(false),
+            repeat_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0,
             m.pp_gpus.is_some(),
             m.eviction.is_some(),
             false,
@@ -3691,7 +3717,7 @@ pub fn generate_dflash(
                 &prompt_tokens,
                 hist,
                 tools,
-                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
                 "dflash",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
@@ -3851,6 +3877,9 @@ pub fn generate_dflash(
     // (greedy or sampled, thinking on or off) when `speculation.mtp_ngram`
     // (env HIPFIRE_MTP_NGRAM) resolves on for this model and GPU: `auto`, the
     // default, arms native Qwen4 MTP on gfx1151/gfx1201 only.
+    // Raon's AR producer penalizes generated tokens only
+    // (`penalty_generated_only`); the speculative route must follow.
+    let penalty_generated_only = m.raon().is_some();
     if let Some(spec) = m.speculator.as_mut() {
         spec.configure_request(SpecRequestConfig {
             temp,
@@ -3872,6 +3901,7 @@ pub fn generate_dflash(
             stop_sequences: !stop.is_empty(),
             // The Qwen spec routes emit no logprobs.
             logprobs: false,
+            penalty_generated_only,
         });
     }
     let prefill_tokens_full = prefill_tokens.len();
@@ -3903,6 +3933,7 @@ pub fn generate_dflash(
             tools: emit_tools,
             enable_grammar: grammar_enabled,
             stop: stop.to_vec(),
+            min_tokens,
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
@@ -4260,7 +4291,14 @@ pub fn generate_dflash(
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
+        let cache_action = legacy_asst_turn_action(
+            hit_length_cap,
+            open_think,
+            started_in_think,
+            &decoded_full,
+            &wire_calls,
+        );
+        let intended_store = cache_action.store && !cached_seq.is_empty();
         let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -4268,36 +4306,9 @@ pub fn generate_dflash(
             return true;
         }
         commit_qwen4_session(m);
-        // Safe stop/tool_calls only — length never stores; Abort suppressed above.
+        // Safe stop/tool_calls only (see legacy_asst_turn_action); Abort suppressed above.
         if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
-            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
+            store_legacy_asst_turn(m, &cache_action, cached_seq);
         }
         crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
@@ -4325,15 +4336,21 @@ fn spec_retire_done_fields(done: &mut serde_json::Value, run: &SpecRun) {
     }
 }
 
-/// Break-even line of the spec → AR retirement policy from `HIPFIRE_SPEC_RETIRE`
-/// (see [`hipfire_runtime::spec_retire::parse_break_even`]). A malformed value
-/// turns retirement off and says so, rather than guessing a line.
-fn spec_retire_break_even() -> Option<hipfire_runtime::spec_retire::BreakEven> {
+/// Break-even line of the spec → AR retirement policy: `HIPFIRE_SPEC_RETIRE`
+/// when set (see [`hipfire_runtime::spec_retire::parse_break_even`]), else the
+/// drafter's measured line (`drafter`), else the shared default. A malformed
+/// value turns retirement off and says so, rather than guessing a line.
+fn spec_retire_break_even(
+    drafter: Option<hipfire_runtime::spec_retire::BreakEven>,
+) -> Option<hipfire_runtime::spec_retire::BreakEven> {
     let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
-    hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()).unwrap_or_else(|e| {
-        eprintln!("[spec-retire] {e}; retirement off");
-        None
-    })
+    match hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()) {
+        Ok(parsed) => hipfire_runtime::spec_retire::resolve_break_even(parsed, drafter),
+        Err(e) => {
+            eprintln!("[spec-retire] {e}; retirement off");
+            None
+        }
+    }
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
@@ -4429,6 +4446,8 @@ pub fn generate_spec(
     // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
     // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
     let arch_id = m.arch_id;
+    // Read before the slot guard takes `m.state`.
+    let qwen4_target = m.qwen4().is_some();
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
@@ -4444,19 +4463,28 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Qwen4 pipeline parallelism runs native greedy MTP on the mesh only;
-    // every other speculative request is refused before any state mutation.
+    // Qwen4 pipeline parallelism runs native MTP on the mesh only (greedy, or
+    // sampled with the Leviathan verify and neutral penalties); every other
+    // speculative request is refused before any state mutation.
     let pp_mesh = m.qwen4().is_some_and(|bundle| bundle.pp_mesh_active());
     if pp_mesh {
-        let native_drafter = m
+        let native = m
             .speculator
             .as_mut()
             .and_then(|s| s.drafter_any_mut())
-            .is_some_and(|any| any.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+            .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+            .map(|drafter| {
+                (
+                    drafter.sampled_mode_is_naive(),
+                    drafter.request_has_nonneutral_penalties(),
+                )
+            });
         if let Some(refusal) = qwen4_pp_spec_refusal(
             m.speculator.as_ref().map_or("", |s| s.name()),
-            native_drafter,
+            native.is_some(),
             temp,
+            native.is_some_and(|(naive, _)| naive),
+            native.is_some_and(|(_, penalized)| penalized),
             m.pp_gpus.is_some(),
             m.eviction.is_some(),
             resume_from.is_some(),
@@ -4656,18 +4684,24 @@ pub fn generate_spec(
                 .saturating_add(spec.block_size()),
         );
     }
-    let prefill_outcome = spec_prefill(
-        pp.as_deref_mut(),
-        gpu,
-        spec.as_mut(),
-        slot,
-        &prompt_tokens,
-        &prefill_tokens,
-        prefill_start,
-        cache_hit,
-        resume_from,
-        &|| check_abort(&id_for_abort),
-    );
+    // Prompt phase: the speculators' prompt-prefill chunk loops report
+    // `prefill_progress` only here, never from the mid-request realign,
+    // forced-advance or repair re-prefills below.
+    let prefill_outcome = {
+        let _prompt_phase = hipfire_runtime::prefill_progress::prompt_phase();
+        spec_prefill(
+            pp.as_deref_mut(),
+            gpu,
+            spec.as_mut(),
+            slot,
+            &prompt_tokens,
+            &prefill_tokens,
+            prefill_start,
+            cache_hit,
+            resume_from,
+            &|| check_abort(&id_for_abort),
+        )
+    };
     let first_token = match classify_spec_prefill(prefill_outcome) {
         Ok(first_token) => first_token,
         Err(terminal) => {
@@ -4760,9 +4794,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no think budget.
-    let promo_shape_ok =
-        emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
+    // think budget.
+    let promo_shape_ok = emit_req.tools.is_none()
+        && emit_req.stop.is_empty()
+        && emit_req.min_tokens == 0
+        && emit_req.max_think == 0;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -4783,6 +4820,7 @@ pub fn generate_spec(
         tools: emit_req.tools.as_deref(),
         enable_grammar: emit_req.enable_grammar,
         stop: emit_req.stop,
+        min_tokens: emit_req.min_tokens,
         max_think: emit_req.max_think,
         max_tokens,
         assistant_prefix: emit_req.assistant_prefix,
@@ -4815,19 +4853,23 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Native Qwen4 MTP commits a whole window before the emitter observes it,
-    // so an emitter intervention (think-budget force-close or think-cap stop)
-    // that lands strictly inside a window would leave committed state past the
-    // intervention. Inside a think span (or over a queued close) the loop
-    // clamps each window to the emitter's `window_cap()` for this speculator
-    // so the intervention only ever falls on a window's last token — no
-    // Realign re-prefill, no window repair. Outside a span the cap is `None`
-    // (thinking off is `max_think_tokens == 1`, so capping there would stop
+    // Native Qwen4 MTP and Qwen4 DFlash2 commit a whole window before the
+    // emitter observes it, so an emitter intervention (think-budget
+    // force-close or think-cap stop) that lands strictly inside a window would
+    // leave committed state past the intervention. Inside a think span (or
+    // over a queued close) the loop clamps each window to the emitter's
+    // `window_cap()` for these speculators so the intervention only ever falls
+    // on a window's last token — no Realign re-prefill (whose numerics differ
+    // from AR), no window repair. Outside a span the cap is `None` (thinking
+    // off is `max_think_tokens == 1`, so capping there would stop
     // speculation): a span opened and tripped inside one window takes the
     // window repair below. Other speculators keep their own handling.
-    let native_qwen4_mtp = spec
-        .drafter_any_mut()
-        .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+    let qwen4_window_capped = spec_qwen4_window_capped(
+        qwen4_target,
+        spec.name(),
+        spec.drafter_any_mut()
+            .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>()),
+    );
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -5053,11 +5095,13 @@ pub fn generate_spec(
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
     // Spec → AR retirement (`hipfire_runtime::spec_retire`) for greedy requests
-    // on a speculator with an AR step. It reads token counts only, so a greedy
-    // request retires at the same cycle on every run.
+    // on a speculator with an AR step, and sampled ones when that AR step
+    // samples with the request's law. It reads token and verified-row counts
+    // only, so a request retires at the same cycle on every run with the same
+    // draws.
     let mut retire = hipfire_runtime::spec_retire::SpecRetire::new(
-        (temp <= 1e-6 && spec.supports_ar_step())
-            .then(spec_retire_break_even)
+        ((temp <= 1e-6 || spec.supports_sampled_ar_step()) && spec.supports_ar_step())
+            .then(|| spec_retire_break_even(spec.retire_break_even()))
             .flatten(),
     );
     let mut ar_steps = 0usize;
@@ -5338,14 +5382,14 @@ pub fn generate_spec(
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = spec_window_emit_budget(
             max_tokens.saturating_sub(generated),
-            native_qwen4_mtp,
+            qwen4_window_capped,
             emit.window_cap(),
         );
         let window_seed = seed_token;
         let mtp_outer_t0 = std::time::Instant::now();
         let ar_step = retire.is_retired();
         let step_result = if ar_step {
-            spec.ar_step(gpu, slot, position, seed_token)
+            spec.ar_step(gpu, slot, position, seed_token, &emitted)
                 .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
         } else {
             spec_step(
@@ -5517,7 +5561,8 @@ pub fn generate_spec(
         } else {
             host.seed_token
         };
-        if !ar_step && retire.observe(committed_tail.len(), position) {
+        // A window verifies its seed row plus the drafts it proposed.
+        if !ar_step && retire.observe(committed_tail.len(), step.proposed + 1, position) {
             eprintln!(
                 "[spec-retire] id={id} drafter={} retired to AR at position {position} (generated {generated}, {spec_cycles} cycles, tau {:.2})",
                 spec.name(),
@@ -5526,8 +5571,9 @@ pub fn generate_spec(
         }
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter. Native Qwen4 MTP first tries a window-local repair
-        // (restore the pre-window target/head, replay only the consumed prefix)
+        // target + drafter. Qwen4 MTP and Qwen4 DFlash2 first try a
+        // window-local repair (restore the pre-window target, replay only the
+        // consumed prefix)
         // for both a terminal strict prefix and a non-terminal one (a forced
         // intervention the window cap did not absorb), so neither pays a
         // full-history re-prefill nor drops live cache metadata. Other
@@ -5545,7 +5591,7 @@ pub fn generate_spec(
         let keep = consumed.min(committed_tail.len());
         let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp, ar_step) {
+        if spec_window_repair_attempt(strict_prefix_action, qwen4_window_capped, ar_step) {
             // Must run right after the window is observed and before any
             // further step / forced advance / prefill / reset on the
             // speculator: the retained pre-window snapshot is only valid until
@@ -7675,6 +7721,66 @@ pub fn qwen_dflash_wire_terminal(
     }
 }
 
+/// Store decision for the legacy (non-semantic-v2) assistant-turn cache,
+/// shared by the DFlash/DSpark spec route and llama AR. The legacy entry is
+/// keyed on the visible text only, so a body that carries a think span
+/// (or started inside one) is never stored: its reasoning would splice into
+/// another conversation with the same visible answer, or into a think-off
+/// turn after the `<think></think>` primer (HIPF-227).
+pub fn legacy_asst_turn_action(
+    hit_length: bool,
+    open_think: bool,
+    started_in_think: bool,
+    decoded_full: &str,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> TurnCacheAction {
+    let has_think =
+        started_in_think || decoded_full.contains("<think>") || decoded_full.contains("</think>");
+    if hit_length || open_think || has_think {
+        return TurnCacheAction::skip();
+    }
+    // Strips the literal `<|im_end|>` the client never echoes back.
+    let visible = strip_think_for_fingerprint(decoded_full);
+    TurnCacheAction {
+        store: true,
+        fingerprint_text: hipfire_runtime::tokenizer::maybe_normalize_prompt(&visible).into_owned(),
+        tool_calls: wire_calls.to_vec(),
+    }
+}
+
+/// Publish a legacy turn: content-only full body under the action's fingerprint.
+pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cached_seq: Vec<u32>) {
+    let _ = apply_turn_cache_action(
+        |fp, seq| {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache store legacy] fp={:#018x} cached_seq={} tool_calls={}",
+                    fp,
+                    seq.len(),
+                    action.tool_calls.len(),
+                );
+            }
+            m.asst_turn_cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: seq,
+                        text: String::new(),
+                    }),
+                },
+            );
+        },
+        action,
+        cached_seq,
+    );
+}
+
 pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {
     match terminal {
         QwenDflashWireTerminal::Malformed { .. } => TurnCacheAction::skip(),
@@ -8010,8 +8116,9 @@ pub fn spec_strict_prefix_action(
 /// window before any reset or re-prefill. A terminal strict prefix always
 /// tries (the speculator answers `false` when it cannot repair); a
 /// non-terminal one (`Realign`, a forced intervention inside the window) tries
-/// only on native Qwen4 MTP, which restores its retained pre-window target and
-/// head and replays the consumed prefix instead of re-prefilling history.
+/// only on a Qwen4 window-capped speculator ([`spec_qwen4_window_capped`]),
+/// which restores its retained pre-window target state and replays the
+/// consumed prefix instead of re-prefilling history.
 ///
 /// A retired request's AR step is not a speculative window and leaves none
 /// retained (DFlash clears it), so it never tries: asking would fail the
@@ -8019,7 +8126,7 @@ pub fn spec_strict_prefix_action(
 /// violation on the AR token end as the validation error it is.
 pub fn spec_window_repair_attempt(
     action: SpecStrictPrefixAction,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     ar_step: bool,
 ) -> bool {
     if ar_step {
@@ -8028,35 +8135,44 @@ pub fn spec_window_repair_attempt(
     match action {
         SpecStrictPrefixAction::None => false,
         SpecStrictPrefixAction::RepairForTerminal => true,
-        SpecStrictPrefixAction::Realign => native_qwen4_mtp,
+        SpecStrictPrefixAction::Realign => qwen4_window_capped,
     }
 }
 
 /// Output budget for the next speculative window. `remaining` is what
-/// `max_tokens` still allows; native Qwen4 MTP additionally clamps it to the
-/// emitter's [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a
-/// think-budget force-close or think-cap stop only lands on the window's last
-/// token. Other speculators ignore the cap.
+/// `max_tokens` still allows; a Qwen4 window-capped speculator
+/// ([`spec_qwen4_window_capped`]) additionally clamps it to the emitter's
+/// [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a think-budget
+/// force-close or think-cap stop only lands on the window's last token. Other
+/// speculators ignore the cap.
 pub fn spec_window_emit_budget(
     remaining: usize,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     cap: Option<usize>,
 ) -> usize {
     match cap {
-        Some(cap) if native_qwen4_mtp => remaining.min(cap.max(1)),
+        Some(cap) if qwen4_window_capped => remaining.min(cap.max(1)),
         _ => remaining,
     }
+}
+
+/// Speculators that commit a whole window on a Qwen4 target before the
+/// emitter observes it: native Qwen4 MTP and DFlash2. Raon DFlash2 shares the
+/// `dflash2` name but has no target-side committed-prefix repair, so it keeps
+/// Realign.
+pub fn spec_qwen4_window_capped(qwen4_target: bool, spec_name: &str, mtp_drafter: bool) -> bool {
+    qwen4_target && (mtp_drafter || spec_name == "dflash2")
 }
 
 #[cfg(test)]
 mod spec_window_repair_tests {
     use super::{
-        spec_strict_prefix_action, spec_window_emit_budget, spec_window_repair_attempt,
-        SpecStrictPrefixAction,
+        spec_qwen4_window_capped, spec_strict_prefix_action, spec_window_emit_budget,
+        spec_window_repair_attempt, SpecStrictPrefixAction,
     };
 
     #[test]
-    fn window_cap_clamps_only_native_qwen4_and_never_to_zero() {
+    fn window_cap_clamps_only_qwen4_capped_and_never_to_zero() {
         assert_eq!(spec_window_emit_budget(9, true, Some(3)), 3);
         assert_eq!(spec_window_emit_budget(2, true, Some(3)), 2);
         assert_eq!(spec_window_emit_budget(9, true, Some(0)), 1);
@@ -8065,7 +8181,15 @@ mod spec_window_repair_tests {
     }
 
     #[test]
-    fn window_repair_precedes_reset_and_realign_on_native_qwen4() {
+    fn window_cap_covers_qwen4_mtp_and_dflash2_not_raon() {
+        assert!(spec_qwen4_window_capped(true, "mtp", true));
+        assert!(spec_qwen4_window_capped(true, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(false, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(true, "dflash", false));
+    }
+
+    #[test]
+    fn window_repair_precedes_reset_and_realign_on_qwen4_capped() {
         // Full window: nothing to repair.
         let full = spec_strict_prefix_action(4, 4, true);
         assert!(!spec_window_repair_attempt(full, true, false));
@@ -8074,8 +8198,8 @@ mod spec_window_repair_tests {
         assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
         assert!(spec_window_repair_attempt(terminal, false, false));
         assert!(spec_window_repair_attempt(terminal, true, false));
-        // Non-terminal strict prefix (forced intervention): only native Qwen4
-        // skips the full re-prefill; others keep Realign.
+        // Non-terminal strict prefix (forced intervention): only a Qwen4
+        // window-capped speculator skips the full re-prefill; others keep Realign.
         let forced = spec_strict_prefix_action(2, 4, false);
         assert_eq!(forced, SpecStrictPrefixAction::Realign);
         assert!(spec_window_repair_attempt(forced, true, false));
@@ -8936,24 +9060,33 @@ mod deepseek4_reasoning_prefix_tests {
 
 #[cfg(test)]
 mod ep_serve_target_tests {
-    use super::{ep_serve_target, EpServeTarget};
+    use super::{ep_serve_target_of, EpServeTarget};
+    use hipfire_loader::bench_topology::EpKind;
 
     #[test]
-    fn known_ep_archs_keep_their_servers_but_all_others_refuse() {
-        // Adjacent supported: DS4, MiniMax and Qwen3.5-MoE keep their servers.
-        // (A dense-TP load refines 5|6 to `Qwen35DenseTp` via its `EpArch` in
-        // `generate_ep`; arch_id alone defaults to the MoE server so MoE
-        // never enters the dense-TP server.)
-        assert_eq!(ep_serve_target(9), EpServeTarget::Deepseek4);
-        assert_eq!(ep_serve_target(10), EpServeTarget::Minimax);
-        assert_eq!(ep_serve_target(5), EpServeTarget::Qwen35Moe);
-        assert_eq!(ep_serve_target(6), EpServeTarget::Qwen35Moe);
-        // No EpArch exists for these: explicit refusal naming the arch,
-        // never the old wrong-server DS4 fallthrough.
-        assert_eq!(ep_serve_target(11), EpServeTarget::UnsupportedArch(11));
-        assert_eq!(ep_serve_target(12), EpServeTarget::UnsupportedArch(12));
-        assert_eq!(ep_serve_target(13), EpServeTarget::UnsupportedArch(13));
-        assert_eq!(ep_serve_target(0), EpServeTarget::UnsupportedArch(0));
+    fn every_loaded_ep_kind_keeps_its_server() {
+        // The loaded `EpKind` alone selects the server: a dense-TP load never
+        // enters the MoE server (nor vice versa), whatever its arch_id.
+        for (kind, target) in [
+            (EpKind::Ds4, EpServeTarget::Deepseek4),
+            (EpKind::Minimax, EpServeTarget::Minimax),
+            (EpKind::Qwen35Moe, EpServeTarget::Qwen35Moe),
+            (EpKind::Qwen35DenseTp, EpServeTarget::Qwen35DenseTp),
+        ] {
+            assert_eq!(ep_serve_target_of(Some(kind), 0), target, "{kind:?}");
+            assert_eq!(ep_serve_target_of(Some(kind), 42), target, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn no_loaded_ep_state_refuses_naming_the_arch() {
+        // Explicit refusal, never a wrong-server (the old DS4) fallthrough.
+        for arch_id in [0, 11, 13, u32::MAX] {
+            assert_eq!(
+                ep_serve_target_of(None, arch_id),
+                EpServeTarget::UnsupportedArch(arch_id)
+            );
+        }
     }
 }
 
@@ -9751,6 +9884,7 @@ mod qwen_history_chain_tests {
                     tools: None,
                     enable_grammar: false,
                     stop: Vec::new(),
+                    min_tokens: 0,
                     max_think: 0,
                     max_tokens: 4096,
                     assistant_prefix: AssistantPrefix::OpenThink,
@@ -10747,6 +10881,7 @@ pub fn generate_qwen4_ar(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     _request_seed: u32,
@@ -10889,7 +11024,7 @@ pub fn generate_qwen4_ar(
         route,
         &prompt_tokens,
         vocab_size,
-        eos_token,
+        &[eos_token],
         temp,
         top_p,
         top_k,
@@ -10902,12 +11037,14 @@ pub fn generate_qwen4_ar(
         max_think_tokens,
         started_in_think,
         stop,
+        min_tokens,
         // Same predicate as the native MTP emitter (`Qwen35Emit::from_ctx`
         // enables its tool router on `tools.is_some()`), so both Qwen4 routes
         // classify `<tool_call>` markup identically.
         tools.is_some(),
         reused,
         decode_penalizes,
+        false,
         |model, device, tokens, logits| {
             // Prefill is never the retained body: the tape holds ordinary
             // single-token continuation only (docs/REDLINE.md §3). The Qwen4
@@ -10979,13 +11116,20 @@ pub(crate) fn qwen4_bundle_and_mesh(
 }
 
 /// Why a Qwen4 speculative request cannot run on the pipeline-parallel mesh
-/// (`None` = it can). Only native greedy MTP reaches the mesh, on the model's
+/// (`None` = it can). Only native MTP reaches the mesh (greedy, or sampled
+/// with the default Leviathan verify and neutral penalties), on the model's
 /// own `Gpus`, without eviction or a divergent-render resume; everything else
-/// is refused before any state mutation.
+/// is refused before any state mutation. `naive_sampled`: the drafter runs
+/// `HIPFIRE_MTP_SAMPLED_MODE=naive` (process-wide sampler draws);
+/// `penalized`: the request carries a non-neutral repeat / presence /
+/// frequency penalty (the GPU penalty prepass refuses the mesh).
+#[allow(clippy::too_many_arguments)]
 fn qwen4_pp_spec_refusal(
     spec_name: &str,
     native_drafter: bool,
     temp: f32,
+    naive_sampled: bool,
+    penalized: bool,
     has_gpus: bool,
     evicting: bool,
     resumes: bool,
@@ -10995,10 +11139,25 @@ fn qwen4_pp_spec_refusal(
             "qwen4 topology.pp supports native MTP speculation only; `{spec_name}` is refused"
         ));
     }
-    if !(temp.is_finite() && temp <= 1.0e-6) {
+    if !temp.is_finite() {
         return Some(format!(
-            "qwen4 topology.pp native MTP is greedy only; a sampled request (temp {temp}) is refused"
+            "qwen4 topology.pp native MTP needs a finite temperature (got {temp})"
         ));
+    }
+    if temp > 1.0e-6 && naive_sampled {
+        return Some(
+            "qwen4 topology.pp native MTP does not support HIPFIRE_MTP_SAMPLED_MODE=naive for a \
+             sampled request (its draws come from the process-wide AR sampler); use the default \
+             leviathan mode"
+                .to_string(),
+        );
+    }
+    if penalized {
+        return Some(
+            "qwen4 topology.pp native MTP does not support repeat/presence/frequency penalties; \
+             penalized requests decode AR"
+                .to_string(),
+        );
     }
     if !has_gpus {
         return Some("qwen4 topology.pp native MTP has no admitted Gpus owner".to_string());
@@ -11021,7 +11180,7 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn greedy_native_mtp_with_gpus_is_admitted() {
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, false),
             None
         );
     }
@@ -11029,23 +11188,56 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn other_speculators_and_foreign_drafters_are_refused() {
         for name in ["dflash", "dspark", "ngram", ""] {
-            assert!(qwen4_pp_spec_refusal(name, true, 0.0, true, false, false).is_some());
+            assert!(
+                qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false, false).is_some()
+            );
         }
-        assert!(qwen4_pp_spec_refusal("mtp", false, 0.0, true, false, false).is_some());
+        assert!(
+            qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false, false).is_some()
+        );
     }
 
     #[test]
-    fn sampled_requests_are_refused() {
-        for temp in [0.7, 1.0e-3, f32::NAN, f32::INFINITY] {
-            assert!(qwen4_pp_spec_refusal("mtp", true, temp, true, false, false).is_some());
+    fn unpenalized_leviathan_sampled_requests_are_admitted() {
+        for temp in [0.7, 1.0e-3, 1.0, 2.0] {
+            assert_eq!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false),
+                None,
+                "temp {temp}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_naive_and_penalized_requests_are_refused() {
+        for temp in [f32::NAN, f32::INFINITY] {
+            assert!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false)
+                    .is_some()
+            );
+        }
+        // Naive sampled mode (process-wide sampler draws) stays refused ...
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false, false).is_some());
+        // ... but a greedy request never draws, whatever the mode.
+        assert_eq!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false, false),
+            None
+        );
+        // Penalties are refused greedy or sampled.
+        for temp in [0.0, 0.7] {
+            assert!(
+                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false).is_some()
+            );
         }
     }
 
     #[test]
     fn missing_gpus_eviction_and_resume_are_refused() {
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, true, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true).is_some());
+        assert!(
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false, false).is_some()
+        );
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some());
     }
 }
 
@@ -11077,7 +11269,8 @@ fn qwen4_pp_mtp_parts<'a>(
 pub enum SpecPrefillTerminal {
     /// The client aborted mid-prefill: a cancel, never a validation error.
     Cancelled,
-    /// A real prefill failure: the fail-closed `validation` error.
+    /// A real prefill failure: the fail-closed `validation` error (a device out-of-memory one
+    /// answers a retryable `overload`, [`crate::common::fail_closed_wire`]).
     Failed(String),
 }
 
@@ -11455,5 +11648,114 @@ mod qwen_ep_sample_tests {
             2
         );
         assert_eq!(qwen_ep_sample(&mut logits, &[2], &greedy(1.0, 1.0, 0.0)), 5);
+    }
+}
+
+#[cfg(test)]
+mod legacy_asst_turn_store_tests {
+    use super::{legacy_asst_turn_action, TurnCacheAction};
+    use hipfire_engine::turn_cache::apply_turn_cache_action;
+    use std::collections::HashMap;
+
+    fn action(hit_length: bool, open_think: bool, started: bool, body: &str) -> TurnCacheAction {
+        legacy_asst_turn_action(hit_length, open_think, started, body, &[])
+    }
+
+    /// Publish through the production seam; returns the stored key.
+    fn store(
+        cache: &mut HashMap<u64, Vec<u32>>,
+        a: &TurnCacheAction,
+        seq: Vec<u32>,
+    ) -> Option<u64> {
+        apply_turn_cache_action(|fp, s| drop(cache.insert(fp, s)), a, seq)
+    }
+
+    #[test]
+    fn same_visible_text_with_different_think_bodies_never_splices() {
+        let mut cache = HashMap::new();
+        let x = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is apple\n</think>\n\nOK",
+        );
+        let y = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is pear\n</think>\n\nOK",
+        );
+        assert!(store(&mut cache, &x, vec![1, 2]).is_none());
+        assert!(store(&mut cache, &y, vec![3, 4]).is_none());
+        // Body that started inside think (prompt ended with `<think>\n`).
+        let z = action(false, false, true, "secret is plum\n</think>\n\nOK");
+        assert!(store(&mut cache, &z, vec![5]).is_none());
+        assert!(
+            cache.is_empty(),
+            "a think body must not be reachable by visible text"
+        );
+    }
+
+    #[test]
+    fn think_on_turn_cannot_be_spliced_after_a_think_off_primer() {
+        let mut cache = HashMap::new();
+        let on = action(false, false, false, "<think>\n17*3 is 51\n</think>\n\n51");
+        assert!(store(&mut cache, &on, vec![9]).is_none());
+        // Turn 2 (thinking off) looks up "51": nothing to prepend its primer to.
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("51", &[]);
+        assert!(!cache.contains_key(&fp));
+    }
+
+    #[test]
+    fn thinking_off_stop_stores_under_the_visible_text() {
+        let mut cache = HashMap::new();
+        let a = action(false, false, false, "Hello there.<|im_end|>");
+        assert!(a.store);
+        assert_eq!(a.fingerprint_text, "Hello there.");
+        let fp = store(&mut cache, &a, vec![7, 8]).expect("clean stop stores");
+        assert_eq!(cache[&fp], vec![7, 8]);
+        // A client echoing the visible text hits the same key.
+        assert_eq!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint("Hello there.", &[])
+        );
+    }
+
+    #[test]
+    fn length_and_open_think_skip() {
+        assert!(!action(true, false, false, "Hello").store);
+        assert!(!action(false, true, false, "Hello").store);
+        assert!(!action(false, true, false, "<think>\nstill thinking").store);
+    }
+
+    #[test]
+    fn ar_routing_splits_reasoning_from_content() {
+        use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+        let mut out = Vec::new();
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = hipfire_runtime::emit_text::ThinkOutputRouter::new(false);
+        for piece in ["<think>", "\nplan", "\n</think>", "\n\nAnswer"] {
+            crate::vision::vl_route_decode_text(
+                &mut out,
+                "r",
+                &mut filter,
+                &mut think,
+                piece.as_bytes(),
+            );
+        }
+        crate::vision::vl_finish_think_routing(&mut out, "r", &mut filter, &mut think);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8(out).unwrap().lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let t = v["text"].as_str().unwrap();
+            match v["type"].as_str().unwrap() {
+                "reasoning" => reasoning.push_str(t),
+                "token" => content.push_str(t),
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(reasoning.contains("plan") && !reasoning.contains("Answer"));
+        assert_eq!(content.trim(), "Answer");
+        assert!(!think.in_think());
     }
 }

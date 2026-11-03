@@ -15,6 +15,13 @@
 //!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
 //!   → {"type":"generate","id":"r1","prompt":"Hello","temperature":0.3,"max_tokens":512}
 //!   → {"type":"generate","id":"r1","prompt":"Describe this","image":"/path/to/img.png","temperature":0.3,"max_tokens":512}
+//!   ← {"type":"gen_start","id":"r1","attempt_id":1,...}
+//!   ← {"type":"prefill_progress","id":"r1","attempt_id":1,"done":2048,"total":9000}
+//!       Prompt-prefill progress, one line per completed chunk while `done < total`
+//!       (none for a single-chunk prompt or at `done == total`; counts exclude a
+//!       cache-hit prefix). Ordered after `gen_start` and before the first
+//!       `token`/`reasoning`. Default on; `HIPFIRE_PREFILL_PROGRESS=0` suppresses it.
+//!       Clients that do not know the type ignore it.
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
 //!   → {"type":"unload"}
@@ -84,6 +91,7 @@ use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
 mod effort_probe;
+mod load_summary;
 mod npu_route;
 mod process_init;
 mod request_guards;
@@ -687,21 +695,42 @@ impl ResidentKvDiag {
         }
     }
 
-    /// Fixed Q8 slot arena always admits legacy storage.
-    fn for_slot(explicit: bool) -> Self {
+    /// The slot engine's own KV backend. `None` = the load request did not
+    /// name one, and the route's documented default (legacy arenas) applies;
+    /// `Some` is the operator's choice (`legacy` or per-slot `vmm`).
+    /// The shared paged pool is backed by VMM. This is a different storage
+    /// route from the per-slot KV backend; reporting it as the per-slot
+    /// automatic-legacy default emitted a warning that contradicted the
+    /// active `paged KV backend=vmm`.
+    fn for_paged_vmm() -> Self {
+        Self {
+            request: "automatic".to_string(),
+            backend: "vmm".to_string(),
+            reason: Some(
+                "shared paged pool physical backend (serve.multi_slot_paged_backend=vmm)"
+                    .to_string(),
+            ),
+            legacy: false,
+            warning: None,
+            mode: None,
+        }
+    }
+
+    fn for_slot(requested: Option<hipfire_runtime::kv_backend::KvBackend>) -> Self {
         use hipfire_loader::admission::KvBackendRequest;
         use hipfire_runtime::kv_backend::KvBackend;
-        let request = if explicit {
-            KvBackendRequest::Explicit(KvBackend::Legacy)
-        } else {
-            KvBackendRequest::Automatic
-        };
-        let automatic_reason = if explicit {
-            None
-        } else {
-            Some("fixed Q8 slot arena has no VMM owner")
-        };
-        Self::from_admission(request, KvBackend::Legacy, automatic_reason)
+        match requested {
+            Some(backend) => {
+                Self::from_admission(KvBackendRequest::Explicit(backend), backend, None)
+            }
+            None => Self::from_admission(
+                KvBackendRequest::Automatic,
+                KvBackend::Legacy,
+                Some(
+                    "kv_backend not requested; the slot route defaults to legacy arenas (pass --kv-backend vmm for per-slot VMM KV)",
+                ),
+            ),
+        }
     }
 }
 
@@ -1286,6 +1315,8 @@ fn main() {
                 // Held for the whole arm: every exit (success after the
                 // receipt, error ACK, refusal `continue`) ends the recording.
                 let _load_phase_scope = rdna_compute::load_phases::begin_load_scope();
+                // A new load: drop the previous load's decision notes.
+                hipfire_config::load_summary::begin();
                 // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
                 // Resolve once, before the weight-host envelope, slot caps and
                 // every pp gate below read the request.
@@ -1394,12 +1425,14 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    let slot_kv_explicit = msg
+                    // The slot engine's backend is its own selector, not the
+                    // sequential route's: report exactly what was requested.
+                    let slot_kv_requested: Option<hipfire_runtime::kv_backend::KvBackend> = msg
                         .get("params")
                         .and_then(|p| p.get("kv_backend"))
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
-                        .is_some();
+                        .and_then(|s| s.parse().ok());
                     // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
                     if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                         emit_uncorrelated_error(
@@ -1448,9 +1481,6 @@ fn main() {
                             }
                         }
                     }
-                    // Fixed Q8 slot arena has no VMM owner — always legacy.
-                    // Emit once here; prior model/slot is about to be torn down.
-                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1521,6 +1551,31 @@ fn main() {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
                     let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Emit the effective slot backend once here; prior
+                    // model/slot is about to be torn down. A paged VMM pool
+                    // is its own storage route, so it must not inherit the
+                    // per-slot route's automatic-legacy disclosure. Resolve
+                    // it with the engine's own predicate: `slot_params`
+                    // carries the CLI's fully derived pool flag (config, page
+                    // count, prefix cache and the developer aliases), and the
+                    // backend spelling must trim like the engine's.
+                    let paged_backend =
+                        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_BACKEND")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| slot_params.multi_slot_paged_backend.clone());
+                    let paged_vmm = (slot_params.multi_slot_paged
+                        || slot_params.multi_slot_paged_pages > 0)
+                        && hipfire_config::select_paged_vmm_backend(
+                            Some(paged_backend.as_str()),
+                            &slot_params.multi_slot_paged_backend,
+                        )
+                        .unwrap_or(false);
+                    let slot_kv_diag = if paged_vmm {
+                        ResidentKvDiag::for_paged_vmm()
+                    } else {
+                        ResidentKvDiag::for_slot(slot_kv_requested)
+                    };
                     // Vision tower: the SAME ladder the ordinary arm applies
                     // (`vision_mode=off` is a hard override). The slot engine
                     // discovers the `.vl` sibling itself, so it has to be told
@@ -1536,6 +1591,9 @@ fn main() {
                         slot_params.mtp_mode,
                         &slot_params.kv_mode_raw,
                         &slot_params.kv_backend,
+                        slot_params.multi_slot_paged,
+                        slot_params.multi_slot_paged_pages,
+                        &slot_params.multi_slot_paged_backend,
                         slot_params.dflash_draft,
                         slot_params.dflash_required,
                         &slot_vision_mode,
@@ -1564,6 +1622,27 @@ fn main() {
                                 mode: Some(slot_params.kv_mode_resolved.to_owned()),
                                 ..slot_kv_diag.clone()
                             });
+                            let slot_summary = load_summary::summarize(
+                                &hipfire_config::load_summary::take(),
+                                &load_summary::SummaryState {
+                                    model: std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or(path),
+                                    arch: &arch,
+                                    kv_mode: slot_params.kv_mode_resolved,
+                                    kv_backend: &slot_kv_diag.backend,
+                                    kv_request: &slot_kv_diag.request,
+                                    max_seq: cap_tokens,
+                                    bound: "slots",
+                                    model_ctx: None,
+                                    card_cap: None,
+                                    speculator: (mtp_mode_effective == "on").then_some("mtp"),
+                                    pp: 1,
+                                    ep: false,
+                                },
+                            );
+                            eprintln!("{}", slot_summary.line);
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let mut ack = serde_json::json!({
                                 "type": "loaded",
@@ -1588,6 +1667,9 @@ fn main() {
                                 "pp": 1,
                                 "mtp_mode_effective": mtp_mode_effective,
                             });
+                            ack.as_object_mut()
+                                .expect("loaded ack is a JSON object")
+                                .insert("load_summary".to_string(), slot_summary.to_json());
                             ack.as_object_mut()
                                 .expect("loaded ack is a JSON object")
                                 .extend(effort_fields);
@@ -1713,18 +1795,45 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1);
                 let draft_path = if dflash_mode == "off" {
-                    if let Some(d) = raw_draft {
+                    if let Some(d) = &raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
                     }
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        match &raw_draft {
+                            Some(d) => format!(
+                                "DFlash off: speculation.dflash=off (draft {} not loaded)",
+                                Path::new(d).file_name().map_or_else(
+                                    || d.clone(),
+                                    |n| n.to_string_lossy().into_owned()
+                                )
+                            ),
+                            None => "DFlash off: speculation.dflash=off".to_string(),
+                        },
+                    );
                     None
                 } else if dflash_mode == "auto" && draft_tp > 1 {
                     if let Some(d) = raw_draft {
                         eprintln!(
                             "[hipfire-daemon] dflash_mode=auto with tp={draft_tp} — DFlash is not served on EP/TP; skipping draft load ({d})"
                         );
+                        hipfire_config::load_summary::note(
+                            hipfire_config::load_summary::Facet::SpecOff,
+                            format!(
+                                "DFlash off: not served on EP/TP (tp={draft_tp}, dflash_mode=auto)"
+                            ),
+                        );
                     }
                     None
                 } else {
+                    if raw_draft.is_none() {
+                        hipfire_config::load_summary::note(
+                            hipfire_config::load_summary::Facet::SpecOff,
+                            format!(
+                                "DFlash off: no draft paired (speculation.dflash={dflash_mode})"
+                            ),
+                        );
+                    }
                     raw_draft
                 };
                 // Shared Qwen3.5-VL tower sidecar (`qwen3.8-27b-vision.hfq`).
@@ -2272,6 +2381,9 @@ fn main() {
                         }
                     };
                 let open_admission_started = std::time::Instant::now();
+                // Cached per device after the first load: a VMM KV backend is
+                // only automatic where this runtime can reserve address space.
+                let vmm_runtime_refusal = gpu.vmm_runtime_refusal();
                 let mut admission = match hipfire_loader::admission::admit_source_with_options(
                     path,
                     tp,
@@ -2293,7 +2405,7 @@ fn main() {
                             deepseek4_compute_placement,
                             hipfire_config::Deepseek4ComputePlacement::Single
                         ),
-                        vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+                        vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
                         free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
@@ -2315,14 +2427,28 @@ fn main() {
                     0,
                 );
                 // The continuous-batch request staged after this load, so a
-                // Qwen4 expert-parallel load reserves the AR lane store's
-                // bytes before it splits the experts. Only the exact VMM
-                // route stages Qwen4 lanes; `vmm_batch` is false for the
-                // non-exact route and without `serve_vmm_batch`.
+                // Qwen4 expert-parallel load reserves the lane store's bytes
+                // before it splits the experts: the native-MTP lane store
+                // (default copy lane included) when the staging will stage it
+                // (`serve.batch_spec`, explicit `--spec mtp`, no
+                // `HIPFIRE_EP_MTP_LANES=0`), else the AR
+                // store. Only the exact VMM route stages Qwen4 lanes;
+                // `vmm_batch` is false for the non-exact route and without
+                // `serve_vmm_batch`.
+                // Only Qwen4 expert-parallel loads read it (the topology comes
+                // from `topology.ep`, not the `tp` param).
+                let (ep_spec_k, ep_spec_copy) =
+                    hipfire_loader::batch_staging::ep_spec_lane_reservation(
+                        parsed_vmm_batch.is_some_and(|params| params.spec),
+                        spec_cfg,
+                        gpu.arch.as_str(),
+                    );
                 admission.batch_request = hipfire_loader::admission::BatchLoadRequest {
                     vmm_batch: parsed_vmm_batch.is_some_and(|params| !params.nonexact),
                     continuous_batch_size: parsed_continuous_batch_size,
                     row_budget: parsed_vmm_batch.map_or(0, |params| params.max_batch_tokens),
+                    spec_k: ep_spec_k,
+                    spec_copy: ep_spec_copy,
                 };
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
@@ -2707,15 +2833,19 @@ fn main() {
                         batch_scheduler = staged_batch_scheduler;
                         vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // Gemma 4 (13) and Qwen4 (16) only with their attached
-                        // session cache (`ArchModel::session_cache_attached`).
+                        // Beyond the Qwen-family / legacy LCP routes listed here, any
+                        // architecture is cache-capable exactly when its bundle has the
+                        // engine session cache attached
+                        // (`ArchModel::session_cache_attached`: Gemma 4, Qwen4,
+                        // Raon-1-mini). The serve layer cold-resets the daemon before
+                        // every request of a model that is not, which would drop the
+                        // cache's resident follow-up snapshot.
                         let cache_capable = match m.arch_id {
                             5 | 6 | 9 | 10 | 12 | 14 => true,
-                            13 | 16 => m
+                            _ => m
                                 .state
                                 .as_deref()
                                 .is_some_and(|state| state.session_cache_attached()),
-                            _ => false,
                         };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
@@ -2742,11 +2872,33 @@ fn main() {
                             mode: Some(seq_kv.to_owned()),
                             ..pending_kv_diag.clone()
                         });
+                        // One INFO line: what is on/off and why, from the
+                        // engine's own decision notes plus state held here.
+                        let summary = load_summary::summarize(
+                            &hipfire_config::load_summary::take(),
+                            &load_summary::SummaryState {
+                                model: std::path::Path::new(path)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(path),
+                                arch,
+                                kv_mode: seq_kv,
+                                kv_backend: &pending_kv_diag.backend,
+                                kv_request: &pending_kv_diag.request,
+                                max_seq,
+                                bound: seq_bound,
+                                model_ctx,
+                                card_cap,
+                                speculator: m.speculator.as_ref().map(|s| s.name()),
+                                pp: m.pp,
+                                ep: staged_ep_batch,
+                            },
+                        );
+                        eprintln!("{}", summary.line);
                         // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             emit_load_phases();
-                            let _ = writeln!(
-                                stdout,
+                            let ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
@@ -2777,6 +2929,8 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(),
                                 seq_kv,
                             );
+                            let ack = load_summary::ack_with_summary(ack, &summary);
+                            let _ = writeln!(stdout, "{ack}");
                         } else {
                             let ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}","mtp_mode_effective":"{}"}}"#,
@@ -2808,6 +2962,7 @@ fn main() {
                                 seq_kv,
                                 m.mtp_mode,
                             );
+                            let ack = load_summary::ack_with_summary(ack, &summary);
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
                                 ack,
                                 &mut m,
@@ -3211,6 +3366,40 @@ fn main() {
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+                // The conversation's images in order (the gateway's
+                // `images_base64`), one per image slot of `messages`.
+                let images_list: Vec<&str> = match msg.get("images_base64") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(list)) => {
+                        match list.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>() {
+                            Some(list) => list,
+                            None => {
+                                hipfire_generate::dense::emit_active_attempt_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    "invalid images_base64 field: every entry must be a base64 string",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        hipfire_generate::dense::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "invalid images_base64 field: expected an array of base64 strings",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -3294,6 +3483,14 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
+                // vLLM-compatible `min_tokens`: EOS and stop sequences stay
+                // inactive until this many tokens are committed. Must not
+                // exceed `max_tokens`; an invalid value is rejected.
+                let Some(min_tokens) =
+                    hipfire_generate::ar::min_tokens_or_reject(&mut stdout, id, &msg, max_tokens)
+                else {
+                    continue;
+                };
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
@@ -3481,7 +3678,8 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
-                let has_image = image_base64.is_some() || image.is_some();
+                let has_image =
+                    image_base64.is_some() || image.is_some() || !images_list.is_empty();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
@@ -3500,6 +3698,20 @@ fn main() {
                 ) {
                     continue;
                 }
+                // The vision routes end on their own EOS checks and never see
+                // `min_tokens`; refuse it instead of silently ignoring it.
+                if min_tokens > 0 && has_image {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        "min_tokens is not supported on image requests",
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
 
                 if has_image {
                     let _ =
@@ -3509,138 +3721,71 @@ fn main() {
                 if has_image && !has_vl {
                     refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
-                    // DEFENSIVE: VL is single-image, single-turn only. The
-                    // CLI rejects images in non-last turns, but a raw
-                    // JSONL client could send a second image on turn 2+.
-                    // If seq_pos > 0 here, a previous conversation's KV
-                    // entries are live — running vision_forward and
-                    // splicing visual tokens into that context would
-                    // produce garbage. Force a reset so VL always starts
-                    // from a clean KV state.
-                    //
-                    // Must mirror the "reset" command handler (line ~2098).
-                    // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
-                    // and lfm2-vl (arch_id 11); other arch states are None
-                    // here — but clear them anyway for defense-in-depth in
-                    // case a future arch adds VL support.
-                    if m.seq_pos > 0 {
+                    // The qwen35-VL route decides for itself whether this prompt
+                    // continues the resident conversation (it renders the whole
+                    // history, so an ongoing image conversation keeps its KV and
+                    // its images) and cold-starts through the shared vision reset
+                    // otherwise. dots-OCR and LFM2-VL render one self-contained
+                    // turn per request, so a live conversation is always dropped
+                    // first. Must mirror the "reset" command handler.
+                    if !matches!(
+                        vision_route,
+                        hipfire_loader::VisionRoute::QwenVl | hipfire_loader::VisionRoute::None
+                    ) && m.seq_pos > 0
+                    {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
-                        m.seq_pos = 0;
-                        m.conversation_tokens.clear();
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.prefill_checkpoints,
-                            &mut gpu,
-                        );
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.dflash_checkpoints,
-                            &mut gpu,
-                        );
-                        // The DFlash checkpoint ring now lives inside the
-                        // speculator (m.dflash_checkpoints is vestigial/empty),
-                        // so free THAT ring on conversation reset too — else its
-                        // GPU snapshots persist until the next prefill-miss.
-                        if let Some(s) = m.speculator.as_mut() {
-                            if let Err(e) = s.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision conversation reset failed: {e}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        // qwen35(-vl) recurrent state lives in the bundle
-                        // (qwen35 arch bundle, accessed via ArchModel). There is no
-                        // `LoadedModel.dn_state` — it was removed as vestigial
-                        // (always None); the live DeltaNet state is inside the
-                        // bundle. `m.kv_cache` is likewise vestigial on this path.
-                        if let Err(e) =
-                            hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu)
-                        {
+                        let reset =
+                            hipfire_generate::common::cold_reset_keep_turn_cache(m, &mut gpu);
+                        if !reset.rolled_back {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
-                                &format!("vision recurrent reset failed: {e}"),
+                                &format!(
+                                    "vision conversation reset failed: {}",
+                                    reset.context.unwrap_or_default()
+                                ),
                                 "gpu",
                                 true,
                                 false,
                             );
                             continue;
                         }
-                        if let Some(b) = m.llama_mut() {
-                            b.kv.compact_offset = 0;
-                        }
-                        if let Some(b) = m.dots_ocr_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.qwen2_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.deepseek4_mut() {
-                            b.state.reset();
-                        }
-                        // lfm2-vl (arch 11): KV + conv state live in the
-                        // lfm2moe bundle. generate_lfm2_vl cold-resets again
-                        // before its own prefill, so this arm is
-                        // defense-in-depth parity with the other VL arches —
-                        // without it a failed dispatch between guard and
-                        // generate body would leave stale state behind.
-                        if let Some(b) = m.lfm2moe_mut() {
-                            if let Err(e) = b.state.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision lfm2moe reset failed: {e:?}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        if let Some(ad) = m.kv_adaptive.as_mut() {
-                            if let Some(s) = m.state.as_mut() {
-                                if s.arch_key() == "qwen35" {
-                                    if let Some(kv) = s.kv_cache_mut() {
-                                        ad.reset_with_cache(&mut gpu, kv);
-                                    } else {
-                                        ad.reset();
-                                    }
-                                } else {
-                                    ad.reset();
-                                }
-                            } else {
-                                ad.reset();
-                            }
-                        }
                     }
-                    if image_base64.is_some() && image.is_some() {
+                    if !images_list.is_empty() && (image_base64.is_some() || image.is_some()) {
+                        eprintln!(
+                            "[daemon/vl] images_base64 provided with image/image_base64 — using images_base64"
+                        );
+                    } else if image_base64.is_some() && image.is_some() {
                         eprintln!(
                             "[daemon/vl] both image and image_base64 provided — using image_base64"
                         );
                     }
-                    let source = if let Some(b64) = image_base64 {
-                        if b64.len() > MAX_BASE64_ENCODED_LEN {
-                            write_typed_error(
-                                &mut stdout,
-                                id,
-                                &format!(
-                                    "image payload exceeds maximum encoded size ({} bytes)",
-                                    MAX_BASE64_ENCODED_LEN,
-                                ),
-                                "validation",
-                                false,
-                                false,
-                            );
-                            continue;
-                        }
-                        ImageSource::Base64(b64)
+                    let sources: Vec<ImageSource> = if !images_list.is_empty() {
+                        images_list
+                            .iter()
+                            .map(|b64| ImageSource::Base64(b64))
+                            .collect()
+                    } else if let Some(b64) = image_base64 {
+                        vec![ImageSource::Base64(b64)]
                     } else {
-                        ImageSource::Path(image.unwrap())
+                        vec![ImageSource::Path(image.unwrap())]
                     };
+                    if sources.iter().any(|source| {
+                        matches!(source, ImageSource::Base64(b64) if b64.len() > MAX_BASE64_ENCODED_LEN)
+                    }) {
+                        write_typed_error(
+                            &mut stdout,
+                            id,
+                            &format!(
+                                "image payload exceeds maximum encoded size ({} bytes)",
+                                MAX_BASE64_ENCODED_LEN,
+                            ),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        continue;
+                    }
                     // Plan-mandated Phase-1 stopgap (docs/plans/completions_vision.md §2.1):
                     // VL dispatch defaults `max_think_tokens` to 256 when the
                     // client doesn't specify one. Caps runaway thinking
@@ -3666,7 +3811,10 @@ fn main() {
                         id,
                         prompt,
                         system_prompt: system,
-                        image_source: source,
+                        image_sources: sources,
+                        messages_history: messages_history.as_deref(),
+                        enable_thinking: enable_thinking_jinja,
+                        reasoning_effort: reasoning_effort_jinja.as_deref(),
                         temp,
                         top_p,
                         max_tokens,
@@ -3796,6 +3944,32 @@ fn main() {
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
                     });
+                    // `min_tokens` is honoured by the singleton routes and the
+                    // Flash-Next fn-lanes only. On any other batching serve it is
+                    // refused (400), never rerouted to a serialized singleton.
+                    if min_tokens > 0 {
+                        let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                            == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                        if let Some(message) = hipfire_generate::batch::min_tokens_batch_refusal(
+                            min_tokens,
+                            continuous_batch_size > 1 && batch_scheduler.is_some(),
+                            qwen4_batch,
+                            m.pp,
+                            hipfire_generate::batch::vmm_route_active(vmm_batch, m),
+                            m.ep.is_some(),
+                        ) {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                &message,
+                                "unsupported",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
                     let ep_batch_eligible =
                         if !singleton_handoff && batch_scheduler.is_some() && m.ep.is_some() {
                             is_qwen_ep_batch_request_eligible(
@@ -4285,6 +4459,7 @@ fn main() {
                         messages_history.as_deref(),
                         think_mode,
                         &stop_seqs, // hunt3 M-F
+                        min_tokens,
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
                         logprobs_top_k,
@@ -4964,6 +5139,9 @@ fn main() {
             }
         }
     }
+    // stdin closed: persist the retained-PM4 dispatch ledger's replay counters
+    // (`HIPFIRE_REDLINE_LEDGER`; a no-op when unset).
+    rdna_compute::pm4_ledger::flush_all();
 }
 
 #[cfg(test)]
@@ -5052,6 +5230,51 @@ mod tests {
         assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
         // Deferred tp>1: prior model survives a failed load.
         assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
+    #[test]
+    fn paged_vmm_diag_does_not_report_legacy() {
+        let diag = super::ResidentKvDiag::for_paged_vmm();
+        assert_eq!(diag.backend, "vmm");
+        assert!(!diag.legacy);
+        assert!(diag.warning.is_none());
+        assert_eq!(diag.request, "automatic");
+        assert!(
+            diag.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("paged pool")),
+            "the paged route must name its storage: {:?}",
+            diag.reason
+        );
+    }
+
+    #[test]
+    fn slot_kv_diag_reports_the_backend_the_load_requested() {
+        use hipfire_runtime::kv_backend::KvBackend;
+        let vmm = super::ResidentKvDiag::for_slot(Some(KvBackend::Vmm));
+        assert_eq!(vmm.backend, "vmm");
+        assert!(!vmm.legacy);
+        assert_eq!(vmm.request, "explicit");
+        assert!(
+            vmm.warning.is_none(),
+            "a VMM slot load must not emit the legacy-backend disclosure: {:?}",
+            vmm.warning
+        );
+        let explicit_legacy = super::ResidentKvDiag::for_slot(Some(KvBackend::Legacy));
+        assert_eq!(explicit_legacy.backend, "legacy");
+        assert!(explicit_legacy.legacy);
+        assert!(explicit_legacy.warning.is_some());
+        let default = super::ResidentKvDiag::for_slot(None);
+        assert_eq!(default.backend, "legacy");
+        assert_eq!(default.request, "automatic");
+        assert!(
+            default
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("kv_backend not requested")),
+            "the automatic legacy warning must name the slot-route default: {:?}",
+            default.warning
+        );
     }
 
     use super::{

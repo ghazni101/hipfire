@@ -2444,6 +2444,10 @@ pub struct Qwen35Weights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    /// Provenance of the validated qt49 zero=-4d header contract. The GPU
+    /// carries the same marker; wide admission must check both provenance
+    /// and uniform dense projection dtypes.
+    pub mq3v2_symmetric: bool,
     /// True when any MoE FFN projection in the loaded model is MQ6. gfx1151's
     /// grouped-i8 MQ4 shortcut is model-level unsafe for these promoted A3B
     /// checkpoints, even in layers whose local routed experts remain MQ4.
@@ -2465,9 +2469,47 @@ pub struct Qwen35Weights {
     /// `load_weights_ep_rank` on the exact 4×gfx1201 MQ4R route; all
     /// ordinary (single-GPU, TP, paged) loads leave `None`.
     pub(crate) ep_shard: Option<Qwen35EpShardInfo>,
+
+    /// Model-scoped decode top-K resolution: `true` when any MoE layer
+    /// resolves decode to the host top-K fallback, which the AR decode hipGraph
+    /// cannot capture (#1149). Resolved at load by the arch load hooks
+    /// (`resolve_moe_decode_host_topk`); a direct loader caller resolves it on
+    /// the first gated decode. Never changes for the model's lifetime.
+    pub(crate) moe_host_topk: std::cell::OnceCell<bool>,
 }
 
 impl Qwen35Weights {
+    /// Whether any MoE layer resolves decode to the host top-K fallback. The
+    /// first call decides (and logs once when it disables the AR decode graph);
+    /// later calls read the cached answer.
+    pub fn moe_decode_host_topk(&self, config: &Qwen35Config, arch_has_wmma: bool) -> bool {
+        *self.moe_host_topk.get_or_init(|| {
+            let host_topk = super::forward::moe_layers_use_host_topk(
+                self.layers.iter().filter_map(|layer| match layer {
+                    LayerWeights::DeltaNetMoe(l) => Some(super::forward::moe_decode_dtypes(&l.ffn)),
+                    LayerWeights::FullAttnMoe(l) => Some(super::forward::moe_decode_dtypes(&l.ffn)),
+                    _ => None,
+                }),
+                config.num_experts_per_tok,
+                arch_has_wmma,
+            );
+            if host_topk {
+                eprintln!(
+                    "qwen35: MoE decode uses the host top-K fallback; AR decode hipGraph runs eager for this model (#1149)"
+                );
+            }
+            host_topk
+        })
+    }
+
+    /// Load-time hook for [`Self::moe_decode_host_topk`]: decide the AR decode
+    /// graph policy right after the weights load.
+    pub fn resolve_moe_decode_host_topk(&self, config: &Qwen35Config, gpu: &Gpu) {
+        if config.num_experts > 0 {
+            self.moe_decode_host_topk(config, gpu.arch_caps.has_wmma());
+        }
+    }
+
     /// True when the loaded placement defers at least one layer's routed MoE FFN
     /// to the CPU splice (`memory.offload_exec=cpu` on a host-placed packed
     /// layer). Resolved placement state read from the loaded weights — the
@@ -3103,10 +3145,14 @@ impl Qwen35Weights {
             output_norm: placeholder_tensor(&seal.output_norm),
             output: placeholder_weight(&seal.output),
             layers,
+            // The seal/shared-weights recipe carries no qt49 provenance, so a
+            // hydrated model fails closed: no symmetric MQ3V25 A4/A8 route.
+            mq3v2_symmetric: false,
             moe_has_mq6: false,
             pager: None,
             lm_head_aliases_embd: seal.lm_head_aliases_embd,
             ep_shard: None,
+            moe_host_topk: Default::default(),
         };
         let tied = seal.lm_head_aliases_embd;
         let mut acquired: Vec<(String, GpuTensor)> = Vec::new();
@@ -4289,10 +4335,12 @@ mod dense_shared_tests {
             output_norm,
             output,
             layers: vec![LayerWeights::DeltaNet(delta), LayerWeights::FullAttn(full)],
+            mq3v2_symmetric: false,
             moe_has_mq6: false,
             pager: None,
             lm_head_aliases_embd: tied,
             ep_shard: None,
+            moe_host_topk: Default::default(),
         }
     }
 

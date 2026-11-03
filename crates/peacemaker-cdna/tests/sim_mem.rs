@@ -513,6 +513,24 @@ fn ds_write_every_width_with_snapshot() {
 }
 
 #[test]
+fn ds_write_b16_d16_hi_stores_upper_half_only() {
+    let mut r = Rig::new();
+    r.lds.fill(0xEE);
+    r.set_v(1, |l| (l * 16) as u32);
+    r.set_v(4, |l| val(l, 0));
+    r.w.exec = 0x5555_5555_5555_5555; // odd lanes inactive
+    r.ok(&ds_off(DsOp::WriteB16D16Hi, None, 1, Some(4), 0x0104));
+    r.drain().unwrap();
+    let mut want = vec![0xEEu8; LDS_BYTES];
+    for l in (0..WAVE).step_by(2) {
+        let b = val(l, 0).to_le_bytes();
+        want[l * 16 + 260] = b[2];
+        want[l * 16 + 261] = b[3];
+    }
+    assert!(r.lds == want, "only bytes 2..4 of active lanes are written");
+}
+
+#[test]
 fn ds_two_address_write2_and_st64() {
     // (op, byte multiplier of one offset unit, dwords per element, lane stride, offset0, offset1)
     let cases: [(DsOp, usize, usize, usize, u8, u8); 5] = [
@@ -944,6 +962,48 @@ fn global_store_every_width_with_snapshot() {
             r.bytes("g") == want.as_slice(),
             "{op:?}: memory image differs"
         );
+    }
+}
+
+#[test]
+fn global_store_short_d16_hi_snapshots_upper_half_and_exec() {
+    let mask = 0xa5a5_5a5a_0f0f_f0f0u64;
+    for offset in [-2i16, 0, 4094] {
+        let mut r = Rig::global(0x4000);
+        r.m.unmap("g");
+        r.map_fill("g", G, 0x4000, 0xee);
+        r.w.exec = mask;
+        r.set_v64(2, |lane| {
+            if mask >> lane & 1 != 0 {
+                G + 0x100 + lane as u64 * 4
+            } else {
+                0
+            }
+        });
+        let value = |lane: usize| ((lane as u32 * 997) << 16) | (0x1234 ^ lane as u32);
+        r.set_v(6, value);
+        r.ok(&gl(
+            FlatOp::StoreShortD16Hi,
+            None,
+            2,
+            Some(6),
+            offset,
+            false,
+        ));
+        assert!(r.bytes("g").iter().all(|&b| b == 0xee));
+        r.w.exec = u64::MAX;
+        r.fill_v(2, 2, 0);
+        r.fill_v(6, 1, 0);
+        r.drain().unwrap();
+        let mut want = vec![0xeeu8; 0x4000];
+        for lane in 0..WAVE {
+            if mask >> lane & 1 != 0 {
+                let start = (0x100 + lane * 4) as i64 + i64::from(offset);
+                let start = start as usize;
+                want[start..start + 2].copy_from_slice(&value(lane).to_le_bytes()[2..]);
+            }
+        }
+        assert_eq!(r.bytes("g"), want.as_slice());
     }
 }
 
