@@ -7912,9 +7912,6 @@ pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC: &str =
 pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC: &str =
     include_str!("../../../kernels/src/gemm_iu8g32_residual_wmma_mb4m2.hip");
 /// Minimal LDS-tiled W8A8 GEMM for the planar int8-per-128 weight format.
-/// In-place qt59 -> int8-per-128 requant (same row size, replicated scales).
-pub const REQUANT_IU8G32_PER128_SRC: &str =
-    include_str!("../../../kernels/src/requant_iu8g32_per128.hip");
 pub const GEMM_IU8G32_W8A8_MIN_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),

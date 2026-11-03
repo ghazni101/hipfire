@@ -33,7 +33,7 @@ __device__ __forceinline__ float iu8g32_row_dot(
     const unsigned char* scales = A + K;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; ++bi) {
-        const float d = (float)*((const _Float16*)(scales + (bi << 1)));
+        const float d = (float)*((const _Float16*)(scales + (((bi >> 2)) << 1)));
         const signed char q = (signed char)codes[(bi << 5) + threadIdx.x];
         sum += d * (float)q * x[(bi << 5) + threadIdx.x];
     }
@@ -51,7 +51,7 @@ extern "C" __global__ void gemv_iu8g32(
     if (row >= M) return;
 
     const int blocks = K >> 5;
-    const long long row_bytes = (long long)K + (long long)(blocks << 1);
+    const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
     float sum = iu8g32_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
@@ -70,7 +70,7 @@ extern "C" __global__ void gemv_iu8g32_residual(
     if (row >= M) return;
 
     const int blocks = K >> 5;
-    const long long row_bytes = (long long)K + (long long)(blocks << 1);
+    const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
     float sum = iu8g32_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
@@ -111,7 +111,7 @@ __device__ __forceinline__ void iu8g32_v2_body(
     const int wave = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
     const int row0 = wave * R;
     if (row0 >= M) return;
-    const long long rb = (long long)K + (long long)(K >> 4);
+    const long long rb = (long long)K + (long long)(K >> 6);
     const int chunks = K >> 4;
     float acc[R];
 #pragma unroll
@@ -128,7 +128,7 @@ __device__ __forceinline__ void iu8g32_v2_body(
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const uint4 w = *(const uint4*)(base[r] + (c << 4));
-            const float d = (float)*((const _Float16*)(base[r] + K + ((c >> 1) << 1)));
+            const float d = (float)*((const _Float16*)(base[r] + K + ((c >> 3) << 1)));
             acc[r] += d * iu8_dot16(w, x0, x1, x2, x3);
         }
     }
@@ -188,7 +188,7 @@ __device__ __forceinline__ void iu8g32_a8_body(
     const int wave = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
     const int row0 = wave * R;
     if (row0 >= M) return;
-    const long long rb = (long long)K + (long long)(K >> 4);
+    const long long rb = (long long)K + (long long)(K >> 6);
     const int chunks = K >> 4;
     float acc[R];
 #pragma unroll
@@ -216,7 +216,7 @@ __device__ __forceinline__ void iu8g32_a8_body(
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const uint4 w = *(const uint4*)(base[r] + (c << 4));
-            const float d = (float)*((const _Float16*)(base[r] + K + ((c >> 1) << 1)));
+            const float d = (float)*((const _Float16*)(base[r] + K + ((c >> 3) << 1)));
             int dot = __builtin_amdgcn_sudot4(true, (int)w.x, true, a0, 0, false);
             dot = __builtin_amdgcn_sudot4(true, (int)w.y, true, a1, dot, false);
             dot = __builtin_amdgcn_sudot4(true, (int)w.z, true, a2, dot, false);

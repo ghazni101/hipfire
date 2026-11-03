@@ -17,7 +17,7 @@ extern "C" __global__ void embedding_iu8g32_batched(
 ) {
     const int batch_idx = blockIdx.x;
     const int tid = threadIdx.x;
-    const int blocks_per_row = dim / 32;
+    const int blocks_per_row = dim / 128;
     const long long bytes_per_row =
         (long long)dim + (long long)(blocks_per_row << 1);
     const unsigned char* row = table + (long long)token_ids[batch_idx] * bytes_per_row;
@@ -25,7 +25,7 @@ extern "C" __global__ void embedding_iu8g32_batched(
     float* out_row = output + (long long)batch_idx * dim;
 
     for (int elem = tid; elem < dim; elem += blockDim.x) {
-        const float d = (float)*((const _Float16*)(scales + ((elem >> 5) << 1)));
+        const float d = (float)*((const _Float16*)(scales + ((elem >> 7) << 1)));
         out_row[elem] = d * (float)(signed char)row[elem];
     }
 }

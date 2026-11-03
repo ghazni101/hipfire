@@ -2,17 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU8G32 (qt59) batched residual GEMM
-//! `gemm_iu8g32_residual_wmma`.
+//! Numerics gate for the compact IU8G32 (qt59) batched residual GEMM family.
 //!
-//! 1. Bit-exact: on the qt59 relayout of a Q8_0 tensor it returns exactly the
-//!    bits of `gemm_q8_0_residual_wmma` (same f16 WMMA arithmetic).
-//! 2. vs an f64 reference of the dequantized weights (f16 X): max abs, and
-//!    rel = max abs / max_row sum|w x| (the kernel rounds W to f16).
-//! 3. Real tensors (`IU8_REAL=<.iu4p>` `Q8_REAL=<.mq4p>`): every qt59 tensor
-//!    shape vs its twin, bit-exact.
-//!
-//! M in {1, 7, 129, 256}, K in {32, 96, 2592, 4096}, N in {1, 2, 15, 16, 17, 77, 512}.
+//! qt59 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
+//! dequantized weight to f16 and run f16 WMMA; this test checks every
+//! candidate against an independent f64 reference of the same compact row,
+//! and checks determinism. `IU8_REAL=<.iu4p>` sweeps every real qt59 tensor.
 //!
 //!   cargo test -p hipfire-runtime --release --test iu8g32_wmma_gemm_gpu -- --ignored --nocapture
 
@@ -32,119 +27,87 @@ impl Rng {
     }
 }
 
-fn q8_0_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    let mut out = vec![0u8; m * (k / 32) * 34];
-    for blk in out.chunks_mut(34) {
-        let sc = 0.001 + 0.02 * rng.f().abs();
-        blk[0..2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
-        for b in &mut blk[2..] {
-            *b = (rng.next() % 255) as u8 ^ 0x80; // -127..=127 after cast, plus -128 occasionally
-        }
-    }
-    out
-}
-
-/// Q8_0 `[scale f16][32 i8]` blocks -> qt59 row `[K i8][K/32 f16]`.
-fn relayout(q8: &[u8], m: usize, k: usize) -> Vec<u8> {
-    let g = k / 32;
+/// Random compact row: one f16 scale per 128 codes.
+fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(k % 128, 0);
+    let g = k / 128;
     let mut out = vec![0u8; m * (k + 2 * g)];
     for r in 0..m {
-        let src = &q8[r * g * 34..(r + 1) * g * 34];
-        let dst = &mut out[r * (k + 2 * g)..(r + 1) * (k + 2 * g)];
+        let row = &mut out[r * (k + 2 * g)..(r + 1) * (k + 2 * g)];
+        for b in &mut row[..k] {
+            *b = (rng.next() % 255) as u8 ^ 0x80;
+        }
         for b in 0..g {
-            dst[b * 32..b * 32 + 32].copy_from_slice(&src[b * 34 + 2..b * 34 + 34]);
-            dst[k + 2 * b..k + 2 * b + 2].copy_from_slice(&src[b * 34..b * 34 + 2]);
+            let sc = 0.001 + 0.02 * rng.f().abs();
+            row[k + 2 * b..k + 2 * b + 2]
+                .copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
         }
     }
     out
 }
 
-fn dequant_q8(q8: &[u8], m: usize, k: usize) -> Vec<f64> {
-    let g = k / 32;
+fn dequant(iu: &[u8], m: usize, k: usize) -> Vec<f64> {
+    let g = k / 128;
+    let row_b = k + 2 * g;
     let mut w = vec![0f64; m * k];
     for r in 0..m {
+        let row = &iu[r * row_b..(r + 1) * row_b];
         for b in 0..g {
-            let o = (r * g + b) * 34;
-            let sc = f16::from_bits(u16::from_le_bytes([q8[o], q8[o + 1]])).to_f64();
-            for i in 0..32 {
-                w[r * k + b * 32 + i] = sc * (q8[o + 2 + i] as i8) as f64;
+            let sc =
+                f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]])).to_f64();
+            for i in 0..128 {
+                w[r * k + b * 128 + i] = sc * (row[b * 128 + i] as i8) as f64;
             }
         }
     }
     w
 }
 
-fn bits_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter()
-        .zip(b)
-        .filter(|(x, y)| x.to_bits() != y.to_bits())
-        .count()
-}
-
 fn check(
     gpu: &mut Gpu,
     label: &str,
-    q8: &[u8],
     iu: &[u8],
     m: usize,
     k: usize,
     n: usize,
     rng: &mut Rng,
-    reference: bool,
 ) -> f64 {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
-    let wq = gpu.upload_raw(q8, &[q8.len()]).unwrap();
     let wi = gpu.upload_raw(iu, &[iu.len()]).unwrap();
     let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
-    // The f16-X scratch is keyed by source pointer; a host upload into a
-    // recycled allocation would otherwise reuse the previous case's X.
     gpu.invalidate_fp16_cache();
-    let yq = gpu.upload_f32(&seed, &[n * m]).unwrap();
     let yi = gpu.upload_f32(&seed, &[n * m]).unwrap();
-    gpu.gemm_q8_0_residual_wmma(&wq, &xd, &yq, m, k, n).unwrap();
     gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &yi, m, k, n)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
-    let a = gpu.download_f32(&yq).unwrap();
     let b = gpu.download_f32(&yi).unwrap();
-    let diff = bits_diff(&a, &b);
-    let mut rel = 0.0;
-    let mut abs = 0.0;
-    if reference {
-        let wd = dequant_q8(q8, m, k);
-        let xh: Vec<f64> = x.iter().map(|v| f16::from_f32(*v).to_f64()).collect();
-        let mut sc = 1e-12f64;
-        for t in 0..n {
-            for r in 0..m {
-                let wx: f64 = (0..k).map(|c| wd[r * k + c] * xh[t * k + c]).sum();
-                // Normalise by sum|w x| (the conditioning of the dot), not
-                // |w x|: a single cancelling output (M=N=1) would inflate rel.
-                let l1: f64 = (0..k).map(|c| (wd[r * k + c] * xh[t * k + c]).abs()).sum();
-                sc = sc.max(l1);
-                let e = (b[t * m + r] as f64 - (wx + seed[t * m + r] as f64)).abs();
-                if e > 1.0 && std::env::var("IU8_DBG").is_ok() {
-                    eprintln!(
-                        "  bad t={t} r={r} got={} want={} seed={}",
-                        b[t * m + r],
-                        wx + seed[t * m + r] as f64,
-                        seed[t * m + r]
-                    );
-                }
-                abs = f64::max(abs, e);
-            }
-        }
-        rel = abs / sc;
-    }
-    eprintln!("{label:<30} m={m:<6} k={k:<6} n={n:<4} bitdiff_vs_q8_0_wmma={diff} abs={abs:.3e} rel={rel:.3e}");
-    assert_eq!(
-        diff, 0,
-        "{label} m={m} k={k} n={n}: IU8G32 WMMA differs from Q8_0 WMMA"
+    let y2 = gpu.upload_f32(&seed, &[n * m]).unwrap();
+    gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &y2, m, k, n)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let b2 = gpu.download_f32(&y2).unwrap();
+    assert!(
+        b.iter().zip(&b2).all(|(u, v)| u.to_bits() == v.to_bits()),
+        "{label} m={m} k={k} n={n}: nondeterministic"
     );
-    if reference && std::env::var("IU8_DBG").is_err() {
-        assert!(rel < 1e-2, "{label} rel {rel:.3e}");
+
+    let wd = dequant(iu, m, k);
+    let xh: Vec<f64> = x.iter().map(|v| f16::from_f32(*v).to_f64()).collect();
+    let mut abs = 0f64;
+    let mut sc = 1e-12f64;
+    for t in 0..n {
+        for r in 0..m {
+            let wx: f64 = (0..k).map(|c| wd[r * k + c] * xh[t * k + c]).sum();
+            let l1: f64 = (0..k).map(|c| (wd[r * k + c] * xh[t * k + c]).abs()).sum();
+            sc = sc.max(l1);
+            abs = abs.max((b[t * m + r] as f64 - (wx + seed[t * m + r] as f64)).abs());
+        }
     }
-    for tt in [wq, wi, xd, yq, yi] {
+    let rel = abs / sc;
+    eprintln!("{label:<30} m={m:<6} k={k:<6} n={n:<4} abs={abs:.3e} rel={rel:.3e}");
+    assert!(rel < 1e-2, "{label} rel {rel:.3e}");
+    for tt in [wi, xd, yi, y2] {
         gpu.free_tensor(tt).ok();
     }
     rel
@@ -152,7 +115,7 @@ fn check(
 
 #[test]
 #[ignore]
-fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
+fn iu8g32_wmma_matches_reference() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -168,26 +131,21 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
     let mut worst = 0f64;
     let mut cases = 0;
     for &m in &[1usize, 7, 129, 256] {
-        for &k in &[32usize, 96, 2592, 4096] {
-            let q8 = q8_0_random(&mut rng, m, k);
-            let iu = relayout(&q8, m, k);
-            for &n in &[1usize, 2, 15, 16, 17, 77, 512] {
-                let reference = m * k * n <= 256 * 4096 * 77;
-                worst = worst.max(check(
-                    &mut gpu, "random", &q8, &iu, m, k, n, &mut rng, reference,
-                ));
+        for &k in &[128usize, 256, 2560, 4096] {
+            let iu = iu8_random(&mut rng, m, k);
+            for &n in &[1usize, 2, 15, 16, 17, 77] {
+                worst = worst.max(check(&mut gpu, "random", &iu, m, k, n, &mut rng));
                 cases += 1;
             }
         }
     }
-    if let (Ok(iu_path), Ok(q8_path)) = (std::env::var("IU8_REAL"), std::env::var("Q8_REAL")) {
+    if let Ok(p) = std::env::var("IU8_REAL") {
         use hipfire_runtime::hfq::HfqFile;
-        let iu_f = HfqFile::open(std::path::Path::new(&iu_path)).unwrap();
-        let q8_f = HfqFile::open(std::path::Path::new(&q8_path)).unwrap();
+        let f = HfqFile::open(std::path::Path::new(&p)).unwrap();
         let mut seen = std::collections::BTreeSet::new();
-        for t in iu_f.tensors().to_vec() {
-            let (ti, ib) = iu_f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 59 || ti.shape.len() < 2 || t.name.contains("embed") {
+        for t in f.tensors().to_vec() {
+            let (ti, ib) = f.tensor_data(&t.name).unwrap();
+            if ti.quant_type != 59 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;
@@ -195,29 +153,16 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
             if !seen.insert((k, m)) {
                 continue;
             }
-            let (tq, qb) = q8_f.tensor_data(&t.name).unwrap();
-            assert_eq!(
-                tq.quant_type, 3,
-                "{}: twin is not Q8_0 (qt {})",
-                t.name, tq.quant_type
-            );
-            assert_eq!(
-                relayout(qb, m, k),
-                ib.to_vec(),
-                "{}: qt59 is not the Q8_0 relayout",
-                t.name
-            );
-            for &n in &[1usize, 77, 512] {
+            assert_eq!(ib.len(), m * (k + k / 64), "{}: bad qt59 row size", t.name);
+            for &n in &[1usize, 77] {
                 check(
                     &mut gpu,
                     &format!("real:{}", &t.name[t.name.len().saturating_sub(24)..]),
-                    qb,
-                    ib,
+                    &ib,
                     m,
                     k,
                     n,
                     &mut rng,
-                    n == 1,
                 );
                 cases += 1;
             }
@@ -227,18 +172,13 @@ fn iu8g32_wmma_residual_is_bit_exact_to_q8_0_wmma() {
 }
 
 fn w8a8_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    // qt59 row size: K codes + K/32 f16 scales; the four per-32 slots of a
-    // K128 block carry the same per-128 scale.
-    let stride = k + k / 16;
+    let stride = k + k / 64;
     let mut out = vec![0u8; m * stride];
     for r in 0..m {
         for kb in 0..k / 128 {
             let sc = 0.001 + 0.02 * rng.f().abs();
-            let off = r * stride + k + kb * 8;
-            for s in 0..4 {
-                out[off + s * 2..off + s * 2 + 2]
-                    .copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
-            }
+            let off = r * stride + k + kb * 2;
+            out[off..off + 2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
             for j in 0..128 {
                 out[r * stride + kb * 128 + j] = (rng.next() % 255) as u8;
             }
@@ -259,7 +199,6 @@ fn w8a8_lds_min_matches_reference_and_times() {
         }
     };
     let mut rng = Rng(0x1357_9BDF_2468_ACE0);
-    // Correctness case.
     let (m, k, n) = (64usize, 512usize, 32usize);
     let w8 = w8a8_weights(&mut rng, m, k);
     let wd = gpu.upload_raw(&w8, &[w8.len()]).unwrap();
@@ -267,7 +206,6 @@ fn w8a8_lds_min_matches_reference_and_times() {
     let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
     let xq = gpu.ensure_int8_mmq_linear_x(&xd, n, k).unwrap();
     let yd = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
-    gpu.hip.device_synchronize().unwrap();
     gpu.gemm_iu8g32_w8a8_min(&wd, xq, &yd, m, k, n, false)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
@@ -281,7 +219,7 @@ fn w8a8_lds_min_matches_reference_and_times() {
     }
     gpu.hip.device_synchronize().unwrap();
     let xqb = gpu.download_raw_bytes(&xt).unwrap();
-    let stride = k + k / 16;
+    let stride = k + k / 64;
     let mut want = vec![0f32; n * m];
     for t in 0..n {
         for r in 0..m {
@@ -290,8 +228,8 @@ fn w8a8_lds_min_matches_reference_and_times() {
                 let blk = &xqb[(kb * n + t) * 136..(kb * n + t + 1) * 136];
                 let d = f32::from_le_bytes(blk[0..4].try_into().unwrap());
                 let sc = f16::from_bits(u16::from_le_bytes([
-                    w8[r * stride + k + kb * 8],
-                    w8[r * stride + k + kb * 8 + 1],
+                    w8[r * stride + k + kb * 2],
+                    w8[r * stride + k + kb * 2 + 1],
                 ]))
                 .to_f32();
                 let mut dot = 0i64;
@@ -316,7 +254,6 @@ fn w8a8_lds_min_matches_reference_and_times() {
     eprintln!("w8a8 min: m={m} k={k} n={n} worst rel={rel:.3e}");
     assert!(rel < 1e-5, "w8a8 min rel {rel:.3e}");
 
-    // WO-shape timing (K=6144 is the 27B LA out_proj).
     let (tm, tk, tn) = (5120usize, 6144usize, 512usize);
     let tw = w8a8_weights(&mut rng, tm, tk);
     let twd = gpu.upload_raw(&tw, &[tw.len()]).unwrap();
@@ -341,123 +278,4 @@ fn w8a8_lds_min_matches_reference_and_times() {
         "w8a8 min wo shape M={tm} K={tk} N={tn}: {ms:.3} ms ({:.1} TFLOPS)",
         flops / 1e9 / ms
     );
-}
-
-#[test]
-#[ignore]
-fn w8a8_requant_and_gemm_roundtrip() {
-    let mut gpu = match Gpu::init() {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("SKIP — no GPU ({e:?}).");
-            return;
-        }
-    };
-    let mut rng = Rng(0xDEAD_BEEF_1234_5678);
-    for &(m, k, n) in &[(4usize, 512usize, 32usize), (128usize, 1024usize, 128usize)] {
-        // qt59 source: signed codes + per-32 f16 scales.
-        let stride59 = k + k / 16;
-        let mut q = vec![0u8; m * stride59];
-        for r in 0..m {
-            for i in 0..k {
-                q[r * stride59 + i] = (rng.next() % 255) as u8;
-            }
-            for g in 0..k / 32 {
-                let sc = 0.001 + 0.02 * rng.f().abs();
-                let off = r * stride59 + k + g * 2;
-                q[off..off + 2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
-            }
-        }
-        let wd = gpu.upload_raw(&q, &[q.len()]).unwrap();
-        gpu.requant_iu8g32_per128(&wd, m, k).unwrap();
-        gpu.hip.device_synchronize().unwrap();
-        let rq = gpu.download_raw_bytes(&wd).unwrap();
-        // Compare every 128 block against a CPU requant.
-        for r in 0..m {
-            for kb in 0..k / 128 {
-                let mut amax = 0f32;
-                let mut w = [0f32; 128];
-                for j in 0..128 {
-                    let gi = kb * 4 + j / 32;
-                    let sc = f16::from_bits(u16::from_le_bytes([
-                        q[r * stride59 + k + gi * 2],
-                        q[r * stride59 + k + gi * 2 + 1],
-                    ]))
-                    .to_f32();
-                    w[j] = (q[r * stride59 + kb * 128 + j] as i8) as f32 * sc;
-                    amax = amax.max(w[j].abs());
-                }
-                let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-                for i in 0..4 {
-                    let off = r * stride59 + k + kb * 8 + i * 2;
-                    let got = f16::from_bits(u16::from_le_bytes([rq[off], rq[off + 1]])).to_f32();
-                    let want_d = f16::from_f32(d).to_f32();
-                    assert!(
-                        (got - want_d).abs() <= 1e-9,
-                        "scale mismatch r={r} kb={kb} i={i}: {got} vs {want_d}"
-                    );
-                }
-                for j in 0..128 {
-                    let want = if d > 0.0 {
-                        (w[j] / d).round_ties_even().clamp(-127.0, 127.0) as i8
-                    } else {
-                        0
-                    };
-                    assert_eq!(
-                        rq[r * stride59 + kb * 128 + j] as i8,
-                        want,
-                        "code r={r} kb={kb} j={j}"
-                    );
-                }
-            }
-        }
-        eprintln!("requant roundtrip ok m={m} k={k}");
-
-        // Linear X + the requantized weights through the W8A8 kernel.
-        let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
-        let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
-        let xq = gpu.ensure_int8_mmq_linear_x(&xd, n, k).unwrap();
-        let yd = gpu.upload_f32(&vec![0f32; n * m], &[n * m]).unwrap();
-        gpu.gemm_iu8g32_w8a8_min(&wd, xq, &yd, m, k, n, false)
-            .unwrap();
-        gpu.hip.device_synchronize().unwrap();
-        let got = gpu.download_f32(&yd).unwrap();
-        let xq_len = (k / 128) * n * 136;
-        let xt = gpu.upload_raw(&vec![0u8; xq_len], &[xq_len]).unwrap();
-        unsafe {
-            gpu.hip
-                .memcpy_dtod_raw(xt.buf.as_ptr(), xq, xq_len)
-                .unwrap()
-        };
-        gpu.hip.device_synchronize().unwrap();
-        let xqb = gpu.download_raw_bytes(&xt).unwrap();
-        let mut worst = 0f64;
-        let mut scale = 0f64;
-        for t in 0..n {
-            for r in 0..m {
-                let mut acc = 0f32;
-                for kb in 0..k / 128 {
-                    let blk = &xqb[(kb * n + t) * 136..(kb * n + t + 1) * 136];
-                    let dx = f32::from_le_bytes(blk[0..4].try_into().unwrap());
-                    let sw = f16::from_bits(u16::from_le_bytes([
-                        rq[r * stride59 + k + kb * 8],
-                        rq[r * stride59 + k + kb * 8 + 1],
-                    ]))
-                    .to_f32();
-                    let mut dot = 0i64;
-                    for j in 0..128 {
-                        dot += (rq[r * stride59 + kb * 128 + j] as i8) as i64
-                            * (blk[8 + j] as i8) as i64;
-                    }
-                    acc = (sw * dx).mul_add(dot as f32, acc);
-                }
-                let d = (got[t * m + r] as f64 - acc as f64).abs();
-                worst = worst.max(d);
-                scale = scale.max(acc.abs() as f64);
-            }
-        }
-        let rel = worst / scale.max(1e-30);
-        eprintln!("w8a8 model-layout rel m={m} k={k} n={n}: {rel:.3e}");
-        assert!(rel < 1e-5, "w8a8 rel {rel:.3e}");
-    }
 }

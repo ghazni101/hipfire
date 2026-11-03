@@ -1078,11 +1078,11 @@ mod tests {
     }
 
     #[test]
-    fn iu8g32_repack_of_q8f16_dequants_to_the_same_grid() {
+    fn iu8g128_repack_requantizes_q8f16_per_128() {
         use super::f16_to_f32;
         use hipfire_runtime::iu_quant::{dequant_q8, q8_row_bytes, repack_q8f16};
         let m = 2usize;
-        let k = 64usize;
+        let k = 128usize;
         let w: Vec<f32> = (0..m * k)
             .map(|i| ((i as f32) * 0.07).sin() * 3.0 - 1.2)
             .collect();
@@ -1090,22 +1090,30 @@ mod tests {
         let packed = repack_q8f16(&q8, m, k).unwrap();
         assert_eq!(packed.len(), m * q8_row_bytes(k).unwrap());
         let got = dequant_q8(&packed, m, k).unwrap();
-        // Same reconstruction as the interleaved blocks: scale * i8(code).
         for row in 0..m {
+            let mut amax = 0.0f32;
+            let mut want = vec![0.0f32; k];
             for g in 0..(k / 32) {
                 let base = (row * (k / 32) + g) * 34;
                 let scale = f16_to_f32(u16::from_le_bytes([q8[base], q8[base + 1]]));
                 for i in 0..32 {
-                    let code = q8[base + 2 + i] as i8;
-                    let expect = scale * f32::from(code);
-                    let actual = got[row * k + g * 32 + i];
-                    assert!((actual - expect).abs() < 1e-6, "{actual} vs {expect}");
-                    assert_eq!(
-                        packed[row * q8_row_bytes(k).unwrap() + g * 32 + i],
-                        code as u8
-                    );
+                    let v = scale * f32::from(q8[base + 2 + i] as i8);
+                    want[g * 32 + i] = v;
+                    amax = amax.max(v.abs());
                 }
             }
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let row_b = q8_row_bytes(k).unwrap();
+            for i in 0..k {
+                let actual = got[row * k + i];
+                assert!(
+                    (actual - want[i]).abs() <= d.max(1e-6) * 1.001,
+                    "row {row} col {i}: {actual} vs {}",
+                    want[i]
+                );
+            }
+            // The row tail holds one scale per 128, not four per-32 words.
+            assert_eq!(packed[row * row_b + k..row * row_b + row_b].len(), 2);
         }
     }
 

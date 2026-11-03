@@ -98,25 +98,33 @@ dtype; a prefill over an `iu4` body takes the per-token decode loop
 
 A lifted row is not put on the 4-bit grid. Q4-grade error there is the reason it was Q8F16, and a byte that only holds `0..=15` does not use the int8 multiplier: `v_wmma_i32_16x16x16_iu8` would be multiplying a nibble stored in a byte, at twice the bandwidth of IU4 for the same values.
 
-They stay on the Q8F16 grid and change layout only. Signed int8, one fp16 scale per 32 weights, zero point 0, no FWHT:
+They stay on the Q8 grid and change layout only: signed int8 codes with one fp16
+scale per 128 weights, zero point 0, no FWHT. The scale is not Q8F16's per-32
+scale; quantization is `d = amax/127` over each 128-wide group and every code is
+`round(w/d)` clamped to `-127..=127`:
 
 ```text
 w = f32(scale) * f32(i8(code))
 ```
 
-Q8F16 stores that scale in front of every 32 codes (34 B per block). IU8G32 (qt 59) moves the scales to the tail of the row so the codes are one contiguous signed operand:
+IU8G32 (qt 59) stores the codes contiguously and the scales at the row tail:
 
 ```text
-IU8G32, one row, K = 256                         272 B/row = 8.5 bpw
+IU8G32, one row, K = 256                          260 B/row = 8.125 bpw
 
-  ┌────────────────────────────────────────────┬────┬────┬────┬────┐
-  │ 256 B signed codes, K-linear, -128..=127   │ sc │ sc │ sc │ sc │
-  │                                            │ 0  │ 1  │ …  │ 7  │
-  └────────────────────────────────────────────┴────┴────┴────┴────┘
-        code plane (offset 0)                    16 B of f16 scales
+  ┌────────────────────────────────────────────┬────┬────┐
+  │ 256 B signed codes, K-linear, -128..=127   │ sc │ sc │
+  │                                            │ 0  │ 1  │
+  └────────────────────────────────────────────┴────┴────┘
+        code plane (offset 0)                    4 B of f16 scales
 ```
 
-`K % 32 == 0`. A row that is not is left as interleaved Q8F16. Two WMMA K=16 tiles share one scale. The kernel sets the weight operand signed and folds `scale * float(C)` per 32 K. There is no zero term.
+`K % 128 == 0`; a row that is not is left as interleaved Q8F16. The row is
+`K + (K/128)*2` bytes, so it is two bytes per 128 smaller than the old
+one-scale-per-32 qt59 layout. The prefill GEMM is W8A8
+(`gemm_iu8g32_w8a8_min`, one int8 activation block per 128, one f32 activation
+scale) with the f16-WMMA residual GEMM as its small-batch fallback; decode is
+the int8×int8 `gemv_iu8g32` family.
 
 Norms stay F16. The embedding table is a gather, not a matrix instruction. On the normal rung it is stored this way so a tied `lm_head` is the same buffer the int8 unit can load. Attention and the router are not rungs; on a MoE model the Q8 pin still holds them.
 
@@ -127,7 +135,7 @@ and DFlash refuse qt 57, 58, and 59.
 
 | reader | qt 57 IU4 | qt 58 IU8 | qt 59 IU8G32 |
 |---|---|---|---|
-| decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` (f16 scale × int8 × f32 x, every arch) |
+| decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` (per-128 f16 scale × int8, every arch; `_v2` and `_a8` variants) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g256_residual` | `gemv_iu8g32_residual` |
 | embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
 | prefill GEMM | — | — | — |

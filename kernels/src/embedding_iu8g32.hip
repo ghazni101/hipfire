@@ -17,14 +17,14 @@ extern "C" __global__ void embedding_iu8g32(
     int token_id, int dim
 ) {
     const int tid = threadIdx.x;
-    const int blocks_per_row = dim / 32;
+    const int blocks_per_row = dim / 128;
     const long long bytes_per_row =
         (long long)dim + (long long)(blocks_per_row << 1);
     const unsigned char* row = table + (long long)token_id * bytes_per_row;
     const unsigned char* scales = row + dim;
 
     for (int elem = tid; elem < dim; elem += blockDim.x) {
-        const int block_idx = elem >> 5;
+        const int block_idx = elem >> 7;
         const float d = (float)*((const _Float16*)(scales + (block_idx << 1)));
         signed char qval = (signed char)row[elem];
         output[elem] = d * (float)qval;

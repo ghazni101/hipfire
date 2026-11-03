@@ -42,7 +42,7 @@ extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4m2(
     const int safe_row1 = (my_row1 < M) ? my_row1 : (M - 1);
 
     const int blocks_per_row = K / 32;
-    const long long row_stride = (long long)blocks_per_row * 34;
+    const long long row_stride = (long long)K + (long long)(K >> 6);
     const char* row0_base = A_q8 + (long long)safe_row0 * row_stride;
     const char* row1_base = A_q8 + (long long)safe_row1 * row_stride;
 
@@ -66,26 +66,10 @@ extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4m2(
         {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
     };
 
-    const bool sc_vec = (K & 255) == 0;
-    uint4 sc0 = make_uint4(0u, 0u, 0u, 0u);
-    uint4 sc1 = make_uint4(0u, 0u, 0u, 0u);
-
     for (int bi = 0; bi < blocks_per_row; bi++) {
-        const int j = bi & 7;
         unsigned short s0_bits, s1_bits;
-        if (sc_vec) {
-            if (j == 0) {
-                sc0 = *(const uint4*)(row0_base + K + bi * 2);
-                sc1 = *(const uint4*)(row1_base + K + bi * 2);
-            }
-            const unsigned int w0 = (j < 2) ? sc0.x : (j < 4) ? sc0.y : (j < 6) ? sc0.z : sc0.w;
-            const unsigned int w1 = (j < 2) ? sc1.x : (j < 4) ? sc1.y : (j < 6) ? sc1.z : sc1.w;
-            s0_bits = (unsigned short)((j & 1) ? (w0 >> 16) : (w0 & 0xffffu));
-            s1_bits = (unsigned short)((j & 1) ? (w1 >> 16) : (w1 & 0xffffu));
-        } else {
-            __builtin_memcpy(&s0_bits, row0_base + K + bi * 2, 2);
-            __builtin_memcpy(&s1_bits, row1_base + K + bi * 2, 2);
-        }
+        __builtin_memcpy(&s0_bits, row0_base + K + ((bi >> 2) << 1), 2);
+        __builtin_memcpy(&s1_bits, row1_base + K + ((bi >> 2) << 1), 2);
         _Float16 s0, s1;
         __builtin_memcpy(&s0, &s0_bits, 2);
         __builtin_memcpy(&s1, &s1_bits, 2);

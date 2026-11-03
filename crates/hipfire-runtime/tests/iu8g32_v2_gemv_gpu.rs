@@ -26,7 +26,8 @@ impl Rng {
 }
 
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    let g = k / 32;
+    assert_eq!(k % 128, 0, "qt59 rows are one scale per 128");
+    let g = k / 128;
     let mut out = vec![0u8; m * (k + 2 * g)];
     for r in 0..m {
         let row = &mut out[r * (k + 2 * g)..(r + 1) * (k + 2 * g)];
@@ -43,7 +44,7 @@ fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 }
 
 fn reference(iu: &[u8], x: &[f32], m: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
-    let g = k / 32;
+    let g = k / 128;
     let rb = k + 2 * g;
     let mut y = vec![0f64; m];
     let mut l1 = vec![0f64; m];
@@ -53,8 +54,8 @@ fn reference(iu: &[u8], x: &[f32], m: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
         for b in 0..g {
             let sc =
                 f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]])).to_f64();
-            for i in 0..32 {
-                let v = sc * (row[b * 32 + i] as i8) as f64 * x[b * 32 + i] as f64;
+            for i in 0..128 {
+                let v = sc * (row[b * 128 + i] as i8) as f64 * x[b * 128 + i] as f64;
                 s += v;
                 a += v.abs();
             }
@@ -121,7 +122,7 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], m: usize, k: usize, rng: &mut Rn
         &l1,
     );
     let mut worst = 0f64;
-    let aligned = (k + k / 16) % 16 == 0;
+    let aligned = (k + k / 64) % 16 == 0;
     if aligned {
         for (p, r) in V2 {
             let a = run(gpu, p, &w, &xd, &zero, m, k);
@@ -167,7 +168,7 @@ fn iu8g32_v2_gemv_matches_reference() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let (mut w1, mut w2, mut cases) = (0f64, 0f64, 0);
     for &m in &[1usize, 3, 7, 129, 4097, 40000] {
-        for &k in &[32usize, 64, 96, 256, 2560, 4096, 9216] {
+        for &k in &[128usize, 256, 384, 2560, 4096, 9216] {
             if m * k > 40000 * 2560 {
                 continue;
             }
@@ -213,8 +214,9 @@ fn iu8g32_v2_gemv_matches_reference() {
 /// (d_x = amax/127, round-half-even, clamp ±127), integer dot per 32,
 /// y = sum_g (d_w * d_x) * dot.
 fn a8_contract(iu: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f64> {
+    let gw = k / 128;
     let g = k / 32;
-    let rb = k + 2 * g;
+    let rb = k + 2 * gw;
     let mut qx = vec![0i32; k];
     let mut dx = vec![0f32; g];
     for b in 0..g {
@@ -232,9 +234,11 @@ fn a8_contract(iu: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f64> {
             let row = &iu[r * rb..(r + 1) * rb];
             (0..g)
                 .map(|b| {
-                    let sc =
-                        f16::from_bits(u16::from_le_bytes([row[k + 2 * b], row[k + 2 * b + 1]]))
-                            .to_f32();
+                    let sc = f16::from_bits(u16::from_le_bytes([
+                        row[k + 2 * (b >> 2)],
+                        row[k + 2 * (b >> 2) + 1],
+                    ]))
+                    .to_f32();
                     let dot: i32 = (0..32)
                         .map(|i| (row[b * 32 + i] as i8) as i32 * qx[b * 32 + i])
                         .sum();
@@ -269,7 +273,7 @@ fn iu8g32_a8_gemv_matches_contract() {
     let (mut wc, mut wa, mut wv, mut cases) = (0f64, 0f64, 0f64, 0);
     let mut shapes: Vec<(String, Vec<u8>, usize, usize)> = Vec::new();
     for &m in &[1usize, 7, 129, 4097, 40000] {
-        for &k in &[32usize, 256, 2560, 4096] {
+        for &k in &[128usize, 256, 2560, 4096] {
             if m * k > 40000 * 2560 {
                 continue;
             }

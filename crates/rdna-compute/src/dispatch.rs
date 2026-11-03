@@ -1096,10 +1096,10 @@ impl DType {
             }
             // qt=59. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
             DType::IU8G32 => {
-                if k % 32 != 0 {
+                if k % 128 != 0 {
                     None
                 } else {
-                    Some(k + (k / 32) * 2)
+                    Some(k + (k / 128) * 2)
                 }
             }
             _ => None,
@@ -1143,7 +1143,7 @@ impl DType {
         match self {
             DType::IU4G256 => Some("IU4G256"),
             DType::IU8G256 => Some("IU8G256"),
-            DType::IU8G32 => Some("IU8G32"),
+            DType::IU8G32 => Some("IU8G128"),
             _ => None,
         }
     }
@@ -1733,9 +1733,6 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
-    /// Weight buffers whose qt59 rows were requantized in place to int8 with
-    /// one scale per 128 (the prefill W8A8 fast path). Cleared on free.
-    pub(crate) w8_128_weights: std::collections::HashSet<usize>,
     /// `HIPFIRE_CB_VERIFY_FP8` scope (see `crate::gemm_fp8_verify`): set by
     /// [`Gpu::fp8_verify_enter`] for the duration of a target verify forward.
     /// While true, every dense MQ4G256V2 verify GEMM runs the PeaceMaker FP8
@@ -3038,7 +3035,6 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
-            w8_128_weights: std::collections::HashSet::new(),
             fp8_verify_scope: false,
             iu4_verify_scope: false,
             iu4_pending_x: None,
@@ -8485,7 +8481,6 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
-        self.w8_128_weights.remove(&key);
         if tensor.buf.is_host_mapped() {
             // Host-mapped owners are never pooled: hipHostFree takes the host
             // pointer, and an offloaded weight is static (freed at unload), so

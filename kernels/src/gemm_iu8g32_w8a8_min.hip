@@ -3,8 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Minimal LDS-tiled W8A8 GEMM for a planar int8 weight format:
-//   row = [K signed int8 codes][K/32 f16 scales] (the qt59 row size), where
-//   the four per-32 slots of each K128 block carry the same per-128 scale.
+//   row = [K signed int8 codes][K/128 f16 scales] (8.125 bpw).
 // Activations are the existing block_i8_128 plane (per-128 d, nibble-pair
 // qs). WMMA-IU8 accumulates a whole K128 in int32, then one scale
 // (sc_w * d_x) folds it into f32 - no per-32 weight dequantization.
@@ -56,7 +55,7 @@ __device__ __forceinline__ void w8a8_body(
     if (tile_tok0 >= N || tile_row0 >= M) return;
 
     const int kblocks = K / 128;
-    const long long row_stride = (long long)K + (long long)(K >> 4);
+    const long long row_stride = (long long)K + (long long)(K >> 6);
 
     const unsigned st_e = (unsigned)(tid >> 2);
     const unsigned st_c0 = (unsigned)((tid & 3) * 2);
@@ -89,7 +88,7 @@ __device__ __forceinline__ void w8a8_body(
         if (st_tok < N) ((float*)(LDS + W8_DX_OFF))[st_e] = ((const block_i8_128*)xb)->d;
         else ((float*)(LDS + W8_DX_OFF))[st_e] = 0.0f;
         const unsigned short sb = (st_row < M)
-            ? *(const unsigned short*)(A + st_woff_row + K + (long long)kb * 8)
+            ? *(const unsigned short*)(A + st_woff_row + K + (long long)kb * 2)
             : 0u;
         ((float*)(LDS + W8_SW_OFF))[st_e] = __half2float(__ushort_as_half(sb));
         __syncthreads();

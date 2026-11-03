@@ -961,3 +961,21 @@ The weight requant is negligible on the decode path. The prefill delta is
 dominated by the W8A8 activation quantizer; it is slightly above the f16
 prefill KL (0.029 vs the body's existing 0.017 vs decode) while top-1 and PPL
 improve. Enabled per-container; the code gate is `HIPFIRE_IU8_W8A8=1`.
+
+## C9 compact qt59 (2026-11-03): one scale per 128, no in-place requant
+
+- Change: qt59 row is `[K signed i8][K/128 f16]` (260 B at K=256) instead of
+  Q8F16's `[K codes][K/32 scales]` (272 B). `d = amax/127` is computed per 128
+  codes at quantization time; the row size is the kernel's stride.
+- Removed the load-time shrink (`requant_iu8g32_per128`) and the
+  `HIPFIRE_IU8_W8A8` request. Every reader (`gemv_iu8g32` v1/v2/a8,
+  `embedding_iu8g32{,_batched}`, `gemm_iu8g32_residual_wmma` + mb4/mb4m2,
+  `gemm_iu8g32_w8a8_min`) reads the compact row; W8A8 is the unconditional
+  prefill path. Old files are refused (qt59 blob length), not misread.
+- `convert_iu8g128` performs the offline per32 -> per128 migration.
+- Model (27B IU4-Pro, gfx1100, q8 KV): file 16,274,209,792 B; pp2048 2,030,
+  pp8192 1,991 tok/s, tg16 46.7 tok/s (3-run medians). Decode vs the old per32 ref: mean KLD
+  6.0e-5 (top-1 508/511); prefill (W8A8) 0.0160 (top-1 483/511).
+- Contract tests updated: `iu8g32_wmma_gemm_gpu` (f64 reference, 100 cases,
+  worst rel 9.9e-5 incl. real lm_head/wo) and `iu8g32_v2_gemv_gpu` (v2/a8 vs
+  the compact contract).

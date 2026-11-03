@@ -265,14 +265,14 @@ fn emit_q8_or_iu8(bytes: Vec<u8>, shape: &[usize]) -> (Vec<u8>, QuantType, u32, 
         return (bytes, QuantType::Q8F16, 32, "Q8_F16");
     }
     let (m, k) = match shape {
-        [m, k] if *m > 0 && *k > 0 && *k % 32 == 0 => (*m, *k),
-        [k] if *k > 0 && *k % 32 == 0 => (1, *k),
+        [m, k] if *m > 0 && *k > 0 && *k % 128 == 0 => (*m, *k),
+        [k] if *k > 0 && *k % 128 == 0 => (1, *k),
         _ => return (bytes, QuantType::Q8F16, 32, "Q8_F16"),
     };
     match hipfire_runtime::iu_quant::repack_q8f16(&bytes, m, k) {
-        Ok(packed) => (packed, QuantType::IU8G32, 32, "IU8G32"),
+        Ok(packed) => (packed, QuantType::IU8G32, 128, "IU8G128"),
         Err(error) => {
-            eprintln!("error: IU8G32 repack failed: {error}");
+            eprintln!("error: IU8G128 repack failed: {error}");
             std::process::exit(2);
         }
     }

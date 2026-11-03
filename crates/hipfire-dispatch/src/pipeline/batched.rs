@@ -1133,7 +1133,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
             n,
         );
     }
-    if w.dtype == DType::IU8G32 && k % 128 == 0 && gpu.is_w8_128(w.buf.buf.as_ptr()) {
+    if w.dtype == DType::IU8G32 && k % 128 == 0 {
         // In-place requantized qt59: one scale per 128, int8 W8A8 path.
         let xq = gpu.ensure_int8_mmq_linear_x(input, n, k)?;
         return match epilogue {

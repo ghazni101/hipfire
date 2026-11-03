@@ -40,7 +40,7 @@ extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4(
     const int safe_row = (my_row < M) ? my_row : (M - 1);
 
     const int blocks_per_row = K / 32;
-    const long long row_stride = (long long)blocks_per_row * 34;
+    const long long row_stride = (long long)K + (long long)(K >> 6);
     const char* row_base = A_q8 + (long long)safe_row * row_stride;
 
     // Four 16-token batch tiles; lanes past N read row 0 (results dropped).
@@ -58,23 +58,10 @@ extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4(
         {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
     };
 
-    // Planar scales live K bytes past the codes. One 16 B load carries eight
-    // scales per lane when K % 256 == 0 (same hoist as the base kernel).
-    const bool sc_vec = (K & 255) == 0;
-    uint4 sc8 = make_uint4(0u, 0u, 0u, 0u);
-
     for (int bi = 0; bi < blocks_per_row; bi++) {
-        const char* sp = row_base + K + bi * 2;
         const char* cp = row_base + bi * 32;
         unsigned short s_bits;
-        if (sc_vec) {
-            if ((bi & 7) == 0) sc8 = *(const uint4*)(row_base + K + bi * 2);
-            const int j = bi & 7;
-            const unsigned int wd = (j < 2) ? sc8.x : (j < 4) ? sc8.y : (j < 6) ? sc8.z : sc8.w;
-            s_bits = (unsigned short)((j & 1) ? (wd >> 16) : (wd & 0xffffu));
-        } else {
-            __builtin_memcpy(&s_bits, sp, 2);
-        }
+        __builtin_memcpy(&s_bits, row_base + K + ((bi >> 2) << 1), 2);
         _Float16 sc;
         __builtin_memcpy(&sc, &s_bits, 2);
 

@@ -152,7 +152,7 @@ fn iu8g32_pick(
     m: usize,
     k: usize,
 ) -> &'static str {
-    let row_bytes = k + k / 16;
+    let row_bytes = k + k / 64;
     let aligned = row_bytes % 16 == 0
         && (x.buf.as_ptr() as usize) % 16 == 0
         && (a.buf.as_ptr() as usize) % 16 == 0;

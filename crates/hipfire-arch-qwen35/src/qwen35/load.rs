@@ -3471,16 +3471,6 @@ fn load_layer_into(
     };
     let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
     if let LayerWeights::DeltaNet(dn) = &mut layer {
-        if dn.wo.gpu_dtype == DType::IU8G32
-            && dn.wo.k % 128 == 0
-            && hipfire_config::developer_var("HIPFIRE_IU8_W8A8")
-                .ok()
-                .as_deref()
-                == Some("1")
-        {
-            gpu.requant_iu8g32_per128(&dn.wo.buf, dn.wo.m, dn.wo.k)?;
-            gpu.mark_w8_128(dn.wo.buf.buf.as_ptr());
-        }
         if let Err(e) = append_betaalpha_to_z(hfq, gpu, p, dn) {
             layer.free_gpu(gpu);
             return Err(e);
@@ -4149,13 +4139,19 @@ fn validate_embedding_info(
             }
             Some(vocab * (dim / 32) * 34)
         }
-        // qt 59 (IU8G32): the same Q8 grid, planar — one code byte per weight
-        // and one f16 scale per 32 at the row tail.
+        // qt 59 (IU8G128): one code byte per weight and one f16 scale per 128
+        // at the row tail.
         59 => {
-            if dim % 32 != 0 {
-                return Err(format!("{name}: IU8G32 dim {dim} not multiple of 32"));
+            if dim % 128 != 0 {
+                return Err(format!("{name}: IU8G128 dim {dim} not multiple of 128"));
             }
-            Some(vocab * (dim + (dim / 32) * 2))
+            if info.group_size != 128 {
+                return Err(format!(
+                    "{name}: IU8G128 group_size must be 128, got {}",
+                    info.group_size
+                ));
+            }
+            Some(vocab * (dim + (dim / 128) * 2))
         }
         6 => expected_mq4_bytes(vocab, dim),
         13 => expected_mq4_bytes(vocab, dim),

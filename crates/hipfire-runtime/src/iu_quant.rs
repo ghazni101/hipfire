@@ -41,21 +41,21 @@
 //! `row_bytes(k)` with the code plane at offset 0 (`code_bytes(k)` long)
 //! and the scales immediately after.
 //!
-//! ## IU8G32 (qt 59), the Q8 tier
+//! ## IU8G128 (qt 59), the int8 tier
 //!
-//! Embeddings, `lm_head`, and the fixed tier are not MQ4 codes. They stay on
-//! the Q8F16 grid: signed int8, one fp16 scale per 32 weights, zero point 0,
-//! `w = f32(scale) * f32(i8(code))`, no FWHT. Q8F16 interleaves that scale in
-//! front of every 32 codes, so an IU8 WMMA load cannot take the row as one
-//! operand. [`repack_q8f16`] moves the scales to the tail:
+//! qt 59 is a true signed-int8 format with **one f16 scale per 128 weights**,
+//! zero point 0, no FWHT:
 //!
 //! ```text
-//! [i8 codes for all K][f16 scale] * (K/32)
+//! [K signed i8 codes][f16 scale] * (K/128)
 //! ```
 //!
-//! `K % 32 == 0`. The bytes are the full int8 range, which
-//! `v_wmma_i32_16x16x16_iu8` multiplies with the weight operand signed. This
-//! is not [`Layout::Iu8`]: that layout is qt 58, MQ4 nibbles stored in a byte.
+//! `K % 128 == 0`. One scale per 128 is exactly what an int-WMMA K128
+//! accumulation needs: `V_WMMA_I32_16X16X16_IU8` sums 128 products in int32,
+//! then one `scale * d_x` fold. The compact row is 8.125 bpw. This is not
+//! [`Layout::Iu8`]: that layout is qt 58, MQ4 nibbles stored in a byte. The
+//! previous kb 59 layout (one scale per 32, `K + K/16`) is retired and old
+//! files are refused.
 
 use half::f16;
 
@@ -67,8 +67,10 @@ pub const HALF: usize = 128;
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 /// Bytes of one `(f16 scale, f16 zero)` pair.
 pub const SCALE_PAIR_BYTES: usize = 4;
-/// Q8F16 group. IU8G32 (qt 59) keeps this grid and only moves the scales.
+/// Q8F16 source group (one f16 scale per 32 signed codes).
 pub const Q8_GROUP: usize = 32;
+/// qt 59 scale group: one f16 scale per 128 weights (the int-WMMA K128 fold).
+pub const Q8_SCALE_GROUP: usize = 128;
 /// Interleaved Q8F16 block: one f16 scale, then 32 signed codes.
 pub const Q8_BLOCK_BYTES: usize = 34;
 /// HFQ quant-type byte of the planar Q8 operand ([`repack_q8f16`]).
@@ -237,16 +239,14 @@ pub fn repack_mq4v2(src: &[u8], m: usize, k: usize, layout: Layout) -> Result<Ve
     Ok(out)
 }
 
-/// Bytes of one IU8G32 row: `K` signed codes, then one f16 scale per 32.
+/// Bytes of one qt 59 row: `K` signed codes, then one f16 scale per 128.
 ///
-/// `None` unless `K` is a positive multiple of [`Q8_GROUP`]. A partial group
-/// is not rounded up: the interleaved Q8F16 block would cross the row, and
-/// there is no legal plane for it.
+/// `None` unless `K` is a positive multiple of [`Q8_SCALE_GROUP`].
 pub fn q8_row_bytes(k: usize) -> Option<usize> {
-    if k == 0 || k % Q8_GROUP != 0 {
+    if k == 0 || k % Q8_SCALE_GROUP != 0 {
         None
     } else {
-        Some(k + (k / Q8_GROUP) * 2)
+        Some(k + (k / Q8_SCALE_GROUP) * 2)
     }
 }
 
@@ -259,7 +259,7 @@ pub fn q8_tensor_bytes(m: usize, k: usize) -> Option<usize> {
 }
 
 fn q8_shape_error(m: usize, k: usize) -> String {
-    format!("IU8G32 requires M > 0 and K % {Q8_GROUP} == 0, got M={m} K={k}")
+    format!("IU8G128 requires M > 0 and K % {Q8_SCALE_GROUP} == 0, got M={m} K={k}")
 }
 
 /// Reject an IU8G32 tensor whose length or shape is not the layout.
@@ -270,7 +270,7 @@ pub fn validate_q8(bytes: &[u8], m: usize, k: usize) -> Result<(), String> {
     let expected = q8_tensor_bytes(m, k).ok_or_else(|| q8_shape_error(m, k))?;
     if bytes.len() != expected {
         return Err(format!(
-            "IU8G32 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+            "IU8G128 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
             bytes.len()
         ));
     }
@@ -288,7 +288,7 @@ pub fn repack_q8f16(src: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
     let gpr = k / Q8_GROUP;
     let groups = m
         .checked_mul(gpr)
-        .ok_or_else(|| format!("IU8G32 shape overflows: M={m} K={k}"))?;
+        .ok_or_else(|| format!("IU8G128 shape overflows: M={m} K={k}"))?;
     let expect = groups
         .checked_mul(Q8_BLOCK_BYTES)
         .ok_or_else(|| format!("Q8F16 blob length overflows: M={m} K={k}"))?;
@@ -299,20 +299,37 @@ pub fn repack_q8f16(src: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
         ));
     }
     let row_b = q8_row_bytes(k).expect("shape already checked");
+    let blocks = k / Q8_SCALE_GROUP;
     let mut out = vec![0u8; m * row_b];
+    let mut w = [0f32; Q8_SCALE_GROUP];
     for row in 0..m {
         let dst = &mut out[row * row_b..(row + 1) * row_b];
-        for g in 0..gpr {
-            let base = (row * gpr + g) * Q8_BLOCK_BYTES;
-            dst[k + g * 2..k + g * 2 + 2].copy_from_slice(&src[base..base + 2]);
-            let code_at = g * Q8_GROUP;
-            dst[code_at..code_at + Q8_GROUP].copy_from_slice(&src[base + 2..base + Q8_BLOCK_BYTES]);
+        for kb in 0..blocks {
+            let mut amax = 0.0f32;
+            for g in 0..4 {
+                let base = (row * gpr + kb * 4 + g) * Q8_BLOCK_BYTES;
+                let sc = load_f16(&src[base..]);
+                for i in 0..Q8_GROUP {
+                    let q = src[base + 2 + i] as i8;
+                    let value = sc * f32::from(q);
+                    w[g * Q8_GROUP + i] = value;
+                    amax = amax.max(value.abs());
+                }
+            }
+            let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for i in 0..Q8_SCALE_GROUP {
+                let q = (w[i] * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+                dst[kb * Q8_SCALE_GROUP + i] = q as u8;
+            }
+            dst[k + kb * 2..k + kb * 2 + 2]
+                .copy_from_slice(&f16::from_f32(d).to_bits().to_le_bytes());
         }
     }
     Ok(out)
 }
 
-/// Dequantise an IU8G32 tensor. `w = f32(scale) * f32(i8(code))` for the
+/// Dequantise an IU8G128 tensor. `w = f32(scale) * f32(i8(code))` for the
 /// scale of `k / 32`. Natural basis: these weights were not FWHT-rotated.
 pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> {
     validate_q8(bytes, m, k)?;
@@ -323,7 +340,7 @@ pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> 
         let codes = &raw[..k];
         let scales = &raw[k..];
         for col in 0..k {
-            let scale = load_f16(&scales[(col / Q8_GROUP) * 2..]);
+            let scale = load_f16(&scales[(col / Q8_SCALE_GROUP) * 2..]);
             let q = f32::from(codes[col] as i8);
             out[row * k + col] = scale * q;
         }
@@ -331,7 +348,7 @@ pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> 
     Ok(out)
 }
 
-/// GEMV contract for an IU8G32 tensor (qt 59): `y = W x` with
+/// GEMV contract for an IU8G128 tensor (qt 59): `y = W x` with
 /// `w = f32(scale) * f32(i8(code))` on the natural-basis `x`.
 ///
 /// This is the dot of the dequantized row with `x`; the device kernel
@@ -342,7 +359,7 @@ pub fn gemv_q8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, 
     validate_q8(bytes, m, k)?;
     if x.len() != k {
         return Err(format!(
-            "IU8G32 GEMV activation length {}, expected K={k}",
+            "IU8G128 GEMV activation length {}, expected K={k}",
             x.len()
         ));
     }
@@ -354,7 +371,7 @@ pub fn gemv_q8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, 
         let scales = &raw[k..];
         let mut acc = 0.0f32;
         for col in 0..k {
-            let scale = load_f16(&scales[(col / Q8_GROUP) * 2..]);
+            let scale = load_f16(&scales[(col / Q8_SCALE_GROUP) * 2..]);
             let q = f32::from(codes[col] as i8);
             acc += (scale * q) * x[col];
         }
@@ -650,44 +667,46 @@ mod tests {
     }
 
     #[test]
-    fn q8_repack_keeps_signed_codes_and_moves_scales_to_the_tail() {
+    fn q8_repack_requantizes_one_scale_per_128() {
         let m = 2usize;
-        let k = 64usize;
-        let scales = [
-            f16::from_f32(0.125).to_bits(),
-            f16::from_f32(-0.5).to_bits(),
-        ];
+        let k = 128usize;
         let mut src = vec![0u8; m * (k / Q8_GROUP) * Q8_BLOCK_BYTES];
         for row in 0..m {
             for g in 0..(k / Q8_GROUP) {
                 let base = (row * (k / Q8_GROUP) + g) * Q8_BLOCK_BYTES;
-                src[base..base + 2].copy_from_slice(&scales[g].to_le_bytes());
+                // Row 0: all ones at 1/8 -> amax 0.125, q 127.
+                // Row 1: one -56 at 0.5 -> amax 28, q -127.
+                let sc = if row == 0 { 0.125f32 } else { 0.5 };
+                src[base..base + 2].copy_from_slice(&f16::from_f32(sc).to_bits().to_le_bytes());
                 for i in 0..Q8_GROUP {
-                    // 200 is i8 -56, which qt 58 would reject as a nibble.
-                    let code: i8 = if i == 0 {
+                    let code: i8 = if row == 0 {
+                        1
+                    } else if g == 0 && i == 0 {
                         -56
                     } else {
-                        ((row + g + i) as i8) % 20
+                        0
                     };
                     src[base + 2 + i] = code as u8;
                 }
             }
         }
         let packed = repack_q8f16(&src, m, k).unwrap();
-        assert_eq!(packed.len(), m * (k + 4));
-        assert_eq!(q8_row_bytes(32), Some(34));
-        assert_eq!(q8_row_bytes(256), Some(272));
-        assert_eq!(q8_row_bytes(31), None);
+        assert_eq!(q8_row_bytes(128), Some(130));
+        assert_eq!(q8_row_bytes(256), Some(260));
+        assert_eq!(q8_row_bytes(32), None);
+        assert_eq!(q8_row_bytes(127), None);
         assert_eq!(Q8_QUANT_TYPE, 59);
-        // Row 0: codes first, then the two scale words that headed the blocks.
-        assert_eq!(packed[0], (-56i8) as u8);
-        assert_eq!(&packed[k..k + 2], &scales[0].to_le_bytes());
-        assert_eq!(&packed[k + 2..k + 4], &scales[1].to_le_bytes());
+        assert_eq!(packed.len(), m * (k + 2));
         let got = dequant_q8(&packed, m, k).unwrap();
-        let scale0 = f16::from_bits(scales[0]).to_f32();
-        assert!((got[0] - scale0 * f32::from(-56i8)).abs() < 1e-6);
-        // qt 58 stores MQ4 nibbles. A signed Q8 code does not fit that range.
-        assert!(packed[0] > 15);
+        for i in 0..k {
+            assert!((got[i] - 0.125).abs() < 1e-4, "row0 col {i}: {}", got[i]);
+            let want = if i == 0 { -28.0 } else { 0.0 };
+            assert!(
+                (got[k + i] - want).abs() < 1e-2,
+                "row1 col {i}: {}",
+                got[k + i]
+            );
+        }
         assert!(repack_q8f16(&src, m, 48).is_err());
     }
 
@@ -719,24 +738,19 @@ mod tests {
 
     #[test]
     fn q8_gemv_dots_the_planar_codes_with_the_natural_basis_activation() {
-        // One row, one 32-block: scale 0.5, codes -4 and 6 on x = 2 and 3.
+        // One row, one 128 block: scale 0.5, codes -4 and 6 on x = 2 and 3.
         // y = 0.5*(-4*2) + 0.5*(6*3) = -4 + 9 = 5.
-        let k = 32usize;
-        let mut src = vec![0u8; Q8_BLOCK_BYTES];
-        src[0..2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
-        src[2] = (-4i8) as u8;
-        src[3] = 6;
-        let packed = repack_q8f16(&src, 1, k).unwrap();
+        let k = 128usize;
+        let mut packed = vec![0u8; k + 2];
+        packed[0] = (-4i8) as u8;
+        packed[1] = 6;
+        packed[k..k + 2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());
         let mut x = vec![0.0f32; k];
         x[0] = 2.0;
         x[1] = 3.0;
         assert_eq!(gemv_q8(&packed, &x, 1, k).unwrap(), vec![5.0f32]);
-        // The interleaved Q8F16 blob has the SAME length (34 == 32 + 2), so a
-        // length check cannot tell the layouts apart — the dtype tag does. Read
-        // as planar, its first code byte (-4, i.e. 0xFC) is charged to x[0] and
-        // its scale word to x[1], so the result is not 5.
-        assert!(gemv_q8(&src, &x, 1, k).is_ok());
-        assert_ne!(gemv_q8(&src, &x, 1, k).unwrap(), vec![5.0f32]);
+        // A row without its scale tail is not a qt59 row.
+        assert!(gemv_q8(&packed[..k], &x, 1, k).is_err());
         assert!(gemv_q8(&packed, &x[..k - 1], 1, k).is_err());
     }
 
