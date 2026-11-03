@@ -538,28 +538,15 @@ pub fn dflash_slot_draft_step(
     {
         for (i, &tok) in block.iter().enumerate() {
             let dst = st.scratch.x.sub_offset(i * h, h);
-            match weights.embd_format {
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => gpu
-                    .embedding_lookup_hfq4g256(&weights.token_embd, &dst, tok, h)
-                    .map_err(|e| format!("noise embed: {e}"))?,
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => gpu
-                    .embedding_lookup_hfq4g128(&weights.token_embd, &dst, tok, h)
-                    .map_err(|e| format!("noise embed: {e}"))?,
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => gpu
-                    .embedding_lookup_q8(&weights.token_embd, &dst, tok, h)
-                    .map_err(|e| format!("noise embed: {e}"))?,
-                hipfire_runtime::llama::EmbeddingFormat::IU8G32 => gpu
-                    .embedding_lookup_iu8g32(&weights.token_embd, &dst, tok, h)
-                    .map_err(|e| format!("noise embed: {e}"))?,
-                hipfire_runtime::llama::EmbeddingFormat::F32 => gpu
-                    .embedding_lookup(&weights.token_embd, &dst, tok, h)
-                    .map_err(|e| format!("noise embed: {e}"))?,
-                _ => {
-                    return Err(
-                        "dflash slot: unsupported target embedding format for noise lookup".into(),
-                    )
-                }
-            }
+            hipfire_runtime::llama::embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &dst,
+                tok,
+                h,
+            )
+            .map_err(|e| format!("noise embed: {e}"))?;
         }
     }
 

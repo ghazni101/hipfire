@@ -892,21 +892,14 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
             // Scalar noise embeddings: draft_dflash_forward_rank's fallback loop.
             for (i, &tok) in block.iter().enumerate() {
                 let dst = draft_scratch.x.sub_offset(i * h, h);
-                match target_weights.embd_format {
-                    llama::EmbeddingFormat::HFQ4G256 => {
-                        gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::HFQ4G128 => {
-                        gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::Q8_0 => {
-                        gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::IU8G32 => {
-                        gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    _ => unreachable!("admission checked the embedding format"),
-                }
+                llama::embedding_lookup_dispatch(
+                    gpu,
+                    target_weights.embd_format,
+                    &target_weights.token_embd,
+                    &dst,
+                    tok,
+                    h,
+                )?;
             }
         }
         dflash::draft_forward_planned(gpu, draft_weights, draft_cfg, &staged, b, l, draft_scratch)?;
