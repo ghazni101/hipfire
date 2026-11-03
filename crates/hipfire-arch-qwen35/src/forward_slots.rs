@@ -660,7 +660,7 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
 /// C16 qt59: IU8G32 residual projections (natural basis input) run
 /// `gemm_iu8g32_residual_wmma` on gfx11, as in the batched prefill.
 fn slots_iu8g32_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
-    dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151") && k % 32 == 0
+    dt == DType::IU8G32 && matches!(arch, "gfx1100" | "gfx1151") && k % 128 == 0
 }
 
 /// `HIPFIRE_SLOTS_IU8_W8A8=0` keeps the f16 qt59 prefill twin on the

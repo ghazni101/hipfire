@@ -2676,7 +2676,7 @@ fn gemm_dispatch(
         )),
         DType::IU4G256 | DType::IU8G256 | DType::IU8G32 => Err(hip_bridge::HipError::new(
             0,
-            "dflash GEMM cannot consume IU4/IU8 (qt=57/58/59): integer-operand layout, and no GPU kernel reads it yet",
+            "dflash GEMM cannot consume IU4/IU8 (qt=57/58/59) on this dispatcher: the qt59 head goes through gemm_iu8g32_residual_wmma and qt57/58 have no entry here",
         )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {

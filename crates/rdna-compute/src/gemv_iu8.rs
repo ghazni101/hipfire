@@ -28,7 +28,7 @@ use std::ffi::c_void;
 impl Gpu {
     /// `y = W x` for a planar IU8G32 weight. `x` is the natural-basis
     /// activation (qt 59 is not rotated). `k` must be a positive multiple of
-    /// 32.
+    /// 128 (one f16 scale per 128 at the row tail).
     pub fn gemv_iu8g32(
         &mut self,
         a: &GpuTensor,
@@ -76,10 +76,10 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        if m == 0 || k == 0 || k % 32 != 0 {
+        if m == 0 || k == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu8g32: M > 0 and K % 32 == 0",
+                "gemv_iu8g32: M > 0 and K % 128 == 0",
             ));
         }
         let func = iu8g32_pick(func, x, a, m, k);

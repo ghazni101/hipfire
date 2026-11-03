@@ -118,8 +118,8 @@ impl Gpu {
     }
 
     /// IU8G32 (qt 59) embedding lookup: dequantize one row on GPU, output
-    /// F32. The table is the planar Q8 grid: `[K signed codes][f16 scale] *
-    /// (K / 32)`, no FWHT. Same math and launch shape as `embedding_q8`.
+    /// F32. The table is the compact qt59 row `[K signed codes][K / 128 f16
+    /// scales]`, no FWHT. Same math and launch shape as `embedding_q8`.
     pub fn embedding_lookup_iu8g32(
         &mut self,
         table: &GpuTensor,
@@ -127,6 +127,12 @@ impl Gpu {
         token_id: u32,
         dim: usize,
     ) -> HipResult<()> {
+        if dim == 0 || dim % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "embedding_lookup_iu8g32: dim must be a positive multiple of 128",
+            ));
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "embedding_iu8g32",
@@ -307,6 +313,12 @@ impl Gpu {
         n: usize,
         dim: usize,
     ) -> HipResult<()> {
+        if dim == 0 || dim % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "embedding_lookup_iu8g32_batched: dim must be a positive multiple of 128",
+            ));
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "embedding_iu8g32_batched",

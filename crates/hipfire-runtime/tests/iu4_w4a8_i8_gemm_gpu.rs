@@ -235,15 +235,15 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
         let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
         let y_int = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
 
-        // qt59 weights: [K i8][K/32 f16 scales] per row.
-        let g32 = k / 32;
-        let stride = k + g32 * 2;
+        // qt59 weights: [K i8][K/128 f16 scales] per row (one scale per 128).
+        let g128 = k / 128;
+        let stride = k + g128 * 2;
         let mut q59 = vec![0u8; m * stride];
         for r in 0..m {
             for i in 0..k {
                 q59[r * stride + i] = (rng.next() & 0xff) as u8;
             }
-            for g in 0..g32 {
+            for g in 0..g128 {
                 let sc = f16::from_f32(0.01 + 0.002 * (g % 5) as f32);
                 q59[r * stride + k + g * 2..r * stride + k + g * 2 + 2]
                     .copy_from_slice(&sc.to_bits().to_le_bytes());

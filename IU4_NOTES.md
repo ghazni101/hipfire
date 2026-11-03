@@ -1125,3 +1125,48 @@ rounds per arm:
 - The paged prefill attention remains `attention_q8_0_flash_prefill_wmma_slots`
   (~3.6x the singleton FA2's quadratic coefficient, C21); that is the remaining
   long-context TTFT/PP gap and needs an FA2-style descriptor-addressed kernel.
+
+## C23 — qt59 (IU8G32) row-shape audit, 32 -> 128 everywhere (2026-11-03)
+
+The qt59 format is **one f16 scale per 128**, not per 32 and not per 256:
+`[K signed i8 codes][K/128 f16 scales]`, row `K + K/64` bytes (260 B at
+K=256, 8.125 bpw). `iu_quant` calls it `IU8G128` (`Q8_SCALE_GROUP = 128`);
+the `IU8G32` DType name is historical. `convert_iu8g128` migrates the legacy
+per-32 rows.
+
+Audited every writer/reader/guard:
+
+| site | expected | found |
+|---|---|---|
+| loader `validate_q8` / `q8_tensor_bytes` | M*(K + K/64) | correct |
+| `DType::IU8G32::row_bytes` | K + K/64 | correct (unit-tested: 130 @128, 260 @256, None @32) |
+| quantizer `emit_q8_or_iu8` / `convert_iu8g128` | per-128 | correct |
+| `gemv_iu8g32` v1/v2/a8 | scale `bi>>2` / `c>>3` | correct; **guard was K%32** -> fixed to K%128 |
+| `embedding_iu8g32{,_batched}` | `dim/128` scales | correct; **no dim guard** -> K%128 added; comments fixed |
+| `gemm_q8_0_residual_wmma` (IU8G32L), mb4, mb4m2 | stride K + K/64, scale `bi>>2` | correct; comments fixed |
+| `gemm_iu8g32_w8a8_min` + `block_i8_128` | per-128 | correct |
+| `gemm_iu8g32_residual_wmma` eligibility | K%128 | **was K%32** -> fixed; profiler bytes were `m*(K/32)*34` -> fixed |
+| multi-slot `slots_iu8g32_residual_ok` | K%128 | **was K%32** -> fixed |
+| `iu4_w4a8_i8_gemm_gpu` qt59 fixture | per-128 | **built per-32** -> fixed |
+| `iu8g32_v2_gemv_gpu` / `iu8g32_wmma_gemm_gpu` | per-128 | correct (the `k/32` there is the activation block / code loop) |
+| docs (`quant-formats/iu.md`, `QUANTIZE.md`) | per-128 + current kernels | corrected (prefill/DFlash capability rows were stale) |
+
+No loaded model was misread: the loader already refused a per-32-length qt59
+blob, so every reachable shape satisfied K%128. The fixed guards close the
+latent synthetic/future-shape hole (a K%96 call would have computed
+`row_stride = K` and read scales from code bytes).
+
+### Container settings applied from the findings
+
+- `multi_slot_prefill_chunk` 1024 -> **2048**. Measured with the W8A8 route,
+  one lane and four concurrent 8k prompts, two fresh-process rounds each:
+  PP +3.7-4.8% single / +4.1% aggregate, TTFT -3.6-4.6% single / -3.8%
+  aggregate. Cost: the auto KV pool drops 1380 -> **1200 pages**
+  (176,640 -> 153,600 tokens of shared KV, chunk 4096 was 855).
+- `--max-seq 262144` stays (it bounds requests, not reservations; admission
+  charges the request's real prompt+max_tokens). The physical ceilings are
+  documented in the config: 1200 pages = 153.6k tokens total, so one request
+  fits up to prompt+max_tokens <= 153.4k (e.g. 120k prompt + 32k output).
+- `prefix_cache` left off: enabling it produced no reuse across independent
+  requests and the chain harness reported `cached=0` in both arms; no
+  measured benefit on this route.

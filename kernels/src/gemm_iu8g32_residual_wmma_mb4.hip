@@ -17,7 +17,7 @@
 // Each Y cell is still written by exactly one lane, so the non-atomic
 // `+=` residual invariant of the base kernel is preserved.
 //
-// Row layout (qt59): [K int8 codes][K/32 f16 scales], 34 B per 32.
+// Row layout (qt59): [K int8 codes][K/128 f16 scales], K + K/64 bytes.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;

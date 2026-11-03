@@ -277,10 +277,10 @@ pub fn validate_q8(bytes: &[u8], m: usize, k: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Rebuild a Q8F16 tensor (`34 * M * K/32` bytes) into an IU8G32 row.
-///
-/// Codes and scale bits are copied. Nothing is re-rounded. The source is
-/// the natural-basis Q8 grid, not an FWHT MQ4 blob.
+/// Rebuild a Q8F16 tensor (`34 * M * K/32` bytes) into compact qt59 rows
+/// (`[K i8][K/128 f16]`). The per-32 source scales are folded to one per 128
+/// (`d = max|w| / 127`) and the codes re-rounded; the source is the
+/// natural-basis Q8 grid, not an FWHT MQ4 blob.
 pub fn repack_q8f16(src: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
     if q8_row_bytes(k).is_none() || m == 0 {
         return Err(q8_shape_error(m, k));
@@ -330,7 +330,8 @@ pub fn repack_q8f16(src: &[u8], m: usize, k: usize) -> Result<Vec<u8>, String> {
 }
 
 /// Dequantise an IU8G128 tensor. `w = f32(scale) * f32(i8(code))` for the
-/// scale of `k / 32`. Natural basis: these weights were not FWHT-rotated.
+/// scale of [`Q8_SCALE_GROUP`] (one per 128). Natural basis: these weights
+/// were not FWHT-rotated.
 pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> {
     validate_q8(bytes, m, k)?;
     let row_b = q8_row_bytes(k).expect("validate checked the shape");
@@ -352,9 +353,10 @@ pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> 
 /// `w = f32(scale) * f32(i8(code))` on the natural-basis `x`.
 ///
 /// This is the dot of the dequantized row with `x`; the device kernel
-/// (`gemv_iu8g32`) folds the same product per 32-block and reduces with a warp
-/// tree, so a GPU result can differ in the last bits while a wrong byte
-/// layout, sign, or scale position is orders of magnitude outside tolerance.
+/// (`gemv_iu8g32`) walks 32-element code blocks under one scale per 128 and
+/// reduces with a warp tree, so a GPU result can differ in the last bits while
+/// a wrong byte layout, sign, or scale position is orders of magnitude outside
+/// tolerance.
 pub fn gemv_q8(bytes: &[u8], x: &[f32], m: usize, k: usize) -> Result<Vec<f32>, String> {
     validate_q8(bytes, m, k)?;
     if x.len() != k {
