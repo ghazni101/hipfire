@@ -363,47 +363,23 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC, ["gemv_mq6g256"]);
     add!("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC, ["gemm_mq6g256"]);
     add!("gemv_q8_0", kernels::GEMV_Q8_0_SRC, ["gemv_q8_0"]);
-    // The `_a8` (int8 x int8, `v_dot4_i32_iu8`) variants and the IU4
-    // dot4/dot8 integer-activation family are compiled only under
-    // `__GFX11__ || __GFX12__`; gfx906/gfx942 build these modules without them.
+    add!(
+        "gemv_iu8g32",
+        kernels::GEMV_IU8G32_SRC,
+        [
+            "gemv_iu8g32",
+            "gemv_iu8g32_residual",
+            "gemv_iu8g32_v2_r1",
+            "gemv_iu8g32_v2_residual_r1",
+            "gemv_iu8g32_v2_r2",
+            "gemv_iu8g32_v2_residual_r2",
+            "gemv_iu8g32_v2_r4",
+            "gemv_iu8g32_v2_residual_r4"
+        ]
+    );
+    // The IU4 dot4/dot8 integer-activation family is compiled only under
+    // `__GFX11__ || __GFX12__`; gfx906/gfx942 build the module without it.
     let iu_int_gemv = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
-    if iu_int_gemv {
-        add!(
-            "gemv_iu8g32",
-            kernels::GEMV_IU8G32_SRC,
-            [
-                "gemv_iu8g32",
-                "gemv_iu8g32_residual",
-                "gemv_iu8g32_v2_r1",
-                "gemv_iu8g32_v2_residual_r1",
-                "gemv_iu8g32_v2_r2",
-                "gemv_iu8g32_v2_residual_r2",
-                "gemv_iu8g32_v2_r4",
-                "gemv_iu8g32_v2_residual_r4",
-                "gemv_iu8g32_a8_r1",
-                "gemv_iu8g32_a8_residual_r1",
-                "gemv_iu8g32_a8_r2",
-                "gemv_iu8g32_a8_residual_r2",
-                "gemv_iu8g32_a8_r4",
-                "gemv_iu8g32_a8_residual_r4"
-            ]
-        );
-    } else {
-        add!(
-            "gemv_iu8g32",
-            kernels::GEMV_IU8G32_SRC,
-            [
-                "gemv_iu8g32",
-                "gemv_iu8g32_residual",
-                "gemv_iu8g32_v2_r1",
-                "gemv_iu8g32_v2_residual_r1",
-                "gemv_iu8g32_v2_r2",
-                "gemv_iu8g32_v2_residual_r2",
-                "gemv_iu8g32_v2_r4",
-                "gemv_iu8g32_v2_residual_r4"
-            ]
-        );
-    }
     add!(
         "gemv_iu8g256",
         kernels::GEMV_IU8G256_SRC,

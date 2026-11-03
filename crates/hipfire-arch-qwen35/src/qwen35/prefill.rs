@@ -6903,8 +6903,6 @@ fn forward_prefill_chunk_pair(
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
     for layer_idx in 0..config.n_layers {
-        gpu.iu4_layer = (layer_idx, config.n_layers);
-        gpu.iu4_role = u8::MAX;
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 for (half_pbs, half_start, half_tape) in [
@@ -7797,8 +7795,6 @@ pub(crate) fn forward_batch_chunk_impl(
     let tap = tap_fn.get();
 
     for layer_idx in layer_start..layer_end {
-        gpu.iu4_layer = (layer_idx, config.n_layers);
-        gpu.iu4_role = u8::MAX;
         // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`): names this
         // layer and the chunk's first position for the sealed-MoE hooks; a no-op when both are unset.
         hipfire_dispatch::pipeline::moe_capture::set_site(layer_idx, start_pos);

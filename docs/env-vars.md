@@ -977,7 +977,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1900
+**Count:** 1895
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1879,14 +1879,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU4G256_RESIDUAL_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4G256_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4G256_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_IU4_A8_LAYERS` | crates/rdna-compute/src/gemm_iu4.rs | developer |
-| `HIPFIRE_IU4_A8_ROLES` | crates/rdna-compute/src/gemm_iu4.rs | developer |
 | `HIPFIRE_IU4_BAFOLD` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_IU4_C2_ONEPASS` | crates/rdna-compute/src/kernels.rs, scripts/test_gfx1100_xts_scope.py | developer |
 | `HIPFIRE_IU4_DECODE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/iu_quant.rs | developer |
 | `HIPFIRE_IU4_FUSED_X` | crates/rdna-compute/src/gemm_iu4.rs | developer |
-| `HIPFIRE_IU4_I8_TILE` | crates/hipfire-runtime/tests/iu4_i8_xplanar_gpu.rs, crates/hipfire-runtime/tests/iu4_w4a8_i8_gemm_gpu.rs | developer |
-| `HIPFIRE_IU4_I8_XPLANAR` | crates/rdna-compute/src/gemm_iu4.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU4_I8_TILE` | crates/hipfire-runtime/tests/iu4_w4a8_i8_gemm_gpu.rs, crates/rdna-compute/src/gemm_iu4.rs | developer |
 | `HIPFIRE_IU4_ONEPASS` | crates/rdna-compute/src/kernels.rs, scripts/test_gfx1100_xts_scope.py | developer |
 | `HIPFIRE_IU4_PLANAR` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4_PREFILL` | crates/hipfire-arch-qwen35/examples/prefill_ragged_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/load.rs | stable |
@@ -1895,7 +1892,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU4_RUNTIME_CAND` | crates/rdna-compute/src/gemm_mq6_i8.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_IU4_SIDECAR` | crates/peacemaker-isa/src/kernels/iu4_v2b_a4.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_IU4_SLAB` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/scratch.rs | developer |
-| `HIPFIRE_IU4_SMALLM` | crates/hipfire-runtime/tests/iu4_w4a4_gemm_gpu.rs, crates/rdna-compute/src/gemm_iu4.rs | developer |
 | `HIPFIRE_IU4_SYMFOLD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/zba_fold_oracle.rs | experimental |
 | `HIPFIRE_IU4_V2B` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_IU4_V2C` | crates/rdna-compute/src/gemm.rs | developer |
@@ -1905,7 +1901,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU8G32_M2` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8G32_MB4` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8G32_W8A8` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
-| `HIPFIRE_IU8_GEMV` | crates/hipfire-runtime/tests/iu8g32_v2_gemv_gpu.rs, crates/rdna-compute/src/gemv_iu8.rs | developer |
+| `HIPFIRE_IU8_GEMV` | crates/rdna-compute/src/gemv_iu8.rs | developer |
 | `HIPFIRE_JINJA_CHAT` | benchmarks/prompts/mtpfloor/generate.py, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | stable |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |
@@ -1988,7 +1984,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MMQ` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_MMQ_DUMP` | crates/rdna-compute/examples/test_gfx906_mmq_realdata.rs | harness |
-| `HIPFIRE_MMQ_IU4L` | crates/rdna-compute/src/gemm_iu4.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MMQ_LUT` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MMQ_LUT_PAIRTAB` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MMQ_MIN_BATCH` | benchmarks/scripts/bench_dflash_27b_gfx906.sh, crates/hipfire-config/src/lib.rs | experimental |

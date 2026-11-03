@@ -196,11 +196,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     // A slab: thread stages token T = tid >> 2, chunk c = tid & 3.
     const unsigned st_T = (unsigned)(tid >> 2);
     const unsigned st_c = (unsigned)(tid & 3);
-#ifdef I8_XPLANAR
-    const unsigned st_aoff = (unsigned)(bs + (int)st_T) * 128u + st_c * 16u;
-#else
     const unsigned st_aoff = (unsigned)(bs + (int)st_T) * (unsigned)sizeof(block_i8_128) + 8u + st_c * 16u;
-#endif
     const unsigned st_alds = i8_chunk(st_T, st_c);
     // W slab: row R = tid >> 2, K16 step c = tid & 3 (8 packed bytes). A
     // wave stages rows 8w..8w+7, one 16-row group: the gate/up selector is
@@ -222,12 +218,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     const int hdr_src = src_row(hdr_i);
     const char* hdr_sp = src_base(hdr_i)
         + (long long)(hdr_src < M ? hdr_src : (M - 1)) * groups_per_row * 136;
-#ifdef I8_XPLANAR
-    const unsigned a_bytes = (unsigned)N * 128u;
-    const unsigned h_bytes = (unsigned)N * 8u;
-#else
     const unsigned a_bytes = (unsigned)N * (unsigned)sizeof(block_i8_128);
-#endif
 
     // Consumer lane bases. The swizzle terms (A: (e >> 1) & 3, W: (e >> 2) &
     // 3) depend on l16 only, so each operand is one lane base XOR the step's
@@ -252,13 +243,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
 
     // Global fetch of K64 slab (kb, s) into registers.
     auto fetch_slab = [&](int kb, int s) {
-#ifdef I8_XPLANAR
-        const auto a_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-            (void*)((const char*)Xq + (long long)kb * N * 136), 0, a_bytes, 0x31004000u);
-#else
         const auto a_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)(Xq + (long long)kb * N), 0, a_bytes, 0x31004000u);
-#endif
         a_pf = __builtin_amdgcn_raw_buffer_load_b128(a_rsrc, st_aoff, (unsigned)(s * 64), 0);
         w_pf = __builtin_amdgcn_raw_buffer_load_b64(
             w_rsrc, st_woff, (unsigned)((kb >> 1) * I8_W_GROUP_CODE_STRIDE + (kb & 1) * 64 + s * 32), 0);
@@ -273,16 +259,10 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     // (waterfall loops), and loads consumed only inside one get sunk next to
     // their use with a full vmcnt(0) wait in front of the barrier.
     auto fetch_hdr = [&](int kb) {
-#ifdef I8_XPLANAR
-        const auto d_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-            (void*)((const char*)Xq + (long long)kb * N * 136 + (long long)N * 128), 0, h_bytes, 0x31004000u);
-        hd_pf = __builtin_amdgcn_raw_buffer_load_b64(d_rsrc, (unsigned)(bs + hdr_i) * 8u, 0u, 0);
-#else
         const auto d_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)(Xq + (long long)kb * N), 0, a_bytes, 0x31004000u);
         hd_pf = __builtin_amdgcn_raw_buffer_load_b64(
             d_rsrc, (unsigned)(bs + hdr_i) * (unsigned)sizeof(block_i8_128), 0u, 0);
-#endif
         hs_pf = *(const unsigned*)(hdr_sp + I8_W_HDR(groups_per_row, kb));
     };
     auto publish_hdr = [&](int par) {

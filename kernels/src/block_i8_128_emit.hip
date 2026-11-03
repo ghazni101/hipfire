@@ -85,19 +85,11 @@ __device__ __forceinline__ void emit_i8_sidecar_from_producer8(
     const unsigned hi = ((unsigned)q[1] & 255u) | (((unsigned)q[3] & 255u) << 8)
                       | (((unsigned)q[5] & 255u) << 16) | ((unsigned)q[7] << 24);
     const int j = lane & 15;
-#ifdef I8_XPLANAR
-    const int kb = 2 * group + (lane >> 4);
-    reinterpret_cast<uint2*>(I8X_QS(Y, kb, token, N))[j] = make_uint2(lo, hi);
-    if (j == 0) {
-        *reinterpret_cast<uint2*>(I8X_HDR(Y, kb, token, N)) = make_uint2(__float_as_uint(d), (unsigned)s);
-    }
-#else
     block_i8_128* out = Y + (long long)(2 * group + (lane >> 4)) * N + token;
     reinterpret_cast<uint2*>(out->qs)[j] = make_uint2(lo, hi);
     if (j == 0) {
         *reinterpret_cast<uint2*>(out) = make_uint2(__float_as_uint(d), (unsigned)s);
     }
-#endif
 }
 
 #define block_i4_128 block_i8_128

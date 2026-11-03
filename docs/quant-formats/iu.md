@@ -140,9 +140,10 @@ kernel symbols (`gemv_iu8g32*`, `gemm_iu8g32*`, `embedding_iu8g32*`), and the
 `HIPFIRE_IU8G32_*` dev knobs is historical — the row carries one f16 scale per
 128.
 
-Decode GEMV is `gemv_iu8g32` v2 with f32 activations by default, on every
-arch. `HIPFIRE_IU8_GEMV=dot4` instead selects the int8×int8 `_a8` variants,
-which are gfx11/gfx12 only; `v1` is the original kernel.
+Decode GEMV is `gemv_iu8g32` v2 with f32 activations, on every arch;
+`HIPFIRE_IU8_GEMV=v1` selects the original kernel (A/B). The int8×int8 `_a8`
+decode variants were removed: on 4B they were speed-neutral (−0.4%) and
+cost 7.3e-4 KL (IU4_NOTES.md C8).
 
 Prefill is two kernels behind one selector, `Gpu::iu8g32_gemm_route`, used by
 both the singleton batched prefill and the multi-slot prefill. W8A8
@@ -166,7 +167,7 @@ noise embedding runs `embedding_lookup_iu8g32`).
 
 | reader | qt 57 IU4 | qt 58 IU8 | qt 59 IU8G32 |
 |---|---|---|---|
-| decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4`/`dot8` opt-in, gfx11/gfx12) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` v2 (f32 activations, every arch; `HIPFIRE_IU8_GEMV=dot4` selects the int8×int8 `_a8` variants, gfx11/gfx12) |
+| decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4`/`dot8` opt-in, gfx11/gfx12) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` v2 (f32 activations, every arch) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g256_residual` | `gemv_iu8g32_residual` |
 | embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
 | prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`, gfx1100/gfx1151 only) | — (per-token decode loop) | one selector, `Gpu::iu8g32_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g32_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g32_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |

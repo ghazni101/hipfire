@@ -1858,12 +1858,6 @@ pub struct Gpu {
     /// C11b: sidecar a fused IU4 producer wrote for the next
     /// `gemm_iu4g256_multi` over `(x_rot ptr, n, k)`; taken by that call.
     pub iu4_pending_x: Option<crate::gemm_iu4::Iu4PendingX>,
-    /// C14: projection role of the IU4 GEMMs being issued (`Gpu::IU4_ROLE_*`, `u8::MAX` = none).
-    pub iu4_role: u8,
-    /// C15: the next gfx11 int8 producer emits the `I8_XPLANAR` layout.
-    pub i8_xplanar_emit: bool,
-    /// C14: (layer index, n_layers) of the layer being issued.
-    pub iu4_layer: (usize, usize),
     /// Set only around a batched DFlash draft forward (and its head GEMM):
     /// lets `gemm_mq4g256v2_overwrite_gfx12_dflash` admit exactly 64 rows
     /// (the batch-tile `_vt4` overwrite kernel, per-row identical to the
@@ -3232,9 +3226,6 @@ impl Gpu {
             fp8_verify_scope: false,
             iu4_verify_scope: false,
             iu4_pending_x: None,
-            iu4_role: u8::MAX,
-            i8_xplanar_emit: false,
-            iu4_layer: (0, 0),
             draft_rows64_scope: false,
             iu4_verify_load: false,
             qwen4_trunk_iu4: false,
@@ -5770,19 +5761,7 @@ impl Gpu {
         n: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        self.ensure_int8_mmq_x_layout(x, n, k, false)
-    }
-
-    /// [`Self::ensure_int8_mmq_x`] with an explicit layout (`xplanar`: C15
-    /// `I8_XPLANAR`, IU4 W4A8 only).
-    pub fn ensure_int8_mmq_x_layout(
-        &mut self,
-        x: &GpuTensor,
-        n: usize,
-        k: usize,
-        xplanar: bool,
-    ) -> HipResult<*mut c_void> {
-        self.ensure_int8_mmq_x_impl(x, n, k, xplanar, false)
+        self.ensure_int8_mmq_x_impl(x, n, k, false)
     }
 
     /// Linear-order K128 int8 activations for the W8A8 per-128 GEMM.
@@ -5792,7 +5771,7 @@ impl Gpu {
         n: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        self.ensure_int8_mmq_x_impl(x, n, k, false, true)
+        self.ensure_int8_mmq_x_impl(x, n, k, true)
     }
 
     fn ensure_int8_mmq_x_impl(
@@ -5800,7 +5779,6 @@ impl Gpu {
         x: &GpuTensor,
         n: usize,
         k: usize,
-        xplanar: bool,
         linear: bool,
     ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
@@ -5825,7 +5803,6 @@ impl Gpu {
             x,
             n,
             k,
-            xplanar,
             linear,
         )
     }

@@ -5378,22 +5378,6 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
 // codes (WMMA A_sign=true at mma_i8). Default decode is HIPFIRE_MMQ_LUT_PAIRTAB
 // (256×u16 LDS pair table, +512 B → shared 57856); set PAIRTAB=0 for the
 // v_perm A/B baseline (shared 57344, same as uniform).
-// IU4G256 (qt57) twin of the MQ4V2 Q8_1 MMQ family: `-DHIPFIRE_MMQ_IU4L=1`
-// swaps only the tile loader's address math for the IU4 row layout
-// ([K/2 codes][8 B header x G]); the arithmetic is the MQ4V2 kernel's, so a
-// qt57 tensor that is the relayout of a qt44 tensor gives bit-identical Y.
-// The six entry symbols are renamed (`gemm_iu4g256_mmq*`) because the
-// function cache is keyed by symbol name.
-pub const GEMM_IU4G256_MMQ_SRC: &str = concat!(
-    "#define HIPFIRE_MMQ_IU4L 1\n",
-    "#define gemm_mq4g256v2_residual_mmq gemm_iu4g256_mmq\n",
-    "#define gemm_mq4g256v2_residual_mmq_x128 gemm_iu4g256_mmq_x128\n",
-    "#define gemm_mq4g256v2_residual_mmq_full_add gemm_iu4g256_mmq_full_add\n",
-    "#define gemm_mq4g256v2_residual_mmq_full_set gemm_iu4g256_mmq_full_set\n",
-    "#define gemm_mq4g256v2_residual_mmq_full_add_x128 gemm_iu4g256_mmq_full_add_x128\n",
-    "#define gemm_mq4g256v2_residual_mmq_full_set_x128 gemm_iu4g256_mmq_full_set_x128\n",
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
-);
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MMQ_LUT 1\n",
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
@@ -5852,28 +5836,6 @@ pub const GEMM_IU4G256_W4A8_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
-/// C15 `I8_XPLANAR` twin of [`GEMM_IU4G256_W4A8_GFX11_SRC`]: X is the 128 B-aligned
-/// qs plane + (d, s) plane per K128 block (`HIPFIRE_IU4_I8_XPLANAR`); also
-/// carries the matching standalone quantizer `quantize_int8_mmq_ds128_xp`.
-pub const GEMM_IU4G256_W4A8X_GFX11_SRC: &str = concat!(
-    "#define I8_XPLANAR 1\n#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
-    "#define quantize_int8_mmq_ds128 quantize_int8_mmq_ds128_xp\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_add gemm_iu4g256_w4a8x_full_add\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_set gemm_iu4g256_w4a8x_full_set\n",
-    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8 gemm_iu4g256_w4a8x_gate_up_silu\n",
-    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
-);
-/// 256-tile build of [`GEMM_IU4G256_W4A8X_GFX11_SRC`].
-pub const GEMM_IU4G256_W4A8X_GFX11_T256_SRC: &str = concat!(
-    "#define I8_TILE 256\n#define I8_XPLANAR 1\n#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
-    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_add_t256 gemm_iu4g256_w4a8x_full_add_t256\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_set_t256 gemm_iu4g256_w4a8x_full_set_t256\n",
-    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8_t256 gemm_iu4g256_w4a8x_gate_up_silu_t256\n",
-    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
-);
 /// 256-tile build of [`GEMM_IU4G256_W4A8_GFX11_SRC`] (entries suffixed `_t256`).
 pub const GEMM_IU4G256_W4A8_GFX11_T256_SRC: &str = concat!(
     "#define I8_TILE 256\n#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
@@ -5941,15 +5903,6 @@ pub const MQ_ROTATE_X_I8_GFX12_SRC: &str = concat!(
 /// gfx1100/gfx1151 twin of [`MQ_ROTATE_X_I8_GFX12_SRC`] (entry `mq_rotate_x_i8_gfx11`); the gfx11
 /// IU4 rotate producer defines nothing beyond the entry name for the plain rotate, so only the
 /// symbol differs.
-/// C15 `I8_XPLANAR` twin of [`MQ_ROTATE_X_I8_GFX11_SRC`].
-pub const MQ_ROTATE_X_I8X_GFX11_SRC: &str = concat!(
-    "#define I8_XPLANAR 1\n",
-    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
-    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
-    include_str!("../../../kernels/src/block_i8_128_emit.hip"),
-    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i8x_gfx11\n",
-    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
-);
 pub const MQ_ROTATE_X_I8_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),

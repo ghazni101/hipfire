@@ -3376,21 +3376,16 @@ impl ScratchState {
         x: &GpuTensor,
         n: usize,
         k: usize,
-        xplanar: bool,
         linear: bool,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
         // The quantizer ships in each arch's A8 GEMM module (one compile).
         let qk = if linear {
             "quantize_int8_mmq_linear128"
-        } else if xplanar {
-            "quantize_int8_mmq_ds128_xp"
         } else {
             "quantize_int8_mmq_ds128"
         };
-        let (module, source) = if xplanar {
-            ("gemm_iu4g256_w4a8x", kernels::GEMM_IU4G256_W4A8X_GFX11_SRC)
-        } else if compiler.arch() == "gfx1201" {
+        let (module, source) = if compiler.arch() == "gfx1201" {
             (
                 "gemm_mq4g256v2_residual_mmq_i8_gfx12",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX12_SRC,

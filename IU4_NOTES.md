@@ -922,8 +922,8 @@ is register- rather than LDS-bound; both are kernel redesigns, not knobs.
 
 ## C20 — design 3 routed: W8A8 int8-per-128 on the qt59 roles (2026-11-03)
 
-The qt59 weight rows are now requantized **in place** at load when
-`HIPFIRE_IU8_W8A8=1`:
+The qt59 weight rows were requantized **in place** at load behind a
+per-container request knob (since removed, see C9 compact qt59 below):
 
 - one scale per 128: `sc = max|w| / 127`, codes `round(w/sc)`, written
   linearly; the four per-32 scale slots of each K128 block receive the same
@@ -960,15 +960,16 @@ Quality (`iu4_kld`, 511 teacher-forced tokens, 27B, same build):
 The weight requant is negligible on the decode path. The prefill delta is
 dominated by the W8A8 activation quantizer; it is slightly above the f16
 prefill KL (0.029 vs the body's existing 0.017 vs decode) while top-1 and PPL
-improve. Enabled per-container; the code gate is `HIPFIRE_IU8_W8A8=1`.
+improve. Enabled per-container behind that knob; C9 compact qt59 below made W8A8
+the unconditional qt59 prefill path and deleted the knob.
 
 ## C9 compact qt59 (2026-11-03): one scale per 128, no in-place requant
 
 - Change: qt59 row is `[K signed i8][K/128 f16]` (260 B at K=256) instead of
   Q8F16's `[K codes][K/32 scales]` (272 B). `d = amax/127` is computed per 128
   codes at quantization time; the row size is the kernel's stride.
-- Removed the load-time shrink (`requant_iu8g32_per128`) and the
-  `HIPFIRE_IU8_W8A8` request. Every reader (`gemv_iu8g32` v1/v2/a8,
+- Removed the load-time shrink (`requant_iu8g32_per128`) and the C20
+  request knob. Every reader (`gemv_iu8g32` v1/v2/a8,
   `embedding_iu8g32{,_batched}`, `gemm_iu8g32_residual_wmma` + mb4/mb4m2,
   `gemm_iu8g32_w8a8_min`) reads the compact row; W8A8 is the unconditional
   prefill path. Old files are refused (qt59 blob length), not misread.
@@ -1074,7 +1075,7 @@ place they were being left idle.
 | prefill, qt59 wo (now) | `gemm_iu8g32_w8a8_min` (128x128 LDS) | `v_wmma_i32_16x16x16_iu8` | used |
 | decode, qt57 | `gemv_iu4g256_xbatch` (new) / `gemv_iu4g256` at n=1 | f32 FMAC | by design; see below |
 | decode, qt59 lm_head/wo | `gemv_iu8g32_v2_r*` | f32 FMAC | by design |
-| decode, integer opt-ins | `HIPFIRE_IU4_DECODE=dot4/dot8`, `HIPFIRE_IU8_GEMV=dot4` | `v_dot4_i32_iu8` / `v_dot8_i32_iu4` | off, measured slower/bad |
+| decode, integer opt-ins | `HIPFIRE_IU4_DECODE=dot4/dot8` (the qt59 `HIPFIRE_IU8_GEMV=dot4` arm was removed in C24) | `v_dot4_i32_iu8` / `v_dot8_i32_iu4` | off, measured slower/bad |
 
 Decode integer dots are not a lever here: the step is weight-bandwidth bound
 (one pass per token, or one pass per 4 tokens with the xbatch). C7/C8 measured
@@ -1171,3 +1172,24 @@ latent synthetic/future-shape hole (a K%96 call would have computed
 - `prefix_cache` left off: enabling it produced no reuse across independent
   requests and the chain harness reported `cached=0` in both arms; no
   measured benefit on this route.
+
+## C24 — losing IU experiment knobs removed (2026-11-03)
+
+Every arm below lost its A/B (slower, or worse KL at no speed gain), was
+never reached by the default path, and was removed with the kernels only it
+reached. The measurements stay above; this is the index.
+
+| knob / arm | experiment | what it measured | removed |
+|---|---|---|---|
+| `HIPFIRE_IU4_PREFILL_ACT=a8q` | C2 / C11a | IU4 Q8_1 MMQ (`gemm_iu4g256_mmq*`, the `HIPFIRE_MMQ_IU4L` build of the MQ4V2 MMQ): 27B pp512 1053 vs a4 1460 vs MQ4P 1578 tok/s (−33% vs MQ4P); 4B KL 1.64e-3 vs a8 3.9e-4 | the `A8Q` arm, `gemm_iu4g256_mmq_prequant`, `GEMM_IU4G256_MMQ_SRC`, the `HIPFIRE_MMQ_IU4L` branches of `gemm_mq4g256v2_residual_mmq.hip`, and the a8q half of `iu4_mmq_gemm_gpu` (renamed `iu4_pertoken_gemm_gpu`; it still gates the per-token fallback) |
+| `HIPFIRE_IU4_SMALLM=mmq` | C10 | small-M (M < 128) on the MMQ instead of the f16 MW-LDS WMMA: −3.1/−3.2% pp512/pp2048 and KL 0.073 vs 0.065 (a4) | the knob; M < 128 always takes the MW-LDS WMMA |
+| `HIPFIRE_IU4_A8_ROLES` / `HIPFIRE_IU4_A8_LAYERS` | C14 | per-role / per-layer a8 over a4: the KL is not concentrated in a few roles; recovering most of it (gu+dqkv+dn) costs ~all of a8's speed (−16% 4B, −23% 27B pp2048) | the selector, `Gpu::iu4_role` / `iu4_layer`, `Gpu::IU4_ROLE_*` and their eight call-site writes; `a8` itself stays as the global opt-in |
+| `HIPFIRE_IU4_I8_XPLANAR=1` | C15 | 128 B-aligned int8 X planes: bit-identical, +0.35% (4B) / +0.48% (27B) under rocprof, only on the non-default a8 path | `Gpu::i8_xplanar_emit`, `ensure_int8_mmq_x_layout`, `gemm_iu4g256_w4a8_prequant_layout`, the `gemm_iu4g256_w4a8x*` / `quantize_int8_mmq_ds128_xp` / `*_i8x_gfx11` producer twins, the `I8_XPLANAR` branches of `block_i8_128_{quant,emit}.hip` and `gemm_mq4g256v2_residual_mmq_i8.gfx11.hip`, and `iu4_i8_xplanar_gpu` |
+| `HIPFIRE_IU8_GEMV=dot4` | C8 | qt59 W8A8 decode GEMV `gemv_iu8g32_a8_r{1,2,4}`: −0.4% (noise) on 4B decode, KL 7.34e-4 vs f32 | the `_a8` kernels in `gemv_iu8g32.hip`, their registry symbols (the module is now arch-agnostic), and `iu8g32_a8_gemv_matches_contract`; `=v1` stays as the A/B control |
+| `HIPFIRE_IU8_W8A8=1` | C20 | in-place per-128 requant request | already removed by C9 compact qt59; the stale "code gate" text above now says so |
+
+Editing the shared MQ4 int8 / Q8_1 HIP sources only deletes `#ifdef` branches
+no live build defines, so live kernels compile to the same code, but their
+source hash changes: expect one JIT recompile per module, and the next
+kernel pack rebuild picks them up.
+
