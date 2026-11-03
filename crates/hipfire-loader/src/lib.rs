@@ -3302,7 +3302,7 @@ fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
     match lm_qt {
         Some(3 | 6 | 13) => true,
         Some(17 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
-        // qt 59 is the IU8G32 relayout of Q8_0. Its batched verify head is
+        // qt 59 is the IU8G128 relayout of Q8_0. Its batched verify head is
         // the gfx11 f16 WMMA residual GEMM, so admit it only where that
         // kernel runs (exact gfx1100/gfx1151).
         Some(59) => matches!(gpu_arch, "gfx1100" | "gfx1151"),

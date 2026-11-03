@@ -105,7 +105,7 @@ pub fn supports_iu4g256_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")
 }
 
-/// qt59 (IU8G32) batched GEMM admission: both the f16-WMMA residual twin
+/// qt59 (IU8G128) batched GEMM admission: both the f16-WMMA residual twin
 /// (`gemm_iu8g32_residual_wmma*`) and the IU8-WMMA W8A8 GEMM
 /// (`gemm_iu8g32_w8a8_min`). Both use gfx11 `_w32` builtins and are validated
 /// on exact gfx1100 and gfx1151 only. qt59 decode GEMV and the embedding

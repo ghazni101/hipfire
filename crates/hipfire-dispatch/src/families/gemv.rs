@@ -694,7 +694,7 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         // one. All three are fused `y += W·x`.
         IU4G256 => Plain(Gpu::gemv_iu4g256_residual),
         IU8G256 => Plain(Gpu::gemv_iu8g256_residual),
-        IU8G32 => Plain(Gpu::gemv_iu8g32_residual),
+        IU8G128 => Plain(Gpu::gemv_iu8g32_residual),
         MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
         MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),
         MQ6G256V2 => Plain(Gpu::gemv_mq6g256v2_residual),
@@ -836,7 +836,7 @@ mod residual_coverage_tests {
             E8PI4G128R128,
             IU4G256,
             IU8G256,
-            IU8G32,
+            IU8G128,
             GgmlQ4K,
             GgmlQ5K,
             GgmlQ6K,

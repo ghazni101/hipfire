@@ -126,7 +126,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | IU4G256 | IU8G256 => RotationPlan::FwhtG256,
         // qt=59 is the Q8 grid in the natural basis. Mapping it to FwhtG256
         // would rotate activations against weights that were not rotated.
-        IU8G32 => RotationPlan::None,
+        IU8G128 => RotationPlan::None,
         // MQ-I4 (qt=131..=136) are typed-qwen4-only; their activation basis
         // is fixed by the profile's rotation width (R256 / R128).
         MQ3I4G128R256 | MQ2I4G128R256 | E8PI4G128R256 => RotationPlan::FwhtG256,
@@ -283,7 +283,7 @@ pub enum KernelKey {
     GemvBf16,
     GemvQ8_0,
     /// qt 59 decode GEMV: the Q8 grid with the scales at the row tail. Not
-    /// rotated (`IU8G32`'s rotation plan is `None`).
+    /// rotated (`IU8G128`'s rotation plan is `None`).
     GemvIu8G32,
     GemvQ4K,
     GemvQ6K,
@@ -893,7 +893,7 @@ impl KernelKey {
             (IU8G256, _) => Err(reject_iu(dtype, "gemv")),
             // qt 59 is the Q8 grid in the natural basis; its planar-tail GEMV
             // (`gemv_iu8g32`) is the same math as `gemv_q8_0`.
-            (IU8G32, Plain) => Ok(Self::GemvIu8G32),
+            (IU8G128, Plain) => Ok(Self::GemvIu8G32),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "unknown",
@@ -960,7 +960,7 @@ impl KernelKey {
             // plain kernel from a "prerotated" caller: the family admits it
             // on the Plain path only (the two are the same kernel, and Plain
             // is the one the caller's variant names).
-            IU8G32 => Err(reject_iu(dtype, "gemv")),
+            IU8G128 => Err(reject_iu(dtype, "gemv")),
             _ => {
                 if dtype_rotation_plan(dtype) == RotationPlan::None {
                     Self::for_gemv(dtype, GemvVariant::Plain, false)
@@ -1009,7 +1009,7 @@ impl KernelKey {
             // rotated activation, qt 59 the natural-basis one.
             IU4G256 => Ok(Self::GemvIu4G256Residual),
             IU8G256 => Ok(Self::GemvIu8G256Residual),
-            IU8G32 => Ok(Self::GemvIu8G32Residual),
+            IU8G128 => Ok(Self::GemvIu8G32Residual),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
                 variant: "residual",
@@ -1045,7 +1045,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G256 | IU8G32 => Err(reject_iu(dtype, "gemv")),
+            IU4G256 | IU8G256 | IU8G128 => Err(reject_iu(dtype, "gemv")),
             // qt=52 shares the qt=44 key: the SwiGLU-residual variant is a
             // residual GEMV over caller-supplied silu(gate)*up (already
             // FWHT-rotated), and the family arm branches on the WEIGHT dtype to
@@ -1125,7 +1125,7 @@ impl KernelKey {
             // qt 57 decode GEMV issues `v_dot8_i32_iu4`, which is on the same
             // RDNA3/RDNA4 parts as integer WMMA. qt 58/59 still have no kernel.
             IU4G256 => ArchPredicate::HasWmma,
-            IU8G256 | IU8G32 => ArchPredicate::Always,
+            IU8G256 | IU8G128 => ArchPredicate::Always,
             // ggml block formats (GGUF-native, no kernel yet): no key resolves
             // them, so resolution fails with MissingImpl; explicit so a future
             // ggml route has to decide its arch gate.
@@ -1259,7 +1259,7 @@ mod tests {
         );
         assert!(dtype_needs_rotation(DType::IU4G256));
         assert!(dtype_needs_rotation(DType::IU8G256));
-        assert!(!dtype_needs_rotation(DType::IU8G32));
+        assert!(!dtype_needs_rotation(DType::IU8G128));
         assert_eq!(
             KernelKey::for_gemv_prerotated(DType::IU8G256).unwrap(),
             KernelKey::GemvIu8G256Prerotated
@@ -1273,11 +1273,11 @@ mod tests {
             KernelKey::GemvIu8G256Residual
         );
         assert_eq!(
-            KernelKey::for_gemv(DType::IU8G32, GemvVariant::Plain, false).unwrap(),
+            KernelKey::for_gemv(DType::IU8G128, GemvVariant::Plain, false).unwrap(),
             KernelKey::GemvIu8G32
         );
         assert_eq!(
-            KernelKey::for_gemv_residual(DType::IU8G32).unwrap(),
+            KernelKey::for_gemv_residual(DType::IU8G128).unwrap(),
             KernelKey::GemvIu8G32Residual
         );
         assert!(KernelKey::for_gemv(DType::IU8G256, GemvVariant::Plain, false).is_err());

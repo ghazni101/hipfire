@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Decode GEMV for [`crate::DType::IU8G32`] (qt 59), the lifted-role tier of
+//! Decode GEMV for [`crate::DType::IU8G128`] (qt 59), the lifted-role tier of
 //! an `iu4` / `iu8` file.
 //!
 //! The grid is the Q8 grid — signed int8 codes, zero point 0, no FWHT — with
@@ -27,7 +27,7 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 impl Gpu {
-    /// `y = W x` for a planar IU8G32 weight. `x` is the natural-basis
+    /// `y = W x` for a planar IU8G128 weight. `x` is the natural-basis
     /// activation (qt 59 is not rotated). `k` must be a positive multiple of
     /// 128 (one f16 scale per 128 at the row tail).
     pub fn gemv_iu8g32(
@@ -41,7 +41,7 @@ impl Gpu {
         self.gemv_iu8g32_launch("gemv_iu8g32", a, x, y, m, k)
     }
 
-    /// `y += W x` for a planar IU8G32 weight (fused residual arm; `y` is both
+    /// `y += W x` for a planar IU8G128 weight (fused residual arm; `y` is both
     /// accumulated into and stored).
     pub fn gemv_iu8g32_residual(
         &mut self,
@@ -54,7 +54,7 @@ impl Gpu {
         self.gemv_iu8g32_launch("gemv_iu8g32_residual", a, x, y, m, k)
     }
 
-    /// Test/A-B entry: launch one named IU8G32 GEMV kernel (v1 or a v2
+    /// Test/A-B entry: launch one named IU8G128 GEMV kernel (v1 or a v2
     /// `_rN` variant) with no automatic selection.
     pub fn gemv_iu8g32_named(
         &mut self,

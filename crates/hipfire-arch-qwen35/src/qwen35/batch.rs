@@ -937,7 +937,7 @@ impl Qwen35DecodeBatchState {
         // silently half-advertised at the first prefill.
         if !matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G128
         ) {
             return Err(HipError::new(
                 0,
@@ -947,7 +947,7 @@ impl Qwen35DecodeBatchState {
         if !matches!(
             weights.output.gpu_dtype,
             DType::Q8_0
-                | DType::IU8G32
+                | DType::IU8G128
                 | DType::HFQ4G256
                 | DType::MQ4G256
                 | DType::MQ4G256V2
@@ -1608,7 +1608,7 @@ pub(crate) fn lm_head_batched(
     match output.gpu_dtype {
         // qt59 (tied/untied lm_head in iu4 files): per-lane decode GEMV, so
         // each lane's logits are bit-identical to the solo decode lm_head.
-        DType::IU8G32 => {
+        DType::IU8G128 => {
             for i in 0..batch_size {
                 let row = hidden.sub_offset(i * output.k, output.k);
                 let logits_row = logits.sub_offset(i * output.m, output.m);
@@ -1817,7 +1817,7 @@ pub fn prepare_decode_batch_inputs(
     // Reject unsupported formats before any device work (aligned with
     // `prefill_lane` / daemon `qwen_batch_weight_formats_supported`).
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G32 => {}
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::IU8G128 => {}
         EmbeddingFormat::F32 => {
             return Err(HipError::new(
                 0,
@@ -1852,7 +1852,7 @@ pub fn prepare_decode_batch_inputs(
             n,
             config.dim,
         )?,
-        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(
+        EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32_batched(
             &weights.token_embd,
             &state.pbs.x_batch,
             &state.pbs.tokens,

@@ -1650,7 +1650,7 @@ pub(crate) fn run() {
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
     // iu4/iu8 keep the MQ4V2 tensor map for the 4-bit body. The product
     // rung (bare name = normal) lifts embed, and on base/pro lm_head, and
-    // on pro ssm_out, onto IU8G32. An omitted --tier selects the bare name.
+    // on pro ssm_out, onto IU8G128. An omitted --tier selects the bare name.
     let iu_layout = hipfire_runtime::iu_quant::Layout::from_format(format);
     let use_mq4v2 =
         format == "mq4v2" || format == "mq4" || format == "mq4g256v2" || iu_layout.is_some();
@@ -5314,7 +5314,7 @@ fn load_vl_processor_budget(
 /// and mq4c keep the historical Q8 embed so the tensor stays loadable.
 fn lfm2_dense_mq_name_matches(name: &str, use_mq4v2: bool) -> bool {
     if name.ends_with("embed_tokens.weight") {
-        // Every iu rung lifts the embedding table to IU8G32.
+        // Every iu rung lifts the embedding table to IU8G128.
         if IU_STORAGE.get().copied().flatten().is_some() {
             return false;
         }
@@ -7062,7 +7062,7 @@ fn handle_main_quant(
                 (q, QuantType::MQ4G128V2, 128u32, "MQ4G128V2-sym")
             } else if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
-                // A 3-D filter stays interleaved; a 2-D row becomes IU8G32.
+                // A 3-D filter stays interleaved; a 2-D row becomes IU8G128.
                 let q = quantize_q8f16(&f32_data);
                 emit_q8_or_iu8(q, &meta.shape)
             } else if kmap_level == QuantLevel::Q8 && !iu_ladder_owns(name) {

@@ -372,7 +372,7 @@ pub(crate) struct QuantizeArgs {
 
     /// Product tier: `xt` keeps lm_head at the body codec, `base` (alias `normal`) lifts lm_head, `pro` also lifts ssm_out.
     /// embed_tokens and linear_attn.conv1d.weight stay above the body at every rung; structural tensors stay F16.
-    /// On `iu4` / `iu8` the lifted roles are IU8G32 and an omitted flag selects `base`.
+    /// On `iu4` / `iu8` the lifted roles are IU8G128 and an omitted flag selects `base`.
     #[arg(long, value_name = "TIER")]
     pub tier: Option<String>,
 

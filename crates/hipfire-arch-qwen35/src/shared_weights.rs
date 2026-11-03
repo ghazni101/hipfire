@@ -192,7 +192,7 @@ dtype_table! {
     // GGUF block formats (additive tags; no export route produces them yet).
     GgmlQ4K = 60, GgmlQ5K = 61, GgmlQ6K = 62, GgmlQ8_0 = 63, GgmlIQ4XS = 64,
     // IU integer operand layouts (feature branch; distinct from GGUF tags).
-    IU4G256 = 65, IU8G256 = 66, IU8G32 = 67,
+    IU4G256 = 65, IU8G256 = 66, IU8G128 = 67,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
@@ -202,7 +202,7 @@ fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
         EmbeddingFormat::HFQ4G256 => 3,
         EmbeddingFormat::HFQ4G128 => 4,
         EmbeddingFormat::Q8_0 => 5,
-        EmbeddingFormat::IU8G32 => 6,
+        EmbeddingFormat::IU8G128 => 6,
         EmbeddingFormat::Ggml(_) => return Err(SharedWeightError::unsupported(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
         )),
@@ -216,7 +216,7 @@ fn embd_from_tag(tag: u8) -> Option<EmbeddingFormat> {
         3 => EmbeddingFormat::HFQ4G256,
         4 => EmbeddingFormat::HFQ4G128,
         5 => EmbeddingFormat::Q8_0,
-        6 => EmbeddingFormat::IU8G32,
+        6 => EmbeddingFormat::IU8G128,
         _ => return None,
     })
 }

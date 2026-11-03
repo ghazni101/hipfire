@@ -853,7 +853,7 @@ pub fn target_embedding_table(target: &Gemma4Weights) -> Option<GpuTensor> {
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
         EmbeddingFormat::F32
         | EmbeddingFormat::Q4K
-        | EmbeddingFormat::IU8G32
+        | EmbeddingFormat::IU8G128
         | EmbeddingFormat::Ggml(_) => return None,
     };
     Some(GpuTensor {

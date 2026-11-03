@@ -251,7 +251,7 @@ pub fn q8_row_bytes(k: usize) -> Option<usize> {
     }
 }
 
-/// Bytes of an `[m, k]` IU8G32 tensor.
+/// Bytes of an `[m, k]` IU8G128 tensor.
 pub fn q8_tensor_bytes(m: usize, k: usize) -> Option<usize> {
     if m == 0 {
         return None;
@@ -263,7 +263,7 @@ fn q8_shape_error(m: usize, k: usize) -> String {
     format!("IU8G128 requires M > 0 and K % {Q8_SCALE_GROUP} == 0, got M={m} K={k}")
 }
 
-/// Reject an IU8G32 tensor whose length or shape is not the layout.
+/// Reject an IU8G128 tensor whose length or shape is not the layout.
 ///
 /// Every byte of the code plane is a legal signed code, including values
 /// above 15. That is the difference from [`validate`] on [`Layout::Iu8`].

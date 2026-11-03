@@ -664,7 +664,7 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
-    IU8G32,   // raw qt 59 compact rows [K codes][K/128 f16 scales]
+    IU8G128,  // raw qt 59 compact rows [K codes][K/128 f16 scales]
     /// GGUF-native table in ggml block bytes (`DType::Ggml*`), dequantised per
     /// row by the ggml get-row kernel of that type.
     Ggml(DType),
@@ -685,7 +685,7 @@ pub fn embedding_lookup_dispatch(
     match format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(table, output, token, dim),
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
-        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32(table, output, token, dim),
+        EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32(table, output, token, dim),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
@@ -795,7 +795,7 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
 /// refusal above: qt 59 is unrotated and must never enter an FWHT path.
 #[inline]
 fn reject_unsupported_gemv_dtype(dtype: DType) -> HipResult<()> {
-    if dtype == DType::IU8G32 {
+    if dtype == DType::IU8G128 {
         return Ok(());
     }
     reject_mq4g128v2(dtype)
@@ -2874,7 +2874,7 @@ fn forward_prefill_chunk(
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
                 }
-                EmbeddingFormat::IU8G32 => {
+                EmbeddingFormat::IU8G128 => {
                     gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::Ggml(dtype) => {
@@ -8673,10 +8673,10 @@ mod tests {
     /// it; the rotation helpers keep refusing the unrotated IU layout.
     #[test]
     fn weight_gemv_admits_qt59_but_not_typed_only_layouts() {
-        assert!(reject_unsupported_gemv_dtype(DType::IU8G32).is_ok());
+        assert!(reject_unsupported_gemv_dtype(DType::IU8G128).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::Q8_0).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::MQ4G128V2).is_err());
-        assert!(reject_mq4g128v2(DType::IU8G32).is_err());
+        assert!(reject_mq4g128v2(DType::IU8G128).is_err());
     }
 
     /// The one-pass replacement gather `gather_pool` must reproduce slot for

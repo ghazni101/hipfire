@@ -2674,7 +2674,7 @@ fn gemm_dispatch(
             0,
             "dflash GEMM cannot consume MQ-I4 / E8P-I4 (qt=131..=136): typed-Qwen4 expert-slab format with no generic GPU kernel",
         )),
-        DType::IU4G256 | DType::IU8G256 | DType::IU8G32 => Err(hip_bridge::HipError::new(
+        DType::IU4G256 | DType::IU8G256 | DType::IU8G128 => Err(hip_bridge::HipError::new(
             0,
             "dflash GEMM cannot consume IU4/IU8 (qt=57/58/59) on this dispatcher: the qt59 head goes through gemm_iu8g32_residual_wmma and qt57/58 have no entry here",
         )),

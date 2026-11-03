@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! GPU↔CPU parity for the IU quant family's decode readers: qt 57
-//! (`IU4G256`), qt 58 (`IU8G256`), qt 59 (`IU8G32`), each with its fused
+//! (`IU4G256`), qt 58 (`IU8G256`), qt 59 (`IU8G128`), each with its fused
 //! `y += W·x` twin, plus the qt 59 embedding gather.
 //!
 //! The CPU contracts are `hipfire_runtime::iu_quant`:
@@ -185,7 +185,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         }
     }
 
-    // ── qt 59 IU8G32 + gather ────────────────────────────────────────────
+    // ── qt 59 IU8G128 + gather ────────────────────────────────────────────
     for k in [128usize, 256, 2688] {
         let src = q8f16_blob(m, k);
         let packed = repack_q8f16(&src, m, k).expect("repack");

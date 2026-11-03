@@ -23,7 +23,7 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::F16,
         DType::Q8_0,
         DType::Q8HFQ,
-        DType::IU8G32,
+        DType::IU8G128,
         DType::Q4K,
         DType::Q6K,
         DType::HFQ4G256,
@@ -136,7 +136,7 @@ fn register_residual(registry: &mut KernelRegistry) {
         DType::MQ4G256Lloyd,
         DType::IU4G256,
         DType::IU8G256,
-        DType::IU8G32,
+        DType::IU8G128,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_residual(dtype) else {

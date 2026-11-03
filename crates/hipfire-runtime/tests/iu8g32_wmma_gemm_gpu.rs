@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the compact IU8G32 (qt59) batched residual GEMM family.
+//! Numerics gate for the compact IU8G128 (qt59) batched residual GEMM family.
 //!
 //! qt59 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
 //! dequantized weight to f16 and run f16 WMMA; this test checks every

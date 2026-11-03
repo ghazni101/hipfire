@@ -2853,7 +2853,7 @@ pub fn forward_ep(
                 gpu.embedding_lookup_hfq4g128(&w.token_embd, &s.x, token, dim)?
             }
             EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&w.token_embd, &s.x, token, dim)?,
-            EmbeddingFormat::IU8G32 => {
+            EmbeddingFormat::IU8G128 => {
                 gpu.embedding_lookup_iu8g32(&w.token_embd, &s.x, token, dim)?
             }
             EmbeddingFormat::F32 => gpu.embedding_lookup(&w.token_embd, &s.x, token, dim)?,
@@ -4898,7 +4898,7 @@ pub fn forward_scratch_multi(
             EmbeddingFormat::Q8_0 => {
                 gpu0.embedding_lookup_q8(&weights.token_embd, &s0.x, token, dim)?
             }
-            EmbeddingFormat::IU8G32 => {
+            EmbeddingFormat::IU8G128 => {
                 gpu0.embedding_lookup_iu8g32(&weights.token_embd, &s0.x, token, dim)?
             }
             EmbeddingFormat::F32 => {

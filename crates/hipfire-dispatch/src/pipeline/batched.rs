@@ -191,7 +191,7 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
             0,
             "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
         ))
-    } else if dtype == DType::IU8G256 || dtype == DType::IU8G32 {
+    } else if dtype == DType::IU8G256 || dtype == DType::IU8G128 {
         Err(HipError::new(
             0,
             &format!(
@@ -1173,7 +1173,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
             n,
         );
     }
-    if w.dtype == DType::IU8G32 {
+    if w.dtype == DType::IU8G128 {
         // qt59 compact row, natural-basis input. `gemm_iu8g32_residual` picks
         // W8A8 or the f16 twin from (arch, K, n) with the one selector the
         // multi-slot body also uses.

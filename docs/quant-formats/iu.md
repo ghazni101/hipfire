@@ -133,8 +133,12 @@ IU8G32, one row, K = 256                          260 B/row = 8.125 bpw
 `K + (K/128)*2` bytes (8.125 bpw), six bytes per 128 smaller than the old
 one-scale-per-32 layout (`K + K/16`, 8.5 bpw).
 
-The wire name is `IU8G32`; `iu_quant` and `DType::iu_quant_name()` spell it
-`IU8G128`. The “G32” is historical — the row carries one f16 scale per 128.
+The wire name is `IU8G32` (`QuantType::IU8G32`, qt 59); the runtime types
+(`rdna_compute::DType::IU8G128`, `EmbeddingFormat::IU8G128`), `iu_quant`, and
+`DType::iu_quant_name()` spell it `IU8G128`. The “G32” in the wire name, the
+kernel symbols (`gemv_iu8g32*`, `gemm_iu8g32*`, `embedding_iu8g32*`), and the
+`HIPFIRE_IU8G32_*` dev knobs is historical — the row carries one f16 scale per
+128.
 
 Decode GEMV is `gemv_iu8g32` v2 with f32 activations by default, on every
 arch. `HIPFIRE_IU8_GEMV=dot4` instead selects the int8×int8 `_a8` variants,

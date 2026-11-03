@@ -2799,7 +2799,7 @@ pub const GEMV_IU4G256_XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
 );
 
-/// IU8G32 (qt 59) decode GEMV: the Q8 grid with the scales at the row tail.
+/// IU8G128 (qt 59) decode GEMV: the Q8 grid with the scales at the row tail.
 /// `gemv_iu8g32` (SET) and `gemv_iu8g32_residual` (fused `y += W·x`).
 /// See `kernels/src/gemv_iu8g32.hip`.
 pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32.hip");
@@ -2809,7 +2809,7 @@ pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32
 /// See `kernels/src/gemv_iu8g256.hip`.
 pub const GEMV_IU8G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g256.hip");
 
-/// IU8G32 (qt 59) embedding lookup: one row dequantized to F32 from the
+/// IU8G128 (qt 59) embedding lookup: one row dequantized to F32 from the
 /// planar Q8 grid. See `kernels/src/embedding_iu8g32.hip`.
 pub const EMBEDDING_IU8G32_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g32.hip");
 pub const EMBEDDING_IU8G32_BATCHED_SRC: &str =
@@ -8124,7 +8124,7 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
-/// IU8G32 (qt59) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G32L`
+/// IU8G128 (qt59) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G32L`
 /// swaps only the row addressing ([K codes][K/32 f16 scales]); the f16 WMMA
 /// arithmetic is the Q8_0 kernel's, so a qt59 relayout of a Q8_0 tensor gives
 /// bit-identical Y. Entry renamed so the function cache cannot alias.
@@ -8133,7 +8133,7 @@ pub const GEMM_IU8G32_RESIDUAL_WMMA_SRC: &str = concat!(
     "#define gemm_q8_0_residual_wmma gemm_iu8g32_residual_wmma\n",
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip")
 );
-/// Four-batch-tile (16x64 wave output) IU8G32 residual GEMM: one weight
+/// Four-batch-tile (16x64 wave output) IU8G128 residual GEMM: one weight
 /// dequantization and read per 64 tokens instead of per 16. Same f16 WMMA
 /// arithmetic and output mapping as [`GEMM_IU8G32_RESIDUAL_WMMA_SRC`].
 pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC: &str =

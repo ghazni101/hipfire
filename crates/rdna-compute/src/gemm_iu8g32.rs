@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Batched (prefill) GEMMs for [`crate::DType::IU8G32`] (qt59) on gfx11.
+//! Batched (prefill) GEMMs for [`crate::DType::IU8G128`] (qt59) on gfx11.
 //!
 //! Two kernels compute `Y[N, M] += W X` for the compact `[K i8][K/128 f16]`
 //! row. `X` is `[N, K]` f32 in the natural basis (qt59 is not rotated).
@@ -143,7 +143,7 @@ impl Gpu {
         }
     }
 
-    /// `Y += W X` for one IU8G32 matrix (`m` rows, `k` cols, `n` tokens).
+    /// `Y += W X` for one IU8G128 matrix (`m` rows, `k` cols, `n` tokens).
     pub fn gemm_iu8g32_residual_wmma(
         &mut self,
         a: &GpuTensor,
