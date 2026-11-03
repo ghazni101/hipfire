@@ -919,3 +919,45 @@ fill) measured 1,139/1,229 tok/s against 1,312/1,350 with the fill path at a
 41.7k prompt, so the warp-specialized fill stays. Moving pp further needs an
 FA2 body under 128 VGPR (2 workgroups/CU) or a KT64 rebuild now that occupancy
 is register- rather than LDS-bound; both are kernel redesigns, not knobs.
+
+## C20 — design 3 routed: W8A8 int8-per-128 on the qt59 roles (2026-11-03)
+
+The qt59 weight rows are now requantized **in place** at load when
+`HIPFIRE_IU8_W8A8=1`:
+
+- one scale per 128: `sc = max|w| / 127`, codes `round(w/sc)`, written
+  linearly; the four per-32 scale slots of each K128 block receive the same
+  f16 `sc`. Row size is unchanged (K + K/16), so **every existing qt59 reader
+  stays correct** (decode GEMV and the f16 prefill see four equal per-32
+  scales) and the mark is per weight buffer.
+- prefill dispatch: the existing `IU8G32` arm checks the mark, quantizes the
+  unrotated input with the new linear-order K128 quantizer
+  (`quantize_int8_mmq_linear128`), and runs `gemm_iu8g32_w8a8_min` (128x128
+  LDS, WMMA-IU8, one scale fold per K128). Decode and every other route are
+  untouched.
+
+Speed (`hipfire bench --matrix --spec off`, 2 rounds, fresh process):
+
+| prefill route | pp2048 base | pp2048 W8A8 | pp8192 base | pp8192 W8A8 |
+|---|---:|---:|---:|---:|
+| 512-row legacy | 1,665 | **1,910 (+14.7%)** | 1,607 | **1,835 (+14.2%)** |
+| wide (container) | 1,821 | **2,022 (+11.0%)** | 1,817 | **1,993 (+9.7%)** |
+
+Decode is unchanged (46.4-46.5 tok/s at ctx128). The synthetic kernel is
+bit-exact against a CPU fold (worst rel 0.0) at m=4/128 and the real
+M=5120/K=6144 shape.
+
+Quality (`iu4_kld`, 511 teacher-forced tokens, 27B, same build):
+
+| comparison | top1 | mean KL top64 | PPL |
+|---|---:|---:|---:|
+| W8A8 off vs itself (sanity) | 511/511 bit-identical | 2e-18 | 6.0168 |
+| weight requant, decode path vs qt59 | 509/511 | 3.09e-5 | 5.8585 vs 5.8634 |
+| W8A8 prefill vs f16 prefill | 469/511 | 2.90e-2 | 5.8552 vs 6.0168 |
+| W8A8 prefill vs decode ref | 485/511 | 1.85e-2 | 5.8552 |
+| f16 prefill vs decode ref (baseline) | 473/511 | 1.72e-2 | 6.0168 |
+
+The weight requant is negligible on the decode path. The prefill delta is
+dominated by the W8A8 activation quantizer; it is slightly above the f16
+prefill KL (0.029 vs the body's existing 0.017 vs decode) while top-1 and PPL
+improve. Enabled per-container; the code gate is `HIPFIRE_IU8_W8A8=1`.

@@ -886,7 +886,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1787
+**Count:** 1788
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1778,6 +1778,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU8G32_M2` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8G32_MB4` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8_GEMV` | crates/hipfire-runtime/tests/iu8g32_v2_gemv_gpu.rs, crates/rdna-compute/src/gemv_iu8.rs | developer |
+| `HIPFIRE_IU8_W8A8` | crates/hipfire-arch-qwen35/src/qwen35/load.rs | developer |
 | `HIPFIRE_JINJA_CHAT` | benchmarks/prompts/mtpfloor/generate.py, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | stable |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |

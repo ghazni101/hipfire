@@ -3471,6 +3471,16 @@ fn load_layer_into(
     };
     let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
     if let LayerWeights::DeltaNet(dn) = &mut layer {
+        if dn.wo.gpu_dtype == DType::IU8G32
+            && dn.wo.k % 128 == 0
+            && hipfire_config::developer_var("HIPFIRE_IU8_W8A8")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            gpu.requant_iu8g32_per128(&dn.wo.buf, dn.wo.m, dn.wo.k)?;
+            gpu.mark_w8_128(dn.wo.buf.buf.as_ptr());
+        }
         if let Err(e) = append_betaalpha_to_z(hfq, gpu, p, dn) {
             layer.free_gpu(gpu);
             return Err(e);

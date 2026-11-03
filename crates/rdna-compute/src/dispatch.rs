@@ -1733,6 +1733,9 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// Weight buffers whose qt59 rows were requantized in place to int8 with
+    /// one scale per 128 (the prefill W8A8 fast path). Cleared on free.
+    pub(crate) w8_128_weights: std::collections::HashSet<usize>,
     /// `HIPFIRE_CB_VERIFY_FP8` scope (see `crate::gemm_fp8_verify`): set by
     /// [`Gpu::fp8_verify_enter`] for the duration of a target verify forward.
     /// While true, every dense MQ4G256V2 verify GEMM runs the PeaceMaker FP8
@@ -3035,6 +3038,7 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            w8_128_weights: std::collections::HashSet::new(),
             fp8_verify_scope: false,
             iu4_verify_scope: false,
             iu4_pending_x: None,
@@ -5535,6 +5539,27 @@ impl Gpu {
         k: usize,
         xplanar: bool,
     ) -> HipResult<*mut c_void> {
+        self.ensure_int8_mmq_x_impl(x, n, k, xplanar, false)
+    }
+
+    /// Linear-order K128 int8 activations for the W8A8 per-128 GEMM.
+    pub fn ensure_int8_mmq_linear_x(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        self.ensure_int8_mmq_x_impl(x, n, k, false, true)
+    }
+
+    fn ensure_int8_mmq_x_impl(
+        &mut self,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+        xplanar: bool,
+        linear: bool,
+    ) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
         if crate::scratch::scratch_will_grow(
             self.scratch.int8_mmq_x_scratch_bytes,
@@ -5558,6 +5583,7 @@ impl Gpu {
             n,
             k,
             xplanar,
+            linear,
         )
     }
 
@@ -8459,6 +8485,7 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
+        self.w8_128_weights.remove(&key);
         if tensor.buf.is_host_mapped() {
             // Host-mapped owners are never pooled: hipHostFree takes the host
             // pointer, and an offloaded weight is static (freed at unload), so

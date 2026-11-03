@@ -129,6 +129,46 @@ impl Gpu {
         result
     }
 
+    /// Mark a weight buffer as in-place requantized to one scale per 128.
+    pub fn mark_w8_128(&mut self, ptr: *mut c_void) {
+        self.w8_128_weights.insert(ptr as usize);
+    }
+
+    /// Whether this weight buffer was requantized to one scale per 128.
+    pub fn is_w8_128(&self, ptr: *mut c_void) -> bool {
+        self.w8_128_weights.contains(&(ptr as usize))
+    }
+
+    /// In-place qt59 -> int8-per-128 requantization (row size unchanged).
+    pub fn requant_iu8g32_per128(&mut self, a: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if m == 0 || k == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "requant_iu8g32_per128 needs M>0 and K%128==0",
+            ));
+        }
+        let module = "requant_iu8g32_per128";
+        self.ensure_kernel(module, kernels::REQUANT_IU8G32_PER128_SRC, module)?;
+        let mut a_p = a.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        let warps = m * (k / 128);
+        let grid = [warps.div_ceil(8) as u32, 1, 1];
+        self.launch_maybe_blob(module, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_p);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+
     /// Minimal LDS-tiled W8A8 launch for a planar int8-per-128 weight row
     /// `[K codes][K/128 f16 scales]` and `block_i8_128` activations. The
     /// caller supplies the pre-quantized X pointer. Diagnostic/microbenchmark
@@ -175,7 +215,7 @@ impl Gpu {
         ];
         let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
         let lds = 33_792u32;
-        let bytes = m * (k + k / 64) + n * k + n * m * 4;
+        let bytes = m * (k + k / 16) + n * k + n * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
         let result = self.launch_maybe_blob(entry, grid, [512, 1, 1], lds, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();

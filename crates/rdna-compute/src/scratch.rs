@@ -3298,10 +3298,13 @@ impl ScratchState {
         n: usize,
         k: usize,
         xplanar: bool,
+        linear: bool,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
         // The quantizer ships in each arch's A8 GEMM module (one compile).
-        let qk = if xplanar {
+        let qk = if linear {
+            "quantize_int8_mmq_linear128"
+        } else if xplanar {
             "quantize_int8_mmq_ds128_xp"
         } else {
             "quantize_int8_mmq_ds128"

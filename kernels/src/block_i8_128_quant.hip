@@ -90,6 +90,36 @@ __device__ __forceinline__ void quantize_block_i8_128_wave(
     quantize_block_i8_128_wave_to(xv, out->qs, &out->d, &out->s, lane);
 }
 
+// Linear-order twin: same d/s quant math, qs[4l + i] = q[i]. Pairs with a
+// linear int8 weight row (W8A8 per-128 GEMM); no nibble-pair shuffle.
+__device__ __forceinline__ void quantize_block_i8_128_wave_linear_to(
+    const float xv[4],
+    signed char* __restrict__ qs,
+    float* __restrict__ dp,
+    int* __restrict__ sp,
+    int lane
+) {
+    float amax = fmaxf(fmaxf(fabsf(xv[0]), fabsf(xv[1])), fmaxf(fabsf(xv[2]), fabsf(xv[3])));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    }
+    const bool zero = amax == 0.0f;
+    const float d = zero ? 0.0f : __fdiv_rn(amax, 127.0f);
+    int s = 0;
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const float qf = zero ? 0.0f : fminf(fmaxf(rintf(__fdiv_rn(xv[e], d)), -127.0f), 127.0f);
+        const int q = (int)qf;
+        qs[4 * lane + e] = (signed char)q;
+        s += q;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) s += __shfl_xor(s, offset, 32);
+    if (lane == 0) {
+        *dp = d;
+        *sp = s;
+    }
+}
+
 // I8_XPLANAR (C15, IU4 W4A8 only): same bytes, re-laid per K128 block kb as
 // one N*136 B chunk at kb*N*136 = [N x 128 B qs plane][N x 8 B (d, s) plane],
 // so every token's qs starts 128 B aligned (given N % 16 == 0 and an aligned
@@ -104,6 +134,26 @@ __device__ __forceinline__ void quantize_block_i8_128_wave(
 // one 128-K group.
 // Layout [K/128 x N]: Y[kb * N + token]. K % 128 == 0.
 #ifndef HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE
+extern "C" __global__ void quantize_int8_mmq_linear128(
+    const float* __restrict__ X,
+    block_i8_128* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int per_row = (K + (int)blockDim.x * 4 - 1) / ((int)blockDim.x * 4);
+    if (per_row <= 0) return;
+    const int token = (int)(blockIdx.x / (unsigned)per_row);
+    const int t = (int)(blockIdx.x % (unsigned)per_row) * blockDim.x + threadIdx.x;
+    const int i0 = t * 4;
+    if (token >= N || i0 >= K) return;
+    const int lane = threadIdx.x & 31;
+    const float4 xi = *(const float4*)(X + (long long)token * K + i0);
+    const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
+    const int kblock = i0 / 128;
+    block_i8_128* out = Y + (long long)kblock * N + token;
+    quantize_block_i8_128_wave_linear_to(xv, out->qs, &out->d, &out->s, lane);
+}
+
 extern "C" __global__ void quantize_int8_mmq_ds128(
     const float* __restrict__ X,
     block_i8_128* __restrict__ Y,

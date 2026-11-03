@@ -1133,6 +1133,21 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
             n,
         );
     }
+    if w.dtype == DType::IU8G32 && k % 128 == 0 && gpu.is_w8_128(w.buf.buf.as_ptr()) {
+        // In-place requantized qt59: one scale per 128, int8 W8A8 path.
+        let xq = gpu.ensure_int8_mmq_linear_x(input, n, k)?;
+        return match epilogue {
+            BatchEpilogue::Residual => {
+                let x_n = pbs.x_batch.sub_offset(0, n * m);
+                gpu.gemm_iu8g32_w8a8_min(&w.buf, xq, &x_n, m, k, n, true)
+            }
+            BatchEpilogue::Partial(out) => {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                let out_n = out.sub_offset(0, n * m);
+                gpu.gemm_iu8g32_w8a8_min(&w.buf, xq, &out_n, m, k, n, false)
+            }
+        };
+    }
     if w.dtype == DType::IU8G32 {
         // qt59 (LA wo in iu4 files): natural-basis input, f16-WMMA residual
         // twin of the Q8_0 arm (bit-identical to the Q8_0 relayout).
