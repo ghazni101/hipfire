@@ -4,13 +4,15 @@
 
 //! Batched (prefill) GEMM for [`crate::DType::IU4G256`].
 //!
-//! On gfx1100/gfx1151 every call is the MQ4V2 Q8_1 MMQ kernel built with
-//! `HIPFIRE_MMQ_IU4L` (IU4 row addressing, same arithmetic): `X` is
-//! quantized once to `block_q8_1_mmq` and the weight tiles are read straight
-//! from the planar IU4 rows. A qt57 tensor that is the relayout of a qt44
-//! tensor therefore gives the same `Y` bits as `gemm_mq4g256v2_mmq_*` on the
-//! twin. Elsewhere, and while a graph is being captured or recorded, each
-//! token is one f32 IU4 GEMV (the decode kernel), i.e. the per-token result.
+//! On exact gfx1100/gfx1151 ([`crate::arch_caps::supports_iu4g256_gemm`])
+//! the activation format is `HIPFIRE_IU4_PREFILL_ACT`: `a4` (default) is the
+//! W4A4 int4 MMQ on `v_wmma_i32_16x16x16_iu4`, `a8` the W4A8 int8 MMQ, `a8q`
+//! the MQ4V2 Q8_1 MMQ built with `HIPFIRE_MMQ_IU4L` (IU4 row addressing, same
+//! arithmetic). Each is bit-identical to its MQ4V2 twin kernel on a qt57
+//! tensor that is the relayout of a qt44 tensor. Projections narrower than
+//! one 128-row tile take the f16 MW-LDS WMMA (`HIPFIRE_IU4_SMALLM`).
+//! Elsewhere, and while a graph is being captured or recorded, each token is
+//! one f32 IU4 GEMV (the decode kernel), i.e. the per-token result.
 //!
 //! `X` is `[N, K]` row-major f32 (FWHT-256 rotated by the caller), `Y` is
 //! `[N, M]` f32.
@@ -163,7 +165,12 @@ fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
                         "gu" => 1 << Gpu::IU4_ROLE_GU,
                         "dn" => 1 << Gpu::IU4_ROLE_DN,
                         "all" => 0x3f,
-                        _ => panic!("HIPFIRE_IU4_A8_ROLES: unknown role {t:?}"),
+                        // A typo in a developer knob must not take down a
+                        // serving daemon on its first prefill.
+                        _ => {
+                            eprintln!("[iu4] HIPFIRE_IU4_A8_ROLES: ignoring unknown role {t:?}");
+                            0
+                        }
                     };
                 }
             }
@@ -176,20 +183,19 @@ fn iu4_a8_sel() -> &'static Option<(u8, Vec<(u8, usize, usize)>)> {
             .map(str::trim)
             .filter(|t| !t.is_empty())
         {
-            let bad = || panic!("HIPFIRE_IU4_A8_LAYERS: bad item {t:?}");
-            if let Some(v) = t.strip_prefix("first") {
-                sel.push((1, v.parse().unwrap_or_else(|_| bad()), 0));
+            let num = |v: &str| v.parse::<usize>().ok();
+            let item = if let Some(v) = t.strip_prefix("first") {
+                num(v).map(|n| (1, n, 0))
             } else if let Some(v) = t.strip_prefix("last") {
-                sel.push((2, v.parse().unwrap_or_else(|_| bad()), 0));
+                num(v).map(|n| (2, n, 0))
             } else if let Some((a, b)) = t.split_once('-') {
-                sel.push((
-                    0,
-                    a.parse().unwrap_or_else(|_| bad()),
-                    b.parse().unwrap_or_else(|_| bad()),
-                ));
+                num(a).zip(num(b)).map(|(a, b)| (0, a, b))
             } else {
-                let a = t.parse().unwrap_or_else(|_| bad());
-                sel.push((0, a, a));
+                num(t).map(|a| (0, a, a))
+            };
+            match item {
+                Some(it) => sel.push(it),
+                None => eprintln!("[iu4] HIPFIRE_IU4_A8_LAYERS: ignoring bad item {t:?}"),
             }
         }
         Some((mask, sel))
@@ -240,7 +246,7 @@ impl Gpu {
     pub fn iu4g256_mmq_eligible(&self, k: usize, n: usize) -> bool {
         n > 0
             && k % 256 == 0
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && crate::arch_caps::supports_iu4g256_gemm(&self.arch)
             && !self.graphs.capture_mode
             && !self.replay.is_recording()
             && !iu4_prefill_gemv()
@@ -561,7 +567,7 @@ impl Gpu {
         batch_size: usize,
         add: bool,
     ) -> HipResult<()> {
-        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+        if !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 Q8_1 MMQ requires exact gfx1100/gfx1151",
@@ -656,7 +662,7 @@ impl Gpu {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+        if k % 256 != 0 || !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
@@ -688,7 +694,7 @@ impl Gpu {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        if k % 256 != 0 || !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+        if k % 256 != 0 || !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
@@ -751,7 +757,7 @@ impl Gpu {
         batch_size: usize,
         add: bool,
     ) -> HipResult<()> {
-        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+        if !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 W4A4 MMQ requires exact gfx1100/gfx1151",
@@ -897,7 +903,7 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
+        if !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 W4A8 i8 MMQ requires gfx1100/gfx1151",

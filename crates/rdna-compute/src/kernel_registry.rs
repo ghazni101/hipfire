@@ -363,48 +363,81 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("gemv_mq6g256", kernels::GEMV_MQ6G256_SRC, ["gemv_mq6g256"]);
     add!("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC, ["gemm_mq6g256"]);
     add!("gemv_q8_0", kernels::GEMV_Q8_0_SRC, ["gemv_q8_0"]);
-    add!(
-        "gemv_iu8g32",
-        kernels::GEMV_IU8G32_SRC,
-        [
+    // The `_a8` (int8 x int8, `v_dot4_i32_iu8`) variants and the IU4
+    // dot4/dot8 integer-activation family are compiled only under
+    // `__GFX11__ || __GFX12__`; gfx906/gfx942 build these modules without them.
+    let iu_int_gemv = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
+    if iu_int_gemv {
+        add!(
             "gemv_iu8g32",
-            "gemv_iu8g32_residual",
-            "gemv_iu8g32_v2_r1",
-            "gemv_iu8g32_v2_residual_r1",
-            "gemv_iu8g32_v2_r2",
-            "gemv_iu8g32_v2_residual_r2",
-            "gemv_iu8g32_v2_r4",
-            "gemv_iu8g32_v2_residual_r4",
-            "gemv_iu8g32_a8_r1",
-            "gemv_iu8g32_a8_residual_r1",
-            "gemv_iu8g32_a8_r2",
-            "gemv_iu8g32_a8_residual_r2",
-            "gemv_iu8g32_a8_r4",
-            "gemv_iu8g32_a8_residual_r4"
-        ]
-    );
+            kernels::GEMV_IU8G32_SRC,
+            [
+                "gemv_iu8g32",
+                "gemv_iu8g32_residual",
+                "gemv_iu8g32_v2_r1",
+                "gemv_iu8g32_v2_residual_r1",
+                "gemv_iu8g32_v2_r2",
+                "gemv_iu8g32_v2_residual_r2",
+                "gemv_iu8g32_v2_r4",
+                "gemv_iu8g32_v2_residual_r4",
+                "gemv_iu8g32_a8_r1",
+                "gemv_iu8g32_a8_residual_r1",
+                "gemv_iu8g32_a8_r2",
+                "gemv_iu8g32_a8_residual_r2",
+                "gemv_iu8g32_a8_r4",
+                "gemv_iu8g32_a8_residual_r4"
+            ]
+        );
+    } else {
+        add!(
+            "gemv_iu8g32",
+            kernels::GEMV_IU8G32_SRC,
+            [
+                "gemv_iu8g32",
+                "gemv_iu8g32_residual",
+                "gemv_iu8g32_v2_r1",
+                "gemv_iu8g32_v2_residual_r1",
+                "gemv_iu8g32_v2_r2",
+                "gemv_iu8g32_v2_residual_r2",
+                "gemv_iu8g32_v2_r4",
+                "gemv_iu8g32_v2_residual_r4"
+            ]
+        );
+    }
     add!(
         "gemv_iu8g256",
         kernels::GEMV_IU8G256_SRC,
         ["gemv_iu8g256", "gemv_iu8g256_residual"]
     );
-    add!(
-        "gemv_iu4g256",
-        kernels::GEMV_IU4G256_SRC,
-        [
+    if iu_int_gemv {
+        add!(
             "gemv_iu4g256",
-            "gemv_iu4g256_residual",
-            "fused_iu4g256_rows",
-            "gemv_iu4g256_dot8",
-            "gemv_iu4g256_dot8_residual",
-            "gemv_iu4g256_dot4",
-            "gemv_iu4g256_dot4_residual",
-            "iu4_quant_x_a8",
-            "gemv_iu4g256_dot4q",
-            "gemv_iu4g256_dot4q_residual",
-            "fused_iu4g256_dot4q_rows"
-        ]
-    );
+            kernels::GEMV_IU4G256_SRC,
+            [
+                "gemv_iu4g256",
+                "gemv_iu4g256_residual",
+                "fused_iu4g256_rows",
+                "gemv_iu4g256_dot8",
+                "gemv_iu4g256_dot8_residual",
+                "gemv_iu4g256_dot4",
+                "gemv_iu4g256_dot4_residual",
+                "iu4_quant_x_a8",
+                "gemv_iu4g256_dot4q",
+                "gemv_iu4g256_dot4q_residual",
+                "fused_iu4g256_dot4q_rows"
+            ]
+        );
+    } else {
+        add!(
+            "gemv_iu4g256",
+            kernels::GEMV_IU4G256_SRC,
+            [
+                "gemv_iu4g256",
+                "gemv_iu4g256_residual",
+                "fused_iu4g256_rows"
+            ]
+        );
+    }
     // Multi-slot decode GEMV: one weight pass for up to four activation
     // vectors (`slots_iu4_multi`). Two modules because the epilogue macro is
     // a compile-time fork, exactly like the MQ4V2 xbatch pair.
@@ -3382,7 +3415,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq4g256v2_gate_up_silu_mmq_i8",
                 "gemm_mq4g256v2_residual_mmq_i8_full_add",
                 "gemm_mq4g256v2_residual_mmq_i8_full_set",
-                "quantize_int8_mmq_ds128"
+                "quantize_int8_mmq_ds128",
+                "quantize_int8_mmq_linear128"
             ]
         );
         // Symmetric qt49 MQ3V25 A4 (default on gfx1201 for qt49 artifacts) and
@@ -11180,11 +11214,15 @@ mod tests {
         // (IU8G32) pair, and the qt 59 embedding gather. All are
         // arch-agnostic (integer-dot / f16-scale x f32 math), so every pack
         // carries them.
-        const IU_QUANT_ADDED_MODULES: [&str; 4] = [
+        // The xbatch pair is the multi-slot IU4 decode GEMV (one weight
+        // pass for up to four activation columns).
+        const IU_QUANT_ADDED_MODULES: [&str; 6] = [
             "embedding_iu8g32",
             "gemv_iu4g256",
             "gemv_iu8g256",
             "gemv_iu8g32",
+            "gemv_iu4g256_xbatch",
+            "gemv_iu4g256_xbatch_residual",
         ];
         for module in IU_QUANT_ADDED_MODULES {
             assert!(

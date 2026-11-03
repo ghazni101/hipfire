@@ -1173,35 +1173,19 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
             n,
         );
     }
-    if w.dtype == DType::IU8G32 && k % 256 == 0 {
-        // qt59 compact row (one scale per 128) through the W8A8 LDS GEMM.
-        // Its launcher requires `K % 256 == 0`, so a K%128-only matrix must
-        // take the f16-WMMA twin below instead of erroring out of the launcher.
-        let xq = gpu.ensure_int8_mmq_linear_x(input, n, k)?;
-        return match epilogue {
-            BatchEpilogue::Residual => {
-                let x_n = pbs.x_batch.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_w8a8_min(&w.buf, xq, &x_n, m, k, n, true)
-            }
-            BatchEpilogue::Partial(out) => {
-                zero_partial_for_residual(gpu, out, n, m)?;
-                let out_n = out.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_w8a8_min(&w.buf, xq, &out_n, m, k, n, false)
-            }
-        };
-    }
     if w.dtype == DType::IU8G32 {
-        // qt59 (LA wo in iu4 files): natural-basis input, f16-WMMA residual
-        // twin of the Q8_0 arm (bit-identical to the Q8_0 relayout).
+        // qt59 compact row, natural-basis input. `gemm_iu8g32_residual` picks
+        // W8A8 or the f16 twin from (arch, K, n) with the one selector the
+        // multi-slot body also uses.
         return match epilogue {
             BatchEpilogue::Residual => {
                 let x_n = pbs.x_batch.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_residual_wmma(&w.buf, input, &x_n, m, k, n)
+                gpu.gemm_iu8g32_residual(&w.buf, input, &x_n, m, k, n)
             }
             BatchEpilogue::Partial(out) => {
                 zero_partial_for_residual(gpu, out, n, m)?;
                 let out_n = out.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_residual_wmma(&w.buf, input, &out_n, m, k, n)
+                gpu.gemm_iu8g32_residual(&w.buf, input, &out_n, m, k, n)
             }
         };
     }

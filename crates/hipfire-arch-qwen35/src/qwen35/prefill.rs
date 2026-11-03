@@ -4585,7 +4585,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // `HIPFIRE_IU4_DECODE=dot8` keeps the original per-token W4A4 prefill;
     // `dot4` (W4A8 decode only) keeps the MMQ prefill.
     let iu4_with_mmq = dt == DType::IU4G256
-        && matches!(arch, "gfx1100" | "gfx1151")
+        && rdna_compute::arch_caps::supports_iu4g256_gemm(arch)
         && rdna_compute::iu4_decode_mode() != rdna_compute::Iu4DecodeMode::Dot8;
 
     iu4_with_mmq
@@ -4702,8 +4702,7 @@ pub fn qwen35_layer_batch_admissible(
                 // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
                 let iu8g32_wo = name == "wo"
                     && dt == DType::IU8G32
-                    && matches!(arch, "gfx1100" | "gfx1151")
-                    && l.wo.k % 128 == 0;
+                    && rdna_compute::iu8g32_gemm_admits(arch, l.wo.k);
                 if !iu8g32_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
                         0,

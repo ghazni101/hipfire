@@ -2367,7 +2367,7 @@ pub(crate) fn run() {
         .expect("IU_STORAGE set twice — should not happen");
     if let Some(layout) = iu_layout {
         eprintln!(
-            "IU storage: {} — MQ4V2 codes, {} operand rows, no GPU kernel yet",
+            "IU storage: {} — MQ4V2 codes in {} operand rows; lifted roles as qt 59 IU8G128",
             layout.name(),
             layout.name()
         );

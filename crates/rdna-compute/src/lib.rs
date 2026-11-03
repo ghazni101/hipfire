@@ -63,6 +63,7 @@ mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub use gemm_iu4::Iu4Proj;
+pub use gemm_iu8g32::{iu8g32_gemm_admits, Iu8g32GemmRoute, IU8G32_W8A8_MIN_ROWS};
 mod gemv_iu4;
 pub use gemv_iu4::{iu4_decode_dot8, iu4_decode_mode, iu4_decode_w4a4, Iu4DecodeMode};
 mod gemv_iu8;

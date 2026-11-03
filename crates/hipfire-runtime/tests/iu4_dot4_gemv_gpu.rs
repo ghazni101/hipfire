@@ -83,6 +83,10 @@ fn run(
     }
     gpu.hip.device_synchronize().unwrap();
     let out = gpu.download_f32(&y).unwrap();
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "{which} m={m} k={k}: non-finite output"
+    );
     gpu.free_tensor(y).ok();
     out
 }
@@ -172,6 +176,9 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
     assert!(r_con < 1e-5, "{label}: dot4 vs CPU contract {r_con:.3e}");
     assert_eq!(det, 0, "{label}: dot4 not deterministic");
     assert!(r4r < 1e-6, "{label}: residual != plain + seed ({r4r:.3e})");
+    // dot8 vs f64 is reported, not gated: it measures int4 activation-quant
+    // error (0.4 on heavy-tailed x at m=1), not kernel correctness. dot8's
+    // contract gate is `gemv_iu4_dot8` in iu_quant_gemv_gpu.rs.
     w.contract = w.contract.max(r_con);
     w.d4 = w.d4.max(r4);
     w.d8 = w.d8.max(r8);

@@ -99,6 +99,14 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
     let single = gpu.download_f32(&y_single).unwrap();
     let batched = gpu.download_f32(&y_batch).unwrap();
     let again = gpu.download_f32(&y_again).unwrap();
+    assert!(
+        single.iter().all(|v| v.is_finite()),
+        "{label} plain m={m} k={k} b={batch}: non-finite singleton output"
+    );
+    assert!(
+        batched.iter().all(|v| v.is_finite()),
+        "{label} plain m={m} k={k} b={batch}: non-finite x-batch output"
+    );
     let rel = max_rel(&batched, &single);
     assert_eq!(
         bits_differ(&batched, &again),
@@ -131,6 +139,14 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
     gpu.hip.device_synchronize().unwrap();
     let single = gpu.download_f32(&r_single).unwrap();
     let batched = gpu.download_f32(&r_batch).unwrap();
+    assert!(
+        single.iter().all(|v| v.is_finite()),
+        "{label} residual m={m} k={k} b={batch}: non-finite singleton output"
+    );
+    assert!(
+        batched.iter().all(|v| v.is_finite()),
+        "{label} residual m={m} k={k} b={batch}: non-finite x-batch output"
+    );
     let rel = max_rel(&batched, &single);
     eprintln!(
         "{label} residual m={m} k={k} b={batch} bitdiff={} max_rel={rel:.3e}",

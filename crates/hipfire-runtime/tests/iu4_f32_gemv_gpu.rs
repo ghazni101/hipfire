@@ -96,6 +96,11 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&y_mq).unwrap();
     let b = gpu.download_f32(&y_iu).unwrap();
+    assert!(
+        b.iter().all(|v| v.is_finite()),
+        "{} plain m={m} k={k}: non-finite output",
+        c.label
+    );
     let diff = bits_equal(&a, &b);
     let want = reference(c.iu, c.x, m, k);
     let (ea, er) = err(&b, &want);
@@ -121,6 +126,11 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&r_mq).unwrap();
     let b = gpu.download_f32(&r_iu).unwrap();
+    assert!(
+        b.iter().all(|v| v.is_finite()),
+        "{} residual m={m} k={k}: non-finite output",
+        c.label
+    );
     let diff = bits_equal(&a, &b);
     let want_r: Vec<f64> = want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect();
     let (ea, er) = err(&b, &want_r);

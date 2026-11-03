@@ -823,12 +823,15 @@ pub enum DType {
     MQ4G256V2,
     /// IU4-G256 (qt=57): MQ4V2 codes in an unsigned-nibble row. Codes occupy
     /// the first `K/2` bytes (low nibble = even K); `(f16 scale, f16 zero)`
-    /// pairs for each 128 weights follow. `K % 256 == 0`, 4.25 bpw. No GPU
-    /// kernel: generic GEMV/GEMM must refuse it. See `hipfire_runtime::iu_quant`.
+    /// pairs for each 128 weights follow. `K % 256 == 0`, 4.25 bpw. Readers:
+    /// `gemv_iu4g256*` (decode) and the `gemm_iu4.rs` prefill family (exact
+    /// gfx1100/gfx1151); the generic GEMV/GEMM families still refuse it. See
+    /// `hipfire_runtime::iu_quant`.
     IU4G256,
     /// IU8-G256 (qt=58): the same codes, one byte `0..=15` per weight
     /// (`K` code bytes, then the same scale plane). 8.25 bpw. The byte is the
-    /// IU8 WMMA operand, not a new 8-bit grid. No GPU kernel yet.
+    /// IU8 WMMA operand, not a new 8-bit grid. Decode GEMV only
+    /// (`gemv_iu8g256*`); no prefill GEMM.
     IU8G256,
     /// IU8-G128 (qt=59): the Q8 grid (signed int8, zero point 0, no FWHT)
     /// with **one f16 scale per 128** stored as a compact row: `K` signed code

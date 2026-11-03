@@ -163,6 +163,10 @@ fn check(
         for t in [y_mq, y_iu, y_iu2] {
             gpu.free_tensor(t).ok();
         }
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n} add={add}: non-finite W4A8 output"
+        );
         let wv: Vec<f64> = if add {
             want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect()
         } else {

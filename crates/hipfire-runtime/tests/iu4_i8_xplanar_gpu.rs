@@ -200,13 +200,17 @@ fn iu4_i8_xplanar_bit_exact() {
                 bits(&mut gpu, &yx2),
             );
             let nd = a.iter().zip(&b).filter(|(p, q)| p != q).count();
-            let nan = a.iter().filter(|v| f32::from_bits(**v).is_nan()).count();
             let det = b == c;
+            assert!(
+                a.iter().all(|v| f32::from_bits(*v).is_finite())
+                    && b.iter().all(|v| f32::from_bits(*v).is_finite()),
+                "gemm m={m} k={k} n={n} add={add}: non-finite output"
+            );
             if nd != 0 || !det {
                 bad += 1;
             }
             eprintln!(
-                "gemm m={m:<6} k={k:<6} n={n:<5} add={} bitdiff={nd}/{} det={det} nan_in_ref={nan}",
+                "gemm m={m:<6} k={k:<6} n={n:<5} add={} bitdiff={nd}/{} det={det}",
                 add as u8,
                 a.len()
             );

@@ -1757,7 +1757,7 @@ impl FeatureFlags {
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
     /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(true) && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+        self.iu4_prefill.unwrap_or(true) && crate::arch_caps::supports_iu4g256_gemm(&self.arch)
     }
     /// True only on exact gfx1201 with the opt-in set. The producer emits
     /// the shared `block_i4_128` recipe, so output is bit-identical to the

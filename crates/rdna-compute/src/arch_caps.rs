@@ -94,6 +94,26 @@ pub fn note_process_gpu_arch(arch: &str) {
     let _ = PROCESS_GPU_ARCH.set(arch.to_string());
 }
 
+/// qt57 (IU4G256) prefill GEMM admission: the W4A4/W4A8/MMQ IU4 GEMM
+/// family in `gemm_iu4.rs`. Every source uses the gfx11 `_w32` WMMA builtins
+/// and is validated on exact gfx1100 and gfx1151 only; gfx12 has the hardware
+/// ([`ArchCaps::has_iu4_wmma`]) but no ported source. CAPABILITY gate (does
+/// the kernel exist and is it validated here). It takes the arch name so the
+/// launchers and every upstream admission predicate (which run on an arch
+/// string, often with no `Gpu` in hand) read this one set.
+pub fn supports_iu4g256_gemm(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1151")
+}
+
+/// qt59 (IU8G32) batched GEMM admission: both the f16-WMMA residual twin
+/// (`gemm_iu8g32_residual_wmma*`) and the IU8-WMMA W8A8 GEMM
+/// (`gemm_iu8g32_w8a8_min`). Both use gfx11 `_w32` builtins and are validated
+/// on exact gfx1100 and gfx1151 only. qt59 decode GEMV and the embedding
+/// gather are arch-free and do not read this.
+pub fn supports_iu8g32_gemm(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1151")
+}
+
 /// The arch recorded at GPU init, if any GPU has been initialized.
 pub fn process_gpu_arch() -> Option<&'static str> {
     PROCESS_GPU_ARCH.get().map(|s| s.as_str())
@@ -893,6 +913,21 @@ mod tests {
             "gfx940", "gfx941", "gfx942", "",
         ] {
             assert!(!make_caps(arch).has_iu4_wmma(), "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn iu_gemm_admission_is_exact_gfx1100_and_gfx1151() {
+        for arch in &["gfx1100", "gfx1151"] {
+            assert!(supports_iu4g256_gemm(arch), "{arch}");
+            assert!(supports_iu8g32_gemm(arch), "{arch}");
+        }
+        for arch in &[
+            "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1152", "gfx1200", "gfx1201", "gfx1030",
+            "gfx1010", "gfx906", "gfx942", "",
+        ] {
+            assert!(!supports_iu4g256_gemm(arch), "{arch:?}");
+            assert!(!supports_iu8g32_gemm(arch), "{arch:?}");
         }
     }
 

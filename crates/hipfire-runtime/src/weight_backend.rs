@@ -736,9 +736,9 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         dtype: DType::MQ2G256V2,
     },
     // qt=57/58: MQ4V2 codes repacked into an IU4 or IU8 operand row
-    // (codes, then per-128 f16 scale/zero). Verbatim upload; generic GEMV/GEMM
-    // refuse them until a kernel exists. Length and IU8 code-range checks are
-    // `iu_quant::validate`.
+    // (codes, then per-128 f16 scale/zero). Verbatim upload; the IU kernels
+    // read them directly and the generic GEMV/GEMM families refuse them by
+    // design. Length and IU8 code-range checks are `iu_quant::validate`.
     RawCodec {
         quant_type: 57,
         dtype: DType::IU4G256,

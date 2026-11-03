@@ -133,6 +133,18 @@ fn check(
         for t in [y_mq, y_iu, z_mq, z_iu, r1, r2] {
             gpu.free_tensor(t).ok();
         }
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n} add={add}: non-finite W4A4 output"
+        );
+        assert!(
+            zb.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n}: non-finite MW-LDS output"
+        );
+        assert!(
+            ra.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n} add={add}: non-finite routed output"
+        );
         let wv: Vec<f64> = if add {
             want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect()
         } else {
@@ -169,6 +181,10 @@ fn check(
         assert_eq!(ddet, 0, "{label}: routed call not deterministic");
         assert!(ea4 < 0.30, "{label} a4 rel {ea4:.3e}");
         assert!(emw < 1e-2, "{label} mwl rel {emw:.3e}");
+        // Routed tolerance follows the route: MW-LDS below m=128 (1e-2), W4A4
+        // at/above it (0.30).
+        let routed_tol = if route == "mwl" { 1e-2 } else { 0.30 };
+        assert!(er < routed_tol, "{label} routed rel {er:.3e}");
     }
     w.cases += 1;
     for t in [wm, wi, xd] {
