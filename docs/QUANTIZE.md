@@ -45,7 +45,7 @@ grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
 CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
 further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
 `mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, `iu4`, `iu8`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
-`hipfire-quantize` directly. `iu4` / `iu8` follow the MQ4V2 tensor map for the body. The bare name is the normal rung (embeddings and `lm_head` as qt 59 `IU8G32`); `--tier xt` leaves `lm_head` on the body and `--tier pro` also lifts `ssm_out`. qt 57 has a decode GEMV; prefill and qt 58/59 still have no kernel ([quant-formats/iu.md](quant-formats/iu.md)).
+`hipfire-quantize` directly. `iu4` / `iu8` follow the MQ4V2 tensor map for the body. The bare name is the normal rung (embeddings and `lm_head` as qt 59 `IU8G32`); `--tier xt` leaves `lm_head` on the body and `--tier pro` also lifts `ssm_out`. qt 57 has a decode GEMV and a W4A4 WMMA prefill; qt 59 has a decode GEMV, the embedding gather and a W8A8 (IU8 WMMA) prefill; qt 58 still has no prefill kernel ([quant-formats/iu.md](quant-formats/iu.md)).
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
 (`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays), product-tier

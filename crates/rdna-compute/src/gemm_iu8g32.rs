@@ -44,7 +44,7 @@ fn iu8g32_m2_enabled() -> bool {
 impl Gpu {
     /// Whether [`Gpu::gemm_iu8g32_residual_wmma`] can run here (gfx11 WMMA).
     pub fn iu8g32_wmma_eligible(&self, k: usize) -> bool {
-        k > 0 && k % 32 == 0 && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+        k > 0 && k % 128 == 0 && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
 
     /// `Y += W X` for one IU8G32 matrix (`m` rows, `k` cols, `n` tokens).
@@ -62,7 +62,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_iu8g32_residual_wmma: needs gfx1100/gfx1151 and K%32==0 (arch {}, K={k})",
+                    "gemm_iu8g32_residual_wmma: needs gfx1100/gfx1151 and K%128==0 (arch {}, K={k})",
                     self.arch
                 ),
             ));
@@ -102,7 +102,7 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
         ];
-        let bytes = m * (k / 32) * 34 + n * k * 2 + n * m * 4 * 2;
+        let bytes = m * (k + k / 64) + n * k * 2 + n * m * 4 * 2;
         let grid_y = if mb4 { (n + 63) / 64 } else { (n + 15) / 16 };
         let grid_x = if m2 { (m + 31) / 32 } else { (m + 15) / 16 };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", sym, bytes);
@@ -131,8 +131,9 @@ impl Gpu {
 
     /// Minimal LDS-tiled W8A8 launch for a planar int8-per-128 weight row
     /// `[K codes][K/128 f16 scales]` and `block_i8_128` activations. The
-    /// caller supplies the pre-quantized X pointer. Diagnostic/microbenchmark
-    /// entry until the format and loader land.
+    /// caller supplies the pre-quantized X pointer. This is the qt59 prefill
+    /// path: the singleton batched body and the multi-slot body both route
+    /// residual roles here when K % 256 == 0.
     pub fn gemm_iu8g32_w8a8_min(
         &mut self,
         a: &GpuTensor,

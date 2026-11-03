@@ -4,11 +4,11 @@
 //
 // Decode GEMV for IU8G32 (qt 59), the lifted-role tier of an iu4/iu8 file.
 //
-// The grid is Q8F16's (signed int8 codes, one f16 scale per 32, no FWHT), but
-// the row stores its scales at the tail so the code plane is one contiguous
-// operand:
+// The grid is Q8F16's (signed int8 codes, no FWHT), but the compact row
+// carries ONE f16 scale per 128 at the tail so the code plane is one
+// contiguous operand:
 //
-//   [K signed codes][f16 scale] * (K / 32)
+//   [K signed codes][K / 128 f16 scales]
 //
 // The math is Q8F16's, element for element: one wave per row, thread `t`
 // folds element `t` of every 32-block and the warp reduces by shuffle, so

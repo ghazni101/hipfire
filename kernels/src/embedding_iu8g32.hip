@@ -5,7 +5,7 @@
 // IU8G32 (qt 59) embedding lookup: dequantize one row on GPU, output F32.
 //
 // This is the Q8 grid in the planar layout the iu4/iu8 products lift their
-// embeddings onto: `[K signed codes][f16 scale] * (K / 32)`, no FWHT. The
+// embeddings onto: `[K signed codes][K / 128 f16 scales]`, no FWHT. The
 // dequantized value is `w = f32(scale) * f32(i8(code))`, identical to
 // `embedding_q8` on the interleaved Q8_0 block.
 

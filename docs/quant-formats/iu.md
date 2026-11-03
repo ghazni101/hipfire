@@ -128,8 +128,10 @@ the int8×int8 `gemv_iu8g32` family.
 
 Norms stay F16. The embedding table is a gather, not a matrix instruction. On the normal rung it is stored this way so a tied `lm_head` is the same buffer the int8 unit can load. Attention and the router are not rungs; on a MoE model the Q8 pin still holds them.
 
-Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. Generic GEMM
-and DFlash refuse qt 57, 58, and 59.
+Q8 and F16 tensors outside an `iu4` / `iu8` file are unchanged. The generic
+GEMM dispatcher refuses qt 57, 58, and 59; DFlash admits qt 59 on exact
+gfx1100/gfx1151 (its verify and draft heads run `gemm_iu8g32_residual_wmma`
+and its noise embedding runs `embedding_lookup_iu8g32`).
 
 ## What runs
 
@@ -138,14 +140,14 @@ and DFlash refuse qt 57, 58, and 59.
 | decode GEMV | `gemv_iu4g256` (`v_dot8_i32_iu4`, RDNA3/RDNA4) | `gemv_iu8g256` (byte plane, `(scale·code + zero)·x`, every arch) | `gemv_iu8g32` (per-128 f16 scale × int8, every arch; `_v2` and `_a8` variants) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g256_residual` | `gemv_iu8g32_residual` |
 | embedding gather | — (the table is qt 59 on every rung) | — | `embedding_iu8g32` |
-| prefill GEMM | — | — | — |
-| DFlash verify | — | — | — |
+| prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`) | — | `gemm_iu8g32_w8a8_min` (IU8 WMMA, W8A8); `gemm_iu8g32_residual_wmma` + mb4/mb4m2 as the small-batch f16 fallback |
+| DFlash verify | — | — | qt 59 head via `gemm_iu8g32_residual_wmma` (gfx1100/gfx1151) |
 
 `hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57,
 `gemv_iu8_dot` (`dequant(Layout::Iu8)` · `x`) for qt 58, and `gemv_q8`
 (`dequant_q8` · `x`) for qt 59. The loaders admit all three dtypes
 (`RAW_CODECS`), and qt 59 embedding tables are admitted raw (one contiguous
 plane + tail scales), so an `iu4` / `iu8` artifact loads and decodes on the
-per-token path. Batched prefill, DFlash and the generic GEMMs still refuse the
-dtypes. A rung's `ssm_out` is a body row on `xt`/base, so that rung takes the
+per-token path. Batched prefill runs qt 57 (W4A4) and qt 59 (W8A8) on the
+archs named above; the generic GEMM dispatcher still refuses all three. A rung's `ssm_out` is a body row on `xt`/base, so that rung takes the
 fused residual twin; there is no `_batched` gather.

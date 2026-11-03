@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Batched IU8G32 (qt 59) embedding lookup: N rows of the planar Q8 table
-// `[K signed codes][f16 scale] * (K / 32)` into `output[n, dim]` F32, token
+// Batched IU8G32 (qt 59) embedding lookup: N rows of the compact table
+// `[K signed codes][K / 128 f16 scales]` into `output[n, dim]` F32, token
 // ids from a device buffer (hipGraph-captureable). Per element identical to
 // `embedding_iu8g32` and to `embedding_q8_batched` on the Q8_0 twin.
 
