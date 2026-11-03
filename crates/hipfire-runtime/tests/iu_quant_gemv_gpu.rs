@@ -121,6 +121,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             .expect("iu4 gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu4 gemv k={k}: non-finite output"
+        );
         let rel = max_rel(&got, &want);
         eprintln!("iu4 gemv      k={k:<5} rel={rel:.3e}");
         assert!(rel <= TOL, "iu4 gemv k={k}: rel {rel:.3e} > {TOL:.0e}");
@@ -131,6 +135,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             .expect("iu4 residual");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yr).expect("download yr");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu4 residual k={k}: non-finite output"
+        );
         let want_r: Vec<f32> = want.iter().zip(&s).map(|(a, b)| a + b).collect();
         let rel = max_rel(&got, &want_r);
         eprintln!("iu4 residual  k={k:<5} rel={rel:.3e}");
@@ -150,6 +158,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         gpu.gemv_iu8g256(&w, &xd, &yd, m, k).expect("iu8 gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8 gemv k={k}: non-finite output"
+        );
         let rel = max_rel(&got, &want);
         eprintln!("iu8 gemv      k={k:<5} rel={rel:.3e}");
         assert!(rel <= TOL, "iu8 gemv k={k}: rel {rel:.3e} > {TOL:.0e}");
@@ -160,6 +172,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             .expect("iu8 residual");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yr).expect("download yr");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8 residual k={k}: non-finite output"
+        );
         let want_r: Vec<f32> = want.iter().zip(&s).map(|(a, b)| a + b).collect();
         let rel = max_rel(&got, &want_r);
         eprintln!("iu8 residual  k={k:<5} rel={rel:.3e}");
@@ -181,6 +197,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         gpu.gemv_iu8g32(&w, &xd, &yd, m, k).expect("gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8g32 gemv k={k}: non-finite output"
+        );
         let want = gemv_q8(&packed, &x, m, k).expect("cpu gemv");
         let rel = max_rel(&got, &want);
         eprintln!("iu8g32 gemv     k={k:<5} rel={rel:.3e}");
@@ -192,6 +212,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             .expect("residual");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yr).expect("download yr");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8g32 residual k={k}: non-finite output"
+        );
         let want_r: Vec<f32> = want.iter().zip(&s).map(|(a, b)| a + b).collect();
         let rel = max_rel(&got, &want_r);
         eprintln!("iu8g32 resid    k={k:<5} rel={rel:.3e}");
@@ -206,6 +230,10 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             .expect("gather");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&out).expect("download row");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8g32 gather k={k}: non-finite output"
+        );
         let deq = dequant_q8(&packed, m, k).expect("cpu dequant");
         let want = &deq[tok * k..(tok + 1) * k];
         let max_abs = got
@@ -216,6 +244,45 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         eprintln!("iu8g32 gather  k={k:<5} max_abs={max_abs:.3e}");
         assert!(max_abs <= 1e-5, "gather k={k}: max_abs {max_abs:.3e}");
 
+        // Batched gather (the prefill and multi-slot embedding): repeated,
+        // first and last rows, each against the same CPU dequant.
+        let toks = [3u32, 0, 4, 3, 1];
+        let tok_bytes: Vec<u8> = toks.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let ids = gpu
+            .upload_raw(&tok_bytes, &[toks.len()])
+            .expect("upload ids");
+        let outb = gpu
+            .upload_f32(&vec![f32::NAN; toks.len() * k], &[toks.len() * k])
+            .expect("alloc rows");
+        gpu.embedding_lookup_iu8g32_batched(&table, &outb, &ids, toks.len(), k)
+            .expect("batched gather");
+        gpu.hip.device_synchronize().expect("sync");
+        let got = gpu.download_f32(&outb).expect("download rows");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "iu8g32 batched gather k={k}: non-finite (unwritten) output"
+        );
+        let max_abs = toks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &t)| {
+                let t = t as usize;
+                got[i * k..(i + 1) * k]
+                    .iter()
+                    .zip(&deq[t * k..(t + 1) * k])
+                    .map(|(a, b)| (a - b).abs())
+                    .collect::<Vec<_>>()
+            })
+            .fold(0.0f32, f32::max);
+        eprintln!("iu8g32 gatherB k={k:<5} max_abs={max_abs:.3e}");
+        assert!(
+            max_abs <= 1e-5,
+            "batched gather k={k}: max_abs {max_abs:.3e}"
+        );
+
+        for t in [ids, outb] {
+            gpu.free_tensor(t).ok();
+        }
         for t in [w, xd, yd, yr, table, out] {
             gpu.free_tensor(t).ok();
         }

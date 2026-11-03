@@ -156,7 +156,8 @@ as an integer-matrix operand (qt 57 or qt 58), so the product name has to say
 so. The three rungs are the same roles: the bare name lifts embeddings and
 `lm_head`, `-xt` leaves `lm_head` on the body, ` pro` also lifts `ssm_out`.
 What a rung lifts *to* is IU8G32 (qt 59), the Q8 grid with one f16 scale per
-128 at the row tail, not a new numeric grid. conv1d stays on that grid at every rung. Norms
+128 at the row tail, not a new numeric grid. `conv1d` is a 3-D tensor, so it
+stays interleaved Q8F16 (qt 3) at every rung rather than IU8G32. Norms
 stay F16. Lifting attention is still not a rung.
 
 Codec bpw is 4.25 for an IU4 body row and 8.25 for an IU8 body row. Model bpw

@@ -13,7 +13,7 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
     // layout; aliasing it would run that kernel and return noise.
     if dtype.is_iu_quant() {
         panic!(
-            "fused_gate_up_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            "fused_gate_up_key_for: {} has no generic fused key — IU operand layouts run through their own IU kernels",
             dtype.iu_quant_name().unwrap_or("IU")
         );
     }
@@ -63,7 +63,7 @@ pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
 pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     if dt.is_iu_quant() {
         panic!(
-            "fused_qkvza_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            "fused_qkvza_key_for: {} has no generic fused key — IU operand layouts run through their own IU kernels",
             dt.iu_quant_name().unwrap_or("IU")
         );
     }
@@ -91,7 +91,7 @@ pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
     if dt.is_iu_quant() {
         panic!(
-            "fused_qkv_key_for: {} has no fused key — no GPU kernel reads the IU operand layouts",
+            "fused_qkv_key_for: {} has no generic fused key — IU operand layouts run through their own IU kernels",
             dt.iu_quant_name().unwrap_or("IU")
         );
     }

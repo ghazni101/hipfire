@@ -85,6 +85,10 @@ fn run(
     gpu.gemv_iu8g32_named(f, w, x, &y, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let out = gpu.download_f32(&y).unwrap();
+    assert!(
+        out.iter().all(|v| v.is_finite()),
+        "{f} m={m} k={k}: non-finite output"
+    );
     gpu.free_tensor(y).ok();
     out
 }

@@ -12,6 +12,9 @@
 //! 3. MMQ vs f64 reference of the CPU dequant weights (Q8_1 activations, so
 //!    a loose bound): max abs / rel reported.
 //!
+//! The test pins `HIPFIRE_IU4_PREFILL_ACT=a8q` and `HIPFIRE_IU4_SMALLM=mmq`
+//! (the default a4 / small-M routes are gated by `iu4_w4a4_gemm_gpu`).
+//!
 //! M in {1, 7, 129, 256}, N in {1, 2, 63, 64, 65, 128, 130, 512}, K covering
 //! G mod 4 = 0..3. Optional real tensors: `IU4_REAL=` / `MQ_REAL=`.
 //!
@@ -150,6 +153,14 @@ fn check(
             want.clone()
         };
         let diff = bits_diff(a, b);
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n} add={add}: non-finite MMQ output"
+        );
+        assert!(
+            t.iter().all(|v| v.is_finite()),
+            "{label} m={m} k={k} n={n} add={add}: non-finite per-token output"
+        );
         // Relative error is normalised by max|W x| (the GEMM output), not by
         // max|seed + W x|: the add seed can cancel W x and would inflate rel.
         let sc = want.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-12);
@@ -182,6 +193,12 @@ fn check(
 #[test]
 #[ignore]
 fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
+    // Since C10/C13 the routed `gemm_iu4g256` defaults to W4A4 (a4) and small-M
+    // WMMA, neither of which is the Q8_1 MMQ this test pins; pin that route
+    // before the first flag read (each is a process-wide OnceLock), so the
+    // gate tests what its name says instead of failing on the default route.
+    std::env::set_var("HIPFIRE_IU4_PREFILL_ACT", "a8q");
+    std::env::set_var("HIPFIRE_IU4_SMALLM", "mmq");
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {

@@ -1904,6 +1904,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU8G32L` | crates/rdna-compute/src/gemm_iu8g32.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU8G32_M2` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8G32_MB4` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
+| `HIPFIRE_IU8G32_W8A8` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8_GEMV` | crates/hipfire-runtime/tests/iu8g32_v2_gemv_gpu.rs, crates/rdna-compute/src/gemv_iu8.rs | developer |
 | `HIPFIRE_JINJA_CHAT` | benchmarks/prompts/mtpfloor/generate.py, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | stable |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
@@ -2730,7 +2731,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SKIP_LLAMA_COMMIT_CHECK` | crates/hipfire-runtime/src/eval_common.rs | developer |
 | `HIPFIRE_SLOTS_ATTN_CROSSOVER` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | developer |
-| `HIPFIRE_SLOTS_IU8_W8A8` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
 | `HIPFIRE_SLOTS_ORACLE_DRAFT` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOTS_ORACLE_DUMP` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-cli/src/serve/mod.rs | developer |
