@@ -3,8 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Numerics gate for the IU4G256 W4A4 prefill route (`HIPFIRE_IU4_PREFILL_ACT`
-//! default `a4`) and the small-M MW-LDS route (`HIPFIRE_IU4_SMALLM` default
-//! `wmma`).
+//! default `a4`) and the small-M MW-LDS route (projections with M < 128).
 //!
 //! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g256_w4a4_prequant` returns
 //!    the bits of `gemm_mq4g256v2_mmq_{set,add}_prequant_iu4` on `src` over

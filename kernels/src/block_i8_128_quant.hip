@@ -120,13 +120,6 @@ __device__ __forceinline__ void quantize_block_i8_128_wave_linear_to(
     }
 }
 
-// I8_XPLANAR (C15, IU4 W4A8 only): same bytes, re-laid per K128 block kb as
-// one N*136 B chunk at kb*N*136 = [N x 128 B qs plane][N x 8 B (d, s) plane],
-// so every token's qs starts 128 B aligned (given N % 16 == 0 and an aligned
-// base) instead of at 136*T + 8.
-#define I8X_QS(Y, kb, tok, N) ((signed char*)(Y) + (long long)(kb) * (N) * 136 + (long long)(tok) * 128)
-#define I8X_HDR(Y, kb, tok, N) ((char*)(Y) + (long long)(kb) * (N) * 136 + (long long)(N) * 128 + (long long)(tok) * 8)
-
 // Standalone quantizer: same (X, Y, K, N) contract as
 // quantize_int4_mmq_ds128 (block (256,1,1), each thread 4 floats). Folded
 // 1-D launch, grid [((K+1023)/1024) * N, 1, 1]: token = blockIdx.x /
@@ -172,13 +165,8 @@ extern "C" __global__ void quantize_int8_mmq_ds128(
     const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
 
     const int kblock = i0 / 128;
-#ifdef I8_XPLANAR
-    char* hdr = I8X_HDR(Y, kblock, token, N);
-    quantize_block_i8_128_wave_to(xv, I8X_QS(Y, kblock, token, N), (float*)hdr, (int*)(hdr + 4), lane);
-#else
     block_i8_128* out = Y + (long long)kblock * N + token;
     quantize_block_i8_128_wave(xv, out, lane);
-#endif
 }
 #endif // HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE
 

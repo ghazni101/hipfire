@@ -353,7 +353,6 @@ pub fn batch_chunk_delta_net_input_projection(
     gdn: Option<&rdna_compute::F2GdnTargets<'_>>,
     math: DenseBatchMath,
 ) -> HipResult<bool> {
-    gpu.iu4_role = Gpu::IU4_ROLE_DQKV;
     let _ = fusion;
     let math = math.resolve(gpu, "batch_chunk_delta_net_input_projection")?;
     // IU4 verify keeps the plain SET consumers: the fused QKVZ + GDN-prep
@@ -1574,7 +1573,6 @@ pub fn batch_chunk_delta_net_output_projection(
     x_fmt: GdnScanOut,
     math: DenseBatchMath,
 ) -> HipResult<()> {
-    gpu.iu4_role = Gpu::IU4_ROLE_DO;
     let math = math.resolve(gpu, "batch_chunk_delta_net_output_projection")?;
     if math == DenseBatchMath::SingletonWmma {
         require_singleton_wmma_mq4v2("batch_chunk_delta_net_output_projection", &[layer.wo.dtype])?;

@@ -2,23 +2,22 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 batched (prefill) GEMM `gemm_iu4g256_multi`.
+//! Numerics gate for the IU4G256 per-token prefill fallback
+//! `gemm_iu4g256_pertoken` (graph capture / recording, non-gfx11 archs, and
+//! `HIPFIRE_IU4_PREFILL=gemv`): set and add, it equals `gemv_iu4g256` per row
+//! bit for bit and matches an f64 reference of the CPU dequant weights.
 //!
-//! 1. Bit-exact: on `repack_mq4v2(src)` the IU4 MMQ kernel returns exactly
-//!    the bits of `gemm_mq4g256v2_mmq_{set,add}_prequant` on `src` over the
-//!    same quantized X (set and add, all six entry variants via M/N tails).
-//! 2. Per-token fallback: `gemm_iu4g256_pertoken` equals `gemv_iu4g256` per
-//!    row bit for bit, and both are compared to an f64 reference.
-//! 3. MMQ vs f64 reference of the CPU dequant weights (Q8_1 activations, so
-//!    a loose bound): max abs / rel reported.
-//!
-//! The test pins `HIPFIRE_IU4_PREFILL_ACT=a8q` and `HIPFIRE_IU4_SMALLM=mmq`
-//! (the default a4 / small-M routes are gated by `iu4_w4a4_gemm_gpu`).
+//! Until the IU knob cleanup this file was `iu4_mmq_gemm_gpu` and also pinned
+//! the `a8q` prefill activation and the small-M MMQ arm to gate the IU4 Q8_1
+//! MMQ (`gemm_iu4g256_mmq*`, an IU4-addressed build of the MQ4V2 Q8_1 MMQ)
+//! bit-exact against MQ4V2. That route lost (27B pp512 1053 vs a4 1460 tok/s,
+//! C11a) and was removed with its kernels; the default a4 / a8 / small-M
+//! routes are gated by `iu4_w4a4_gemm_gpu` and `iu4_w4a8_i8_gemm_gpu`.
 //!
 //! M in {1, 7, 129, 256}, N in {1, 2, 63, 64, 65, 128, 130, 512}, K covering
-//! G mod 4 = 0..3. Optional real tensors: `IU4_REAL=` / `MQ_REAL=`.
+//! G mod 4 = 0..3. Optional real tensors: `IU4_REAL=<.iu4p>`.
 //!
-//!   cargo test -p hipfire-runtime --release --test iu4_mmq_gemm_gpu -- --ignored --nocapture
+//!   cargo test -p hipfire-runtime --release --test iu4_pertoken_gemm_gpu -- --ignored --nocapture
 
 use half::f16;
 use hipfire_runtime::iu_quant::{dequant, repack_mq4v2, Layout};
@@ -73,7 +72,6 @@ fn err(got: &[f32], want: &[f64]) -> (f64, f64) {
 
 #[derive(Default)]
 struct Worst {
-    mmq_rel: f64,
     tok_rel: f64,
     cases: usize,
 }
@@ -82,7 +80,6 @@ struct Worst {
 fn check(
     gpu: &mut Gpu,
     label: &str,
-    mq: &[u8],
     iu: &[u8],
     m: usize,
     k: usize,
@@ -92,34 +89,17 @@ fn check(
 ) {
     let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
     let seed: Vec<f32> = (0..n * m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
-    let wm = gpu.upload_raw(mq, &[mq.len()]).unwrap();
     let wi = gpu.upload_raw(iu, &[iu.len()]).unwrap();
     let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
     let mut outs = Vec::new();
     for add in [false, true] {
-        let y_mq = gpu.upload_f32(&seed, &[n * m]).unwrap();
-        let y_iu = gpu.upload_f32(&seed, &[n * m]).unwrap();
         let y_tok = gpu.upload_f32(&seed, &[n * m]).unwrap();
-        // The oracle: MQ4V2 MMQ over the same quantized X.
-        let xq = gpu.ensure_q8_1_mmq_x128(&xd, n, k).unwrap();
-        if add {
-            gpu.gemm_mq4g256v2_mmq_add_prequant(&wm, xq, &y_mq, m, k, n)
-                .unwrap();
-        } else {
-            gpu.gemm_mq4g256v2_mmq_set_prequant(&wm, xq, &y_mq, m, k, n)
-                .unwrap();
-        }
-        gpu.gemm_iu4g256(&wi, &xd, &y_iu, m, k, n, add).unwrap();
         gpu.gemm_iu4g256_pertoken(&[(&wi, &y_tok, m)], &xd, k, n, add)
             .unwrap();
         gpu.hip.device_synchronize().unwrap();
-        let a = gpu.download_f32(&y_mq).unwrap();
-        let b = gpu.download_f32(&y_iu).unwrap();
         let t = gpu.download_f32(&y_tok).unwrap();
-        outs.push((add, a, b, t));
-        for tt in [y_mq, y_iu, y_tok] {
-            gpu.free_tensor(tt).ok();
-        }
+        outs.push((add, t));
+        gpu.free_tensor(y_tok).ok();
     }
     // f64 reference.
     let wd = dequant(iu, m, k, Layout::Iu4).expect("dequant");
@@ -142,21 +122,16 @@ fn check(
         gpu.gemv_iu4g256(&wi, &xt, &yt, m, k).unwrap();
         gpu.hip.device_synchronize().unwrap();
         let g = gpu.download_f32(&yt).unwrap();
-        tok_vs_gemv += bits_diff(&g, &outs[0].3[t * m..(t + 1) * m]);
+        tok_vs_gemv += bits_diff(&g, &outs[0].1[t * m..(t + 1) * m]);
         gpu.free_tensor(xt).ok();
         gpu.free_tensor(yt).ok();
     }
-    for (add, a, b, t) in &outs {
+    for (add, t) in &outs {
         let want_v: Vec<f64> = if *add {
             want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect()
         } else {
             want.clone()
         };
-        let diff = bits_diff(a, b);
-        assert!(
-            b.iter().all(|v| v.is_finite()),
-            "{label} m={m} k={k} n={n} add={add}: non-finite MMQ output"
-        );
         assert!(
             t.iter().all(|v| v.is_finite()),
             "{label} m={m} k={k} n={n} add={add}: non-finite per-token output"
@@ -164,20 +139,13 @@ fn check(
         // Relative error is normalised by max|W x| (the GEMM output), not by
         // max|seed + W x|: the add seed can cancel W x and would inflate rel.
         let sc = want.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-12);
-        let (ea, _) = err(b, &want_v);
         let (ta, _) = err(t, &want_v);
-        let (er, tr) = (ea / sc, ta / sc);
-        w.mmq_rel = w.mmq_rel.max(er);
+        let tr = ta / sc;
         w.tok_rel = w.tok_rel.max(tr);
         eprintln!(
-            "{label:<26} m={m:<6} k={k:<6} n={n:<4} {} bitdiff_vs_mq4v2_mmq={diff} mmq_abs={ea:.3e} mmq_rel={er:.3e} tok_abs={ta:.3e} tok_rel={tr:.3e}",
+            "{label:<26} m={m:<6} k={k:<6} n={n:<4} {} tok_abs={ta:.3e} tok_rel={tr:.3e}",
             if *add { "add" } else { "set" }
         );
-        assert_eq!(
-            diff, 0,
-            "{label} m={m} k={k} n={n} add={add}: IU4 MMQ differs from MQ4V2 MMQ"
-        );
-        assert!(er < 3e-2, "{label} mmq rel {er:.3e}");
         assert!(tr < 1e-4, "{label} per-token rel {tr:.3e}");
     }
     assert_eq!(
@@ -185,20 +153,14 @@ fn check(
         "{label}: per-token path differs from gemv_iu4g256"
     );
     w.cases += 1;
-    for tt in [wm, wi, xd] {
+    for tt in [wi, xd] {
         gpu.free_tensor(tt).ok();
     }
 }
 
 #[test]
 #[ignore]
-fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
-    // Since C10/C13 the routed `gemm_iu4g256` defaults to W4A4 (a4) and small-M
-    // WMMA, neither of which is the Q8_1 MMQ this test pins; pin that route
-    // before the first flag read (each is a process-wide OnceLock), so the
-    // gate tests what its name says instead of failing on the default route.
-    std::env::set_var("HIPFIRE_IU4_PREFILL_ACT", "a8q");
-    std::env::set_var("HIPFIRE_IU4_SMALLM", "mmq");
+fn iu4_pertoken_gemm_matches_gemv_and_reference() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -206,10 +168,6 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
             return;
         }
     };
-    if !gpu.iu4g256_mmq_eligible(256, 64) {
-        eprintln!("SKIP — IU4 MMQ not eligible on this arch / env.");
-        return;
-    }
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
     let mut w = Worst::default();
     for &m in &[1usize, 7, 129, 256] {
@@ -217,14 +175,13 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
             let mq = mq4v2_random(&mut rng, m, k);
             let iu = repack_mq4v2(&mq, m, k, Layout::Iu4).unwrap();
             for &n in &[1usize, 2, 63, 64, 65, 128, 130, 512] {
-                check(&mut gpu, "random", &mq, &iu, m, k, n, &mut rng, &mut w);
+                check(&mut gpu, "random", &iu, m, k, n, &mut rng, &mut w);
             }
         }
     }
-    if let (Ok(iu_path), Ok(mq_path)) = (std::env::var("IU4_REAL"), std::env::var("MQ_REAL")) {
+    if let Ok(iu_path) = std::env::var("IU4_REAL") {
         use hipfire_runtime::hfq::HfqFile;
         let iu_f = HfqFile::open(std::path::Path::new(&iu_path)).unwrap();
-        let mq_f = HfqFile::open(std::path::Path::new(&mq_path)).unwrap();
         let mut seen = std::collections::BTreeSet::new();
         let mut done = 0;
         for t in iu_f.tensors().to_vec() {
@@ -237,7 +194,6 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
             if !seen.insert((k, m)) || m > 20_000 {
                 continue;
             }
-            let (_, mb) = mq_f.tensor_data(&t.name).unwrap();
             let label: String = format!(
                 "real:{}",
                 t.name
@@ -250,7 +206,7 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
                     .collect::<String>()
             );
             for &n in &[1usize, 77, 512] {
-                check(&mut gpu, &label, mb, ib, m, k, n, &mut rng, &mut w);
+                check(&mut gpu, &label, ib, m, k, n, &mut rng, &mut w);
             }
             done += 1;
             if done >= 6 {
@@ -259,7 +215,7 @@ fn iu4_mmq_gemm_is_bit_exact_to_mq4v2_mmq() {
         }
     }
     eprintln!(
-        "PASS cases={} worst_mmq_rel_vs_f64={:.3e} worst_pertoken_rel_vs_f64={:.3e}",
-        w.cases, w.mmq_rel, w.tok_rel
+        "PASS cases={} worst_pertoken_rel_vs_f64={:.3e}",
+        w.cases, w.tok_rel
     );
 }

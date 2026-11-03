@@ -123,25 +123,17 @@ impl Gpu {
     }
 }
 
-/// `HIPFIRE_IU8_GEMV=v1` keeps the original one-byte-per-lane kernel (A/B).
+/// `HIPFIRE_IU8_GEMV=v1` keeps the original one-byte-per-lane kernel (A/B);
+/// anything else = v2 (f32 x). Read once.
 fn iu8g32_v1_forced() -> bool {
-    iu8g32_mode() == 1
-}
-
-/// `HIPFIRE_IU8_GEMV`: `v1` (original wave-per-row), `dot4` (W8A8 int8
-/// activation per 32, `v_dot4_i32_iu8`), anything else = v2 (f32 x).
-/// 0 = v2, 1 = v1, 2 = dot4. Read once.
-fn iu8g32_mode() -> u8 {
-    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_IU8_GEMV")
-            .ok()
-            .as_deref()
-        {
-            Some("v1") => 1,
-            Some("dot4") => 2,
-            _ => 0,
-        }
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_IU8_GEMV")
+                .ok()
+                .as_deref(),
+            Some("v1")
+        )
     })
 }
 
@@ -168,16 +160,6 @@ fn iu8g32_pick(
     } else {
         1
     };
-    if iu8g32_mode() == 2 {
-        return match (add, r) {
-            (false, 4) => "gemv_iu8g32_a8_r4",
-            (false, 2) => "gemv_iu8g32_a8_r2",
-            (false, _) => "gemv_iu8g32_a8_r1",
-            (true, 4) => "gemv_iu8g32_a8_residual_r4",
-            (true, 2) => "gemv_iu8g32_a8_residual_r2",
-            (true, _) => "gemv_iu8g32_a8_residual_r1",
-        };
-    }
     match (add, r) {
         (false, 4) => "gemv_iu8g32_v2_r4",
         (false, 2) => "gemv_iu8g32_v2_r2",
