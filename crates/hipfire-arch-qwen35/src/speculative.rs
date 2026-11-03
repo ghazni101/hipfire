@@ -312,7 +312,7 @@ pub(crate) fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bo
     matches!(
         dtype,
         rdna_compute::DType::Q8_0
-            | rdna_compute::DType::IU8G128
+            | rdna_compute::DType::IU8G32
             | rdna_compute::DType::HFQ4G256
             | rdna_compute::DType::MQ4G256
             | rdna_compute::DType::MQ4G256V2
@@ -349,7 +349,7 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
         }
-        rdna_compute::DType::IU8G128 => {
+        rdna_compute::DType::IU8G32 => {
             // qt59 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
             // WMMA residual kernel, so seed the slice the residual adds to.
             gpu.hip.memset(&logits_batch.buf, 0, b * vocab * 4)?;
@@ -7753,24 +7753,14 @@ fn draft_dflash_forward_rank(
     if !build_dflash_noise_embeddings_weights(gpu, target_weights, block, h, draft_scratch)? {
         for (i, &tok) in block.iter().enumerate() {
             let dst = draft_scratch.x.sub_offset(i * h, h);
-            match target_weights.embd_format {
-                llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::IU8G128 => {
-                    gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
-                }
-                llama::EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
-                }
-                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
-            }
+            llama::embedding_lookup_dispatch(
+                gpu,
+                target_weights.embd_format,
+                &target_weights.token_embd,
+                &dst,
+                tok,
+                h,
+            )?;
         }
     }
     let effective_ctx_len = match ctx_slice {
@@ -7834,7 +7824,7 @@ pub(crate) fn draft_lmhead_batched(
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, hidden_rows, logits_batch, batch)?;
         }
-        rdna_compute::DType::IU8G128 => {
+        rdna_compute::DType::IU8G32 => {
             gpu.hip.memset(&logits_batch.buf, 0, batch * w_out.m * 4)?;
             gpu.gemm_iu8g32_residual_wmma(
                 &w_out.buf,
@@ -8434,24 +8424,14 @@ fn draft_dflash_forward_head_batched(
                     draft_cfg.mask_token_id
                 };
                 let dst = shared.x.sub_offset((off + i) * h, h);
-                match target_weights.embd_format {
-                    llama::EmbeddingFormat::HFQ4G256 => {
-                        gpu.embedding_lookup_hfq4g256(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::HFQ4G128 => {
-                        gpu.embedding_lookup_hfq4g128(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::Q8_0 => {
-                        gpu.embedding_lookup_q8(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::IU8G128 => {
-                        gpu.embedding_lookup_iu8g32(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    llama::EmbeddingFormat::F32 => {
-                        gpu.embedding_lookup(&target_weights.token_embd, &dst, tok, h)?
-                    }
-                    _ => return err("unsupported target embedding format for noise lookup".into()),
-                }
+                llama::embedding_lookup_dispatch(
+                    gpu,
+                    target_weights.embd_format,
+                    &target_weights.token_embd,
+                    &dst,
+                    tok,
+                    h,
+                )?;
             }
             off += l.b;
         }
@@ -11320,24 +11300,14 @@ fn run_dflash_draft_for_logits(
     // Step 1: D2D embedding lookup per block slot (parallels spec_step_dflash).
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::IU8G128 => {
-                gpu.embedding_lookup_iu8g32(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            _ => panic!("ddtree draft: unsupported target embedding format"),
-        }
+        llama::embedding_lookup_dispatch(
+            gpu,
+            target.weights.embd_format,
+            &target.weights.token_embd,
+            &dst,
+            tok,
+            h,
+        )?;
     }
 
     // Step 2: Positions + optional ctx_slice (identical to spec_step_dflash).
@@ -11655,24 +11625,14 @@ fn run_dflash_draft_for_topk_gpu(
     block[0] = seed_token;
     for (i, &tok) in block.iter().enumerate() {
         let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::IU8G128 => {
-                gpu.embedding_lookup_iu8g32(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            _ => panic!("ddtree draft: unsupported target embedding format"),
-        }
+        llama::embedding_lookup_dispatch(
+            gpu,
+            target.weights.embd_format,
+            &target.weights.token_embd,
+            &dst,
+            tok,
+            h,
+        )?;
     }
     // Stage 1b: positions and hidden-source depend on whether we are using the
     // GPU-resident path (target_hidden_host=None) or the ctx_slice host path.

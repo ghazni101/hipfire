@@ -1051,28 +1051,7 @@ pub fn forward_step(
 
     // Embedding lookup → state.x.
     let dim = cfg.hidden_size;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
-            0,
-            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
-        )),
-    }
+    embed_token_into_x(gpu, weights, &state.x, token, dim)?;
 
     forward_step_after_x(gpu, weights, cfg, state, pos)
 }
@@ -1121,29 +1100,33 @@ pub fn embed_token_row(
     token: u32,
 ) -> HipResult<Vec<f32>> {
     let dim = cfg.hidden_size;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::Q4K => {
-            gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &state.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
+    embed_token_into_x(gpu, weights, &state.x, token, dim)?;
+    gpu.download_f32(&state.x)
+}
+
+/// Single-token embedding lookup into `x`. GGUF-native tables are refused;
+/// every other format goes through the shared `embedding_lookup_dispatch`.
+fn embed_token_into_x(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    x: &GpuTensor,
+    token: u32,
+    dim: usize,
+) -> HipResult<()> {
+    if let EmbeddingFormat::Ggml(_) = weights.embd_format {
+        return Err(hip_bridge::HipError::new(
             0,
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
-        )),
+        ));
     }
-    gpu.download_f32(&state.x)
+    hipfire_runtime::llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        x,
+        token,
+        dim,
+    )
 }
 
 /// Common prefix: bounds-check, upload pos. Returns the position used.
@@ -1740,23 +1723,15 @@ pub fn forward_verify_block_batched(
                 unsafe { std::slice::from_raw_parts(tok_ids.as_ptr() as *const u8, batch * 4) };
             let tok_buf = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 payload
             gpu.hip.memcpy_htod(&tok_buf.buf, tok_bytes)?;
-            match weights.embd_format {
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                    &weights.token_embd,
-                    &x_batch,
-                    &tok_buf,
-                    batch,
-                    dim,
-                )?,
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                    &weights.token_embd,
-                    &x_batch,
-                    &tok_buf,
-                    batch,
-                    dim,
-                )?,
-                _ => unreachable!(),
-            }
+            hipfire_runtime::llama::embedding_lookup_batched_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &x_batch,
+                &tok_buf,
+                batch,
+                dim,
+            )?;
             gpu.free_tensor(tok_buf)?;
         }
         _ => {

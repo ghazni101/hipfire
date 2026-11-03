@@ -28,11 +28,10 @@
 // every other KV mode is refused rather than routed to a legacy arena.
 
 use super::{
-    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible,
-    require_batchable_deltanet_layer, require_batchable_deltanet_moe_layer,
-    require_batchable_fullattn_layer, require_batchable_fullattn_moe_layer,
-    require_batchable_moe_ffn, run_layers_slots, slots_embed_format_admitted, LayerKvAddr,
-    SlotKvTier,
+    final_logits_per_slot, lm_head_slots_admissible, require_batchable_deltanet_layer,
+    require_batchable_deltanet_moe_layer, require_batchable_fullattn_layer,
+    require_batchable_fullattn_moe_layer, require_batchable_moe_ffn, run_layers_slots,
+    slots_embed_format_admitted, LayerKvAddr, SlotKvTier,
 };
 use crate::carrier::Qwen35Bundle;
 use crate::qwen35::LayerWeights;
@@ -1770,7 +1769,7 @@ fn run_pass(
         .memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
     gpu.hip
         .memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
-    embed_lookup_slots(
+    hipfire_runtime::llama::embedding_lookup_batched_dispatch(
         gpu,
         weights.embd_format,
         &weights.token_embd,

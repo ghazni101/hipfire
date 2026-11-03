@@ -483,23 +483,14 @@ impl Lfm2DecodeBatchState {
                 .map_err(|e| HipError::new(0, &format!("prefill_lane htod pos: {e:?}")))?;
 
             // embedding into h_lane (reuse same buffer as residual stream)
-            match weights.embd_format {
-                hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&weights.embed, &h_lane, tok, hidden)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&weights.embed, &h_lane, tok, hidden)?
-                }
-                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                    gpu.embedding_lookup_hfq4g256(&weights.embed, &h_lane, tok, hidden)?
-                }
-                _ => {
-                    return Err(HipError::new(
-                        0,
-                        "prefill_lane: unsupported embedding format",
-                    ))
-                }
-            }
+            hipfire_runtime::llama::embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.embed,
+                &h_lane,
+                tok,
+                hidden,
+            )?;
 
             // Per-layer stack (reuse existing single-lane helpers inline, operating on lane views).
             for (l, layer) in weights.layers.iter().enumerate() {

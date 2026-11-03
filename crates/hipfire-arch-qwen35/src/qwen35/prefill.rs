@@ -327,7 +327,7 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
         })
 }
 
-/// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G128 projection
+/// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G32 projection
 /// family (qt 57 + qt 59 wo) to the widened ordinary-prefill chunks. The
 /// widened route keeps its 512-row commit seams and runs the same per-layer
 /// kernels on larger n; it is opt-in until its prefill output is pinned
@@ -345,9 +345,9 @@ fn iu4_wide_prefill_requested() -> bool {
 }
 
 /// Every dense projection of an IU4-family artifact: qt 57 (IU4G256)
-/// projections with the qt 59 (IU8G128) out projection, no MoE layers.
+/// projections with the qt 59 (IU8G32) out projection, no MoE layers.
 fn dense_layers_have_iu4_family(weights: &Qwen35Weights) -> bool {
-    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G128);
+    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G32);
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => [
@@ -4705,10 +4705,10 @@ pub fn qwen35_layer_batch_admissible(
                 ("w_up", l.w_up.gpu_dtype),
                 ("w_down", l.w_down.gpu_dtype),
             ] {
-                // qt59 IU8G128 is admitted only as the DeltaNet `wo` (natural
+                // qt59 IU8G32 is admitted only as the DeltaNet `wo` (natural
                 // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
                 let iu8g32_wo = name == "wo"
-                    && dt == DType::IU8G128
+                    && dt == DType::IU8G32
                     && rdna_compute::iu8g32_gemm_admits(arch, l.wo.k);
                 if !iu8g32_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
@@ -5985,7 +5985,7 @@ pub(crate) fn batch_chunk_embed_tokens(
             weights.embd_format,
             EmbeddingFormat::HFQ4G256
                 | EmbeddingFormat::Q8_0
-                | EmbeddingFormat::IU8G128
+                | EmbeddingFormat::IU8G32
                 | EmbeddingFormat::Ggml(_)
         )
     {
@@ -6013,95 +6013,40 @@ pub(crate) fn batch_chunk_embed_tokens(
             for_each_active_span(embed_mask, n, |start, len| {
                 let output = pbs.x_batch.sub_offset(start * dim, len * dim);
                 let token_ids = pbs.tokens.sub_offset(start, len);
-                match weights.embd_format {
-                    EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
-                        dtype,
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    _ => unreachable!(),
-                }
+                llama::embedding_lookup_batched_dispatch(
+                    gpu,
+                    weights.embd_format,
+                    &weights.token_embd,
+                    &output,
+                    &token_ids,
+                    len,
+                    dim,
+                )
             })?;
         } else {
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
-                    dtype,
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                _ => unreachable!(),
-            }
+            llama::embedding_lookup_batched_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?;
         }
     } else if do_embed && !pre_embedded {
         for (i, &tok) in tokens.iter().enumerate() {
             if embed_mask.is_some_and(|mask| (mask >> i) & 1 == 0) {
                 continue;
             }
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => unreachable!(),
-                EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::IU8G128 => unreachable!(),
-                EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Ggml(dtype) => {
-                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
-                }
-                _ => panic!("unsupported embedding format"),
-            }
+            llama::embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &s.x,
+                tok,
+                dim,
+            )?;
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
                 i * dim_row_bytes,
@@ -6910,6 +6855,8 @@ fn forward_prefill_chunk_pair(
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
     for layer_idx in 0..config.n_layers {
+        gpu.iu4_layer = (layer_idx, config.n_layers);
+        gpu.iu4_role = u8::MAX;
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 for (half_pbs, half_start, half_tape) in [
@@ -7802,6 +7749,8 @@ pub(crate) fn forward_batch_chunk_impl(
     let tap = tap_fn.get();
 
     for layer_idx in layer_start..layer_end {
+        gpu.iu4_layer = (layer_idx, config.n_layers);
+        gpu.iu4_role = u8::MAX;
         // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`): names this
         // layer and the chunk's first position for the sealed-MoE hooks; a no-op when both are unset.
         hipfire_dispatch::pipeline::moe_capture::set_site(layer_idx, start_pos);

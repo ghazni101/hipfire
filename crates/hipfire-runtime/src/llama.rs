@@ -668,10 +668,10 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
-    IU8G128,  // raw qt 59 compact rows [K codes][K/128 f16 scales]
     /// GGUF-native table in ggml block bytes (`DType::Ggml*`), dequantised per
     /// row by the ggml get-row kernel of that type.
     Ggml(DType),
+    IU8G32,   // raw qt 59 planar Q8 rows (codes then f16 scales per 32)
 }
 
 /// Single-token embedding lookup, dispatched on the table's storage format.
@@ -689,11 +689,48 @@ pub fn embedding_lookup_dispatch(
     match format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(table, output, token, dim),
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
-        EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32(table, output, token, dim),
+        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32(table, output, token, dim),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
         EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup(dtype, table, output, token, dim),
+    }
+}
+
+/// Batched embedding lookup: `n` rows gathered from `table` into `output`
+/// (`[n, dim]` F32), with the token ids read from the device buffer
+/// `token_ids` (i32 payload). The batched twin of
+/// [`embedding_lookup_dispatch`]; every format with a batched kernel is wired
+/// here once. Every arm reads the ids from device memory, so the call replays
+/// under graph capture. Q4K has no batched kernel and returns an error.
+pub fn embedding_lookup_batched_dispatch(
+    gpu: &mut Gpu,
+    format: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token_ids: &GpuTensor,
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    match format {
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::IU8G32 => {
+            gpu.embedding_lookup_iu8g32_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::Ggml(dtype) => {
+            gpu.ggml_embedding_lookup_batched(dtype, table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::Q4K => Err(hip_bridge::HipError::new(
+            0,
+            "embedding_lookup_batched_dispatch: Q4K has no batched lookup kernel",
+        )),
     }
 }
 
@@ -799,7 +836,7 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
 /// refusal above: qt 59 is unrotated and must never enter an FWHT path.
 #[inline]
 fn reject_unsupported_gemv_dtype(dtype: DType) -> HipResult<()> {
-    if dtype == DType::IU8G128 {
+    if dtype == DType::IU8G32 {
         return Ok(());
     }
     reject_mq4g128v2(dtype)
@@ -2846,49 +2883,25 @@ fn forward_prefill_chunk(
                 unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
         }
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                &weights.token_embd,
-                &pbs.x_batch,
-                &pbs.tokens,
-                n,
-                dim,
-            )?,
-            _ => unreachable!(),
-        }
+        embedding_lookup_batched_dispatch(
+            gpu,
+            weights.embd_format,
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            n,
+            dim,
+        )?;
     } else {
         for (i, &tok) in tokens.iter().enumerate() {
-            match weights.embd_format {
-                EmbeddingFormat::Q4K => {
-                    gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::IU8G128 => {
-                    gpu.embedding_lookup_iu8g32(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Ggml(dtype) => {
-                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {
-                    unreachable!()
-                }
-            }
+            embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &s.x,
+                tok,
+                dim,
+            )?;
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
                 i * dim_row_bytes,
@@ -8689,10 +8702,10 @@ mod tests {
     /// it; the rotation helpers keep refusing the unrotated IU layout.
     #[test]
     fn weight_gemv_admits_qt59_but_not_typed_only_layouts() {
-        assert!(reject_unsupported_gemv_dtype(DType::IU8G128).is_ok());
+        assert!(reject_unsupported_gemv_dtype(DType::IU8G32).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::Q8_0).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::MQ4G128V2).is_err());
-        assert!(reject_mq4g128v2(DType::IU8G128).is_err());
+        assert!(reject_mq4g128v2(DType::IU8G32).is_err());
     }
 
     /// The one-pass replacement gather `gather_pool` must reproduce slot for
