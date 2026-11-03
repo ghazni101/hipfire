@@ -673,6 +673,19 @@ fn slots_iu4_multi(
     add: bool,
 ) -> HipResult<()> {
     let k = projs[0].0.k;
+    // Decode-width rows: the per-token GEMV re-reads every projection's
+    // weight matrix once per slot, which is the whole cost of a multi-slot
+    // decode step (the pipeline is weight-bandwidth bound). The x-batched
+    // GEMV decodes each weight row once for every column and keeps the
+    // singleton's per-row accumulation order, so the step's weight traffic
+    // stops scaling with the number of live slots.
+    if (2..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n) {
+        for &(w, y) in projs {
+            let y_n = y.sub_offset(0, n * w.m);
+            gpu.gemv_iu4g256_xbatch(&w.buf, x, &y_n, w.m, k, n, add)?;
+        }
+        return Ok(());
+    }
     let v: Vec<_> = projs.iter().map(|(w, y)| (&w.buf, *y, w.m)).collect();
     gpu.gemm_iu4g256_multi(&v, x, k, n, add)
 }
