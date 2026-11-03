@@ -6006,95 +6006,40 @@ pub(crate) fn batch_chunk_embed_tokens(
             for_each_active_span(embed_mask, n, |start, len| {
                 let output = pbs.x_batch.sub_offset(start * dim, len * dim);
                 let token_ids = pbs.tokens.sub_offset(start, len);
-                match weights.embd_format {
-                    EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32_batched(
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
-                        dtype,
-                        &weights.token_embd,
-                        &output,
-                        &token_ids,
-                        len,
-                        dim,
-                    ),
-                    _ => unreachable!(),
-                }
+                llama::embedding_lookup_batched_dispatch(
+                    gpu,
+                    weights.embd_format,
+                    &weights.token_embd,
+                    &output,
+                    &token_ids,
+                    len,
+                    dim,
+                )
             })?;
         } else {
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g32_batched(
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup_batched(
-                    dtype,
-                    &weights.token_embd,
-                    &pbs.x_batch,
-                    &pbs.tokens,
-                    n,
-                    dim,
-                )?,
-                _ => unreachable!(),
-            }
+            llama::embedding_lookup_batched_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &pbs.x_batch,
+                &pbs.tokens,
+                n,
+                dim,
+            )?;
         }
     } else if do_embed && !pre_embedded {
         for (i, &tok) in tokens.iter().enumerate() {
             if embed_mask.is_some_and(|mask| (mask >> i) & 1 == 0) {
                 continue;
             }
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => unreachable!(),
-                EmbeddingFormat::HFQ4G128 => {
-                    gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Q8_0 => {
-                    gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::IU8G128 => unreachable!(),
-                EmbeddingFormat::F32 => {
-                    gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?
-                }
-                EmbeddingFormat::Ggml(dtype) => {
-                    gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &s.x, tok, dim)?
-                }
-                _ => panic!("unsupported embedding format"),
-            }
+            llama::embedding_lookup_dispatch(
+                gpu,
+                weights.embd_format,
+                &weights.token_embd,
+                &s.x,
+                tok,
+                dim,
+            )?;
             gpu.hip.memcpy_dtod_at(
                 &pbs.x_batch.buf,
                 i * dim_row_bytes,

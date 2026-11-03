@@ -956,7 +956,7 @@ pub(super) fn decode(
         .flat_map(|&(_, p)| (p as i32).to_ne_bytes())
         .collect();
     gpu.hip.memcpy_htod(&st.pbs.positions.buf, &pos_bytes)?;
-    crate::forward_slots::embed_lookup_slots(
+    hipfire_runtime::llama::embedding_lookup_batched_dispatch(
         gpu,
         weights.embd_format,
         &weights.token_embd,

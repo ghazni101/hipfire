@@ -1324,15 +1324,15 @@ fn embed_device_token_into(
     token_id: &GpuTensor,
     dim: usize,
 ) -> HipResult<()> {
-    match weights.embd_format {
-        llama::EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, out, token_id, 1, dim)
-        }
-        llama::EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
-        }
-        other => panic!("device-token MTP chain does not support embedding format {other:?}"),
-    }
+    llama::embedding_lookup_batched_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        out,
+        token_id,
+        1,
+        dim,
+    )
 }
 
 fn upload_mtp_proposal_graph_inputs(

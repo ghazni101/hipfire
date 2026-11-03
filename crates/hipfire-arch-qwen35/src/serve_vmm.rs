@@ -43,8 +43,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::forward_slots::vmm::{vmm_map_room, VmmLayerKv, VMM_RESERVE_SLACK_ROWS};
 use crate::forward_slots::{
-    advance_slot_seq_lens, embed_lookup_slots, final_logits_per_slot, run_layers_slots,
-    LayerKvAddr, SlotKvTier, SpecVerifyCapture,
+    advance_slot_seq_lens, final_logits_per_slot, run_layers_slots, LayerKvAddr, SlotKvTier,
+    SpecVerifyCapture,
 };
 use crate::qwen35::{
     DeltaNetState, ExtractHiddenCapture, LayerType, PrefillBatchScratch, Qwen35Config,
@@ -721,7 +721,7 @@ impl VmmSlotKv {
         mut spec_capture: Option<&mut SpecVerifyCapture>,
     ) -> HipResult<()> {
         let n = batch.total_rows();
-        embed_lookup_slots(
+        hipfire_runtime::llama::embedding_lookup_batched_dispatch(
             gpu,
             weights.embd_format,
             &weights.token_embd,

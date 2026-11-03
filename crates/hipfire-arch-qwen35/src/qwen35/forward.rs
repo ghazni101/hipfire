@@ -972,23 +972,14 @@ pub fn forward(
 
     // Embedding lookup
     let x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &x, token, dim)?
-        }
-        _ => panic!("unsupported embedding format"),
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
 
     forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
 }
@@ -1950,27 +1941,14 @@ pub fn forward_scratch(
     let gap_started = rdna_compute::gap_timing::begin_forward();
     let embed_started = rdna_compute::gap_timing::now();
     // Embedding lookup into scratch.x (always direct, changes per token)
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, dim)?
-        }
-        _ => panic!("unsupported embedding format"),
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        dim,
+    )?;
     rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::Embed, embed_started);
     // The retained window opens after the embedding: the token row is a
     // per-replay input staged outside the tape, and a launch inside the window
@@ -2130,29 +2108,14 @@ pub fn prepare_scratch_inputs(
     pos: usize,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, config.dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, config.dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, config.dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, config.dim)?
-        }
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, config.dim)?
-        }
-        other => {
-            return Err(HipError::new(
-                0,
-                &format!("unsupported embedding format for Redline: {other:?}"),
-            ));
-        }
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        config.dim,
+    )?;
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
     Ok(())
@@ -2187,27 +2150,14 @@ pub fn forward_scratch_with_hidden(
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, dim)?
-        }
-        _ => panic!("unsupported embedding format"),
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &scratch.x,
+        token,
+        dim,
+    )?;
 
     forward_scratch_layers(
         gpu,
@@ -5639,23 +5589,14 @@ pub fn forward_gpu(
 ) -> HipResult<GpuTensor> {
     let dim = config.dim;
     let x = gpu.alloc_tensor(&[dim], DType::F32)?;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32(&weights.token_embd, &x, token, dim)?
-        }
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &x, token, dim)?
-        }
-        _ => panic!("unsupported embedding format"),
-    }
+    llama::embedding_lookup_dispatch(
+        gpu,
+        weights.embd_format,
+        &weights.token_embd,
+        &x,
+        token,
+        dim,
+    )?;
     forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)
 }
 

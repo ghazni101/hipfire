@@ -2845,25 +2845,7 @@ pub fn forward_ep(
         let w = &weights_per_rank[r];
         let s = &scratch_per_rank[r];
         let gpu = &mut gpus.devices[r];
-        match w.embd_format {
-            EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&w.token_embd, &s.x, token, dim)?
-            }
-            EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&w.token_embd, &s.x, token, dim)?
-            }
-            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&w.token_embd, &s.x, token, dim)?,
-            EmbeddingFormat::IU8G128 => {
-                gpu.embedding_lookup_iu8g32(&w.token_embd, &s.x, token, dim)?
-            }
-            EmbeddingFormat::F32 => gpu.embedding_lookup(&w.token_embd, &s.x, token, dim)?,
-            other => {
-                return Err(HipError::new(
-                    0,
-                    &format!("forward_ep: unsupported embedding format {other:?}"),
-                ));
-            }
-        }
+        llama::embedding_lookup_dispatch(gpu, w.embd_format, &w.token_embd, &s.x, token, dim)?;
         gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
     }
 
@@ -4888,24 +4870,14 @@ pub fn forward_scratch_multi(
     {
         let gpu0 = &mut gpus.devices[0];
         let s0 = &scratch_set.per_device[0];
-        match weights.embd_format {
-            EmbeddingFormat::HFQ4G256 => {
-                gpu0.embedding_lookup_hfq4g256(&weights.token_embd, &s0.x, token, dim)?
-            }
-            EmbeddingFormat::HFQ4G128 => {
-                gpu0.embedding_lookup_hfq4g128(&weights.token_embd, &s0.x, token, dim)?
-            }
-            EmbeddingFormat::Q8_0 => {
-                gpu0.embedding_lookup_q8(&weights.token_embd, &s0.x, token, dim)?
-            }
-            EmbeddingFormat::IU8G128 => {
-                gpu0.embedding_lookup_iu8g32(&weights.token_embd, &s0.x, token, dim)?
-            }
-            EmbeddingFormat::F32 => {
-                gpu0.embedding_lookup(&weights.token_embd, &s0.x, token, dim)?
-            }
-            _ => panic!("unsupported embedding format"),
-        }
+        llama::embedding_lookup_dispatch(
+            gpu0,
+            weights.embd_format,
+            &weights.token_embd,
+            &s0.x,
+            token,
+            dim,
+        )?;
     }
     // pos_buf written to every device's scratch — every band reads it inside
     // RoPE / KV write for FullAttention layers. F1 (review): bind_thread

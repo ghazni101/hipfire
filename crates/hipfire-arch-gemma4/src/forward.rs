@@ -268,30 +268,16 @@ fn embed_lookup(
     gpu: &mut Gpu,
     token_id: u32,
 ) -> Result<(), String> {
-    use hipfire_runtime::llama::EmbeddingFormat;
     let dim = cfg.dim;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("gemma4: embed hfq4g256: {e:?}"))?,
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("gemma4: embed hfq4g128: {e:?}"))?,
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("gemma4: embed q8: {e:?}"))?,
-        EmbeddingFormat::IU8G128 => gpu
-            .embedding_lookup_iu8g32(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("gemma4: embed iu8g32: {e:?}"))?,
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
-            .map_err(|e| format!("gemma4: embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => return Err("gemma4: Q4K embedding format unsupported".to_string()),
-        EmbeddingFormat::Ggml(_) => return Err(
-            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
-                .to_string(),
-        ),
-    }
+    embedding_lookup_to(
+        gpu,
+        weights.embd_format,
+        &weights.embed_tokens,
+        &state.x,
+        token_id,
+        dim,
+        "embed",
+    )?;
     gpu.scale_f32(&state.x, cfg.embed_scale)
         .map_err(|e| format!("gemma4: embed scale: {e:?}"))?;
     Ok(())
@@ -308,26 +294,15 @@ fn embedding_lookup_to(
 ) -> Result<(), String> {
     use hipfire_runtime::llama::EmbeddingFormat;
     match format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(table, dst, token_id, dim)
-            .map_err(|e| format!("gemma4: {label} hfq4g256: {e:?}")),
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(table, dst, token_id, dim)
-            .map_err(|e| format!("gemma4: {label} hfq4g128: {e:?}")),
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(table, dst, token_id, dim)
-            .map_err(|e| format!("gemma4: {label} q8: {e:?}")),
-        EmbeddingFormat::IU8G128 => gpu
-            .embedding_lookup_iu8g32(table, dst, token_id, dim)
-            .map_err(|e| format!("gemma4: {label} iu8g32: {e:?}")),
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(table, dst, token_id, dim)
-            .map_err(|e| format!("gemma4: {label} f32: {e:?}")),
         EmbeddingFormat::Q4K => Err(format!("gemma4: {label} Q4K embedding format unsupported")),
         EmbeddingFormat::Ggml(_) => Err(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
                 .to_string(),
         ),
+        _ => hipfire_runtime::llama::embedding_lookup_dispatch(
+            gpu, format, table, dst, token_id, dim,
+        )
+        .map_err(|e| format!("gemma4: {label} {format:?}: {e:?}")),
     }
 }
 
@@ -1180,30 +1155,16 @@ fn embed_lookup_row(
     dst: &GpuTensor,
     token_id: u32,
 ) -> Result<(), String> {
-    use hipfire_runtime::llama::EmbeddingFormat;
     let dim = cfg.dim;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu
-            .embedding_lookup_hfq4g256(&weights.embed_tokens, dst, token_id, dim)
-            .map_err(|e| format!("gemma4 forward_batch embed hfq4g256: {e:?}")),
-        EmbeddingFormat::HFQ4G128 => gpu
-            .embedding_lookup_hfq4g128(&weights.embed_tokens, dst, token_id, dim)
-            .map_err(|e| format!("gemma4 forward_batch embed hfq4g128: {e:?}")),
-        EmbeddingFormat::Q8_0 => gpu
-            .embedding_lookup_q8(&weights.embed_tokens, dst, token_id, dim)
-            .map_err(|e| format!("gemma4 forward_batch embed q8: {e:?}")),
-        EmbeddingFormat::IU8G128 => gpu
-            .embedding_lookup_iu8g32(&weights.embed_tokens, dst, token_id, dim)
-            .map_err(|e| format!("gemma4 forward_batch embed iu8g32: {e:?}")),
-        EmbeddingFormat::F32 => gpu
-            .embedding_lookup(&weights.embed_tokens, dst, token_id, dim)
-            .map_err(|e| format!("gemma4 forward_batch embed f32: {e:?}")),
-        EmbeddingFormat::Q4K => Err("gemma4 forward_batch: Q4K embedding unsupported".to_string()),
-        EmbeddingFormat::Ggml(_) => Err(
-            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
-                .to_string(),
-        ),
-    }
+    embedding_lookup_to(
+        gpu,
+        weights.embd_format,
+        &weights.embed_tokens,
+        dst,
+        token_id,
+        dim,
+        "forward_batch embed",
+    )
 }
 
 #[inline]

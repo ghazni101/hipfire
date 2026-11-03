@@ -951,37 +951,6 @@ pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()>
     }
 }
 
-/// Batched embedding lookup for the admitted slots formats: every branch
-/// reads token ids from a device buffer, so the call replays under graph
-/// capture (a host-side per-row D2D would bake stale offsets).
-pub(crate) fn embed_lookup_slots(
-    gpu: &mut Gpu,
-    fmt: EmbeddingFormat,
-    table: &GpuTensor,
-    output: &GpuTensor,
-    token_ids: &GpuTensor,
-    n: usize,
-    dim: usize,
-) -> HipResult<()> {
-    match fmt {
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, output, token_ids, n, dim),
-        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(table, output, token_ids, n, dim),
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256_batched(table, output, token_ids, n, dim)
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
-        }
-        EmbeddingFormat::IU8G128 => {
-            gpu.embedding_lookup_iu8g32_batched(table, output, token_ids, n, dim)
-        }
-        other => Err(HipError::new(
-            0,
-            &format!("embed_lookup_slots: unsupported format {other:?}"),
-        )),
-    }
-}
-
 /// `y += w · x`, dispatching by `w.gpu_dtype` alone: Q8_0 residual path,
 /// rotated containers rotate `x` into `rot_scratch` first, plain
 /// containers project `x` directly. Replaces the layer-uniform arm the
@@ -5788,7 +5757,7 @@ pub fn forward_batch_slots_opts(
             unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
     }
-    embed_lookup_slots(
+    hipfire_runtime::llama::embedding_lookup_batched_dispatch(
         gpu,
         weights.embd_format,
         &weights.token_embd,
