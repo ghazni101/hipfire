@@ -2804,6 +2804,13 @@ pub const GEMV_IU4G256_XBATCH_RESIDUAL_SRC: &str = concat!(
 /// See `kernels/src/gemv_iu8g32.hip`.
 pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32.hip");
 
+/// Paged-pool GQA-shared Q8_0 decode tile (gfx1100 H24/KV4/D256, tile 128).
+/// Compiled only through `kv_slot_desc_vmm_paged_source`; one 256-thread
+/// workgroup serves all six query heads of its kv head, so each K/V page is
+/// read once per kv head instead of once per query head.
+pub const ATTENTION_FLASH_Q8_0_TILE_GQA_PAGED_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa_paged.gfx1100.hip");
+
 /// IU8G256 (qt 58) decode GEMV: the MQ4V2 grid with one byte per code.
 /// `gemv_iu8g256` (SET) and `gemv_iu8g256_residual` (fused `y += W·x`).
 /// See `kernels/src/gemv_iu8g256.hip`.

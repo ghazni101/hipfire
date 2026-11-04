@@ -68,6 +68,90 @@ impl Gpu {
         self.gemv_iu8g32_launch_exact(func, a, x, y, m, k)
     }
 
+    /// `y[b] = W·x[b]` for `batch` activation columns sharing one IU8G128
+    /// weight pass (`1..=4`). Multi-slot decode: a per-slot GEMV re-reads the
+    /// whole weight matrix once per slot; here each weight row is read once
+    /// for every column. Column `b` matches [`Self::gemv_iu8g32`] on that
+    /// column to f32 rounding (different module → contraction may differ);
+    /// two runs are bit-identical.
+    ///
+    /// `x` is `[batch × k]`, `y` is `[batch × m]`, both row-major. Requires a
+    /// 16 B-aligned row stride (`(k + k/64) % 16 == 0`) for the `uint4`
+    /// weight and activation chunks.
+    pub fn gemv_iu8g32_xbatch(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        if m == 0 || k == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_iu8g32_xbatch: M > 0 and K % 128 == 0",
+            ));
+        }
+        if batch == 0 || batch > 4 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_iu8g32_xbatch: batch must be 1..=4",
+            ));
+        }
+        let row_bytes = k + k / 64;
+        if row_bytes % 16 != 0
+            || (a.buf.as_ptr() as usize) % 16 != 0
+            || (x.buf.as_ptr() as usize) % 16 != 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_iu8g32_xbatch: needs a 16 B-aligned row and activation base",
+            ));
+        }
+        self.bind_thread()?;
+        // Same module key as the v1/v2 kernels: one source, one compiled
+        // module, and the registry entry that declares it.
+        self.ensure_kernel(
+            "gemv_iu8g32",
+            kernels::GEMV_IU8G32_SRC,
+            "gemv_iu8g32_xbatch",
+        )?;
+        let waves = m.div_ceil(4);
+        let grid = [waves.div_ceil(4) as u32, 1, 1];
+        let mut ap = a.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut bv = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut bv as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_iu8g32_xbatch",
+            grid,
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(bv);
+                b
+            },
+        )
+    }
+
     fn gemv_iu8g32_launch(
         &mut self,
         func: &'static str,

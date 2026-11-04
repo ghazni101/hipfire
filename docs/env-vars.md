@@ -977,7 +977,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1895
+**Count:** 1896
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1878,7 +1878,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ISA_TILE_ROWS` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_IU4G256_RESIDUAL_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4G256_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_IU4G256_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU4G256_XBATCH_MAX` | crates/rdna-compute/src/gemv_iu4.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4_BAFOLD` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_IU4_C2_ONEPASS` | crates/rdna-compute/src/kernels.rs, scripts/test_gfx1100_xts_scope.py | developer |
 | `HIPFIRE_IU4_DECODE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/iu_quant.rs | developer |
@@ -1902,6 +1902,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU8G32_MB4` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8G32_W8A8` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
 | `HIPFIRE_IU8_GEMV` | crates/rdna-compute/src/gemv_iu8.rs | developer |
+| `HIPFIRE_IU8_HEAD_XBATCH` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
 | `HIPFIRE_JINJA_CHAT` | benchmarks/prompts/mtpfloor/generate.py, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | stable |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh | harness |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh | harness |

@@ -4990,6 +4990,7 @@ impl Gpu {
         }
         let tile_size =
             q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, model_max_seq);
+        let max_tiles = max_ctx.div_ceil(tile_size);
         let route = match format {
             VmmKvFormat::Fp8E4M3 => {
                 match fp8_decode_attn_gqa_vmm_route(self, n_heads, n_kv_heads, head_dim, tile_size)
@@ -5015,13 +5016,203 @@ impl Gpu {
                 VmmFlashDecodeRoute::Q8Generic
             }
         };
-        let max_tiles = max_ctx.div_ceil(tile_size);
+        if self.slot_trace() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[slot-trace] vmm flash plan: h={n_heads} kv={n_kv_heads} hd={head_dim} \
+                     model_max_seq={model_max_seq} max_ctx={max_ctx} tile={tile_size} \
+                     max_tiles={max_tiles} route={route:?}"
+                );
+            });
+        }
         Ok(VmmFlashDecodePlan {
             route,
             tile_size,
             max_tiles,
             partial_floats_per_row: n_heads * max_tiles * (2 + head_dim),
         })
+    }
+
+    /// Whether the paged-pool GQA-shared Q8_0 decode tile admits this shape.
+    /// gfx1100 only; the kernel's geometry is compile-time (head_dim 256, GQA
+    /// group 6, 128-key tile = one shared-pool page).
+    pub fn slots_gqa_decode_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        tile_size: usize,
+    ) -> bool {
+        self.arch_caps.is_gfx1100()
+            && head_dim == 256
+            && n_kv_heads > 0
+            && n_heads == 6 * n_kv_heads
+            && tile_size == 128
+            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DECODE_ATTN_GQA", true)
+    }
+
+    /// Paged-pool GQA-shared Q8_0 decode: one workgroup per (kv head, 128-key
+    /// page tile, row) serves all six query heads of its kv head, so each K/V
+    /// tile is read once instead of once per query head. The shared pool's
+    /// 48-byte descriptor translates the page-aligned tile base. Partials use
+    /// the same `[rows, n_heads, max_tiles, 2 + head_dim]` layout and the same
+    /// Q8 reduce as the batched tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_gqa_paged_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+        slot_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        const TILE: usize = 128;
+        assert_eq!(TILE, crate::page_pool::PAGE_TOKENS, "tile must be one page");
+        assert_eq!(head_dim, 256);
+        assert_eq!(n_heads, 6 * n_kv_heads);
+        let max_tiles = max_ctx_len.div_ceil(TILE);
+        let per_row = n_heads * max_tiles * (2 + head_dim);
+        let per_row = per_row.max(1);
+        if per_row > partials.numel() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_flash_q8_0_gqa_paged_slots: partials row exceeds the buffer",
+            ));
+        }
+        self.bind_thread()?;
+        const SYM: &str = "attention_flash_q8_0_tile_gqa_paged_gfx1100";
+        static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let src = SRC.get_or_init(|| {
+            crate::kernels::kv_slot_desc_vmm_paged_source(
+                crate::kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_PAGED_GFX1100_SRC,
+                SYM,
+                SYM,
+            )
+        });
+        self.ensure_kernel(SYM, src, SYM)?;
+        const REDUCE: &str = "attention_flash_q8_0_reduce_vmm";
+        self.ensure_vmm_rows_module(
+            REDUCE,
+            "attention_flash_q8_0_reduce",
+            crate::kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+            "VMM_ROWS_Q8_REDUCE",
+        )?;
+
+        let group = (partials.numel() / per_row).max(1);
+        let q_row = n_heads * head_dim;
+        let tile_bytes = (max_tiles * TILE) as i32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let tile_size = TILE as i32;
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let len = group.min(rows - r0);
+            let q_v = q.sub_offset(r0 * q_row, len * q_row);
+            let out_v = out.sub_offset(r0 * q_row, len * q_row);
+            let pos_v = positions.sub_offset(r0, len);
+            let row_slot_v = row_slot.sub_offset(r0, len);
+            let partials_v = partials.sub_offset(r0 * per_row, len * per_row);
+
+            let mut qp = q_v.buf.as_ptr();
+            let mut kp = k_cache.buf.as_ptr();
+            let mut vp = v_cache.buf.as_ptr();
+            let mut pp = partials_v.buf.as_ptr();
+            let mut posp = pos_v.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut ms = tile_bytes;
+            let mut sc = scale;
+            let mut ts = tile_size;
+            let mut dp = slot_descs.buf.as_ptr();
+            let mut rsp = row_slot_v.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut pp as *mut _ as *mut c_void,
+                &mut posp as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut dp as *mut _ as *mut c_void,
+                &mut rsp as *mut _ as *mut c_void,
+            ];
+            let grid = [
+                n_kv_heads as u32,
+                max_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP) as u32,
+                len as u32,
+            ];
+            self.launch_maybe_blob(SYM, grid, [256, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(pp);
+                b.push_ptr(posp);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(ts);
+                b.push_ptr(dp);
+                b.push_ptr(rsp);
+                b
+            })?;
+
+            let mut opp = out_v.buf.as_ptr();
+            let mut ppp = partials_v.buf.as_ptr();
+            let mut pp2 = pos_v.buf.as_ptr();
+            let mut nh2 = n_heads as i32;
+            let mut hd2 = head_dim as i32;
+            let mut ts2 = tile_size;
+            let mut mt2 = max_tiles as i32;
+            let mut params2: Vec<*mut c_void> = vec![
+                &mut ppp as *mut _ as *mut c_void,
+                &mut opp as *mut _ as *mut c_void,
+                &mut nh2 as *mut _ as *mut c_void,
+                &mut hd2 as *mut _ as *mut c_void,
+                &mut pp2 as *mut _ as *mut c_void,
+                &mut ts2 as *mut _ as *mut c_void,
+                &mut mt2 as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                REDUCE,
+                [n_heads as u32, 1, len as u32],
+                [256, 1, 1],
+                (max_tiles * 4) as u32,
+                &mut params2,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(ppp);
+                    b.push_ptr(opp);
+                    b.push_i32(nh2);
+                    b.push_i32(hd2);
+                    b.push_ptr(pp2);
+                    b.push_i32(ts2);
+                    b.push_i32(mt2);
+                    b
+                },
+            )?;
+            r0 += len;
+        }
+        Ok(())
     }
 
     /// Row-batched flash decode over per-request VMM KV: row `r` attends

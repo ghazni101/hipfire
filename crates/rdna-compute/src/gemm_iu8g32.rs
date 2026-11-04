@@ -37,6 +37,7 @@ const SYM_MB4M2: &str = "gemm_iu8g32_residual_wmma_mb4m2";
 /// and 1.9-2.8x from n=64 (where the twin's mb4 fanout starts). Below the
 /// threshold the 128-row W8A8 tile idles and its activation quant buys
 /// nothing, so short chunks and DFlash-width batches keep the f16 twin.
+// selector-receipt: receipts/selectors/iu8g32_w8a8_min_rows.json
 pub const IU8G32_W8A8_MIN_ROWS: usize = 48;
 
 /// Which qt59 batched GEMM a shape takes ([`Gpu::iu8g32_gemm_route`]).

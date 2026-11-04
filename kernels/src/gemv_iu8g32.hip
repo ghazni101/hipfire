@@ -162,3 +162,90 @@ __device__ __forceinline__ void iu8g32_v2_body(
 IU8G32_V2(1)
 IU8G32_V2(2)
 IU8G32_V2(4)
+
+// ---------------------------------------------------------------------------
+// xbatch (multi-slot decode): one weight row is decoded/read once and dotted
+// against up to BMAX activation columns. R output rows share one wave, and a
+// row's weight packet is loaded once per chunk and reused for every column,
+// so the per-row weight pass AND the per-row x re-reads both amortise:
+//
+//   weights: R rows read once for all B columns
+//   x:       one column chunk read once for all R rows
+//
+// Column b's accumulation keeps v2's chunk order and 16-term fold
+// (`iu8_dot16`), so it matches `gemv_iu8g32` (`_v2_r*`) on that column to f32
+// rounding (different module → contraction may differ); determinism is exact.
+// Grid: ceil(ceil(M/R) / waves_per_block) blocks of 128 threads (4 waves).
+template <int R, int BMAX>
+__device__ __forceinline__ void iu8g32_xbatch_body(
+    const unsigned char* __restrict__ A,
+    const float* __restrict__ x,   // [B x K]
+    float* __restrict__ y,         // [B x M]
+    int M, int K, int B) {
+    const int lane = (int)(threadIdx.x & 31);
+    const int wave = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
+    const int row0 = wave * R;
+    if (row0 >= M) return;
+    const long long rb = (long long)K + (long long)(K >> 6);
+    const int chunks = K >> 4;
+    float acc[R][BMAX];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) acc[r][b] = 0.0f;
+    }
+    const unsigned char* base[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = (row0 + r < M) ? (row0 + r) : (M - 1);
+        base[r] = A + (long long)row * rb;
+    }
+    for (int c = lane; c < chunks; c += 32) {
+        uint4 w[R];
+        float d[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            w[r] = *(const uint4*)(base[r] + (c << 4));
+            d[r] = (float)*((const _Float16*)(base[r] + K + ((c >> 3) << 1)));
+        }
+        // Hoist the column chunk: loaded once, reused by every row.
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            if (b >= B) break;
+            const float4* xp = (const float4*)(x + (long long)b * K + (c << 4));
+            const float4 x0 = xp[0], x1 = xp[1], x2 = xp[2], x3 = xp[3];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                acc[r][b] += d[r] * iu8_dot16(w[r], x0, x1, x2, x3);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            float s = acc[r][b];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_xor(s, off);
+            acc[r][b] = s;
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int b = 0; b < BMAX; ++b) {
+            if (b >= B) break;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int row = row0 + r;
+                if (row < M) y[(long long)b * M + row] = acc[r][b];
+            }
+        }
+    }
+}
+
+// Multi-slot lm_head: 4 output rows per wave, up to 4 activation columns.
+extern "C" __global__ __launch_bounds__(128) void gemv_iu8g32_xbatch(
+    const unsigned char* __restrict__ A, const float* __restrict__ x,
+    float* __restrict__ y, int M, int K, int B) {
+    iu8g32_xbatch_body<4, 4>(A, x, y, M, K, B);
+}

@@ -5824,6 +5824,10 @@ fn run_loop(
             let mut provision_failed = Vec::new();
             let mut row = 0usize;
             let mut vmm_map_poison: Option<String> = None;
+            // Sessions with a row in this step are never reclaim victims; a
+            // finished request's session stays resident for a later turn and
+            // is reclaimable.
+            let busy_sessions: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
             for s in 0..n {
                 let m = batch.m_per_slot[s];
                 if m == 0 {
@@ -5846,13 +5850,39 @@ fn run_loop(
                         idx.evict_unpinned_leaves(pp, usize::MAX);
                         pp.drain_completed();
                     }
-                    match rig.pool.set_seq_len(SlotId(s), frontier) {
-                        Ok(()) => reserved = true,
-                        Err(error) => {
-                            eprintln!("[serve] page provisioning refused slot {s}: {error}");
-                            provision_failed.push(s);
+                    reserved = rig.pool.set_seq_len(SlotId(s), frontier).is_ok();
+                }
+                if !reserved {
+                    // A live lane's generation can outgrow the pool while
+                    // finished requests park their KV for a later turn. Those
+                    // sessions are reclaimable (swap-out, or cold), and a live
+                    // request has priority over a parked one — evict LRU idle
+                    // sessions before failing the lane. Re-check after every
+                    // eviction; a victim that cannot be parked is dropped cold
+                    // and still frees its pages.
+                    loop {
+                        let Some(victim) = rig.sessions.lru_idle_victim(&busy_sessions) else {
+                            break;
+                        };
+                        if !evict(&mut rig, victim, &stats) {
+                            break;
+                        }
+                        lock_stats(&stats).note_eviction();
+                        if rig.pool.set_seq_len(SlotId(s), frontier).is_ok() {
+                            reserved = true;
+                            if rig.gpu.slot_trace() {
+                                eprintln!(
+                                    "[slot-trace] evicted idle session {victim:?} to grow \
+                                     slot {s} to {frontier} tokens"
+                                );
+                            }
+                            break;
                         }
                     }
+                }
+                if !reserved {
+                    eprintln!("[serve] page provisioning refused slot {s}: page pool exhausted");
+                    provision_failed.push(s);
                 }
                 if !reserved || rig.model.paged_vmm.is_none() {
                     continue;
@@ -7483,6 +7513,84 @@ fn sync_fair_needs(
     let _ = q.set_uncached_prefill(id, uncached);
 }
 
+/// KV pages an in-flight request may still materialize: its final token
+/// frontier minus the pages its block table already holds.
+fn lane_growth_pages(frontier_tokens: usize, allocated_pages: usize) -> usize {
+    frontier_tokens
+        .div_ceil(PAGE_TOKENS)
+        .saturating_sub(allocated_pages)
+}
+
+/// KV pages a request keeps reserved from admission until its prompt is
+/// prefilled: the prompt's own pages plus one page of generation headroom.
+///
+/// Generation growth past that is **best effort**: the client's `max_tokens`
+/// is a cap, not a promise to materialize that many KV rows, and reserving it
+/// would reject ordinary four-lane traffic (the shipped default is 32k, and
+/// four 8k-prompt lanes would need 4 x 40k > the 153.6k-token pool). When a
+/// lane actually runs the pool dry, the step's per-slot provisioning failure
+/// drops that lane alone with a retryable overload and keeps the rest of the
+/// batch serving.
+fn admission_prompt_pages(prompt_suffix_tokens: usize) -> usize {
+    prompt_suffix_tokens.div_ceil(PAGE_TOKENS).saturating_add(1)
+}
+
+/// KV pages resident in-flight requests still have to write for their
+/// **prompt** (the rows past each lane's KV frontier up to its token count).
+/// Decode rows and generated tokens are not counted: they grow from the free
+/// pool under the per-step refusal.
+fn pending_prompt_pages(rig: &Rig, slots: &[Option<InFlight>], exclude: SessionId) -> usize {
+    let mut total = 0usize;
+    for (s, flight) in slots.iter().enumerate() {
+        let Some(f) = flight.as_ref() else { continue };
+        if f.session == exclude {
+            continue;
+        }
+        let Some(sess) = rig.sessions.get(f.session) else {
+            continue;
+        };
+        let frontier = rig
+            .pool
+            .descriptors()
+            .get(s)
+            .map(|d| d.seq_len.max(0) as usize)
+            .unwrap_or(0);
+        let pending = sess.tokens.len().saturating_sub(frontier);
+        total = total.saturating_add(lane_growth_pages(pending, 0));
+    }
+    total
+}
+
+/// Admission verdict for one request against the shared paged KV pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionVerdict {
+    /// The pool backs this request's prompt plus every live lane's pending
+    /// prompt.
+    Admit,
+    /// Capacity is in use by live lanes; the request could fit once they
+    /// finish. Retryable (503).
+    Wait,
+    /// `prompt + max_tokens` can never fit this pool, however empty: the
+    /// client must reduce `max_tokens` or the prompt. Not retryable (400).
+    TooLarge,
+}
+
+fn admission_verdict(
+    free_pages: usize,
+    committed_pages: usize,
+    prompt_pages: usize,
+    request_tokens: usize,
+    pool_tokens: usize,
+) -> AdmissionVerdict {
+    if request_tokens > pool_tokens {
+        AdmissionVerdict::TooLarge
+    } else if prompt_pages.saturating_add(committed_pages) > free_pages {
+        AdmissionVerdict::Wait
+    } else {
+        AdmissionVerdict::Admit
+    }
+}
+
 /// Admit one request, evicting an idle session if that is what it takes.
 fn admit(
     rig: &mut Rig,
@@ -7708,17 +7816,20 @@ fn admit(
                         .unwrap_or_else(|| {
                             rig.sessions.get(existing).map(|s| s.next_pos).unwrap_or(0)
                         });
-                    let needed_pages = extended
-                        .len()
-                        .saturating_sub(held)
-                        .saturating_add(req.max_tokens.max(1))
-                        .div_ceil(PAGE_TOKENS)
-                        .saturating_add(1);
+                    let suffix_tokens = extended.len().saturating_sub(held);
+                    let prompt_pages = admission_prompt_pages(suffix_tokens);
+                    // Reserve the live lanes' pending prompt rows too (not
+                    // their `max_tokens`): generation is best effort, and the
+                    // step refuses a lane that actually runs the pool dry.
+                    let committed = pending_prompt_pages(rig, slots, existing);
+                    let pool_total = rig.pool.page_pool().map(|pp| pp.n_pages()).unwrap_or(0);
+                    let pool_tokens = pool_total.saturating_mul(PAGE_TOKENS);
+                    let request_tokens = extended.len().saturating_add(req.max_tokens.max(1));
                     if let (Some(idx), Some(domain)) =
                         (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
                     {
                         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free < needed_pages {
+                        if free < prompt_pages.saturating_add(committed) {
                             let page_bytes = rig
                                 .pool
                                 .page_pool()
@@ -7727,7 +7838,8 @@ fn admit(
                             let pp = rig.pool.page_pool_mut().expect("paged pool");
                             idx.evict_unpinned_leaves(
                                 pp,
-                                needed_pages.saturating_sub(free) * page_bytes,
+                                prompt_pages.saturating_add(committed).saturating_sub(free)
+                                    * page_bytes,
                             );
                         }
                         let _ = domain;
@@ -7736,34 +7848,60 @@ fn admit(
                     exclude.push(existing);
                     loop {
                         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free >= needed_pages {
+                        if free >= prompt_pages.saturating_add(committed) {
                             break;
                         }
                         let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
                             break;
                         };
-                        if !evict(rig, victim, stats) {
+                        if !evict(rig, victim, &stats) {
                             break;
                         }
-                        lock_stats(stats).note_eviction();
+                        lock_stats(&stats).note_eviction();
                     }
                     let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                    if free < needed_pages {
-                        // Keep the session resident — a smaller retry can
-                        // still continue it; only this request is refused.
-                        let _ = send_event(
-                            &req.reply,
-                            Event::Rejected {
-                                class: RejectClass::Overload,
-                                reason: format!(
-                                    "page demand exceeds pool: need \
-                                     {needed_pages} pages, {free} free \
-                                     after reclaim"
-                                ),
-                            },
-                        );
-                        lock_stats(stats).note_rejected();
-                        return;
+                    match admission_verdict(
+                        free,
+                        committed,
+                        prompt_pages,
+                        request_tokens,
+                        pool_tokens,
+                    ) {
+                        AdmissionVerdict::Admit => {}
+                        AdmissionVerdict::TooLarge => {
+                            // Keep the session resident — a smaller retry can
+                            // still continue it; only this request is refused.
+                            let _ = send_event(
+                                &req.reply,
+                                Event::Rejected {
+                                    class: RejectClass::Validation,
+                                    reason: format!(
+                                        "request needs {request_tokens} tokens of KV \
+                                         (suffix + max_tokens) but the pool holds \
+                                         {pool_tokens} tokens in total — reduce \
+                                         max_tokens or shorten the prompt"
+                                    ),
+                                },
+                            );
+                            lock_stats(stats).note_rejected();
+                            return;
+                        }
+                        AdmissionVerdict::Wait => {
+                            let _ = send_event(
+                                &req.reply,
+                                Event::Rejected {
+                                    class: RejectClass::Overload,
+                                    reason: format!(
+                                        "page pool reserved: need {prompt_pages} pages for \
+                                         this request's prompt plus {committed} pending for \
+                                         live requests, {free} free of {pool_total} — retry \
+                                         when they finish"
+                                    ),
+                                },
+                            );
+                            lock_stats(stats).note_rejected();
+                            return;
+                        }
                     }
                 }
                 // Compile the JSON Schema BEFORE any session mutation (spec
@@ -8438,18 +8576,17 @@ fn admit(
     // free list) rather than letting a mid-prefill provision fail.
     if rig.prefix_cache {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = suffix_tokens
-            .saturating_add(req.max_tokens.max(1))
-            .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
+        let needed_pages = admission_prompt_pages(suffix_tokens);
+        let committed = pending_prompt_pages(rig, slots, id);
         let page_bytes = rig
             .pool
             .page_pool()
             .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
             .unwrap_or(0);
         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-        if page_bytes > 0 && free < needed_pages {
-            let evict_bytes = needed_pages.saturating_sub(free) * page_bytes;
+        let demand = needed_pages.saturating_add(committed);
+        if page_bytes > 0 && free < demand {
+            let evict_bytes = demand.saturating_sub(free) * page_bytes;
             let evicted = if let (Some(idx), Some(_domain)) =
                 (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
             {
@@ -8476,17 +8613,27 @@ fn admit(
     // remains, reject at admit instead of letting the forward die.
     if rig.pool.is_paged() {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = suffix_tokens
-            .saturating_add(req.max_tokens.max(1))
-            .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
+        let prompt_pages = admission_prompt_pages(suffix_tokens);
+        // Capacity already promised to live lanes' pending prompt rows. The
+        // client's `max_tokens` is not reserved: it is a cap, and reserving it
+        // would refuse ordinary four-lane traffic (8k prompt + the shipped 32k
+        // default x 4 > the pool). A lane that actually runs the pool dry is
+        // refused by the step's per-slot provisioning, alone.
+        let committed = pending_prompt_pages(rig, slots, id);
+        let pool_total = rig.pool.page_pool().map(|pp| pp.n_pages()).unwrap_or(0);
+        let pool_tokens = pool_total.saturating_mul(PAGE_TOKENS);
+        let request_tokens = req
+            .prompt_tokens
+            .len()
+            .saturating_add(req.max_tokens.max(1));
+        let demand = prompt_pages.saturating_add(committed);
         // The just-opened session holds a slot but is not in `busy` —
         // exclude it explicitly so it is never its own eviction victim.
         let mut exclude: Vec<SessionId> = busy.clone();
         exclude.push(id);
         loop {
             let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-            if free >= needed_pages {
+            if free >= demand {
                 break;
             }
             let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
@@ -8499,26 +8646,56 @@ fn admit(
             if rig.gpu.slot_trace() {
                 eprintln!(
                     "[slot-trace] evicted idle session {victim:?} for page demand \
-                     ({free} free < {needed_pages} needed)"
+                     ({free} free < {demand} needed incl. {committed} pending)"
                 );
             }
         }
         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-        if free < needed_pages {
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Overload,
-                    reason: format!(
-                        "page demand exceeds pool: need {needed_pages} pages, \
-                         {free} free after reclaim"
-                    ),
-                },
+        if rig.gpu.slot_trace() {
+            let verdict =
+                admission_verdict(free, committed, prompt_pages, request_tokens, pool_tokens);
+            eprintln!(
+                "[slot-trace] admit session {}: prompt_pages={prompt_pages}                  pending={committed} free={free} pool={pool_total}                  tokens={request_tokens}/{pool_tokens} -> {verdict:?}",
+                id.0
             );
-            release_pin_ticket(rig, &mut pin_ticket);
-            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-            lock_stats(stats).note_rejected();
-            return;
+        }
+        match admission_verdict(free, committed, prompt_pages, request_tokens, pool_tokens) {
+            AdmissionVerdict::Admit => {}
+            AdmissionVerdict::TooLarge => {
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected {
+                        class: RejectClass::Validation,
+                        reason: format!(
+                            "request needs {request_tokens} tokens of KV (prompt + \
+                             max_tokens) but the pool holds {pool_tokens} tokens in \
+                             total — reduce max_tokens or shorten the prompt"
+                        ),
+                    },
+                );
+                release_pin_ticket(rig, &mut pin_ticket);
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                lock_stats(stats).note_rejected();
+                return;
+            }
+            AdmissionVerdict::Wait => {
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected {
+                        class: RejectClass::Overload,
+                        reason: format!(
+                            "page pool reserved: need {prompt_pages} pages for this \
+                             request's prompt plus {committed} pending for live \
+                             requests, {free} free of {pool_total} — retry when they \
+                             finish"
+                        ),
+                    },
+                );
+                release_pin_ticket(rig, &mut pin_ticket);
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                lock_stats(stats).note_rejected();
+                return;
+            }
         }
     }
 
@@ -9114,6 +9291,63 @@ mod tests {
         assert_eq!(multi_slot_prefill_rows(64, 8), 512);
         // Saturating: an absurd slot count must not wrap or panic.
         assert!(multi_slot_prefill_rows(1024, usize::MAX) >= 1024);
+    }
+
+    #[test]
+    fn admission_reserves_pending_prompts_and_separates_pressure_from_oversize() {
+        // Prompt reservation: the prompt's pages plus one page of generation
+        // headroom; the client's `max_tokens` is a cap, not a reservation.
+        assert_eq!(admission_prompt_pages(8_000), 64);
+        assert_eq!(admission_prompt_pages(39_598), 311);
+        assert_eq!(lane_growth_pages(50_000, 100), 291);
+
+        const POOL_PAGES: usize = 1200;
+        const POOL_TOKENS: usize = POOL_PAGES * PAGE_TOKENS;
+
+        // Four ordinary 8k-prompt lanes with the shipped 32k default stay
+        // admitted: reserving max_tokens would refuse the fourth.
+        let p8k = admission_prompt_pages(8_000);
+        let req8k = 8_000 + 32_768;
+        assert_eq!(
+            admission_verdict(POOL_PAGES, 0, p8k, req8k, POOL_TOKENS),
+            AdmissionVerdict::Admit
+        );
+        assert_eq!(
+            admission_verdict(POOL_PAGES, 2 * 63, p8k, req8k, POOL_TOKENS),
+            AdmissionVerdict::Admit
+        );
+        assert_eq!(
+            admission_verdict(POOL_PAGES, 3 * 63, p8k, req8k, POOL_TOKENS),
+            AdmissionVerdict::Admit
+        );
+
+        // Four 39.6k-token prompts do not all fit the pool: the fourth waits
+        // at admission instead of after a full prefill.
+        let p40k = admission_prompt_pages(39_598);
+        let req40k = 39_598 + 50_000;
+        assert_eq!(
+            admission_verdict(POOL_PAGES, 3 * 310, p40k, req40k, POOL_TOKENS),
+            AdmissionVerdict::Wait
+        );
+        // An exact fit admits; one page short waits.
+        assert_eq!(
+            admission_verdict(1200, 900, 300, req40k, POOL_TOKENS),
+            AdmissionVerdict::Admit
+        );
+        assert_eq!(
+            admission_verdict(1199, 900, 300, req40k, POOL_TOKENS),
+            AdmissionVerdict::Wait
+        );
+        // `prompt + max_tokens` beyond the whole pool can never fit: 400.
+        assert_eq!(
+            admission_verdict(1200, 0, 1, 200_000, POOL_TOKENS),
+            AdmissionVerdict::TooLarge
+        );
+        // Saturating: an absurd committed value must not wrap.
+        assert_eq!(
+            admission_verdict(0, usize::MAX, 1, 1, POOL_TOKENS),
+            AdmissionVerdict::Wait
+        );
     }
 
     #[test]

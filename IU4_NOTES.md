@@ -1193,3 +1193,301 @@ no live build defines, so live kernels compile to the same code, but their
 source hash changes: expect one JIT recompile per module, and the next
 kernel pack rebuild picks them up.
 
+
+## C25 — branch audit, qt59 xbatch head, and the IU4 xbatch B=4 wall (2026-11-03)
+
+### Branch audit — nothing to pull, one stale image
+
+- `feat/iu4-iu8-quant-family` at `dc1f7fb2f` is **ahead** of `origin/feat/iu4-iu8-quant-family`
+  (`git log HEAD..origin/feat/iu4-iu8-quant-family` is empty), so every IU4/IU8
+  commit in this line is already local. The local commits after the deployed
+  image (`ed3eaa6a5`, 12:29) are `9f1cadadc` (C22 slots W8A8), `f2bffb483`,
+  `84ad8d4f0` (one qt59 GEMM selector at the 48-row crossover), the
+  `IU8G32 -> IU8G128` rename, the embedding-helper refactor, `d450d6707`
+  (C24 knob removal) and the merge `dc1f7fb2f`.
+- `origin/beta` is far ahead but its unmerged work is Qwen4-EP / Raon /
+  Railgun / MoE-cohort / Flash-Next packaging. None of it is reachable from
+  this dense `qwen3_5` qt57/qt59 route, and `git log HEAD..origin/beta` over
+  `attention_q8_0_flash_prefill_wmma.hip`, `attention_flash_q8_0*` and
+  `attention_q8_0_fa2*` is empty. No cherry-pick.
+- `fix/replay-pm4-phase-compute-idle` (`ac8cf8ddc`) is already in HEAD as
+  `965eb209a` ("replay: end native PM4 phases on compute-idle").
+- The deployed image was the stale part: `hipfire:iu4-vmm-multislot` was built
+  at `ed3eaa6a5`, before C22 and the 48-row crossover. Rebuilt at HEAD; the
+  previous image is kept as `hipfire:iu4-vmm-multislot-ed3eaa6a5`.
+
+### qt59 xbatch head (shipped): four lanes read the 1.27 GB lm_head once
+
+`final_logits_per_slot` ran one `Step::Gemv` per active slot. On the 27B IU4-Pro
+head (compact qt59, M=248320, K=5120, 1.29 GB) four lanes re-read the same
+matrix four times. New `gemv_iu8g32_xbatch` (`kernels/src/gemv_iu8g32.hip`,
+`Gpu::gemv_iu8g32_xbatch`): four output rows per wave (128 threads), the
+activation chunk loaded once per row group and dotted against up to four
+columns with the same 16-term fold as `gemv_iu8g32_v2_r*`.
+
+- Numerics: **bit-identical** to `gemv_iu8g32` on every tested shape (each
+  column, B=1..4, M in {1,7,129,4097,32768,5120}, K in {1024,5120,6144};
+  `differing_vs_singleton=0`, deterministic). Gate:
+  `cargo test -p hipfire-runtime --release --test iu8g32_xbatch_gemv_gpu
+  -- --ignored`. `K % 1024 != 0` (row stride not 16 B aligned, e.g. 2560) is
+  refused, not misread; such heads keep the per-slot route.
+- Shape cost (one launch, weight pass only): B=1 1.59 ms, B=2 1.48, B=3 1.50,
+  B=4 1.52 ms (815-873 GB/s). Four per-slot launches: 1.50 / 3.00 / 4.49 /
+  5.99 ms (858-862 GB/s each). The head was bandwidth-bound; the win is the
+  three redundant passes.
+- Route: `final_logits_per_slot` runs the per-slot `rmsnorm_f32` into
+  `pbs.x_norm_batch` rows and one xbatch launch, only when every slot is
+  active and none is skip-marked (batch row `b` must be slot `b`).
+  `HIPFIRE_IU8_HEAD_XBATCH=0` restores the per-slot head.
+- End to end (interleaved A/B, fresh process per arm, 4 concurrent greedy
+  lanes x 128 tokens, 619-token and ~5,958-token prompts, 4-slot paged
+  retained PM4, q8):
+
+| arm | C4 short agg tok/s | C4 ~6k agg tok/s | TTFT short / 6k | C1 decode |
+|---|---:|---:|---:|---:|
+| per-slot head | 88.46 / 88.36 / 87.93 / 88.29 (median 88.4) | 74.80 / 77.26 / 74.64 / 80.09 (median 76.0) | 1.59-1.65 s / 14.74-14.89 s | 41.8-42.1 |
+| xbatch head | 97.34 / 97.68 / 97.22 / 97.25 (median 97.3) | 82.19 / 84.85 / 81.12 / 86.98 (median 83.5) | 1.63-1.65 s / 14.78-14.82 s | 41.2-41.8 |
+
++10.1% aggregate decode short, +9.9% at ~6k (byte-identical prompts across arms, four ON samples all above four OFF samples at short); C1, prefill and TTFT unchanged
+(inside the session noise band). The earlier single-arm comparison read 88.2
+for the new build and was **noise**; the in-binary kill switch interleaved is
+what makes the delta visible.
+
+### IU4 xbatch B=4 wall (measured, not changed)
+
+The multi-slot step still reads the projections at ~400 GB/s effective weight
+bandwidth (18.6 GB with the old head / 45.5 ms), against 622 GB/s for the
+singleton per-token GEMV (`gemv_iu4g256`, 14.82 GB / 23.8 ms). Microbench at
+the model's projection shapes (`iu4_xbatch_shape_cost`, one launch):
+
+| shape | B=1 | B=4 |
+|---|---:|---:|
+| M=5120 K=5120 | 208 GB/s (0.067 ms) | 260 GB/s (0.053 ms) |
+| M=5120 K=17408 | 611 GB/s | 358 GB/s |
+| M=9216 K=5120 | 551 GB/s | 338 GB/s |
+
+Row-blocking the xbatch (R=2/4 output rows per block, activation chunk loaded
+once per R rows) was the obvious fix and **lost**: B=4 rows=4 71-135 GB/s
+against 260-358 at rows=1; rows=2 parity. The extra accumulator/header
+registers (R x 4 acc sets x B, plus R x 4 x 2 header floats) cost more than
+the activation reads they save. Reverted; a future attempt needs the
+LDS/pipelined shape (stage the activation tile in LDS, many rows per block),
+not more registers.
+
+### Deployed container numbers (image rebuilt at HEAD)
+
+`hipfire:iu4-vmm-multislot` (HEAD), 4-slot paged VMM, q8, `HIPFIRE_IU4_WIDE_PREFILL=1`,
+`HIPFIRE_REPLAY_BACKEND=redline`, `HIPFIRE_REPLAY_TRANSPORT=pm4`, greedy,
+unique prompt per request, no prompt cache:
+
+| prompt tokens | C1 TTFT | C1 prefill tok/s | C1 decode tok/s | C4 agg decode tok/s | C4 max TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 617 | 0.43 s | 1,441 | 40.8 | 98.1 / 98.2 | 1.35 s |
+| 5,958 | 3.77 s | 1,580 | 38.5 | 81.7 / 87.7 (median 84.7) | 14.38-14.61 s |
+
+Aggregate prefill with four concurrent prompts is ~1.59-1.64k tok/s, i.e. the
+same as one lane: prefill is compute-bound, so batching lanes lowers max TTFT
+(they finish together) but cannot raise aggregate PP above the single-lane
+rate. The remaining PP/TTFT ceiling is unchanged from C18/C21: W4A4 GEMM 61%
+of prefill at 66% of F16-WMMA peak, paged prefill attention ~3.6x the
+singleton FA2's quadratic coefficient (a descriptor-addressed FA2-style
+kernel is the fix), GDN 7.5%, qt59 W8A8 residuals 16%.
+
+## C26 — live container failure: 4 x 50k generation, and the two hard defects it exposed (2026-11-03)
+
+The `qwen38-27b-iu4p` container was left running (image at `dc1f7fb2f`, 4-slot paged VMM,
+q8, 1200-page / 153,600-token pool, 5.37 GB) and driven with four concurrent
+50,000-token generation requests. No restart was used to recover or clear state.
+
+### Live profile (before the failure)
+
+- `/health`: `mode=multi-slot`, 4 slots, cap 262,144 tokens, prefill chunk 2048,
+  `max_batch_tokens=2048`, pool auto 1200 pages; `/stats` recent ~24-38 tok/s,
+  `queue_depth=0`; swap tier host+disk, 0 evictions.
+- GPU sysfs during a 4-lane prefill/decode: `gpu_busy_percent` 99-100,
+  `mem_busy_percent` 10-52, VRAM 25.39/25.8 GB. Host `docker stats` CPU
+  97-101 % (one engine thread saturates a core feeding the tape), 0 % when idle.
+  The multi-slot decode is GPU-compute/issue bound, consistent with the
+  `gemv_iu4g256_xbatch` B=4 analysis in C25.
+- Container tape metadata vs the host build: container
+  `typed=453 untyped=689 (no_effects=689)` with the xbatch/GDN/IU8 kernels on
+  the snapshot backlog; host `typed=1145 untyped=0`. The image's baked
+  `kernels/compiled` pack carries no radiowave certifications, so those
+  launches take the snapshot path. Performance is unaffected (container
+  96-98 tok/s aggregate C4 short vs the host's 97-98), but a *cold* container
+  tape is not the typed tape the host produces. New JIT'd kernels (e.g.
+  `gemv_iu8g32_xbatch`) appear as `suballocation_candidates` until a pack
+  includes them.
+- 4 x (608-token prompt, `max_tokens=50000`): all four admitted (200), decoded
+  137-300 tokens and stopped on EOS; no failure — the request budget, not the
+  output, is what the pool must reserve.
+
+### The hard failure (observed)
+
+1. **Internal `gemv_iu4g256_xbatch: batch must be 1..=4`.** A step with 5-8
+   live rows (the IU4 xbatch route admitted `2..=FEW_ROW_ROUTE_ROWS` = 2..=8
+   while the kernel takes four columns) raised
+   `[internal retryable=false …] multi_slot rejected: HipError(0):
+   gemv_iu4g256_xbatch: batch must be 1..=4` and `fail_all_active` closed
+   every active lane.
+2. **Late, oversubscribed admission.** 4 x (39,598-token prompt,
+   `max_tokens=50000`, i.e. 701 pages each against a 1200-page pool): all four
+   were admitted because each request was compared to the *current* free list
+   only. After a 157 s four-lane prefill, one lane was rejected at 166 s with
+   `page demand exceeds pool: need 701 pages, 580 free after reclaim`,
+   `overload retryable=true` — 2.6 minutes of work discarded, and the client
+   only learns at the end.
+3. **An impossible request was retryable.** A single `max_tokens=200000`
+   request (1,564 pages > 1,200) returned `503 overload retryable=true`
+   naming "page demand exceeds pool", i.e. the client was told to retry a
+   request that can never fit.
+
+### Fixes
+
+- `Gpu::gemv_iu4g256_xbatch` accepts any positive batch and splits it into
+  consecutive column blocks of at most `IU4G256_XBATCH_COLUMNS` (4); the
+  residual twin uses the same path. Plain stays bit-identical to the singleton
+  per column, residual <= 1.3e-7, deterministic (gate now batches 1..=8).
+- Admission charges **pending prompts**, not the client's `max_tokens`:
+  `pending_prompt_pages` sums every live lane's un-prefilled prompt rows
+  (session token count minus its KV frontier), and a new request is admitted
+  when `free >= pending + this prompt's pages`. `max_tokens` is a cap, not a
+  reservation — reserving it was measured rejecting one of four ordinary
+  8k-prompt lanes under the shipped 32k default (3 x 318 + 323 > 1200 pages),
+  i.e. it broke normal multi-slot serving. Generation growth is best effort:
+  the step's per-slot provisioning failure drops only the lane that actually
+  runs the pool dry (retryable overload), and the rest of the batch continues.
+  `prompt + max_tokens` beyond the whole pool is `Validation` (HTTP 400,
+  non-retryable, names the pool's token capacity); prompt pressure is
+  `Overload` (HTTP 503, retry when live prompts finish). Both paged admission
+  paths (continuation and cold admit) and both reclaim loops use the same
+  charge.
+
+### After the fix (27B IU4P host serve, same pool)
+
+| case | before | after |
+|---|---|---|
+| 4 x (8k prompt, default 32k max) | 3 x 200 + 1 x 503 at 1.0 s (over-strict full-`max_tokens` reservation) | **4 x 200**, 26-43 s each |
+| `max_tokens=200000` | 503 overload (retryable) | **400** at 0.0 s: "request needs 200017 tokens of KV … pool holds 153600" |
+| 4 x (608-token, max 50k) | 4 admitted; all run | 4 admitted; all run (prompt fits; generation best effort) |
+| 4 x (39.6k-token, max 50k) | 4 admitted; 1 rejected at 166 s after a 157 s prefill | **3 admitted, the 4th 503 at 1.1 s** (311 needed + 914 pending > 1184 free) |
+| 2,053-token prompt (2048 + 5-row tail; the row class that raised defect 1) | `gemv_iu4g256_xbatch: batch must be 1..=4`, all lanes torn down | 200 in 1.4 s, no `batch must be` line |
+| 3 decoding lanes + 2,053-token prompt (mixed 5-row step) | same internal error class | all four 200, tape prepared for 4/3/2/1 live slots |
+
+- Generation pressure now preempts **parked** sessions instead of a live lane:
+  when `set_seq_len` cannot grow a live slot after the radix-leaf eviction,
+  the pre-step loop evicts LRU idle sessions (swap-out, or cold when the
+  snapshot fails) and retries the frontier after each victim. Sessions with a
+  row in the current step are never victims, so a live request always has
+  priority over a finished one that is only holding its KV for a later turn.
+  This is the fix for the reported 3 × 80k case: the two lanes that finished
+  first kept their pages resident, and the third died at 60-70k tokens with
+  `server capacity exhausted while reserving KV pages`; with the reclaim it
+  can free those parked pages and finish.
+  Verified on a 32-page pool (gfx1100 host serve, 4-slot paged, two concurrent
+  lanes): A `max_tokens=4` on a 502-token prompt finishes and stays resident
+  (`slot 0`, seq_len 505); B (2,958-token prompt, 800 max) prefills while A is
+  idle, then at 3,585 tokens needs pages past the 32-page pool. The log shows
+  `[slot-trace] swap-out session 0 slot=0 seq_len=505 bytes=137906176` and
+  `[slot-trace] evicted idle session SessionId(0) to grow slot 1 to 3585
+  tokens`; B completes 200 with all 800 tokens and there is no
+  `page provisioning refused`/`server capacity` line. Sessions with rows in
+  the step are excluded, so the eviction can only take parked work.
+Tests: `rdna-compute` lib 1327 pass; `hipfire-arch-qwen35` lib 509 pass;
+`iu4_xbatch_gemv_gpu` gate now covers batches 1..=8; the pure admission verdict
+is unit-tested. The engine stays healthy after every rejection (a small
+request returns 200 in 0.2-0.3 s).
+
+### Residual risk / next steps
+
+- Generation is best effort: if four admitted lanes collectively generate
+  past the pool they can still hit the step refusal (one lane dropped with a
+  retryable 503, the others keep serving). The alternative — vLLM-style
+  preemption of an active lane (recompute or swap) — is not implemented; the
+  swap tier only parks idle sessions. Reserving each lane's full `max_tokens`
+  would remove that window but was measured to reject a quarter of ordinary
+  four-lane traffic, so it is not the right default.
+- `503` still carries no `Retry-After`; the gateway only retries class
+  `transient`, so the practical effect is "client decides", which is standard
+  but less helpful than a hint.
+- The container's baked kernel pack lacks radiowave certifications for 641-691
+  launches per step (snapshot path). Rebuilding the pack with the current
+  `scripts/` inventory would produce the host's fully typed tape; the
+  measured throughput does not change.
+
+## C27 — long-context paged decode: GQA-shared page tile (2026-11-04)
+
+### Symptom (live container, single lane, 64 greedy tokens)
+
+`ctx_scale` (content-delta timing, not SSE headers — the gateway emits an
+early event at 15 s that otherwise contaminates the decode window):
+
+| prompt tokens | decode tok/s | ms/token |
+|---:|---:|---:|
+| 236 | 40.5 | 24.7 |
+| 7,619 | 38.0 | 26.3 |
+| 30,426 | 30.5 | 32.8 |
+| 60,836 | 23.4 | 42.7 |
+
+A linear fit gives **0.31 us/token** — 113 GB/s effective for one KV pass, i.e.
+the redundant passes are hitting HBM. Prefill also degrades (7.6k 1502 tok/s,
+30k 879, 61k 550), but decode is the steady-state term.
+
+### Root cause
+
+The shared page pool's decode attention (`q8_attend_slots`) runs
+`attention_flash_q8_0_tile_batched`: grid `[n_heads, max_tiles, sub_batch]`,
+block 32, i.e. **one workgroup per query head**. An H24/KV4 trunk (group 6)
+reads every K/V page six times. The GQA-shared singleton tile
+(`attention_flash_q8_0_tile_gqa_gfx1100`, 256 threads, one workgroup per
+(nv head, tile)) existed only for the contiguous singleton route, and its
+`_vmm` twin uses the 32-byte absolute-VA descriptor of the per-request `vmm`
+backend — **not** the shared pool's 48-byte block-table descriptor.
+
+### Fix
+
+`attention_flash_q8_0_tile_gqa_paged_gfx1100`
+(`kernels/src/attention_flash_q8_0_tile_gqa_paged.gfx1100.hip`, compiled via
+`kv_slot_desc_vmm_paged_source`): grid `[n_kv_heads, tiles, rows]`, block 256.
+A shared-pool page is 128 tokens and the tile is 128 keys, so each tile is
+exactly one logical page: `kv_offset_for_k/v(desc, tile_start, stride)` gives
+the page-aligned tile base, the tile is contiguous, and the singleton GQA body
+runs unchanged over it (`tile_start=0`, output `partial_tile=tile_id`). The
+partials layout and the Q8 reduce are the batched tile's, so the route is a
+drop-in in `q8_attend_slots` (guarded by gfx1100 + H24/KV4/D256 + tile 128 +
+`HIPFIRE_GFX1100_DECODE_ATTN_GQA`, default on). The first attempt wired the
+per-request `_vmm` row-wrapper instead; it passed the shared pool's 48-byte
+descriptors to a 32-byte-ABI kernel and hung the GPU (`HSAIL hardware
+exception`) — reverted and replaced by the paged descriptor variant.
+
+### After
+
+| prompt tokens | before tok/s | after tok/s | delta |
+|---:|---:|---:|---:|
+| 236 | 40.5 | 44.8 | +10.5% |
+| 7,619 | 38.0 | 43.5 | +14.4% |
+| 30,426 | 30.5 | 40.7 | +33.5% |
+| 60,836 | 23.4 | 37.3 | +59.6% |
+
+Per-token time is now 22.3 ms at 0.2k and 26.8 ms at 61k (was 24.7 -> 42.7):
+the context term drops from 0.31 to 0.074 us/token (~4x), i.e. one KV read per
+kv head at ~470 GB/s effective. Four-lane aggregate: 97-98 -> 101.5-102.1
+tok/s short, 84-86 -> 91.3-91.4 at ~8k.
+
+Gates: `vmm_paged_gqa_decode_gpu` compares the new tile against the batched
+VMM tile on synthetic paged KV (block-table descriptor, 129/300/1024 tokens):
+max_rel 3.3e-7 / 2.2e-7 / 2.0e-7, deterministic. `serve_harness battery` 5/5
+(runaway/empty/attractor/retrieval 0, 42.6 tok/s), `chain` 5 turns clean.
+Greedy output is *not* byte-identical to the batched route (different tile
+partition; ~2e-7) — this is a route change, so it is gated by coherence, not
+byte parity. `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0` restores the batched tile.
+
+### Remaining
+
+- **Prefill/TTFT** still uses the per-head WMMA page kernel
+  (`attention_q8_0_flash_prefill_wmma_vmm_paged`) with the same 6x K/V stream
+  plus its 16-row tile; a GQA-shared paged FA2-style prefill is the next term
+  (prefill 7.6k 1502 -> 61k 550 tok/s).
+- `HIPFIRE_ATTN_TILE_SIZE=256/512` on the batched tile moved the long-context
+  point (+8.5% at 61k for 256) but lost at 8k and does not change the 6x
+  stream; not a fix.

@@ -374,7 +374,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_iu8g32_v2_r2",
             "gemv_iu8g32_v2_residual_r2",
             "gemv_iu8g32_v2_r4",
-            "gemv_iu8g32_v2_residual_r4"
+            "gemv_iu8g32_v2_residual_r4",
+            "gemv_iu8g32_xbatch"
         ]
     );
     // The IU4 dot4/dot8 integer-activation family is compiled only under

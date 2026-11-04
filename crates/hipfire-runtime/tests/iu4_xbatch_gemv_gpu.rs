@@ -11,6 +11,11 @@
 //! rounding (max relative error < 1e-6 against the singleton's own scale),
 //! not bit identity. Determinism (two runs are bit-identical) IS required.
 //!
+//! Batches above the kernel's four-column width are part of the gate: the
+//! launcher splits them into consecutive column blocks, so a mixed step of
+//! 5-8 live rows (four decoding slots plus a prompt tail) must stay equal to
+//! the singleton per column instead of failing on width.
+//!
 //!   cargo test -p hipfire-runtime --release --test iu4_xbatch_gemv_gpu -- --ignored --nocapture
 
 use half::f16;
@@ -160,8 +165,8 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
 fn iu4_xbatch_matches_singleton_gemv() {
     let mut gpu = Gpu::init().expect("GPU required");
     let mut rng = Rng(0x9e3779b97f4a7c15);
-    // Every G mod 4 tail, all admitted batch widths, decode shapes plus the
-    // model's real projection shapes.
+    // Every G mod 4 tail, single-launch and split-launch batch widths, decode
+    // shapes plus the model's real projection shapes.
     for &(m, k) in &[
         (1, 256),
         (7, 512),
@@ -173,7 +178,7 @@ fn iu4_xbatch_matches_singleton_gemv() {
         (17408, 5120),
         (5120, 6144),
     ] {
-        for batch in 1..=4 {
+        for batch in 1..=8 {
             check(&mut gpu, "rand", m, k, batch, &mut rng);
         }
     }
