@@ -888,9 +888,23 @@ fn multi_slot_prefill_rows(prefill_chunk: usize, n_slots: usize) -> usize {
     prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(n_slots))
 }
 
-/// Headroom the auto-sized paged pool leaves free for the map reserve, graph
-/// capture, JIT and driver allocations. Mirrors the VMM map reserve.
-const PAGED_MAP_RESERVE_BYTES: usize = 512 << 20;
+/// Headroom the auto-sized paged pool leaves uncommitted.
+///
+/// Measured on gfx1100 / Qwen3.8-27B IU4-P, q8 KV, 4-slot paged (2026-11-04):
+///   total VRAM                25,753,026,560 B
+///   HIP free after weights+scratch  5,958,008,832 B
+///   allocated between that reading and the served model  117,235,712 B
+///   largest per-step transient (4 lanes, max chunk)       ~54,800,000 B
+///   full-pool margin at this reserve                     ~139 MiB
+///
+/// The VMM pool commits a whole 64 MiB granule group (15 pages) at a time, so
+/// the reserve must be large enough for those two measured terms plus a real
+/// safety margin, and no larger. 300 MiB yields 84 groups = 1260 pages =
+/// 161,280 tokens; measured full-pool peaks: 84 groups -> 139 MiB free,
+/// 85 -> 75 MiB, 86 -> 11 MiB, 87 over-committed. 84 is the largest group
+/// count with a >128 MiB margin, so it is both the maximum safe KV cache and
+/// the point where admission is anchored.
+const PAGED_MAP_RESERVE_BYTES: usize = 300 << 20;
 
 /// Physical pages the shared paged pool may own from `free` device bytes.
 ///
@@ -2033,7 +2047,13 @@ impl Rig {
         // The arena route still charges the logical K+V page.
         let mut paged_vmm_budget = 0usize;
         let mut pool = if let Some(requested_pages) = paged_pages {
-            let pages = if requested_pages == 0 {
+            // One page count for every paged backend. For the VMM pool this is
+            // computed from the measured granule geometry and clamped to the
+            // safe maximum even when the operator names a count explicitly:
+            // promising pages the card cannot map turns into a mid-request
+            // map failure instead of an admission decision. The arena route
+            // keeps its logical-page arithmetic.
+            let (pages, auto_logged) = if paged_vmm {
                 let gpu = g.gpu.as_mut().unwrap();
                 let free = gpu
                     .device_mem_info()
@@ -2042,42 +2062,65 @@ impl Rig {
                 let cap_pages = cfg
                     .n_slots
                     .saturating_mul(cfg.cap_tokens.div_ceil(PAGE_TOKENS));
-                if paged_vmm {
-                    let granularity = gpu.vmm_recommended_granularity().map_err(|e| {
-                        format!("VMM-paged auto pool: granularity unavailable: {e}")
-                    })?;
-                    let geom = VmmGranuleGeometry::plan(granularity, PAGE_TOKENS, per_pos_bytes, 0)
-                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
-                    let usable = free.saturating_sub(PAGED_MAP_RESERVE_BYTES);
-                    let pages = geom
-                        .pages_fitting(n_fa_layers, usable, cap_pages)
-                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
-                    paged_vmm_budget = geom
-                        .physical_bytes(n_fa_layers, pages)
-                        .map_err(|e| format!("VMM-paged auto pool: {e}"))?;
+                let granularity = gpu.vmm_recommended_granularity().map_err(|e| {
+                    format!("VMM-paged pool: granularity unavailable: {e}")
+                })?;
+                let geom = VmmGranuleGeometry::plan(granularity, PAGE_TOKENS, per_pos_bytes, 0)
+                    .map_err(|e| format!("VMM-paged pool: {e}"))?;
+                let group = geom
+                    .group_bytes(n_fa_layers)
+                    .map_err(|e| format!("VMM-paged pool: {e}"))?;
+                let usable = free.saturating_sub(PAGED_MAP_RESERVE_BYTES);
+                let safe_pages = geom
+                    .pages_fitting(n_fa_layers, usable, cap_pages)
+                    .map_err(|e| format!("VMM-paged pool: {e}"))?;
+                let pages = if requested_pages == 0 {
+                    safe_pages
+                } else if requested_pages > safe_pages {
+                    eprintln!(
+                        "[hipfire] paged KV pool: requested {requested_pages} pages exceeds                          the safe {safe_pages} (free={free} B, reserve                          {PAGED_MAP_RESERVE_BYTES} B, {group} B per                          {}-page granule group); clamping",
+                        geom.pages_per_granule
+                    );
+                    safe_pages
+                } else {
+                    requested_pages
+                };
+                paged_vmm_budget = geom
+                    .physical_bytes(n_fa_layers, pages)
+                    .map_err(|e| format!("VMM-paged pool: {e}"))?;
+                if requested_pages == 0 {
                     eprintln!(
                         "[hipfire] paged KV auto pool (vmm): free={free} B usable={usable} B \
                          granule={} B pages/granule={} physical={paged_vmm_budget} B -> \
                          {pages} pages (cap {cap_pages})",
                         geom.granule_bytes, geom.pages_per_granule
                     );
-                    pages
-                } else {
-                    let page_bytes = n_fa_layers
-                        .checked_mul(PAGE_TOKENS)
-                        .and_then(|v| v.checked_mul(per_pos_bytes.saturating_add(per_pos_v_bytes)))
-                        .ok_or_else(|| "multi-slot paged page size overflow".to_string())?;
-                    let pages = paged_pool_pages_from_free(free, page_bytes, cap_pages);
-                    eprintln!(
-                        "[hipfire] paged KV auto pool: free={free} B page={page_bytes} B -> \
-                         {pages} pages (cap {cap_pages}, {} tokens/page)",
-                        PAGE_TOKENS
-                    );
-                    pages
                 }
+                (pages, true)
+            } else if requested_pages == 0 {
+                let gpu = g.gpu.as_mut().unwrap();
+                let free = gpu
+                    .device_mem_info()
+                    .map_err(|e| format!("paged pool VRAM query: {e}"))?
+                    .0;
+                let cap_pages = cfg
+                    .n_slots
+                    .saturating_mul(cfg.cap_tokens.div_ceil(PAGE_TOKENS));
+                let page_bytes = n_fa_layers
+                    .checked_mul(PAGE_TOKENS)
+                    .and_then(|v| v.checked_mul(per_pos_bytes.saturating_add(per_pos_v_bytes)))
+                    .ok_or_else(|| "multi-slot paged page size overflow".to_string())?;
+                let pages = paged_pool_pages_from_free(free, page_bytes, cap_pages);
+                eprintln!(
+                    "[hipfire] paged KV auto pool: free={free} B page={page_bytes} B -> \
+                     {pages} pages (cap {cap_pages}, {} tokens/page)",
+                    PAGE_TOKENS
+                );
+                (pages, true)
             } else {
-                requested_pages
+                (requested_pages, false)
             };
+            let _ = auto_logged;
             SlotPool::new_paged_with_strides(
                 cfg.n_slots,
                 cfg.cap_tokens,
@@ -7521,42 +7564,43 @@ fn lane_growth_pages(frontier_tokens: usize, allocated_pages: usize) -> usize {
         .saturating_sub(allocated_pages)
 }
 
-/// KV pages a request keeps reserved from admission until its prompt is
-/// prefilled: the prompt's own pages plus one page of generation headroom.
-///
-/// Generation growth past that is **best effort**: the client's `max_tokens`
-/// is a cap, not a promise to materialize that many KV rows, and reserving it
-/// would reject ordinary four-lane traffic (the shipped default is 32k, and
-/// four 8k-prompt lanes would need 4 x 40k > the 153.6k-token pool). When a
-/// lane actually runs the pool dry, the step's per-slot provisioning failure
-/// drops that lane alone with a retryable overload and keeps the rest of the
-/// batch serving.
-fn admission_prompt_pages(prompt_suffix_tokens: usize) -> usize {
-    prompt_suffix_tokens.div_ceil(PAGE_TOKENS).saturating_add(1)
+/// KV pages one request's whole budget needs: prompt suffix + `max_tokens`,
+/// rounded up to the pool's 128-token pages.
+fn admission_need_pages(prompt_suffix_tokens: usize, max_tokens: usize) -> usize {
+    prompt_suffix_tokens
+        .saturating_add(max_tokens.max(1))
+        .div_ceil(PAGE_TOKENS)
 }
 
-/// KV pages resident in-flight requests still have to write for their
-/// **prompt** (the rows past each lane's KV frontier up to its token count).
-/// Decode rows and generated tokens are not counted: they grow from the free
-/// pool under the per-step refusal.
-fn pending_prompt_pages(rig: &Rig, slots: &[Option<InFlight>], exclude: SessionId) -> usize {
+/// KV pages resident in-flight requests have reserved but not materialized:
+/// each lane's final frontier (current session tokens + remaining
+/// `max_tokens`) minus the pages its block table already holds.
+///
+/// Admission adds this to the new request's whole budget so every admitted
+/// lane can complete. On the measured 1260-page / 161,280-token pool that is
+/// two 80k lanes, three 8k+32k lanes (the shipped default needs 1276 pages,
+/// so the fourth waits), or four 8k+32,320 lanes exactly. A request that can
+/// never fit the pool is rejected up front instead of dying mid-generation.
+fn reserved_growth_pages(rig: &Rig, slots: &[Option<InFlight>], exclude: SessionId) -> usize {
     let mut total = 0usize;
     for (s, flight) in slots.iter().enumerate() {
         let Some(f) = flight.as_ref() else { continue };
         if f.session == exclude {
             continue;
         }
-        let Some(sess) = rig.sessions.get(f.session) else {
-            continue;
-        };
-        let frontier = rig
-            .pool
-            .descriptors()
-            .get(s)
-            .map(|d| d.seq_len.max(0) as usize)
+        let held_tokens = rig
+            .sessions
+            .get(f.session)
+            .map(|sess| sess.tokens.len())
             .unwrap_or(0);
-        let pending = sess.tokens.len().saturating_sub(frontier);
-        total = total.saturating_add(lane_growth_pages(pending, 0));
+        let remaining = f.max_tokens.saturating_sub(f.produced);
+        let frontier = held_tokens.saturating_add(remaining);
+        let allocated = rig
+            .pool
+            .block_table(SlotId(s))
+            .map(|bt| bt.num_pages())
+            .unwrap_or(0);
+        total = total.saturating_add(lane_growth_pages(frontier, allocated));
     }
     total
 }
@@ -7564,27 +7608,26 @@ fn pending_prompt_pages(rig: &Rig, slots: &[Option<InFlight>], exclude: SessionI
 /// Admission verdict for one request against the shared paged KV pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmissionVerdict {
-    /// The pool backs this request's prompt plus every live lane's pending
-    /// prompt.
+    /// The pool backs this request and every live lane's reserved growth.
     Admit,
     /// Capacity is in use by live lanes; the request could fit once they
     /// finish. Retryable (503).
     Wait,
-    /// `prompt + max_tokens` can never fit this pool, however empty: the
-    /// client must reduce `max_tokens` or the prompt. Not retryable (400).
+    /// The request's whole budget can never fit this pool, however empty:
+    /// the client must reduce `max_tokens` or the prompt. Not retryable
+    /// (400).
     TooLarge,
 }
 
 fn admission_verdict(
     free_pages: usize,
     committed_pages: usize,
-    prompt_pages: usize,
-    request_tokens: usize,
-    pool_tokens: usize,
+    need_pages: usize,
+    pool_pages: usize,
 ) -> AdmissionVerdict {
-    if request_tokens > pool_tokens {
+    if need_pages > pool_pages {
         AdmissionVerdict::TooLarge
-    } else if prompt_pages.saturating_add(committed_pages) > free_pages {
+    } else if need_pages.saturating_add(committed_pages) > free_pages {
         AdmissionVerdict::Wait
     } else {
         AdmissionVerdict::Admit
@@ -7817,11 +7860,10 @@ fn admit(
                             rig.sessions.get(existing).map(|s| s.next_pos).unwrap_or(0)
                         });
                     let suffix_tokens = extended.len().saturating_sub(held);
-                    let prompt_pages = admission_prompt_pages(suffix_tokens);
-                    // Reserve the live lanes' pending prompt rows too (not
-                    // their `max_tokens`): generation is best effort, and the
-                    // step refuses a lane that actually runs the pool dry.
-                    let committed = pending_prompt_pages(rig, slots, existing);
+                    let need_pages = admission_need_pages(suffix_tokens, req.max_tokens);
+                    // Reserve every live lane's remaining budget too, so the
+                    // admitted set can always complete.
+                    let committed = reserved_growth_pages(rig, slots, existing);
                     let pool_total = rig.pool.page_pool().map(|pp| pp.n_pages()).unwrap_or(0);
                     let pool_tokens = pool_total.saturating_mul(PAGE_TOKENS);
                     let request_tokens = extended.len().saturating_add(req.max_tokens.max(1));
@@ -7829,7 +7871,7 @@ fn admit(
                         (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
                     {
                         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free < prompt_pages.saturating_add(committed) {
+                        if free < need_pages.saturating_add(committed) {
                             let page_bytes = rig
                                 .pool
                                 .page_pool()
@@ -7838,7 +7880,7 @@ fn admit(
                             let pp = rig.pool.page_pool_mut().expect("paged pool");
                             idx.evict_unpinned_leaves(
                                 pp,
-                                prompt_pages.saturating_add(committed).saturating_sub(free)
+                                need_pages.saturating_add(committed).saturating_sub(free)
                                     * page_bytes,
                             );
                         }
@@ -7848,7 +7890,7 @@ fn admit(
                     exclude.push(existing);
                     loop {
                         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free >= prompt_pages.saturating_add(committed) {
+                        if free >= need_pages.saturating_add(committed) {
                             break;
                         }
                         let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
@@ -7860,13 +7902,7 @@ fn admit(
                         lock_stats(&stats).note_eviction();
                     }
                     let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                    match admission_verdict(
-                        free,
-                        committed,
-                        prompt_pages,
-                        request_tokens,
-                        pool_tokens,
-                    ) {
+                    match admission_verdict(free, committed, need_pages, pool_total) {
                         AdmissionVerdict::Admit => {}
                         AdmissionVerdict::TooLarge => {
                             // Keep the session resident — a smaller retry can
@@ -7876,10 +7912,11 @@ fn admit(
                                 Event::Rejected {
                                     class: RejectClass::Validation,
                                     reason: format!(
-                                        "request needs {request_tokens} tokens of KV \
-                                         (suffix + max_tokens) but the pool holds \
-                                         {pool_tokens} tokens in total — reduce \
-                                         max_tokens or shorten the prompt"
+                                        "request needs {need_pages} KV pages \
+                                         ({request_tokens} tokens of suffix + max_tokens) \
+                                         but the pool holds {pool_total} pages \
+                                         ({pool_tokens} tokens) — reduce max_tokens or \
+                                         shorten the prompt"
                                     ),
                                 },
                             );
@@ -7892,10 +7929,10 @@ fn admit(
                                 Event::Rejected {
                                     class: RejectClass::Overload,
                                     reason: format!(
-                                        "page pool reserved: need {prompt_pages} pages for \
-                                         this request's prompt plus {committed} pending for \
-                                         live requests, {free} free of {pool_total} — retry \
-                                         when they finish"
+                                        "page pool reserved: need {need_pages} pages for \
+                                         this request's whole budget plus {committed} \
+                                         reserved by live requests, {free} free of \
+                                         {pool_total} — retry when they finish"
                                     ),
                                 },
                             );
@@ -8576,8 +8613,8 @@ fn admit(
     // free list) rather than letting a mid-prefill provision fail.
     if rig.prefix_cache {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = admission_prompt_pages(suffix_tokens);
-        let committed = pending_prompt_pages(rig, slots, id);
+        let needed_pages = admission_need_pages(suffix_tokens, req.max_tokens);
+        let committed = reserved_growth_pages(rig, slots, id);
         let page_bytes = rig
             .pool
             .page_pool()
@@ -8613,20 +8650,19 @@ fn admit(
     // remains, reject at admit instead of letting the forward die.
     if rig.pool.is_paged() {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let prompt_pages = admission_prompt_pages(suffix_tokens);
-        // Capacity already promised to live lanes' pending prompt rows. The
-        // client's `max_tokens` is not reserved: it is a cap, and reserving it
-        // would refuse ordinary four-lane traffic (8k prompt + the shipped 32k
-        // default x 4 > the pool). A lane that actually runs the pool dry is
-        // refused by the step's per-slot provisioning, alone.
-        let committed = pending_prompt_pages(rig, slots, id);
+        let need_pages = admission_need_pages(suffix_tokens, req.max_tokens);
+        // Reserve every live lane's remaining budget as well, so an admitted
+        // set can always complete: on the measured 1260-page pool that is
+        // two 80k lanes, three 8k+32k lanes (the shipped 32,768 default needs
+        // 1276 pages, so the fourth waits), or four 8k+32,320 lanes exactly.
+        let committed = reserved_growth_pages(rig, slots, id);
         let pool_total = rig.pool.page_pool().map(|pp| pp.n_pages()).unwrap_or(0);
         let pool_tokens = pool_total.saturating_mul(PAGE_TOKENS);
         let request_tokens = req
             .prompt_tokens
             .len()
             .saturating_add(req.max_tokens.max(1));
-        let demand = prompt_pages.saturating_add(committed);
+        let demand = need_pages.saturating_add(committed);
         // The just-opened session holds a slot but is not in `busy` —
         // exclude it explicitly so it is never its own eviction victim.
         let mut exclude: Vec<SessionId> = busy.clone();
@@ -8646,20 +8682,21 @@ fn admit(
             if rig.gpu.slot_trace() {
                 eprintln!(
                     "[slot-trace] evicted idle session {victim:?} for page demand \
-                     ({free} free < {demand} needed incl. {committed} pending)"
+                     ({free} free < {demand} needed incl. {committed} reserved)"
                 );
             }
         }
         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+        let verdict = admission_verdict(free, committed, need_pages, pool_total);
         if rig.gpu.slot_trace() {
-            let verdict =
-                admission_verdict(free, committed, prompt_pages, request_tokens, pool_tokens);
             eprintln!(
-                "[slot-trace] admit session {}: prompt_pages={prompt_pages}                  pending={committed} free={free} pool={pool_total}                  tokens={request_tokens}/{pool_tokens} -> {verdict:?}",
+                "[slot-trace] admit session {}: need_pages={need_pages} \
+                 committed={committed} free={free} pool={pool_total} \
+                 tokens={request_tokens}/{pool_tokens} -> {verdict:?}",
                 id.0
             );
         }
-        match admission_verdict(free, committed, prompt_pages, request_tokens, pool_tokens) {
+        match verdict {
             AdmissionVerdict::Admit => {}
             AdmissionVerdict::TooLarge => {
                 let _ = send_event(
@@ -8667,9 +8704,10 @@ fn admit(
                     Event::Rejected {
                         class: RejectClass::Validation,
                         reason: format!(
-                            "request needs {request_tokens} tokens of KV (prompt + \
-                             max_tokens) but the pool holds {pool_tokens} tokens in \
-                             total — reduce max_tokens or shorten the prompt"
+                            "request needs {need_pages} KV pages ({request_tokens} \
+                             tokens of prompt + max_tokens) but the pool holds \
+                             {pool_total} pages ({pool_tokens} tokens) — reduce \
+                             max_tokens or shorten the prompt"
                         ),
                     },
                 );
@@ -8684,8 +8722,8 @@ fn admit(
                     Event::Rejected {
                         class: RejectClass::Overload,
                         reason: format!(
-                            "page pool reserved: need {prompt_pages} pages for this \
-                             request's prompt plus {committed} pending for live \
+                            "page pool reserved: need {need_pages} pages for this \
+                             request's whole budget plus {committed} reserved by live \
                              requests, {free} free of {pool_total} — retry when they \
                              finish"
                         ),
@@ -9294,58 +9332,75 @@ mod tests {
     }
 
     #[test]
-    fn admission_reserves_pending_prompts_and_separates_pressure_from_oversize() {
-        // Prompt reservation: the prompt's pages plus one page of generation
-        // headroom; the client's `max_tokens` is a cap, not a reservation.
-        assert_eq!(admission_prompt_pages(8_000), 64);
-        assert_eq!(admission_prompt_pages(39_598), 311);
-        assert_eq!(lane_growth_pages(50_000, 100), 291);
+    fn admission_reserves_the_whole_budget_on_the_measured_pool() {
+        // 1260 pages = 161,280 tokens is the measured safe maximum for the
+        // 24 GiB card (84 granule groups, ~139 MiB free at full mapping).
+        const POOL_PAGES: usize = 1260;
+        assert_eq!(POOL_PAGES * PAGE_TOKENS, 161_280);
 
-        const POOL_PAGES: usize = 1200;
-        const POOL_TOKENS: usize = POOL_PAGES * PAGE_TOKENS;
+        // Page need is the whole contract: prompt + max_tokens, rounded up.
+        assert_eq!(admission_need_pages(8_000, 32_768), 319);
+        assert_eq!(admission_need_pages(8_000, 32_320), 315);
+        assert_eq!(admission_need_pages(608, 80_000), 630);
 
-        // Four ordinary 8k-prompt lanes with the shipped 32k default stay
-        // admitted: reserving max_tokens would refuse the fourth.
-        let p8k = admission_prompt_pages(8_000);
-        let req8k = 8_000 + 32_768;
+        // Four 8k lanes with the shipped 32k default need 1276 pages and do
+        // not fit; the fourth waits at admission instead of over-committing.
+        let n8k = admission_need_pages(8_000, 32_768);
         assert_eq!(
-            admission_verdict(POOL_PAGES, 0, p8k, req8k, POOL_TOKENS),
+            admission_verdict(POOL_PAGES, 0, n8k, POOL_PAGES),
             AdmissionVerdict::Admit
         );
         assert_eq!(
-            admission_verdict(POOL_PAGES, 2 * 63, p8k, req8k, POOL_TOKENS),
+            admission_verdict(POOL_PAGES, 2 * n8k, n8k, POOL_PAGES),
             AdmissionVerdict::Admit
         );
         assert_eq!(
-            admission_verdict(POOL_PAGES, 3 * 63, p8k, req8k, POOL_TOKENS),
-            AdmissionVerdict::Admit
-        );
-
-        // Four 39.6k-token prompts do not all fit the pool: the fourth waits
-        // at admission instead of after a full prefill.
-        let p40k = admission_prompt_pages(39_598);
-        let req40k = 39_598 + 50_000;
-        assert_eq!(
-            admission_verdict(POOL_PAGES, 3 * 310, p40k, req40k, POOL_TOKENS),
+            admission_verdict(POOL_PAGES, 3 * n8k, n8k, POOL_PAGES),
             AdmissionVerdict::Wait
         );
-        // An exact fit admits; one page short waits.
+
+        // Four 8k lanes with a 32,320 budget fit exactly.
+        let n8k32 = admission_need_pages(8_000, 32_320);
+        assert_eq!(4 * n8k32, POOL_PAGES);
         assert_eq!(
-            admission_verdict(1200, 900, 300, req40k, POOL_TOKENS),
+            admission_verdict(POOL_PAGES, 3 * n8k32, n8k32, POOL_PAGES),
+            AdmissionVerdict::Admit
+        );
+
+        // Three 80k lanes need 1890 pages: two fit, the third waits.
+        let n80k = admission_need_pages(608, 80_000);
+        assert_eq!(
+            admission_verdict(POOL_PAGES, n80k, n80k, POOL_PAGES),
             AdmissionVerdict::Admit
         );
         assert_eq!(
-            admission_verdict(1199, 900, 300, req40k, POOL_TOKENS),
+            admission_verdict(POOL_PAGES, 2 * n80k, n80k, POOL_PAGES),
             AdmissionVerdict::Wait
         );
-        // `prompt + max_tokens` beyond the whole pool can never fit: 400.
+
+        // Exact fit admits; one page short waits.
         assert_eq!(
-            admission_verdict(1200, 0, 1, 200_000, POOL_TOKENS),
+            admission_verdict(1260, 0, 1260, POOL_PAGES),
+            AdmissionVerdict::Admit
+        );
+        assert_eq!(
+            admission_verdict(1259, 0, 1260, POOL_PAGES),
+            AdmissionVerdict::Wait
+        );
+
+        // A whole budget larger than the pool can never fit: 400.
+        let oversized = admission_need_pages(0, 200_000);
+        assert_eq!(oversized, 1563);
+        assert_eq!(
+            admission_verdict(POOL_PAGES, 0, oversized, POOL_PAGES),
             AdmissionVerdict::TooLarge
         );
+
+        // Growth is the final frontier minus what the lane already holds.
+        assert_eq!(lane_growth_pages(50_000, 100), 291);
         // Saturating: an absurd committed value must not wrap.
         assert_eq!(
-            admission_verdict(0, usize::MAX, 1, 1, POOL_TOKENS),
+            admission_verdict(0, usize::MAX, 1, POOL_PAGES),
             AdmissionVerdict::Wait
         );
     }

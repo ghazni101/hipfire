@@ -1296,7 +1296,8 @@ kernel is the fix), GDN 7.5%, qt59 W8A8 residuals 16%.
 ## C26 — live container failure: 4 x 50k generation, and the two hard defects it exposed (2026-11-03)
 
 The `qwen38-27b-iu4p` container was left running (image at `dc1f7fb2f`, 4-slot paged VMM,
-q8, 1200-page / 153,600-token pool, 5.37 GB) and driven with four concurrent
+q8, 1200-page / 153,600-token pool, 5.37 GB; now 1260 pages / 161,280 tokens after the
+capacity measurement below) and driven with four concurrent
 50,000-token generation requests. No restart was used to recover or clear state.
 
 ### Live profile (before the failure)
@@ -1348,32 +1349,24 @@ q8, 1200-page / 153,600-token pool, 5.37 GB) and driven with four concurrent
   consecutive column blocks of at most `IU4G256_XBATCH_COLUMNS` (4); the
   residual twin uses the same path. Plain stays bit-identical to the singleton
   per column, residual <= 1.3e-7, deterministic (gate now batches 1..=8).
-- Admission charges **pending prompts**, not the client's `max_tokens`:
-  `pending_prompt_pages` sums every live lane's un-prefilled prompt rows
-  (session token count minus its KV frontier), and a new request is admitted
-  when `free >= pending + this prompt's pages`. `max_tokens` is a cap, not a
-  reservation — reserving it was measured rejecting one of four ordinary
-  8k-prompt lanes under the shipped 32k default (3 x 318 + 323 > 1200 pages),
-  i.e. it broke normal multi-slot serving. Generation growth is best effort:
-  the step's per-slot provisioning failure drops only the lane that actually
-  runs the pool dry (retryable overload), and the rest of the batch continues.
-  `prompt + max_tokens` beyond the whole pool is `Validation` (HTTP 400,
-  non-retryable, names the pool's token capacity); prompt pressure is
-  `Overload` (HTTP 503, retry when live prompts finish). Both paged admission
-  paths (continuation and cold admit) and both reclaim loops use the same
-  charge.
-
-### After the fix (27B IU4P host serve, same pool)
-
-| case | before | after |
-|---|---|---|
-| 4 x (8k prompt, default 32k max) | 3 x 200 + 1 x 503 at 1.0 s (over-strict full-`max_tokens` reservation) | **4 x 200**, 26-43 s each |
-| `max_tokens=200000` | 503 overload (retryable) | **400** at 0.0 s: "request needs 200017 tokens of KV … pool holds 153600" |
-| 4 x (608-token, max 50k) | 4 admitted; all run | 4 admitted; all run (prompt fits; generation best effort) |
-| 4 x (39.6k-token, max 50k) | 4 admitted; 1 rejected at 166 s after a 157 s prefill | **3 admitted, the 4th 503 at 1.1 s** (311 needed + 914 pending > 1184 free) |
-| 2,053-token prompt (2048 + 5-row tail; the row class that raised defect 1) | `gemv_iu4g256_xbatch: batch must be 1..=4`, all lanes torn down | 200 in 1.4 s, no `batch must be` line |
-| 3 decoding lanes + 2,053-token prompt (mixed 5-row step) | same internal error class | all four 200, tape prepared for 4/3/2/1 live slots |
-
+- KV capacity is measured, not assumed. Geometry: 16 full-attention layers,
+  8 KV heads x 128 dim, q8 (1,088 B/token/side/layer) -> a 128-token page is
+  4,456,448 B logical; the VMM pool commits a whole 64 MiB granule group per
+  15 pages, i.e. 4,473,924 B/page physically. Total VRAM 25,753,026,560 B;
+  post-weight/scratch used 19,912,2xx,xxx B. Full-pool peaks (after the
+  ~54.8 MB per-step transient): 84 groups = 1260 pages = 161,280 tokens ->
+  ~139 MiB free; 85 -> 75 MiB; 86 -> 11 MiB; 87 over-committed. An
+  over-committed 1320-page pool was measured at 25.741 GB used / 29 MB free
+  under a 1286-page stress, which is why it is not the default. Auto-sizing
+  leaves 300 MiB (was 512) from the HIP free figure -> 1260 pages; an explicit
+  page count is clamped to the same measured safe maximum.
+- Admission reserves the **whole budget** (`ceil((prompt + max_tokens)/128)`
+  pages) plus every live lane's reserved growth (`current tokens + remaining
+  max_tokens - allocated pages`). On 1260 pages: four 8k lanes with the
+  shipped 32,768 default need 1276 pages -> three admit and the fourth is a
+  503; four 8k lanes with `max_tokens=32320` need exactly 1260 -> all admit;
+  three 80k lanes need 1890 -> two admit; 200k -> 400. The earlier
+  prompt-only policy admitted work it could not finish (the 3 x 80k report).
 - Generation pressure now preempts **parked** sessions instead of a live lane:
   when `set_seq_len` cannot grow a live slot after the radix-leaf eviction,
   the pre-step loop evicts LRU idle sessions (swap-out, or cold when the
@@ -1398,15 +1391,30 @@ Tests: `rdna-compute` lib 1327 pass; `hipfire-arch-qwen35` lib 509 pass;
 is unit-tested. The engine stays healthy after every rejection (a small
 request returns 200 in 0.2-0.3 s).
 
+### Measured capacity and admission (after the fix)
+
+| case | pages needed vs 1260 | outcome |
+|---|---:|---|
+| 4 x (8k prompt, `max_tokens=32768`) | 4 x 319 = 1276 | 3 x 200 + 1 x 503 at admission |
+| 4 x (8k prompt, `max_tokens=32320`) | 4 x 315 = 1260 | 4 x 200 exactly |
+| 3 x (608-token prompt, `max_tokens=80000`) | 3 x 630 = 1890 | 2 x 200 + 1 x 503 |
+| 4 x (608-token prompt, `max_tokens=50000`) | 4 x 396 = 1584 | 3 x 200 + 1 x 503 |
+| 4 x (39.6k prompt, `max_tokens=50000`) | 4 x 700 = 2800 | 1 x 200 + 3 x 503 |
+| `max_tokens=200000` | 1563 | 400 (validation, non-retryable) |
+| 1320-page control, 4 x 41,142-token prompts | 1286 pages mapped | all 200 but peak 25.741 GB / 29 MB free -> over-committed, not shipped |
+| 1260-page pool, 4 x 39,193-token prompts | 1228 pages mapped | all 200, peak 25.473 GB / ~267 MB free, no map refusal |
+| 32-page pool, idle 505-token session + live lane | 4 pages reclaim + growth | swap-out + evicted idle session, live lane 800/800 |
+
 ### Residual risk / next steps
 
-- Generation is best effort: if four admitted lanes collectively generate
-  past the pool they can still hit the step refusal (one lane dropped with a
-  retryable 503, the others keep serving). The alternative — vLLM-style
-  preemption of an active lane (recompute or swap) — is not implemented; the
-  swap tier only parks idle sessions. Reserving each lane's full `max_tokens`
-  would remove that window but was measured to reject a quarter of ordinary
-  four-lane traffic, so it is not the right default.
+- Admission now reserves each request's whole budget, so an admitted lane
+  cannot fail for capacity; the cost is that a fourth ordinary 8k+32,768 lane
+  is refused on the 161,280-token pool (1276 pages needed). Lowering
+  `generation.max_tokens` to 32,320, shortening the prompt, or a card with
+  more free VRAM is the way to admit four. The earlier prompt-only policy
+  admitted the work and failed it mid-generation, which is strictly worse.
+  The idle-session reclaim remains as a safety net for any residual growth
+  pressure (for example a speculative window past the reserved frontier).
 - `503` still carries no `Retry-After`; the gateway only retries class
   `transient`, so the practical effect is "client decides", which is standard
   but less helpful than a hint.

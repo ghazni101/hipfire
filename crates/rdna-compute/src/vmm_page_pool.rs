@@ -883,4 +883,40 @@ mod tests {
         assert_eq!(geom.physical_bytes(16, 10).unwrap(), group);
         assert_eq!(geom.pages_fitting(16, group * 2, 1000).unwrap(), 30);
     }
+
+    /// Pins the measured Qwen3.8-27B IU4-P q8 geometry: 16 full-attention
+    /// layers, 1,088 B/token/side/layer, 128-token pages packed 15 per 2 MiB
+    /// granule (64 MiB per group). With the measured post-load free figure and
+    /// the 300 MiB reserve this is 84 groups = 1260 pages = 161,280 tokens,
+    /// and mapping all of it leaves >128 MiB on the 24 GiB card.
+    #[test]
+    fn measured_qwen38_27b_q8_pool_is_1260_pages_with_a_real_margin() {
+        let geom = VmmGranuleGeometry::plan(4096, 128, 1088, 0).unwrap();
+        // page_bytes is one layer/side arena's 128-token page; the pool-wide
+        // logical page is x 2 sides x 16 layers = 4,456,448 B.
+        assert_eq!(geom.page_bytes, 139_264);
+        assert_eq!(geom.page_bytes * 32, 4_456_448);
+        assert_eq!(geom.granule_bytes, 2 * 1024 * 1024);
+        assert_eq!(geom.pages_per_granule, 15);
+        let group = geom.group_bytes(16).unwrap();
+        assert_eq!(group, 64 * 1024 * 1024);
+
+        // HIP free after weights+scratch on the measured card, less the
+        // serve's 300 MiB map reserve.
+        let usable = 5_958_008_832usize - (300 << 20);
+        let pages = geom.pages_fitting(16, usable, 8192).unwrap();
+        assert_eq!(pages, 1260);
+        assert_eq!(pages * 128, 161_280);
+        assert_eq!(geom.physical_bytes(16, pages).unwrap(), 84 * group);
+
+        // Full mapping, less the measured ~54.8 MB step transient.
+        let total = 25_753_026_560usize;
+        let after_load = 19_912_232_960usize;
+        let transient = 54_800_000usize;
+        let free_at_full = total - after_load - 84 * group - transient;
+        assert!(
+            free_at_full > 128 << 20,
+            "full-pool margin {free_at_full} B must exceed 128 MiB"
+        );
+    }
 }
