@@ -3599,25 +3599,52 @@ fn q8_attend_slots(
             )
         }
     } else if vmm_paged {
-        gpu.attention_flash_q8_0_batched_masked_slots_vmm_paged(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            positions,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            physical_cap,
-            max_ctx_len,
-            batch_size,
-            flash_partials,
-            None,
-            0,
-            0,
-            Some(descs_dev),
-            Some(row_slot_dev),
-        )
+        // gfx1100 H24/KV4/D256: the GQA-shared tile serves all six query
+        // heads of a kv head from one K/V page read, instead of the per-head
+        // batched tile's six passes over the context (the term that makes
+        // long-context decode fall off). The shared pool's page descriptor
+        // translates each 128-key tile's base; partials and the reduce are
+        // the same layout/contract as the batched tile.
+        if gpu.slots_gqa_decode_admitted(n_heads, n_kv_heads, head_dim, 128)
+            && max_ctx_len <= physical_cap
+        {
+            gpu.attention_flash_q8_0_gqa_paged_slots(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                flash_partials,
+                descs_dev,
+                row_slot_dev,
+            )
+        } else {
+            gpu.attention_flash_q8_0_batched_masked_slots_vmm_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                physical_cap,
+                max_ctx_len,
+                batch_size,
+                flash_partials,
+                None,
+                0,
+                0,
+                Some(descs_dev),
+                Some(row_slot_dev),
+            )
+        }
     } else {
         gpu.attention_flash_q8_0_batched_masked_slots(
             q,
@@ -4367,6 +4394,49 @@ pub(crate) fn final_logits_per_slot(
         return Ok(());
     }
 
+    // qt59 (IU8G128) head: the same one-weight-pass idea as the MQ4G256 arm
+    // above. The per-slot loop re-reads the whole lm_head matrix (1.27 GB at
+    // vocab 248320 x dim 5120) once per live slot; `gemv_iu8g32_xbatch` reads
+    // each row once for all columns. Only the GEMV is batched: each slot's
+    // last hidden row takes the reference's own `rmsnorm_f32`, exactly what
+    // `Step::Gemv` would run. Requires every slot active so batch row `b` is
+    // slot `b` (the kernel writes straight into `logits_out`).
+    if weights.output.gpu_dtype == DType::IU8G128
+        && n_slots > 1
+        && n_slots <= 4
+        && batch.m_per_slot.iter().all(|&m| m > 0)
+        && lm_head_skip.iter().all(|&skip| !skip)
+        && pbs.x_norm_batch.numel() >= n_slots * dim
+        && iu8g32_xbatch_shape_ok(dim)
+        && !head_xbatch_disabled()
+    {
+        let mut row_off = 0usize;
+        for (slot, &m) in batch.m_per_slot.iter().enumerate() {
+            let last_row = row_off + m - 1;
+            let last_row_view = pbs.x_batch.sub_offset(last_row * dim, dim);
+            let norm_out = pbs.x_norm_batch.sub_offset(slot * dim, dim);
+            gpu.rmsnorm_f32(
+                &last_row_view,
+                &weights.output_norm,
+                &norm_out,
+                config.norm_eps,
+            )?;
+            row_off += m;
+        }
+        debug_assert_eq!(row_off, batch.total_rows());
+        let x_all = pbs.x_norm_batch.sub_offset(0, n_slots * dim);
+        let head = weights.output.dispatch_ref();
+        gpu.gemv_iu8g32_xbatch(
+            head.buf,
+            &x_all,
+            logits_out,
+            config.vocab_size,
+            dim,
+            n_slots,
+        )?;
+        return Ok(());
+    }
+
     if batched_head_v2_admitted(gpu, weights, batch, pbs, lm_head_skip, dim) {
         batched_head_v2(
             gpu,
@@ -4423,6 +4493,27 @@ fn batched_head_verify_enabled() -> bool {
         hipfire_config::developer_var("HIPFIRE_BATCHED_HEAD_VERIFY").as_deref() == Ok("1")
     });
     *ENABLED
+}
+
+/// `HIPFIRE_IU8_HEAD_XBATCH=0` restores one IU8G128 lm_head GEMV per slot
+/// (diagnostic A/B for the one-weight-pass xbatch head). Default on.
+fn head_xbatch_disabled() -> bool {
+    static DISABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_IU8_HEAD_XBATCH")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
+    });
+    *DISABLED
+}
+
+/// The IU8G128 xbatch GEMV reads `uint4` weight and `float4` activation
+/// chunks, so the compact row stride (`K + K/64`) and `x` rows must be 16 B
+/// aligned as well as one-scale-per-128 shaped.
+fn iu8g32_xbatch_shape_ok(k: usize) -> bool {
+    k % 128 == 0 && (k + k / 64) % 16 == 0
 }
 
 /// Whether this step's final heads run as one multi-column launch per run of

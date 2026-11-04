@@ -1,0 +1,8 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "IU8G32_W8A8_MIN_ROWS",
+  "value": 48,
+  "row_key": "rows",
+  "covers": true,
+  "records": []
+}
