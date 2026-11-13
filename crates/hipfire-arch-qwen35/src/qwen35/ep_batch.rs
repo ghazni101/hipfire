@@ -1289,6 +1289,7 @@ impl QwenRootEpBinding<'_> {
             self.semantics,
             DflashFusionCtx::Off,
             None, // commit_stride: EP keeps legacy cadence
+            None, // extract_hidden: EP lanes do not seed a draft context
         )
         .map_err(dispatch_err)
     }
@@ -2076,6 +2077,7 @@ impl Qwen35DecodeBatchEpState {
                                 BatchSemantics::Sequential,
                                 DflashFusionCtx::Off,
                                 None, // commit_stride: EP lanes keep legacy cadence
+                                None, // extract_hidden: EP lanes do not seed a draft context
                             )?;
                         }
                     }
@@ -2445,6 +2447,7 @@ impl Qwen35DecodeBatchEpState {
                             },
                             DflashFusionCtx::Off,
                             None, // commit_stride: EP lanes keep legacy cadence
+                            None, // extract_hidden: EP lanes do not seed a draft context
                         )?;
                     }
                 }
@@ -3211,6 +3214,7 @@ pub fn forward_prefill_batch_ep(
                     routed_out,
                     DflashFusionCtx::Off,
                     None, // commit_stride: EP bands keep legacy cadence
+                    None, // extract_hidden: EP bands do not seed a draft context
                 )?;
             }
         }
@@ -4973,6 +4977,7 @@ pub fn forward_prefill_batch_multi(
                         None, // routed_out: PP bands are multi-layer, not EP
                         DflashFusionCtx::Off,
                         None, // commit_stride: EP bands keep legacy cadence
+                        None, // extract_hidden: EP bands do not seed a draft context
                     )?;
                 }
 
