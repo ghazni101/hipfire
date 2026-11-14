@@ -991,7 +991,19 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     }
 }
 
-/// Decode-width MQ4V2 (1..=[`FEW_ROW_ROUTE_ROWS`]). The prefill WMMA tile is
+/// Widest multi-slot step the gfx1100 decode-width layer routes take: the
+/// per-row sealed MoE (merged cohort at 2..=4) and the x-batch MQ4V2 GEMV.
+///
+/// The x-batch GEMV decodes each weight row for at most four activations, and
+/// the cohort covers 2..=4 rows. Past four rows the GEMV runs a second pass and
+/// the MoE falls back to one sealed single-row program per row, which reloads
+/// every routed expert per row. On gfx1100 with 8 slots on Qwen3.6-35B-A3B,
+/// those widths decoded below the batched WMMA/MoE body (c8 aggregate 249 vs
+/// 351 tok/s), so rows 5..=8 keep the batched body, as on beta.
+// selector-receipt: receipts/selectors/slots_decode_route_max_rows.json
+pub(crate) const SLOTS_DECODE_ROUTE_MAX_ROWS: usize = 4;
+
+/// Decode-width MQ4V2 (1..=[`SLOTS_DECODE_ROUTE_MAX_ROWS`]). The prefill WMMA tile is
 /// 16 rows and a PM4 recording is pinned to its base kernel, so a 1..4 row
 /// slot step was paying for an empty tile. The x-batch GEMV is the sequential
 /// accumulator with each weight row decoded once for up to four activations.
@@ -1000,7 +1012,7 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
 /// below call: gfx1151/gfx1201 keep the fused WMMA path and its bytes.
 fn slots_few_mq4v2(gpu: &Gpu, dt: DType, k: usize, n: usize) -> bool {
     dt == DType::MQ4G256V2
-        && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n)
+        && (1..=SLOTS_DECODE_ROUTE_MAX_ROWS).contains(&n)
         && k.is_multiple_of(256)
         && gpu.slots_decode_scope
 }
@@ -1809,7 +1821,8 @@ fn slots_moe_ffn(
     n: usize,
     weights_moe_has_mq6: bool,
 ) -> HipResult<()> {
-    // Decode-width rows (1..=8) each run the sealed single-row MoE. The
+    // Decode-width rows (1..=[`SLOTS_DECODE_ROUTE_MAX_ROWS`]) run the merged
+    // cohort or the sealed single-row MoE per row. The
     // batched prefill body is a different reduction: at 4 live slots, row 0
     // and rows 1..3 diverge from a solo sealed step (and from each other)
     // within a few dozen greedy tokens. Prompt chunks are larger than 8 and
@@ -1817,10 +1830,7 @@ fn slots_moe_ffn(
     //
     // gfx1100 decode-width routes only ([`slots_gfx1100_routes`]): every other
     // arch keeps the batched body at every width, as on beta.
-    if gpu.slots_decode_scope
-        && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n)
-        && config.dim > 0
-    {
+    if gpu.slots_decode_scope && (1..=SLOTS_DECODE_ROUTE_MAX_ROWS).contains(&n) && config.dim > 0 {
         if slots_moe_cohort(gpu, ffn, ffn_norm, config, pbs, n)? {
             return Ok(());
         }
@@ -6153,6 +6163,13 @@ mod tests {
         assert_eq!(cohort_precheck(1, true), Err(CohortDecline::Rows));
         assert_eq!(cohort_precheck(0, true), Err(CohortDecline::Rows));
         assert_eq!(cohort_precheck(5, true), Err(CohortDecline::Rows));
+        // The per-row MoE route stops where the cohort stops: wider steps
+        // would run one sealed program per row and reload every expert.
+        assert_eq!(cohort_precheck(SLOTS_DECODE_ROUTE_MAX_ROWS, true), Ok(()));
+        assert_eq!(
+            cohort_precheck(SLOTS_DECODE_ROUTE_MAX_ROWS + 1, true),
+            Err(CohortDecline::Rows)
+        );
         for n in 2..=4 {
             assert_eq!(cohort_precheck(n, true), Ok(()));
             assert_eq!(cohort_precheck(n, false), Err(CohortDecline::Arch));
