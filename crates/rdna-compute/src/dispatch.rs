@@ -859,14 +859,14 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
-    /// IU4-G256 (qt=57): MQ4V2 codes in an unsigned-nibble row. Codes occupy
+    /// IU4G128 (qt=60): MQ4V2 codes in an unsigned-nibble row. Codes occupy
     /// the first `K/2` bytes (low nibble = even K); `(f16 scale, f16 zero)`
     /// pairs for each 128 weights follow. `K % 256 == 0`, 4.25 bpw. Readers:
     /// `gemv_iu4g128*` (decode) and the `gemm_iu4.rs` prefill family (exact
     /// gfx1100/gfx1151); the generic GEMV/GEMM families still refuse it. See
     /// `hipfire_runtime::iu_quant`.
     IU4G128,
-    /// IU8-G128 (qt=58): the Q8 grid (signed int8, zero point 0, no FWHT)
+    /// IU8G128 (qt=61): the Q8 grid (signed int8, zero point 0, no FWHT)
     /// with **one f16 scale per 128** stored as a compact row: `K` signed code
     /// bytes, then `K/128` little-endian f16 scales (`K + K/64` bytes, 8.125
     /// bpw). `K % 128 == 0`. This is the signed operand of
@@ -1199,7 +1199,7 @@ impl DType {
                     Some((codes + (k / 128) * 4).div_ceil(16) * 16)
                 }
             }
-            // qt=58. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
+            // qt=61. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
             DType::IU8G128 => {
                 if k % 128 != 0 {
                     None
@@ -1242,7 +1242,7 @@ impl DType {
         self.mq_i4_name().is_some()
     }
 
-    /// Canonical name of the IU4/IU8 operand layouts (qt=57/58); `None` for
+    /// Canonical name of the IU4/IU8 operand layouts (qt=60/61); `None` for
     /// every other dtype. Generic consumers refuse these: no kernel reads them yet.
     pub fn iu_quant_name(self) -> Option<&'static str> {
         match self {
@@ -11853,7 +11853,7 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.mq_i4_name(), None);
     }
 
-    /// qt=57/58 are row-addressed MQ4V2 code layouts. K must be a multiple of
+    /// qt=60/61 are row-addressed MQ4V2 code layouts. K must be a multiple of
     /// 256; the row is codes then the per-128 scale pairs.
     #[test]
     fn iu_dtypes_are_row_addressed_and_named() {
@@ -11866,7 +11866,7 @@ mod tests {
         assert!(DType::IU4G128.is_iu_quant());
         assert!(!DType::MQ4G256V2.is_iu_quant());
         assert!(!DType::IU4G128.is_mq_i4());
-        // qt=58 is the compact Q8 grid, one scale per 128, not K%256.
+        // qt=61 is the compact Q8 grid, one scale per 128, not K%256.
         assert_eq!(DType::IU8G128.row_bytes(128), Some(130));
         assert_eq!(DType::IU8G128.row_bytes(256), Some(260));
         assert_eq!(DType::IU8G128.row_bytes(32), None);

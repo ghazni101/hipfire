@@ -1606,14 +1606,14 @@ pub(crate) fn lm_head_batched(
     batch_size: usize,
 ) -> HipResult<()> {
     match output.gpu_dtype {
-        // qt58 (tied/untied lm_head in iu4 files): per-lane decode GEMV, so
+        // qt61 (tied/untied lm_head in iu4 files): per-lane decode GEMV, so
         // each lane's logits are bit-identical to the solo decode lm_head.
         DType::IU8G128 => {
             for i in 0..batch_size {
                 let row = hidden.sub_offset(i * output.k, output.k);
                 let logits_row = logits.sub_offset(i * output.m, output.m);
                 // Same Step::Gemv the solo decode lm_head runs (forward.rs),
-                // not llama::weight_gemv (which refuses qt 58).
+                // not llama::weight_gemv (which refuses qt 61).
                 let wr = output.dispatch_ref();
                 let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
                 let step = hipfire_dispatch::pipeline::Step::Gemv {

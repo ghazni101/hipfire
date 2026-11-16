@@ -1355,7 +1355,7 @@ impl HfqFile {
                     sampled_groups += 1;
                 }
             }
-            // qt57 (IU4G128) stores the same per-128 (scale, zero) pairs at the
+            // qt60 (IU4G128) stores the same per-128 (scale, zero) pairs at the
             // row tail: [K/2 codes][(sc, zp) x K/128]. Sample three rows.
             for tensor in tensors
                 .iter()
@@ -1402,7 +1402,7 @@ impl HfqFile {
             if sampled_groups == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "HfqFile: symmetric MQ4V2 marker set but no qt=44 or qt=57 groups exist",
+                    "HfqFile: symmetric MQ4V2 marker set but no qt=44 or qt=60 groups exist",
                 ));
             }
         }
@@ -5648,7 +5648,7 @@ mod iu4_symmetric_marker_tests {
     use super::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
     use crate::iu_quant::{row_bytes, Layout};
 
-    /// Four qt57 rows of K=256 whose per-128 zero is `zero(d)`.
+    /// Four qt60 rows of K=256 whose per-128 zero is `zero(d)`.
     fn write_iu4(path: &std::path::Path, zero: impl Fn(f32) -> f32) {
         let (m, k) = (4usize, 256usize);
         let rb = row_bytes(k, Layout::Iu4).unwrap();

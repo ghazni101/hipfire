@@ -5919,7 +5919,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
             ["gemm_q8_0_residual_wmma"]
         );
-        // qt 58 (IU8G128) relayout of the Q8_0 residual GEMM, base and the
+        // qt 61 (IU8G128) relayout of the Q8_0 residual GEMM, base and the
         // four-batch-tile fanout used at N >= 64.
         add!(
             "gemm_iu8g128_residual_wmma",
@@ -11957,8 +11957,8 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The IU quant family readers: qt 57 (IU4G128) decode GEMV with its
-        // fused residual twin, the qt 58 (IU8G128) pair, and the qt 58
+        // The IU quant family readers: qt 60 (IU4G128) decode GEMV with its
+        // fused residual twin, the qt 61 (IU8G128) pair, and the qt 61
         // embedding gather. All are arch-agnostic (integer-dot / f16-scale x
         // f32 math), so every pack carries them.
         // The xbatch pair is the multi-slot IU4 decode GEMV (one weight

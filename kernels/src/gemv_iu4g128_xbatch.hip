@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// x-batched decode GEMV for IU4G128 (qt 57): one weight row is decoded ONCE
+// x-batched decode GEMV for IU4G128 (qt 60): one weight row is decoded ONCE
 // and dotted against B separate activation vectors. It is the IU4 twin of
-// `gemv_mq4g256v2_xbatch.hip`, with the planar qt 57 address math of
+// `gemv_mq4g256v2_xbatch.hip`, with the planar qt 60 address math of
 // `gemv_iu4g128`.
 //
 // Why: the multi-slot decode path runs one GEMV launch per slot, so every
@@ -12,7 +12,7 @@
 // bound, so B slots cost B full weight passes per step. Every slot wants the
 // same weights against a different x; the reads collapse to one pass here.
 //
-// Row layout (qt 57): `[K/2 code bytes][K/256 * 8 B headers]`, header
+// Row layout (qt 60): `[K/2 code bytes][K/256 * 8 B headers]`, header
 // `f16 sc0, f16 zp0, f16 sc1, f16 zp1`; low nibble = even K. `w = sc*code + zp`
 // with sc/zp selected by `tid < 16` (first/second 128 of the group). x is
 // already FWHT-256 rotated.
@@ -34,7 +34,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// qt60 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
 #ifndef IU4_ROW_BYTES
 #define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)

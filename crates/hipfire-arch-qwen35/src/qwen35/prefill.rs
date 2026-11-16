@@ -4585,7 +4585,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let bf16_with_gfx942 =
         matches!(dt, DType::BF16) && arch == "gfx942" && rdna_compute::calib_force_bf16();
 
-    // IU4G128 (qt57): native IU4 Q8_1 MMQ prefill (`gemm_iu4g128_multi`, the
+    // IU4G128 (qt60): native IU4 Q8_1 MMQ prefill (`gemm_iu4g128_multi`, the
     // MQ4V2 MMQ arithmetic over the planar IU4 rows) on gfx1100/gfx1151. The
     // six rotation lists (qkv/wo/ffn/w_down in batched*.rs) and the
     // gate_up/qkv/qkvza/epilogue/single-weight IU4 arms land in lockstep.

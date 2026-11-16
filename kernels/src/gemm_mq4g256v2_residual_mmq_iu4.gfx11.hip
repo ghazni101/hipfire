@@ -31,7 +31,7 @@
 
 #include <hip/hip_runtime.h>
 
-// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// qt60 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
 #ifndef IU4_ROW_BYTES
 #define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
@@ -157,7 +157,7 @@ static __device__ __forceinline__ void load_iu4_tile(
         const int i = i0 + threadIdx.y;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
 #ifdef HIPFIRE_IU4_PLANAR
-        // qt57 planar row [K/2 codes][8 B header x G]: payload-form base - 8.
+        // qt60 planar row [K/2 codes][8 B header x G]: payload-form base - 8.
         const char* gp = A + (long long)row * IU4_ROW_BYTES(groups_per_row) + (long long)kb * 128 - 8;
 #else
         const char* gp = A + ((long long)row * groups_per_row + kb) * 136;

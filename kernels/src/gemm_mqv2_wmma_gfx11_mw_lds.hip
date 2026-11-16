@@ -39,7 +39,7 @@
 #include <hip/hip_fp16.h>
 
 // Residual-entry A addressing. Default: V2 group-major ([8 B header][payload]
-// per group). HIPFIRE_MWL_IU4L (4-bit only): qt57 planar row
+// per group). HIPFIRE_MWL_IU4L (4-bit only): qt60 planar row
 // [K/2 codes][8 B header x G]; gp is the group's payload base - 8 so the
 // shared `gp + 8` payload expression is unchanged.
 #ifdef HIPFIRE_MWL_IU4L

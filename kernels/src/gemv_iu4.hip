@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Decode GEMV for IU4G128 (qt 57).
+// Decode GEMV for IU4G128 (qt 60).
 //
 // Row layout: [K/2 code bytes][f16 sc, f16 zp per 128] x K/128, zero-padded
 // to 16 B (IU4_ROW_BYTES). Low nibble = even K. Dequant w = sc*code + zp.
@@ -24,7 +24,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
-// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// qt60 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
 #ifndef IU4_ROW_BYTES
 #define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)

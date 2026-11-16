@@ -1,10 +1,10 @@
-# IU4 / IU8G128 (qt 57 / qt 58)
+# IU4 / IU8G128 (qt 60 / qt 61)
 
 MQ4G256V2 codes stored so an integer matrix instruction can load them.
 The product is `iu4`, with the three rungs in
 [ladder.md](ladder.md). `--format iu4` on
 `hipfire-quantize` uses the MQ4V2 tensor map for the body. A role the rung
-lifts is stored as IU8G128 (qt 58), a contiguous signed-int8 operand, instead
+lifts is stored as IU8G128 (qt 61), a contiguous signed-int8 operand, instead
 of interleaved Q8F16. Norms stay F16. K-map Promote6 does not rewrite a
 body row to MQ6. Those rows stay on this layout, which is the operand
 `v_wmma_i32_16x16x16_iu4` and `v_dot4_i32_iu8` can load. Q8 and F16 K-map
@@ -64,7 +64,7 @@ and has to be re-quantized.
 
 | | code bytes | scale bytes | row bytes at K=256 | stored bpw |
 |---|---:|---:|---:|---:|
-| IU4, qt 57 | `K/2` | `K/128 * 4` | 136 | 4.25 |
+| IU4, qt 60 | `K/2` | `K/128 * 4` | 136 | 4.25 |
 
 Scales are little-endian and in half order: for each 256-weight group, half 0
 (weights 0..127) then half 1 (128..255), which is the 8-byte MQ4V2 header
@@ -82,7 +82,7 @@ is already K element `m`, so IU4 needs no permute before
 `dequant`, `gemv_iu4_dot8`, `row_bytes`, `code_bytes`. Dequant is the
 rotated-basis f32 value above.
 
-Decode GEMV for qt 57 is `gemv_iu4g128` with f32 activations, on every arch.
+Decode GEMV for qt 60 is `gemv_iu4g128` with f32 activations, on every arch.
 It is a wide-load kernel: one row per 32-lane wave, four rows per 128-thread
 block, and each lane reads 16 code bytes (32 weights) at a time, so it needs
 the 16-byte row alignment above. Per 32 weights it folds
@@ -96,7 +96,7 @@ hardware: `HIPFIRE_IU4_DECODE=dot4` (W4A8, `v_dot4_i32_iu8`). The W4A4
 `v_dot8_i32_iu4` decode route was removed; `iu_quant::gemv_iu4_dot8` stays as
 the CPU int4-activation reference.
 
-Prefill GEMM for qt 57 is W4A8 by default (`gemm_iu4g128_w4a8_*`, int8
+Prefill GEMM for qt 60 is W4A8 by default (`gemm_iu4g128_w4a8_*`, int8
 activation per 128, `v_wmma_i32_16x16x16_iu8`); `HIPFIRE_IU4_PREFILL_ACT=a4`
 selects the faster W4A4 (`gemm_iu4g128_w4a4_*`, `v_wmma_i32_16x16x16_iu4`).
 Qwen3.5-4B on gfx1100, pp512: W4A8 about 7,700 tok/s and prefill KL vs
@@ -106,7 +106,7 @@ Both run on exact gfx1100 and gfx1151 only, gated by
 per-token decode loop. DFlash verify runs the target's batched body, so it
 takes the same route.
 
-## Lifted roles (qt 58)
+## Lifted roles (qt 61)
 
 A lifted row is not put on the 4-bit grid. Q4-grade error there is the reason it was Q8F16, and a byte that only holds `0..=15` does not use the int8 multiplier: `v_wmma_i32_16x16x16_iu8` would be multiplying a nibble stored in a byte, at twice the bandwidth of IU4 for the same values.
 
@@ -119,7 +119,7 @@ scale; quantization is `d = amax/127` over each 128-wide group and every code is
 w = f32(scale) * f32(i8(code))
 ```
 
-IU8G128 (qt 58) stores the codes contiguously and the scales at the row tail:
+IU8G128 (qt 61) stores the codes contiguously and the scales at the row tail:
 
 ```text
 IU8G128, one row, K = 256                          260 B/row = 8.125 bpw
@@ -136,7 +136,7 @@ IU8G128, one row, K = 256                          260 B/row = 8.125 bpw
 one-scale-per-32 layout (`K + K/16`, 8.5 bpw), then zero-padded to a 16-byte
 multiple (see Row layout).
 
-The wire name is `IU8G128` (`QuantType::IU8G128`, qt 58). The runtime types
+The wire name is `IU8G128` (`QuantType::IU8G128`, qt 61). The runtime types
 (`rdna_compute::DType::IU8G128`, `EmbeddingFormat::IU8G128`), `iu_quant`, and
 `DType::iu_quant_name()` use the same name. The row carries one f16 scale per 128.
 
@@ -159,25 +159,25 @@ and W8A8 is 1.26–1.36× faster at 56–63 and 1.9–2.8× from 64.
 Norms stay F16. The embedding table is a gather, not a matrix instruction. On the normal rung it is stored this way so a tied `lm_head` is the same buffer the int8 unit can load. Attention and the router are not rungs; on a MoE model the Q8 pin still holds them.
 
 Q8 and F16 tensors outside an `iu4` file are unchanged. The generic
-GEMM dispatcher refuses qt 57 and 58; DFlash admits qt 58 on exact
+GEMM dispatcher refuses qt 60 and 61; DFlash admits qt 61 on exact
 gfx1100/gfx1151 (its verify head runs `gemm_iu8g128_residual_wmma` and its
 noise embedding runs `embedding_lookup_iu8g128`).
 
 ## What runs
 
-| reader | qt 57 IU4 | qt 58 IU8G128 |
+| reader | qt 60 IU4 | qt 61 IU8G128 |
 |---|---|---|
 | decode GEMV | `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
 | fused `y += W·x` | `gemv_iu4g128_residual` | `gemv_iu8g128_residual` |
-| embedding gather | — (the table is qt 58 on every rung) | `embedding_iu8g128` |
+| embedding gather | — (the table is qt 61 on every rung) | `embedding_iu8g128` |
 | prefill GEMM | `gemm_iu4g128_w4a8_*` (`v_wmma_i32_16x16x16_iu8`; `HIPFIRE_IU4_PREFILL_ACT=a4` = W4A4 `gemm_iu4g128_w4a4_*`; gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
-| DFlash verify | — | qt 58 head via `gemm_iu8g128_residual_wmma` (gfx1100/gfx1151) |
+| DFlash verify | — | qt 61 head via `gemm_iu8g128_residual_wmma` (gfx1100/gfx1151) |
 
-`hipfire_runtime::iu_quant` is the CPU contract: `dequant` for qt 57
-and `gemv_q8` (`dequant_q8` · `x`) for qt 58. The loaders admit both dtypes
-(`RAW_CODECS`), and qt 58 embedding tables are admitted raw (one contiguous
+`hipfire_runtime::iu_quant` is the CPU contract: `dequant` for qt 60
+and `gemv_q8` (`dequant_q8` · `x`) for qt 61. The loaders admit both dtypes
+(`RAW_CODECS`), and qt 61 embedding tables are admitted raw (one contiguous
 plane + tail scales), so an `iu4` artifact loads and decodes on the
-per-token path. Batched prefill runs qt 57 (W4A8, or W4A4 opt-in) and qt 58 (W8A8 or its
+per-token path. Batched prefill runs qt 60 (W4A8, or W4A4 opt-in) and qt 61 (W8A8 or its
 f16-WMMA twin, per `Gpu::iu8g128_gemm_route`) on exact gfx1100/gfx1151 only;
 the generic GEMM dispatcher still refuses both. A rung's `ssm_out` is a body row on `xt`/base, so that rung takes the
 fused residual twin; there is no `_batched` gather.

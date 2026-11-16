@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the compact IU8G128 (qt58) batched residual GEMM family.
+//! Numerics gate for the compact IU8G128 (qt61) batched residual GEMM family.
 //!
-//! qt58 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
+//! qt61 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
 //! dequantized weight to f16 and run f16 WMMA; this test checks every
 //! candidate against an independent f64 reference of the same compact row,
-//! and checks determinism. `IU8_REAL=<.iu4p>` sweeps every real qt58 tensor.
+//! and checks determinism. `IU8_REAL=<.iu4p>` sweeps every real qt61 tensor.
 //!
 //!   cargo test -p hipfire-runtime --release --test iu8g128_wmma_gemm_gpu -- --ignored --nocapture
 
@@ -149,7 +149,7 @@ fn iu8g128_wmma_matches_reference() {
         let mut seen = std::collections::BTreeSet::new();
         for t in f.tensors().to_vec() {
             let (ti, ib) = f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 58 || ti.shape.len() < 2 {
+            if ti.quant_type != 61 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;
@@ -160,7 +160,7 @@ fn iu8g128_wmma_matches_reference() {
             assert_eq!(
                 ib.len(),
                 m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap(),
-                "{}: bad qt58 row size",
+                "{}: bad qt61 row size",
                 t.name
             );
             for &n in &[1usize, 77] {
@@ -263,7 +263,7 @@ fn w8a8_lds_min_matches_reference_and_times() {
     eprintln!("w8a8 min: m={m} k={k} n={n} worst rel={rel:.3e}");
     assert!(rel < 1e-5, "w8a8 min rel {rel:.3e}");
 
-    // The residual epilogue (`add = true`) is the role both qt58 prefill
+    // The residual epilogue (`add = true`) is the role both qt61 prefill
     // bodies use; it must equal seed + the set result exactly.
     let seed: Vec<f32> = (0..n * m).map(|i| 0.11 * (i % 13) as f32 - 0.7).collect();
     let y_add = gpu.upload_f32(&seed, &[n * m]).unwrap();
@@ -401,7 +401,7 @@ fn w8a8_lds_min_ragged_shapes() {
 
 /// Crossover timing for [`Gpu::iu8g128_gemm_route`]: the W8A8 route
 /// (activation int8 quant + IU8 WMMA) against the f16 twin (activation f16
-/// convert + f16 WMMA), both as `Y += W X` on real 27B qt58 shapes, each
+/// convert + f16 WMMA), both as `Y += W X` on real 27B qt61 shapes, each
 /// activation conversion charged per call as it is in a layer loop.
 ///
 ///   cargo test -p hipfire-runtime --release --test iu8g128_wmma_gemm_gpu \

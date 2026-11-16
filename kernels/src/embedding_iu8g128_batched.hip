@@ -2,14 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Batched IU8G128 (qt 58) embedding lookup: N rows of the compact table
+// Batched IU8G128 (qt 61) embedding lookup: N rows of the compact table
 // `[K signed codes][K / 128 f16 scales]` into `output[n, dim]` F32, token
 // ids from a device buffer (hipGraph-captureable). Per element identical to
 // `embedding_iu8g128` and to `embedding_q8_batched` on the Q8_0 twin.
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)

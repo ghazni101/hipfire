@@ -2676,7 +2676,7 @@ fn gemm_dispatch(
         )),
         DType::IU4G128 | DType::IU8G128 => Err(hip_bridge::HipError::new(
             0,
-            "dflash GEMM cannot consume IU4/IU8 (qt=57/58) on this dispatcher: the qt58 head goes through gemm_iu8g128_residual_wmma and qt57 has no entry here",
+            "dflash GEMM cannot consume IU4/IU8 (qt=60/61) on this dispatcher: the qt61 head goes through gemm_iu8g128_residual_wmma and qt60 has no entry here",
         )),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {

@@ -152,10 +152,10 @@ sits outside the ladder and the § 1 budget governs each step.
 ### IU products
 
 `iu4` is not an `mq4` file. The body is the same MQ4V2 grid, stored
-as an integer-matrix operand (qt 57 or qt 58), so the product name has to say
+as an integer-matrix operand (qt 60 or qt 61), so the product name has to say
 so. The three rungs are the same roles: the bare name lifts embeddings and
 `lm_head`, `-xt` leaves `lm_head` on the body, ` pro` also lifts `ssm_out`.
-What a rung lifts *to* is IU8G128 (qt 58), the Q8 grid with one f16 scale per
+What a rung lifts *to* is IU8G128 (qt 61), the Q8 grid with one f16 scale per
 128 at the row tail, not a new numeric grid. `conv1d` is a 3-D tensor, so it
 stays interleaved Q8F16 (qt 3) at every rung rather than IU8G128. Norms
 stay F16. Lifting attention is still not a rung.

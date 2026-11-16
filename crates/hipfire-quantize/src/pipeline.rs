@@ -255,7 +255,7 @@ fn iu_role_stays_on_body(name: &str) -> bool {
 /// source scales are folded to **one f16 scale per 128** and the codes are
 /// re-rounded (`d = amax/127` per 128), so the row becomes
 /// `[K signed codes][K/128 f16 scales]` — a contiguous signed operand for
-/// `v_wmma_i32_16x16x16_iu8` (qt 58 `IU8G128`).
+/// `v_wmma_i32_16x16x16_iu8` (qt 61 `IU8G128`).
 /// which stores MQ4 nibbles `0..=15` in a byte. A row whose K is not a
 /// multiple of 128, or a tensor that is not a single row or a 2-D matrix,
 /// stays interleaved Q8F16.
@@ -2411,7 +2411,7 @@ pub(crate) fn run() {
         .expect("IU_STORAGE set twice — should not happen");
     if let Some(layout) = iu_layout {
         eprintln!(
-            "IU storage: {} — MQ4V2 codes in {} operand rows; lifted roles as qt 58 IU8G128",
+            "IU storage: {} — MQ4V2 codes in {} operand rows; lifted roles as qt 61 IU8G128",
             layout.name(),
             layout.name()
         );

@@ -226,7 +226,7 @@ fn iu4_w4a4_and_mwl_are_bit_exact_to_mq4v2() {
         let mut done = 0;
         for t in iu_f.tensors().to_vec() {
             let (ti, ib) = iu_f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 57 || ti.shape.len() < 2 {
+            if ti.quant_type != 60 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;

@@ -37,7 +37,7 @@ impl Rng {
     }
 }
 
-/// Planar qt 57 row block: `[g*128 codes][g*8 headers]`, zero-padded to 16 B.
+/// Planar qt 60 row block: `[g*128 codes][g*8 headers]`, zero-padded to 16 B.
 fn iu4_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     let g = k / 256;
     let rb =

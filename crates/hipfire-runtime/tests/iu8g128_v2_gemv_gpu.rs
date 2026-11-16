@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Numerics gate for the IU8G128 (qt58) decode GEMV v2 (`gemv_iu8g128_v2_*`).
+//! Numerics gate for the IU8G128 (qt61) decode GEMV v2 (`gemv_iu8g128_v2_*`).
 //!
 //! Every v2 variant (R = 1, 2, 4; plain and residual) vs an f64 reference of
 //! the dequantized row dot f32 x, next to v1 on the same case:
 //! rel = max abs / max_row sum|w x|. Gate: v2 rel <= max(4 * v1 rel, 2e-6)
 //! and < 1e-4; v2 run twice is bit-identical. Real tensors with
-//! `IU8_REAL=<.iu4p>` (embedding/lm_head and every qt58 shape).
+//! `IU8_REAL=<.iu4p>` (embedding/lm_head and every qt61 shape).
 //!
 //!   cargo test -p hipfire-runtime --release --test iu8g128_v2_gemv_gpu -- --ignored --nocapture
 
@@ -26,7 +26,7 @@ impl Rng {
 }
 
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    assert_eq!(k % 128, 0, "qt58 rows are one scale per 128");
+    assert_eq!(k % 128, 0, "qt61 rows are one scale per 128");
     let g = k / 128;
     let mut out = vec![0u8; m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()];
     for r in 0..m {
@@ -190,7 +190,7 @@ fn iu8g128_v2_gemv_matches_reference() {
         let mut seen = std::collections::BTreeSet::new();
         for t in f.tensors().to_vec() {
             let (ti, ib) = f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 58 || ti.shape.len() < 2 {
+            if ti.quant_type != 61 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;

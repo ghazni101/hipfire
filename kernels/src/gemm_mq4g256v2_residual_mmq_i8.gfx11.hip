@@ -106,14 +106,14 @@
 _Static_assert(I8_LDS_BYTES == I8_LDS_EXPECT,
                "i8 gfx11 planes must match the host LDS contract");
 // Weight addressing. MQ4V2 row: groups of [8 B header][128 B codes].
-// HIPFIRE_IU4_PLANAR (qt57): row = [groups x 128 B codes][groups x 8 B headers].
+// HIPFIRE_IU4_PLANAR (qt60): row = [groups x 128 B codes][groups x 8 B headers].
 #ifdef HIPFIRE_IU4_PLANAR
 #define I8_W_CODE0 0u
 #define I8_W_GROUP_CODE_STRIDE 128
 // No outer parens: pointer + I8_W_HDR keeps the left-assoc pointer adds
 // of the original source (identical MQ4V2 code objects).
 #define I8_W_HDR(gpr, kb) (gpr) * 128 + ((kb) >> 1) * 8 + ((kb) & 1) * 4
-// qt57 rows are padded to 16 B (hipfire_runtime::iu_quant::row_bytes).
+// qt60 rows are padded to 16 B (hipfire_runtime::iu_quant::row_bytes).
 #define I8_W_ROW_U(gpr) ((((unsigned)(gpr) * 136u) + 15u) & ~15u)
 #define I8_W_ROW(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
 #else

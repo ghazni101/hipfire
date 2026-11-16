@@ -4,7 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
@@ -78,7 +78,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
     // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
     for (int bi = 0; bi < blocks_per_row; bi++) {
 #ifdef HIPFIRE_IU8G128L
-        // qt58: [K int8 codes][K/128 f16 scales]; one scale per K128.
+        // qt61: [K int8 codes][K/128 f16 scales]; one scale per K128.
         const char* cp = row_base + bi * 32;
         unsigned short s_bits;
         __builtin_memcpy(&s_bits, row_base + K + ((bi >> 2) << 1), 2);

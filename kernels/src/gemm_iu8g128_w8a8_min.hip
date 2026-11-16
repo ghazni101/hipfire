@@ -14,7 +14,7 @@
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)

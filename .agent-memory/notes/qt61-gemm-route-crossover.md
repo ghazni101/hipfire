@@ -1,12 +1,12 @@
 ---
-title: qt58 W8A8 vs f16-twin crossover is 48 rows; DFlash verify arithmetic follows it
+title: qt61 W8A8 vs f16-twin crossover is 48 rows; DFlash verify arithmetic follows it
 date: 2026-11-03
-tags: [iu8g128,qt58,w8a8,dflash,gfx1100]
+tags: [iu8g128,qt61,w8a8,dflash,gfx1100]
 ---
 
 ## Crossover (gfx1100, `iu8g128_route_crossover`)
 
-qt58 (IU8G128) has two batched GEMMs: W8A8 (`gemm_iu8g128_w8a8_min`,
+qt61 (IU8G128) has two batched GEMMs: W8A8 (`gemm_iu8g128_w8a8_min`,
 128x128 LDS tile, int8 activations) and the f16-WMMA twin
 (`gemm_iu8g128_residual_wmma` + mb4/mb4m2). On 27B `wo` (M=5120, K=6144) and
 `w_down` (M=5120, K=17408), activation conversion charged per call, two passes:
@@ -24,7 +24,7 @@ body ran W8A8 at every n and the slots body only at n >= 128.
 
 ## DFlash consequence
 
-DFlash verify (16 rows) on the singleton body used W8A8 for the qt58 `wo`;
+DFlash verify (16 rows) on the singleton body used W8A8 for the qt61 `wo`;
 the serve path (multi-slot body) already used the twin. With one selector the
 two agree. Measured on 27B IU4P + `qwen38-27b-dflash-mq4.hfq` (md5 0133955...),
 pep8 LRU prompt (md5 df5dedc8...), `hipfire bench --spec dflash`, fresh process,

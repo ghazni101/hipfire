@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! IU4 storage for the integer matrix units (HFQ qt=57), plus the
-//! IU8G128 lifted-role layout (HFQ qt=58).
+//! IU4 storage for the integer matrix units (HFQ qt=60), plus the
+//! IU8G128 lifted-role layout (HFQ qt=61).
 //!
 //! The codes and the per-128 affine grid are MQ4G256V2's (qt=44): FWHT-256,
 //! unsigned codes `0..=15`, `w = f32(scale) * code + f32(zero)` on each
@@ -19,7 +19,7 @@
 //!
 //! * `K % 256 == 0`. The FWHT group is still 256 weights, which is two
 //!   128-wide affine halves. `K == 0` is rejected.
-//! * **IU4 (qt 57).** Unsigned nibbles, low nibble = even K, high nibble =
+//! * **IU4 (qt 60).** Unsigned nibbles, low nibble = even K, high nibble =
 //!   odd K. That is the packing `v_wmma_i32_16x16x16_iu4` consumes with the
 //!   weight side unsigned: nibble `m` of a dword is K element `m`. 128 code
 //!   bytes per 256 weights. Stored bpw 4.25, same as MQ4V2.
@@ -32,15 +32,15 @@
 //! round trip.
 //!
 //! Decode GEMV for [`Layout::Iu4`] is an f32-activation kernel on this plane
-//! ([`gemv_iu4_dot8`] remains the CPU contract of the W4A4 integer dot). qt 57
-//! has a decode GEMV and a W4A8/W4A4 prefill GEMM; qt 58 has the GEMV/embedding/GEMM family described below.
+//! ([`gemv_iu4_dot8`] remains the CPU contract of the W4A4 integer dot). qt 60
+//! has a decode GEMV and a W4A8/W4A4 prefill GEMM; qt 61 has the GEMV/embedding/GEMM family described below.
 //! Generic GEMM still refuses every IU dtype. A kernel loads `row_bytes(k)`
 //! with the code plane at offset 0
 //! (`code_bytes(k)` long) and the scales immediately after.
 //!
-//! ## IU8G128 (qt 58), the int8 tier
+//! ## IU8G128 (qt 61), the int8 tier
 //!
-//! qt 58 is a true signed-int8 format with **one f16 scale per 128 weights**,
+//! qt 61 is a true signed-int8 format with **one f16 scale per 128 weights**,
 //! zero point 0, no FWHT:
 //!
 //! ```text
@@ -49,9 +49,7 @@
 //!
 //! `K % 128 == 0`. One scale per 128 is exactly what an int-WMMA K128
 //! accumulation needs: `V_WMMA_I32_16X16X16_IU8` sums 128 products in int32,
-//! then one `scale * d_x` fold. The compact row is 8.125 bpw. This is not
-//! a byte-widened nibble body layout (that experiment was removed). The previous
-//! one-scale-per-32 row (`K + K/16`) is also retired and old files are refused.
+//! then one `scale * d_x` fold. The compact row is 8.125 bpw.
 
 use half::f16;
 
@@ -65,17 +63,17 @@ pub const MQ4V2_GROUP_BYTES: usize = 136;
 pub const SCALE_PAIR_BYTES: usize = 4;
 /// Q8F16 source group (one f16 scale per 32 signed codes).
 pub const Q8_GROUP: usize = 32;
-/// qt 58 scale group: one f16 scale per 128 weights (the int-WMMA K128 fold).
+/// qt 61 scale group: one f16 scale per 128 weights (the int-WMMA K128 fold).
 pub const Q8_SCALE_GROUP: usize = 128;
 /// Interleaved Q8F16 block: one f16 scale, then 32 signed codes.
 pub const Q8_BLOCK_BYTES: usize = 34;
 /// HFQ quant-type byte of the planar Q8 operand ([`repack_q8f16`]).
-pub const Q8_QUANT_TYPE: u8 = 58;
+pub const Q8_QUANT_TYPE: u8 = 61;
 
 /// Which integer operand the codes are stored as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Layout {
-    /// qt=57. Packed unsigned nibbles.
+    /// qt=60. Packed unsigned nibbles.
     Iu4,
 }
 
@@ -83,7 +81,7 @@ impl Layout {
     /// HFQ quant-type byte.
     pub const fn quant_type(self) -> u8 {
         match self {
-            Self::Iu4 => 57,
+            Self::Iu4 => 60,
         }
     }
 
@@ -94,11 +92,10 @@ impl Layout {
         }
     }
 
-    /// Parse a `--format` token. `iu4` / `iu4g128`; `iu4g256` is the old
-    /// name of the same layout and is still accepted.
+    /// Parse a `--format` token. `iu4` / `iu4g128`.
     pub fn from_format(format: &str) -> Option<Self> {
         match format {
-            "iu4" | "iu4g128" | "iu4g256" => Some(Self::Iu4),
+            "iu4" | "iu4g128" => Some(Self::Iu4),
             _ => None,
         }
     }
@@ -223,7 +220,7 @@ pub fn repack_mq4v2(src: &[u8], m: usize, k: usize, layout: Layout) -> Result<Ve
     Ok(out)
 }
 
-/// Bytes of one qt 58 row: `K` signed codes, then one f16 scale per 128,
+/// Bytes of one qt 61 row: `K` signed codes, then one f16 scale per 128,
 /// then zero padding to [`ROW_ALIGN`].
 ///
 /// `None` unless `K` is a positive multiple of [`Q8_SCALE_GROUP`].
@@ -262,7 +259,7 @@ pub fn validate_q8(bytes: &[u8], m: usize, k: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Rebuild a Q8F16 tensor (`34 * M * K/32` bytes) into compact qt58 rows
+/// Rebuild a Q8F16 tensor (`34 * M * K/32` bytes) into compact qt61 rows
 /// (`[K i8][K/128 f16]`). The per-32 source scales are folded to one per 128
 /// (`d = max|w| / 127`) and the codes re-rounded; the source is the
 /// natural-basis Q8 grid, not an FWHT MQ4 blob.
@@ -334,7 +331,7 @@ pub fn dequant_q8(bytes: &[u8], m: usize, k: usize) -> Result<Vec<f32>, String> 
     Ok(out)
 }
 
-/// GEMV contract for an IU8G128 tensor (qt 58): `y = W x` with
+/// GEMV contract for an IU8G128 tensor (qt 61): `y = W x` with
 /// `w = f32(scale) * f32(i8(code))` on the natural-basis `x`.
 ///
 /// This is the dot of the dequantized row with `x`; the device kernel
@@ -578,9 +575,8 @@ mod tests {
         assert!((stored_bpw(Layout::Iu4) - 4.25).abs() < 1e-6);
         assert_eq!(row_bytes(128, Layout::Iu4), None);
         assert_eq!(tensor_bytes(0, 256, Layout::Iu4), None);
-        assert_eq!(Layout::Iu4.quant_type(), 57);
+        assert_eq!(Layout::Iu4.quant_type(), 60);
         assert_eq!(Layout::from_format("iu4g128"), Some(Layout::Iu4));
-        assert_eq!(Layout::from_format("iu4g256"), Some(Layout::Iu4));
         assert_eq!(Layout::from_format("iu8"), None);
         assert_eq!(Layout::from_format("mq4"), None);
     }
@@ -636,7 +632,7 @@ mod tests {
         assert_eq!(q8_row_bytes(2560), Some(2608));
         assert_eq!(q8_row_bytes(32), None);
         assert_eq!(q8_row_bytes(127), None);
-        assert_eq!(Q8_QUANT_TYPE, 58);
+        assert_eq!(Q8_QUANT_TYPE, 61);
         assert_eq!(packed.len(), m * q8_row_bytes(k).unwrap());
         let got = dequant_q8(&packed, m, k).unwrap();
         for i in 0..k {
@@ -664,7 +660,7 @@ mod tests {
         x[0] = 2.0;
         x[1] = 3.0;
         assert_eq!(gemv_q8(&packed, &x, 1, k).unwrap(), vec![5.0f32]);
-        // A row without its scale tail is not a qt58 row.
+        // A row without its scale tail is not a qt61 row.
         assert!(gemv_q8(&packed[..k], &x, 1, k).is_err());
         assert!(gemv_q8(&packed, &x[..k - 1], 1, k).is_err());
     }

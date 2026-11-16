@@ -1537,7 +1537,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
             None
         )
         .is_ok());
-    // qt 58 has no prerotated variant: it is rotation-free, admitted Plain.
+    // qt 61 has no prerotated variant: it is rotation-free, admitted Plain.
     assert!(fam
         .resolve(
             DType::IU8G128,
@@ -1551,7 +1551,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
 
 #[test]
 fn iu8g128_gemv_resolves_plain_and_residual_on_every_arch() {
-    // qt 58 is the Q8 grid with the scales at the row tail: f16-scale x int8 x
+    // qt 61 is the Q8 grid with the scales at the row tail: f16-scale x int8 x
     // f32 x, no integer matrix unit, no rotation. Plain (lm_head / ssm_out) and
     // the fused residual (DeltaNet out_proj) must resolve everywhere.
     let fam = GemvFamily::new();

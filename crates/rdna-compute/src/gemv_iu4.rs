@@ -6,7 +6,7 @@
 //!
 //! f32 activation, wide loads: block 128, one output row per 32-lane wave,
 //! each lane reading 16 code bytes per 32 weights (see gemv_iu4.hip). Needs
-//! 16-byte-aligned rows, which the padded qt 57 layout gives
+//! 16-byte-aligned rows, which the padded qt 60 layout gives
 //! (`hipfire_runtime::iu_quant::row_bytes`); the launcher refuses a weight
 //! base that is not 16-byte aligned.
 //!

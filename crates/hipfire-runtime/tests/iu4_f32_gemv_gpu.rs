@@ -224,7 +224,7 @@ fn iu4_f32_gemv_matches_reference_and_is_deterministic() {
         let mut seen_k = std::collections::BTreeSet::new();
         for t in iu_f.tensors().to_vec() {
             let (ti, ib) = iu_f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 57 || ti.shape.len() < 2 {
+            if ti.quant_type != 60 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;

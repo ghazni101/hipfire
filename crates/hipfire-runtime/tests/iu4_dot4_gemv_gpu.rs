@@ -221,7 +221,7 @@ fn iu4_dot4_gemv_matches_contract() {
         let mut done = 0;
         for t in f.tensors().to_vec() {
             let (ti, ib) = f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 57 || ti.shape.len() < 2 {
+            if ti.quant_type != 60 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;

@@ -3319,10 +3319,10 @@ fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
     match lm_qt {
         Some(3 | 6 | 13) => true,
         Some(17 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
-        // qt 58 is the IU8G128 relayout of Q8_0. Its batched verify head is
+        // qt 61 is the IU8G128 relayout of Q8_0. Its batched verify head is
         // the gfx11 f16 WMMA residual GEMM, so admit it only where that
         // kernel runs (exact gfx1100/gfx1151).
-        Some(58) => matches!(gpu_arch, "gfx1100" | "gfx1151"),
+        Some(61) => matches!(gpu_arch, "gfx1100" | "gfx1151"),
         _ => false,
     }
 }
@@ -7948,18 +7948,18 @@ mod registry_tests {
     }
 
     #[test]
-    fn dflash_lm_head_qt58_iu8g128_only_on_gfx11_iu8_wmma() {
+    fn dflash_lm_head_qt61_iu8g128_only_on_gfx11_iu8_wmma() {
         use super::dflash_lm_head_quant_supported;
         for arch in ["gfx1100", "gfx1151"] {
             assert!(
-                dflash_lm_head_quant_supported(Some(58u8), arch),
-                "qt=58 must be admitted on {arch}"
+                dflash_lm_head_quant_supported(Some(61u8), arch),
+                "qt=61 must be admitted on {arch}"
             );
         }
         for arch in ["gfx1030", "gfx1200", "gfx1201", "gfx942", "gfx906"] {
             assert!(
-                !dflash_lm_head_quant_supported(Some(58), arch),
-                "qt=58 has no batched verify head kernel on {arch}"
+                !dflash_lm_head_quant_supported(Some(61), arch),
+                "qt=61 has no batched verify head kernel on {arch}"
             );
         }
     }

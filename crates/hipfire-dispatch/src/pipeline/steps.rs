@@ -375,7 +375,7 @@ pub(crate) fn guard_qkv_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
         && gemv_steps_uniform(steps, DType::MQ4G256V2, true)
 }
 
-/// qt=57 (IU4G128) decode fusion: every projection IU4G128, Prerotated, no
+/// qt=60 (IU4G128) decode fusion: every projection IU4G128, Prerotated, no
 /// AWQ. Wave32 only (the kernel maps one row to each 32-lane wave);
 /// `force_unfused` wins.
 fn iu4g128_fusion_ok(steps: &[Step], ctx: &DispatchCtx, n: usize) -> bool {
@@ -2220,7 +2220,7 @@ fn launch_fused<'a>(
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))
         }
-        // qt=57 IU4G128: one launch over every projection; the guard proved
+        // qt=60 IU4G128: one launch over every projection; the guard proved
         // each step is an IU4G128 Prerotated Gemv sharing the activated input.
         KernelKey::FusedQkvIu4G128
         | KernelKey::FusedQkvzaIu4G128

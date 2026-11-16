@@ -4,14 +4,14 @@
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
 #endif
 #include <hip/hip_fp16.h>
 
-// IU8G128 (qt58) WMMA residual GEMM with 4x batch-tile fanout per wave.
+// IU8G128 (qt61) WMMA residual GEMM with 4x batch-tile fanout per wave.
 //
 // Sibling of gemm_q8_0_residual_wmma.hip (same f16 WMMA math and output
 // mapping), but each 16-row wave walks four 16-token batch tiles before it
@@ -23,7 +23,7 @@
 // Each Y cell is still written by exactly one lane, so the non-atomic
 // `+=` residual invariant of the base kernel is preserved.
 //
-// Row layout (qt58): [K int8 codes][K/128 f16 scales], K + K/64 bytes.
+// Row layout (qt61): [K int8 codes][K/128 f16 scales], K + K/64 bytes.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;

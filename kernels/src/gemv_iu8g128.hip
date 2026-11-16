@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Decode GEMV for IU8G128 (qt 58), the lifted-role tier of an iu4 file.
+// Decode GEMV for IU8G128 (qt 61), the lifted-role tier of an iu4 file.
 //
 // The grid is Q8F16's (signed int8 codes, no FWHT), but the compact row
 // carries ONE f16 scale per 128 at the tail so the code plane is one
@@ -14,7 +14,7 @@
 // folds element `t` of every 32-block and the warp reduces by shuffle, so
 // this kernel is bit-identical to `gemv_q8_0` on the same grid (the only
 // difference is where the scale is read from). `x` is the natural-basis
-// activation; qt 58 is not FWHT-rotated.
+// activation; qt 61 is not FWHT-rotated.
 //
 // `gemv_iu8g128_residual` is the fused `y += W·x` twin used by the DeltaNet
 // out_proj (ssm_out) decode step.
@@ -24,7 +24,7 @@
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)

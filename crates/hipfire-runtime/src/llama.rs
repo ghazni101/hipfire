@@ -831,9 +831,9 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
     hipfire_dispatch::pipeline::batched::reject_typed_only_format(dtype)
 }
 
-/// qt 58 has a generic GEMV (`KernelKey::GemvIu8G128`), so the plain
+/// qt 61 has a generic GEMV (`KernelKey::GemvIu8G128`), so the plain
 /// `weight_gemv` route must admit it. The rotation helpers keep the broader
-/// refusal above: qt 58 is unrotated and must never enter an FWHT path.
+/// refusal above: qt 61 is unrotated and must never enter an FWHT path.
 #[inline]
 fn reject_unsupported_gemv_dtype(dtype: DType) -> HipResult<()> {
     if dtype == DType::IU8G128 {
@@ -8698,7 +8698,7 @@ fn simple_rand() -> f32 {
 mod tests {
     use super::*;
 
-    /// qt 58 has a generic GEMV, so the plain `weight_gemv` gate must admit
+    /// qt 61 has a generic GEMV, so the plain `weight_gemv` gate must admit
     /// it; the rotation helpers keep refusing the unrotated IU layout.
     #[test]
     fn weight_gemv_admits_qt61_but_not_typed_only_layouts() {

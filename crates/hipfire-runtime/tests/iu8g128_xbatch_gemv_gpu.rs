@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the x-batched IU8G128 (qt 58) decode GEMV
+//! Numerics gate for the x-batched IU8G128 (qt 61) decode GEMV
 //! (`gemv_iu8g128_xbatch`, the multi-slot lm_head route).
 //!
 //! Every column of the x-batch launch must match running the singleton
@@ -32,7 +32,7 @@ impl Rng {
     }
 }
 
-/// qt 58 row: `[K signed codes][K/128 f16 scales]`, zero-padded to 16 B.
+/// qt 61 row: `[K signed codes][K/128 f16 scales]`, zero-padded to 16 B.
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     let row_bytes = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut out = vec![0u8; m * row_bytes];

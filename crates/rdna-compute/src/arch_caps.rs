@@ -94,7 +94,7 @@ pub fn note_process_gpu_arch(arch: &str) {
     let _ = PROCESS_GPU_ARCH.set(arch.to_string());
 }
 
-/// qt57 (IU4G128) prefill GEMM admission: the W4A4/W4A8/MMQ IU4 GEMM
+/// qt60 (IU4G128) prefill GEMM admission: the W4A4/W4A8/MMQ IU4 GEMM
 /// family in `gemm_iu4.rs`. Every source uses the gfx11 `_w32` WMMA builtins
 /// and is validated on exact gfx1100 and gfx1151 only; gfx12 has the hardware
 /// ([`ArchCaps::has_iu4_wmma`]) but no ported source. CAPABILITY gate (does
@@ -105,10 +105,10 @@ pub fn supports_iu4g128_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")
 }
 
-/// qt58 (IU8G128) batched GEMM admission: both the f16-WMMA residual twin
+/// qt61 (IU8G128) batched GEMM admission: both the f16-WMMA residual twin
 /// (`gemm_iu8g128_residual_wmma*`) and the IU8-WMMA W8A8 GEMM
 /// (`gemm_iu8g128_w8a8_min`). Both use gfx11 `_w32` builtins and are validated
-/// on exact gfx1100 and gfx1151 only. qt58 decode GEMV and the embedding
+/// on exact gfx1100 and gfx1151 only. qt61 decode GEMV and the embedding
 /// gather are arch-free and do not read this.
 pub fn supports_iu8g128_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")

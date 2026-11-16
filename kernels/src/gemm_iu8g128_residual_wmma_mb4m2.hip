@@ -4,14 +4,14 @@
 
 #include <hip/hip_runtime.h>
 
-// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// qt61 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
 // bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
 #ifndef IU8_ROW_BYTES
 #define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
 #endif
 #include <hip/hip_fp16.h>
 
-// IU8G128 (qt58) WMMA residual GEMM: 32 rows x 64 tokens per wave.
+// IU8G128 (qt61) WMMA residual GEMM: 32 rows x 64 tokens per wave.
 //
 // Extends gemm_iu8g128_residual_wmma_mb4 with a second 16-row M tile per
 // wave. Both tiles consume the same four 16-token X fragments, so a fixed

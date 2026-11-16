@@ -455,7 +455,7 @@ pub fn batch_chunk_delta_net_input_projection(
         layer.wqkv.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=57 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs
             // rotated x); the DISPATCH arm below routes to the FP8-LUT twin.
@@ -1062,7 +1062,7 @@ pub fn batch_chunk_delta_net_input_projection(
                 "batch_chunk_delta_net_input_projection: mixed IU4G128/other LA projections — refusing",
             ));
         }
-        // qt=57: qkv/z/beta/alpha MMQ launches over one quantized X.
+        // qt=60: qkv/z/beta/alpha MMQ launches over one quantized X.
         gpu.gemm_iu4g128_multi(
             &[
                 (&layer.wqkv.buf, &pbs.dn_qkv_batch, layer.wqkv.m),
@@ -1767,7 +1767,7 @@ pub fn batch_chunk_delta_net_output_projection(
         layer.wo.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=57 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs rotated x).
             | DType::MQ4G256V2Lloyd

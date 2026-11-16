@@ -547,7 +547,7 @@ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
-            // C16 qt57: uniform groups + residual only (no plain key, so a
+            // C16 qt60: uniform groups + residual only (no plain key, so a
             // mixed group with an IU4 member is refused at plan time).
             | DType::IU4G128
     );
@@ -598,7 +598,7 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::MQ2G256V2
             | DType::HFQ3G256
             | DType::F16
-            // C16 qt58 lm_head of the iu4 files: Step::Gemv -> GemvIu8G128
+            // C16 qt61 lm_head of the iu4 files: Step::Gemv -> GemvIu8G128
             // (same GEMV as the solo decode lm_head and `lm_head_batched`).
             | DType::IU8G128
     )
@@ -663,7 +663,7 @@ fn slots_iu8g128_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
     dt == DType::IU8G128 && rdna_compute::iu8g128_gemm_admits(arch, k)
 }
 
-/// C16 qt57: one IU4G128 launch set over a shared rotated X
+/// C16 qt60: one IU4G128 launch set over a shared rotated X
 /// (`gemm_iu4g128_multi` quantizes X once, or takes the producer sidecar).
 fn slots_iu4_multi(
     gpu: &mut Gpu,
@@ -4394,7 +4394,7 @@ pub(crate) fn final_logits_per_slot(
         return Ok(());
     }
 
-    // qt58 (IU8G128) head: the same one-weight-pass idea as the MQ4G256 arm
+    // qt61 (IU8G128) head: the same one-weight-pass idea as the MQ4G256 arm
     // above. The per-slot loop re-reads the whole lm_head matrix (1.27 GB at
     // vocab 248320 x dim 5120) once per live slot; `gemv_iu8g128_xbatch` reads
     // each row once for all columns. Only the GEMV is batched: each slot's
