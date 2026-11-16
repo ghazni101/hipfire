@@ -1355,10 +1355,54 @@ impl HfqFile {
                     sampled_groups += 1;
                 }
             }
+            // qt57 (IU4G256) stores the same per-128 (scale, zero) pairs at the
+            // row tail: [K/2 codes][(sc, zp) x K/128]. Sample three rows.
+            for tensor in tensors
+                .iter()
+                .filter(|tensor| tensor.quant_type == crate::iu_quant::Layout::Iu4.quant_type())
+                .take(4)
+            {
+                let (m, k) = match tensor.shape.as_slice() {
+                    [m, k] => (*m as usize, *k as usize),
+                    _ => continue,
+                };
+                let Some(row_bytes) = crate::iu_quant::row_bytes(k, crate::iu_quant::Layout::Iu4)
+                else {
+                    continue;
+                };
+                if m == 0 || tensor.data_size != m * row_bytes {
+                    continue;
+                }
+                let code_bytes = k / 2;
+                for row in [0, m / 2, m - 1] {
+                    let tail = tensor.data_offset + row * row_bytes + code_bytes;
+                    for pair in 0..k / 128 {
+                        let offset = tail + pair * 4;
+                        let d_bits =
+                            u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
+                        let z_bits =
+                            u16::from_le_bytes(mmap[offset + 2..offset + 4].try_into().unwrap());
+                        let d = half::f16::from_bits(d_bits).to_f32();
+                        let expected = half::f16::from_f32(-8.0 * d).to_bits();
+                        if z_bits != expected {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "HfqFile: symmetric MQ4V2 marker/header mismatch in '{}' \
+                                     row {row} scale {pair}: z=0x{z_bits:04x}, \
+                                     expected -8*d=0x{expected:04x}",
+                                    tensor.name
+                                ),
+                            ));
+                        }
+                    }
+                    sampled_groups += 1;
+                }
+            }
             if sampled_groups == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "HfqFile: symmetric MQ4V2 marker set but no qt=44 groups exist",
+                    "HfqFile: symmetric MQ4V2 marker set but no qt=44 or qt=57 groups exist",
                 ));
             }
         }
@@ -5596,5 +5640,48 @@ mod mq3v2_symmetric_tests {
             !f.mq3v2_symmetric(),
             "asymmetric ladder base must report marker=false"
         );
+    }
+}
+
+#[cfg(test)]
+mod iu4_symmetric_marker_tests {
+    use super::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+    use crate::iu_quant::{row_bytes, Layout};
+
+    /// Four qt57 rows of K=256 whose per-128 zero is `zero(d)`.
+    fn write_iu4(path: &std::path::Path, zero: impl Fn(f32) -> f32) {
+        let (m, k) = (4usize, 256usize);
+        let rb = row_bytes(k, Layout::Iu4).unwrap();
+        let mut data = vec![0u8; m * rb];
+        for row in 0..m {
+            for pair in 0..k / 128 {
+                let at = row * rb + k / 2 + pair * 4;
+                let d = 0.5 + pair as f32;
+                data[at..at + 2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                data[at + 2..at + 4].copy_from_slice(&half::f16::from_f32(zero(d)).to_le_bytes());
+            }
+        }
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: Layout::Iu4.quant_type(),
+            shape: vec![m as u32, k as u32],
+            group_size: 128,
+            data,
+        }];
+        write_hfqm_package_mem(path, 16, r#"{"mq4v2.symmetric":1}"#, &tensors).unwrap();
+    }
+
+    #[test]
+    fn symmetric_marker_accepts_symmetric_iu4_and_refuses_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sym.hfq");
+        write_iu4(&path, |d| -8.0 * d);
+        assert!(HfqFile::open(&path).unwrap().mq4v2_symmetric());
+
+        write_iu4(&path, |_| 0.0);
+        let err = HfqFile::open(&path)
+            .err()
+            .expect("asymmetric zero must be refused");
+        assert!(err.to_string().contains("marker/header mismatch"), "{err}");
     }
 }
