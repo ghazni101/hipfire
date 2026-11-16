@@ -4589,11 +4589,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // MQ4V2 MMQ arithmetic over the planar IU4 rows) on gfx1100/gfx1151. The
     // six rotation lists (qkv/wo/ffn/w_down in batched*.rs) and the
     // gate_up/qkv/qkvza/epilogue/single-weight IU4 arms land in lockstep.
-    // `HIPFIRE_IU4_DECODE=dot8` keeps the original per-token W4A4 prefill;
-    // `dot4` (W4A8 decode only) keeps the MMQ prefill.
-    let iu4_with_mmq = dt == DType::IU4G256
-        && rdna_compute::arch_caps::supports_iu4g256_gemm(arch)
-        && rdna_compute::iu4_decode_mode() != rdna_compute::Iu4DecodeMode::Dot8;
+    let iu4_with_mmq = dt == DType::IU4G256 && rdna_compute::arch_caps::supports_iu4g256_gemm(arch);
 
     iu4_with_mmq
         || mq3_uniform_with_wmma
@@ -8506,10 +8502,8 @@ mod tests {
         // gfx12 unchanged already proven above, but explicitly re-prove
         // that the admit set includes both gfx12 variants
         // IU4G256: native MMQ prefill on gfx1100/gfx1151 only.
-        if rdna_compute::iu4_decode_mode() != rdna_compute::Iu4DecodeMode::Dot8 {
-            assert!(is_batchable_la(DType::IU4G256, "gfx1100"));
-            assert!(is_batchable_la(DType::IU4G256, "gfx1151"));
-        }
+        assert!(is_batchable_la(DType::IU4G256, "gfx1100"));
+        assert!(is_batchable_la(DType::IU4G256, "gfx1151"));
         for arch in ["gfx1201", "gfx1030", "gfx1010", "gfx906"] {
             assert!(!is_batchable_la(DType::IU4G256, arch), "IU4 on {arch}");
         }

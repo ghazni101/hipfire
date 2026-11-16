@@ -82,21 +82,19 @@ is already K element `m`, so IU4 needs no permute before
 `dequant`, `gemv_iu4_dot8`, `row_bytes`, `code_bytes`. Dequant is the
 rotated-basis f32 value above.
 
-Decode GEMV for qt 57 is `gemv_iu4g256` with f32 activations by default, on
-every arch, and is bit-exact with the MQ4G256V2 twin. Two opt-in routes need
-gfx11/gfx12 IU WMMA hardware: `HIPFIRE_IU4_DECODE=dot4` (W4A8,
-`v_dot4_i32_iu8`) and `=dot8` (W4A4, `v_dot8_i32_iu4`). The dot8 route loads
-one wave per row and issues the code plane unsigned to `v_dot8_i32_iu4`; the
-activation is signed int4, one scale per 32 elements (`d = max(|x|) / 7`), and
-each eight weights fold
+Decode GEMV for qt 57 is `gemv_iu4g256` with f32 activations, on every arch.
+It is a wide-load kernel: one row per 32-lane wave, four rows per 128-thread
+block, and each lane reads 16 code bytes (32 weights) at a time, so it needs
+the 16-byte row alignment above. Per 32 weights it folds
 
 ```text
-acc += (d * scale) * dot(q, xq) + zero * (d * sum(xq))
+acc += scale * sum(code * x) + zero * sum(x)
 ```
 
-That integer form is the dot8 contract only, not the default GEMV. `x` is the
-FWHT-256 activation. The integer dot is exact. The activation quant is the
-approximation.
+with `x` the FWHT-256 activation. One opt-in route needs gfx11/gfx12 IU
+hardware: `HIPFIRE_IU4_DECODE=dot4` (W4A8, `v_dot4_i32_iu8`). The W4A4
+`v_dot8_i32_iu4` decode route was removed; `iu_quant::gemv_iu4_dot8` stays as
+the CPU int4-activation reference.
 
 Prefill GEMM for qt 57 is W4A4 (`gemm_iu4g256_w4a4_*`,
 `v_wmma_i32_16x16x16_iu4`) on exact gfx1100 and gfx1151 only, gated by
@@ -165,13 +163,13 @@ noise embedding runs `embedding_lookup_iu8g128`).
 
 | reader | qt 57 IU4 | qt 58 IU8G128 |
 |---|---|---|
-| decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4`/`dot8` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
+| decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g128_residual` |
 | embedding gather | — (the table is qt 58 on every rung) | `embedding_iu8g128` |
 | prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`, gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
 | DFlash verify | — | qt 58 head via `gemm_iu8g128_residual_wmma` (gfx1100/gfx1151) |
 
-`hipfire_runtime::iu_quant` is the CPU contract: `gemv_iu4_dot8` for qt 57
+`hipfire_runtime::iu_quant` is the CPU contract: `dequant` for qt 57
 and `gemv_q8` (`dequant_q8` · `x`) for qt 58. The loaders admit both dtypes
 (`RAW_CODECS`), and qt 58 embedding tables are admitted raw (one contiguous
 plane + tail scales), so an `iu4` artifact loads and decodes on the

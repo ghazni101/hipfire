@@ -327,7 +327,7 @@ pub enum KernelKey {
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
-    /// qt 57 decode GEMV. `v_dot8_i32_iu4` on the planar nibble row.
+    /// qt 57 decode GEMV. f32 activation, wide loads of the padded row.
     GemvIu4G256Prerotated,
     GemvMq4CG256Prerotated,
     GemvMq5G256V2Prerotated,
@@ -1126,9 +1126,9 @@ impl KernelKey {
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 | MQ4G256V2P | MQ4G128V2P => ArchPredicate::Always,
-            // qt 57 decode GEMV issues `v_dot8_i32_iu4`, which is on the same
-            // RDNA3/RDNA4 parts as integer WMMA. qt 58 (IU8G128) is a f16-scale
-            // int8 GEMV and is admitted on every arch.
+            // qt 60 prefill GEMM is integer WMMA (W4A8/W4A4), so the dtype is
+            // gated on WMMA parts. qt 61 (IU8G128) is a f16-scale int8 GEMV and
+            // is admitted on every arch.
             IU4G256 => ArchPredicate::HasWmma,
             IU8G128 => ArchPredicate::Always,
             // ggml block formats (GGUF-native, no kernel yet): no key resolves

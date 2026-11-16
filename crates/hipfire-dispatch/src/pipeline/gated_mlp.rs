@@ -700,10 +700,9 @@ fn swiglu_down_residual(
         }
         // qt=57 IU4G256 is a byte relayout of qt=44 (same FWHT-G256 input
         // contract, same per-group affine math): take the MQ arm's fused
-        // SiLU*up+rotate producer, then the IU4 residual GEMV (bit-exact to the
-        // MQ4V2 residual kernel). Replaces the generic arm's silu + rotate +
-        // GEMV + per-token alloc + add + free.
-        DType::IU4G256 if w_down.awq_scale.is_none() && !rdna_compute::iu4_decode_w4a4() => {
+        // SiLU*up+rotate producer, then the IU4 residual GEMV. Replaces the
+        // generic arm's silu + rotate + GEMV + per-token alloc + add + free.
+        DType::IU4G256 if w_down.awq_scale.is_none() => {
             gpu.ensure_mq_signs().map_err(hip)?;
             let xr = mq_rotation_scratch(gpu)?;
             gpu.fused_silu_mul_rotate_mq(gate, up, &xr, w_down.k)

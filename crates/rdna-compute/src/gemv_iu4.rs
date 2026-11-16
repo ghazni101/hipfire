@@ -4,17 +4,18 @@
 
 //! Decode GEMV for [`crate::DType::IU4G256`].
 //!
-//! One wave per output row, f32 activation. The arithmetic is the MQ4G256V2
-//! decode kernel's, with IU4 address math, so a qt 57 tensor that is the
-//! `repack_mq4v2` relayout of a qt 44 tensor decodes bit-identically to it.
+//! f32 activation, wide loads: block 128, one output row per 32-lane wave,
+//! each lane reading 16 code bytes per 32 weights (see gemv_iu4.hip). Needs
+//! 16-byte-aligned rows, which the padded qt 57 layout gives
+//! (`hipfire_runtime::iu_quant::row_bytes`); the launcher refuses a weight
+//! base that is not 16-byte aligned.
 //!
 //! `gemv_iu4g256_residual` is the fused `y += W·x` twin. `fused_iu4g256_rows`
 //! runs up to four matrices that share `x` in one launch (gate/up, q/k/v,
 //! qkv/z/beta/alpha); each output equals the plain kernel on that matrix.
 //!
-//! `HIPFIRE_IU4_DECODE=dot8` selects the original W4A4 kernels (signed int4
-//! activation per 32, `v_dot8_i32_iu4`, RDNA3/RDNA4 only), whose numeric
-//! contract is `hipfire_runtime::iu_quant::gemv_iu4_dot8`.
+//! `HIPFIRE_IU4_DECODE=dot4` selects the W4A8 kernels (int8 activation per
+//! 32, `v_dot4_i32_iu8`, RDNA3/RDNA4 only).
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
@@ -34,15 +35,13 @@ pub const IU4G256_XBATCH_COLUMNS: usize = 4;
 /// Integer-activation decode mode for IU4G256 (`HIPFIRE_IU4_DECODE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Iu4DecodeMode {
-    /// Default: f32 activation (MQ4G256V2's algorithm, bit-exact with the twin).
+    /// Default: f32 activation, wide-load kernels.
     F32,
     /// `dot4`: W4A8, int8 activation per 32, `v_dot4_i32_iu8`.
     Dot4,
-    /// `dot8`: W4A4, int4 activation per 32, `v_dot8_i32_iu4` (branch original).
-    Dot8,
 }
 
-/// `HIPFIRE_IU4_DECODE=f32|dot4|dot8` (unset or unknown = f32). Read once.
+/// `HIPFIRE_IU4_DECODE=f32|dot4` (unset or unknown = f32). Read once.
 pub fn iu4_decode_mode() -> Iu4DecodeMode {
     static V: std::sync::OnceLock<Iu4DecodeMode> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -50,28 +49,29 @@ pub fn iu4_decode_mode() -> Iu4DecodeMode {
             .ok()
             .as_deref()
         {
-            Some("dot8") => Iu4DecodeMode::Dot8,
             Some("dot4") => Iu4DecodeMode::Dot4,
             _ => Iu4DecodeMode::F32,
         }
     })
 }
 
-/// True for either integer-activation mode.
-pub fn iu4_decode_dot8() -> bool {
-    iu4_decode_mode() != Iu4DecodeMode::F32
-}
-
-/// True only for `dot8`, the original W4A4 route: the dispatcher skips the
-/// IU4 fused-row keys and the fused SwiGLU-down arm and prefill runs per
-/// token, as on the branch before review. `dot4` keeps the fused keys (with
-/// the `_dot4q` kernels) and the MMQ prefill.
-pub fn iu4_decode_w4a4() -> bool {
-    iu4_decode_mode() == Iu4DecodeMode::Dot8
-}
-
 /// Fixed size of `scratch.iu4_a8_x_scratch` (2 B per K element: K <= 131072).
 const IU4_A8_SCRATCH_BYTES: usize = 256 * 1024;
+
+/// Output rows per block of the wide f32 kernels (one per 32-lane wave).
+const WIDE_ROWS_PER_BLOCK: u32 = 4;
+
+/// The wide kernels load 16 code bytes per lane; rows are padded to 16 B, so
+/// only the base pointer needs checking.
+fn check_wide_align(what: &str, ap: *mut c_void) -> HipResult<()> {
+    if (ap as usize) % 16 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{what}: IU4 weight base must be 16-byte aligned"),
+        ));
+    }
+    Ok(())
+}
 
 fn check_shape(what: &str, m: usize, k: usize) -> HipResult<()> {
     if m == 0 || k == 0 || k % 256 != 0 {
@@ -95,7 +95,6 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
-            Iu4DecodeMode::Dot8 => "gemv_iu4g256_dot8",
             Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, false),
             Iu4DecodeMode::F32 => "gemv_iu4g256",
         };
@@ -113,7 +112,6 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
-            Iu4DecodeMode::Dot8 => "gemv_iu4g256_dot8_residual",
             Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, true),
             Iu4DecodeMode::F32 => "gemv_iu4g256_residual",
         };
@@ -211,25 +209,6 @@ impl Gpu {
         Ok(qp)
     }
 
-    /// The W4A4 `v_dot8` kernel, regardless of `HIPFIRE_IU4_DECODE`
-    /// (parity tests and A/B). `residual` selects `y += W x`.
-    pub fn gemv_iu4g256_dot8(
-        &mut self,
-        a: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        residual: bool,
-    ) -> HipResult<()> {
-        let func = if residual {
-            "gemv_iu4g256_dot8_residual"
-        } else {
-            "gemv_iu4g256_dot8"
-        };
-        self.gemv_iu4g256_launch(func, a, x, y, m, k)
-    }
-
     /// `y_i = W_i x` for up to four IU4G256 weights sharing `x` and `k`, in
     /// one launch. Each `(weight, output, rows)`; an empty slice is an error.
     pub fn fused_iu4g256_rows(
@@ -283,6 +262,11 @@ impl Gpu {
         } else {
             x.buf.as_ptr()
         };
+        if !dot4 {
+            for (a, _, _) in mats {
+                check_wide_align("fused_iu4g256_rows", a.buf.as_ptr())?;
+            }
+        }
         self.bind_thread()?;
         self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, fname)?;
         let mut ap = [std::ptr::null_mut::<c_void>(); 4];
@@ -316,13 +300,14 @@ impl Gpu {
             .map(|m| crate::profile::gemv_hfq4g256_bytes(m.2, k))
             .sum();
         let timer = crate::profile::begin_timer(&self.hip, "fused", fname, bytes);
-        let result = self.launch_maybe_blob(
-            fname,
-            [total as u32, 1, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
+        // Wide f32 kernel: 4 rows (waves) per 128-thread block.
+        let (grid, block) = if dot4 {
+            (total as u32, 32u32)
+        } else {
+            ((total as u32).div_ceil(WIDE_ROWS_PER_BLOCK), 128u32)
+        };
+        let result =
+            self.launch_maybe_blob(fname, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 for p in ap {
                     b.push_ptr(p);
@@ -336,8 +321,7 @@ impl Gpu {
                 }
                 b.push_i32(kv);
                 b
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -354,10 +338,10 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         check_shape("gemv_iu4g256", m, k)?;
-        if (func.contains("dot8") || func.contains("dot4")) && !self.arch_caps.has_iu4_wmma() {
+        if func.contains("dot4") && !self.arch_caps.has_iu4_wmma() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu4g256_dot8: v_dot8_i32_iu4 is the RDNA3/RDNA4 integer-4 dot",
+                "gemv_iu4g256_dot4: v_dot4_i32_iu8 is the RDNA3/RDNA4 integer dot",
             ));
         }
         self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr(), m, k)
@@ -477,23 +461,29 @@ impl Gpu {
             &mv as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
-        // The f32 residual kernel is the two-rows-per-block MQ4V2 residual port.
-        let grid = if func == "gemv_iu4g256_residual" {
-            (m as u32).div_ceil(2)
+        // The f32 kernels are the wide-load ones: 4 rows (waves) per
+        // 128-thread block. The dot4 kernels are one 32-lane block per row.
+        let wide = func == "gemv_iu4g256" || func == "gemv_iu4g256_residual";
+        if wide {
+            check_wide_align(func, ap)?;
+        }
+        let (grid, block) = if wide {
+            ((m as u32).div_ceil(WIDE_ROWS_PER_BLOCK), 128u32)
         } else {
-            m as u32
+            (m as u32, 32u32)
         };
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", func, bytes);
-        let result = self.launch_maybe_blob(func, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(ap);
-            b.push_ptr(xp);
-            b.push_ptr(yp);
-            b.push_i32(mv);
-            b.push_i32(kv);
-            b
-        });
+        let result =
+            self.launch_maybe_blob(func, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

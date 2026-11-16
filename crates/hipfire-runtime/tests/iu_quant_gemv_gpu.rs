@@ -7,7 +7,7 @@
 //! `y += W·x` twin, plus the qt 58 embedding gather.
 //!
 //! The CPU contracts are `hipfire_runtime::iu_quant`:
-//! `gemv_iu4_dot8` (int4 activation, integer dot, per-128 `(scale, zero)`)
+//! `dequant` (qt 57, f32 activation, per-128 `(scale, zero)`)
 //! and `gemv_q8` (planar
 //! Q8 grid, one f16 scale per 128, natural basis). A wrong row stride, a scale read at the wrong
 //! offset, a nibble-order flip or a sign error lands orders of magnitude
@@ -23,7 +23,7 @@
 
 use half::f16;
 use hipfire_runtime::iu_quant::{
-    dequant_q8, gemv_iu4_dot8, gemv_q8, repack_mq4v2, repack_q8f16, Layout, Q8_BLOCK_BYTES,
+    dequant, dequant_q8, gemv_q8, repack_mq4v2, repack_q8f16, Layout, Q8_BLOCK_BYTES,
 };
 use rdna_compute::{DType, Gpu};
 
@@ -110,14 +110,20 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
 
         // ── qt 57 IU4G256 ────────────────────────────────────────────────
         let iu4 = repack_mq4v2(&src, m, k, Layout::Iu4).expect("repack iu4");
-        let want = gemv_iu4_dot8(&iu4, &x, m, k).expect("cpu iu4");
+        let wq = dequant(&iu4, m, k, Layout::Iu4).expect("cpu iu4");
+        let want: Vec<f32> = (0..m)
+            .map(|r| {
+                (0..k)
+                    .map(|c| wq[r * k + c] as f64 * x[c] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect();
         let (w, xd) = (
             gpu.upload_raw(&iu4, &[iu4.len()]).expect("upload iu4"),
             gpu.upload_f32(&x, &[k]).expect("upload x"),
         );
         let yd = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
-        gpu.gemv_iu4g256_dot8(&w, &xd, &yd, m, k, false)
-            .expect("iu4 gemv");
+        gpu.gemv_iu4g256(&w, &xd, &yd, m, k).expect("iu4 gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
         assert!(
@@ -130,7 +136,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
 
         let s = seed(m);
         let yr = gpu.upload_f32(&s, &[m]).expect("upload seed");
-        gpu.gemv_iu4g256_dot8(&w, &xd, &yr, m, k, true)
+        gpu.gemv_iu4g256_residual(&w, &xd, &yr, m, k)
             .expect("iu4 residual");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yr).expect("download yr");

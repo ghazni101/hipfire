@@ -7,7 +7,7 @@
 //! 1. Contract: matches the CPU `iu_quant::gemv_iu4_dot4` (integer dot is
 //!    exact; only the f32 combine order may differ).
 //! 2. Reference: error vs an f64 dot of the dequantized weights with the
-//!    unquantized x, side by side with the f32 kernel and the W4A4 dot8 one.
+//!    unquantized x, side by side with the f32 kernel.
 //! 3. Residual and two-run bit determinism.
 //!
 //! M in {1, 7, 129, 4097}, K in {256, 512, 768, 2560, 9216}; uniform and
@@ -76,7 +76,6 @@ fn run(
     match (which, res) {
         ("dot4", r) => gpu.gemv_iu4g256_dot4(w, xd, &y, m, k, r).unwrap(),
         ("dot4q", r) => gpu.gemv_iu4g256_dot4q(w, xd, &y, m, k, r).unwrap(),
-        ("dot8", r) => gpu.gemv_iu4g256_dot8(w, xd, &y, m, k, r).unwrap(),
         ("f32", false) => gpu.gemv_iu4g256(w, xd, &y, m, k).unwrap(),
         ("f32", true) => gpu.gemv_iu4g256_residual(w, xd, &y, m, k).unwrap(),
         _ => unreachable!(),
@@ -94,7 +93,6 @@ fn run(
 struct Worst {
     contract: f64,
     d4: f64,
-    d8: f64,
     f32_: f64,
     n: usize,
 }
@@ -104,7 +102,6 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
     let xd = gpu.upload_f32(x, &[k]).unwrap();
     let d4 = run(gpu, "dot4", &wd, &xd, m, k, None);
     let d4b = run(gpu, "dot4", &wd, &xd, m, k, None);
-    let d8 = run(gpu, "dot8", &wd, &xd, m, k, None);
     let f = run(gpu, "f32", &wd, &xd, m, k, None);
     let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let d4r = run(gpu, "dot4", &wd, &xd, m, k, Some(&seed));
@@ -153,7 +150,7 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
     let refr: Vec<f64> = refv.iter().zip(&seed).map(|(a, s)| a + *s as f64).collect();
 
     let r_con = rel(&d4, &cpu64);
-    let (r4, r8, rf) = (rel(&d4, &refv), rel(&d8, &refv), rel(&f, &refv));
+    let (r4, rf) = (rel(&d4, &refv), rel(&f, &refv));
     // Residual = plain + seed (same body, ADD only in the store): compare to
     // d4 + seed directly, scale = |d4| + |seed| per row.
     let r4r = d4r
@@ -172,16 +169,12 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
         .zip(&d4b)
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
-    eprintln!("{label:<28} m={m:<6} k={k:<5} dot4_vs_cpu={r_con:.2e} | vs f64 ref: f32={rf:.2e} dot4={r4:.2e} dot8={r8:.2e} dot4_resid={r4r:.2e} nondet={det}");
+    eprintln!("{label:<28} m={m:<6} k={k:<5} dot4_vs_cpu={r_con:.2e} | vs f64 ref: f32={rf:.2e} dot4={r4:.2e} dot4_resid={r4r:.2e} nondet={det}");
     assert!(r_con < 1e-5, "{label}: dot4 vs CPU contract {r_con:.3e}");
     assert_eq!(det, 0, "{label}: dot4 not deterministic");
     assert!(r4r < 1e-6, "{label}: residual != plain + seed ({r4r:.3e})");
-    // dot8 vs f64 is reported, not gated: it measures int4 activation-quant
-    // error (0.4 on heavy-tailed x at m=1), not kernel correctness. dot8's
-    // contract gate is `gemv_iu4_dot8` in iu_quant_gemv_gpu.rs.
     w.contract = w.contract.max(r_con);
     w.d4 = w.d4.max(r4);
-    w.d8 = w.d8.max(r8);
     w.f32_ = w.f32_.max(rf);
     w.n += 1;
     gpu.free_tensor(wd).ok();
@@ -202,7 +195,6 @@ fn iu4_dot4_gemv_matches_contract() {
     let mut w = Worst {
         contract: 0.0,
         d4: 0.0,
-        d8: 0.0,
         f32_: 0.0,
         n: 0,
     };
@@ -258,7 +250,7 @@ fn iu4_dot4_gemv_matches_contract() {
         eprintln!("real tensors checked: {done}");
     }
     eprintln!(
-        "iu4 dot4: {} cases; worst dot4 vs CPU contract {:.3e}; worst vs f64 ref: f32 {:.3e}, dot4 {:.3e}, dot8 {:.3e}",
-        w.n, w.contract, w.f32_, w.d4, w.d8
+        "iu4 dot4: {} cases; worst dot4 vs CPU contract {:.3e}; worst vs f64 ref: f32 {:.3e}, dot4 {:.3e}",
+        w.n, w.contract, w.f32_, w.d4
     );
 }

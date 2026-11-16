@@ -70,7 +70,7 @@ pub use gemm_iu4::Iu4Proj;
 pub mod gemv_mq8_rows;
 pub use gemm_iu8g128::{iu8g128_gemm_admits, Iu8g128GemmRoute, IU8G128_W8A8_MIN_ROWS};
 mod gemv_iu4;
-pub use gemv_iu4::{iu4_decode_dot8, iu4_decode_mode, iu4_decode_w4a4, Iu4DecodeMode};
+pub use gemv_iu4::{iu4_decode_mode, Iu4DecodeMode};
 mod gemv_iu8;
 mod gemv_q8x;
 pub mod ggml_convert;

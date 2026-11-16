@@ -390,7 +390,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_iu8g128_xbatch"
         ]
     );
-    // The IU4 dot4/dot8 integer-activation family is compiled only under
+    // The IU4 dot4 integer-activation family is compiled only under
     // `__GFX11__ || __GFX12__`; gfx906/gfx942 build the module without it.
     let iu_int_gemv = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
     if iu_int_gemv {
@@ -401,8 +401,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_iu4g256",
                 "gemv_iu4g256_residual",
                 "fused_iu4g256_rows",
-                "gemv_iu4g256_dot8",
-                "gemv_iu4g256_dot8_residual",
                 "gemv_iu4g256_dot4",
                 "gemv_iu4g256_dot4_residual",
                 "iu4_quant_x_a8",

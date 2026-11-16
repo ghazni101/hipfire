@@ -31,9 +31,9 @@
 //! `sum((q - 8) * x)` can use it when that identity holds after the fp16
 //! round trip.
 //!
-//! Decode GEMV for [`Layout::Iu4`] is `v_dot8_i32_iu4` on this plane
-//! ([`gemv_iu4_dot8`] is the CPU contract). qt 57 has a decode GEMV and a W4A4
-//! prefill GEMM; qt 58 has the GEMV/embedding/GEMM family described below.
+//! Decode GEMV for [`Layout::Iu4`] is an f32-activation kernel on this plane
+//! ([`gemv_iu4_dot8`] remains the CPU contract of the W4A4 integer dot). qt 57
+//! has a decode GEMV and a W4A8/W4A4 prefill GEMM; qt 58 has the GEMV/embedding/GEMM family described below.
 //! Generic GEMM still refuses every IU dtype. A kernel loads `row_bytes(k)`
 //! with the code plane at offset 0
 //! (`code_bytes(k)` long) and the scales immediately after.

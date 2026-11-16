@@ -5,11 +5,12 @@
 //! Numerics gate for the f32-activation IU4G256 decode kernels
 //! (`gemv_iu4g256`, `gemv_iu4g256_residual`, `fused_iu4g256_rows`).
 //!
-//! 1. Bit-exact: on `repack_mq4v2(src)` the IU4 kernels must return exactly
-//!    the bits of `gemv_mq4g256v2` / `gemv_hfq4g256_residual_mq4v2` on `src`.
-//! 2. Reference: max abs / rel error against an f64 dot of the CPU
-//!    `iu_quant::dequant` weights.
+//! 1. Reference: max abs / rel error against an f64 dot of the CPU
+//!    `iu_quant::dequant` weights (plain and residual).
+//! 2. Determinism: two launches return the same bits.
 //! 3. Fused rows: each fused output equals the plain kernel on its matrix.
+//! The difference to the MQ4V2 twin kernel on `src` is printed, not gated
+//! (the wide-load kernel sums in a different order).
 //!
 //! Random headers and codes (xorshift), M in {1, 7, 129}, K covering every
 //! tail (G mod 4 = 0..3) up to 17408. Optional real tensors: set
@@ -96,53 +97,45 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&y_mq).unwrap();
     let b = gpu.download_f32(&y_iu).unwrap();
+    gpu.gemv_iu4g256(&wi, &xd, &y_iu, m, k).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let b2 = gpu.download_f32(&y_iu).unwrap();
     assert!(
         b.iter().all(|v| v.is_finite()),
         "{} plain m={m} k={k}: non-finite output",
         c.label
     );
-    let diff = bits_equal(&a, &b);
+    let nondet = bits_equal(&b, &b2);
     let want = reference(c.iu, c.x, m, k);
     let (ea, er) = err(&b, &want);
+    let (_, er_mq) = err(&a, &want);
     *worst_rel = worst_rel.max(er);
     eprintln!(
-        "{:<28} m={m:<6} k={k:<6} plain   bitdiff_vs_mq4v2={diff} max_abs={ea:.3e} max_rel={er:.3e}",
+        "{:<28} m={m:<6} k={k:<6} plain   max_abs={ea:.3e} max_rel={er:.3e} mq4v2_rel={er_mq:.3e} nondet={nondet}",
         c.label
     );
-    assert_eq!(
-        diff, 0,
-        "{} plain: {diff} rows differ from gemv_mq4g256v2",
-        c.label
-    );
+    assert_eq!(nondet, 0, "{} plain: not deterministic", c.label);
     assert!(er < 1e-4, "{} plain rel {er:.3e}", c.label);
 
-    // Residual: seed both outputs with the same values.
+    // Residual: seed the output.
     let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let r_mq = gpu.upload_f32(&seed, &[m]).unwrap();
     let r_iu = gpu.upload_f32(&seed, &[m]).unwrap();
-    gpu.gemv_hfq4g256_residual_mq4v2(&wm, &xd, &r_mq, m, k)
-        .unwrap();
     gpu.gemv_iu4g256_residual(&wi, &xd, &r_iu, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
-    let a = gpu.download_f32(&r_mq).unwrap();
     let b = gpu.download_f32(&r_iu).unwrap();
     assert!(
         b.iter().all(|v| v.is_finite()),
         "{} residual m={m} k={k}: non-finite output",
         c.label
     );
-    let diff = bits_equal(&a, &b);
     let want_r: Vec<f64> = want.iter().zip(&seed).map(|(w, s)| w + *s as f64).collect();
     let (ea, er) = err(&b, &want_r);
     eprintln!(
-        "{:<28} m={m:<6} k={k:<6} resid   bitdiff_vs_mq4v2={diff} max_abs={ea:.3e} max_rel={er:.3e}",
+        "{:<28} m={m:<6} k={k:<6} resid   max_abs={ea:.3e} max_rel={er:.3e}",
         c.label
     );
-    assert_eq!(
-        diff, 0,
-        "{} residual differs from the mq4v2 residual",
-        c.label
-    );
+    assert!(er < 1e-4, "{} residual rel {er:.3e}", c.label);
 
     // Fused rows: split M into up to 3 parts plus the full matrix again.
     let plain = gpu.download_f32(&y_iu).unwrap();
@@ -191,7 +184,7 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
 
 #[test]
 #[ignore]
-fn iu4_f32_gemv_is_bit_exact_to_mq4v2_and_matches_reference() {
+fn iu4_f32_gemv_matches_reference_and_is_deterministic() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
