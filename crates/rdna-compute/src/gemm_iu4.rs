@@ -5,9 +5,9 @@
 //! Batched (prefill) GEMM for [`crate::DType::IU4G256`].
 //!
 //! On exact gfx1100/gfx1151 ([`crate::arch_caps::supports_iu4g256_gemm`])
-//! the activation format is `HIPFIRE_IU4_PREFILL_ACT`: `a4` (default) is the
-//! W4A4 int4 MMQ on `v_wmma_i32_16x16x16_iu4`, `a8` the W4A8 int8 MMQ on
-//! `v_wmma_i32_16x16x16_iu8`. Each is bit-identical to its MQ4V2 twin kernel
+//! the activation format is `HIPFIRE_IU4_PREFILL_ACT`: `a8` (default) is the
+//! W4A8 int8 MMQ on `v_wmma_i32_16x16x16_iu8`, `a4` the opt-in W4A4 int4 MMQ
+//! on `v_wmma_i32_16x16x16_iu4`. Each is bit-identical to its MQ4V2 twin kernel
 //! on a qt57 tensor that is the relayout of a qt44 tensor. Projections
 //! narrower than one 128-row tile take the f16 MW-LDS WMMA.
 //! Elsewhere, and while a graph is being captured or recorded, each token is
@@ -38,9 +38,10 @@ fn iu4_prefill_gemv() -> bool {
 }
 
 /// `HIPFIRE_IU4_PREFILL_ACT`: activation format of the MMQ prefill path.
-/// `a4` (default): `block_i4_128` int4 X (FWHT-rotated, the MQ4P W4A4 recipe)
-/// into the planar-addressed lf16 iu4 WMMA kernel. `a8`: `block_i8_128` X
-/// into the iu8 WMMA W4A8 MMQ (C11; KL-exact to decode, ~17-25% slower).
+/// `a8` (default): `block_i8_128` X into the iu8 WMMA W4A8 MMQ. `a4`
+/// (opt-in): `block_i4_128` int4 X (FWHT-rotated, the MQ4P W4A4 recipe) into
+/// the planar-addressed lf16 iu4 WMMA kernel; faster, with a larger KL to the
+/// decode path (docs/quant-formats/iu.md).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Iu4PrefillAct {
     A4,
@@ -54,13 +55,13 @@ fn iu4_prefill_act() -> Iu4PrefillAct {
             .ok()
             .as_deref()
         {
-            Some("a8") => Iu4PrefillAct::A8,
-            None | Some("") | Some("a4") => Iu4PrefillAct::A4,
+            Some("a4") => Iu4PrefillAct::A4,
+            None | Some("") | Some("a8") => Iu4PrefillAct::A8,
             // A typo (or the removed `a8q`) must not take down a serving
             // daemon on its first prefill.
             Some(v) => {
-                eprintln!("[iu4] HIPFIRE_IU4_PREFILL_ACT: ignoring unknown value {v:?}, using a4");
-                Iu4PrefillAct::A4
+                eprintln!("[iu4] HIPFIRE_IU4_PREFILL_ACT: ignoring unknown value {v:?}, using a8");
+                Iu4PrefillAct::A8
             }
         }
     })

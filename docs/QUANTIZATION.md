@@ -34,7 +34,7 @@ Production defaults for day-to-day use:
 | `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
-| `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in on gfx11/gfx12); prefill is the W4A4 WMMA GEMM on gfx1100/gfx1151 only |
+| `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in on gfx11/gfx12); prefill is the W4A8 WMMA GEMM (W4A4 opt-in) on gfx1100/gfx1151 only |
 | `iu4` lifted roles | `IU8G128` (qt 58) | 8 | 8.125 | K + 2 B per 128 (260 B at K=256) | Q8 grid, one scale per 128 at the row tail. Embeddings every rung; lm_head on `iu4` and `pro`; ssm_out on `pro`. Decode GEMV family, the embedding gather and the W8A8 / f16-WMMA prefill GEMM selector have kernels; that selector runs on gfx1100/gfx1151 only |
 
 **Nominal bitwidth is not bpw.** The “bits” column is the payload width only.

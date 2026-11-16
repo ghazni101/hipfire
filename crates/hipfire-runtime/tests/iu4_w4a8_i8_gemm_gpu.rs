@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 W4A8 iu8-WMMA prefill route (C11,
-//! `HIPFIRE_IU4_PREFILL_ACT=a8`, `block_i8_128` X).
+//! Numerics gate for the IU4G256 W4A8 iu8-WMMA prefill route (C11, the
+//! default `HIPFIRE_IU4_PREFILL_ACT=a8`, `block_i8_128` X).
 //!
 //! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g256_w4a8_prequant` returns
 //!    the bits of the interleaved-row twin `gemm_mq4g256v2_asym_i8_prequant`

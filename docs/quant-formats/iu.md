@@ -96,8 +96,12 @@ hardware: `HIPFIRE_IU4_DECODE=dot4` (W4A8, `v_dot4_i32_iu8`). The W4A4
 `v_dot8_i32_iu4` decode route was removed; `iu_quant::gemv_iu4_dot8` stays as
 the CPU int4-activation reference.
 
-Prefill GEMM for qt 57 is W4A4 (`gemm_iu4g256_w4a4_*`,
-`v_wmma_i32_16x16x16_iu4`) on exact gfx1100 and gfx1151 only, gated by
+Prefill GEMM for qt 57 is W4A8 by default (`gemm_iu4g256_w4a8_*`, int8
+activation per 128, `v_wmma_i32_16x16x16_iu8`); `HIPFIRE_IU4_PREFILL_ACT=a4`
+selects the faster W4A4 (`gemm_iu4g256_w4a4_*`, `v_wmma_i32_16x16x16_iu4`).
+Qwen3.5-4B on gfx1100, pp512: W4A8 about 7,700 tok/s and prefill KL vs
+BF16 0.0467 (equal to decode); W4A4 about 9,470 tok/s and KL 0.0982.
+Both run on exact gfx1100 and gfx1151 only, gated by
 `rdna_compute::arch_caps::supports_iu4g256_gemm`; every other arch takes the
 per-token decode loop. DFlash verify runs the target's batched body, so it
 takes the same route.
@@ -166,14 +170,14 @@ noise embedding runs `embedding_lookup_iu8g128`).
 | decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
 | fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g128_residual` |
 | embedding gather | — (the table is qt 58 on every rung) | `embedding_iu8g128` |
-| prefill GEMM | `gemm_iu4g256_w4a4_*` (`v_wmma_i32_16x16x16_iu4`, gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
+| prefill GEMM | `gemm_iu4g256_w4a8_*` (`v_wmma_i32_16x16x16_iu8`; `HIPFIRE_IU4_PREFILL_ACT=a4` = W4A4 `gemm_iu4g256_w4a4_*`; gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
 | DFlash verify | — | qt 58 head via `gemm_iu8g128_residual_wmma` (gfx1100/gfx1151) |
 
 `hipfire_runtime::iu_quant` is the CPU contract: `dequant` for qt 57
 and `gemv_q8` (`dequant_q8` · `x`) for qt 58. The loaders admit both dtypes
 (`RAW_CODECS`), and qt 58 embedding tables are admitted raw (one contiguous
 plane + tail scales), so an `iu4` artifact loads and decodes on the
-per-token path. Batched prefill runs qt 57 (W4A4) and qt 58 (W8A8 or its
+per-token path. Batched prefill runs qt 57 (W4A8, or W4A4 opt-in) and qt 58 (W8A8 or its
 f16-WMMA twin, per `Gpu::iu8g128_gemm_route`) on exact gfx1100/gfx1151 only;
 the generic GEMM dispatcher still refuses both. A rung's `ssm_out` is a body row on `xt`/base, so that rung takes the
 fused residual twin; there is no `_batched` gather.

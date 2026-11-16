@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 W4A4 prefill route (`HIPFIRE_IU4_PREFILL_ACT`
-//! default `a4`) and the small-M MW-LDS route (projections with M < 128).
+//! Numerics gate for the IU4G256 W4A4 prefill route (opt-in
+//! `HIPFIRE_IU4_PREFILL_ACT=a4`, which the test sets) and the small-M MW-LDS route (projections with M < 128).
 //!
 //! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g256_w4a4_prequant` returns
 //!    the bits of `gemm_mq4g256v2_mmq_{set,add}_prequant_iu4` on `src` over
@@ -194,6 +194,8 @@ fn check(
 #[test]
 #[ignore]
 fn iu4_w4a4_and_mwl_are_bit_exact_to_mq4v2() {
+    // The routed calls below must take W4A4; a8 is the default.
+    std::env::set_var("HIPFIRE_IU4_PREFILL_ACT", "a4");
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
