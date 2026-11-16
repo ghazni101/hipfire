@@ -28,9 +28,10 @@ impl Rng {
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     assert_eq!(k % 128, 0, "qt58 rows are one scale per 128");
     let g = k / 128;
-    let mut out = vec![0u8; m * (k + 2 * g)];
+    let mut out = vec![0u8; m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()];
     for r in 0..m {
-        let row = &mut out[r * (k + 2 * g)..(r + 1) * (k + 2 * g)];
+        let row = &mut out[r * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()
+            ..(r + 1) * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()];
         for b in &mut row[..k] {
             *b = (rng.next() & 0xff) as u8;
         }
@@ -45,7 +46,7 @@ fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 
 fn reference(iu: &[u8], x: &[f32], m: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
     let g = k / 128;
-    let rb = k + 2 * g;
+    let rb = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut y = vec![0f64; m];
     let mut l1 = vec![0f64; m];
     for r in 0..m {
@@ -126,7 +127,7 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], m: usize, k: usize, rng: &mut Rn
         &l1,
     );
     let mut worst = 0f64;
-    let aligned = (k + k / 64) % 16 == 0;
+    let aligned = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap() % 16 == 0;
     if aligned {
         for (p, r) in V2 {
             let a = run(gpu, p, &w, &xd, &zero, m, k);

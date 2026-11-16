@@ -3,6 +3,12 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+
+// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
+#ifndef IU8_ROW_BYTES
+#define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
+#endif
 #include <hip/hip_fp16.h>
 
 // WMMA-accelerated batched Q8_0 GEMM with fused residual add.
@@ -58,7 +64,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
 
     const int blocks_per_row = K / 32;
 #ifdef HIPFIRE_IU8G128L
-    const long long row_stride = (long long)K + (long long)(K >> 6);
+    const long long row_stride = IU8_ROW_BYTES(K);
 #else
     const long long row_stride = (long long)blocks_per_row * 34;
 #endif

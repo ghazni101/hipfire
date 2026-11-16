@@ -113,10 +113,15 @@ _Static_assert(I8_LDS_BYTES == I8_LDS_EXPECT,
 // No outer parens: pointer + I8_W_HDR keeps the left-assoc pointer adds
 // of the original source (identical MQ4V2 code objects).
 #define I8_W_HDR(gpr, kb) (gpr) * 128 + ((kb) >> 1) * 8 + ((kb) & 1) * 4
+// qt57 rows are padded to 16 B (hipfire_runtime::iu_quant::row_bytes).
+#define I8_W_ROW_U(gpr) ((((unsigned)(gpr) * 136u) + 15u) & ~15u)
+#define I8_W_ROW(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
 #else
 #define I8_W_CODE0 8u
 #define I8_W_GROUP_CODE_STRIDE 136
 #define I8_W_HDR(gpr, kb) ((kb) >> 1) * 136 + ((kb) & 1) * 4
+#define I8_W_ROW_U(gpr) ((unsigned)(gpr) * 136u)
+#define I8_W_ROW(gpr) ((long long)(gpr) * 136)
 #endif
 _Static_assert(I8_LDS_BYTES <= 65536, "RDNA3 workgroup LDS limit");
 #define I8_MAGIC 0x4B400000
@@ -204,7 +209,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     // descriptor turns every load into a waterfall loop).
     const int st_wsrc = src_row((int)st_T);
     const unsigned st_woff =
-        (unsigned)(st_wsrc < M ? st_wsrc : (M - 1)) * (unsigned)groups_per_row * 136u + I8_W_CODE0 + st_c * 8u;
+        (unsigned)(st_wsrc < M ? st_wsrc : (M - 1)) * I8_W_ROW_U(groups_per_row) + I8_W_CODE0 + st_c * 8u;
     // Packed W plane: row R's 8 bytes of K16 step c at R*32 + 8*(c ^ ((R >> 2) & 3)).
     const unsigned st_wlds = I8_A_SLAB_BYTES + st_T * 32u + ((st_c ^ ((st_T >> 2) & 3u)) << 3);
     const char* st_wbase = src_base(__builtin_amdgcn_readfirstlane((int)st_T));
@@ -217,7 +222,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_i8_gfx11_body
     const unsigned hdr_ds = i8_ds_slot((unsigned)hdr_i);
     const int hdr_src = src_row(hdr_i);
     const char* hdr_sp = src_base(hdr_i)
-        + (long long)(hdr_src < M ? hdr_src : (M - 1)) * groups_per_row * 136;
+        + (long long)(hdr_src < M ? hdr_src : (M - 1)) * I8_W_ROW(groups_per_row);
     const unsigned a_bytes = (unsigned)N * (unsigned)sizeof(block_i8_128);
 
     // Consumer lane bases. The swizzle terms (A: (e >> 1) & 3, W: (e >> 2) &

@@ -32,6 +32,13 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
+#ifndef IU4_ROW_BYTES
+#define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
+#define IU4_ROW_BYTES_U(gpr) ((((unsigned int)(gpr) * 136u) + 15u) & ~15u)
+#endif
+
 #define IU4_DOG(pk, sc, zp, b, a) \
     (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
          + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -119,7 +126,7 @@ extern "C" __global__ void gemv_iu4g256(
     const int row = blockIdx.x;
     if (row >= M) return;
     const int G = K >> 8;
-    const float acc = iu4_row_dot_f32(A + (long long)row * G * 136, x, G);
+    const float acc = iu4_row_dot_f32(A + (long long)row * IU4_ROW_BYTES(G), x, G);
     if (threadIdx.x == 0) y[row] = acc;
 }
 
@@ -157,7 +164,7 @@ extern "C" __global__ void gemv_iu4g256_residual(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const long long row_stride = (long long)groups_per_row * 136;
+    const long long row_stride = IU4_ROW_BYTES(groups_per_row);
     const int hdr_off = groups_per_row * 128;
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
@@ -358,7 +365,7 @@ extern "C" __global__ void fused_iu4g256_rows(
     else if ((row -= M2) < M3) { A = A3; y = y3; }
     else return;
     const int G = K >> 8;
-    const float acc = iu4_row_dot_f32(A + (long long)row * G * 136, x, G);
+    const float acc = iu4_row_dot_f32(A + (long long)row * IU4_ROW_BYTES(G), x, G);
     if (threadIdx.x == 0) y[row] = acc;
 }
 
@@ -487,7 +494,7 @@ extern "C" __global__ void gemv_iu4g256_dot4(
     int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot_a8(A + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) y[row] = acc;
 }
@@ -500,7 +507,7 @@ extern "C" __global__ void gemv_iu4g256_dot4_residual(
     int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot_a8(A + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) y[row] = y[row] + acc;
 }
@@ -513,7 +520,7 @@ extern "C" __global__ void gemv_iu4g256_dot8(
     int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot(A + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) y[row] = acc;
 }
@@ -526,7 +533,7 @@ extern "C" __global__ void gemv_iu4g256_dot8_residual(
     int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot(A + (long long)row * row_bytes, x, K);
     if (threadIdx.x == 0) y[row] = y[row] + acc;
 }
@@ -596,7 +603,7 @@ extern "C" __global__ void gemv_iu4g256_dot4q(
     float* __restrict__ y, int M, int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
     if (threadIdx.x == 0) y[row] = acc;
 }
@@ -607,7 +614,7 @@ extern "C" __global__ void gemv_iu4g256_dot4q_residual(
     float* __restrict__ y, int M, int K) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
     if (threadIdx.x == 0) y[row] = y[row] + acc;
 }
@@ -630,7 +637,7 @@ extern "C" __global__ void fused_iu4g256_dot4q_rows(
     else if ((row -= M1) < M2) { A = A2; y = y2; }
     else if ((row -= M2) < M3) { A = A3; y = y3; }
     else return;
-    const long long row_bytes = (long long)(K >> 1) + (K >> 5);
+    const long long row_bytes = IU4_ROW_BYTES(K >> 8);
     const float acc = iu4_row_dot_a8q(A + (long long)row * row_bytes, xq, K);
     if (threadIdx.x == 0) y[row] = acc;
 }

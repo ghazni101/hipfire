@@ -31,9 +31,10 @@ impl Rng {
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     assert_eq!(k % 128, 0);
     let g = k / 128;
-    let mut out = vec![0u8; m * (k + 2 * g)];
+    let mut out = vec![0u8; m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()];
     for r in 0..m {
-        let row = &mut out[r * (k + 2 * g)..(r + 1) * (k + 2 * g)];
+        let row = &mut out[r * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()
+            ..(r + 1) * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()];
         for b in &mut row[..k] {
             *b = (rng.next() % 255) as u8 ^ 0x80;
         }
@@ -48,7 +49,7 @@ fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
 
 fn dequant(iu: &[u8], m: usize, k: usize) -> Vec<f64> {
     let g = k / 128;
-    let row_b = k + 2 * g;
+    let row_b = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut w = vec![0f64; m * k];
     for r in 0..m {
         let row = &iu[r * row_b..(r + 1) * row_b];
@@ -156,7 +157,12 @@ fn iu8g128_wmma_matches_reference() {
             if !seen.insert((k, m)) {
                 continue;
             }
-            assert_eq!(ib.len(), m * (k + k / 64), "{}: bad qt58 row size", t.name);
+            assert_eq!(
+                ib.len(),
+                m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap(),
+                "{}: bad qt58 row size",
+                t.name
+            );
             for &n in &[1usize, 77] {
                 check(
                     &mut gpu,
@@ -175,7 +181,7 @@ fn iu8g128_wmma_matches_reference() {
 }
 
 fn w8a8_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    let stride = k + k / 64;
+    let stride = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut out = vec![0u8; m * stride];
     for r in 0..m {
         for kb in 0..k / 128 {
@@ -222,7 +228,7 @@ fn w8a8_lds_min_matches_reference_and_times() {
     }
     gpu.hip.device_synchronize().unwrap();
     let xqb = gpu.download_raw_bytes(&xt).unwrap();
-    let stride = k + k / 64;
+    let stride = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut want = vec![0f32; n * m];
     for t in 0..n {
         for r in 0..m {
@@ -322,7 +328,7 @@ fn w8a8_lds_min_ragged_shapes() {
     for &(m, k) in &[(1usize, 256usize), (129, 512), (300, 2560), (130, 6144)] {
         let w8 = w8a8_weights(&mut rng, m, k);
         let wd = gpu.upload_raw(&w8, &[w8.len()]).unwrap();
-        let stride = k + k / 64;
+        let stride = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
         for &n in &[1usize, 16, 127, 129, 300] {
             let x: Vec<f32> = (0..n * k).map(|_| rng.f() * 2.0).collect();
             let xd = gpu.upload_f32(&x, &[n * k]).unwrap();

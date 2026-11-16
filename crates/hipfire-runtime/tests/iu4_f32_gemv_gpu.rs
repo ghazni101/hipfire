@@ -153,7 +153,7 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     };
     let mut off = 0;
     let mut views = Vec::new();
-    let row_b = (k / 256) * 136;
+    let row_b = hipfire_runtime::iu_quant::row_bytes(k, Layout::Iu4).unwrap();
     for &p in &parts {
         let w = gpu
             .upload_raw(&c.iu[off * row_b..(off + p) * row_b], &[p * row_b])

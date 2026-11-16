@@ -24,6 +24,12 @@
 
 #include <hip/hip_runtime.h>
 
+// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
+#ifndef IU8_ROW_BYTES
+#define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
+#endif
+
 __device__ __forceinline__ float iu8g128_row_dot(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
@@ -51,7 +57,7 @@ extern "C" __global__ void gemv_iu8g128(
     if (row >= M) return;
 
     const int blocks = K >> 5;
-    const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
+    const long long row_bytes = IU8_ROW_BYTES(K);
     float sum = iu8g128_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
@@ -70,7 +76,7 @@ extern "C" __global__ void gemv_iu8g128_residual(
     if (row >= M) return;
 
     const int blocks = K >> 5;
-    const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
+    const long long row_bytes = IU8_ROW_BYTES(K);
     float sum = iu8g128_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
@@ -111,7 +117,7 @@ __device__ __forceinline__ void iu8g128_v2_body(
     const int wave = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
     const int row0 = wave * R;
     if (row0 >= M) return;
-    const long long rb = (long long)K + (long long)(K >> 6);
+    const long long rb = IU8_ROW_BYTES(K);
     const int chunks = K >> 4;
     float acc[R];
 #pragma unroll
@@ -186,7 +192,7 @@ __device__ __forceinline__ void iu8g128_xbatch_body(
     const int wave = (int)(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
     const int row0 = wave * R;
     if (row0 >= M) return;
-    const long long rb = (long long)K + (long long)(K >> 6);
+    const long long rb = IU8_ROW_BYTES(K);
     const int chunks = K >> 4;
     float acc[R][BMAX];
 #pragma unroll

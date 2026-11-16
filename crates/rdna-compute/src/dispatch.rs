@@ -1196,7 +1196,7 @@ impl DType {
                     None
                 } else {
                     let codes = if self == DType::IU4G256 { k / 2 } else { k };
-                    Some(codes + (k / 128) * 4)
+                    Some((codes + (k / 128) * 4).div_ceil(16) * 16)
                 }
             }
             // qt=58. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
@@ -1204,7 +1204,7 @@ impl DType {
                 if k % 128 != 0 {
                     None
                 } else {
-                    Some(k + (k / 128) * 2)
+                    Some((k + (k / 128) * 2).div_ceil(16) * 16)
                 }
             }
             _ => None,

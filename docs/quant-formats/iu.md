@@ -51,8 +51,16 @@ weight side unsigned.
 `K % 256 == 0`. One row of `K` weights:
 
 ```text
-[codes][f16 scale, f16 zero] * (K / 128)
+[codes][f16 scale, f16 zero] * (K / 128)[zero pad to a 16-byte multiple]
 ```
+
+Both IU layouts pad every row with zero bytes to a multiple of 16
+(`iu_quant::ROW_ALIGN`), so each row starts 16-byte aligned and the decode
+kernels can use 16-byte loads at any `K`. Padding is not counted in stored
+bpw. For IU4 it is non-zero only when `K % 512 != 0`; for IU8G128 only when
+`K % 1024 != 0` (the `K = 2560` lm_head row is 2608 B instead of 2600 B). A
+file written before padding fails the loader's size check at those shapes
+and has to be re-quantized.
 
 | | code bytes | scale bytes | row bytes at K=256 | stored bpw |
 |---|---:|---:|---:|---:|
@@ -123,7 +131,8 @@ IU8G128, one row, K = 256                          260 B/row = 8.125 bpw
 
 `K % 128 == 0`; a row that is not is left as interleaved Q8F16. The row is
 `K + (K/128)*2` bytes (8.125 bpw), six bytes per 128 smaller than the old
-one-scale-per-32 layout (`K + K/16`, 8.5 bpw).
+one-scale-per-32 layout (`K + K/16`, 8.5 bpw), then zero-padded to a 16-byte
+multiple (see Row layout).
 
 The wire name is `IU8G128` (`QuantType::IU8G128`, qt 58). The runtime types
 (`rdna_compute::DType::IU8G128`, `EmbeddingFormat::IU8G128`), `iu_quant`, and

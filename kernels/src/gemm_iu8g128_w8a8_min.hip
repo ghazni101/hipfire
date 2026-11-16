@@ -13,6 +13,12 @@
 // Grid [ceil(M/128), ceil(N/128)]. SET or ADD epilogue.
 
 #include <hip/hip_runtime.h>
+
+// qt58 rows are padded to a 16-byte multiple: K code bytes + K/64 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::q8_row_bytes).
+#ifndef IU8_ROW_BYTES
+#define IU8_ROW_BYTES(K) ((((long long)(K) + (long long)((K) >> 6)) + 15LL) & ~15LL)
+#endif
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
@@ -55,7 +61,7 @@ __device__ __forceinline__ void w8a8_body(
     if (tile_tok0 >= N || tile_row0 >= M) return;
 
     const int kblocks = K / 128;
-    const long long row_stride = (long long)K + (long long)(K >> 6);
+    const long long row_stride = IU8_ROW_BYTES(K);
 
     const unsigned st_e = (unsigned)(tid >> 2);
     const unsigned st_c0 = (unsigned)((tid & 3) * 2);

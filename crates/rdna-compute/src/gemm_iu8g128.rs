@@ -203,7 +203,7 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
         ];
-        let bytes = m * (k + k / 64) + n * k * 2 + n * m * 4 * 2;
+        let bytes = m * (k + k / 64).div_ceil(16) * 16 + n * k * 2 + n * m * 4 * 2;
         let grid_y = if mb4 { (n + 63) / 64 } else { (n + 15) / 16 };
         let grid_x = if m2 { (m + 31) / 32 } else { (m + 15) / 16 };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", sym, bytes);
@@ -279,7 +279,7 @@ impl Gpu {
         ];
         let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
         let lds = 33_792u32;
-        let bytes = m * (k + k / 64) + n * k + n * m * 4;
+        let bytes = m * (k + k / 64).div_ceil(16) * 16 + n * k + n * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
         let result = self.launch_maybe_blob(entry, grid, [512, 1, 1], lds, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();

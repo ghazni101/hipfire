@@ -126,9 +126,21 @@ pub fn scale_bytes(k: usize) -> Option<usize> {
     Some((k / HALF) * SCALE_PAIR_BYTES)
 }
 
-/// Bytes of one row: codes, then scales.
+/// Row stride alignment of both IU layouts. A row is padded with zero bytes
+/// to a multiple of this, so every row starts 16-byte aligned and the decode
+/// kernels can use 16-byte loads at any `K` (e.g. the `K = 2560` lm_head,
+/// whose compact IU8G128 row is 2600 B).
+pub const ROW_ALIGN: usize = 16;
+
+fn pad_row(bytes: usize) -> Option<usize> {
+    bytes
+        .checked_add(ROW_ALIGN - 1)
+        .map(|b| b / ROW_ALIGN * ROW_ALIGN)
+}
+
+/// Bytes of one row: codes, then scales, then zero padding to [`ROW_ALIGN`].
 pub fn row_bytes(k: usize, layout: Layout) -> Option<usize> {
-    code_bytes(k, layout)?.checked_add(scale_bytes(k)?)
+    pad_row(code_bytes(k, layout)?.checked_add(scale_bytes(k)?)?)
 }
 
 /// Bytes of an `[m, k]` tensor.
@@ -139,9 +151,10 @@ pub fn tensor_bytes(m: usize, k: usize, layout: Layout) -> Option<usize> {
     m.checked_mul(row_bytes(k, layout)?)
 }
 
-/// Stored bits per weight, header included. IU4 is 4.25.
+/// Stored bits per weight, header included, row padding excluded. IU4 is 4.25.
 pub fn stored_bpw(layout: Layout) -> f32 {
-    let row = row_bytes(GROUP, layout).expect("256 is a legal K");
+    let row = code_bytes(GROUP, layout).expect("256 is a legal K")
+        + scale_bytes(GROUP).expect("256 is a legal K");
     (row * 8) as f32 / GROUP as f32
 }
 
@@ -204,19 +217,20 @@ pub fn repack_mq4v2(src: &[u8], m: usize, k: usize, layout: Layout) -> Result<Ve
             scale_at += 8;
         }
         debug_assert_eq!(code_at, code_b);
-        debug_assert_eq!(scale_at, row_b);
+        debug_assert!(scale_at <= row_b && row_b - scale_at < ROW_ALIGN);
     }
     Ok(out)
 }
 
-/// Bytes of one qt 58 row: `K` signed codes, then one f16 scale per 128.
+/// Bytes of one qt 58 row: `K` signed codes, then one f16 scale per 128,
+/// then zero padding to [`ROW_ALIGN`].
 ///
 /// `None` unless `K` is a positive multiple of [`Q8_SCALE_GROUP`].
 pub fn q8_row_bytes(k: usize) -> Option<usize> {
     if k == 0 || k % Q8_SCALE_GROUP != 0 {
         None
     } else {
-        Some(k + (k / Q8_SCALE_GROUP) * 2)
+        pad_row(k + (k / Q8_SCALE_GROUP) * 2)
     }
 }
 
@@ -556,8 +570,9 @@ mod tests {
 
     #[test]
     fn stored_width_matches_mq4v2_for_iu4() {
-        assert_eq!(row_bytes(256, Layout::Iu4), Some(136));
+        assert_eq!(row_bytes(256, Layout::Iu4), Some(144));
         assert_eq!(row_bytes(512, Layout::Iu4), Some(272));
+        assert_eq!(row_bytes(768, Layout::Iu4), Some(416));
         assert_eq!(scale_bytes(512), Some(16));
         assert!((stored_bpw(Layout::Iu4) - 4.25).abs() < 1e-6);
         assert_eq!(row_bytes(128, Layout::Iu4), None);
@@ -613,12 +628,14 @@ mod tests {
             }
         }
         let packed = repack_q8f16(&src, m, k).unwrap();
-        assert_eq!(q8_row_bytes(128), Some(130));
-        assert_eq!(q8_row_bytes(256), Some(260));
+        assert_eq!(q8_row_bytes(128), Some(144));
+        assert_eq!(q8_row_bytes(256), Some(272));
+        assert_eq!(q8_row_bytes(1024), Some(1040));
+        assert_eq!(q8_row_bytes(2560), Some(2608));
         assert_eq!(q8_row_bytes(32), None);
         assert_eq!(q8_row_bytes(127), None);
         assert_eq!(Q8_QUANT_TYPE, 58);
-        assert_eq!(packed.len(), m * (k + 2));
+        assert_eq!(packed.len(), m * q8_row_bytes(k).unwrap());
         let got = dequant_q8(&packed, m, k).unwrap();
         for i in 0..k {
             assert!((got[i] - 0.125).abs() < 1e-4, "row0 col {i}: {}", got[i]);
@@ -637,7 +654,7 @@ mod tests {
         // One row, one 128 block: scale 0.5, codes -4 and 6 on x = 2 and 3.
         // y = 0.5*(-4*2) + 0.5*(6*3) = -4 + 9 = 5.
         let k = 128usize;
-        let mut packed = vec![0u8; k + 2];
+        let mut packed = vec![0u8; q8_row_bytes(k).unwrap()];
         packed[0] = (-4i8) as u8;
         packed[1] = 6;
         packed[k..k + 2].copy_from_slice(&f16::from_f32(0.5).to_bits().to_le_bytes());

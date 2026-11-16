@@ -30,6 +30,13 @@
 // LDS: (128*18 + 128*42)*4 = 30720 B (vs 57344 B baseline) -> 2 blocks/CU.
 
 #include <hip/hip_runtime.h>
+
+// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
+#ifndef IU4_ROW_BYTES
+#define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
+#define IU4_ROW_BYTES_U(gpr) ((((unsigned int)(gpr) * 136u) + 15u) & ~15u)
+#endif
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 #include <math.h>
@@ -151,7 +158,7 @@ static __device__ __forceinline__ void load_iu4_tile(
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
 #ifdef HIPFIRE_IU4_PLANAR
         // qt57 planar row [K/2 codes][8 B header x G]: payload-form base - 8.
-        const char* gp = A + (long long)row * groups_per_row * 136 + (long long)kb * 128 - 8;
+        const char* gp = A + (long long)row * IU4_ROW_BYTES(groups_per_row) + (long long)kb * 128 - 8;
 #else
         const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
 #endif
@@ -164,7 +171,7 @@ static __device__ __forceinline__ void load_iu4_tile(
         if (i < IU4_MMQ_Y) {
             const int row = FULL ? row0 + i : min(row0 + i, M - 1);
 #ifdef HIPFIRE_IU4_PLANAR
-            const char* gp = A + (long long)row * groups_per_row * 136
+            const char* gp = A + (long long)row * IU4_ROW_BYTES(groups_per_row)
                 + (long long)groups_per_row * 128 + (long long)kb * 8;
 #else
             const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
@@ -432,7 +439,7 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
         // Uniform (SGPR) column base + 32-bit per-row offset (< 4 GiB):
         // keeps the per-row address math in one VGPR like the MQ4V2 form.
         const char* ak = A + (long long)kb * 128 - 8;
-        const unsigned int rb = (unsigned int)groups_per_row * 136u;
+        const unsigned int rb = IU4_ROW_BYTES_U(groups_per_row);
         const unsigned int ro = (unsigned int)(row0 + base) * rb;
         const char* gp0 = ak + ro;
         const char* gp1 = ak + (ro + 16u * rb);
@@ -468,7 +475,7 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
 #ifdef HIPFIRE_IU4_PLANAR
         const char* pld = (A + (long long)groups_per_row * 128 + (long long)kb * 8)
             + (4u * (unsigned int)lane
-               + (unsigned int)(row0 + i) * ((unsigned int)groups_per_row * 136u));
+               + (unsigned int)(row0 + i) * IU4_ROW_BYTES_U(groups_per_row));
 #else
         const char* pld = A + 4 * lane
             + ((long long)(row0 + i) * groups_per_row + kb) * 136;

@@ -99,7 +99,7 @@ impl Gpu {
                 "gemv_iu8g128_xbatch: batch must be 1..=4",
             ));
         }
-        let row_bytes = k + k / 64;
+        let row_bytes = (k + k / 64).div_ceil(16) * 16;
         if row_bytes % 16 != 0
             || (a.buf.as_ptr() as usize) % 16 != 0
             || (x.buf.as_ptr() as usize) % 16 != 0
@@ -229,7 +229,7 @@ fn iu8g128_pick(
     m: usize,
     k: usize,
 ) -> &'static str {
-    let row_bytes = k + k / 64;
+    let row_bytes = (k + k / 64).div_ceil(16) * 16;
     let aligned = row_bytes % 16 == 0
         && (x.buf.as_ptr() as usize) % 16 == 0
         && (a.buf.as_ptr() as usize) % 16 == 0;

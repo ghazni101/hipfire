@@ -44,9 +44,9 @@
 // shared `gp + 8` payload expression is unchanged.
 #ifdef HIPFIRE_MWL_IU4L
 #define MWL_GP(A, row, g, gpr, GB) \
-    ((A) + (long long)(row) * (gpr) * 136 + (long long)(g) * 128 - 8)
+    ((A) + (long long)(row) * ((((long long)(gpr) * 136LL) + 15LL) & ~15LL) + (long long)(g) * 128 - 8)
 #define MWL_HDR(gp, A, row, g, gpr) \
-    ((A) + (long long)(row) * (gpr) * 136 + (long long)(gpr) * 128 + (long long)(g) * 8)
+    ((A) + (long long)(row) * ((((long long)(gpr) * 136LL) + 15LL) & ~15LL) + (long long)(gpr) * 128 + (long long)(g) * 8)
 #else
 #define MWL_GP(A, row, g, gpr, GB) \
     ((A) + (long long)(row) * (gpr) * (GB) + (long long)(g) * (GB))

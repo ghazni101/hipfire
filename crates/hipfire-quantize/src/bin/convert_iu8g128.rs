@@ -139,7 +139,7 @@ fn write_hfq(path: &Path, arch: u32, metadata: &str, tensors: &[Tensor]) {
 fn requant_row(src: &[u8], k: usize) -> Vec<u8> {
     let old_row = k + (k / 32) * 2;
     assert_eq!(src.len(), old_row, "legacy row length");
-    let new_row = k + (k / 128) * 2;
+    let new_row = hipfire_runtime::iu_quant::q8_row_bytes(k).expect("K % 128 == 0");
     let mut out = vec![0u8; new_row];
     let mut w = [0f32; 128];
     for kb in 0..k / 128 {
@@ -192,7 +192,7 @@ fn main() {
                 m * old_row
             );
         }
-        let mut out = Vec::with_capacity(m * (k + (k / 128) * 2));
+        let mut out = Vec::with_capacity(m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap());
         for r in 0..m {
             out.extend_from_slice(&requant_row(&t.data[r * old_row..(r + 1) * old_row], k));
         }

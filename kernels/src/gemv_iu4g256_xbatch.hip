@@ -34,6 +34,13 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+// qt57 rows are padded to a 16-byte multiple: K/2 code bytes + K/32 scale
+// bytes, rounded up (hipfire_runtime::iu_quant::row_bytes). Wide loads need it.
+#ifndef IU4_ROW_BYTES
+#define IU4_ROW_BYTES(gpr) ((((long long)(gpr) * 136LL) + 15LL) & ~15LL)
+#define IU4_ROW_BYTES_U(gpr) ((((unsigned int)(gpr) * 136u) + 15u) & ~15u)
+#endif
+
 #ifndef HIPFIRE_IU4G256_XBATCH_KERNEL
 #define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch
 #endif
@@ -65,7 +72,7 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
     const int tid = threadIdx.x;
 
     const int groups_per_row = K >> 8;
-    const long long row_bytes = (long long)groups_per_row * 136;
+    const long long row_bytes = IU4_ROW_BYTES(groups_per_row);
     const char* row_ptr = A + (long long)row * row_bytes;
     const char* codes = row_ptr;
     const char* hdr = row_ptr + (long long)groups_per_row * 128;

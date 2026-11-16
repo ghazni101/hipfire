@@ -144,6 +144,7 @@ pub fn load_embedding(
                 dim,
                 "token_embd",
             )?;
+            check_raw_embedding(fmt, data, vocab, dim)?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok((buf, fmt))
         }
@@ -156,6 +157,23 @@ pub fn load_embedding(
             Ok((buf, EmbeddingFormat::F32))
         }
     }
+}
+
+/// Byte-extent check for a verbatim-uploaded embedding table. Only IU8G128
+/// is checked here: its rows are padded to 16 B, and a table written before
+/// padding (`K + K/64` B rows) would otherwise be gathered at the wrong stride.
+fn check_raw_embedding(
+    fmt: EmbeddingFormat,
+    data: &[u8],
+    vocab: usize,
+    dim: usize,
+) -> HipResult<()> {
+    if fmt == EmbeddingFormat::IU8G128 {
+        crate::iu_quant::validate_q8(data, vocab, dim).map_err(|error| {
+            hip_bridge::HipError::new(0, &format!("{error} (caller: embedding){BLOB_FIX}"))
+        })?;
+    }
+    Ok(())
 }
 
 /// EmbeddingFormat → the DType tag for a tied lm_head WeightTensor.
@@ -1726,6 +1744,7 @@ impl<'a> WeightBackend for ParoBackend<'a> {
 mod tests {
     use super::*;
 
+<<<<<<< HEAD
     /// Every row-packed raw dtype refuses a cross-row (pre-per-row) payload
     /// for ragged K and accepts the per-row one; the set is shared by
     /// `decode_raw_codec` and the non-codec loaders.
@@ -1762,6 +1781,19 @@ mod tests {
                 "{dtype:?}"
             );
         }
+    }
+
+    #[test]
+    fn iu8g128_embedding_refuses_the_unpadded_row() {
+        let (vocab, dim) = (3usize, 2560usize);
+        let padded = vec![0u8; vocab * crate::iu_quant::q8_row_bytes(dim).unwrap()];
+        assert!(check_raw_embedding(EmbeddingFormat::IU8G128, &padded, vocab, dim).is_ok());
+        // Pre-padding row: K + K/64 = 2600 B instead of 2608 B.
+        let compact = vec![0u8; vocab * (dim + dim / 64)];
+        let err = check_raw_embedding(EmbeddingFormat::IU8G128, &compact, vocab, dim).unwrap_err();
+        assert!(err.message.contains("length mismatch"), "{err:?}");
+        // Other raw formats are not checked here.
+        assert!(check_raw_embedding(EmbeddingFormat::Q8_0, &compact, vocab, dim).is_ok());
     }
 
     /// `fwht256_inplace` must be bit-identical to the per-arm inlined FWHT it

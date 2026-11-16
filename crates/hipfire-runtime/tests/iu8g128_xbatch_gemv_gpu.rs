@@ -32,9 +32,9 @@ impl Rng {
     }
 }
 
-/// Compact qt 58 row: `[K signed codes][K/128 f16 scales]`.
+/// qt 58 row: `[K signed codes][K/128 f16 scales]`, zero-padded to 16 B.
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    let row_bytes = k + k / 64;
+    let row_bytes = hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap();
     let mut out = vec![0u8; m * row_bytes];
     for row in out.chunks_mut(row_bytes) {
         let (codes, scales) = row.split_at_mut(k);
@@ -131,7 +131,10 @@ fn iu8g128_head_shape_cost() {
     let mut gpu = Gpu::init_with_device(0).expect("GPU 0");
     let mut rng = Rng(0x1234_5678_9abc_def1);
     let w = gpu
-        .upload_raw(&iu8_random(&mut rng, m, k), &[m * (k + k / 64)])
+        .upload_raw(
+            &iu8_random(&mut rng, m, k),
+            &[m * hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap()],
+        )
         .unwrap();
     let x: Vec<f32> = (0..4 * k).map(|_| rng.f()).collect();
     let xd = gpu.upload_f32(&x, &[4 * k]).unwrap();
@@ -147,7 +150,7 @@ fn iu8g128_head_shape_cost() {
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
         eprintln!("{label:<28} {ms:8.3} ms   {:.1} GB/s", bytes / (ms * 1e6));
     }
-    let bytes = (m as f64) * ((k + k / 64) as f64);
+    let bytes = (m as f64) * (hipfire_runtime::iu_quant::q8_row_bytes(k).unwrap() as f64);
     for b in 1..=4usize {
         let xb = xd.sub_offset(0, b * k);
         let yb = y.sub_offset(0, b * m);
@@ -190,16 +193,9 @@ fn iu8g128_xbatch_matches_singleton() {
         }
     }
 
-    // A compact row whose stride is not 16 B aligned (`K = 256` → 260 B) has no
-    // valid `uint4` path: the launcher must refuse rather than misread.
-    let w = gpu
-        .upload_raw(&iu8_random(&mut rng, 4, 256), &[4 * 260])
-        .unwrap();
-    let x = gpu.upload_f32(&vec![0.0; 256], &[256]).unwrap();
-    let y = gpu.alloc_tensor(&[4], DType::F32).unwrap();
-    let err = gpu.gemv_iu8g128_xbatch(&w, &x, &y, 4, 256, 1).unwrap_err();
-    assert!(
-        err.message.contains("16 B-aligned"),
-        "misaligned row must be refused, got {err:?}"
-    );
+    // Rows are padded to 16 B, so `K = 256` (260 B unpadded, refused before
+    // padding) now takes the uint4 path like every other K.
+    for batch in 1..=4 {
+        check(&mut gpu, "k256", 4, 256, batch, &mut rng);
+    }
 }

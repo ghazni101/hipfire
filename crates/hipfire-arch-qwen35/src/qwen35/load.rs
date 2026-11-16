@@ -4186,7 +4186,7 @@ fn validate_embedding_info(
                     info.group_size
                 ));
             }
-            Some(vocab * (dim + (dim / 128) * 2))
+            hipfire_runtime::iu_quant::q8_row_bytes(dim).map(|row| vocab * row)
         }
         6 => expected_mq4_bytes(vocab, dim),
         13 => expected_mq4_bytes(vocab, dim),
@@ -4243,12 +4243,14 @@ mod qt58_embedding_validation {
         }
     }
 
-    /// qt58 is the compact `[K i8][K/128 f16]` row; the retired per-32 row and
-    /// a `K % 128 != 0` table are refused rather than misread.
+    /// qt58 is the `[K i8][K/128 f16]` row padded to 16 B; the retired per-32
+    /// row and a `K % 128 != 0` table are refused rather than misread. (At
+    /// `K = 256` the padded row and the per-32 row are both 272 B, so that
+    /// width is told apart by the group tag only; 512 differs in size.)
     #[test]
     fn qt58_embedding_admits_only_the_compact_row() {
-        let (vocab, dim) = (7usize, 256usize);
-        let compact = vocab * (dim + (dim / 128) * 2);
+        let (vocab, dim) = (7usize, 512usize);
+        let compact = vocab * hipfire_runtime::iu_quant::q8_row_bytes(dim).unwrap();
         validate_embedding_info(&info(58, 128, vocab, dim, compact), vocab, dim, "embed")
             .expect("compact qt58 row");
         // Old per-32 extent (same declared group tag).

@@ -37,12 +37,15 @@ impl Rng {
     }
 }
 
-/// Planar qt 57 row block: `[g*128 codes][g*8 headers]`.
+/// Planar qt 57 row block: `[g*128 codes][g*8 headers]`, zero-padded to 16 B.
 fn iu4_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     let g = k / 256;
-    let mut out = vec![0u8; m * g * 136];
-    for row in out.chunks_mut(g * 136) {
-        let (codes, hdr) = row.split_at_mut(g * 128);
+    let rb =
+        hipfire_runtime::iu_quant::row_bytes(k, hipfire_runtime::iu_quant::Layout::Iu4).unwrap();
+    let mut out = vec![0u8; m * rb];
+    for row in out.chunks_mut(rb) {
+        let (codes, rest) = row.split_at_mut(g * 128);
+        let hdr = &mut rest[..g * 8];
         for c in codes.iter_mut() {
             *c = rng.u8();
         }
