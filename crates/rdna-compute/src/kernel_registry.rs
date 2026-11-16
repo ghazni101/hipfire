@@ -307,9 +307,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ["embedding_hfq4g256"]
     );
     add!(
-        "embedding_iu8g32",
-        kernels::EMBEDDING_IU8G32_SRC,
-        ["embedding_iu8g32"]
+        "embedding_iu8g128",
+        kernels::EMBEDDING_IU8G128_SRC,
+        ["embedding_iu8g128"]
     );
     add!(
         "embedding_hfq4g256_batched",
@@ -376,28 +376,23 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!("gemm_mq6g256", kernels::GEMM_MQ6G256_SRC, ["gemm_mq6g256"]);
     add!("gemv_q8_0", kernels::GEMV_Q8_0_SRC, ["gemv_q8_0"]);
     add!(
-        "gemv_iu8g32",
-        kernels::GEMV_IU8G32_SRC,
+        "gemv_iu8g128",
+        kernels::GEMV_IU8G128_SRC,
         [
-            "gemv_iu8g32",
-            "gemv_iu8g32_residual",
-            "gemv_iu8g32_v2_r1",
-            "gemv_iu8g32_v2_residual_r1",
-            "gemv_iu8g32_v2_r2",
-            "gemv_iu8g32_v2_residual_r2",
-            "gemv_iu8g32_v2_r4",
-            "gemv_iu8g32_v2_residual_r4",
-            "gemv_iu8g32_xbatch"
+            "gemv_iu8g128",
+            "gemv_iu8g128_residual",
+            "gemv_iu8g128_v2_r1",
+            "gemv_iu8g128_v2_residual_r1",
+            "gemv_iu8g128_v2_r2",
+            "gemv_iu8g128_v2_residual_r2",
+            "gemv_iu8g128_v2_r4",
+            "gemv_iu8g128_v2_residual_r4",
+            "gemv_iu8g128_xbatch"
         ]
     );
     // The IU4 dot4/dot8 integer-activation family is compiled only under
     // `__GFX11__ || __GFX12__`; gfx906/gfx942 build the module without it.
     let iu_int_gemv = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
-    add!(
-        "gemv_iu8g256",
-        kernels::GEMV_IU8G256_SRC,
-        ["gemv_iu8g256", "gemv_iu8g256_residual"]
-    );
     if iu_int_gemv {
         add!(
             "gemv_iu4g256",
@@ -5926,27 +5921,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
             ["gemm_q8_0_residual_wmma"]
         );
-        // qt 59 (IU8G128) relayout of the Q8_0 residual GEMM, base and the
+        // qt 58 (IU8G128) relayout of the Q8_0 residual GEMM, base and the
         // four-batch-tile fanout used at N >= 64.
         add!(
-            "gemm_iu8g32_residual_wmma",
-            kernels::GEMM_IU8G32_RESIDUAL_WMMA_SRC,
-            ["gemm_iu8g32_residual_wmma"]
+            "gemm_iu8g128_residual_wmma",
+            kernels::GEMM_IU8G128_RESIDUAL_WMMA_SRC,
+            ["gemm_iu8g128_residual_wmma"]
         );
         add!(
-            "gemm_iu8g32_residual_wmma_mb4",
-            kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC,
-            ["gemm_iu8g32_residual_wmma_mb4"]
+            "gemm_iu8g128_residual_wmma_mb4",
+            kernels::GEMM_IU8G128_RESIDUAL_WMMA_MB4_SRC,
+            ["gemm_iu8g128_residual_wmma_mb4"]
         );
         add!(
-            "gemm_iu8g32_residual_wmma_mb4m2",
-            kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC,
-            ["gemm_iu8g32_residual_wmma_mb4m2"]
+            "gemm_iu8g128_residual_wmma_mb4m2",
+            kernels::GEMM_IU8G128_RESIDUAL_WMMA_MB4M2_SRC,
+            ["gemm_iu8g128_residual_wmma_mb4m2"]
         );
         add!(
-            "gemm_iu8g32_w8a8_min",
-            kernels::GEMM_IU8G32_W8A8_MIN_SRC,
-            ["gemm_iu8g32_w8a8_min_set", "gemm_iu8g32_w8a8_min_add"]
+            "gemm_iu8g128_w8a8_min",
+            kernels::GEMM_IU8G128_W8A8_MIN_SRC,
+            ["gemm_iu8g128_w8a8_min_set", "gemm_iu8g128_w8a8_min_add"]
         );
         add!(
             "gemm_gate_up_q8_0_wmma",
@@ -11964,18 +11959,16 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The IU4/IU8 quant family readers: qt 57 (IU4G256) and qt 58
-        // (IU8G256) decode GEMVs with their fused residual twins, the qt 59
-        // (IU8G128) pair, and the qt 59 embedding gather. All are
-        // arch-agnostic (integer-dot / f16-scale x f32 math), so every pack
-        // carries them.
+        // The IU quant family readers: qt 57 (IU4G256) decode GEMV with its
+        // fused residual twin, the qt 58 (IU8G128) pair, and the qt 58
+        // embedding gather. All are arch-agnostic (integer-dot / f16-scale x
+        // f32 math), so every pack carries them.
         // The xbatch pair is the multi-slot IU4 decode GEMV (one weight
         // pass for up to four activation columns).
-        const IU_QUANT_ADDED_MODULES: [&str; 6] = [
-            "embedding_iu8g32",
+        const IU_QUANT_ADDED_MODULES: [&str; 5] = [
+            "embedding_iu8g128",
             "gemv_iu4g256",
-            "gemv_iu8g256",
-            "gemv_iu8g32",
+            "gemv_iu8g128",
             "gemv_iu4g256_xbatch",
             "gemv_iu4g256_xbatch_residual",
         ];

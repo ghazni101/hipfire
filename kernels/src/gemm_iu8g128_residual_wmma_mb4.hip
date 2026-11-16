@@ -5,7 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// IU8G32 (qt59) WMMA residual GEMM with 4x batch-tile fanout per wave.
+// IU8G128 (qt58) WMMA residual GEMM with 4x batch-tile fanout per wave.
 //
 // Sibling of gemm_q8_0_residual_wmma.hip (same f16 WMMA math and output
 // mapping), but each 16-row wave walks four 16-token batch tiles before it
@@ -17,13 +17,13 @@
 // Each Y cell is still written by exactly one lane, so the non-atomic
 // `+=` residual invariant of the base kernel is preserved.
 //
-// Row layout (qt59): [K int8 codes][K/128 f16 scales], K + K/64 bytes.
+// Row layout (qt58): [K int8 codes][K/128 f16 scales], K + K/64 bytes.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4(
+extern "C" __global__ void gemm_iu8g128_residual_wmma_mb4(
     const char* __restrict__ A_q8,
     const _Float16* __restrict__ X,      // [N, K] FP16
     float* __restrict__ Y,               // [N, M] FP32 - caller seeds residual

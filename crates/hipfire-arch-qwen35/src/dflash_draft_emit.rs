@@ -554,7 +554,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     }
     match target_weights.embd_format {
         llama::EmbeddingFormat::Q8_0
-        | llama::EmbeddingFormat::IU8G32
+        | llama::EmbeddingFormat::IU8G128
         | llama::EmbeddingFormat::HFQ4G256
         | llama::EmbeddingFormat::HFQ4G128 => {}
         other => {
@@ -567,7 +567,7 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     if !matches!(
         w_out.gpu_dtype,
         DType::Q8_0
-            | DType::IU8G32
+            | DType::IU8G128
             | DType::HFQ4G256
             | DType::MQ4G256
             | DType::MQ4G256V2

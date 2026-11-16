@@ -76,8 +76,7 @@ impl QuantType {
             56 => Some(Self::FP8E4M3PT),
             57 => Some(Self::HC8E4M3Row),
             60 => Some(Self::IU4G256),
-            61 => Some(Self::IU8G256),
-            62 => Some(Self::IU8G32),
+            61 => Some(Self::IU8G128),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -266,13 +265,10 @@ pub(crate) enum QuantType {
     /// IU4G256 (qt=60): MQ4G256V2 codes stored as an unsigned-nibble operand
     /// plane. See `hipfire_runtime::iu_quant`. No GPU kernel yet.
     IU4G256 = 60,
-    /// IU8G256 (qt=61): the same codes stored one byte each (`0..=15`) for
-    /// `v_wmma_i32_16x16x16_iu8`. Not an 8-bit grid. See `iu_quant`.
-    IU8G256 = 61,
-    /// IU8G128 (qt=62): unsigned-int8-range signed codes (one f16 scale per
+    /// IU8G128 (qt=61): unsigned-int8-range signed codes (one f16 scale per
     /// 128, no FWHT) in a compact row `[K i8][K/128 f16]`. The fixed tier of
-    /// an `iu4` / `iu8` file. Full int8 range, not qt=61. See `iu_quant`.
-    IU8G32 = 62,
+    /// an `iu4` file. Full int8 range. See `iu_quant`.
+    IU8G128 = 61,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert

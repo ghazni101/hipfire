@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Numerics gate for the IU8G128 (qt59) decode GEMV v2 (`gemv_iu8g32_v2_*`).
+//! Numerics gate for the IU8G128 (qt58) decode GEMV v2 (`gemv_iu8g128_v2_*`).
 //!
 //! Every v2 variant (R = 1, 2, 4; plain and residual) vs an f64 reference of
 //! the dequantized row dot f32 x, next to v1 on the same case:
 //! rel = max abs / max_row sum|w x|. Gate: v2 rel <= max(4 * v1 rel, 2e-6)
 //! and < 1e-4; v2 run twice is bit-identical. Real tensors with
-//! `IU8_REAL=<.iu4p>` (embedding/lm_head and every qt59 shape).
+//! `IU8_REAL=<.iu4p>` (embedding/lm_head and every qt58 shape).
 //!
-//!   cargo test -p hipfire-runtime --release --test iu8g32_v2_gemv_gpu -- --ignored --nocapture
+//!   cargo test -p hipfire-runtime --release --test iu8g128_v2_gemv_gpu -- --ignored --nocapture
 
 use half::f16;
 use rdna_compute::Gpu;
@@ -26,7 +26,7 @@ impl Rng {
 }
 
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
-    assert_eq!(k % 128, 0, "qt59 rows are one scale per 128");
+    assert_eq!(k % 128, 0, "qt58 rows are one scale per 128");
     let g = k / 128;
     let mut out = vec![0u8; m * (k + 2 * g)];
     for r in 0..m {
@@ -67,9 +67,9 @@ fn reference(iu: &[u8], x: &[f32], m: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 const V2: [(&str, &str); 3] = [
-    ("gemv_iu8g32_v2_r1", "gemv_iu8g32_v2_residual_r1"),
-    ("gemv_iu8g32_v2_r2", "gemv_iu8g32_v2_residual_r2"),
-    ("gemv_iu8g32_v2_r4", "gemv_iu8g32_v2_residual_r4"),
+    ("gemv_iu8g128_v2_r1", "gemv_iu8g128_v2_residual_r1"),
+    ("gemv_iu8g128_v2_r2", "gemv_iu8g128_v2_residual_r2"),
+    ("gemv_iu8g128_v2_r4", "gemv_iu8g128_v2_residual_r4"),
 ];
 
 fn run(
@@ -82,7 +82,7 @@ fn run(
     k: usize,
 ) -> Vec<f32> {
     let y = gpu.upload_f32(seed, &[m]).unwrap();
-    gpu.gemv_iu8g32_named(f, w, x, &y, m, k).unwrap();
+    gpu.gemv_iu8g128_named(f, w, x, &y, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let out = gpu.download_f32(&y).unwrap();
     assert!(
@@ -112,14 +112,14 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], m: usize, k: usize, rng: &mut Rn
     let xd = gpu.upload_f32(&x, &[k]).unwrap();
     let (want, l1) = reference(iu, &x, m, k);
     let v1 = rel_of(
-        &run(gpu, "gemv_iu8g32", &w, &xd, &zero, m, k),
+        &run(gpu, "gemv_iu8g128", &w, &xd, &zero, m, k),
         &zero,
         false,
         &want,
         &l1,
     );
     let v1r = rel_of(
-        &run(gpu, "gemv_iu8g32_residual", &w, &xd, &seed, m, k),
+        &run(gpu, "gemv_iu8g128_residual", &w, &xd, &seed, m, k),
         &seed,
         true,
         &want,
@@ -161,7 +161,7 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], m: usize, k: usize, rng: &mut Rn
 
 #[test]
 #[ignore]
-fn iu8g32_v2_gemv_matches_reference() {
+fn iu8g128_v2_gemv_matches_reference() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -189,7 +189,7 @@ fn iu8g32_v2_gemv_matches_reference() {
         let mut seen = std::collections::BTreeSet::new();
         for t in f.tensors().to_vec() {
             let (ti, ib) = f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 59 || ti.shape.len() < 2 {
+            if ti.quant_type != 58 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;
@@ -211,5 +211,5 @@ fn iu8g32_v2_gemv_matches_reference() {
             cases += 1;
         }
     }
-    eprintln!("iu8g32 v2 gemv: {cases} cases, worst rel v1 = {w1:.3e}, v2 = {w2:.3e}");
+    eprintln!("iu8g128 v2 gemv: {cases} cases, worst rel v1 = {w1:.3e}, v2 = {w2:.3e}");
 }

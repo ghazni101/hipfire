@@ -191,11 +191,11 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
             0,
             "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
         ))
-    } else if dtype == DType::IU8G256 || dtype == DType::IU8G128 {
+    } else if dtype == DType::IU8G128 {
         Err(HipError::new(
             0,
             &format!(
-                "this model uses the {} weight format (qt 58/59): an integer-matrix operand layout this generic batched route cannot consume (it needs a rotation input the IU operand does not take). qt 59 has its own unrotated GEMV, embedding and residual GEMM; qt 58 has decode GEMV only",
+                "this model uses the {} weight format (qt 58): an integer-matrix operand layout this generic batched route cannot consume (it needs a rotation input the IU operand does not take). qt 58 has its own unrotated GEMV, embedding and residual GEMM",
                 dtype.iu_quant_name().unwrap_or("IU")
             ),
         ))
@@ -1176,18 +1176,18 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
         );
     }
     if w.dtype == DType::IU8G128 {
-        // qt59 compact row, natural-basis input. `gemm_iu8g32_residual` picks
+        // qt58 compact row, natural-basis input. `gemm_iu8g128_residual` picks
         // W8A8 or the f16 twin from (arch, K, n) with the one selector the
         // multi-slot body also uses.
         return match epilogue {
             BatchEpilogue::Residual => {
                 let x_n = pbs.x_batch.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_residual(&w.buf, input, &x_n, m, k, n)
+                gpu.gemm_iu8g128_residual(&w.buf, input, &x_n, m, k, n)
             }
             BatchEpilogue::Partial(out) => {
                 zero_partial_for_residual(gpu, out, n, m)?;
                 let out_n = out.sub_offset(0, n * m);
-                gpu.gemm_iu8g32_residual(&w.buf, input, &out_n, m, k, n)
+                gpu.gemm_iu8g128_residual(&w.buf, input, &out_n, m, k, n)
             }
         };
     }

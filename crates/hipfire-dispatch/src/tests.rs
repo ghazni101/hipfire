@@ -810,7 +810,6 @@ const ALL_DTYPES: &[DType] = &[
     DType::E8PI4G128R256,
     DType::E8PI4G128R128,
     DType::IU4G256,
-    DType::IU8G256,
     DType::IU8G128,
     DType::MQ4G256V2P,
     DType::MQ4G128V2P,
@@ -1527,23 +1526,8 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
             None
         )
         .is_err());
-    // qt 58 is the same grid with one byte per code: no integer dot, so it
-    // resolves on every arch.
-    for ctx in [ctx_rdna1(), ctx_rdna2(), ctx_rdna3(), ctx_rdna4()] {
-        assert!(
-            fam.resolve(DType::IU8G256, GemvVariant::Prerotated, false, &ctx, None)
-                .is_ok(),
-            "IU8G256 Prerotated must resolve"
-        );
-        assert!(
-            fam.resolve(DType::IU8G256, GemvVariant::WithResidual, false, &ctx, None)
-                .is_ok(),
-            "IU8G256 WithResidual must resolve"
-        );
-    }
     // A body-dtype `ssm_out` takes the fused residual arm.
     assert!(KernelKey::for_gemv_residual(DType::IU4G256).is_ok());
-    assert!(KernelKey::for_gemv_residual(DType::IU8G256).is_ok());
     assert!(fam
         .resolve(
             DType::IU4G256,
@@ -1553,7 +1537,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
             None
         )
         .is_ok());
-    // qt 59 has no prerotated variant: it is rotation-free, admitted Plain.
+    // qt 58 has no prerotated variant: it is rotation-free, admitted Plain.
     assert!(fam
         .resolve(
             DType::IU8G128,
@@ -1566,8 +1550,8 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
 }
 
 #[test]
-fn iu8g32_gemv_resolves_plain_and_residual_on_every_arch() {
-    // qt 59 is the Q8 grid with the scales at the row tail: f16-scale x int8 x
+fn iu8g128_gemv_resolves_plain_and_residual_on_every_arch() {
+    // qt 58 is the Q8 grid with the scales at the row tail: f16-scale x int8 x
     // f32 x, no integer matrix unit, no rotation. Plain (lm_head / ssm_out) and
     // the fused residual (DeltaNet out_proj) must resolve everywhere.
     let fam = GemvFamily::new();

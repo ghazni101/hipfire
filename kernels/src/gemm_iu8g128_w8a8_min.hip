@@ -159,13 +159,13 @@ __device__ __forceinline__ void w8a8_body(
 }
 
 extern "C" __global__ __launch_bounds__(W8_NTHREADS)
-void gemm_iu8g32_w8a8_min_set(
+void gemm_iu8g128_w8a8_min_set(
     const char* __restrict__ A, const block_i8_128* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N, int
 ) { w8a8_body<false>(A, Xq, Y, M, K, N); }
 
 extern "C" __global__ __launch_bounds__(W8_NTHREADS)
-void gemm_iu8g32_w8a8_min_add(
+void gemm_iu8g128_w8a8_min_add(
     const char* __restrict__ A, const block_i8_128* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N, int
 ) { w8a8_body<true>(A, Xq, Y, M, K, N); }

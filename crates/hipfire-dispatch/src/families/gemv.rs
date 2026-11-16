@@ -590,7 +590,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
         K::GemvBf16 => hip!(gpu.gemv_bf16_xf32(w.buf, x, y, m, k)),
         K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
-        K::GemvIu8G32 => hip!(gpu.gemv_iu8g32(w.buf, x, y, m, k)),
+        K::GemvIu8G128 => hip!(gpu.gemv_iu8g128(w.buf, x, y, m, k)),
         K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
         K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
         K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
@@ -610,7 +610,6 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
         K::GemvIu4G256Prerotated => hip!(gpu.gemv_iu4g256(w.buf, x, y, m, k)),
-        K::GemvIu8G256Prerotated => hip!(gpu.gemv_iu8g256(w.buf, x, y, m, k)),
         K::GemvMq4G256V2Prerotated => {
             // qt=52 shares the qt=44 dispatch key: branch on the WEIGHT dtype,
             // never the key. LUT None fails closed (a Lloyd tensor without its
@@ -690,11 +689,10 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         HFQ6G256 | MQ6G256 => Plain(Gpu::gemv_hfq6g256_residual),
         MQ5G256 => Plain(Gpu::gemv_hfq5g256_residual),
         MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
-        // IU body rows consume the rotated activation; qt 59 the natural-basis
+        // IU body rows consume the rotated activation; qt 58 the natural-basis
         // one. All three are fused `y += W·x`.
         IU4G256 => Plain(Gpu::gemv_iu4g256_residual),
-        IU8G256 => Plain(Gpu::gemv_iu8g256_residual),
-        IU8G128 => Plain(Gpu::gemv_iu8g32_residual),
+        IU8G128 => Plain(Gpu::gemv_iu8g128_residual),
         MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
         MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),
         MQ6G256V2 => Plain(Gpu::gemv_mq6g256v2_residual),
@@ -836,7 +834,6 @@ mod residual_coverage_tests {
             E8PI4G128R256,
             E8PI4G128R128,
             IU4G256,
-            IU8G256,
             IU8G128,
             MQ4G256V2P,
             MQ4G128V2P,

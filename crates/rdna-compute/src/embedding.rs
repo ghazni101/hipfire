@@ -117,10 +117,10 @@ impl Gpu {
         })
     }
 
-    /// IU8G128 (qt 59) embedding lookup: dequantize one row on GPU, output
-    /// F32. The table is the compact qt59 row `[K signed codes][K / 128 f16
+    /// IU8G128 (qt 58) embedding lookup: dequantize one row on GPU, output
+    /// F32. The table is the compact qt58 row `[K signed codes][K / 128 f16
     /// scales]`, no FWHT. Same math and launch shape as `embedding_q8`.
-    pub fn embedding_lookup_iu8g32(
+    pub fn embedding_lookup_iu8g128(
         &mut self,
         table: &GpuTensor,
         output: &GpuTensor,
@@ -130,14 +130,14 @@ impl Gpu {
         if dim == 0 || dim % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "embedding_lookup_iu8g32: dim must be a positive multiple of 128",
+                "embedding_lookup_iu8g128: dim must be a positive multiple of 128",
             ));
         }
         self.bind_thread()?;
         self.ensure_kernel(
-            "embedding_iu8g32",
-            kernels::EMBEDDING_IU8G32_SRC,
-            "embedding_iu8g32",
+            "embedding_iu8g128",
+            kernels::EMBEDDING_IU8G128_SRC,
+            "embedding_iu8g128",
         )?;
         let mut tp = table.buf.as_ptr();
         let mut op = output.buf.as_ptr();
@@ -152,7 +152,7 @@ impl Gpu {
         ];
 
         if !self.hip.plan_active() {
-            let func = &self.functions["embedding_iu8g32"];
+            let func = &self.functions["embedding_iu8g128"];
             // SAFETY: params match the kernel signature; null stream as before.
             return unsafe {
                 self.hip
@@ -160,7 +160,7 @@ impl Gpu {
             };
         }
         self.launch_maybe_blob(
-            "embedding_iu8g32",
+            "embedding_iu8g128",
             [1, 1, 1],
             [256, 1, 1],
             0,
@@ -303,9 +303,9 @@ impl Gpu {
         )
     }
 
-    /// Batched IU8G128 (qt 59) embedding lookup; per element identical to
-    /// `embedding_lookup_iu8g32`. `output` shape: `[n × dim]` row-major.
-    pub fn embedding_lookup_iu8g32_batched(
+    /// Batched IU8G128 (qt 58) embedding lookup; per element identical to
+    /// `embedding_lookup_iu8g128`. `output` shape: `[n × dim]` row-major.
+    pub fn embedding_lookup_iu8g128_batched(
         &mut self,
         table: &GpuTensor,
         output: &GpuTensor,
@@ -316,14 +316,14 @@ impl Gpu {
         if dim == 0 || dim % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "embedding_lookup_iu8g32_batched: dim must be a positive multiple of 128",
+                "embedding_lookup_iu8g128_batched: dim must be a positive multiple of 128",
             ));
         }
         self.bind_thread()?;
         self.ensure_kernel(
-            "embedding_iu8g32_batched",
-            kernels::EMBEDDING_IU8G32_BATCHED_SRC,
-            "embedding_iu8g32_batched",
+            "embedding_iu8g128_batched",
+            kernels::EMBEDDING_IU8G128_BATCHED_SRC,
+            "embedding_iu8g128_batched",
         )?;
 
         let mut tp = table.buf.as_ptr();
@@ -339,7 +339,7 @@ impl Gpu {
         ];
 
         self.launch_maybe_blob(
-            "embedding_iu8g32_batched",
+            "embedding_iu8g128_batched",
             [n as u32, 1, 1],
             [256, 1, 1],
             0,

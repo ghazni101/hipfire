@@ -1897,10 +1897,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_IU4_V2C` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_IU4_WIDE_PREFILL` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_IU4_X5` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_IU8G32L` | crates/rdna-compute/src/gemm_iu8g32.rs, crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_IU8G32_M2` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
-| `HIPFIRE_IU8G32_MB4` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
-| `HIPFIRE_IU8G32_W8A8` | crates/rdna-compute/src/gemm_iu8g32.rs | developer |
+| `HIPFIRE_IU8G128L` | crates/rdna-compute/src/gemm_iu8g128.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU8G128_M2` | crates/rdna-compute/src/gemm_iu8g128.rs | developer |
+| `HIPFIRE_IU8G128_MB4` | crates/rdna-compute/src/gemm_iu8g128.rs | developer |
+| `HIPFIRE_IU8G128_W8A8` | crates/rdna-compute/src/gemm_iu8g128.rs | developer |
 | `HIPFIRE_IU8_GEMV` | crates/rdna-compute/src/gemv_iu8.rs | developer |
 | `HIPFIRE_IU8_HEAD_XBATCH` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
 | `HIPFIRE_JINJA_CHAT` | benchmarks/prompts/mtpfloor/generate.py, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | stable |

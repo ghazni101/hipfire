@@ -125,7 +125,7 @@ struct MainQuantState<'a> {
 }
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
-/// Set for `--format iu4` / `iu8`. `None` means the body stays qt=44.
+/// Set for `--format iu4`. `None` means the body stays qt=44.
 /// Unset (tests that encode MQ4V2 without going through the CLI) also stays qt=44.
 static IU_STORAGE: OnceLock<Option<hipfire_runtime::iu_quant::Layout>> = OnceLock::new();
 
@@ -152,7 +152,6 @@ fn stamp_mq4v2_body(
     let m = groups / gpr;
     let quant_type = match layout {
         hipfire_runtime::iu_quant::Layout::Iu4 => QuantType::IU4G256,
-        hipfire_runtime::iu_quant::Layout::Iu8 => QuantType::IU8G256,
     };
     match hipfire_runtime::iu_quant::repack_mq4v2(&bytes, m, k, layout) {
         Ok(packed) => (packed, quant_type, layout.name()),
@@ -168,7 +167,6 @@ fn stamp_mq4v2_body(
 fn iu_product_name(format: &str, tier: crate::model_filter::ProductTier) -> Option<String> {
     let body = match hipfire_runtime::iu_quant::Layout::from_format(format) {
         Some(hipfire_runtime::iu_quant::Layout::Iu4) => "iu4",
-        Some(hipfire_runtime::iu_quant::Layout::Iu8) => "iu8",
         None => return None,
     };
     Some(match tier {
@@ -251,13 +249,13 @@ fn iu_role_stays_on_body(name: &str) -> bool {
     iu_unlifted_role(crate::model_filter::q8_class_of(name), tier)
 }
 
-/// Retag a finished Q8F16 blob when `--format iu4` / `iu8` is latched.
+/// Retag a finished Q8F16 blob when `--format iu4` is latched.
 ///
 /// The grid stays Q8 (signed int8, zero point 0, no FWHT), but the per-32
 /// source scales are folded to **one f16 scale per 128** and the codes are
 /// re-rounded (`d = amax/127` per 128), so the row becomes
 /// `[K signed codes][K/128 f16 scales]` — a contiguous signed operand for
-/// `v_wmma_i32_16x16x16_iu8` (qt 59 `IU8G32`/`IU8G128`). This is not qt 58,
+/// `v_wmma_i32_16x16x16_iu8` (qt 58 `IU8G128`).
 /// which stores MQ4 nibbles `0..=15` in a byte. A row whose K is not a
 /// multiple of 128, or a tensor that is not a single row or a 2-D matrix,
 /// stays interleaved Q8F16.
@@ -271,7 +269,7 @@ fn emit_q8_or_iu8(bytes: Vec<u8>, shape: &[usize]) -> (Vec<u8>, QuantType, u32, 
         _ => return (bytes, QuantType::Q8F16, 32, "Q8_F16"),
     };
     match hipfire_runtime::iu_quant::repack_q8f16(&bytes, m, k) {
-        Ok(packed) => (packed, QuantType::IU8G32, 128, "IU8G128"),
+        Ok(packed) => (packed, QuantType::IU8G128, 128, "IU8G128"),
         Err(error) => {
             eprintln!("error: IU8G128 repack failed: {error}");
             std::process::exit(2);
@@ -335,7 +333,7 @@ fn check_moe_expert_down(
     const FLAG: &str = "--moe-expert-down mq4g128v2-symmetric";
     if hipfire_runtime::iu_quant::Layout::from_format(&args.format).is_some() {
         return Err(format!(
-            "{FLAG} does not apply to --format iu4/iu8; those formats have no G128 operand layout"
+            "{FLAG} does not apply to --format iu4; that format has no G128 operand layout"
         ));
     }
     if route != crate::cli::Route::Main {
@@ -1557,7 +1555,7 @@ pub(crate) fn run() {
         },
         None => None,
     };
-    // A bare iu4 / iu8 file is the normal rung. xt and pro are opt-in.
+    // A bare iu4 file is the normal rung. xt and pro are opt-in.
     // `normal` already parsed as `base` above, so an explicit flag still wins.
     if product_tier.is_none()
         && hipfire_runtime::iu_quant::Layout::from_format(args.format.as_str()).is_some()
@@ -1696,7 +1694,7 @@ pub(crate) fn run() {
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
-    // iu4/iu8 keep the MQ4V2 tensor map for the 4-bit body. The product
+    // iu4 keeps the MQ4V2 tensor map for the 4-bit body. The product
     // rung (bare name = normal) lifts embed, and on base/pro lm_head, and
     // on pro ssm_out, onto IU8G128. An omitted --tier selects the bare name.
     let iu_layout = hipfire_runtime::iu_quant::Layout::from_format(format);
@@ -2413,7 +2411,7 @@ pub(crate) fn run() {
         .expect("IU_STORAGE set twice — should not happen");
     if let Some(layout) = iu_layout {
         eprintln!(
-            "IU storage: {} — MQ4V2 codes in {} operand rows; lifted roles as qt 59 IU8G128",
+            "IU storage: {} — MQ4V2 codes in {} operand rows; lifted roles as qt 58 IU8G128",
             layout.name(),
             layout.name()
         );
@@ -6247,7 +6245,7 @@ fn handle_moe_expert_3d(
         // #599's description states "K-map Promote6 now emits MQ6 for qt44/qt45
         // when K%256==0". That holds on the non-expert path; this arm is where
         // routed experts are decided, and it was never updated.
-        // `--format iu4` / `iu8` also sets use_mq4v2, but those rows must stay
+        // `--format iu4` also sets use_mq4v2, but those rows must stay
         // on the integer operand. `kmap_promote_emits_mq6` drops that term.
         || kmap_promote_emits_mq6(iu_integer_body_latched(), kmap_promote, use_mq4v2)
         || (kmap_promote && use_mq4v2_lloyd && mq6v2_promote_supported(arch_id))
@@ -10230,18 +10228,6 @@ mod pipeline_tests {
             iu_product_name("iu4", ProductTier::Pro).as_deref(),
             Some("iu4 pro")
         );
-        assert_eq!(
-            iu_product_name("iu8", ProductTier::Xt).as_deref(),
-            Some("iu8-xt")
-        );
-        assert_eq!(
-            iu_product_name("iu8", ProductTier::Base).as_deref(),
-            Some("iu8")
-        );
-        assert_eq!(
-            iu_product_name("iu8g256", ProductTier::Pro).as_deref(),
-            Some("iu8 pro")
-        );
         assert_eq!(iu_product_name("mq4", ProductTier::Base), None);
         // The bare name is the normal rung. xt drops the head, pro lifts ssm_out.
         assert!(iu_unlifted_role(Some("lm_head"), ProductTier::Xt));
@@ -10268,10 +10254,6 @@ mod pipeline_tests {
         .unwrap_err();
         assert!(err.contains("HIPFIRE_MOE_EXPERTS_MQ6"), "{err}");
         assert!(err.contains("integer operand"), "{err}");
-        check_iu_integer_body("iu8", &|var| {
-            (var == "HIPFIRE_MOE_DOWN_MQ5").then(|| "0".to_string())
-        })
-        .unwrap();
         check_iu_integer_body("mq4", &|_| Some("1".to_string())).unwrap();
     }
 

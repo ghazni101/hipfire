@@ -312,7 +312,7 @@ pub(crate) fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bo
     matches!(
         dtype,
         rdna_compute::DType::Q8_0
-            | rdna_compute::DType::IU8G32
+            | rdna_compute::DType::IU8G128
             | rdna_compute::DType::HFQ4G256
             | rdna_compute::DType::MQ4G256
             | rdna_compute::DType::MQ4G256V2
@@ -349,11 +349,11 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
         }
-        rdna_compute::DType::IU8G32 => {
-            // qt59 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
+        rdna_compute::DType::IU8G128 => {
+            // qt61 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
             // WMMA residual kernel, so seed the slice the residual adds to.
             gpu.hip.memset(&logits_batch.buf, 0, b * vocab * 4)?;
-            gpu.gemm_iu8g32_residual_wmma(
+            gpu.gemm_iu8g128_residual_wmma(
                 &w_out.buf,
                 final_hidden,
                 &logits_batch,
@@ -7824,9 +7824,9 @@ pub(crate) fn draft_lmhead_batched(
         rdna_compute::DType::Q8_0 => {
             dflash_gemm_q8_lmhead(gpu, w_out, hidden_rows, logits_batch, batch)?;
         }
-        rdna_compute::DType::IU8G32 => {
+        rdna_compute::DType::IU8G128 => {
             gpu.hip.memset(&logits_batch.buf, 0, batch * w_out.m * 4)?;
-            gpu.gemm_iu8g32_residual_wmma(
+            gpu.gemm_iu8g128_residual_wmma(
                 &w_out.buf,
                 hidden_rows,
                 logits_batch,

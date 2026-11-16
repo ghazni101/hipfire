@@ -2,14 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the compact IU8G128 (qt59) batched residual GEMM family.
+//! Numerics gate for the compact IU8G128 (qt58) batched residual GEMM family.
 //!
-//! qt59 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
+//! qt58 is `[K signed i8 codes][K/128 f16 scales]`. The GEMM kernels round the
 //! dequantized weight to f16 and run f16 WMMA; this test checks every
 //! candidate against an independent f64 reference of the same compact row,
-//! and checks determinism. `IU8_REAL=<.iu4p>` sweeps every real qt59 tensor.
+//! and checks determinism. `IU8_REAL=<.iu4p>` sweeps every real qt58 tensor.
 //!
-//!   cargo test -p hipfire-runtime --release --test iu8g32_wmma_gemm_gpu -- --ignored --nocapture
+//!   cargo test -p hipfire-runtime --release --test iu8g128_wmma_gemm_gpu -- --ignored --nocapture
 
 use half::f16;
 use rdna_compute::Gpu;
@@ -78,12 +78,12 @@ fn check(
     let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
     gpu.invalidate_fp16_cache();
     let yi = gpu.upload_f32(&seed, &[n * m]).unwrap();
-    gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &yi, m, k, n)
+    gpu.gemm_iu8g128_residual_wmma(&wi, &xd, &yi, m, k, n)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let b = gpu.download_f32(&yi).unwrap();
     let y2 = gpu.upload_f32(&seed, &[n * m]).unwrap();
-    gpu.gemm_iu8g32_residual_wmma(&wi, &xd, &y2, m, k, n)
+    gpu.gemm_iu8g128_residual_wmma(&wi, &xd, &y2, m, k, n)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let b2 = gpu.download_f32(&y2).unwrap();
@@ -115,7 +115,7 @@ fn check(
 
 #[test]
 #[ignore]
-fn iu8g32_wmma_matches_reference() {
+fn iu8g128_wmma_matches_reference() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
@@ -125,7 +125,7 @@ fn iu8g32_wmma_matches_reference() {
     };
     // Probe with a width the compact row admits: K=32 is refused by design
     // and used to turn this whole gate into a silent SKIP.
-    if !gpu.iu8g32_wmma_eligible(128) {
+    if !gpu.iu8g128_wmma_eligible(128) {
         eprintln!("SKIP — not gfx1100/gfx1151.");
         return;
     }
@@ -148,7 +148,7 @@ fn iu8g32_wmma_matches_reference() {
         let mut seen = std::collections::BTreeSet::new();
         for t in f.tensors().to_vec() {
             let (ti, ib) = f.tensor_data(&t.name).unwrap();
-            if ti.quant_type != 59 || ti.shape.len() < 2 {
+            if ti.quant_type != 58 || ti.shape.len() < 2 {
                 continue;
             }
             let m = ti.shape[0] as usize;
@@ -156,7 +156,7 @@ fn iu8g32_wmma_matches_reference() {
             if !seen.insert((k, m)) {
                 continue;
             }
-            assert_eq!(ib.len(), m * (k + k / 64), "{}: bad qt59 row size", t.name);
+            assert_eq!(ib.len(), m * (k + k / 64), "{}: bad qt58 row size", t.name);
             for &n in &[1usize, 77] {
                 check(
                     &mut gpu,
@@ -171,7 +171,7 @@ fn iu8g32_wmma_matches_reference() {
             }
         }
     }
-    eprintln!("iu8g32 wmma: {cases} cases, worst rel vs f64 = {worst:.3e}");
+    eprintln!("iu8g128 wmma: {cases} cases, worst rel vs f64 = {worst:.3e}");
 }
 
 fn w8a8_weights(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
@@ -209,7 +209,7 @@ fn w8a8_lds_min_matches_reference_and_times() {
     let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
     let xq = gpu.ensure_int8_mmq_linear_x(&xd, n, k).unwrap();
     let yd = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
-    gpu.gemm_iu8g32_w8a8_min(&wd, xq, &yd, m, k, n, false)
+    gpu.gemm_iu8g128_w8a8_min(&wd, xq, &yd, m, k, n, false)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let got = gpu.download_f32(&yd).unwrap();
@@ -257,11 +257,11 @@ fn w8a8_lds_min_matches_reference_and_times() {
     eprintln!("w8a8 min: m={m} k={k} n={n} worst rel={rel:.3e}");
     assert!(rel < 1e-5, "w8a8 min rel {rel:.3e}");
 
-    // The residual epilogue (`add = true`) is the role both qt59 prefill
+    // The residual epilogue (`add = true`) is the role both qt58 prefill
     // bodies use; it must equal seed + the set result exactly.
     let seed: Vec<f32> = (0..n * m).map(|i| 0.11 * (i % 13) as f32 - 0.7).collect();
     let y_add = gpu.upload_f32(&seed, &[n * m]).unwrap();
-    gpu.gemm_iu8g32_w8a8_min(&wd, xq, &y_add, m, k, n, true)
+    gpu.gemm_iu8g128_w8a8_min(&wd, xq, &y_add, m, k, n, true)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let add = gpu.download_f32(&y_add).unwrap();
@@ -282,13 +282,13 @@ fn w8a8_lds_min_matches_reference_and_times() {
     let txq = gpu.ensure_int8_mmq_linear_x(&txd, tn, tk).unwrap();
     let ty = gpu.upload_f32(&vec![0.0f32; tn * tm], &[tn * tm]).unwrap();
     for _ in 0..2 {
-        gpu.gemm_iu8g32_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
+        gpu.gemm_iu8g128_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
             .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let t0 = Instant::now();
     for _ in 0..8 {
-        gpu.gemm_iu8g32_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
+        gpu.gemm_iu8g128_w8a8_min(&twd, txq, &ty, tm, tk, tn, false)
             .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
@@ -313,7 +313,7 @@ fn w8a8_lds_min_ragged_shapes() {
             return;
         }
     };
-    if !gpu.iu8g32_w8a8_eligible(256) {
+    if !gpu.iu8g128_w8a8_eligible(256) {
         eprintln!("SKIP — no IU8 W8A8 GEMM on {}.", gpu.arch);
         return;
     }
@@ -337,9 +337,9 @@ fn w8a8_lds_min_ragged_shapes() {
             let seed: Vec<f32> = (0..n * m).map(|i| 0.13 * (i % 7) as f32 - 0.4).collect();
             let ys = gpu.upload_f32(&vec![f32::NAN; n * m], &[n * m]).unwrap();
             let ya = gpu.upload_f32(&seed, &[n * m]).unwrap();
-            gpu.gemm_iu8g32_w8a8_min(&wd, xq, &ys, m, k, n, false)
+            gpu.gemm_iu8g128_w8a8_min(&wd, xq, &ys, m, k, n, false)
                 .unwrap();
-            gpu.gemm_iu8g32_w8a8_min(&wd, xq, &ya, m, k, n, true)
+            gpu.gemm_iu8g128_w8a8_min(&wd, xq, &ya, m, k, n, true)
                 .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let xqb = gpu.download_raw_bytes(&xt).unwrap();
@@ -393,16 +393,16 @@ fn w8a8_lds_min_ragged_shapes() {
     eprintln!("w8a8 ragged: worst rel vs f64 = {worst:.3e}");
 }
 
-/// Crossover timing for [`Gpu::iu8g32_gemm_route`]: the W8A8 route
+/// Crossover timing for [`Gpu::iu8g128_gemm_route`]: the W8A8 route
 /// (activation int8 quant + IU8 WMMA) against the f16 twin (activation f16
-/// convert + f16 WMMA), both as `Y += W X` on real 27B qt59 shapes, each
+/// convert + f16 WMMA), both as `Y += W X` on real 27B qt58 shapes, each
 /// activation conversion charged per call as it is in a layer loop.
 ///
-///   cargo test -p hipfire-runtime --release --test iu8g32_wmma_gemm_gpu \
-///     iu8g32_route_crossover -- --ignored --nocapture
+///   cargo test -p hipfire-runtime --release --test iu8g128_wmma_gemm_gpu \
+///     iu8g128_route_crossover -- --ignored --nocapture
 #[test]
 #[ignore]
-fn iu8g32_route_crossover() {
+fn iu8g128_route_crossover() {
     use std::time::Instant;
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
@@ -411,7 +411,7 @@ fn iu8g32_route_crossover() {
             return;
         }
     };
-    if !gpu.iu8g32_w8a8_eligible(256) {
+    if !gpu.iu8g128_w8a8_eligible(256) {
         eprintln!("SKIP — no IU8 W8A8 GEMM on {}.", gpu.arch);
         return;
     }
@@ -427,11 +427,11 @@ fn iu8g32_route_crossover() {
                 let mut run = |gpu: &mut Gpu| {
                     if w8a8 {
                         let xq = gpu.ensure_int8_mmq_linear_x(&xd, n, k).unwrap();
-                        gpu.gemm_iu8g32_w8a8_min(&wd, xq, &y, m, k, n, true)
+                        gpu.gemm_iu8g128_w8a8_min(&wd, xq, &y, m, k, n, true)
                             .unwrap();
                     } else {
                         gpu.invalidate_fp16_cache();
-                        gpu.gemm_iu8g32_residual_wmma(&wd, &xd, &y, m, k, n)
+                        gpu.gemm_iu8g128_residual_wmma(&wd, &xd, &y, m, k, n)
                             .unwrap();
                     }
                 };

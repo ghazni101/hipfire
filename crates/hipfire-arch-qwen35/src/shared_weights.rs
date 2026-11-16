@@ -196,7 +196,7 @@ dtype_table! {
     // Qwen4 HC8 sidecar weight (qt 57; exact gfx1201, never in a shared qwen35 weight file; additive tag).
     HC8E4M3Row = 67,
     // IU integer operand layouts (feature branch; distinct from the GGUF/planar tags).
-    IU4G256 = 68, IU8G256 = 69, IU8G128 = 70,
+    IU4G256 = 68, IU8G128 = 69,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {

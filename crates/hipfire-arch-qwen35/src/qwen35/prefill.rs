@@ -327,8 +327,8 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
         })
 }
 
-/// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G32 projection
-/// family (qt 57 + qt 59 wo) to the widened ordinary-prefill chunks. The
+/// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G128 projection
+/// family (qt 60 + qt 61 wo) to the widened ordinary-prefill chunks. The
 /// widened route keeps its 512-row commit seams and runs the same per-layer
 /// kernels on larger n; it is opt-in until its prefill output is pinned
 /// against the legacy 512-row cadence on real IU4 artifacts.
@@ -344,10 +344,10 @@ fn iu4_wide_prefill_requested() -> bool {
     *V
 }
 
-/// Every dense projection of an IU4-family artifact: qt 57 (IU4G256)
-/// projections with the qt 59 (IU8G32) out projection, no MoE layers.
+/// Every dense projection of an IU4-family artifact: qt 60 (IU4G256)
+/// projections with the qt 61 (IU8G128) out projection, no MoE layers.
 fn dense_layers_have_iu4_family(weights: &Qwen35Weights) -> bool {
-    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G32);
+    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G128);
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => [
@@ -4705,12 +4705,12 @@ pub fn qwen35_layer_batch_admissible(
                 ("w_up", l.w_up.gpu_dtype),
                 ("w_down", l.w_down.gpu_dtype),
             ] {
-                // qt59 IU8G32 is admitted only as the DeltaNet `wo` (natural
-                // basis input) via `gemm_iu8g32_residual_wmma` on gfx11.
-                let iu8g32_wo = name == "wo"
-                    && dt == DType::IU8G32
-                    && rdna_compute::iu8g32_gemm_admits(arch, l.wo.k);
-                if !iu8g32_wo && !is_batchable_la(dt, arch) {
+                // qt61 IU8G128 is admitted only as the DeltaNet `wo` (natural
+                // basis input) via `gemm_iu8g128_residual_wmma` on gfx11.
+                let iu8g128_wo = name == "wo"
+                    && dt == DType::IU8G128
+                    && rdna_compute::iu8g128_gemm_admits(arch, l.wo.k);
+                if !iu8g128_wo && !is_batchable_la(dt, arch) {
                     return Err(HipError::new(
                         0,
                         &format!("DeltaNet {name} dtype {dt:?} not batchable on {arch}"),
@@ -5985,7 +5985,7 @@ pub(crate) fn batch_chunk_embed_tokens(
             weights.embd_format,
             EmbeddingFormat::HFQ4G256
                 | EmbeddingFormat::Q8_0
-                | EmbeddingFormat::IU8G32
+                | EmbeddingFormat::IU8G128
                 | EmbeddingFormat::Ggml(_)
         )
     {
@@ -8513,7 +8513,6 @@ mod tests {
         for arch in ["gfx1201", "gfx1030", "gfx1010", "gfx906"] {
             assert!(!is_batchable_la(DType::IU4G256, arch), "IU4 on {arch}");
         }
-        assert!(!is_batchable_la(DType::IU8G256, "gfx1100"));
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1200"));
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
         // gfx1100/gfx1151 true (the two parity-proven parts)

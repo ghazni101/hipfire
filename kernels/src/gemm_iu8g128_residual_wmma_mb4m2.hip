@@ -5,9 +5,9 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// IU8G32 (qt59) WMMA residual GEMM: 32 rows x 64 tokens per wave.
+// IU8G128 (qt58) WMMA residual GEMM: 32 rows x 64 tokens per wave.
 //
-// Extends gemm_iu8g32_residual_wmma_mb4 with a second 16-row M tile per
+// Extends gemm_iu8g128_residual_wmma_mb4 with a second 16-row M tile per
 // wave. Both tiles consume the same four 16-token X fragments, so a fixed
 // M tile no longer re-reads X once per 16 output rows. Weight dequantization
 // and X traffic are both amortized over 32 rows and 64 tokens.
@@ -15,14 +15,14 @@
 // Grid: [ceil(M/32), ceil(N/64)]. Block: [32] (wave32). LDS: 0 B.
 // Every Y cell is written by exactly one lane in one block, so the `+=`
 // residual invariant of the base kernel is preserved. Per-output-row
-// arithmetic is identical to gemm_iu8g32_residual_wmma (same K order, same
+// arithmetic is identical to gemm_iu8g128_residual_wmma (same K order, same
 // f16 WMMA operands), hence bit-identical results.
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_iu8g32_residual_wmma_mb4m2(
+extern "C" __global__ void gemm_iu8g128_residual_wmma_mb4m2(
     const char* __restrict__ A_q8,
     const _Float16* __restrict__ X,      // [N, K] FP16
     float* __restrict__ Y,               // [N, M] FP32 - caller seeds residual

@@ -151,17 +151,17 @@ sits outside the ladder and the § 1 budget governs each step.
 
 ### IU products
 
-`iu4` and `iu8` are not `mq4` files. The body is the same MQ4V2 grid, stored
+`iu4` is not an `mq4` file. The body is the same MQ4V2 grid, stored
 as an integer-matrix operand (qt 57 or qt 58), so the product name has to say
 so. The three rungs are the same roles: the bare name lifts embeddings and
 `lm_head`, `-xt` leaves `lm_head` on the body, ` pro` also lifts `ssm_out`.
-What a rung lifts *to* is IU8G32 (qt 59), the Q8 grid with one f16 scale per
+What a rung lifts *to* is IU8G128 (qt 58), the Q8 grid with one f16 scale per
 128 at the row tail, not a new numeric grid. `conv1d` is a 3-D tensor, so it
-stays interleaved Q8F16 (qt 3) at every rung rather than IU8G32. Norms
+stays interleaved Q8F16 (qt 3) at every rung rather than IU8G128. Norms
 stay F16. Lifting attention is still not a rung.
 
-Codec bpw is 4.25 for an IU4 body row and 8.25 for an IU8 body row. Model bpw
-for these six names has not been measured. `iu8` is an 8-bit-class file
+Codec bpw is 4.25 for an IU4 body row. Model bpw
+for these names has not been measured. An `iu4` file
 because the body stores each 4-bit code in a byte; it is not a uniform Q8
 product, which is why it still has rungs. `--tier normal` is the bare name.
 The metadata token remains `base`.

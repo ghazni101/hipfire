@@ -105,12 +105,12 @@ pub fn supports_iu4g256_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")
 }
 
-/// qt59 (IU8G128) batched GEMM admission: both the f16-WMMA residual twin
-/// (`gemm_iu8g32_residual_wmma*`) and the IU8-WMMA W8A8 GEMM
-/// (`gemm_iu8g32_w8a8_min`). Both use gfx11 `_w32` builtins and are validated
-/// on exact gfx1100 and gfx1151 only. qt59 decode GEMV and the embedding
+/// qt58 (IU8G128) batched GEMM admission: both the f16-WMMA residual twin
+/// (`gemm_iu8g128_residual_wmma*`) and the IU8-WMMA W8A8 GEMM
+/// (`gemm_iu8g128_w8a8_min`). Both use gfx11 `_w32` builtins and are validated
+/// on exact gfx1100 and gfx1151 only. qt58 decode GEMV and the embedding
 /// gather are arch-free and do not read this.
-pub fn supports_iu8g32_gemm(arch: &str) -> bool {
+pub fn supports_iu8g128_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")
 }
 
@@ -920,14 +920,14 @@ mod tests {
     fn iu_gemm_admission_is_exact_gfx1100_and_gfx1151() {
         for arch in &["gfx1100", "gfx1151"] {
             assert!(supports_iu4g256_gemm(arch), "{arch}");
-            assert!(supports_iu8g32_gemm(arch), "{arch}");
+            assert!(supports_iu8g128_gemm(arch), "{arch}");
         }
         for arch in &[
             "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1152", "gfx1200", "gfx1201", "gfx1030",
             "gfx1010", "gfx906", "gfx942", "",
         ] {
             assert!(!supports_iu4g256_gemm(arch), "{arch:?}");
-            assert!(!supports_iu8g32_gemm(arch), "{arch:?}");
+            assert!(!supports_iu8g128_gemm(arch), "{arch:?}");
         }
     }
 

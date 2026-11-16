@@ -2,16 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// IU8G32 (qt 59) embedding lookup: dequantize one row on GPU, output F32.
+// IU8G128 (qt 58) embedding lookup: dequantize one row on GPU, output F32.
 //
-// This is the Q8 grid in the planar layout the iu4/iu8 products lift their
+// This is the Q8 grid in the planar layout the iu4 products lift their
 // embeddings onto: `[K signed codes][K / 128 f16 scales]`, no FWHT. The
 // dequantized value is `w = f32(scale) * f32(i8(code))`, identical to
 // `embedding_q8` on the interleaved Q8_0 block.
 
 #include <hip/hip_runtime.h>
 
-extern "C" __global__ void embedding_iu8g32(
+extern "C" __global__ void embedding_iu8g128(
     const unsigned char* __restrict__ table,
     float* __restrict__ output,
     int token_id, int dim

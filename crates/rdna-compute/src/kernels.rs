@@ -2827,10 +2827,10 @@ pub const GEMV_IU4G256_XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
 );
 
-/// IU8G128 (qt 59) decode GEMV: the Q8 grid with the scales at the row tail.
-/// `gemv_iu8g32` (SET) and `gemv_iu8g32_residual` (fused `y += W·x`).
-/// See `kernels/src/gemv_iu8g32.hip`.
-pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32.hip");
+/// IU8G128 (qt 58) decode GEMV: the Q8 grid with the scales at the row tail.
+/// `gemv_iu8g128` (SET) and `gemv_iu8g128_residual` (fused `y += W·x`).
+/// See `kernels/src/gemv_iu8g128.hip`.
+pub const GEMV_IU8G128_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g128.hip");
 
 /// Paged-pool GQA-shared Q8_0 decode tile (gfx1100 H24/KV4/D256, tile 128).
 /// Compiled only through `kv_slot_desc_vmm_paged_source`; one 256-thread
@@ -2839,16 +2839,11 @@ pub const GEMV_IU8G32_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g32
 pub const ATTENTION_FLASH_Q8_0_TILE_GQA_PAGED_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa_paged.gfx1100.hip");
 
-/// IU8G256 (qt 58) decode GEMV: the MQ4V2 grid with one byte per code.
-/// `gemv_iu8g256` (SET) and `gemv_iu8g256_residual` (fused `y += W·x`).
-/// See `kernels/src/gemv_iu8g256.hip`.
-pub const GEMV_IU8G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g256.hip");
-
-/// IU8G128 (qt 59) embedding lookup: one row dequantized to F32 from the
-/// planar Q8 grid. See `kernels/src/embedding_iu8g32.hip`.
-pub const EMBEDDING_IU8G32_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g32.hip");
-pub const EMBEDDING_IU8G32_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/embedding_iu8g32_batched.hip");
+/// IU8G128 (qt 58) embedding lookup: one row dequantized to F32 from the
+/// planar Q8 grid. See `kernels/src/embedding_iu8g128.hip`.
+pub const EMBEDDING_IU8G128_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g128.hip");
+pub const EMBEDDING_IU8G128_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_iu8g128_batched.hip");
 
 pub const GEMV_MQ4G256V2_Q8X_QUANT_SRC: &str = concat!(
     "#define Q8X_QUANT 1\n",
@@ -8399,29 +8394,29 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
-/// IU8G128 (qt59) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G32L`
+/// IU8G128 (qt58) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G128L`
 /// swaps only the row addressing ([K codes][K/32 f16 scales]); the f16 WMMA
-/// arithmetic is the Q8_0 kernel's, so a qt59 relayout of a Q8_0 tensor gives
+/// arithmetic is the Q8_0 kernel's, so a qt58 relayout of a Q8_0 tensor gives
 /// bit-identical Y. Entry renamed so the function cache cannot alias.
-pub const GEMM_IU8G32_RESIDUAL_WMMA_SRC: &str = concat!(
-    "#define HIPFIRE_IU8G32L 1\n",
-    "#define gemm_q8_0_residual_wmma gemm_iu8g32_residual_wmma\n",
+pub const GEMM_IU8G128_RESIDUAL_WMMA_SRC: &str = concat!(
+    "#define HIPFIRE_IU8G128L 1\n",
+    "#define gemm_q8_0_residual_wmma gemm_iu8g128_residual_wmma\n",
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip")
 );
 /// Four-batch-tile (16x64 wave output) IU8G128 residual GEMM: one weight
 /// dequantization and read per 64 tokens instead of per 16. Same f16 WMMA
-/// arithmetic and output mapping as [`GEMM_IU8G32_RESIDUAL_WMMA_SRC`].
-pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC: &str =
-    include_str!("../../../kernels/src/gemm_iu8g32_residual_wmma_mb4.hip");
-/// 32-row x 64-token wave: [`GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC`] with a
+/// arithmetic and output mapping as [`GEMM_IU8G128_RESIDUAL_WMMA_SRC`].
+pub const GEMM_IU8G128_RESIDUAL_WMMA_MB4_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu8g128_residual_wmma_mb4.hip");
+/// 32-row x 64-token wave: [`GEMM_IU8G128_RESIDUAL_WMMA_MB4_SRC`] with a
 /// second 16-row M tile sharing the same X fragments.
-pub const GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_iu8g32_residual_wmma_mb4m2.hip");
+pub const GEMM_IU8G128_RESIDUAL_WMMA_MB4M2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_iu8g128_residual_wmma_mb4m2.hip");
 /// Minimal LDS-tiled W8A8 GEMM for the planar int8-per-128 weight format.
-pub const GEMM_IU8G32_W8A8_MIN_SRC: &str = concat!(
+pub const GEMM_IU8G128_W8A8_MIN_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
-    include_str!("../../../kernels/src/gemm_iu8g32_w8a8_min.hip")
+    include_str!("../../../kernels/src/gemm_iu8g128_w8a8_min.hip")
 );
 
 // gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses

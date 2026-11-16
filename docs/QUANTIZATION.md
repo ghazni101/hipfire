@@ -35,8 +35,7 @@ Production defaults for day-to-day use:
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
 | `iu4` | `IU4G256` (qt 57) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4`/`dot8` opt-in on gfx11/gfx12); prefill is the W4A4 WMMA GEMM on gfx1100/gfx1151 only |
-| `iu8` | `IU8G256` (qt 58) | 4 | 8.25 | 264 (K bytes of codes 0..=15, then the same scales) | Same codes, pre-expanded for the IU8 unit. Not an 8-bit grid. Decode GEMV + residual (`gemv_iu8g256`) run on every arch; prefill GEMM does not |
-| `iu4` / `iu8` lifted roles | `IU8G32` (qt 59) | 8 | 8.125 | K + 2 B per 128 (260 B at K=256) | Q8 grid, one scale per 128 at the row tail. Embeddings every rung; lm_head on `iu4`/`iu8` and `pro`; ssm_out on `pro`. Decode GEMV family, the embedding gather and the W8A8 / f16-WMMA prefill GEMM selector have kernels; that selector runs on gfx1100/gfx1151 only |
+| `iu4` lifted roles | `IU8G128` (qt 58) | 8 | 8.125 | K + 2 B per 128 (260 B at K=256) | Q8 grid, one scale per 128 at the row tail. Embeddings every rung; lm_head on `iu4` and `pro`; ssm_out on `pro`. Decode GEMV family, the embedding gather and the W8A8 / f16-WMMA prefill GEMM selector have kernels; that selector runs on gfx1100/gfx1151 only |
 
 **Nominal bitwidth is not bpw.** The “bits” column is the payload width only.
 Stored bpw is the exact group arithmetic and includes the per-group header:
@@ -47,8 +46,8 @@ role lifts sit above the base width; see [ladder.md](quant-formats/ladder.md)), 
 none of these figures is a performance or quality claim.
 
 Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
-(Q4-grade embedding error compounds). On `iu4` / `iu8` that same grid is
-stored as `IU8G32` (qt 59) for the roles the rung lifts: the signed codes
+(Q4-grade embedding error compounds). On `iu4` that same grid is
+stored as `IU8G128` (qt 58) for the roles the rung lifts: the signed codes
 are contiguous and one f16 scale per 128 sits at the end of the row, which
 is the operand `v_wmma_i32_16x16x16_iu8` loads in the W8A8 GEMM (gfx1100/gfx1151
 only). The bare product lifts embeddings

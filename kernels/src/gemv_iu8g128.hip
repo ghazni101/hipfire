@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Decode GEMV for IU8G32 (qt 59), the lifted-role tier of an iu4/iu8 file.
+// Decode GEMV for IU8G128 (qt 58), the lifted-role tier of an iu4 file.
 //
 // The grid is Q8F16's (signed int8 codes, no FWHT), but the compact row
 // carries ONE f16 scale per 128 at the tail so the code plane is one
@@ -14,9 +14,9 @@
 // folds element `t` of every 32-block and the warp reduces by shuffle, so
 // this kernel is bit-identical to `gemv_q8_0` on the same grid (the only
 // difference is where the scale is read from). `x` is the natural-basis
-// activation; qt 59 is not FWHT-rotated.
+// activation; qt 58 is not FWHT-rotated.
 //
-// `gemv_iu8g32_residual` is the fused `y += W·x` twin used by the DeltaNet
+// `gemv_iu8g128_residual` is the fused `y += W·x` twin used by the DeltaNet
 // out_proj (ssm_out) decode step.
 //
 // Contract: `hipfire_runtime::iu_quant::dequant_q8` (the dot of the
@@ -24,7 +24,7 @@
 
 #include <hip/hip_runtime.h>
 
-__device__ __forceinline__ float iu8g32_row_dot(
+__device__ __forceinline__ float iu8g128_row_dot(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     int K) {
@@ -40,7 +40,7 @@ __device__ __forceinline__ float iu8g32_row_dot(
     return sum;
 }
 
-extern "C" __global__ void gemv_iu8g32(
+extern "C" __global__ void gemv_iu8g128(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -52,14 +52,14 @@ extern "C" __global__ void gemv_iu8g32(
 
     const int blocks = K >> 5;
     const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
-    float sum = iu8g32_row_dot(A + (long long)row * row_bytes, x, K);
+    float sum = iu8g128_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
     if (t == 0) y[row] = sum;
 }
 
-extern "C" __global__ void gemv_iu8g32_residual(
+extern "C" __global__ void gemv_iu8g128_residual(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -71,7 +71,7 @@ extern "C" __global__ void gemv_iu8g32_residual(
 
     const int blocks = K >> 5;
     const long long row_bytes = (long long)K + (long long)((blocks >> 2) << 1);
-    float sum = iu8g32_row_dot(A + (long long)row * row_bytes, x, K);
+    float sum = iu8g128_row_dot(A + (long long)row * row_bytes, x, K);
 
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
@@ -101,7 +101,7 @@ __device__ __forceinline__ float iu8_dot16(uint4 w, float4 a, float4 b, float4 c
 }
 
 template <int R, bool ADD>
-__device__ __forceinline__ void iu8g32_v2_body(
+__device__ __forceinline__ void iu8g128_v2_body(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -148,20 +148,20 @@ __device__ __forceinline__ void iu8g32_v2_body(
     }
 }
 
-#define IU8G32_V2(R)                                                                 \
-    extern "C" __global__ __launch_bounds__(128) void gemv_iu8g32_v2_r##R(           \
+#define IU8G128_V2(R)                                                                 \
+    extern "C" __global__ __launch_bounds__(128) void gemv_iu8g128_v2_r##R(           \
         const unsigned char* __restrict__ A, const float* __restrict__ x,            \
         float* __restrict__ y, int M, int K) {                                       \
-        iu8g32_v2_body<R, false>(A, x, y, M, K);                                     \
+        iu8g128_v2_body<R, false>(A, x, y, M, K);                                     \
     }                                                                                \
-    extern "C" __global__ __launch_bounds__(128) void gemv_iu8g32_v2_residual_r##R(  \
+    extern "C" __global__ __launch_bounds__(128) void gemv_iu8g128_v2_residual_r##R(  \
         const unsigned char* __restrict__ A, const float* __restrict__ x,            \
         float* __restrict__ y, int M, int K) {                                       \
-        iu8g32_v2_body<R, true>(A, x, y, M, K);                                      \
+        iu8g128_v2_body<R, true>(A, x, y, M, K);                                      \
     }
-IU8G32_V2(1)
-IU8G32_V2(2)
-IU8G32_V2(4)
+IU8G128_V2(1)
+IU8G128_V2(2)
+IU8G128_V2(4)
 
 // ---------------------------------------------------------------------------
 // xbatch (multi-slot decode): one weight row is decoded/read once and dotted
@@ -173,11 +173,11 @@ IU8G32_V2(4)
 //   x:       one column chunk read once for all R rows
 //
 // Column b's accumulation keeps v2's chunk order and 16-term fold
-// (`iu8_dot16`), so it matches `gemv_iu8g32` (`_v2_r*`) on that column to f32
+// (`iu8_dot16`), so it matches `gemv_iu8g128` (`_v2_r*`) on that column to f32
 // rounding (different module → contraction may differ); determinism is exact.
 // Grid: ceil(ceil(M/R) / waves_per_block) blocks of 128 threads (4 waves).
 template <int R, int BMAX>
-__device__ __forceinline__ void iu8g32_xbatch_body(
+__device__ __forceinline__ void iu8g128_xbatch_body(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,   // [B x K]
     float* __restrict__ y,         // [B x M]
@@ -244,8 +244,8 @@ __device__ __forceinline__ void iu8g32_xbatch_body(
 }
 
 // Multi-slot lm_head: 4 output rows per wave, up to 4 activation columns.
-extern "C" __global__ __launch_bounds__(128) void gemv_iu8g32_xbatch(
+extern "C" __global__ __launch_bounds__(128) void gemv_iu8g128_xbatch(
     const unsigned char* __restrict__ A, const float* __restrict__ x,
     float* __restrict__ y, int M, int K, int B) {
-    iu8g32_xbatch_body<4, 4>(A, x, y, M, K, B);
+    iu8g128_xbatch_body<4, 4>(A, x, y, M, K, B);
 }

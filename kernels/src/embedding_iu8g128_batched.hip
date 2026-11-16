@@ -2,14 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Batched IU8G32 (qt 59) embedding lookup: N rows of the compact table
+// Batched IU8G128 (qt 58) embedding lookup: N rows of the compact table
 // `[K signed codes][K / 128 f16 scales]` into `output[n, dim]` F32, token
 // ids from a device buffer (hipGraph-captureable). Per element identical to
-// `embedding_iu8g32` and to `embedding_q8_batched` on the Q8_0 twin.
+// `embedding_iu8g128` and to `embedding_q8_batched` on the Q8_0 twin.
 
 #include <hip/hip_runtime.h>
 
-extern "C" __global__ void embedding_iu8g32_batched(
+extern "C" __global__ void embedding_iu8g128_batched(
     const unsigned char* __restrict__ table,
     float* __restrict__ output,
     const int* __restrict__ token_ids,

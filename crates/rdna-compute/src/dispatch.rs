@@ -866,19 +866,13 @@ pub enum DType {
     /// gfx1100/gfx1151); the generic GEMV/GEMM families still refuse it. See
     /// `hipfire_runtime::iu_quant`.
     IU4G256,
-    /// IU8-G256 (qt=58): the same codes, one byte `0..=15` per weight
-    /// (`K` code bytes, then the same scale plane). 8.25 bpw. The byte is the
-    /// IU8 WMMA operand, not a new 8-bit grid. Decode GEMV only
-    /// (`gemv_iu8g256*`); no prefill GEMM.
-    IU8G256,
-    /// IU8-G128 (qt=59): the Q8 grid (signed int8, zero point 0, no FWHT)
+    /// IU8-G128 (qt=58): the Q8 grid (signed int8, zero point 0, no FWHT)
     /// with **one f16 scale per 128** stored as a compact row: `K` signed code
     /// bytes, then `K/128` little-endian f16 scales (`K + K/64` bytes, 8.125
     /// bpw). `K % 128 == 0`. This is the signed operand of
-    /// `v_wmma_i32_16x16x16_iu8`. Not qt=58: those bytes are MQ4 nibbles in a
-    /// byte. Readers: `gemv_iu8g32`, `embedding_iu8g32`, and the
-    /// `gemm_iu8g32_residual_wmma` / `gemm_iu8g32_w8a8_min` family. See
-    /// `hipfire_runtime::iu_quant::repack_q8f16`.
+    /// `v_wmma_i32_16x16x16_iu8`. Readers: `gemv_iu8g128`, `embedding_iu8g128`,
+    /// and the `gemm_iu8g128_residual_wmma` / `gemm_iu8g128_w8a8_min` family.
+    /// See `hipfire_runtime::iu_quant::repack_q8f16`.
     IU8G128,
     /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
     /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
@@ -1126,7 +1120,6 @@ impl DType {
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128
             | DType::IU4G256
-            | DType::IU8G256
             | DType::IU8G128
             | DType::MQ4G256V2P
             | DType::MQ4G128V2P
@@ -1198,7 +1191,7 @@ impl DType {
             // IU rows are codes then scales. K must be a multiple of 256;
             // a partial group is not a legal row, so it is not rounded up.
             // Keep this arithmetic identical to `hipfire_runtime::iu_quant::row_bytes`.
-            DType::IU4G256 | DType::IU8G256 => {
+            DType::IU4G256 => {
                 if k % 256 != 0 {
                     None
                 } else {
@@ -1206,7 +1199,7 @@ impl DType {
                     Some(codes + (k / 128) * 4)
                 }
             }
-            // qt=59. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
+            // qt=58. Keep this arithmetic identical to `iu_quant::q8_row_bytes`.
             DType::IU8G128 => {
                 if k % 128 != 0 {
                     None
@@ -1254,7 +1247,6 @@ impl DType {
     pub fn iu_quant_name(self) -> Option<&'static str> {
         match self {
             DType::IU4G256 => Some("IU4G256"),
-            DType::IU8G256 => Some("IU8G256"),
             DType::IU8G128 => Some("IU8G128"),
             _ => None,
         }
@@ -1369,7 +1361,7 @@ impl DType {
                 // IU4/IU8 are repacked MQ4V2 bodies, so they carry the same
                 // AWQ sidecar. Dropping it here would silently compute (W·s)·x.
                 | DType::IU4G256
-                | DType::IU8G256
+
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -1407,7 +1399,6 @@ impl DType {
                 | DType::MQ3G256V2
                 | DType::MQ2G256V2
                 | DType::IU4G256
-                | DType::IU8G256
                 | DType::GgmlQ4K
                 | DType::GgmlQ5K
                 | DType::GgmlQ6K
@@ -11867,20 +11858,15 @@ mod tests {
     #[test]
     fn iu_dtypes_are_row_addressed_and_named() {
         assert_eq!(DType::IU4G256.row_bytes(256), Some(136));
-        assert_eq!(DType::IU8G256.row_bytes(256), Some(264));
         assert_eq!(DType::IU4G256.row_bytes(512), Some(272));
         assert_eq!(DType::IU4G256.row_bytes(128), None);
-        assert_eq!(DType::IU8G256.row_bytes(0), None);
         assert!(DType::IU4G256.requires_k_mod_256());
-        assert!(DType::IU8G256.requires_k_mod_256());
         assert!(DType::IU4G256.supports_awq_sidecar());
-        assert!(DType::IU8G256.supports_awq_sidecar());
         assert_eq!(DType::IU4G256.iu_quant_name(), Some("IU4G256"));
-        assert_eq!(DType::IU8G256.iu_quant_name(), Some("IU8G256"));
         assert!(DType::IU4G256.is_iu_quant());
         assert!(!DType::MQ4G256V2.is_iu_quant());
         assert!(!DType::IU4G256.is_mq_i4());
-        // qt=59 is the compact Q8 grid, one scale per 128, not K%256.
+        // qt=58 is the compact Q8 grid, one scale per 128, not K%256.
         assert_eq!(DType::IU8G128.row_bytes(128), Some(130));
         assert_eq!(DType::IU8G128.row_bytes(256), Some(260));
         assert_eq!(DType::IU8G128.row_bytes(32), None);

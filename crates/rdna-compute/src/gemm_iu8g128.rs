@@ -2,71 +2,71 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Batched (prefill) GEMMs for [`crate::DType::IU8G128`] (qt59) on gfx11.
+//! Batched (prefill) GEMMs for [`crate::DType::IU8G128`] (qt58) on gfx11.
 //!
 //! Two kernels compute `Y[N, M] += W X` for the compact `[K i8][K/128 f16]`
-//! row. `X` is `[N, K]` f32 in the natural basis (qt59 is not rotated).
+//! row. `X` is `[N, K]` f32 in the natural basis (qt58 is not rotated).
 //!
-//! - **f16 twin** (`gemm_iu8g32_residual_wmma` + mb4/mb4m2): the Q8_0
-//!   f16-WMMA residual kernel built with `HIPFIRE_IU8G32L` (tail-scale row
+//! - **f16 twin** (`gemm_iu8g128_residual_wmma` + mb4/mb4m2): the Q8_0
+//!   f16-WMMA residual kernel built with `HIPFIRE_IU8G128L` (tail-scale row
 //!   addressing); `X` is converted to f16. Needs `K % 128 == 0`.
-//! - **W8A8** (`gemm_iu8g32_w8a8_min`): a 128x128 LDS tile on
+//! - **W8A8** (`gemm_iu8g128_w8a8_min`): a 128x128 LDS tile on
 //!   `v_wmma_i32_16x16x16_iu8`; `X` is quantized to int8 per 128. Needs
 //!   `K % 256 == 0`.
 //!
-//! [`Gpu::iu8g32_gemm_route`] is the one selector between them and
-//! [`Gpu::gemm_iu8g32_residual`] the one entry point, so the singleton
+//! [`Gpu::iu8g128_gemm_route`] is the one selector between them and
+//! [`Gpu::gemm_iu8g128_residual`] the one entry point, so the singleton
 //! batched body and the multi-slot body cannot disagree on which arithmetic
 //! a prompt chunk gets. Arch admission is
-//! [`crate::arch_caps::supports_iu8g32_gemm`].
+//! [`crate::arch_caps::supports_iu8g128_gemm`].
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-const SYM: &str = "gemm_iu8g32_residual_wmma";
-const SYM_MB4: &str = "gemm_iu8g32_residual_wmma_mb4";
-const SYM_MB4M2: &str = "gemm_iu8g32_residual_wmma_mb4m2";
+const SYM: &str = "gemm_iu8g128_residual_wmma";
+const SYM_MB4: &str = "gemm_iu8g128_residual_wmma_mb4";
+const SYM_MB4M2: &str = "gemm_iu8g128_residual_wmma_mb4m2";
 
 /// Fewest token rows that take the W8A8 route. Measured on gfx1100 with
-/// `iu8g32_route_crossover` (`hipfire-runtime/tests/iu8g32_wmma_gemm_gpu.rs`,
+/// `iu8g128_route_crossover` (`hipfire-runtime/tests/iu8g128_wmma_gemm_gpu.rs`,
 /// 27B `wo` M=5120/K=6144 and `w_down` M=5120/K=17408, activation conversion
 /// charged per call, two passes): the f16 twin is 1.3-2.4x faster at n<=32,
 /// the two are at parity at n=40-48, and W8A8 is 1.26-1.36x faster at n=56-63
 /// and 1.9-2.8x from n=64 (where the twin's mb4 fanout starts). Below the
 /// threshold the 128-row W8A8 tile idles and its activation quant buys
 /// nothing, so short chunks and DFlash-width batches keep the f16 twin.
-// selector-receipt: receipts/selectors/iu8g32_w8a8_min_rows.json
-pub const IU8G32_W8A8_MIN_ROWS: usize = 48;
+// selector-receipt: receipts/selectors/iu8g128_w8a8_min_rows.json
+pub const IU8G128_W8A8_MIN_ROWS: usize = 48;
 
-/// Which qt59 batched GEMM a shape takes ([`Gpu::iu8g32_gemm_route`]).
+/// Which qt58 batched GEMM a shape takes ([`Gpu::iu8g128_gemm_route`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Iu8g32GemmRoute {
-    /// `gemm_iu8g32_w8a8_min`: int8 activations, IU8 WMMA.
+pub enum Iu8g128GemmRoute {
+    /// `gemm_iu8g128_w8a8_min`: int8 activations, IU8 WMMA.
     W8A8,
-    /// `gemm_iu8g32_residual_wmma*`: f16 activations, f16 WMMA.
+    /// `gemm_iu8g128_residual_wmma*`: f16 activations, f16 WMMA.
     F16Twin,
 }
 
-/// `HIPFIRE_IU8G32_W8A8=0` keeps every qt59 GEMM on the f16 twin (A/B
+/// `HIPFIRE_IU8G128_W8A8=0` keeps every qt58 GEMM on the f16 twin (A/B
 /// control for both the singleton and the multi-slot prefill).
-fn iu8g32_w8a8_enabled() -> bool {
+fn iu8g128_w8a8_enabled() -> bool {
     static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !matches!(
-            hipfire_config::developer_var("HIPFIRE_IU8G32_W8A8").as_deref(),
+            hipfire_config::developer_var("HIPFIRE_IU8G128_W8A8").as_deref(),
             Ok("0") | Ok("off") | Ok("false")
         )
     });
     *V
 }
 
-/// `HIPFIRE_IU8G32_MB4=0` keeps the 16-token-tile kernel (A/B control).
+/// `HIPFIRE_IU8G128_MB4=0` keeps the 16-token-tile kernel (A/B control).
 /// Unset keeps the 64-token fanout for every batch of 64+ rows.
-fn iu8g32_mb4_enabled() -> bool {
+fn iu8g128_mb4_enabled() -> bool {
     static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !matches!(
-            hipfire_config::developer_var("HIPFIRE_IU8G32_MB4").as_deref(),
+            hipfire_config::developer_var("HIPFIRE_IU8G128_MB4").as_deref(),
             Ok("0") | Ok("false")
         )
     });
@@ -74,55 +74,55 @@ fn iu8g32_mb4_enabled() -> bool {
 }
 
 /// 32-row-per-wave variant (two 16-row M tiles sharing one X fragment
-/// stream). `HIPFIRE_IU8G32_M2=0` restores the 16-row fanout (A/B control).
-fn iu8g32_m2_enabled() -> bool {
+/// stream). `HIPFIRE_IU8G128_M2=0` restores the 16-row fanout (A/B control).
+fn iu8g128_m2_enabled() -> bool {
     static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !matches!(
-            hipfire_config::developer_var("HIPFIRE_IU8G32_M2").as_deref(),
+            hipfire_config::developer_var("HIPFIRE_IU8G128_M2").as_deref(),
             Ok("0") | Ok("false")
         )
     });
     *V
 }
 
-/// Whether a qt59 matrix of width `k` has a batched GEMM on `arch` (the f16
-/// twin, which every other qt59 GEMM route falls back to). Admission
+/// Whether a qt58 matrix of width `k` has a batched GEMM on `arch` (the f16
+/// twin, which every other qt58 GEMM route falls back to). Admission
 /// predicates that hold only an arch name call this; launchers call
-/// [`Gpu::iu8g32_wmma_eligible`], which is the same rule.
-pub fn iu8g32_gemm_admits(arch: &str, k: usize) -> bool {
-    k > 0 && k % 128 == 0 && crate::arch_caps::supports_iu8g32_gemm(arch)
+/// [`Gpu::iu8g128_wmma_eligible`], which is the same rule.
+pub fn iu8g128_gemm_admits(arch: &str, k: usize) -> bool {
+    k > 0 && k % 128 == 0 && crate::arch_caps::supports_iu8g128_gemm(arch)
 }
 
 impl Gpu {
-    /// Whether [`Gpu::gemm_iu8g32_residual_wmma`] (the f16 twin) can run
-    /// here. Any qt59 batched GEMM is admissible exactly when this holds.
-    pub fn iu8g32_wmma_eligible(&self, k: usize) -> bool {
-        iu8g32_gemm_admits(&self.arch, k)
+    /// Whether [`Gpu::gemm_iu8g128_residual_wmma`] (the f16 twin) can run
+    /// here. Any qt58 batched GEMM is admissible exactly when this holds.
+    pub fn iu8g128_wmma_eligible(&self, k: usize) -> bool {
+        iu8g128_gemm_admits(&self.arch, k)
     }
 
-    /// Whether [`Gpu::gemm_iu8g32_w8a8_min`] can run here.
-    pub fn iu8g32_w8a8_eligible(&self, k: usize) -> bool {
-        k > 0 && k % 256 == 0 && crate::arch_caps::supports_iu8g32_gemm(&self.arch)
+    /// Whether [`Gpu::gemm_iu8g128_w8a8_min`] can run here.
+    pub fn iu8g128_w8a8_eligible(&self, k: usize) -> bool {
+        k > 0 && k % 256 == 0 && crate::arch_caps::supports_iu8g128_gemm(&self.arch)
     }
 
-    /// The qt59 batched GEMM for `n` token rows of a `K`-wide matrix, or
-    /// `None` when no qt59 GEMM runs here (the caller must refuse the
+    /// The qt58 batched GEMM for `n` token rows of a `K`-wide matrix, or
+    /// `None` when no qt58 GEMM runs here (the caller must refuse the
     /// layer). W8A8 needs its own eligibility and at least
-    /// [`IU8G32_W8A8_MIN_ROWS`] rows; everything else takes the f16 twin.
-    pub fn iu8g32_gemm_route(&self, k: usize, n: usize) -> Option<Iu8g32GemmRoute> {
-        if !self.iu8g32_wmma_eligible(k) {
+    /// [`IU8G128_W8A8_MIN_ROWS`] rows; everything else takes the f16 twin.
+    pub fn iu8g128_gemm_route(&self, k: usize, n: usize) -> Option<Iu8g128GemmRoute> {
+        if !self.iu8g128_wmma_eligible(k) {
             return None;
         }
-        if n >= IU8G32_W8A8_MIN_ROWS && self.iu8g32_w8a8_eligible(k) && iu8g32_w8a8_enabled() {
-            Some(Iu8g32GemmRoute::W8A8)
+        if n >= IU8G128_W8A8_MIN_ROWS && self.iu8g128_w8a8_eligible(k) && iu8g128_w8a8_enabled() {
+            Some(Iu8g128GemmRoute::W8A8)
         } else {
-            Some(Iu8g32GemmRoute::F16Twin)
+            Some(Iu8g128GemmRoute::F16Twin)
         }
     }
 
-    /// `Y += W X` for one qt59 matrix through [`Gpu::iu8g32_gemm_route`].
+    /// `Y += W X` for one qt58 matrix through [`Gpu::iu8g128_gemm_route`].
     /// `x` is `[n, k]` f32; the W8A8 route quantizes it here.
-    pub fn gemm_iu8g32_residual(
+    pub fn gemm_iu8g128_residual(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -132,20 +132,20 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        match self.iu8g32_gemm_route(k, n) {
-            Some(Iu8g32GemmRoute::W8A8) => {
+        match self.iu8g128_gemm_route(k, n) {
+            Some(Iu8g128GemmRoute::W8A8) => {
                 let xq = self.ensure_int8_mmq_linear_x(x, n, k)?;
-                self.gemm_iu8g32_w8a8_min(a, xq, y, m, k, n, true)
+                self.gemm_iu8g128_w8a8_min(a, xq, y, m, k, n, true)
             }
             // The twin's own guard names the arch/K refusal.
-            Some(Iu8g32GemmRoute::F16Twin) | None => {
-                self.gemm_iu8g32_residual_wmma(a, x, y, m, k, n)
+            Some(Iu8g128GemmRoute::F16Twin) | None => {
+                self.gemm_iu8g128_residual_wmma(a, x, y, m, k, n)
             }
         }
     }
 
     /// `Y += W X` for one IU8G128 matrix (`m` rows, `k` cols, `n` tokens).
-    pub fn gemm_iu8g32_residual_wmma(
+    pub fn gemm_iu8g128_residual_wmma(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -155,17 +155,17 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.iu8g32_wmma_eligible(k) {
+        if !self.iu8g128_wmma_eligible(k) {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_iu8g32_residual_wmma: needs gfx1100/gfx1151 and K%128==0 (arch {}, K={k})",
+                    "gemm_iu8g128_residual_wmma: needs gfx1100/gfx1151 and K%128==0 (arch {}, K={k})",
                     self.arch
                 ),
             ));
         }
-        let mb4 = n >= 64 && iu8g32_mb4_enabled();
-        let m2 = mb4 && m >= 32 && iu8g32_m2_enabled();
+        let mb4 = n >= 64 && iu8g128_mb4_enabled();
+        let m2 = mb4 && m >= 32 && iu8g128_m2_enabled();
         let sym = if m2 {
             SYM_MB4M2
         } else if mb4 {
@@ -176,13 +176,17 @@ impl Gpu {
         if m2 {
             self.ensure_kernel(
                 SYM_MB4M2,
-                kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4M2_SRC,
+                kernels::GEMM_IU8G128_RESIDUAL_WMMA_MB4M2_SRC,
                 SYM_MB4M2,
             )?;
         } else if mb4 {
-            self.ensure_kernel(SYM_MB4, kernels::GEMM_IU8G32_RESIDUAL_WMMA_MB4_SRC, SYM_MB4)?;
+            self.ensure_kernel(
+                SYM_MB4,
+                kernels::GEMM_IU8G128_RESIDUAL_WMMA_MB4_SRC,
+                SYM_MB4,
+            )?;
         } else {
-            self.ensure_kernel(SYM, kernels::GEMM_IU8G32_RESIDUAL_WMMA_SRC, SYM)?;
+            self.ensure_kernel(SYM, kernels::GEMM_IU8G128_RESIDUAL_WMMA_SRC, SYM)?;
         }
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
         let mut a_p = a.buf.as_ptr();
@@ -229,8 +233,8 @@ impl Gpu {
     /// Minimal LDS-tiled W8A8 launch for a planar int8-per-128 weight row
     /// `[K codes][K/128 f16 scales]` and `block_i8_128` activations. The
     /// caller supplies the pre-quantized X pointer. Prefill bodies reach it
-    /// through [`Gpu::gemm_iu8g32_residual`], not directly.
-    pub fn gemm_iu8g32_w8a8_min(
+    /// through [`Gpu::gemm_iu8g128_residual`], not directly.
+    pub fn gemm_iu8g128_w8a8_min(
         &mut self,
         a: &GpuTensor,
         xq: *mut c_void,
@@ -241,22 +245,22 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if m == 0 || n == 0 || !self.iu8g32_w8a8_eligible(k) {
+        if m == 0 || n == 0 || !self.iu8g128_w8a8_eligible(k) {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(
-                    "gemm_iu8g32_w8a8_min needs gfx1100/gfx1151, M>0, N>0 and K%256==0 (arch {}, M={m}, N={n}, K={k})",
+                    "gemm_iu8g128_w8a8_min needs gfx1100/gfx1151, M>0, N>0 and K%256==0 (arch {}, M={m}, N={n}, K={k})",
                     self.arch
                 ),
             ));
         }
-        let module = "gemm_iu8g32_w8a8_min";
+        let module = "gemm_iu8g128_w8a8_min";
         let entry = if add {
-            "gemm_iu8g32_w8a8_min_add"
+            "gemm_iu8g128_w8a8_min_add"
         } else {
-            "gemm_iu8g32_w8a8_min_set"
+            "gemm_iu8g128_w8a8_min_set"
         };
-        self.ensure_kernel(module, kernels::GEMM_IU8G32_W8A8_MIN_SRC, entry)?;
+        self.ensure_kernel(module, kernels::GEMM_IU8G128_W8A8_MIN_SRC, entry)?;
         let mut a_p = a.buf.as_ptr();
         let mut xq_p = xq;
         let mut y_p = y.buf.as_ptr();
@@ -300,19 +304,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qt59_gemm_admission_is_one_rule() {
+    fn qt58_gemm_admission_is_one_rule() {
         for arch in ["gfx1100", "gfx1151"] {
-            assert!(iu8g32_gemm_admits(arch, 128), "{arch}");
-            assert!(iu8g32_gemm_admits(arch, 6144), "{arch}");
-            assert!(!iu8g32_gemm_admits(arch, 0), "{arch}");
+            assert!(iu8g128_gemm_admits(arch, 128), "{arch}");
+            assert!(iu8g128_gemm_admits(arch, 6144), "{arch}");
+            assert!(!iu8g128_gemm_admits(arch, 0), "{arch}");
             assert!(
-                !iu8g32_gemm_admits(arch, 32),
+                !iu8g128_gemm_admits(arch, 32),
                 "{arch}: retired per-32 width"
             );
-            assert!(!iu8g32_gemm_admits(arch, 192), "{arch}");
+            assert!(!iu8g128_gemm_admits(arch, 192), "{arch}");
         }
         for arch in ["gfx1201", "gfx1101", "gfx1030", ""] {
-            assert!(!iu8g32_gemm_admits(arch, 256), "{arch:?}");
+            assert!(!iu8g128_gemm_admits(arch, 256), "{arch:?}");
         }
     }
 }

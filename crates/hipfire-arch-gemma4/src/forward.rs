@@ -325,7 +325,7 @@ fn embedding_lookup_batched_to(
             gpu.embedding_lookup_hfq4g128_batched(table, dst, token_ids, batch, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim),
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G32 => return Ok(false),
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G128 => return Ok(false),
         EmbeddingFormat::Ggml(_) => return Err(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
                 .to_string(),

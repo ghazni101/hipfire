@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Decode GEMV for [`crate::DType::IU8G128`] (qt 59), the lifted-role tier of
-//! an `iu4` / `iu8` file.
+//! Decode GEMV for [`crate::DType::IU8G128`] (qt 58), the lifted-role tier of
+//! an `iu4` file.
 //!
 //! The grid is the Q8 grid — signed int8 codes, zero point 0, no FWHT — with
 //! **one fp16 scale per 128** moved to the row tail:
@@ -12,7 +12,7 @@
 //! [K signed codes][K/128 f16 scales]       (K + K/64 bytes, 8.125 bpw)
 //! ```
 //!
-//! The kernel (`gemv_iu8g32`, and the fused `gemv_iu8g32_residual`) folds
+//! The kernel (`gemv_iu8g128`, and the fused `gemv_iu8g128_residual`) folds
 //! element for element like `gemv_q8_0`: one wave per row, thread `t` takes
 //! element `t` of every 32-block (four blocks share one scale) and the warp
 //! reduces by shuffle. The numeric contract is
@@ -28,9 +28,9 @@ use std::ffi::c_void;
 
 impl Gpu {
     /// `y = W x` for a planar IU8G128 weight. `x` is the natural-basis
-    /// activation (qt 59 is not rotated). `k` must be a positive multiple of
+    /// activation (qt 58 is not rotated). `k` must be a positive multiple of
     /// 128 (one f16 scale per 128 at the row tail).
-    pub fn gemv_iu8g32(
+    pub fn gemv_iu8g128(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -38,12 +38,12 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.gemv_iu8g32_launch("gemv_iu8g32", a, x, y, m, k)
+        self.gemv_iu8g128_launch("gemv_iu8g128", a, x, y, m, k)
     }
 
     /// `y += W x` for a planar IU8G128 weight (fused residual arm; `y` is both
     /// accumulated into and stored).
-    pub fn gemv_iu8g32_residual(
+    pub fn gemv_iu8g128_residual(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -51,12 +51,12 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.gemv_iu8g32_launch("gemv_iu8g32_residual", a, x, y, m, k)
+        self.gemv_iu8g128_launch("gemv_iu8g128_residual", a, x, y, m, k)
     }
 
     /// Test/A-B entry: launch one named IU8G128 GEMV kernel (v1 or a v2
     /// `_rN` variant) with no automatic selection.
-    pub fn gemv_iu8g32_named(
+    pub fn gemv_iu8g128_named(
         &mut self,
         func: &'static str,
         a: &GpuTensor,
@@ -65,20 +65,20 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.gemv_iu8g32_launch_exact(func, a, x, y, m, k)
+        self.gemv_iu8g128_launch_exact(func, a, x, y, m, k)
     }
 
     /// `y[b] = W·x[b]` for `batch` activation columns sharing one IU8G128
     /// weight pass (`1..=4`). Multi-slot decode: a per-slot GEMV re-reads the
     /// whole weight matrix once per slot; here each weight row is read once
-    /// for every column. Column `b` matches [`Self::gemv_iu8g32`] on that
+    /// for every column. Column `b` matches [`Self::gemv_iu8g128`] on that
     /// column to f32 rounding (different module → contraction may differ);
     /// two runs are bit-identical.
     ///
     /// `x` is `[batch × k]`, `y` is `[batch × m]`, both row-major. Requires a
     /// 16 B-aligned row stride (`(k + k/64) % 16 == 0`) for the `uint4`
     /// weight and activation chunks.
-    pub fn gemv_iu8g32_xbatch(
+    pub fn gemv_iu8g128_xbatch(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -90,13 +90,13 @@ impl Gpu {
         if m == 0 || k == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu8g32_xbatch: M > 0 and K % 128 == 0",
+                "gemv_iu8g128_xbatch: M > 0 and K % 128 == 0",
             ));
         }
         if batch == 0 || batch > 4 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu8g32_xbatch: batch must be 1..=4",
+                "gemv_iu8g128_xbatch: batch must be 1..=4",
             ));
         }
         let row_bytes = k + k / 64;
@@ -106,16 +106,16 @@ impl Gpu {
         {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu8g32_xbatch: needs a 16 B-aligned row and activation base",
+                "gemv_iu8g128_xbatch: needs a 16 B-aligned row and activation base",
             ));
         }
         self.bind_thread()?;
         // Same module key as the v1/v2 kernels: one source, one compiled
         // module, and the registry entry that declares it.
         self.ensure_kernel(
-            "gemv_iu8g32",
-            kernels::GEMV_IU8G32_SRC,
-            "gemv_iu8g32_xbatch",
+            "gemv_iu8g128",
+            kernels::GEMV_IU8G128_SRC,
+            "gemv_iu8g128_xbatch",
         )?;
         let waves = m.div_ceil(4);
         let grid = [waves.div_ceil(4) as u32, 1, 1];
@@ -134,7 +134,7 @@ impl Gpu {
             &mut bv as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "gemv_iu8g32_xbatch",
+            "gemv_iu8g128_xbatch",
             grid,
             [128, 1, 1],
             0,
@@ -152,7 +152,7 @@ impl Gpu {
         )
     }
 
-    fn gemv_iu8g32_launch(
+    fn gemv_iu8g128_launch(
         &mut self,
         func: &'static str,
         a: &GpuTensor,
@@ -164,14 +164,14 @@ impl Gpu {
         if m == 0 || k == 0 || k % 128 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu8g32: M > 0 and K % 128 == 0",
+                "gemv_iu8g128: M > 0 and K % 128 == 0",
             ));
         }
-        let func = iu8g32_pick(func, x, a, m, k);
-        self.gemv_iu8g32_launch_exact(func, a, x, y, m, k)
+        let func = iu8g128_pick(func, x, a, m, k);
+        self.gemv_iu8g128_launch_exact(func, a, x, y, m, k)
     }
 
-    fn gemv_iu8g32_launch_exact(
+    fn gemv_iu8g128_launch_exact(
         &mut self,
         func: &'static str,
         a: &GpuTensor,
@@ -181,8 +181,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemv_iu8g32", kernels::GEMV_IU8G32_SRC, func)?;
-        let (grid, block) = iu8g32_geometry(func, m);
+        self.ensure_kernel("gemv_iu8g128", kernels::GEMV_IU8G128_SRC, func)?;
+        let (grid, block) = iu8g128_geometry(func, m);
         let mut ap = a.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -209,7 +209,7 @@ impl Gpu {
 
 /// `HIPFIRE_IU8_GEMV=v1` keeps the original one-byte-per-lane kernel (A/B);
 /// anything else = v2 (f32 x). Read once.
-fn iu8g32_v1_forced() -> bool {
+fn iu8g128_v1_forced() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         matches!(
@@ -222,7 +222,7 @@ fn iu8g32_v1_forced() -> bool {
 }
 
 /// v2 (R rows/wave, dwordx4 code loads) when rows and `x` are 16B aligned.
-fn iu8g32_pick(
+fn iu8g128_pick(
     func: &'static str,
     x: &GpuTensor,
     a: &GpuTensor,
@@ -233,10 +233,10 @@ fn iu8g32_pick(
     let aligned = row_bytes % 16 == 0
         && (x.buf.as_ptr() as usize) % 16 == 0
         && (a.buf.as_ptr() as usize) % 16 == 0;
-    if iu8g32_v1_forced() || !aligned {
+    if iu8g128_v1_forced() || !aligned {
         return func;
     }
-    let add = func == "gemv_iu8g32_residual";
+    let add = func == "gemv_iu8g128_residual";
     let r = if m >= 32768 {
         4
     } else if m >= 4096 {
@@ -245,16 +245,16 @@ fn iu8g32_pick(
         1
     };
     match (add, r) {
-        (false, 4) => "gemv_iu8g32_v2_r4",
-        (false, 2) => "gemv_iu8g32_v2_r2",
-        (false, _) => "gemv_iu8g32_v2_r1",
-        (true, 4) => "gemv_iu8g32_v2_residual_r4",
-        (true, 2) => "gemv_iu8g32_v2_residual_r2",
-        (true, _) => "gemv_iu8g32_v2_residual_r1",
+        (false, 4) => "gemv_iu8g128_v2_r4",
+        (false, 2) => "gemv_iu8g128_v2_r2",
+        (false, _) => "gemv_iu8g128_v2_r1",
+        (true, 4) => "gemv_iu8g128_v2_residual_r4",
+        (true, 2) => "gemv_iu8g128_v2_residual_r2",
+        (true, _) => "gemv_iu8g128_v2_residual_r1",
     }
 }
 
-fn iu8g32_geometry(func: &str, m: usize) -> ([u32; 3], [u32; 3]) {
+fn iu8g128_geometry(func: &str, m: usize) -> ([u32; 3], [u32; 3]) {
     let r = if func.ends_with("_r4") {
         4
     } else if func.ends_with("_r2") {

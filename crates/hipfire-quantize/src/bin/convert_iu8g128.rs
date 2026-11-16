@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Offline qt59 converter: legacy `[K i8][K/32 f16]` rows -> compact
-//! `[K i8][K/128 f16]` rows (one scale per 128). Non-qt59 tensors are copied
+//! Offline qt58 converter: legacy `[K i8][K/32 f16]` rows -> compact
+//! `[K i8][K/128 f16]` rows (one scale per 128). Non-qt58 tensors are copied
 //! byte for byte. Usage:
 //!
 //!   convert_iu8g128 <old.iu4p> <new.iu4p>
@@ -176,11 +176,11 @@ fn main() {
     let (arch, metadata, mut tensors) = read_hfq(Path::new(&a[1]));
     let mut converted = 0usize;
     for t in &mut tensors {
-        if t.quant_type != 59 {
+        if t.quant_type != 58 {
             continue;
         }
         if t.shape.len() != 2 {
-            panic!("qt59 tensor {} has shape {:?}", t.name, t.shape);
+            panic!("qt58 tensor {} has shape {:?}", t.name, t.shape);
         }
         let (m, k) = (t.shape[0] as usize, t.shape[1] as usize);
         let old_row = k + (k / 32) * 2;
@@ -202,7 +202,7 @@ fn main() {
     }
     write_hfq(Path::new(&a[2]), arch, &metadata, &tensors);
     eprintln!(
-        "wrote {} (arch {arch}, {} tensors, {converted} qt59 rows requantized)",
+        "wrote {} (arch {arch}, {} tensors, {converted} qt58 rows requantized)",
         a[2],
         tensors.len()
     );

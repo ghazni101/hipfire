@@ -8,7 +8,7 @@
 //!
 //! The reference is the format-named `Gpu` method called directly (written out
 //! below, not taken from the helper), so a misrouted arm — a Q8_0 table read by
-//! the HFQ4 gather, an IU8G32 arm left out — shows up as a byte mismatch or an
+//! the HFQ4 gather, an IU8G128 arm left out — shows up as a byte mismatch or an
 //! error. The helper and the reference read the same table, so agreement is
 //! bit-exact. The F32 arm is also checked against the host table, and every
 //! batched row against the single-row gather of the same token. Kernel
@@ -38,7 +38,7 @@ const FORMATS: [EmbeddingFormat; 7] = [
     EmbeddingFormat::HFQ4G256,
     EmbeddingFormat::HFQ4G128,
     EmbeddingFormat::Q8_0,
-    EmbeddingFormat::IU8G32,
+    EmbeddingFormat::IU8G128,
     EmbeddingFormat::Ggml(DType::GgmlQ8_0),
 ];
 
@@ -65,7 +65,7 @@ fn direct_single(
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, out, tok, DIM),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, out, tok, DIM),
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, out, tok, DIM),
-        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32(table, out, tok, DIM),
+        EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g128(table, out, tok, DIM),
         EmbeddingFormat::Ggml(dtype) => gpu.ggml_embedding_lookup(dtype, table, out, tok, DIM),
     }
 }
@@ -85,7 +85,7 @@ fn direct_batched(
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(table, out, ids, n, DIM),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128_batched(table, out, ids, n, DIM),
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, out, ids, n, DIM),
-        EmbeddingFormat::IU8G32 => gpu.embedding_lookup_iu8g32_batched(table, out, ids, n, DIM),
+        EmbeddingFormat::IU8G128 => gpu.embedding_lookup_iu8g128_batched(table, out, ids, n, DIM),
         EmbeddingFormat::Ggml(dtype) => {
             gpu.ggml_embedding_lookup_batched(dtype, table, out, ids, n, DIM)
         }

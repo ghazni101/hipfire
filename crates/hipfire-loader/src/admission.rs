@@ -1674,7 +1674,7 @@ fn dflash_lm_head_refusal(lm_qt: Option<u8>, gpu_arch: &str) -> Option<String> {
         Some(49) => "quant_type=49, MQ3G256V2".to_string(),
         Some(50) => "quant_type=50, MQ2G256V2".to_string(),
         Some(17) => "quant_type=17, MQ3G256".to_string(),
-        Some(59) => "quant_type=59, IU8G32".to_string(),
+        Some(58) => "quant_type=58, IU8G128".to_string(),
         Some(qt) => format!("quant_type={qt}"),
         None => "no lm_head/embed_tokens tensor found".to_string(),
     };

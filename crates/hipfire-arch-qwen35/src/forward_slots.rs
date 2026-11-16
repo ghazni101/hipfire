@@ -598,9 +598,9 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::MQ2G256V2
             | DType::HFQ3G256
             | DType::F16
-            // C16 qt59 lm_head of the iu4 files: Step::Gemv -> GemvIu8G32
+            // C16 qt58 lm_head of the iu4 files: Step::Gemv -> GemvIu8G128
             // (same GEMV as the solo decode lm_head and `lm_head_batched`).
-            | DType::IU8G32
+            | DType::IU8G128
     )
 }
 
@@ -657,10 +657,10 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
     })
 }
 
-/// C16 qt59: IU8G32 residual projections (natural basis input) take the
-/// same qt59 GEMM selector as the batched prefill (`Gpu::iu8g32_gemm_route`).
-fn slots_iu8g32_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
-    dt == DType::IU8G32 && rdna_compute::iu8g32_gemm_admits(arch, k)
+/// C16 qt61: IU8G128 residual projections (natural basis input) take the
+/// same qt61 GEMM selector as the batched prefill (`Gpu::iu8g128_gemm_route`).
+fn slots_iu8g128_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
+    dt == DType::IU8G128 && rdna_compute::iu8g128_gemm_admits(arch, k)
 }
 
 /// C16 qt57: one IU4G256 launch set over a shared rotated X
@@ -696,7 +696,7 @@ fn slots_iu4_multi(
 fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipResult<()> {
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0
-        || slots_iu8g32_residual_ok(dt, w.k, arch)
+        || slots_iu8g128_residual_ok(dt, w.k, arch)
         || (slots_proj_admissible(dt, arch)
             && (slots_weight_rotated(dt) || slots_residual_gemm_key(dt).is_some()))
     {
@@ -940,12 +940,12 @@ pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()>
         | EmbeddingFormat::F32
         | EmbeddingFormat::HFQ4G256
         | EmbeddingFormat::HFQ4G128
-        | EmbeddingFormat::IU8G32 => Ok(()),
+        | EmbeddingFormat::IU8G128 => Ok(()),
         other => Err(HipError::new(
             0,
             &format!(
                 "forward_batch_slots: embedding format {other:?} has no batched \
-                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128, IU8G32)"
+                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128, IU8G128)"
             ),
         )),
     }
@@ -970,13 +970,13 @@ fn slots_residual_proj(
     if dt == DType::Q8_0 {
         return q8_residual_proj(gpu, w, x, y, q8_scratch, n, q8_wmma_arch);
     }
-    if slots_iu8g32_residual_ok(dt, w.k, gpu.arch.as_str()) {
+    if slots_iu8g128_residual_ok(dt, w.k, gpu.arch.as_str()) {
         // Prompt chunks of one W8A8 tile or more run the IU8 matrix core;
         // sub-tile chunks and decode-width rows take the f16 twin. The same
         // selector serves the singleton batched body, so both bodies give a
         // chunk the same arithmetic.
         let y_n = y.sub_offset(0, n * w.m);
-        return gpu.gemm_iu8g32_residual(&w.buf, x, &y_n, w.m, w.k, n);
+        return gpu.gemm_iu8g128_residual(&w.buf, x, &y_n, w.m, w.k, n);
     }
     if slots_weight_rotated(dt) {
         return mq4_residual_proj(gpu, w, x, y, rot_scratch, n);
@@ -4394,9 +4394,9 @@ pub(crate) fn final_logits_per_slot(
         return Ok(());
     }
 
-    // qt59 (IU8G128) head: the same one-weight-pass idea as the MQ4G256 arm
+    // qt58 (IU8G128) head: the same one-weight-pass idea as the MQ4G256 arm
     // above. The per-slot loop re-reads the whole lm_head matrix (1.27 GB at
-    // vocab 248320 x dim 5120) once per live slot; `gemv_iu8g32_xbatch` reads
+    // vocab 248320 x dim 5120) once per live slot; `gemv_iu8g128_xbatch` reads
     // each row once for all columns. Only the GEMV is batched: each slot's
     // last hidden row takes the reference's own `rmsnorm_f32`, exactly what
     // `Step::Gemv` would run. Requires every slot active so batch row `b` is
@@ -4407,7 +4407,7 @@ pub(crate) fn final_logits_per_slot(
         && batch.m_per_slot.iter().all(|&m| m > 0)
         && lm_head_skip.iter().all(|&skip| !skip)
         && pbs.x_norm_batch.numel() >= n_slots * dim
-        && iu8g32_xbatch_shape_ok(dim)
+        && iu8g128_xbatch_shape_ok(dim)
         && !head_xbatch_disabled()
     {
         let mut row_off = 0usize;
@@ -4426,7 +4426,7 @@ pub(crate) fn final_logits_per_slot(
         debug_assert_eq!(row_off, batch.total_rows());
         let x_all = pbs.x_norm_batch.sub_offset(0, n_slots * dim);
         let head = weights.output.dispatch_ref();
-        gpu.gemv_iu8g32_xbatch(
+        gpu.gemv_iu8g128_xbatch(
             head.buf,
             &x_all,
             logits_out,
@@ -4512,7 +4512,7 @@ fn head_xbatch_disabled() -> bool {
 /// The IU8G128 xbatch GEMV reads `uint4` weight and `float4` activation
 /// chunks, so the compact row stride (`K + K/64`) and `x` rows must be 16 B
 /// aligned as well as one-scale-per-128 shaped.
-fn iu8g32_xbatch_shape_ok(k: usize) -> bool {
+fn iu8g128_xbatch_shape_ok(k: usize) -> bool {
     k % 128 == 0 && (k + k / 64) % 16 == 0
 }
 

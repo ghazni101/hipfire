@@ -2,16 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the x-batched IU8G128 (qt 59) decode GEMV
-//! (`gemv_iu8g32_xbatch`, the multi-slot lm_head route).
+//! Numerics gate for the x-batched IU8G128 (qt 58) decode GEMV
+//! (`gemv_iu8g128_xbatch`, the multi-slot lm_head route).
 //!
 //! Every column of the x-batch launch must match running the singleton
-//! `gemv_iu8g32` on that column. The files compile separately, so the FMA
+//! `gemv_iu8g128` on that column. The files compile separately, so the FMA
 //! contraction can differ: the contract is f32 rounding (max relative error
 //! < 1e-6 against the singleton's own scale), not bit identity. Determinism
 //! (two runs are bit-identical) IS required.
 //!
-//!   cargo test -p hipfire-runtime --release --test iu8g32_xbatch_gemv_gpu -- --ignored --nocapture
+//!   cargo test -p hipfire-runtime --release --test iu8g128_xbatch_gemv_gpu -- --ignored --nocapture
 
 use half::f16;
 use rdna_compute::{DType, Gpu};
@@ -32,7 +32,7 @@ impl Rng {
     }
 }
 
-/// Compact qt 59 row: `[K signed codes][K/128 f16 scales]`.
+/// Compact qt 58 row: `[K signed codes][K/128 f16 scales]`.
 fn iu8_random(rng: &mut Rng, m: usize, k: usize) -> Vec<u8> {
     let row_bytes = k + k / 64;
     let mut out = vec![0u8; m * row_bytes];
@@ -82,11 +82,11 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
     for b in 0..batch {
         let xb = xd.sub_offset(b * k, k);
         let yb = y_single.sub_offset(b * m, m);
-        gpu.gemv_iu8g32(&w, &xb, &yb, m, k).unwrap();
+        gpu.gemv_iu8g128(&w, &xb, &yb, m, k).unwrap();
     }
-    gpu.gemv_iu8g32_xbatch(&w, &xd, &y_batch, m, k, batch)
+    gpu.gemv_iu8g128_xbatch(&w, &xd, &y_batch, m, k, batch)
         .unwrap();
-    gpu.gemv_iu8g32_xbatch(&w, &xd, &y_again, m, k, batch)
+    gpu.gemv_iu8g128_xbatch(&w, &xd, &y_again, m, k, batch)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let single = gpu.download_f32(&y_single).unwrap();
@@ -125,7 +125,7 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
 
 #[test]
 #[ignore = "GPU required: run with --ignored on a gfx11/gfx12 host"]
-fn iu8g32_head_shape_cost() {
+fn iu8g128_head_shape_cost() {
     // The 27B IU4-Pro lm_head shape: one weight pass = 1.29 GB.
     let (m, k) = (248_320usize, 5120usize);
     let mut gpu = Gpu::init_with_device(0).expect("GPU 0");
@@ -152,7 +152,7 @@ fn iu8g32_head_shape_cost() {
         let xb = xd.sub_offset(0, b * k);
         let yb = y.sub_offset(0, b * m);
         time(&mut gpu, &format!("xbatch B={b}"), bytes, |gpu| {
-            gpu.gemv_iu8g32_xbatch(&w, &xb, &yb, m, k, b).unwrap()
+            gpu.gemv_iu8g128_xbatch(&w, &xb, &yb, m, k, b).unwrap()
         });
     }
     for b in 1..=4usize {
@@ -164,7 +164,7 @@ fn iu8g32_head_shape_cost() {
                 for s in 0..b {
                     let xs = xd.sub_offset(s * k, k);
                     let ys = y.sub_offset(s * m, m);
-                    gpu.gemv_iu8g32(&w, &xs, &ys, m, k).unwrap();
+                    gpu.gemv_iu8g128(&w, &xs, &ys, m, k).unwrap();
                 }
             },
         );
@@ -173,7 +173,7 @@ fn iu8g32_head_shape_cost() {
 
 #[test]
 #[ignore = "GPU required: run with --ignored on a gfx11/gfx12 host"]
-fn iu8g32_xbatch_matches_singleton() {
+fn iu8g128_xbatch_matches_singleton() {
     let mut gpu = Gpu::init_with_device(0).expect("GPU 0");
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for &(m, k) in &[
@@ -197,7 +197,7 @@ fn iu8g32_xbatch_matches_singleton() {
         .unwrap();
     let x = gpu.upload_f32(&vec![0.0; 256], &[256]).unwrap();
     let y = gpu.alloc_tensor(&[4], DType::F32).unwrap();
-    let err = gpu.gemv_iu8g32_xbatch(&w, &x, &y, 4, 256, 1).unwrap_err();
+    let err = gpu.gemv_iu8g128_xbatch(&w, &x, &y, 4, 256, 1).unwrap_err();
     assert!(
         err.message.contains("16 B-aligned"),
         "misaligned row must be refused, got {err:?}"

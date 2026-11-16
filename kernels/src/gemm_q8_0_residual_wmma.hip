@@ -57,7 +57,7 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
     const int safe_row = (my_row < M) ? my_row : (M - 1);
 
     const int blocks_per_row = K / 32;
-#ifdef HIPFIRE_IU8G32L
+#ifdef HIPFIRE_IU8G128L
     const long long row_stride = (long long)K + (long long)(K >> 6);
 #else
     const long long row_stride = (long long)blocks_per_row * 34;
@@ -71,8 +71,8 @@ extern "C" __global__ void gemm_q8_0_residual_wmma(
 
     // TODO(perf): K-tile prefetch — see gemm_qkv_q8_0_wmma.hip's note.
     for (int bi = 0; bi < blocks_per_row; bi++) {
-#ifdef HIPFIRE_IU8G32L
-        // qt59: [K int8 codes][K/128 f16 scales]; one scale per K128.
+#ifdef HIPFIRE_IU8G128L
+        // qt58: [K int8 codes][K/128 f16 scales]; one scale per K128.
         const char* cp = row_base + bi * 32;
         unsigned short s_bits;
         __builtin_memcpy(&s_bits, row_base + K + ((bi >> 2) << 1), 2);

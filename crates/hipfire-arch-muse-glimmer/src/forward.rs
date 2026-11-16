@@ -265,7 +265,7 @@ fn embed_lookup_batched(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8_batched(&weights.embed_tokens, x, token_ids, b, dim)
             .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G32 => return Ok(false),
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K | EmbeddingFormat::IU8G128 => return Ok(false),
         EmbeddingFormat::Ggml(_) => return Err(
             "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only"
                 .to_string(),
