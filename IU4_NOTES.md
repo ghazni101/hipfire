@@ -22,7 +22,7 @@ Every tensor of each IU4P file is a byte-exact relayout of its MQ4P twin:
 ## Gaps (code review)
 - G1 prefill: no IU GEMM; is_batchable_la has no IU arm -> per-token loop (64x slower than twin at pp512)
 - G2 decode fused gate_up/qkv/qkvza keys panic for IU -> unfused launches
-- G3 gemv_iu4g256: requantizes x to int4 inside every row (M-fold redundant), 1 dword/lane/group, no unroll/multirow
+- G3 gemv_iu4g128: requantizes x to int4 inside every row (M-fold redundant), 1 dword/lane/group, no unroll/multirow
 - G4 accuracy: decode is W4A4 (int4 activation per 32) vs twin W4 x f32
 - G5 DFlash/MTP/multi-slot batched: refused/untested for IU
 - G6 MoE refuses IU (no MoE iu4 models present)
@@ -32,7 +32,7 @@ Every tensor of each IU4P file is a byte-exact relayout of its MQ4P twin:
 ## C2 progress (00:12 UTC = 04:12 Dubai)
 - C1 (uncommitted): f32 gemv, 2-row residual, fused keys, swiglu arm. C1 binaries saved at ~/work/iu4/c1/.
 - chainA (C1 build, 4B): dot8 == pre on all 6 prompts (hash 3778622fa4d6 ...). new IU4P == new MQ4P on code/math, differs elsewhere (prefill paths differ pre-C2). unstable 0, conc_mismatch 0, klog 0 for all four runs.
-- C2: IU4 MMQ kernel (HIPFIRE_MMQ_IU4L variant of gemm_mq4g256v2_residual_mmq.hip), gemm_iu4.rs, dispatch arms, is_batchable_la admits IU4G256 on gfx1100|gfx1151 unless dot8.
+- C2: IU4 MMQ kernel (HIPFIRE_MMQ_IU4L variant of gemm_mq4g256v2_residual_mmq.hip), gemm_iu4.rs, dispatch arms, is_batchable_la admits IU4G128 on gfx1100|gfx1151 unless dot8.
 - iu4_mmq_gemm_gpu: 548 checks, bitdiff vs MQ4V2 MMQ = 0 everywhere (random 128 cases, + real 4B 18 cases); worst mmq rel vs f64 2.305e-2 (Q8_1 activation quant, same as MQ4V2); pertoken rel 2.0e-7.
 - Test fix: rel normalized by max|Wx| (add-seed cancellation made rel 0.385 at m=1 n=1 while abs equalled set).
 - next: build6 (release C2) + t_c2 (unit tests), then chainB gates.
@@ -54,7 +54,7 @@ Every tensor of each IU4P file is a byte-exact relayout of its MQ4P twin:
 - C4: batched IU8G128 embedding kernel + lm_head/embedding allow-lists (batch.rs, prefill.rs, batch_staging.rs). gate c4_iu4p4b (serve default = sequential): unstable 0 / conc 0 / errors 0 / klog 0.
 - GAP: the gate's "concurrent" phase was serialized (serve defaults to continuous_batch_size 1). With `--continuous-batch-size 4` every request failed: `forward_decode_batch: IU8G128 ... no GPU kernel reads it yet` (lm_head_batched IU8G128 arm called llama::weight_gemv, which refuses qt58).
 - C5: lm_head_batched IU8G128 arm runs the solo Step::Gemv per lane. gate c5cb_iu4p4b (cb=4): unstable 0 / conc_mismatch 0 / errors 0 / klog 0. c5cb_mq4p4b: 0/0/0.
-- Batched-route speed (rocprofv3 under serve cb=4, 256 tok solo + 2x256 concurrent): IU4P solo 3.47 s, conc2 4.07 s. Top kernels: fused_iu4g256_rows 29%, gemv_iu8g128 (lm_head 248320x2560) 1.51 ms/call 26%, gemv_iu8g128_residual 14%.
+- Batched-route speed (rocprofv3 under serve cb=4, 256 tok solo + 2x256 concurrent): IU4P solo 3.47 s, conc2 4.07 s. Top kernels: fused_iu4g128_rows 29%, gemv_iu8g128 (lm_head 248320x2560) 1.51 ms/call 26%, gemv_iu8g128_residual 14%.
 
 ## C6 IU8G128 decode GEMV v2 (01:46-, UTC)
 - Why: rocprof (cb=4 serve) gemv_iu8g128 lm_head 248320x2560 = 1.511 ms/call vs roofline ~0.66 ms (635 MB @ ~960 GB/s); MQ4P's gemv_q8_0 lm_head max 1.266 ms. IU8G128 total 1.80 s vs Q8_0 0.91 s.
@@ -101,7 +101,7 @@ Every tensor of each IU4P file is a byte-exact relayout of its MQ4P twin:
   "int8+FWHT" for qt58 would need rotated requantized weights (new files alongside,
   not done; would ask before replacing anything) - UNTESTED.
 
-### C7: `gemv_iu4g256_dot4` (W4A8, `HIPFIRE_IU4_DECODE=dot4`)
+### C7: `gemv_iu4g128_dot4` (W4A8, `HIPFIRE_IU4_DECODE=dot4`)
 - Lane owns 8 rotated x; amax over 4 lanes (32 elems, shfl_xor 1,2); q = clamp(rint(x*127/amax));
   dot = V_DOT4_I32_IU8(w_hi, a_hi, V_DOT4_I32_IU8(w_lo, a_lo, 0)) with unsigned nibbles
   (w & 0x0F0F0F0F, (w>>4) & 0x0F0F0F0F); sumq the same with 0x01010101;
@@ -111,7 +111,7 @@ Every tensor of each IU4P file is a byte-exact relayout of its MQ4P twin:
   (RDNA3 ISA §16.10, V_DOT4_I32_IU8), NEG_LO[1]=1 => src1 (activation) signed, src0 (weight) unsigned
   (§7.9/VOP3P NEG semantics for IU8/IU4 dots). Per kernel: 4x v_dot4_i32_iu8, 8 v_rndne_f32, 8 v_med3_i32.
   dot8: 2x `v_dot8_i32_iu4 neg_lo:[0,1,0]` `CC18..` -> opcode 0x18=24 (§16.10 V_DOT8_I32_IU4).
-  f32 `gemv_iu4g256`: 49 v_fmac_f32, no integer dot.
+  f32 `gemv_iu4g128`: 49 v_fmac_f32, no integer dot.
 - Numerics (t_dot4.out, 45 cases: M {1,7,129,4097} x K {256..9216}, uniform + heavy-tailed x, 7 real 4B tensors):
   dot4 vs CPU contract worst 3.38e-6 (gate <1e-5) PASS; deterministic; residual == plain+seed (<6e-8).
   vs f64 dequant ref (rel = max|err| / max|ref|), worst: **f32 1.50e-7, dot4 4.02e-2, dot8 4.12e-1**;
@@ -194,11 +194,11 @@ so these rows are short-context decode (decode median tok/s, per round):
 | allint8 | 151.30 | 150.95 | 151.30 | -23% |
 
 Finding: the IU4 integer decode modes are ~22% SLOWER than f32 on 4B. Hypothesis (untested): integer modes skip the fused
-`fused_iu4g256_rows` decode keys (gated_mlp.rs:706, steps.rs:377), so they launch more kernels and add an extra x-quantize pass.
+`fused_iu4g128_rows` decode keys (gated_mlp.rs:706, steps.rs:377), so they launch more kernels and add an extra x-quantize pass.
 A fused dot4 rows kernel would be the fix. Not done.
 
 ## Matrix A/B (ab.sh phase 2): m_pre_* INVALID
-`~/work/iu4/pre/hipfire bench` spawned the NEW daemon from target/release: its logs bind `gemm_iu4g256_mmq_*`, which only
+`~/work/iu4/pre/hipfire bench` spawned the NEW daemon from target/release: its logs bind `gemm_iu4g128_mmq_*`, which only
 exists in the new tree. ab.sh did not set HIPFIRE_DAEMON_BIN. The m_new and m_mq4p rows are valid:
 new pp512 5798/5796/5815, pp2048 5490/5476/5477, tg64@128 204.6/205.0/204.3, tg64@4096 192.4/192.6/192.4;
 MQ4P pp512 8070/8101/8087, pp2048 7442/7444/7446, tg64@128 201.1/201.0/200.2, tg64@4096 189.7/189.3/188.7.
@@ -235,16 +235,16 @@ dot4 decode −24% vs f32 (item 1, C9 below). All rows rc=0, klog=0.
 
 **Root cause of the C8 dot4 slowdown** (156.7 vs 204.9 tok/s f32, 4B tg64@128):
 1. Each row re-quantized x per 256-group (2 ds_bpermute, 8 v_rndne, 8 v_med3 per group per row), so the work was repeated M times.
-2. Integer modes skipped the fused qkv/qkvza/gate_up keys (`iu4g256_fusion_ok`) and the IU4 down arm (gated_mlp.rs). The generic fallback allocated and freed per token.
+2. Integer modes skipped the fused qkv/qkvza/gate_up keys (`iu4g128_fusion_ok`) and the IU4 down arm (gated_mlp.rs). The generic fallback allocated and freed per token.
 
 **Design:**
 - `iu4_quant_x_a8` (grid K/256, block 32) quantizes x once into `int4 xq[g*32+t] = {a_lo, a_hi, sumq, float_as_int(d)}`. The per-lane math is identical to C8 `iu4_row_dot_a8`.
 - `iu4_row_dot_a8q` uses the same accumulation expression, so results are bit-identical.
-- Kernels: `gemv_iu4g256_dot4q`, `_dot4q_residual`, `fused_iu4g256_dot4q_rows` (up to 4 matrices). Each is one row per block with `__launch_bounds__(32,16)`.
+- Kernels: `gemv_iu4g128_dot4q`, `_dot4q_residual`, `fused_iu4g128_dot4q_rows` (up to 4 matrices). Each is one row per block with `__launch_bounds__(32,16)`.
 - Scratch is a fixed 256 KiB `iu4_a8_x_scratch`, allocated once and never regrown, so graph capture stays valid. It errors if K*2 is over the limit.
 - `iu4_decode_w4a4()` is true only for dot8. dot4 now uses the fused keys and the down arm; dot8 keeps the per-token route.
 
-**ISA** (llvm-objdump, gfx1100, `isa/gemv_iu4.s`): `gemv_iu4g256_dot4q` has 10× `v_dot4_i32_iu8` (VOP3P op 22, RDNA3 ISA §16.10; unroll 4 + remainder), 5× `global_load_b128` and 10× `global_load_b32`. The inner loop has no ds_bpermute, v_rndne or v_med3.
+**ISA** (llvm-objdump, gfx1100, `isa/gemv_iu4.s`): `gemv_iu4g128_dot4q` has 10× `v_dot4_i32_iu8` (VOP3P op 22, RDNA3 ISA §16.10; unroll 4 + remainder), 5× `global_load_b128` and 10× `global_load_b32`. The inner loop has no ds_bpermute, v_rndne or v_med3.
 
 **Numerics** (`tests/iu4_dot4_gemv_gpu.rs`, dot4q arm): 45 cases (38 random including odd M, M=1, tails, large K, plus 7 real 4B tensors).
 - dot4q plain and residual are bit-identical to the C8 dot4 kernel.
@@ -287,9 +287,9 @@ GPU time summed over all 4 passes:
 
 | role | IU4P kernel | µs | MQ4P kernel | µs | Δ µs |
 |---|---|---|---|---|---|
-| qkv/gate_up GEMM (set) | gemm_iu4g256_mmq_full_set_x128 | 580658 | gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 | 343541 | +237117 |
-| down/out GEMM (add) | gemm_iu4g256_mmq_full_add_x128 | 212283 | …mmq_iu4_full_add_lf16_col_gfx1151 | 141126 | +71157 |
-| small-M GEMM | gemm_iu4g256_mmq_x128 (n=768) | 81667 | gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds | 11408 | +70259 |
+| qkv/gate_up GEMM (set) | gemm_iu4g128_mmq_full_set_x128 | 580658 | gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 | 343541 | +237117 |
+| down/out GEMM (add) | gemm_iu4g128_mmq_full_add_x128 | 212283 | …mmq_iu4_full_add_lf16_col_gfx1151 | 141126 | +71157 |
+| small-M GEMM | gemm_iu4g128_mmq_x128 (n=768) | 81667 | gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds | 11408 | +70259 |
 | IU8G128 / Q8_0 wo | gemm_iu8g128_residual_wmma | 177217 | gemm_q8_0_residual_wmma | 149040 | +28177 |
 | act quant | quantize_q8_1_mmq_ds4_x128 + rmsnorm/silu rotate | 40233 | rotate_i4 fused (rmsnorm/silu/mq_rotate) | 44937 | −4704 |
 | attention, GDN, conv | — | ~327k | — | ~333k | ≈0 |
@@ -306,7 +306,7 @@ Hypotheses (untested):
 ## C10 — IU4 W4A4 prefill + small-M WMMA (6d9af850d, test 3e2e7c795, iu4_kld pscore f5d172365)
 
 What: MQ4P's int4-activation MMQ kernels (`..._mmq_iu4_full_{set,add}_lf16_col`, generic tail) compiled with
-`HIPFIRE_IU4_PLANAR` planar qt57 loads -> `gemm_iu4g256_w4a4*`; m<128 projections -> `gemm_iu4g256_residual_wmma_gfx11_mw4_lds`
+`HIPFIRE_IU4_PLANAR` planar qt57 loads -> `gemm_iu4g128_w4a4*`; m<128 projections -> `gemm_iu4g128_residual_wmma_gfx11_mw4_lds`
 (f16 X converted once per multi-GEMM, uncached convert + `invalidate_fp16_cache`, fixes a stale pointer-keyed cache).
 Knobs: `HIPFIRE_IU4_PREFILL_ACT=a4` (default) | `a8` (C7 W4A8 q8_1 path); `HIPFIRE_IU4_SMALLM=wmma` (default) | `mmq`.
 
@@ -317,10 +317,10 @@ in_proj_a m=32, qkv m=8192, z m=4096, down k=9216, gate m=9216, k_proj m=1024, o
 vs f32 reference: a4 worst rel 0.208 (random), 0.045–0.113 real (int4 activation noise, same as MQ4P); mwl worst rel 9.1e-4.
 
 ### ISA (llvm-objdump / llvm-readelf --notes on ~/.hipfire_kernels/gfx1100, unbundled)
-- First version: `gemm_iu4g256_w4a4_full_{set,add}_lf16_col` 96 VGPR, **vgpr_spill_count=2, private 12 B** (MQ twin: 0).
+- First version: `gemm_iu4g128_w4a4_full_{set,add}_lf16_col` 96 VGPR, **vgpr_spill_count=2, private 12 B** (MQ twin: 0).
   Fix: uniform column base `A + kb*128 - 8` + 32-bit row offset `row*gpr*136` (header: `A + gpr*128 + kb*8` + 32-bit) ->
   96 VGPR, 0 spills, 0 private. Test re-run after fix: 490/490 bitdiff=0.
-- `gemm_iu4g256_w4a4` (generic) 193 VGPR, 0 spills; `gemm_iu4g256_residual_wmma_gfx11_mw{4,8}_lds` 90 VGPR, 0 spills, 8 KiB LDS.
+- `gemm_iu4g128_w4a4` (generic) 193 VGPR, 0 spills; `gemm_iu4g128_residual_wmma_gfx11_mw{4,8}_lds` 90 VGPR, 0 spills, 8 KiB LDS.
 - MQ code objects unchanged by the `#ifdef` patches: disassembly sha identical pre/post for
   `gemm_mq4g256v2_residual_mmq_iu4` (0d0b9bd1bf21), `_gridspec` (a4f9db208282), `gemm_mqv2_wmma_gfx1100_mw_lds` (42ea4d2268d2).
 
@@ -405,7 +405,7 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
 ## C11a — IU4 W4A8 on the iu8 WMMA (checkpoint 2026-11-02 15:35 Dubai)
 
 - New: `HIPFIRE_IU4_PREFILL_ACT=a8` = `block_i8_128` X (ensure_int8_mmq_x) + `v_wmma_i32_16x16x16_iu8`
-  W4A8 (gemm_iu4g256_w4a8_*). Old q8_1 path renamed `a8q`. `HIPFIRE_IU4_I8_TILE=128|256` (auto: 256 when
+  W4A8 (gemm_iu4g128_w4a8_*). Old q8_1 path renamed `a8q`. `HIPFIRE_IU4_I8_TILE=128|256` (auto: 256 when
   ceil(m/256)*ceil(n/256) >= CUs).
 - Kernel = MQ4P's gfx11 i8 source + `I8_ASYM` (asym fold, IU4_FOLD_RN DAG: t1=RN(sc*d) p=RN(t1*C) t2=RN(zp*d)
   sum+=fma(t2,s,p); zp plane in LDS, +1024 B / +2048 B) + `HIPFIRE_IU4_PLANAR` (codes at 0, stride 128, header
@@ -417,8 +417,8 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
 - Build: daemon release BRC=0, snapshot ~/work/iu4/c11a/. Test crates/hipfire-runtime/tests/iu4_w4a8_i8_gemm_gpu.rs
   built (TRC=0); queued in chZ.sh after chR (GPU busy). UNTESTED until then: twin bit-exact, CPU fold emulation,
   f64 rel, determinism, both tiles, model-level KL/speed.
-- Next (C11b, not started): route fused_rmsnorm/silu_hin/gated_norm_rotate_mq_i8 producers for IU4G256 (no
-  symmetric gate; i8 blocks are weight-independent) into gemm_iu4g256_w4a8_prequant; a4 producers for IU4G256.
+- Next (C11b, not started): route fused_rmsnorm/silu_hin/gated_norm_rotate_mq_i8 producers for IU4G128 (no
+  symmetric gate; i8 blocks are weight-independent) into gemm_iu4g128_w4a8_prequant; a4 producers for IU4G128.
 - C11a numerics (measured 11:40-11:41 UTC = 15:40-15:41 Dubai), test iu4_w4a8_i8_gemm_gpu, 4B real tensors:
   tile 128 and tile 256 each: 260/260 calls twin_bitdiff=0 (IU4 planar == MQ4V2 asym interleaved twin),
   244/244 emulated calls emu_bitdiff=0 (CPU fold emulation over the downloaded block_i8_128 X: bit-exact
@@ -437,7 +437,7 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
   IU8G128 embedding lookup. (Serve --continuous-batch-size works: w4cb27 gate passed.)
 
 ## C11b fused producer sidecars (11:50-12:16 UTC = 15:50-16:16 Dubai)
-- Design: the rmsnorm / silu*up / rotate producers emit the MMQ X sidecar next to the f32 x_rot and hand it to `gemm_iu4g256_multi` through `gpu.iu4_pending_x` (consumed only when ptr/n/k/kind match, generation-checked; otherwise falls back to ensure_int*_mmq_x). New `fused_silu_mul_mq_rotate_i8_gfx11` (block_i8_128 quant+emit prepended to the IU4_SIDECAR silu producer). Knob `HIPFIRE_IU4_FUSED_X`: 0 off; unset/1 = a8 fused (default); `all` = also a4.
+- Design: the rmsnorm / silu*up / rotate producers emit the MMQ X sidecar next to the f32 x_rot and hand it to `gemm_iu4g128_multi` through `gpu.iu4_pending_x` (consumed only when ptr/n/k/kind match, generation-checked; otherwise falls back to ensure_int*_mmq_x). New `fused_silu_mul_mq_rotate_i8_gfx11` (block_i8_128 quant+emit prepended to the IU4_SIDECAR silu producer). Knob `HIPFIRE_IU4_FUSED_X`: 0 off; unset/1 = a8 fused (default); `all` = also a4.
 - a4 fusion is opt-in because the i4 producer emit uses the reduced MSE candidate set, so the sidecar is not bit-exact to `ensure_int4_mmq_x` (8 candidates); ~20% of sidecar bytes differ in t11b. Exact a4 would need the RUNTIME_CAND cand_mode=8 variant (not done).
 - RMSNorm producers that keep x_rot in LDS need (k+256)*4 <= 65536; larger k (17408) falls back (the f32 reference itself fails "invalid argument" there).
 - t11b (iu4_fused_x_producers_gpu, k {256,768,2560,9728,17408} x n {1,7,64,333,2048} x Norm/Silu/Rot x i4/i8 x awq): SUMMARY cases=224 bad=0 (x_rot bit-exact + deterministic everywhere, i8 sidecars bit-exact, i4 = candset only).
@@ -468,7 +468,7 @@ C9 also diverged solo-vs-cb4 on `story`, so a cb4-server path difference predate
   | a8 C11a | 1156.30 | 1154.60 | 46.7 |
   | MQ4P | 1575.10 | 1572.65 | 46.8 |
   - a8 fusion: +0.7%/+0.3% (4B), +0.8%/+0.7% (27B): small, the a8 gap is the matmul (step 3). a8 vs a4: -13% (4B), -21% (27B). a4all closes 4B to -1.4%/-1.8% of MQ4P.
-- chZ (batched decode): MQ4P 4B slots r1-3 rc=0; every IU4 slots run failed: embedding IU8G128 had no slots lookup. Step 5 finding: the embedding is not the only gap. forward_slots.rs admits no IU4G256/IU8G128 projection (slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key, lm_head_slots_admissible), so batched slots decode for IU4 needs a real port (KernelKey entries for the IU4 multi GEMM + IU8G128 residual, graph-capture-safe X prep). Embedding arm added (embed_lookup_slots + admit list, uses existing embedding_lookup_iu8g128_batched, device token ids => capture safe); slots lib tests 22/22 pass. Serve --continuous-batch-size (non-slots batched route) already works (w4cb27 gate).
+- chZ (batched decode): MQ4P 4B slots r1-3 rc=0; every IU4 slots run failed: embedding IU8G128 had no slots lookup. Step 5 finding: the embedding is not the only gap. forward_slots.rs admits no IU4G128/IU8G128 projection (slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key, lm_head_slots_admissible), so batched slots decode for IU4 needs a real port (KernelKey entries for the IU4 multi GEMM + IU8G128 residual, graph-capture-safe X prep). Embedding arm added (embed_lookup_slots + admit list, uses existing embedding_lookup_iu8g128_batched, device token ids => capture safe); slots lib tests 22/22 pass. Serve --continuous-batch-size (non-slots batched route) already works (w4cb27 gate).
 - Step 4 (IU8G128 wo gap) in progress: same ISA mix as Q8_0 (6 b128 + 8 b32 + 1 d16_b16, llvm-objdump/clang -S gfx1100); hypothesis (untested): the planar scale stream (K bytes past the codes) costs an extra scattered cache line per block. Change: hoist scales to one b128 load per 8 blocks when K%256==0 (IU8 ISA now 7 b128, 77 VGPR; Q8_0 ISA unchanged byte-for-byte except cuid). Needs bit-exact test + rocprof A/B.
 
 ### C11b gates (chB, finished 16:21 Dubai)
@@ -502,11 +502,11 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
 ### Step 3: a8 vs a4 prefill matmul, 4B IU4P, bench_prefill 2048 x4, rocprof kernel-trace (c11b)
 | kernel | calls | ms | VGPR | WG |
 |---|---|---|---|---|
-| gemm_iu4g256_w4a8_full_set (t128) | 2176 | 489.11 | 120 | 512 |
-| gemm_iu4g256_w4a4_full_set_lf16_col | 2176 | 331.52 | 96 | 512 |
+| gemm_iu4g128_w4a8_full_set (t128) | 2176 | 489.11 | 120 | 512 |
+| gemm_iu4g128_w4a4_full_set_lf16_col | 2176 | 331.52 | 96 | 512 |
 | MQ4P gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col | 2176 | 343.91 | 96 | 512 |
 
-- CORRECTION: the runtime a4 kernel is gemm_iu4g256_w4a4_* (the mmq_iu4 gfx11 file, v_wmma_i32_16x16x16_iu4), not GEMM_IU4G256_MMQ_SRC (iu8 WMMA). The earlier static-ISA "a4 also uses iu8 WMMA" note was about the wrong kernel. So a4 vs a8 is iu4 WMMA vs iu8 WMMA, plus data movement.
+- CORRECTION: the runtime a4 kernel is gemm_iu4g128_w4a4_* (the mmq_iu4 gfx11 file, v_wmma_i32_16x16x16_iu4), not GEMM_IU4G128_MMQ_SRC (iu8 WMMA). The earlier static-ISA "a4 also uses iu8 WMMA" note was about the wrong kernel. So a4 vs a8 is iu4 WMMA vs iu8 WMMA, plus data movement.
 - `HIPFIRE_GFX11_A8_PREFILL=1` on MQ4P did not engage MQ4P's a8 kernel: the trace shows the same mmq_iu4 kernels. a8_prefill_active also requires mq4v2_symmetric, and this MQ4P model apparently is not (untested inference). So there is no runtime comparison against MQ4P's iu8 kernel. The static ISA comparison stands: IU4 t128 has 1062 instructions vs MQ4P's 917, with 32 WMMAs each.
 - PMC (rocprofv3 --pmc, 4 counters per pass) is unreliable here. SQ_INSTS_LDS, SQ_INSTS_VALU, SQ_WAVE_CYCLES and SQ_INST_CYCLES_VMEM read 0. The same MQ4P kernel gives SQC_LDS_BANK_CONFLICT 5.49e8 in one pass and 2.74e8 in another, with IDX_ACTIVE 0 vs 8.2e8. Only SQ_WAVES (3554 per dispatch for both) and SQ_BUSY_CYCLES (a8/a4 = 1.39) look plausible. No bank-conflict claim is made.
 - Tile 128 vs 256 (c12, x2):
@@ -522,7 +522,7 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
   - Gate c13x1 (FUSED_X=1): all 6 shas match b4a4.
   - Both gates: unstable 0, conc 0, errors 0.
 - Slots step 5: only the IU8G128 embedding arm has been committed (74b59ff5a).
-  - Still missing: IU4G256/IU8G128 in slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key and lm_head_slots_admissible, plus the slots-side producer and pending-x wiring.
+  - Still missing: IU4G128/IU8G128 in slots_proj_admissible, slots_plain_gemm_key, slots_residual_gemm_key and lm_head_slots_admissible, plus the slots-side producer and pending-x wiring.
   - chZ (slots) does not run on IU4 until that port lands. NOT STARTED.
 - qt58 rotation: last item, untouched.
 
@@ -537,7 +537,7 @@ b4a4, b4a8, b4a8cb, b27a8, b27a4: unstable 0, conc_mismatch 0, errors 0 for ever
 ### (2) C14 commit 82672f514: per-role/layer a8 override
 - Gpu fields iu4_role (u8, MAX=none) and iu4_layer (idx, n_layers); role set at entry of the 6 projection fns
   (full-attn in/out, deltanet in/out, ffn gate_up/down); layer set (+role reset) at the top of both prefill.rs layer loops.
-- Gpu::iu4_act_eff() replaces the global act in iu4_fused_x_act (producer) and gemm_iu4g256_multi (consumer), so producer+consumer agree.
+- Gpu::iu4_act_eff() replaces the global act in iu4_fused_x_act (producer) and gemm_iu4g128_multi (consumer), so producer+consumer agree.
 - Env: HIPFIRE_IU4_A8_ROLES=aqkv,ao,dqkv,do,gu,dn,all ; HIPFIRE_IU4_A8_LAYERS=firstN,lastN,a-b,a. Only when base act is a4. Both unset = off.
 - Sanity: default KL bitwise = C13 (0.03875639474581316); ROLES=all KL = a8 bitwise (4B 3.897451151503087e-4).
 - `do` is a no-op: KL bitwise = default on both models (DeltaNet wo in these IU4P models is IU8G128 (C12), not IU4 — inference from C12, consistent with the result).
@@ -571,7 +571,7 @@ the same N*(K/128)*136 B, per K128 block kb one chunk at kb*N*136 = [N x 128 B q
 Every token's qs starts 128 B aligned (legacy layout: 136*T+8). The consumer's fetch_slab uses a qs-plane
 descriptor (bound N*128), and fetch_hdr uses a header-plane descriptor (bound N*8, offset 8*T). Twins were added for the
 standalone quantizer (quantize_int8_mmq_ds128_xp), the 3 gfx11 i8 producers (*_i8x_gfx11) and the
-w4a8 t128/t256 GEMMs (gemm_iu4g256_w4a8x_*).
+w4a8 t128/t256 GEMMs (gemm_iu4g128_w4a8x_*).
 
 Bit-exactness (test `iu4_i8_xplanar_gpu`, run with TILE auto/128/256: bad=0 each):
 - standalone XP bytes == relayout(legacy bytes): 25 (K,N) cases, K∈{256..17408}, N∈{1,7,64,333,2048}
@@ -596,7 +596,7 @@ Not measured: an ISA diff of the xp kernel (llvm-objdump), a 4B gate on the xp p
 Steer: int8 work deprioritised. a8 GEMM-gap investigation and WMMA iu8 microbench DROPPED (wm.hip compiled+ISA-checked, never run).
 Future work (untested hypotheses): a8 gap = weight-unpack ALU + 2x X LDS bytes, not WMMA rate (static ISA: a4 lf16_col 64 iu4 WMMA/955 instr/96 VGPR; a8x 32 iu8 WMMA/1072 instr/118 VGPR, not per-tile normalised). qt58 (IU8G128) int8 rotation: not started.
 
-C16 (89d74ab2f): forward_slots admits IU4G256 (proj + rotated), IU8G128 lm_head + residual (gfx1100/1151, k%32==0); Uniform IU4 groups (qkvza x2, qkv x2, gate_up) + residual/w_down via gemm_iu4g256_multi on x_rot. Builds clean.
+C16 (89d74ab2f): forward_slots admits IU4G128 (proj + rotated), IU8G128 lm_head + residual (gfx1100/1151, k%32==0); Uniform IU4 groups (qkvza x2, qkv x2, gate_up) + residual/w_down via gemm_iu4g128_multi on x_rot. Builds clean.
 **C16 is compiled but NOT exercised**: the only daemon consumer (serve.vmm_batch, HIPFIRE_SERVE_VMM_BATCH=1) refuses Qwen3.5-4B for BOTH formats:
 "VMM continuous batch unsupported for this model: exact VMM route: layer 0 is not a dense uniform-MQ4G256V2 layer". Legacy SlotEngine (serve.multi_slot) not tried. vmm_iu4 c15 vs c16 hashes identical (aeff3a104d...) = singleton route, nothing changed. saddle-lab test_forward_slots_golden on IU4P not run -> C16 numerics/coherence UNTESTED.
 
@@ -655,7 +655,7 @@ and `HIPFIRE_IU8G128_MB4=0` are A/B controls.
 
 `ordinary_prefill_static_ceiling` admitted only uniform MQ4G256V2 / native
 MQ4G256 dense models to the widened chunks; IU4 dense stayed on the 512-row
-legacy cadence. The IU4 family (all projections IU4G256, or IU8G128 in the LA
+legacy cadence. The IU4 family (all projections IU4G128, or IU8G128 in the LA
 out role) is now admitted when the env opt-in is set. The route keeps its
 512-row commit seams, so it is the same per-row arithmetic grouped into larger
 chunks.
@@ -736,7 +736,7 @@ traces, FILE header FLOP accounting.
   accumulator converts, and the existing opt-in W4A8 route measured slower.
 - Decode: f32 FMAC/FMA (VOPD present but limited by pairing rules), 14.82 GB
   of weights per token / 23.03 ms = **643 GB/s = 67% of 960 GB/s** (76% of a
-  realistic ~850 GB/s). `fused_iu4g256_rows` is the best stream (~874 GB/s);
+  realistic ~850 GB/s). `fused_iu4g128_rows` is the best stream (~874 GB/s);
   qt58 wo ~623 GB/s.
 - No hot kernel sets `SLC`/`DLC`; every load is default LRU.
 
@@ -841,7 +841,7 @@ single thread walking `n_tiles` records strided 1,032 B (25.4 MiB per layer at
 tile 128; 24 workgroups = 24 CUs).
 
 Every other decode kernel is context-independent: the weight stream
-(14.82 GB/step: `gemm_iu4g256_w4a4_*`, `gemm_iu8g128_residual_wmma_mb4m2`,
+(14.82 GB/step: `gemm_iu4g128_w4a4_*`, `gemm_iu8g128_residual_wmma_mb4m2`,
 `gemv_*`), GDN (`gated_delta_net_q8_fast`), the FA prep/norm/rope chain and the
 q8 KV row write.
 
@@ -984,21 +984,21 @@ the unconditional qt58 prefill path and deleted the knob.
 ## C21 — multi-slot decode: one weight pass for every live slot (2026-11-03)
 
 **Problem.** The paged 4-slot decode ran the IU4 projections through
-`gemm_iu4g256_multi`. Under retained PM4 recording that route is not
+`gemm_iu4g128_multi`. Under retained PM4 recording that route is not
 MMQ-eligible (`replay.is_recording()`), so it fell to
-`gemm_iu4g256_pertoken`: one f32 GEMV launch per projection per live slot.
+`gemm_iu4g128_pertoken`: one f32 GEMV launch per projection per live slot.
 Every decode step re-read the whole IU4 weight set once per slot. The engine
 is weight-bandwidth bound, and the numbers said exactly that: four lanes at
 61.8-65.5 tok/s aggregate = 14.82 GB x 64/s ≈ 950 GB/s, i.e. the HBM wall
 for four independent passes.
 
-**Change.** `gemv_iu4g256_xbatch` / `gemv_iu4g256_xbatch_residual`
-(`kernels/src/gemv_iu4g256_xbatch.hip`), the IU4 twin of the MQ4V2 xbatch
+**Change.** `gemv_iu4g128_xbatch` / `gemv_iu4g128_xbatch_residual`
+(`kernels/src/gemv_iu4g128_xbatch.hip`), the IU4 twin of the MQ4V2 xbatch
 GEMV: each weight row is decoded once per launch and dotted with up to four
 activation columns. `slots_iu4_multi` routes decode-width rows
 (`2..=FEW_ROW_ROUTE_ROWS`) through it, so qkvza / qkv / gate+up / w_down / wo
 each become one launch per step; `n = 1` and prefill keep the incumbent
-route. `gemv_iu4g256_xbatch` is bit-identical to `gemv_iu4g256` on every
+route. `gemv_iu4g128_xbatch` is bit-identical to `gemv_iu4g128` on every
 tested shape (random tails and the model's 2560/5120/6144/9216/17408-K
 projections). The residual variant follows the same expression order but is
 compiled in a different module, so the FMA contraction differs: measured
@@ -1069,11 +1069,11 @@ place they were being left idle.
 
 | stage | route | unit | state |
 |---|---|---|---|
-| prefill, qt57 body | `gemm_iu4g256_multi` -> `gemm_iu4g256_w4a4_*` | `v_wmma_i32_16x16x16_iu4` | used, 66% of F16 peak (C18) |
-| prefill, qt57 A8 opt-in | `gemm_iu4g256_w4a8_*` | `v_wmma_i32_16x16x16_iu8` | opt-in, slower (C14/C15) |
+| prefill, qt57 body | `gemm_iu4g128_multi` -> `gemm_iu4g128_w4a4_*` | `v_wmma_i32_16x16x16_iu4` | used, 66% of F16 peak (C18) |
+| prefill, qt57 A8 opt-in | `gemm_iu4g128_w4a8_*` | `v_wmma_i32_16x16x16_iu8` | opt-in, slower (C14/C15) |
 | prefill, qt58 wo | was `gemm_iu8g128_residual_wmma` | F16 WMMA + int8->f16 dequant | **idle IU8 core** |
 | prefill, qt58 wo (now) | `gemm_iu8g128_w8a8_min` (128x128 LDS) | `v_wmma_i32_16x16x16_iu8` | used |
-| decode, qt57 | `gemv_iu4g256_xbatch` (new) / `gemv_iu4g256` at n=1 | f32 FMAC | by design; see below |
+| decode, qt57 | `gemv_iu4g128_xbatch` (new) / `gemv_iu4g128` at n=1 | f32 FMAC | by design; see below |
 | decode, qt58 lm_head/wo | `gemv_iu8g128_v2_r*` | f32 FMAC | by design |
 | decode, integer opt-ins | `HIPFIRE_IU4_DECODE=dot4/dot8` (the qt58 `HIPFIRE_IU8_GEMV=dot4` arm was removed in C24) | `v_dot4_i32_iu8` / `v_dot8_i32_iu4` | off, measured slower/bad |
 
@@ -1181,10 +1181,10 @@ reached. The measurements stay above; this is the index.
 
 | knob / arm | experiment | what it measured | removed |
 |---|---|---|---|
-| `HIPFIRE_IU4_PREFILL_ACT=a8q` | C2 / C11a | IU4 Q8_1 MMQ (`gemm_iu4g256_mmq*`, the `HIPFIRE_MMQ_IU4L` build of the MQ4V2 MMQ): 27B pp512 1053 vs a4 1460 vs MQ4P 1578 tok/s (−33% vs MQ4P); 4B KL 1.64e-3 vs a8 3.9e-4 | the `A8Q` arm, `gemm_iu4g256_mmq_prequant`, `GEMM_IU4G256_MMQ_SRC`, the `HIPFIRE_MMQ_IU4L` branches of `gemm_mq4g256v2_residual_mmq.hip`, and the a8q half of `iu4_mmq_gemm_gpu` (renamed `iu4_pertoken_gemm_gpu`; it still gates the per-token fallback) |
+| `HIPFIRE_IU4_PREFILL_ACT=a8q` | C2 / C11a | IU4 Q8_1 MMQ (`gemm_iu4g128_mmq*`, the `HIPFIRE_MMQ_IU4L` build of the MQ4V2 MMQ): 27B pp512 1053 vs a4 1460 vs MQ4P 1578 tok/s (−33% vs MQ4P); 4B KL 1.64e-3 vs a8 3.9e-4 | the `A8Q` arm, `gemm_iu4g128_mmq_prequant`, `GEMM_IU4G128_MMQ_SRC`, the `HIPFIRE_MMQ_IU4L` branches of `gemm_mq4g256v2_residual_mmq.hip`, and the a8q half of `iu4_mmq_gemm_gpu` (renamed `iu4_pertoken_gemm_gpu`; it still gates the per-token fallback) |
 | `HIPFIRE_IU4_SMALLM=mmq` | C10 | small-M (M < 128) on the MMQ instead of the f16 MW-LDS WMMA: −3.1/−3.2% pp512/pp2048 and KL 0.073 vs 0.065 (a4) | the knob; M < 128 always takes the MW-LDS WMMA |
 | `HIPFIRE_IU4_A8_ROLES` / `HIPFIRE_IU4_A8_LAYERS` | C14 | per-role / per-layer a8 over a4: the KL is not concentrated in a few roles; recovering most of it (gu+dqkv+dn) costs ~all of a8's speed (−16% 4B, −23% 27B pp2048) | the selector, `Gpu::iu4_role` / `iu4_layer`, `Gpu::IU4_ROLE_*` and their eight call-site writes; `a8` itself stays as the global opt-in |
-| `HIPFIRE_IU4_I8_XPLANAR=1` | C15 | 128 B-aligned int8 X planes: bit-identical, +0.35% (4B) / +0.48% (27B) under rocprof, only on the non-default a8 path | `Gpu::i8_xplanar_emit`, `ensure_int8_mmq_x_layout`, `gemm_iu4g256_w4a8_prequant_layout`, the `gemm_iu4g256_w4a8x*` / `quantize_int8_mmq_ds128_xp` / `*_i8x_gfx11` producer twins, the `I8_XPLANAR` branches of `block_i8_128_{quant,emit}.hip` and `gemm_mq4g256v2_residual_mmq_i8.gfx11.hip`, and `iu4_i8_xplanar_gpu` |
+| `HIPFIRE_IU4_I8_XPLANAR=1` | C15 | 128 B-aligned int8 X planes: bit-identical, +0.35% (4B) / +0.48% (27B) under rocprof, only on the non-default a8 path | `Gpu::i8_xplanar_emit`, `ensure_int8_mmq_x_layout`, `gemm_iu4g128_w4a8_prequant_layout`, the `gemm_iu4g128_w4a8x*` / `quantize_int8_mmq_ds128_xp` / `*_i8x_gfx11` producer twins, the `I8_XPLANAR` branches of `block_i8_128_{quant,emit}.hip` and `gemm_mq4g256v2_residual_mmq_i8.gfx11.hip`, and `iu4_i8_xplanar_gpu` |
 | `HIPFIRE_IU8_GEMV=dot4` | C8 | qt58 W8A8 decode GEMV `gemv_iu8g128_a8_r{1,2,4}`: −0.4% (noise) on 4B decode, KL 7.34e-4 vs f32 | the `_a8` kernels in `gemv_iu8g128.hip`, their registry symbols (the module is now arch-agnostic), and `iu8g128_a8_gemv_matches_contract`; `=v1` stays as the A/B control |
 | `HIPFIRE_IU8_W8A8=1` | C20 | in-place per-128 requant request | already removed by C9 compact qt58; the stale "code gate" text above now says so |
 
@@ -1257,7 +1257,7 @@ what makes the delta visible.
 
 The multi-slot step still reads the projections at ~400 GB/s effective weight
 bandwidth (18.6 GB with the old head / 45.5 ms), against 622 GB/s for the
-singleton per-token GEMV (`gemv_iu4g256`, 14.82 GB / 23.8 ms). Microbench at
+singleton per-token GEMV (`gemv_iu4g128`, 14.82 GB / 23.8 ms). Microbench at
 the model's projection shapes (`iu4_xbatch_shape_cost`, one launch):
 
 | shape | B=1 | B=4 |
@@ -1309,7 +1309,7 @@ capacity measurement below) and driven with four concurrent
   `mem_busy_percent` 10-52, VRAM 25.39/25.8 GB. Host `docker stats` CPU
   97-101 % (one engine thread saturates a core feeding the tape), 0 % when idle.
   The multi-slot decode is GPU-compute/issue bound, consistent with the
-  `gemv_iu4g256_xbatch` B=4 analysis in C25.
+  `gemv_iu4g128_xbatch` B=4 analysis in C25.
 - Container tape metadata vs the host build: container
   `typed=453 untyped=689 (no_effects=689)` with the xbatch/GDN/IU8 kernels on
   the snapshot backlog; host `typed=1145 untyped=0`. The image's baked
@@ -1325,11 +1325,11 @@ capacity measurement below) and driven with four concurrent
 
 ### The hard failure (observed)
 
-1. **Internal `gemv_iu4g256_xbatch: batch must be 1..=4`.** A step with 5-8
+1. **Internal `gemv_iu4g128_xbatch: batch must be 1..=4`.** A step with 5-8
    live rows (the IU4 xbatch route admitted `2..=FEW_ROW_ROUTE_ROWS` = 2..=8
    while the kernel takes four columns) raised
    `[internal retryable=false …] multi_slot rejected: HipError(0):
-   gemv_iu4g256_xbatch: batch must be 1..=4` and `fail_all_active` closed
+   gemv_iu4g128_xbatch: batch must be 1..=4` and `fail_all_active` closed
    every active lane.
 2. **Late, oversubscribed admission.** 4 x (39,598-token prompt,
    `max_tokens=50000`, i.e. 701 pages each against a 1200-page pool): all four
@@ -1345,8 +1345,8 @@ capacity measurement below) and driven with four concurrent
 
 ### Fixes
 
-- `Gpu::gemv_iu4g256_xbatch` accepts any positive batch and splits it into
-  consecutive column blocks of at most `IU4G256_XBATCH_COLUMNS` (4); the
+- `Gpu::gemv_iu4g128_xbatch` accepts any positive batch and splits it into
+  consecutive column blocks of at most `IU4G128_XBATCH_COLUMNS` (4); the
   residual twin uses the same path. Plain stays bit-identical to the singleton
   per column, residual <= 1.3e-7, deterministic (gate now batches 1..=8).
 - KV capacity is measured, not assumed. Geometry: 16 full-attention layers,

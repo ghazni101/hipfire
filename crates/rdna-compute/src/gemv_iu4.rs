@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Decode GEMV for [`crate::DType::IU4G256`].
+//! Decode GEMV for [`crate::DType::IU4G128`].
 //!
 //! f32 activation, wide loads: block 128, one output row per 32-lane wave,
 //! each lane reading 16 code bytes per 32 weights (see gemv_iu4.hip). Needs
@@ -10,7 +10,7 @@
 //! (`hipfire_runtime::iu_quant::row_bytes`); the launcher refuses a weight
 //! base that is not 16-byte aligned.
 //!
-//! `gemv_iu4g256_residual` is the fused `y += W·x` twin. `fused_iu4g256_rows`
+//! `gemv_iu4g128_residual` is the fused `y += W·x` twin. `fused_iu4g128_rows`
 //! runs up to four matrices that share `x` in one launch (gate/up, q/k/v,
 //! qkv/z/beta/alpha); each output equals the plain kernel on that matrix.
 //!
@@ -22,17 +22,17 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-const MODULE: &str = "gemv_iu4g256";
+const MODULE: &str = "gemv_iu4g128";
 
-/// Activation columns one `gemv_iu4g256_xbatch*` kernel launch takes (the
-/// compiled `HIPFIRE_IU4G256_XBATCH_MAX`). [`Gpu::gemv_iu4g256_xbatch`]
+/// Activation columns one `gemv_iu4g128_xbatch*` kernel launch takes (the
+/// compiled `HIPFIRE_IU4G128_XBATCH_MAX`). [`Gpu::gemv_iu4g128_xbatch`]
 /// accepts any batch width and splits it into launches of at most this many
 /// columns, so a caller can pass a whole step's live-row count (the
 /// multi-slot engine reaches 5-8 rows on mixed decode + prefill-tail steps)
 /// without knowing the kernel's shape.
-pub const IU4G256_XBATCH_COLUMNS: usize = 4;
+pub const IU4G128_XBATCH_COLUMNS: usize = 4;
 
-/// Integer-activation decode mode for IU4G256 (`HIPFIRE_IU4_DECODE`).
+/// Integer-activation decode mode for IU4G128 (`HIPFIRE_IU4_DECODE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Iu4DecodeMode {
     /// Default: f32 activation, wide-load kernels.
@@ -84,9 +84,9 @@ fn check_shape(what: &str, m: usize, k: usize) -> HipResult<()> {
 }
 
 impl Gpu {
-    /// `y = W x` for a planar IU4G256 weight. `x` is one FWHT-256-rotated
+    /// `y = W x` for a planar IU4G128 weight. `x` is one FWHT-256-rotated
     /// f32 vector of length `k`. `k` must be a positive multiple of 256.
-    pub fn gemv_iu4g256(
+    pub fn gemv_iu4g128(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -95,15 +95,15 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
-            Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, false),
-            Iu4DecodeMode::F32 => "gemv_iu4g256",
+            Iu4DecodeMode::Dot4 => return self.gemv_iu4g128_dot4q(a, x, y, m, k, false),
+            Iu4DecodeMode::F32 => "gemv_iu4g128",
         };
-        self.gemv_iu4g256_launch(func, a, x, y, m, k)
+        self.gemv_iu4g128_launch(func, a, x, y, m, k)
     }
 
-    /// `y += W x` for a planar IU4G256 weight (`y` is both accumulated into
+    /// `y += W x` for a planar IU4G128 weight (`y` is both accumulated into
     /// and stored).
-    pub fn gemv_iu4g256_residual(
+    pub fn gemv_iu4g128_residual(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -112,15 +112,15 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         let func = match iu4_decode_mode() {
-            Iu4DecodeMode::Dot4 => return self.gemv_iu4g256_dot4q(a, x, y, m, k, true),
-            Iu4DecodeMode::F32 => "gemv_iu4g256_residual",
+            Iu4DecodeMode::Dot4 => return self.gemv_iu4g128_dot4q(a, x, y, m, k, true),
+            Iu4DecodeMode::F32 => "gemv_iu4g128_residual",
         };
-        self.gemv_iu4g256_launch(func, a, x, y, m, k)
+        self.gemv_iu4g128_launch(func, a, x, y, m, k)
     }
 
     /// The W4A8 `v_dot4` kernel, regardless of `HIPFIRE_IU4_DECODE`
     /// (parity tests and A/B). `residual` selects `y += W x`.
-    pub fn gemv_iu4g256_dot4(
+    pub fn gemv_iu4g128_dot4(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -130,17 +130,17 @@ impl Gpu {
         residual: bool,
     ) -> HipResult<()> {
         let func = if residual {
-            "gemv_iu4g256_dot4_residual"
+            "gemv_iu4g128_dot4_residual"
         } else {
-            "gemv_iu4g256_dot4"
+            "gemv_iu4g128_dot4"
         };
-        self.gemv_iu4g256_launch(func, a, x, y, m, k)
+        self.gemv_iu4g128_launch(func, a, x, y, m, k)
     }
 
     /// W4A8 v2: quantize `x` once (`iu4_quant_x_a8`) into the fixed scratch,
-    /// then `gemv_iu4g256_dot4q[_residual]`. Same per-group arithmetic as
-    /// [`Self::gemv_iu4g256_dot4`]. Used by `HIPFIRE_IU4_DECODE=dot4`.
-    pub fn gemv_iu4g256_dot4q(
+    /// then `gemv_iu4g128_dot4q[_residual]`. Same per-group arithmetic as
+    /// [`Self::gemv_iu4g128_dot4`]. Used by `HIPFIRE_IU4_DECODE=dot4`.
+    pub fn gemv_iu4g128_dot4q(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -149,14 +149,14 @@ impl Gpu {
         k: usize,
         residual: bool,
     ) -> HipResult<()> {
-        check_shape("gemv_iu4g256_dot4q", m, k)?;
+        check_shape("gemv_iu4g128_dot4q", m, k)?;
         let qp = self.iu4_quant_x_a8(x.buf.as_ptr(), k)?;
         let func = if residual {
-            "gemv_iu4g256_dot4q_residual"
+            "gemv_iu4g128_dot4q_residual"
         } else {
-            "gemv_iu4g256_dot4q"
+            "gemv_iu4g128_dot4q"
         };
-        self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), qp, y.buf.as_ptr(), m, k)
+        self.gemv_iu4g128_launch_raw(func, a.buf.as_ptr(), qp, y.buf.as_ptr(), m, k)
     }
 
     /// Quantize a length-`k` f32 `x` into `scratch.iu4_a8_x_scratch` and
@@ -180,7 +180,7 @@ impl Gpu {
             self.scratch.iu4_a8_x_scratch = Some(b);
         }
         let qp = self.scratch.iu4_a8_x_scratch.as_ref().unwrap().as_ptr();
-        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, "iu4_quant_x_a8")?;
+        self.ensure_kernel(MODULE, kernels::GEMV_IU4G128_SRC, "iu4_quant_x_a8")?;
         let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
@@ -209,9 +209,9 @@ impl Gpu {
         Ok(qp)
     }
 
-    /// `y_i = W_i x` for up to four IU4G256 weights sharing `x` and `k`, in
+    /// `y_i = W_i x` for up to four IU4G128 weights sharing `x` and `k`, in
     /// one launch. Each `(weight, output, rows)`; an empty slice is an error.
-    pub fn fused_iu4g256_rows(
+    pub fn fused_iu4g128_rows(
         &mut self,
         mats: &[(&GpuTensor, &GpuTensor, usize)],
         x: &GpuTensor,
@@ -220,24 +220,24 @@ impl Gpu {
         if mats.is_empty() || mats.len() > 4 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "fused_iu4g256_rows: 1..=4 matrices",
+                "fused_iu4g128_rows: 1..=4 matrices",
             ));
         }
         let total: usize = mats.iter().map(|m| m.2).sum();
-        check_shape("fused_iu4g256_rows", total, k)?;
+        check_shape("fused_iu4g128_rows", total, k)?;
         if total > u32::MAX as usize {
             return Err(hip_bridge::HipError::new(
                 0,
-                "fused_iu4g256_rows: grid overflow",
+                "fused_iu4g128_rows: grid overflow",
             ));
         }
         let dot4 = iu4_decode_mode() == Iu4DecodeMode::Dot4;
-        self.fused_iu4g256_rows_impl(mats, x, k, dot4)
+        self.fused_iu4g128_rows_impl(mats, x, k, dot4)
     }
 
-    /// [`Self::fused_iu4g256_rows`] with the kernel chosen explicitly:
-    /// `dot4` = quantize x once, then `fused_iu4g256_dot4q_rows` (W4A8).
-    pub fn fused_iu4g256_rows_impl(
+    /// [`Self::fused_iu4g128_rows`] with the kernel chosen explicitly:
+    /// `dot4` = quantize x once, then `fused_iu4g128_dot4q_rows` (W4A8).
+    pub fn fused_iu4g128_rows_impl(
         &mut self,
         mats: &[(&GpuTensor, &GpuTensor, usize)],
         x: &GpuTensor,
@@ -247,15 +247,15 @@ impl Gpu {
         if mats.is_empty() || mats.len() > 4 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "fused_iu4g256_rows: 1..=4 matrices",
+                "fused_iu4g128_rows: 1..=4 matrices",
             ));
         }
         let total: usize = mats.iter().map(|m| m.2).sum();
-        check_shape("fused_iu4g256_rows", total, k)?;
+        check_shape("fused_iu4g128_rows", total, k)?;
         let fname: &'static str = if dot4 {
-            "fused_iu4g256_dot4q_rows"
+            "fused_iu4g128_dot4q_rows"
         } else {
-            "fused_iu4g256_rows"
+            "fused_iu4g128_rows"
         };
         let xp = if dot4 {
             self.iu4_quant_x_a8(x.buf.as_ptr(), k)?
@@ -264,11 +264,11 @@ impl Gpu {
         };
         if !dot4 {
             for (a, _, _) in mats {
-                check_wide_align("fused_iu4g256_rows", a.buf.as_ptr())?;
+                check_wide_align("fused_iu4g128_rows", a.buf.as_ptr())?;
             }
         }
         self.bind_thread()?;
-        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, fname)?;
+        self.ensure_kernel(MODULE, kernels::GEMV_IU4G128_SRC, fname)?;
         let mut ap = [std::ptr::null_mut::<c_void>(); 4];
         let mut yp = [std::ptr::null_mut::<c_void>(); 4];
         let mut mv = [0i32; 4];
@@ -328,7 +328,7 @@ impl Gpu {
         result
     }
 
-    fn gemv_iu4g256_launch(
+    fn gemv_iu4g128_launch(
         &mut self,
         func: &'static str,
         a: &GpuTensor,
@@ -337,20 +337,20 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        check_shape("gemv_iu4g256", m, k)?;
+        check_shape("gemv_iu4g128", m, k)?;
         if func.contains("dot4") && !self.arch_caps.has_iu4_wmma() {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu4g256_dot4: v_dot4_i32_iu8 is the RDNA3/RDNA4 integer dot",
+                "gemv_iu4g128_dot4: v_dot4_i32_iu8 is the RDNA3/RDNA4 integer dot",
             ));
         }
-        self.gemv_iu4g256_launch_raw(func, a.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr(), m, k)
+        self.gemv_iu4g128_launch_raw(func, a.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr(), m, k)
     }
 
     /// `y[b] = W·x[b]` (plain) or `y[b] += W·x[b]` (`residual`) for `batch`
-    /// activation columns sharing one IU4G256 weight pass, split into launches
-    /// of at most [`IU4G256_XBATCH_COLUMNS`] columns. Each column follows the
-    /// scalar `gemv_iu4g256` / `gemv_iu4g256_residual` accumulation order; the
+    /// activation columns sharing one IU4G128 weight pass, split into launches
+    /// of at most [`IU4G128_XBATCH_COLUMNS`] columns. Each column follows the
+    /// scalar `gemv_iu4g128` / `gemv_iu4g128_residual` accumulation order; the
     /// plain launch is bit-identical to running that GEMV once per column, the
     /// residual one matches to f32 rounding (its module compiles to a
     /// different FMA contraction).
@@ -361,7 +361,7 @@ impl Gpu {
     /// wider than four columns (a step with decode rows plus a prompt tail)
     /// costs one weight pass per four columns — still far cheaper than a pass
     /// per row — and never fails on width.
-    pub fn gemv_iu4g256_xbatch(
+    pub fn gemv_iu4g128_xbatch(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -374,7 +374,7 @@ impl Gpu {
         if m == 0 || k == 0 || !k.is_multiple_of(256) {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemv_iu4g256_xbatch: requires M > 0 and K % 256 == 0",
+                "gemv_iu4g128_xbatch: requires M > 0 and K % 256 == 0",
             ));
         }
         if batch == 0 {
@@ -382,11 +382,11 @@ impl Gpu {
         }
         let (fname, src): (&'static str, &'static str) = if residual {
             (
-                "gemv_iu4g256_xbatch_residual",
-                kernels::GEMV_IU4G256_XBATCH_RESIDUAL_SRC,
+                "gemv_iu4g128_xbatch_residual",
+                kernels::GEMV_IU4G128_XBATCH_RESIDUAL_SRC,
             )
         } else {
-            ("gemv_iu4g256_xbatch", kernels::GEMV_IU4G256_XBATCH_SRC)
+            ("gemv_iu4g128_xbatch", kernels::GEMV_IU4G128_XBATCH_SRC)
         };
         self.bind_thread()?;
         self.ensure_kernel(fname, src, fname)?;
@@ -398,7 +398,7 @@ impl Gpu {
         let mut result = Ok(());
         let mut off = 0usize;
         while off < batch {
-            let take = (batch - off).min(IU4G256_XBATCH_COLUMNS);
+            let take = (batch - off).min(IU4G128_XBATCH_COLUMNS);
             // `x` is [batch x K] f32 and `y` is [batch x M] f32; each launch
             // takes its own contiguous column block.
             let xp = unsafe {
@@ -438,9 +438,9 @@ impl Gpu {
         result
     }
 
-    /// Raw-pointer form of [`Self::gemv_iu4g256_launch`] (the per-token
+    /// Raw-pointer form of [`Self::gemv_iu4g128_launch`] (the per-token
     /// prefill fallback walks `x`/`y` rows of a batch).
-    pub(crate) fn gemv_iu4g256_launch_raw(
+    pub(crate) fn gemv_iu4g128_launch_raw(
         &mut self,
         func: &'static str,
         ap: *mut c_void,
@@ -449,9 +449,9 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        check_shape("gemv_iu4g256", m, k)?;
+        check_shape("gemv_iu4g128", m, k)?;
         self.bind_thread()?;
-        self.ensure_kernel(MODULE, kernels::GEMV_IU4G256_SRC, func)?;
+        self.ensure_kernel(MODULE, kernels::GEMV_IU4G128_SRC, func)?;
         let mv = m as i32;
         let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -463,7 +463,7 @@ impl Gpu {
         ];
         // The f32 kernels are the wide-load ones: 4 rows (waves) per
         // 128-thread block. The dot4 kernels are one 32-lane block per row.
-        let wide = func == "gemv_iu4g256" || func == "gemv_iu4g256_residual";
+        let wide = func == "gemv_iu4g128" || func == "gemv_iu4g128_residual";
         if wide {
             check_wide_align(func, ap)?;
         }

@@ -20,9 +20,9 @@ is the same rung as `--tier base` and is stored as `base`. The file records
 
 | product | flag | body | embed | lm_head | ssm_out |
 |---|---|---|---|---|---|
-| `iu4-xt` | `--format iu4 --tier xt` | IU4G256 | IU8G128 | body | body |
-| `iu4` | `--format iu4` | IU4G256 | IU8G128 | IU8G128 | body |
-| `iu4 pro` | `--format iu4 --tier pro` | IU4G256 | IU8G128 | IU8G128 | IU8G128 |
+| `iu4-xt` | `--format iu4 --tier xt` | IU4G128 | IU8G128 | body | body |
+| `iu4` | `--format iu4` | IU4G128 | IU8G128 | IU8G128 | body |
+| `iu4 pro` | `--format iu4 --tier pro` | IU4G128 | IU8G128 | IU8G128 | IU8G128 |
 
 `linear_attn.conv1d` is a 3-D tensor, so it stays interleaved Q8F16 (qt 3) at
 every rung; it does not take the IU8G128 row layout. On a MoE model the
@@ -82,7 +82,7 @@ is already K element `m`, so IU4 needs no permute before
 `dequant`, `gemv_iu4_dot8`, `row_bytes`, `code_bytes`. Dequant is the
 rotated-basis f32 value above.
 
-Decode GEMV for qt 57 is `gemv_iu4g256` with f32 activations, on every arch.
+Decode GEMV for qt 57 is `gemv_iu4g128` with f32 activations, on every arch.
 It is a wide-load kernel: one row per 32-lane wave, four rows per 128-thread
 block, and each lane reads 16 code bytes (32 weights) at a time, so it needs
 the 16-byte row alignment above. Per 32 weights it folds
@@ -96,13 +96,13 @@ hardware: `HIPFIRE_IU4_DECODE=dot4` (W4A8, `v_dot4_i32_iu8`). The W4A4
 `v_dot8_i32_iu4` decode route was removed; `iu_quant::gemv_iu4_dot8` stays as
 the CPU int4-activation reference.
 
-Prefill GEMM for qt 57 is W4A8 by default (`gemm_iu4g256_w4a8_*`, int8
+Prefill GEMM for qt 57 is W4A8 by default (`gemm_iu4g128_w4a8_*`, int8
 activation per 128, `v_wmma_i32_16x16x16_iu8`); `HIPFIRE_IU4_PREFILL_ACT=a4`
-selects the faster W4A4 (`gemm_iu4g256_w4a4_*`, `v_wmma_i32_16x16x16_iu4`).
+selects the faster W4A4 (`gemm_iu4g128_w4a4_*`, `v_wmma_i32_16x16x16_iu4`).
 Qwen3.5-4B on gfx1100, pp512: W4A8 about 7,700 tok/s and prefill KL vs
 BF16 0.0467 (equal to decode); W4A4 about 9,470 tok/s and KL 0.0982.
 Both run on exact gfx1100 and gfx1151 only, gated by
-`rdna_compute::arch_caps::supports_iu4g256_gemm`; every other arch takes the
+`rdna_compute::arch_caps::supports_iu4g128_gemm`; every other arch takes the
 per-token decode loop. DFlash verify runs the target's batched body, so it
 takes the same route.
 
@@ -167,10 +167,10 @@ noise embedding runs `embedding_lookup_iu8g128`).
 
 | reader | qt 57 IU4 | qt 58 IU8G128 |
 |---|---|---|
-| decode GEMV | `gemv_iu4g256` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
-| fused `y += W·x` | `gemv_iu4g256_residual` | `gemv_iu8g128_residual` |
+| decode GEMV | `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12) | `gemv_iu8g128` v2 (f32 activations, every arch) |
+| fused `y += W·x` | `gemv_iu4g128_residual` | `gemv_iu8g128_residual` |
 | embedding gather | — (the table is qt 58 on every rung) | `embedding_iu8g128` |
-| prefill GEMM | `gemm_iu4g256_w4a8_*` (`v_wmma_i32_16x16x16_iu8`; `HIPFIRE_IU4_PREFILL_ACT=a4` = W4A4 `gemm_iu4g256_w4a4_*`; gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
+| prefill GEMM | `gemm_iu4g128_w4a8_*` (`v_wmma_i32_16x16x16_iu8`; `HIPFIRE_IU4_PREFILL_ACT=a4` = W4A4 `gemm_iu4g128_w4a4_*`; gfx1100/gfx1151 only) | one selector, `Gpu::iu8g128_gemm_route` (gfx1100/gfx1151 only): `gemm_iu8g128_w8a8_min` (IU8 WMMA, W8A8) when `K % 256 == 0` and n ≥ 48 rows; the f16-WMMA twin (`gemm_iu8g128_residual_wmma` + mb4/mb4m2, `K % 128 == 0`) otherwise |
 | DFlash verify | — | qt 58 head via `gemm_iu8g128_residual_wmma` (gfx1100/gfx1151) |
 
 `hipfire_runtime::iu_quant` is the CPU contract: `dequant` for qt 57

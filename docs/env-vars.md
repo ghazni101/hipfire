@@ -1876,9 +1876,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ISA_MODULE` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_ISA_SYMBOL_SUFFIX` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
 | `HIPFIRE_ISA_TILE_ROWS` | crates/hipfire-runtime/examples/tmp_iu4_gfx12_v3_oracle.rs | harness |
-| `HIPFIRE_IU4G256_RESIDUAL_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_IU4G256_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_IU4G256_XBATCH_MAX` | crates/rdna-compute/src/gemv_iu4.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU4G128_RESIDUAL_EPILOGUE` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU4G128_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_IU4G128_XBATCH_MAX` | crates/rdna-compute/src/gemv_iu4.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_IU4_BAFOLD` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_IU4_C2_ONEPASS` | crates/rdna-compute/src/kernels.rs, scripts/test_gfx1100_xts_scope.py | developer |
 | `HIPFIRE_IU4_DECODE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-runtime/src/iu_quant.rs | developer |

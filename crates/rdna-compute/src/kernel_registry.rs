@@ -395,28 +395,28 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     let iu_int_gemv = matches!(arch, "gfx1100" | "gfx1151" | "gfx1201");
     if iu_int_gemv {
         add!(
-            "gemv_iu4g256",
-            kernels::GEMV_IU4G256_SRC,
+            "gemv_iu4g128",
+            kernels::GEMV_IU4G128_SRC,
             [
-                "gemv_iu4g256",
-                "gemv_iu4g256_residual",
-                "fused_iu4g256_rows",
-                "gemv_iu4g256_dot4",
-                "gemv_iu4g256_dot4_residual",
+                "gemv_iu4g128",
+                "gemv_iu4g128_residual",
+                "fused_iu4g128_rows",
+                "gemv_iu4g128_dot4",
+                "gemv_iu4g128_dot4_residual",
                 "iu4_quant_x_a8",
-                "gemv_iu4g256_dot4q",
-                "gemv_iu4g256_dot4q_residual",
-                "fused_iu4g256_dot4q_rows"
+                "gemv_iu4g128_dot4q",
+                "gemv_iu4g128_dot4q_residual",
+                "fused_iu4g128_dot4q_rows"
             ]
         );
     } else {
         add!(
-            "gemv_iu4g256",
-            kernels::GEMV_IU4G256_SRC,
+            "gemv_iu4g128",
+            kernels::GEMV_IU4G128_SRC,
             [
-                "gemv_iu4g256",
-                "gemv_iu4g256_residual",
-                "fused_iu4g256_rows"
+                "gemv_iu4g128",
+                "gemv_iu4g128_residual",
+                "fused_iu4g128_rows"
             ]
         );
     }
@@ -424,14 +424,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // vectors (`slots_iu4_multi`). Two modules because the epilogue macro is
     // a compile-time fork, exactly like the MQ4V2 xbatch pair.
     add!(
-        "gemv_iu4g256_xbatch",
-        kernels::GEMV_IU4G256_XBATCH_SRC,
-        ["gemv_iu4g256_xbatch"]
+        "gemv_iu4g128_xbatch",
+        kernels::GEMV_IU4G128_XBATCH_SRC,
+        ["gemv_iu4g128_xbatch"]
     );
     add!(
-        "gemv_iu4g256_xbatch_residual",
-        kernels::GEMV_IU4G256_XBATCH_RESIDUAL_SRC,
-        ["gemv_iu4g256_xbatch_residual"]
+        "gemv_iu4g128_xbatch_residual",
+        kernels::GEMV_IU4G128_XBATCH_RESIDUAL_SRC,
+        ["gemv_iu4g128_xbatch_residual"]
     );
     add!(
         "gemv_mq4g256",
@@ -11957,7 +11957,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The IU quant family readers: qt 57 (IU4G256) decode GEMV with its
+        // The IU quant family readers: qt 57 (IU4G128) decode GEMV with its
         // fused residual twin, the qt 58 (IU8G128) pair, and the qt 58
         // embedding gather. All are arch-agnostic (integer-dot / f16-scale x
         // f32 math), so every pack carries them.
@@ -11965,10 +11965,10 @@ mod tests {
         // pass for up to four activation columns).
         const IU_QUANT_ADDED_MODULES: [&str; 5] = [
             "embedding_iu8g128",
-            "gemv_iu4g256",
+            "gemv_iu4g128",
             "gemv_iu8g128",
-            "gemv_iu4g256_xbatch",
-            "gemv_iu4g256_xbatch_residual",
+            "gemv_iu4g128_xbatch",
+            "gemv_iu4g128_xbatch_residual",
         ];
         for module in IU_QUANT_ADDED_MODULES {
             assert!(

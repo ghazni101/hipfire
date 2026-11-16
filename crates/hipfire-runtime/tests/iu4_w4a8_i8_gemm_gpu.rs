@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 W4A8 iu8-WMMA prefill route (C11, the
+//! Numerics gate for the IU4G128 W4A8 iu8-WMMA prefill route (C11, the
 //! default `HIPFIRE_IU4_PREFILL_ACT=a8`, `block_i8_128` X).
 //!
-//! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g256_w4a8_prequant` returns
+//! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g128_w4a8_prequant` returns
 //!    the bits of the interleaved-row twin `gemm_mq4g256v2_asym_i8_prequant`
 //!    on `src` over the same `block_i8_128` X (tails in M and N).
 //! 2. Contract: both vs a CPU emulation of the fold over the downloaded X
@@ -143,9 +143,9 @@ fn check(
         let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
         gpu.gemm_mq4g256v2_asym_i8_prequant(&wm, xq, &y_mq, m, k, n, add)
             .unwrap();
-        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu, m, k, n, add)
+        gpu.gemm_iu4g128_w4a8_prequant(&wi, xq, &y_iu, m, k, n, add)
             .unwrap();
-        gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_iu2, m, k, n, add)
+        gpu.gemm_iu4g128_w4a8_prequant(&wi, xq, &y_iu2, m, k, n, add)
             .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let xq_len = (k / 128) * n * 136;
@@ -218,7 +218,7 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
             return;
         }
     };
-    if !gpu.iu4g256_mmq_eligible(256, 64) {
+    if !gpu.iu4g128_mmq_eligible(256, 64) {
         eprintln!("SKIP — IU4 MMQ not eligible on this arch / env.");
         return;
     }
@@ -258,7 +258,7 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
 
         let flops = 2.0 * (m as f64) * (k as f64) * (n as f64);
         for _ in 0..2 {
-            gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
+            gpu.gemm_iu4g128_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
                 .unwrap();
             gpu.gemm_iu8g128_residual_wmma(&w59, &xd, &y_f16, m, k, n)
                 .unwrap();
@@ -266,7 +266,7 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..8 {
-            gpu.gemm_iu4g256_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
+            gpu.gemm_iu4g128_w4a8_prequant(&wi, xq, &y_int, m, k, n, false)
                 .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
@@ -300,7 +300,7 @@ fn iu4_w4a8_i8_is_bit_exact_to_twin_and_emulation() {
             return;
         }
     };
-    if !gpu.iu4g256_mmq_eligible(256, 64) {
+    if !gpu.iu4g128_mmq_eligible(256, 64) {
         eprintln!("SKIP — IU4 MMQ not eligible on this arch / env.");
         return;
     }

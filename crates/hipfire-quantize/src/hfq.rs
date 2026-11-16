@@ -75,7 +75,7 @@ impl QuantType {
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
             57 => Some(Self::HC8E4M3Row),
-            60 => Some(Self::IU4G256),
+            60 => Some(Self::IU4G128),
             61 => Some(Self::IU8G128),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
@@ -262,9 +262,9 @@ pub(crate) enum QuantType {
     /// (`4*m`); decode `q * s`. Layout in `docs/quant-formats/hc8-e4m3-row.md`;
     /// built by `hipfire-quantize hc8 build`.
     HC8E4M3Row = 57,
-    /// IU4G256 (qt=60): MQ4G256V2 codes stored as an unsigned-nibble operand
+    /// IU4G128 (qt=60): MQ4G256V2 codes stored as an unsigned-nibble operand
     /// plane. See `hipfire_runtime::iu_quant`. No GPU kernel yet.
-    IU4G256 = 60,
+    IU4G128 = 60,
     /// IU8G128 (qt=61): unsigned-int8-range signed codes (one f16 scale per
     /// 128, no FWHT) in a compact row `[K i8][K/128 f16]`. The fixed tier of
     /// an `iu4` file. Full int8 range. See `iu_quant`.

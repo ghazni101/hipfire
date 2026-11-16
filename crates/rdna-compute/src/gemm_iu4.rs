@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Batched (prefill) GEMM for [`crate::DType::IU4G256`].
+//! Batched (prefill) GEMM for [`crate::DType::IU4G128`].
 //!
-//! On exact gfx1100/gfx1151 ([`crate::arch_caps::supports_iu4g256_gemm`])
+//! On exact gfx1100/gfx1151 ([`crate::arch_caps::supports_iu4g128_gemm`])
 //! the activation format is `HIPFIRE_IU4_PREFILL_ACT`: `a8` (default) is the
 //! W4A8 int8 MMQ on `v_wmma_i32_16x16x16_iu8`, `a4` the opt-in W4A4 int4 MMQ
 //! on `v_wmma_i32_16x16x16_iu4`. Each is bit-identical to its MQ4V2 twin kernel
@@ -101,26 +101,26 @@ pub struct Iu4PendingX {
     kind: Iu4PendingXKind,
 }
 
-const W4A4_MODULE: &str = "gemm_iu4g256_w4a4";
-const MWL_MODULE: &str = "gemm_iu4g256_mwl";
+const W4A4_MODULE: &str = "gemm_iu4g128_w4a4";
+const MWL_MODULE: &str = "gemm_iu4g128_mwl";
 
 impl Gpu {
     /// True when the IU4 MMQ path serves this call.
-    pub fn iu4g256_mmq_eligible(&self, k: usize, n: usize) -> bool {
+    pub fn iu4g128_mmq_eligible(&self, k: usize, n: usize) -> bool {
         n > 0
             && k % 256 == 0
-            && crate::arch_caps::supports_iu4g256_gemm(&self.arch)
+            && crate::arch_caps::supports_iu4g128_gemm(&self.arch)
             && !self.graphs.capture_mode
             && !self.replay.is_recording()
             && !iu4_prefill_gemv()
     }
 
     /// C11b: `Some(true)` = fuse an int8 (`a8`) sidecar into the producer
-    /// for an IU4G256 consumer, `Some(false)` = int4 (`a4`), `None` = the
+    /// for an IU4G128 consumer, `Some(false)` = int4 (`a4`), `None` = the
     /// f32-only producer (route ineligible or the knob off).
     fn iu4_fused_x_act(&self, k: usize, n: usize) -> Option<bool> {
         let (f8, f4) = iu4_fused_x();
-        if !self.iu4g256_mmq_eligible(k, n) {
+        if !self.iu4g128_mmq_eligible(k, n) {
             return None;
         }
         match iu4_prefill_act() {
@@ -139,7 +139,7 @@ impl Gpu {
         });
     }
 
-    /// RMSNorm+FWHT for an IU4G256 consumer, also emitting the MMQ X
+    /// RMSNorm+FWHT for an IU4G128 consumer, also emitting the MMQ X
     /// sidecar when eligible. `Ok(false)`: nothing launched; run the f32
     /// producer. Always writes the f32 `x_rot` (the small-M f16 route reads it).
     pub fn iu4_fused_rmsnorm_rotate(
@@ -274,8 +274,8 @@ impl Gpu {
         }
     }
 
-    /// `Y = W X` (or `Y += W X` when `add`) for one IU4G256 matrix.
-    pub fn gemm_iu4g256(
+    /// `Y = W X` (or `Y += W X` when `add`) for one IU4G128 matrix.
+    pub fn gemm_iu4g128(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -285,12 +285,12 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        self.gemm_iu4g256_multi(&[(a, y, m)], x, k, n, add)
+        self.gemm_iu4g128_multi(&[(a, y, m)], x, k, n, add)
     }
 
-    /// Several IU4G256 matrices over one `X` (gate/up, q/k/v,
+    /// Several IU4G128 matrices over one `X` (gate/up, q/k/v,
     /// qkv/z/beta/alpha). `X` is quantized once.
-    pub fn gemm_iu4g256_multi(
+    pub fn gemm_iu4g128_multi(
         &mut self,
         projs: &[Iu4Proj<'_>],
         x: &GpuTensor,
@@ -302,7 +302,7 @@ impl Gpu {
         if n == 0 || projs.is_empty() {
             return Ok(());
         }
-        if self.iu4g256_mmq_eligible(k, n) {
+        if self.iu4g128_mmq_eligible(k, n) {
             self.iu4_pending_x = pending;
             self.bind_thread()?;
             let mut big: Vec<Iu4Proj<'_>> = Vec::with_capacity(projs.len());
@@ -322,7 +322,7 @@ impl Gpu {
                             p
                         }
                     };
-                    self.gemm_iu4g256_mwl_residual_f16(a, xp, y, m, k, n)?;
+                    self.gemm_iu4g128_mwl_residual_f16(a, xp, y, m, k, n)?;
                 } else {
                     big.push((a, y, m));
                 }
@@ -338,7 +338,7 @@ impl Gpu {
                         None => self.ensure_int4_mmq_x(x, n, k)?,
                     };
                     for &(a, y, m) in &big {
-                        self.gemm_iu4g256_w4a4_prequant(a, xq, y, m, k, n, add)?;
+                        self.gemm_iu4g128_w4a4_prequant(a, xq, y, m, k, n, add)?;
                     }
                 }
                 Iu4PrefillAct::A8 => {
@@ -347,18 +347,18 @@ impl Gpu {
                         None => self.ensure_int8_mmq_x(x, n, k)?,
                     };
                     for &(a, y, m) in &big {
-                        self.gemm_iu4g256_w4a8_prequant(a, xq, y, m, k, n, add)?;
+                        self.gemm_iu4g128_w4a8_prequant(a, xq, y, m, k, n, add)?;
                     }
                 }
             }
             return Ok(());
         }
-        self.gemm_iu4g256_pertoken(projs, x, k, n, add)
+        self.gemm_iu4g128_pertoken(projs, x, k, n, add)
     }
 
     /// The fallback: one f32 IU4 GEMV per token per matrix. Public for the
     /// parity test and `HIPFIRE_IU4_PREFILL=gemv` A/B runs.
-    pub fn gemm_iu4g256_pertoken(
+    pub fn gemm_iu4g128_pertoken(
         &mut self,
         projs: &[Iu4Proj<'_>],
         x: &GpuTensor,
@@ -367,9 +367,9 @@ impl Gpu {
         add: bool,
     ) -> HipResult<()> {
         let func = if add {
-            "gemv_iu4g256_residual"
+            "gemv_iu4g128_residual"
         } else {
-            "gemv_iu4g256"
+            "gemv_iu4g128"
         };
         let xp = x.buf.as_ptr() as *mut u8;
         for &(a, y, m) in projs {
@@ -377,7 +377,7 @@ impl Gpu {
             for t in 0..n {
                 // SAFETY: device pointer arithmetic inside [N,K] / [N,M] buffers.
                 let (xt, yt) = unsafe { (xp.add(t * k * 4), yp.add(t * m * 4)) };
-                self.gemv_iu4g256_launch_raw(
+                self.gemv_iu4g128_launch_raw(
                     func,
                     a.buf.as_ptr(),
                     xt as *mut c_void,
@@ -397,9 +397,9 @@ impl Gpu {
         }
     }
 
-    /// `Y += W X` for a small-M IU4G256 matrix: f16 X, the planar-addressed
+    /// `Y += W X` for a small-M IU4G128 matrix: f16 X, the planar-addressed
     /// MW4-LDS f16 WMMA residual (the MQ4V2 small-M prefill route).
-    pub fn gemm_iu4g256_mwl_residual(
+    pub fn gemm_iu4g128_mwl_residual(
         &mut self,
         a: &GpuTensor,
         x: &GpuTensor,
@@ -411,7 +411,7 @@ impl Gpu {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        if k % 256 != 0 || !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
+        if k % 256 != 0 || !crate::arch_caps::supports_iu4g128_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
@@ -419,7 +419,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let xp = self.iu4_fp16_x(x, n * k)?;
-        self.gemm_iu4g256_mwl_residual_f16(a, xp, y, m, k, n)
+        self.gemm_iu4g128_mwl_residual_f16(a, xp, y, m, k, n)
     }
 
     /// f32 -> f16 X conversion that never trusts the pointer-keyed cache,
@@ -431,7 +431,7 @@ impl Gpu {
     }
 
     /// MW4-LDS residual on an already-converted f16 X (`n * k` halves).
-    pub fn gemm_iu4g256_mwl_residual_f16(
+    pub fn gemm_iu4g128_mwl_residual_f16(
         &mut self,
         a: &GpuTensor,
         x_f16_ptr: *mut c_void,
@@ -443,14 +443,14 @@ impl Gpu {
         if m == 0 || n == 0 {
             return Ok(());
         }
-        if k % 256 != 0 || !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
+        if k % 256 != 0 || !crate::arch_caps::supports_iu4g128_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 MW-LDS requires gfx1100/gfx1151 and K % 256 == 0",
             ));
         }
-        const NAME: &str = "gemm_iu4g256_residual_wmma_gfx11_mw4_lds";
-        self.ensure_kernel(MWL_MODULE, kernels::GEMM_IU4G256_MWL_SRC, NAME)?;
+        const NAME: &str = "gemm_iu4g128_residual_wmma_gfx11_mw4_lds";
+        self.ensure_kernel(MWL_MODULE, kernels::GEMM_IU4G128_MWL_SRC, NAME)?;
         let mut a_ptr = a.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -496,7 +496,7 @@ impl Gpu {
     /// of `ensure_int4_mmq_x`). Full tiles: the lf16 16-wave column entry
     /// (grid [N/128, M/128]); otherwise the guarded generic entry.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_iu4g256_w4a4_prequant(
+    pub fn gemm_iu4g128_w4a4_prequant(
         &mut self,
         a: &GpuTensor,
         x_i4_ptr: *mut c_void,
@@ -506,7 +506,7 @@ impl Gpu {
         batch_size: usize,
         add: bool,
     ) -> HipResult<()> {
-        if !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
+        if !crate::arch_caps::supports_iu4g128_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 W4A4 MMQ requires exact gfx1100/gfx1151",
@@ -521,11 +521,11 @@ impl Gpu {
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
         let kernel_name = match (full, add) {
-            (true, false) => "gemm_iu4g256_w4a4_full_set_lf16_col",
-            (true, true) => "gemm_iu4g256_w4a4_full_add_lf16_col",
-            (false, _) => "gemm_iu4g256_w4a4",
+            (true, false) => "gemm_iu4g128_w4a4_full_set_lf16_col",
+            (true, true) => "gemm_iu4g128_w4a4_full_add_lf16_col",
+            (false, _) => "gemm_iu4g128_w4a4",
         };
-        self.ensure_kernel(W4A4_MODULE, kernels::GEMM_IU4G256_W4A4_SRC, kernel_name)?;
+        self.ensure_kernel(W4A4_MODULE, kernels::GEMM_IU4G128_W4A4_SRC, kernel_name)?;
         let mut a_ptr = a.buf.as_ptr();
         let mut xq_ptr = x_i4_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -594,8 +594,8 @@ fn iu4_i8_tile() -> Option<usize> {
 }
 
 impl Gpu {
-    /// IU4G256 W4A8 (`block_i8_128` X, iu8 WMMA): `Y = W X` / `Y += W X`.
-    pub fn gemm_iu4g256_w4a8_prequant(
+    /// IU4G128 W4A8 (`block_i8_128` X, iu8 WMMA): `Y = W X` / `Y += W X`.
+    pub fn gemm_iu4g128_w4a8_prequant(
         &mut self,
         a: &GpuTensor,
         xq: *mut c_void,
@@ -608,7 +608,7 @@ impl Gpu {
         self.i8_asym_prequant(true, a, xq, y, m, k, n, add)
     }
 
-    /// Interleaved-MQ4V2 twin of [`Self::gemm_iu4g256_w4a8_prequant`] (tests).
+    /// Interleaved-MQ4V2 twin of [`Self::gemm_iu4g128_w4a8_prequant`] (tests).
     pub fn gemm_mq4g256v2_asym_i8_prequant(
         &mut self,
         a: &GpuTensor,
@@ -634,7 +634,7 @@ impl Gpu {
         n: usize,
         add: bool,
     ) -> HipResult<()> {
-        if !crate::arch_caps::supports_iu4g256_gemm(&self.arch) {
+        if !crate::arch_caps::supports_iu4g128_gemm(&self.arch) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "IU4 W4A8 i8 MMQ requires gfx1100/gfx1151",
@@ -656,14 +656,14 @@ impl Gpu {
         });
         let (module, source, threads, lds): (&str, &str, u32, u32) = match (planar, tile) {
             (true, 256) => (
-                "gemm_iu4g256_w4a8_t256",
-                kernels::GEMM_IU4G256_W4A8_GFX11_T256_SRC,
+                "gemm_iu4g128_w4a8_t256",
+                kernels::GEMM_IU4G128_W4A8_GFX11_T256_SRC,
                 1024,
                 57344,
             ),
             (true, _) => (
-                "gemm_iu4g256_w4a8",
-                kernels::GEMM_IU4G256_W4A8_GFX11_SRC,
+                "gemm_iu4g128_w4a8",
+                kernels::GEMM_IU4G128_W4A8_GFX11_SRC,
                 512,
                 28672,
             ),
@@ -681,10 +681,10 @@ impl Gpu {
             ),
         };
         let kernel: &'static str = match (planar, add, tile) {
-            (true, true, 256) => "gemm_iu4g256_w4a8_full_add_t256",
-            (true, false, 256) => "gemm_iu4g256_w4a8_full_set_t256",
-            (true, true, _) => "gemm_iu4g256_w4a8_full_add",
-            (true, false, _) => "gemm_iu4g256_w4a8_full_set",
+            (true, true, 256) => "gemm_iu4g128_w4a8_full_add_t256",
+            (true, false, 256) => "gemm_iu4g128_w4a8_full_set_t256",
+            (true, true, _) => "gemm_iu4g128_w4a8_full_add",
+            (true, false, _) => "gemm_iu4g128_w4a8_full_set",
             (false, true, 256) => "gemm_mq4g256v2_asym_mmq_i8_full_add_t256",
             (false, false, 256) => "gemm_mq4g256v2_asym_mmq_i8_full_set_t256",
             (false, true, _) => "gemm_mq4g256v2_asym_mmq_i8_full_add",

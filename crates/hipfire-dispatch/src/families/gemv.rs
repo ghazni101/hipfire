@@ -609,7 +609,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
-        K::GemvIu4G256Prerotated => hip!(gpu.gemv_iu4g256(w.buf, x, y, m, k)),
+        K::GemvIu4G128Prerotated => hip!(gpu.gemv_iu4g128(w.buf, x, y, m, k)),
         K::GemvMq4G256V2Prerotated => {
             // qt=52 shares the qt=44 dispatch key: branch on the WEIGHT dtype,
             // never the key. LUT None fails closed (a Lloyd tensor without its
@@ -691,7 +691,7 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
         // IU body rows consume the rotated activation; qt 58 the natural-basis
         // one. All three are fused `y += W·x`.
-        IU4G256 => Plain(Gpu::gemv_iu4g256_residual),
+        IU4G128 => Plain(Gpu::gemv_iu4g128_residual),
         IU8G128 => Plain(Gpu::gemv_iu8g128_residual),
         MQ4G256V2Lloyd => ResidualKernel::Mq4v2Lloyd,
         MQ5G256V2 => Plain(Gpu::gemv_mq5g256v2_residual),
@@ -833,7 +833,7 @@ mod residual_coverage_tests {
             MQ2I4G128R128,
             E8PI4G128R256,
             E8PI4G128R128,
-            IU4G256,
+            IU4G128,
             IU8G128,
             MQ4G256V2P,
             MQ4G128V2P,

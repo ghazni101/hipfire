@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// x-batched decode GEMV for IU4G256 (qt 57): one weight row is decoded ONCE
+// x-batched decode GEMV for IU4G128 (qt 57): one weight row is decoded ONCE
 // and dotted against B separate activation vectors. It is the IU4 twin of
 // `gemv_mq4g256v2_xbatch.hip`, with the planar qt 57 address math of
-// `gemv_iu4g256`.
+// `gemv_iu4g128`.
 //
 // Why: the multi-slot decode path runs one GEMV launch per slot, so every
 // projection's weight row is read once per slot. Decode is weight-bandwidth
@@ -18,7 +18,7 @@
 // already FWHT-256 rotated.
 //
 // Accuracy: each acc[b] accumulates the same terms in the same source order
-// as `gemv_iu4g256` / `gemv_iu4g256_residual`; only the x vector index changes,
+// as `gemv_iu4g128` / `gemv_iu4g128_residual`; only the x vector index changes,
 // and the weight decode is hoisted out of the b loop (a pure CSE). The two
 // files' different register pressure can still pick different FMA
 // contractions, so the result matches the per-token GEMV to f32 rounding
@@ -28,8 +28,8 @@
 // x is [B x K] row-major, y is [B x M] row-major, so y[b*M + row] lands where
 // a caller holding an [n_slots x M] block wants it.
 //
-// HIPFIRE_IU4G256_RESIDUAL_EPILOGUE selects `y[b] += acc`; the symbol is named
-// by HIPFIRE_IU4G256_XBATCH_KERNEL.
+// HIPFIRE_IU4G128_RESIDUAL_EPILOGUE selects `y[b] += acc`; the symbol is named
+// by HIPFIRE_IU4G128_XBATCH_KERNEL.
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -41,12 +41,12 @@
 #define IU4_ROW_BYTES_U(gpr) ((((unsigned int)(gpr) * 136u) + 15u) & ~15u)
 #endif
 
-#ifndef HIPFIRE_IU4G256_XBATCH_KERNEL
-#define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch
+#ifndef HIPFIRE_IU4G128_XBATCH_KERNEL
+#define HIPFIRE_IU4G128_XBATCH_KERNEL gemv_iu4g128_xbatch
 #endif
 
-#ifndef HIPFIRE_IU4G256_XBATCH_MAX
-#define HIPFIRE_IU4G256_XBATCH_MAX 4
+#ifndef HIPFIRE_IU4G128_XBATCH_MAX
+#define HIPFIRE_IU4G128_XBATCH_MAX 4
 #endif
 
 // One group header: `f16 sc, f16 zp` (the second 4-byte pair covers the
@@ -61,7 +61,7 @@ __device__ __forceinline__ float2 iu4g32_hdr(const unsigned int hs) {
 // live float state by B. Asking for 16 waves/SIMD at B=4 makes the compiler
 // spill, and a spilled accumulator changes the FMA sequence.
 __launch_bounds__(32, 8)
-extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
+extern "C" __global__ void HIPFIRE_IU4G128_XBATCH_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,   // [B x K]
     float* __restrict__ y,         // [B x M]
@@ -79,12 +79,12 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
     const int boff = tid * 4;
     const int hsel = (tid < 16) ? 0 : 4;
 
-    float acc0[HIPFIRE_IU4G256_XBATCH_MAX];
-    float acc1[HIPFIRE_IU4G256_XBATCH_MAX];
-    float acc2[HIPFIRE_IU4G256_XBATCH_MAX];
-    float acc3[HIPFIRE_IU4G256_XBATCH_MAX];
+    float acc0[HIPFIRE_IU4G128_XBATCH_MAX];
+    float acc1[HIPFIRE_IU4G128_XBATCH_MAX];
+    float acc2[HIPFIRE_IU4G128_XBATCH_MAX];
+    float acc3[HIPFIRE_IU4G128_XBATCH_MAX];
     #pragma unroll
-    for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+    for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
         acc0[b] = 0.0f; acc1[b] = 0.0f; acc2[b] = 0.0f; acc3[b] = 0.0f;
     }
 
@@ -120,7 +120,7 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
 
         const int base = g * 256 + tid * 8;
         #pragma unroll
-        for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+        for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
             if (b >= B) break;
             const float* xb = x + (long long)b * K;
             IU4XDOG(pk0, sc0, zp0, base,       acc0[b], xb);
@@ -141,7 +141,7 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
         const unsigned int pk = *(const unsigned int*)(codes + g * 128 + boff);
         const int base = g * 256 + tid * 8;
         #pragma unroll
-        for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+        for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
             if (b >= B) break;
             const float* xb = x + (long long)b * K;
             IU4XDOG(pk, sc, zp, base, acc0[b], xb);
@@ -154,7 +154,7 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
         const unsigned int pk = *(const unsigned int*)(codes + g * 128 + boff);
         const int base = g * 256 + tid * 8;
         #pragma unroll
-        for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+        for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
             if (b >= B) break;
             const float* xb = x + (long long)b * K;
             IU4XDOG(pk, sc, zp, base, acc1[b], xb);
@@ -167,7 +167,7 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
         const unsigned int pk = *(const unsigned int*)(codes + g * 128 + boff);
         const int base = g * 256 + tid * 8;
         #pragma unroll
-        for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+        for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
             if (b >= B) break;
             const float* xb = x + (long long)b * K;
             IU4XDOG(pk, sc, zp, base, acc2[b], xb);
@@ -176,12 +176,12 @@ extern "C" __global__ void HIPFIRE_IU4G256_XBATCH_KERNEL(
     #undef IU4XDOG
 
     #pragma unroll
-    for (int b = 0; b < HIPFIRE_IU4G256_XBATCH_MAX; b++) {
+    for (int b = 0; b < HIPFIRE_IU4G128_XBATCH_MAX; b++) {
         if (b >= B) break;
         float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
         for (int offset = 16; offset > 0; offset >>= 1)
             acc += __shfl_down(acc, offset);
-#if defined(HIPFIRE_IU4G256_RESIDUAL_EPILOGUE)
+#if defined(HIPFIRE_IU4G128_RESIDUAL_EPILOGUE)
         if (tid == 0) y[(long long)b * M + row] += acc;
 #else
         if (tid == 0) y[(long long)b * M + row] = acc;

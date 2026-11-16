@@ -134,7 +134,7 @@ fn iu4_fused_x_producers_bit_exact() {
             return;
         }
     };
-    if !gpu.iu4g256_mmq_eligible(256, 64) {
+    if !gpu.iu4g128_mmq_eligible(256, 64) {
         eprintln!("SKIP — IU4 MMQ not eligible on this arch.");
         return;
     }

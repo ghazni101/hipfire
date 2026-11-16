@@ -90,14 +90,15 @@ impl Layout {
     /// Wire name. Matches `QuantType` and the qt register.
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Iu4 => "IU4G256",
+            Self::Iu4 => "IU4G128",
         }
     }
 
-    /// Parse a `--format` token. `iu4` / `iu4g256`.
+    /// Parse a `--format` token. `iu4` / `iu4g128`; `iu4g256` is the old
+    /// name of the same layout and is still accepted.
     pub fn from_format(format: &str) -> Option<Self> {
         match format {
-            "iu4" | "iu4g256" => Some(Self::Iu4),
+            "iu4" | "iu4g128" | "iu4g256" => Some(Self::Iu4),
             _ => None,
         }
     }
@@ -458,7 +459,7 @@ fn quant_i8(x: f32, id: f32) -> i32 {
     q.clamp(-127, 127)
 }
 
-/// Decode-GEMV contract for the W4A8 IU4 kernel (`gemv_iu4g256_dot4`,
+/// Decode-GEMV contract for the W4A8 IU4 kernel (`gemv_iu4g128_dot4`,
 /// `HIPFIRE_IU4_DECODE=dot4`): as [`gemv_iu4_dot8`] but each 32-element
 /// block of the rotated `x` is quantized to signed int8 with
 /// `d = amax / 127`.
@@ -578,6 +579,7 @@ mod tests {
         assert_eq!(row_bytes(128, Layout::Iu4), None);
         assert_eq!(tensor_bytes(0, 256, Layout::Iu4), None);
         assert_eq!(Layout::Iu4.quant_type(), 57);
+        assert_eq!(Layout::from_format("iu4g128"), Some(Layout::Iu4));
         assert_eq!(Layout::from_format("iu4g256"), Some(Layout::Iu4));
         assert_eq!(Layout::from_format("iu8"), None);
         assert_eq!(Layout::from_format("mq4"), None);

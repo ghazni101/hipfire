@@ -94,14 +94,14 @@ pub fn note_process_gpu_arch(arch: &str) {
     let _ = PROCESS_GPU_ARCH.set(arch.to_string());
 }
 
-/// qt57 (IU4G256) prefill GEMM admission: the W4A4/W4A8/MMQ IU4 GEMM
+/// qt57 (IU4G128) prefill GEMM admission: the W4A4/W4A8/MMQ IU4 GEMM
 /// family in `gemm_iu4.rs`. Every source uses the gfx11 `_w32` WMMA builtins
 /// and is validated on exact gfx1100 and gfx1151 only; gfx12 has the hardware
 /// ([`ArchCaps::has_iu4_wmma`]) but no ported source. CAPABILITY gate (does
 /// the kernel exist and is it validated here). It takes the arch name so the
 /// launchers and every upstream admission predicate (which run on an arch
 /// string, often with no `Gpu` in hand) read this one set.
-pub fn supports_iu4g256_gemm(arch: &str) -> bool {
+pub fn supports_iu4g128_gemm(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1151")
 }
 
@@ -919,14 +919,14 @@ mod tests {
     #[test]
     fn iu_gemm_admission_is_exact_gfx1100_and_gfx1151() {
         for arch in &["gfx1100", "gfx1151"] {
-            assert!(supports_iu4g256_gemm(arch), "{arch}");
+            assert!(supports_iu4g128_gemm(arch), "{arch}");
             assert!(supports_iu8g128_gemm(arch), "{arch}");
         }
         for arch in &[
             "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1152", "gfx1200", "gfx1201", "gfx1030",
             "gfx1010", "gfx906", "gfx942", "",
         ] {
-            assert!(!supports_iu4g256_gemm(arch), "{arch:?}");
+            assert!(!supports_iu4g128_gemm(arch), "{arch:?}");
             assert!(!supports_iu8g128_gemm(arch), "{arch:?}");
         }
     }

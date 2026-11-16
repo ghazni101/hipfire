@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the W4A8 IU4G256 decode kernel (`gemv_iu4g256_dot4`,
+//! Numerics gate for the W4A8 IU4G128 decode kernel (`gemv_iu4g128_dot4`,
 //! `HIPFIRE_IU4_DECODE=dot4`, `v_dot4_i32_iu8`).
 //!
 //! 1. Contract: matches the CPU `iu_quant::gemv_iu4_dot4` (integer dot is
@@ -74,10 +74,10 @@ fn run(
     };
     let res = seed.is_some();
     match (which, res) {
-        ("dot4", r) => gpu.gemv_iu4g256_dot4(w, xd, &y, m, k, r).unwrap(),
-        ("dot4q", r) => gpu.gemv_iu4g256_dot4q(w, xd, &y, m, k, r).unwrap(),
-        ("f32", false) => gpu.gemv_iu4g256(w, xd, &y, m, k).unwrap(),
-        ("f32", true) => gpu.gemv_iu4g256_residual(w, xd, &y, m, k).unwrap(),
+        ("dot4", r) => gpu.gemv_iu4g128_dot4(w, xd, &y, m, k, r).unwrap(),
+        ("dot4q", r) => gpu.gemv_iu4g128_dot4q(w, xd, &y, m, k, r).unwrap(),
+        ("f32", false) => gpu.gemv_iu4g128(w, xd, &y, m, k).unwrap(),
+        ("f32", true) => gpu.gemv_iu4g128_residual(w, xd, &y, m, k).unwrap(),
         _ => unreachable!(),
     }
     gpu.hip.device_synchronize().unwrap();
@@ -116,7 +116,7 @@ fn check(gpu: &mut Gpu, label: &str, iu: &[u8], x: &[f32], m: usize, k: usize, w
         .iter()
         .map(|&mm| gpu.alloc_tensor(&[mm], DType::F32).unwrap())
         .collect();
-    gpu.fused_iu4g256_rows_impl(
+    gpu.fused_iu4g128_rows_impl(
         &[(&wd, &ys[0], m), (&wd, &ys[1], m), (&wd, &ys[2], m2)],
         &xd,
         k,

@@ -1355,7 +1355,7 @@ impl HfqFile {
                     sampled_groups += 1;
                 }
             }
-            // qt57 (IU4G256) stores the same per-128 (scale, zero) pairs at the
+            // qt57 (IU4G128) stores the same per-128 (scale, zero) pairs at the
             // row tail: [K/2 codes][(sc, zp) x K/128]. Sample three rows.
             for tensor in tensors
                 .iter()
@@ -2325,7 +2325,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
         57 => "HC8E4M3Row",
-        60 => "IU4G256",
+        60 => "IU4G128",
         61 => "IU8G128",
         131 => "MQ3I4G128R256",
         132 => "MQ3I4G128R128",

@@ -344,10 +344,10 @@ fn iu4_wide_prefill_requested() -> bool {
     *V
 }
 
-/// Every dense projection of an IU4-family artifact: qt 60 (IU4G256)
+/// Every dense projection of an IU4-family artifact: qt 60 (IU4G128)
 /// projections with the qt 61 (IU8G128) out projection, no MoE layers.
 fn dense_layers_have_iu4_family(weights: &Qwen35Weights) -> bool {
-    let iu = |dtype: DType| matches!(dtype, DType::IU4G256 | DType::IU8G128);
+    let iu = |dtype: DType| matches!(dtype, DType::IU4G128 | DType::IU8G128);
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => [
@@ -4585,11 +4585,11 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let bf16_with_gfx942 =
         matches!(dt, DType::BF16) && arch == "gfx942" && rdna_compute::calib_force_bf16();
 
-    // IU4G256 (qt57): native IU4 Q8_1 MMQ prefill (`gemm_iu4g256_multi`, the
+    // IU4G128 (qt57): native IU4 Q8_1 MMQ prefill (`gemm_iu4g128_multi`, the
     // MQ4V2 MMQ arithmetic over the planar IU4 rows) on gfx1100/gfx1151. The
     // six rotation lists (qkv/wo/ffn/w_down in batched*.rs) and the
     // gate_up/qkv/qkvza/epilogue/single-weight IU4 arms land in lockstep.
-    let iu4_with_mmq = dt == DType::IU4G256 && rdna_compute::arch_caps::supports_iu4g256_gemm(arch);
+    let iu4_with_mmq = dt == DType::IU4G128 && rdna_compute::arch_caps::supports_iu4g128_gemm(arch);
 
     iu4_with_mmq
         || mq3_uniform_with_wmma
@@ -8501,11 +8501,11 @@ mod tests {
         }
         // gfx12 unchanged already proven above, but explicitly re-prove
         // that the admit set includes both gfx12 variants
-        // IU4G256: native MMQ prefill on gfx1100/gfx1151 only.
-        assert!(is_batchable_la(DType::IU4G256, "gfx1100"));
-        assert!(is_batchable_la(DType::IU4G256, "gfx1151"));
+        // IU4G128: native MMQ prefill on gfx1100/gfx1151 only.
+        assert!(is_batchable_la(DType::IU4G128, "gfx1100"));
+        assert!(is_batchable_la(DType::IU4G128, "gfx1151"));
         for arch in ["gfx1201", "gfx1030", "gfx1010", "gfx906"] {
-            assert!(!is_batchable_la(DType::IU4G256, arch), "IU4 on {arch}");
+            assert!(!is_batchable_la(DType::IU4G128, arch), "IU4 on {arch}");
         }
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1200"));
         assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));

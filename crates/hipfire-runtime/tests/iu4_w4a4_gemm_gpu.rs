@@ -2,15 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 W4A4 prefill route (opt-in
+//! Numerics gate for the IU4G128 W4A4 prefill route (opt-in
 //! `HIPFIRE_IU4_PREFILL_ACT=a4`, which the test sets) and the small-M MW-LDS route (projections with M < 128).
 //!
-//! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g256_w4a4_prequant` returns
+//! 1. Bit-exact: on `repack_mq4v2(src)`, `gemm_iu4g128_w4a4_prequant` returns
 //!    the bits of `gemm_mq4g256v2_mmq_{set,add}_prequant_iu4` on `src` over
 //!    the same `block_i4_128` X (full lf16 tiles and guarded tails).
-//! 2. Bit-exact: `gemm_iu4g256_mwl_residual` equals the MQ4V2 MW4-LDS
+//! 2. Bit-exact: `gemm_iu4g128_mwl_residual` equals the MQ4V2 MW4-LDS
 //!    residual on the twin.
-//! 3. The routed `gemm_iu4g256` (set and add) vs an f64 reference of the CPU
+//! 3. The routed `gemm_iu4g128` (set and add) vs an f64 reference of the CPU
 //!    dequant weights: max rel reported (int4 / f16 activations: loose bound).
 //! 4. Determinism: every routed call is run twice and must match bit for bit.
 //!
@@ -106,19 +106,19 @@ fn check(
             gpu.gemm_mq4g256v2_mmq_set_prequant_iu4(&wm, xq4, &y_mq, m, k, n)
                 .unwrap();
         }
-        gpu.gemm_iu4g256_w4a4_prequant(&wi, xq4, &y_iu, m, k, n, add)
+        gpu.gemm_iu4g128_w4a4_prequant(&wi, xq4, &y_iu, m, k, n, add)
             .unwrap();
         // 2. MW-LDS residual twin (Y += W X), seeded.
         let (z_mq, z_iu) = (up(gpu), up(gpu));
         gpu.invalidate_fp16_cache();
         gpu.gemm_mqv2_residual_wmma_gfx11_mw_lds(4, 4, &wm, &xd, &z_mq, m, k, n)
             .unwrap();
-        gpu.gemm_iu4g256_mwl_residual(&wi, &xd, &z_iu, m, k, n)
+        gpu.gemm_iu4g128_mwl_residual(&wi, &xd, &z_iu, m, k, n)
             .unwrap();
         // 3/4. Routed call, twice.
         let (r1, r2) = (up(gpu), up(gpu));
-        gpu.gemm_iu4g256(&wi, &xd, &r1, m, k, n, add).unwrap();
-        gpu.gemm_iu4g256(&wi, &xd, &r2, m, k, n, add).unwrap();
+        gpu.gemm_iu4g128(&wi, &xd, &r1, m, k, n, add).unwrap();
+        gpu.gemm_iu4g128(&wi, &xd, &r2, m, k, n, add).unwrap();
         gpu.hip.device_synchronize().unwrap();
         let d = |gpu: &mut Gpu, t: &rdna_compute::GpuTensor| gpu.download_f32(t).unwrap();
         let (a, b, za, zb, ra, rb) = (
@@ -203,7 +203,7 @@ fn iu4_w4a4_and_mwl_are_bit_exact_to_mq4v2() {
             return;
         }
     };
-    if !gpu.iu4g256_mmq_eligible(256, 64) {
+    if !gpu.iu4g128_mmq_eligible(256, 64) {
         eprintln!("SKIP — IU4 MMQ not eligible on this arch / env.");
         return;
     }

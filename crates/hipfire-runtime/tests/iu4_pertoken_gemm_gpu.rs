@@ -2,14 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the IU4G256 per-token prefill fallback
-//! `gemm_iu4g256_pertoken` (graph capture / recording, non-gfx11 archs, and
-//! `HIPFIRE_IU4_PREFILL=gemv`): set and add, it equals `gemv_iu4g256` per row
+//! Numerics gate for the IU4G128 per-token prefill fallback
+//! `gemm_iu4g128_pertoken` (graph capture / recording, non-gfx11 archs, and
+//! `HIPFIRE_IU4_PREFILL=gemv`): set and add, it equals `gemv_iu4g128` per row
 //! bit for bit and matches an f64 reference of the CPU dequant weights.
 //!
 //! Until the IU knob cleanup this file was `iu4_mmq_gemm_gpu` and also pinned
 //! the `a8q` prefill activation and the small-M MMQ arm to gate the IU4 Q8_1
-//! MMQ (`gemm_iu4g256_mmq*`, an IU4-addressed build of the MQ4V2 Q8_1 MMQ)
+//! MMQ (`gemm_iu4g128_mmq*`, an IU4-addressed build of the MQ4V2 Q8_1 MMQ)
 //! bit-exact against MQ4V2. That route lost (27B pp512 1053 vs a4 1460 tok/s,
 //! C11a) and was removed with its kernels; the default a4 / a8 / small-M
 //! routes are gated by `iu4_w4a4_gemm_gpu` and `iu4_w4a8_i8_gemm_gpu`.
@@ -94,7 +94,7 @@ fn check(
     let mut outs = Vec::new();
     for add in [false, true] {
         let y_tok = gpu.upload_f32(&seed, &[n * m]).unwrap();
-        gpu.gemm_iu4g256_pertoken(&[(&wi, &y_tok, m)], &xd, k, n, add)
+        gpu.gemm_iu4g128_pertoken(&[(&wi, &y_tok, m)], &xd, k, n, add)
             .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let t = gpu.download_f32(&y_tok).unwrap();
@@ -119,7 +119,7 @@ fn check(
     for t in [0, n - 1] {
         let xt = gpu.upload_f32(&x[t * k..(t + 1) * k], &[k]).unwrap();
         let yt = gpu.alloc_tensor(&[m], DType::F32).unwrap();
-        gpu.gemv_iu4g256(&wi, &xt, &yt, m, k).unwrap();
+        gpu.gemv_iu4g128(&wi, &xt, &yt, m, k).unwrap();
         gpu.hip.device_synchronize().unwrap();
         let g = gpu.download_f32(&yt).unwrap();
         tok_vs_gemv += bits_diff(&g, &outs[0].1[t * m..(t + 1) * m]);
@@ -150,7 +150,7 @@ fn check(
     }
     assert_eq!(
         tok_vs_gemv, 0,
-        "{label}: per-token path differs from gemv_iu4g256"
+        "{label}: per-token path differs from gemv_iu4g128"
     );
     w.cases += 1;
     for tt in [wi, xd] {

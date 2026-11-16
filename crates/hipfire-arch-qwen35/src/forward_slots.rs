@@ -549,7 +549,7 @@ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
             | DType::MQ2G256V2
             // C16 qt57: uniform groups + residual only (no plain key, so a
             // mixed group with an IU4 member is refused at plan time).
-            | DType::IU4G256
+            | DType::IU4G128
     );
     member && is_batchable_la(dt, arch)
 }
@@ -572,7 +572,7 @@ fn slots_weight_rotated(dt: DType) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
-            | DType::IU4G256
+            | DType::IU4G128
     )
 }
 
@@ -663,8 +663,8 @@ fn slots_iu8g128_residual_ok(dt: DType, k: usize, arch: &str) -> bool {
     dt == DType::IU8G128 && rdna_compute::iu8g128_gemm_admits(arch, k)
 }
 
-/// C16 qt57: one IU4G256 launch set over a shared rotated X
-/// (`gemm_iu4g256_multi` quantizes X once, or takes the producer sidecar).
+/// C16 qt57: one IU4G128 launch set over a shared rotated X
+/// (`gemm_iu4g128_multi` quantizes X once, or takes the producer sidecar).
 fn slots_iu4_multi(
     gpu: &mut Gpu,
     projs: &[(&WeightTensor, &GpuTensor)],
@@ -682,12 +682,12 @@ fn slots_iu4_multi(
     if (2..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n) {
         for &(w, y) in projs {
             let y_n = y.sub_offset(0, n * w.m);
-            gpu.gemv_iu4g256_xbatch(&w.buf, x, &y_n, w.m, k, n, add)?;
+            gpu.gemv_iu4g128_xbatch(&w.buf, x, &y_n, w.m, k, n, add)?;
         }
         return Ok(());
     }
     let v: Vec<_> = projs.iter().map(|(w, y)| (&w.buf, *y, w.m)).collect();
-    gpu.gemm_iu4g256_multi(&v, x, k, n, add)
+    gpu.gemm_iu4g128_multi(&v, x, k, n, add)
 }
 
 /// Validate one weight for the residual-projection role (wo, w_down):
@@ -1814,7 +1814,7 @@ fn mq4_residual_proj(
         return gpu.gemv_mq4g256v2_xbatch_residual(&w.buf, scratch, &y_n, w.m, w.k, n);
     }
     let y_n = y.sub_offset(0, n * w.m);
-    if w.gpu_dtype == DType::IU4G256 {
+    if w.gpu_dtype == DType::IU4G128 {
         return slots_iu4_multi(gpu, &[(w, &y_n)], scratch, n, true);
     }
     let key = slots_residual_gemm_key(w.gpu_dtype).ok_or_else(|| {
@@ -2000,7 +2000,7 @@ fn dense_ffn_body_slots(
             n,
             q8_wmma_arch,
         )?,
-        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+        GroupPlan::Uniform(DType::IU4G128) => slots_iu4_multi(
             gpu,
             &[(w_gate, &pbs.gate_ffn_batch), (w_up, &pbs.up_batch)],
             &pbs.x_rot_batch,
@@ -2047,7 +2047,7 @@ fn dense_ffn_body_slots(
             n,
         )?;
         let y = pbs.x_batch.sub_offset(0, n * w_down.m);
-        if dt == DType::IU4G256 {
+        if dt == DType::IU4G128 {
             return slots_iu4_multi(gpu, &[(w_down, &y)], &pbs.ffn_hidden_batch, n, true);
         }
         let key = slots_residual_gemm_key(dt).expect("rotated w_down has a residual key");
@@ -2288,7 +2288,7 @@ where
                 n,
             )?;
         }
-        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+        GroupPlan::Uniform(DType::IU4G128) => slots_iu4_multi(
             gpu,
             &[
                 (&layer.wqkv, &pbs.dn_qkv_batch),
@@ -2585,7 +2585,7 @@ where
                 n,
             )?;
         }
-        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+        GroupPlan::Uniform(DType::IU4G128) => slots_iu4_multi(
             gpu,
             &[
                 (&layer.wqkv, &pbs.dn_qkv_batch),
@@ -3751,7 +3751,7 @@ fn run_fullattn_layer_slots(
                 n,
             )?;
         }
-        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+        GroupPlan::Uniform(DType::IU4G128) => slots_iu4_multi(
             gpu,
             &[
                 (&layer.wq, &pbs.fa_q_full_batch),
@@ -4023,7 +4023,7 @@ fn run_fullattn_moe_layer_slots(
                 n,
             )?;
         }
-        GroupPlan::Uniform(DType::IU4G256) => slots_iu4_multi(
+        GroupPlan::Uniform(DType::IU4G128) => slots_iu4_multi(
             gpu,
             &[
                 (&layer.wq, &pbs.fa_q_full_batch),

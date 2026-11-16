@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the f32-activation IU4G256 decode kernels
-//! (`gemv_iu4g256`, `gemv_iu4g256_residual`, `fused_iu4g256_rows`).
+//! Numerics gate for the f32-activation IU4G128 decode kernels
+//! (`gemv_iu4g128`, `gemv_iu4g128_residual`, `fused_iu4g128_rows`).
 //!
 //! 1. Reference: max abs / rel error against an f64 dot of the CPU
 //!    `iu_quant::dequant` weights (plain and residual).
@@ -93,11 +93,11 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     let y_mq = gpu.alloc_tensor(&[m], DType::F32).unwrap();
     let y_iu = gpu.alloc_tensor(&[m], DType::F32).unwrap();
     gpu.gemv_mq4g256v2(&wm, &xd, &y_mq, m, k).unwrap();
-    gpu.gemv_iu4g256(&wi, &xd, &y_iu, m, k).unwrap();
+    gpu.gemv_iu4g128(&wi, &xd, &y_iu, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&y_mq).unwrap();
     let b = gpu.download_f32(&y_iu).unwrap();
-    gpu.gemv_iu4g256(&wi, &xd, &y_iu, m, k).unwrap();
+    gpu.gemv_iu4g128(&wi, &xd, &y_iu, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let b2 = gpu.download_f32(&y_iu).unwrap();
     assert!(
@@ -121,7 +121,7 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
     let seed: Vec<f32> = (0..m).map(|i| 0.37 * (i as f32 % 11.0) - 1.1).collect();
     let r_mq = gpu.upload_f32(&seed, &[m]).unwrap();
     let r_iu = gpu.upload_f32(&seed, &[m]).unwrap();
-    gpu.gemv_iu4g256_residual(&wi, &xd, &r_iu, m, k).unwrap();
+    gpu.gemv_iu4g128_residual(&wi, &xd, &r_iu, m, k).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let b = gpu.download_f32(&r_iu).unwrap();
     assert!(
@@ -160,7 +160,7 @@ fn check(gpu: &mut Gpu, c: &Case<'_>, worst_rel: &mut f64) {
         let mut mats: Vec<(&rdna_compute::GpuTensor, &rdna_compute::GpuTensor, usize)> =
             views.iter().map(|(w, y, p, _)| (w, y, *p)).collect();
         mats.push((&wi, &y_all, m));
-        gpu.fused_iu4g256_rows(&mats, &xd, k).unwrap();
+        gpu.fused_iu4g128_rows(&mats, &xd, k).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let mut fused_diff = bits_equal(&gpu.download_f32(&y_all).unwrap(), &plain);

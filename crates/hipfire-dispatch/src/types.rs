@@ -123,7 +123,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
         | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
-        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | IU4G256 => RotationPlan::FwhtG256,
+        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | IU4G128 => RotationPlan::FwhtG256,
         // qt=58 is the Q8 grid in the natural basis. Mapping it to FwhtG256
         // would rotate activations against weights that were not rotated.
         IU8G128 => RotationPlan::None,
@@ -180,7 +180,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128
         | MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
-        | E8PI4G128R128 | IU4G256 => GemvVariant::Prerotated,
+        | E8PI4G128R128 | IU4G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -188,7 +188,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 /// Refusal for the typed-qwen4-only planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134)
 /// on every generic GEMV/GEMM family resolution: they have no generic kernel.
 /// Refusal for an IU dtype this family does not run. qt 57 decode GEMV is
-/// `GemvIu4G256Prerotated`; qt 58 plain GEMV is `GemvIu8G128`. GEMM of these
+/// `GemvIu4G128Prerotated`; qt 58 plain GEMV is `GemvIu8G128`. GEMM of these
 /// layouts still lands here.
 pub(crate) fn reject_iu(dtype: DType, family: &'static str) -> DispatchError {
     DispatchError::UnsupportedVariant {
@@ -223,7 +223,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvMq4G256V2
         | FusedQkvMq4G256V2VerifyExact
         | FusedQkvMq4G256V2Lloyd
-        | FusedQkvIu4G256
+        | FusedQkvIu4G128
         | FusedQkvMq6G256V2
         | FusedQkvMq5G256V2
         | FusedQkvMq3G256V2
@@ -242,7 +242,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaMq4G256V2
         | FusedQkvzaMq4G256V2VerifyExact
         | FusedQkvzaMq4G256V2Lloyd
-        | FusedQkvzaIu4G256
+        | FusedQkvzaIu4G128
         | FusedQkvzaMq6G256V2
         | FusedQkvzaMq5G256V2
         | FusedQkvzaMq3G256V2
@@ -260,7 +260,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedGateUpMq4G256V2
         | FusedGateUpMq4G256V2VerifyExact
         | FusedGateUpMq4G256V2Lloyd
-        | FusedGateUpIu4G256
+        | FusedGateUpIu4G128
         | FusedGateUpMq6G256V2
         | FusedGateUpMq5G256V2
         | FusedGateUpMq3G256V2
@@ -328,7 +328,7 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
     /// qt 57 decode GEMV. f32 activation, wide loads of the padded row.
-    GemvIu4G256Prerotated,
+    GemvIu4G128Prerotated,
     GemvMq4CG256Prerotated,
     GemvMq5G256V2Prerotated,
     GemvMq6G256V2Prerotated,
@@ -369,7 +369,7 @@ pub enum KernelKey {
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
     /// qt 57 fused `y += W·x` for a body-dtype `ssm_out`.
-    GemvIu4G256Residual,
+    GemvIu4G128Residual,
     /// qt 58 fused `y += W·x` (DeltaNet out_proj / ssm_out decode step).
     GemvIu8G128Residual,
     // GEMV SwiGLU + residual
@@ -526,11 +526,11 @@ pub enum KernelKey {
     FusedGateUpMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedGateUpMq4G256V2Lloyd,
-    /// qt=57 (IU4G256) decode: one `fused_iu4g256_rows` launch over QKV,
-    /// QKVZA or gate+up; each row is bit-identical to `gemv_iu4g256`.
-    FusedQkvIu4G256,
-    FusedQkvzaIu4G256,
-    FusedGateUpIu4G256,
+    /// qt=57 (IU4G128) decode: one `fused_iu4g128_rows` launch over QKV,
+    /// QKVZA or gate+up; each row is bit-identical to `gemv_iu4g128`.
+    FusedQkvIu4G128,
+    FusedQkvzaIu4G128,
+    FusedGateUpIu4G128,
     FusedGateUpMq4CG256,
     FusedGateUpMq5G256V2,
     FusedGateUpMq6G256V2,
@@ -901,7 +901,7 @@ impl KernelKey {
         use DType::*;
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
-            IU4G256 => Ok(Self::GemvIu4G256Prerotated),
+            IU4G128 => Ok(Self::GemvIu4G128Prerotated),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
             // qt=52 reuses the qt=44 dispatch key: the LAUNCH arm branches on
             // w.dtype and selects the LUT kernel (fail-closed on missing LUT).
@@ -1000,7 +1000,7 @@ impl KernelKey {
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
             // Fused residual for a body-dtype `ssm_out`: qt 57 reads the
             // rotated activation, qt 58 the natural-basis one.
-            IU4G256 => Ok(Self::GemvIu4G256Residual),
+            IU4G128 => Ok(Self::GemvIu4G128Residual),
             IU8G128 => Ok(Self::GemvIu8G128Residual),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv",
@@ -1037,7 +1037,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            IU4G256 | IU8G128 => Err(reject_iu(dtype, "gemv")),
+            IU4G128 | IU8G128 => Err(reject_iu(dtype, "gemv")),
             // qt=52 shares the qt=44 key: the SwiGLU-residual variant is a
             // residual GEMV over caller-supplied silu(gate)*up (already
             // FWHT-rotated), and the family arm branches on the WEIGHT dtype to
@@ -1129,7 +1129,7 @@ impl KernelKey {
             // qt 60 prefill GEMM is integer WMMA (W4A8/W4A4), so the dtype is
             // gated on WMMA parts. qt 61 (IU8G128) is a f16-scale int8 GEMV and
             // is admitted on every arch.
-            IU4G256 => ArchPredicate::HasWmma,
+            IU4G128 => ArchPredicate::HasWmma,
             IU8G128 => ArchPredicate::Always,
             // ggml block formats (GGUF-native, no kernel yet): no key resolves
             // them, so resolution fails with MissingImpl; explicit so a future
@@ -1154,7 +1154,7 @@ impl KernelKey {
                 let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
                     | MQ6G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
-                    | MQ4G256Lloyd | IU4G256 => &[
+                    | MQ4G256Lloyd | IU4G128 => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -1217,7 +1217,7 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP2G32E8
             | ParoQ4G128
             | ParoQ4G64
-            | IU4G256
+            | IU4G128
     )
 }
 
@@ -1258,14 +1258,14 @@ mod tests {
         );
         assert!(dtype_needs_rotation(DType::MQ4G256V2Lloyd));
         assert_eq!(
-            KernelKey::for_gemv_prerotated(DType::IU4G256).unwrap(),
-            KernelKey::GemvIu4G256Prerotated
+            KernelKey::for_gemv_prerotated(DType::IU4G128).unwrap(),
+            KernelKey::GemvIu4G128Prerotated
         );
-        assert!(dtype_needs_rotation(DType::IU4G256));
+        assert!(dtype_needs_rotation(DType::IU4G128));
         assert!(!dtype_needs_rotation(DType::IU8G128));
         assert_eq!(
-            KernelKey::for_gemv_residual(DType::IU4G256).unwrap(),
-            KernelKey::GemvIu4G256Residual
+            KernelKey::for_gemv_residual(DType::IU4G128).unwrap(),
+            KernelKey::GemvIu4G128Residual
         );
         assert_eq!(
             KernelKey::for_gemv(DType::IU8G128, GemvVariant::Plain, false).unwrap(),

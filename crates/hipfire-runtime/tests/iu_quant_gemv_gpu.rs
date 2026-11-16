@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! GPU↔CPU parity for the IU quant family's decode readers: qt 57
-//! (`IU4G256`) and qt 58 (`IU8G128`), each with its fused
+//! (`IU4G128`) and qt 58 (`IU8G128`), each with its fused
 //! `y += W·x` twin, plus the qt 58 embedding gather.
 //!
 //! The CPU contracts are `hipfire_runtime::iu_quant`:
@@ -108,7 +108,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         let src = mq4v2_blob(m, k);
         let x = activation(k);
 
-        // ── qt 57 IU4G256 ────────────────────────────────────────────────
+        // ── qt 57 IU4G128 ────────────────────────────────────────────────
         let iu4 = repack_mq4v2(&src, m, k, Layout::Iu4).expect("repack iu4");
         let wq = dequant(&iu4, m, k, Layout::Iu4).expect("cpu iu4");
         let want: Vec<f32> = (0..m)
@@ -123,7 +123,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
             gpu.upload_f32(&x, &[k]).expect("upload x"),
         );
         let yd = gpu.alloc_tensor(&[m], DType::F32).expect("alloc y");
-        gpu.gemv_iu4g256(&w, &xd, &yd, m, k).expect("iu4 gemv");
+        gpu.gemv_iu4g128(&w, &xd, &yd, m, k).expect("iu4 gemv");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yd).expect("download y");
         assert!(
@@ -136,7 +136,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
 
         let s = seed(m);
         let yr = gpu.upload_f32(&s, &[m]).expect("upload seed");
-        gpu.gemv_iu4g256_residual(&w, &xd, &yr, m, k)
+        gpu.gemv_iu4g128_residual(&w, &xd, &yr, m, k)
             .expect("iu4 residual");
         gpu.hip.device_synchronize().expect("sync");
         let got = gpu.download_f32(&yr).expect("download yr");

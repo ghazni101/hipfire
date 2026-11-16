@@ -93,7 +93,7 @@
 #define I8_DS_OFF (2 * I8_SLOT_BYTES)
 #define I8_DS_BYTES (I8_TILE * 8)
 #define I8_SZ_OFF (I8_DS_OFF + 2 * I8_DS_BYTES)
-// I8_ASYM (IU4G256 / asymmetric MQ4V2): the SZ plane carries sc[I8_TILE]
+// I8_ASYM (IU4G128 / asymmetric MQ4V2): the SZ plane carries sc[I8_TILE]
 // then zp[I8_TILE]; the DS seed slot carries the exact int s of the token.
 #ifdef I8_ASYM
 #define I8_SZ_BYTES (I8_TILE * 8)

@@ -2806,25 +2806,25 @@ pub const GEMV_MQ4G256V2_XBATCH_RESIDUAL_SIGMOID_SRC: &str = concat!(
 /// activation quantizer and the v4 (persistent, all of K in LDS) / v3
 /// (LDS-staged chunks, two rows per warp) GEMVs, one module per batch (2..=5)
 /// and residual flavour, each with a `_multi` twin for up to four weights.
-/// IU4G256 decode GEMV. One wave per row, `v_dot8_i32_iu4` on the planar
+/// IU4G128 decode GEMV. One wave per row, `v_dot8_i32_iu4` on the planar
 /// nibble row. See `kernels/src/gemv_iu4.hip`.
-pub const GEMV_IU4G256_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.hip");
+pub const GEMV_IU4G128_SRC: &str = include_str!("../../../kernels/src/gemv_iu4.hip");
 
-/// x-batched IU4G256 decode GEMV (`y[b] = A . x[b]`, B <= 4): each weight row
+/// x-batched IU4G128 decode GEMV (`y[b] = A . x[b]`, B <= 4): each weight row
 /// is decoded once per launch and every row follows the scalar kernel's
 /// accumulation order (f32 rounding, not bit-identical where codegen picks a
 /// different FMA contraction). For the multi-slot decode path.
-pub const GEMV_IU4G256_XBATCH_SRC: &str = concat!(
-    "#define HIPFIRE_IU4G256_XBATCH_MAX 4\n",
-    "#define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch\n",
-    include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
+pub const GEMV_IU4G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_IU4G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_IU4G128_XBATCH_KERNEL gemv_iu4g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_iu4g128_xbatch.hip")
 );
-/// Residual sibling of [`GEMV_IU4G256_XBATCH_SRC`] (`y[b] += A . x[b]`).
-pub const GEMV_IU4G256_XBATCH_RESIDUAL_SRC: &str = concat!(
-    "#define HIPFIRE_IU4G256_XBATCH_MAX 4\n",
-    "#define HIPFIRE_IU4G256_RESIDUAL_EPILOGUE 1\n",
-    "#define HIPFIRE_IU4G256_XBATCH_KERNEL gemv_iu4g256_xbatch_residual\n",
-    include_str!("../../../kernels/src/gemv_iu4g256_xbatch.hip")
+/// Residual sibling of [`GEMV_IU4G128_XBATCH_SRC`] (`y[b] += A . x[b]`).
+pub const GEMV_IU4G128_XBATCH_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_IU4G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_IU4G128_RESIDUAL_EPILOGUE 1\n",
+    "#define HIPFIRE_IU4G128_XBATCH_KERNEL gemv_iu4g128_xbatch_residual\n",
+    include_str!("../../../kernels/src/gemv_iu4g128_xbatch.hip")
 );
 
 /// IU8G128 (qt 58) decode GEMV: the Q8 grid with the scales at the row tail.
@@ -5609,27 +5609,27 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the shared
 // block_i4_128 quant recipe (standalone quantize_int4_mmq_ds128 + C2
 // producer sidecars). Opt-in through HIPFIRE_IU4_PREFILL on gfx1100/gfx1151.
-// IU4G256 (qt57) W4A4 twin of the gfx11 MQ4V2 IU4 MMQ family:
+// IU4G128 (qt57) W4A4 twin of the gfx11 MQ4V2 IU4 MMQ family:
 // `-DHIPFIRE_IU4_PLANAR=1` swaps only the generic and lf16 tile loaders'
 // address math for the planar IU4 row ([K/2 codes][8 B header x G]). The
 // arithmetic (iu4 WMMA, IU4_FOLD_RN) is the MQ4V2 kernel's, so a qt57 tensor
 // that is the relayout of a qt44 tensor gives bit-identical Y for the same
 // `block_i4_128` X. Only the renamed entries are ever looked up.
-pub const GEMM_IU4G256_W4A4_SRC: &str = concat!(
+pub const GEMM_IU4G128_W4A4_SRC: &str = concat!(
     "#define HIPFIRE_IU4_PLANAR 1\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_iu4g256_w4a4\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 gemm_iu4g256_w4a4_full_set_lf16_col\n",
-    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151 gemm_iu4g256_w4a4_full_add_lf16_col\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_iu4g128_w4a4\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151 gemm_iu4g128_w4a4_full_set_lf16_col\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151 gemm_iu4g128_w4a4_full_add_lf16_col\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
-// IU4G256 (qt57) twin of the gfx11 MW-LDS f16 WMMA residual (`Y += W X`) for
+// IU4G128 (qt57) twin of the gfx11 MW-LDS f16 WMMA residual (`Y += W X`) for
 // small-M projections: `-DHIPFIRE_MWL_IU4L=1` swaps the A address math for
 // the planar IU4 row; decode and WMMA are the MQ4V2 entry's.
-pub const GEMM_IU4G256_MWL_SRC: &str = concat!(
+pub const GEMM_IU4G128_MWL_SRC: &str = concat!(
     "#define HIPFIRE_MWL_IU4L 1\n",
-    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds gemm_iu4g256_residual_wmma_gfx11_mw4_lds\n",
-    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds gemm_iu4g256_residual_wmma_gfx11_mw8_lds\n",
+    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds gemm_iu4g128_residual_wmma_gfx11_mw4_lds\n",
+    "#define gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds gemm_iu4g128_residual_wmma_gfx11_mw8_lds\n",
     include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_mw_lds.hip")
 );
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
@@ -6107,26 +6107,26 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
-// IU4G256 (qt57) W4A8 build of the gfx11 A8 MMQ (`v_wmma_i32_16x16x16_iu8`):
+// IU4G128 (qt57) W4A8 build of the gfx11 A8 MMQ (`v_wmma_i32_16x16x16_iu8`):
 // `I8_ASYM` folds the asymmetric MQ4V2 header (sc, zp) with the IU4_FOLD_RN
 // DAG (C = sum q*x8 on unsigned codes, s = exact int sum of x8), and
 // `HIPFIRE_IU4_PLANAR` swaps only the weight address math for the planar row.
 // X is the `block_i8_128` produced by `ensure_int8_mmq_x` / the fused
 // `*_rotate_mq_i8` producers. Only the renamed entries are looked up.
-pub const GEMM_IU4G256_W4A8_GFX11_SRC: &str = concat!(
+pub const GEMM_IU4G128_W4A8_GFX11_SRC: &str = concat!(
     "#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_add gemm_iu4g256_w4a8_full_add\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_set gemm_iu4g256_w4a8_full_set\n",
-    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8 gemm_iu4g256_w4a8_gate_up_silu\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add gemm_iu4g128_w4a8_full_add\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set gemm_iu4g128_w4a8_full_set\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8 gemm_iu4g128_w4a8_gate_up_silu\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
-/// 256-tile build of [`GEMM_IU4G256_W4A8_GFX11_SRC`] (entries suffixed `_t256`).
-pub const GEMM_IU4G256_W4A8_GFX11_T256_SRC: &str = concat!(
+/// 256-tile build of [`GEMM_IU4G128_W4A8_GFX11_SRC`] (entries suffixed `_t256`).
+pub const GEMM_IU4G128_W4A8_GFX11_T256_SRC: &str = concat!(
     "#define I8_TILE 256\n#define I8_ASYM 1\n#define HIPFIRE_IU4_PLANAR 1\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_add_t256 gemm_iu4g256_w4a8_full_add_t256\n",
-    "#define gemm_mq4g256v2_residual_mmq_i8_full_set_t256 gemm_iu4g256_w4a8_full_set_t256\n",
-    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8_t256 gemm_iu4g256_w4a8_gate_up_silu_t256\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_add_t256 gemm_iu4g128_w4a8_full_add_t256\n",
+    "#define gemm_mq4g256v2_residual_mmq_i8_full_set_t256 gemm_iu4g128_w4a8_full_set_t256\n",
+    "#define gemm_mq4g256v2_gate_up_silu_mmq_i8_t256 gemm_iu4g128_w4a8_gate_up_silu_t256\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );

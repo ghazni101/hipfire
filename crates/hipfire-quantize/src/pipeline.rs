@@ -151,7 +151,7 @@ fn stamp_mq4v2_body(
     }
     let m = groups / gpr;
     let quant_type = match layout {
-        hipfire_runtime::iu_quant::Layout::Iu4 => QuantType::IU4G256,
+        hipfire_runtime::iu_quant::Layout::Iu4 => QuantType::IU4G128,
     };
     match hipfire_runtime::iu_quant::repack_mq4v2(&bytes, m, k, layout) {
         Ok(packed) => (packed, quant_type, layout.name()),
@@ -10221,7 +10221,7 @@ mod pipeline_tests {
             Some("iu4-xt")
         );
         assert_eq!(
-            iu_product_name("iu4g256", ProductTier::Base).as_deref(),
+            iu_product_name("iu4g128", ProductTier::Base).as_deref(),
             Some("iu4")
         );
         assert_eq!(

@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Numerics gate for the x-batched IU4G256 decode GEMV
-//! (`gemv_iu4g256_xbatch`, `gemv_iu4g256_xbatch_residual`).
+//! Numerics gate for the x-batched IU4G128 decode GEMV
+//! (`gemv_iu4g128_xbatch`, `gemv_iu4g128_xbatch_residual`).
 //!
 //! Every column of the x-batch launch must match running the singleton
-//! `gemv_iu4g256` / `gemv_iu4g256_residual` on that column. The files compile
+//! `gemv_iu4g128` / `gemv_iu4g128_residual` on that column. The files compile
 //! separately, so the FMA contraction can differ: the contract is f32
 //! rounding (max relative error < 1e-6 against the singleton's own scale),
 //! not bit identity. Determinism (two runs are bit-identical) IS required.
@@ -97,11 +97,11 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
     for b in 0..batch {
         let xb = xd.sub_offset(b * k, k);
         let yb = y_single.sub_offset(b * m, m);
-        gpu.gemv_iu4g256(&w, &xb, &yb, m, k).unwrap();
+        gpu.gemv_iu4g128(&w, &xb, &yb, m, k).unwrap();
     }
-    gpu.gemv_iu4g256_xbatch(&w, &xd, &y_batch, m, k, batch, false)
+    gpu.gemv_iu4g128_xbatch(&w, &xd, &y_batch, m, k, batch, false)
         .unwrap();
-    gpu.gemv_iu4g256_xbatch(&w, &xd, &y_again, m, k, batch, false)
+    gpu.gemv_iu4g128_xbatch(&w, &xd, &y_again, m, k, batch, false)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let single = gpu.download_f32(&y_single).unwrap();
@@ -140,9 +140,9 @@ fn check(gpu: &mut Gpu, label: &str, m: usize, k: usize, batch: usize, rng: &mut
     for b in 0..batch {
         let xb = xd.sub_offset(b * k, k);
         let yb = r_single.sub_offset(b * m, m);
-        gpu.gemv_iu4g256_residual(&w, &xb, &yb, m, k).unwrap();
+        gpu.gemv_iu4g128_residual(&w, &xb, &yb, m, k).unwrap();
     }
-    gpu.gemv_iu4g256_xbatch(&w, &xd, &r_batch, m, k, batch, true)
+    gpu.gemv_iu4g128_xbatch(&w, &xd, &r_batch, m, k, batch, true)
         .unwrap();
     gpu.hip.device_synchronize().unwrap();
     let single = gpu.download_f32(&r_single).unwrap();

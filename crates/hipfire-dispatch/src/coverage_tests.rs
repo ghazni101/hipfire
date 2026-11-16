@@ -1089,15 +1089,15 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
             archs: WAVE32,
         },
         FusedKeyUse {
-            key: KernelKey::FusedQkvIu4G256,
+            key: KernelKey::FusedQkvIu4G128,
             archs: WAVE32,
         },
         FusedKeyUse {
-            key: KernelKey::FusedQkvzaIu4G256,
+            key: KernelKey::FusedQkvzaIu4G128,
             archs: WAVE32,
         },
         FusedKeyUse {
-            key: KernelKey::FusedGateUpIu4G256,
+            key: KernelKey::FusedGateUpIu4G128,
             archs: WAVE32,
         },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──

@@ -809,7 +809,7 @@ const ALL_DTYPES: &[DType] = &[
     DType::MQ2I4G128R128,
     DType::E8PI4G128R256,
     DType::E8PI4G128R128,
-    DType::IU4G256,
+    DType::IU4G128,
     DType::IU8G128,
     DType::MQ4G256V2P,
     DType::MQ4G128V2P,
@@ -1501,7 +1501,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
     let fam = GemvFamily::new();
     assert!(fam
         .resolve(
-            DType::IU4G256,
+            DType::IU4G128,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna3(),
@@ -1510,7 +1510,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
         .is_ok());
     assert!(fam
         .resolve(
-            DType::IU4G256,
+            DType::IU4G128,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna4(),
@@ -1519,7 +1519,7 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
         .is_ok());
     assert!(fam
         .resolve(
-            DType::IU4G256,
+            DType::IU4G128,
             GemvVariant::Prerotated,
             false,
             &ctx_rdna2(),
@@ -1527,10 +1527,10 @@ fn iu4_gemv_resolves_only_where_the_integer_dot_exists() {
         )
         .is_err());
     // A body-dtype `ssm_out` takes the fused residual arm.
-    assert!(KernelKey::for_gemv_residual(DType::IU4G256).is_ok());
+    assert!(KernelKey::for_gemv_residual(DType::IU4G128).is_ok());
     assert!(fam
         .resolve(
-            DType::IU4G256,
+            DType::IU4G128,
             GemvVariant::WithResidual,
             false,
             &ctx_rdna3(),

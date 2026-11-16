@@ -2,14 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Decode GEMV for IU4G256 (qt 57).
+// Decode GEMV for IU4G128 (qt 57).
 //
 // Row layout: [K/2 code bytes][f16 sc, f16 zp per 128] x K/128, zero-padded
 // to 16 B (IU4_ROW_BYTES). Low nibble = even K. Dequant w = sc*code + zp.
 // x is already FWHT-256 rotated.
 //
-// Default kernels (`gemv_iu4g256`, `gemv_iu4g256_residual`,
-// `fused_iu4g256_rows`): f32 activation, wide loads. Block 128 = four
+// Default kernels (`gemv_iu4g128`, `gemv_iu4g128_residual`,
+// `fused_iu4g128_rows`): f32 activation, wide loads. Block 128 = four
 // 32-lane waves, one output row per wave. Lane l owns the 32-weight chunks
 // c = l, l + 32, ...: one 16-byte code load at row + c*16, the (sc, zp) dword
 // of its 128-group at row + K/2 + (c/4)*4, and x[c*32 .. c*32+31] as eight
@@ -70,7 +70,7 @@ __device__ __forceinline__ float iu4_row_dot_wide(
 
 // Grid = ceil(M / 4), block 128: wave w of block b computes row 4b + w.
 __launch_bounds__(128)
-extern "C" __global__ void gemv_iu4g256(
+extern "C" __global__ void gemv_iu4g128(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -82,9 +82,9 @@ extern "C" __global__ void gemv_iu4g256(
     if ((threadIdx.x & 31) == 0) y[row] = acc;
 }
 
-// `y += W x`. Same grid and dot as gemv_iu4g256.
+// `y += W x`. Same grid and dot as gemv_iu4g128.
 __launch_bounds__(128)
-extern "C" __global__ void gemv_iu4g256_residual(
+extern "C" __global__ void gemv_iu4g128_residual(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -99,7 +99,7 @@ extern "C" __global__ void gemv_iu4g256_residual(
 // Up to four matrices sharing x. Global row 4b + w maps to the first matrix
 // whose cumulative row count exceeds it; grid = ceil((M0+M1+M2+M3) / 4).
 __launch_bounds__(128)
-extern "C" __global__ void fused_iu4g256_rows(
+extern "C" __global__ void fused_iu4g128_rows(
     const char* __restrict__ A0, const char* __restrict__ A1,
     const char* __restrict__ A2, const char* __restrict__ A3,
     const float* __restrict__ x,
@@ -176,7 +176,7 @@ __device__ __forceinline__ float iu4_row_dot_a8(
     return acc;
 }
 
-extern "C" __global__ void gemv_iu4g256_dot4(
+extern "C" __global__ void gemv_iu4g128_dot4(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -189,7 +189,7 @@ extern "C" __global__ void gemv_iu4g256_dot4(
     if (threadIdx.x == 0) y[row] = acc;
 }
 
-extern "C" __global__ void gemv_iu4g256_dot4_residual(
+extern "C" __global__ void gemv_iu4g128_dot4_residual(
     const unsigned char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -263,7 +263,7 @@ __device__ __forceinline__ float iu4_row_dot_a8q(
 }
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_iu4g256_dot4q(
+extern "C" __global__ void gemv_iu4g128_dot4q(
     const unsigned char* __restrict__ A, const int4* __restrict__ xq,
     float* __restrict__ y, int M, int K) {
     const int row = (int)blockIdx.x;
@@ -274,7 +274,7 @@ extern "C" __global__ void gemv_iu4g256_dot4q(
 }
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_iu4g256_dot4q_residual(
+extern "C" __global__ void gemv_iu4g128_dot4q_residual(
     const unsigned char* __restrict__ A, const int4* __restrict__ xq,
     float* __restrict__ y, int M, int K) {
     const int row = (int)blockIdx.x;
@@ -285,9 +285,9 @@ extern "C" __global__ void gemv_iu4g256_dot4q_residual(
 }
 
 // Up to four matrices sharing x (gate/up, q/k/v, qkv/z/beta/alpha) in one
-// launch; each output equals gemv_iu4g256_dot4q on that matrix.
+// launch; each output equals gemv_iu4g128_dot4q on that matrix.
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_iu4g256_dot4q_rows(
+extern "C" __global__ void fused_iu4g128_dot4q_rows(
     const unsigned char* __restrict__ A0, const unsigned char* __restrict__ A1,
     const unsigned char* __restrict__ A2, const unsigned char* __restrict__ A3,
     const int4* __restrict__ xq,

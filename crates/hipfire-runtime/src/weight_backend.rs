@@ -766,7 +766,7 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
     // design. Length and IU8 code-range checks are `iu_quant::validate`.
     RawCodec {
         quant_type: 57,
-        dtype: DType::IU4G256,
+        dtype: DType::IU4G128,
     },
     // qt=58: Q8F16 codes as a contiguous signed int8 plane, scales at the
     // tail. Verbatim upload. `iu_quant::validate_q8` checks the length.
@@ -843,7 +843,7 @@ fn validate_raw_codec_payload(
         ));
     }
     if let Some(layout) = match codec.dtype {
-        DType::IU4G256 => Some(crate::iu_quant::Layout::Iu4),
+        DType::IU4G128 => Some(crate::iu_quant::Layout::Iu4),
         _ => None,
     } {
         if let Err(error) = crate::iu_quant::validate(data, m, k, layout) {
@@ -2125,8 +2125,8 @@ mod tests {
             (49, DType::MQ3G256V2), // 104 B/G256 3.25bpw
             (50, DType::MQ2G256V2), // 72 B/G256 2.25bpw
             // qt=57: IU4 operand layout of MQ4V2 codes. rhs pinned against
-            // hipfire-quantize `QuantType::IU4G256 = 57`.
-            (57, DType::IU4G256),
+            // hipfire-quantize `QuantType::IU4G128 = 57`.
+            (57, DType::IU4G128),
             // qt=58: planar Q8 operand. rhs pinned against QuantType::IU8G128 = 58.
             (58, DType::IU8G128),
         ];
