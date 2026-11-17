@@ -1109,8 +1109,11 @@ mod tests {
                     want[i]
                 );
             }
-            // The row tail holds one scale per 128, not four per-32 words.
-            assert_eq!(packed[row * row_b + k..row * row_b + row_b].len(), 2);
+            // The row tail holds one scale per 128 (2 B), then zero padding
+            // to the 16-byte row multiple.
+            let row_end = (row + 1) * row_b;
+            assert_eq!(row_end - (row * row_b + k), 16);
+            assert!(packed[row_end - 14..row_end].iter().all(|&b| b == 0));
         }
     }
 

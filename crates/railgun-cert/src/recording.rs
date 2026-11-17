@@ -3051,7 +3051,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/dispatch.rs",
-        function: "ensure_int8_mmq_x",
+        function: "ensure_int8_mmq_x_impl",
         occurrences: 1,
         decisions: &["scratch-launch-plumbing"],
     },
@@ -3236,6 +3236,12 @@ pub const SITES: &[Site] = &[
         function: "fp8_f2_row_active",
         occurrences: 2,
         decisions: &["gfx1201-fp8-f2-row-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_iu4.rs",
+        function: "iu4g128_mmq_eligible",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
     },
     Site {
         file: "rdna-compute/src/gemv_q8x.rs",

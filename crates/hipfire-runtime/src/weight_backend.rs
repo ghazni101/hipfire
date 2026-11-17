@@ -1744,7 +1744,6 @@ impl<'a> WeightBackend for ParoBackend<'a> {
 mod tests {
     use super::*;
 
-<<<<<<< HEAD
     /// Every row-packed raw dtype refuses a cross-row (pre-per-row) payload
     /// for ragged K and accepts the per-row one; the set is shared by
     /// `decode_raw_codec` and the non-codec loaders.
