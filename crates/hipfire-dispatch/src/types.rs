@@ -124,7 +124,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | IU4G128 => RotationPlan::FwhtG256,
-        // qt=61 is the Q8 grid in the natural basis. Mapping it to FwhtG256
+        // qt=71 is the Q8 grid in the natural basis. Mapping it to FwhtG256
         // would rotate activations against weights that were not rotated.
         IU8G128 => RotationPlan::None,
         // MQ-I4 (qt=131..=136) are typed-qwen4-only; their activation basis
@@ -187,8 +187,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 
 /// Refusal for the typed-qwen4-only planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134)
 /// on every generic GEMV/GEMM family resolution: they have no generic kernel.
-/// Refusal for an IU dtype this family does not run. qt 60 decode GEMV is
-/// `GemvIu4G128Prerotated`; qt 61 plain GEMV is `GemvIu8G128`. GEMM of these
+/// Refusal for an IU dtype this family does not run. qt 70 decode GEMV is
+/// `GemvIu4G128Prerotated`; qt 71 plain GEMV is `GemvIu8G128`. GEMM of these
 /// layouts still lands here.
 pub(crate) fn reject_iu(dtype: DType, family: &'static str) -> DispatchError {
     DispatchError::UnsupportedVariant {
@@ -288,7 +288,7 @@ pub enum KernelKey {
     GemvF16,
     GemvBf16,
     GemvQ8_0,
-    /// qt 61 decode GEMV: the Q8 grid with the scales at the row tail. Not
+    /// qt 71 decode GEMV: the Q8 grid with the scales at the row tail. Not
     /// rotated (`IU8G128`'s rotation plan is `None`).
     GemvIu8G128,
     GemvQ4K,
@@ -327,7 +327,7 @@ pub enum KernelKey {
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
-    /// qt 60 decode GEMV. f32 activation, wide loads of the padded row.
+    /// qt 70 decode GEMV. f32 activation, wide loads of the padded row.
     GemvIu4G128Prerotated,
     GemvMq4CG256Prerotated,
     GemvMq5G256V2Prerotated,
@@ -368,9 +368,9 @@ pub enum KernelKey {
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
-    /// qt 60 fused `y += W·x` for a body-dtype `ssm_out`.
+    /// qt 70 fused `y += W·x` for a body-dtype `ssm_out`.
     GemvIu4G128Residual,
-    /// qt 61 fused `y += W·x` (DeltaNet out_proj / ssm_out decode step).
+    /// qt 71 fused `y += W·x` (DeltaNet out_proj / ssm_out decode step).
     GemvIu8G128Residual,
     // GEMV SwiGLU + residual
     GemvHfq4G256SwiGLUResidual,
@@ -526,7 +526,7 @@ pub enum KernelKey {
     FusedGateUpMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedGateUpMq4G256V2Lloyd,
-    /// qt=60 (IU4G128) decode: one `fused_iu4g128_rows` launch over QKV,
+    /// qt=70 (IU4G128) decode: one `fused_iu4g128_rows` launch over QKV,
     /// QKVZA or gate+up; each row is bit-identical to `gemv_iu4g128`.
     FusedQkvIu4G128,
     FusedQkvzaIu4G128,
@@ -885,7 +885,7 @@ impl KernelKey {
                 | E8PI4G128R128,
                 _,
             ) => Err(reject_mq_i4(dtype, "gemv")),
-            // qt 61 is the Q8 grid in the natural basis; its planar-tail GEMV
+            // qt 71 is the Q8 grid in the natural basis; its planar-tail GEMV
             // (`gemv_iu8g128`) is the same math as `gemv_q8_0`.
             (IU8G128, Plain) => Ok(Self::GemvIu8G128),
             _ => Err(DispatchError::UnsupportedVariant {
@@ -949,7 +949,7 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            // qt 61 is rotation-free, but it must not fall through to a
+            // qt 71 is rotation-free, but it must not fall through to a
             // plain kernel from a "prerotated" caller: the family admits it
             // on the Plain path only (the two are the same kernel, and Plain
             // is the one the caller's variant names).
@@ -998,8 +998,8 @@ impl KernelKey {
             }),
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 => Err(reject_mq_i4(dtype, "gemv")),
-            // Fused residual for a body-dtype `ssm_out`: qt 60 reads the
-            // rotated activation, qt 61 the natural-basis one.
+            // Fused residual for a body-dtype `ssm_out`: qt 70 reads the
+            // rotated activation, qt 71 the natural-basis one.
             IU4G128 => Ok(Self::GemvIu4G128Residual),
             IU8G128 => Ok(Self::GemvIu8G128Residual),
             _ => Err(DispatchError::UnsupportedVariant {
@@ -1126,8 +1126,8 @@ impl KernelKey {
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
             | E8PI4G128R128 | MQ4G256V2P | MQ4G128V2P => ArchPredicate::Always,
-            // qt 60 prefill GEMM is integer WMMA (W4A8/W4A4), so the dtype is
-            // gated on WMMA parts. qt 61 (IU8G128) is a f16-scale int8 GEMV and
+            // qt 70 prefill GEMM is integer WMMA (W4A8/W4A4), so the dtype is
+            // gated on WMMA parts. qt 71 (IU8G128) is a f16-scale int8 GEMV and
             // is admitted on every arch.
             IU4G128 => ArchPredicate::HasWmma,
             IU8G128 => ArchPredicate::Always,

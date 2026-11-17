@@ -698,7 +698,7 @@ fn swiglu_down_residual(
                 },
             )
         }
-        // qt=60 IU4G128 is a byte relayout of qt=44 (same FWHT-G256 input
+        // qt=70 IU4G128 is a byte relayout of qt=44 (same FWHT-G256 input
         // contract, same per-group affine math): take the MQ arm's fused
         // SiLU*up+rotate producer, then the IU4 residual GEMV. Replaces the
         // generic arm's silu + rotate + GEMV + per-token alloc + add + free.

@@ -108,18 +108,18 @@ pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
-        // qt 61 (IU8G128): the lifted-role tier of an iu4 file. The grid is
+        // qt 71 (IU8G128): the lifted-role tier of an iu4 file. The grid is
         // Q8 (signed int8, no FWHT) with one f16 scale per 128 at the row
         // tail, so the table uploads verbatim and `embedding_iu8g128`
         // dequantizes a row.
-        61 => Ok(EmbedPlan::Raw(EmbeddingFormat::IU8G128)),
+        71 => Ok(EmbedPlan::Raw(EmbeddingFormat::IU8G128)),
         1 | 2 | 16 | 40 | 41 | 44 | 45 | 47 | 48 | 49 | 50 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}: this model's embedding table is stored in a \
                  weight format hipfire cannot load. Supported embedding formats: 1 (F16), 2 (F32), 3 (Q8_0), \
-                 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16), 40 (TQ2G128), 41 (BQ1G128), 44/45/47-50 (MQ*G256V2), 61 (IU8G128). \
+                 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16), 40 (TQ2G128), 41 (BQ1G128), 44/45/47-50 (MQ*G256V2), 71 (IU8G128). \
                  Update hipfire, or re-quantize / re-download the model with a supported embedding format."
             ),
         )),
@@ -760,18 +760,18 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 50,
         dtype: DType::MQ2G256V2,
     },
-    // qt=60/61: MQ4V2 codes repacked into an IU4 or IU8 operand row
+    // qt=70/71: MQ4V2 codes repacked into an IU4 or IU8 operand row
     // (codes, then per-128 f16 scale/zero). Verbatim upload; the IU kernels
     // read them directly and the generic GEMV/GEMM families refuse them by
     // design. Length and IU8 code-range checks are `iu_quant::validate`.
     RawCodec {
-        quant_type: 60,
+        quant_type: 70,
         dtype: DType::IU4G128,
     },
-    // qt=61: Q8F16 codes as a contiguous signed int8 plane, scales at the
+    // qt=71: Q8F16 codes as a contiguous signed int8 plane, scales at the
     // tail. Verbatim upload. `iu_quant::validate_q8` checks the length.
     RawCodec {
-        quant_type: 61,
+        quant_type: 71,
         dtype: DType::IU8G128,
     },
 ];
@@ -2123,11 +2123,11 @@ mod tests {
             (48, DType::MQ5G256V2), // 168 B/G256 5.25bpw
             (49, DType::MQ3G256V2), // 104 B/G256 3.25bpw
             (50, DType::MQ2G256V2), // 72 B/G256 2.25bpw
-            // qt=60: IU4 operand layout of MQ4V2 codes. rhs pinned against
-            // hipfire-quantize `QuantType::IU4G128 = 60`.
-            (60, DType::IU4G128),
-            // qt=61: planar Q8 operand. rhs pinned against QuantType::IU8G128 = 61.
-            (61, DType::IU8G128),
+            // qt=70: IU4 operand layout of MQ4V2 codes. rhs pinned against
+            // hipfire-quantize `QuantType::IU4G128 = 70`.
+            (70, DType::IU4G128),
+            // qt=71: planar Q8 operand. rhs pinned against QuantType::IU8G128 = 71.
+            (71, DType::IU8G128),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

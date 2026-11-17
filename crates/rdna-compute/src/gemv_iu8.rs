@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Decode GEMV for [`crate::DType::IU8G128`] (qt 61), the lifted-role tier of
+//! Decode GEMV for [`crate::DType::IU8G128`] (qt 71), the lifted-role tier of
 //! an `iu4` file.
 //!
 //! The grid is the Q8 grid — signed int8 codes, zero point 0, no FWHT — with
@@ -28,7 +28,7 @@ use std::ffi::c_void;
 
 impl Gpu {
     /// `y = W x` for a planar IU8G128 weight. `x` is the natural-basis
-    /// activation (qt 61 is not rotated). `k` must be a positive multiple of
+    /// activation (qt 71 is not rotated). `k` must be a positive multiple of
     /// 128 (one f16 scale per 128 at the row tail).
     pub fn gemv_iu8g128(
         &mut self,

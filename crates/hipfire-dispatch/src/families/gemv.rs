@@ -689,7 +689,7 @@ fn residual_kernel(dtype: DType, variant: &'static str) -> Result<ResidualKernel
         HFQ6G256 | MQ6G256 => Plain(Gpu::gemv_hfq6g256_residual),
         MQ5G256 => Plain(Gpu::gemv_hfq5g256_residual),
         MQ4G256V2 => Plain(Gpu::gemv_hfq4g256_residual_mq4v2),
-        // IU body rows consume the rotated activation; qt 61 the natural-basis
+        // IU body rows consume the rotated activation; qt 71 the natural-basis
         // one. All three are fused `y += W·x`.
         IU4G128 => Plain(Gpu::gemv_iu4g128_residual),
         IU8G128 => Plain(Gpu::gemv_iu8g128_residual),

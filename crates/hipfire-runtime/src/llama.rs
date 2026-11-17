@@ -668,7 +668,7 @@ pub enum EmbeddingFormat {
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
-    IU8G128,  // raw qt 61 compact rows [K codes][K/128 f16 scales]
+    IU8G128,  // raw qt 71 compact rows [K codes][K/128 f16 scales]
     /// GGUF-native table in ggml block bytes (`DType::Ggml*`), dequantised per
     /// row by the ggml get-row kernel of that type.
     Ggml(DType),
@@ -831,9 +831,9 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
     hipfire_dispatch::pipeline::batched::reject_typed_only_format(dtype)
 }
 
-/// qt 61 has a generic GEMV (`KernelKey::GemvIu8G128`), so the plain
+/// qt 71 has a generic GEMV (`KernelKey::GemvIu8G128`), so the plain
 /// `weight_gemv` route must admit it. The rotation helpers keep the broader
-/// refusal above: qt 61 is unrotated and must never enter an FWHT path.
+/// refusal above: qt 71 is unrotated and must never enter an FWHT path.
 #[inline]
 fn reject_unsupported_gemv_dtype(dtype: DType) -> HipResult<()> {
     if dtype == DType::IU8G128 {
@@ -8698,10 +8698,10 @@ fn simple_rand() -> f32 {
 mod tests {
     use super::*;
 
-    /// qt 61 has a generic GEMV, so the plain `weight_gemv` gate must admit
+    /// qt 71 has a generic GEMV, so the plain `weight_gemv` gate must admit
     /// it; the rotation helpers keep refusing the unrotated IU layout.
     #[test]
-    fn weight_gemv_admits_qt61_but_not_typed_only_layouts() {
+    fn weight_gemv_admits_qt71_but_not_typed_only_layouts() {
         assert!(reject_unsupported_gemv_dtype(DType::IU8G128).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::Q8_0).is_ok());
         assert!(reject_unsupported_gemv_dtype(DType::MQ4G128V2).is_err());

@@ -75,8 +75,8 @@ impl QuantType {
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
             57 => Some(Self::HC8E4M3Row),
-            60 => Some(Self::IU4G128),
-            61 => Some(Self::IU8G128),
+            70 => Some(Self::IU4G128),
+            71 => Some(Self::IU8G128),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -262,13 +262,13 @@ pub(crate) enum QuantType {
     /// (`4*m`); decode `q * s`. Layout in `docs/quant-formats/hc8-e4m3-row.md`;
     /// built by `hipfire-quantize hc8 build`.
     HC8E4M3Row = 57,
-    /// IU4G128 (qt=60): MQ4G256V2 codes stored as an unsigned-nibble operand
+    /// IU4G128 (qt=70): MQ4G256V2 codes stored as an unsigned-nibble operand
     /// plane. See `hipfire_runtime::iu_quant`. No GPU kernel yet.
-    IU4G128 = 60,
-    /// IU8G128 (qt=61): unsigned-int8-range signed codes (one f16 scale per
+    IU4G128 = 70,
+    /// IU8G128 (qt=71): unsigned-int8-range signed codes (one f16 scale per
     /// 128, no FWHT) in a compact row `[K i8][K/128 f16]`. The fixed tier of
     /// an `iu4` file. Full int8 range. See `iu_quant`.
-    IU8G128 = 61,
+    IU8G128 = 71,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
@@ -933,6 +933,16 @@ mod maple_dtype_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn iu_qtypes_70_and_71_round_trip() {
+        assert_eq!(QuantType::IU4G128 as u8, 70);
+        assert_eq!(QuantType::IU8G128 as u8, 71);
+        assert_eq!(QuantType::from_u8(70), Some(QuantType::IU4G128));
+        assert_eq!(QuantType::from_u8(71), Some(QuantType::IU8G128));
+        // 57 is the upstream HC8 sidecar; the IU ids must not alias it.
+        assert_eq!(QuantType::from_u8(57), Some(QuantType::HC8E4M3Row));
     }
 
     const MQ_I4: [(u8, QuantType); 4] = [

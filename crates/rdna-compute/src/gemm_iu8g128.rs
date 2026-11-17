@@ -2,10 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Batched (prefill) GEMMs for [`crate::DType::IU8G128`] (qt61) on gfx11.
+//! Batched (prefill) GEMMs for [`crate::DType::IU8G128`] (qt71) on gfx11.
 //!
 //! Two kernels compute `Y[N, M] += W X` for the compact `[K i8][K/128 f16]`
-//! row. `X` is `[N, K]` f32 in the natural basis (qt61 is not rotated).
+//! row. `X` is `[N, K]` f32 in the natural basis (qt71 is not rotated).
 //!
 //! - **f16 twin** (`gemm_iu8g128_residual_wmma` + mb4/mb4m2): the Q8_0
 //!   f16-WMMA residual kernel built with `HIPFIRE_IU8G128L` (tail-scale row
@@ -40,7 +40,7 @@ const SYM_MB4M2: &str = "gemm_iu8g128_residual_wmma_mb4m2";
 // selector-receipt: receipts/selectors/iu8g128_w8a8_min_rows.json
 pub const IU8G128_W8A8_MIN_ROWS: usize = 48;
 
-/// Which qt61 batched GEMM a shape takes ([`Gpu::iu8g128_gemm_route`]).
+/// Which qt71 batched GEMM a shape takes ([`Gpu::iu8g128_gemm_route`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Iu8g128GemmRoute {
     /// `gemm_iu8g128_w8a8_min`: int8 activations, IU8 WMMA.
@@ -49,7 +49,7 @@ pub enum Iu8g128GemmRoute {
     F16Twin,
 }
 
-/// `HIPFIRE_IU8G128_W8A8=0` keeps every qt61 GEMM on the f16 twin (A/B
+/// `HIPFIRE_IU8G128_W8A8=0` keeps every qt71 GEMM on the f16 twin (A/B
 /// control for both the singleton and the multi-slot prefill).
 fn iu8g128_w8a8_enabled() -> bool {
     static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -85,8 +85,8 @@ fn iu8g128_m2_enabled() -> bool {
     *V
 }
 
-/// Whether a qt61 matrix of width `k` has a batched GEMM on `arch` (the f16
-/// twin, which every other qt61 GEMM route falls back to). Admission
+/// Whether a qt71 matrix of width `k` has a batched GEMM on `arch` (the f16
+/// twin, which every other qt71 GEMM route falls back to). Admission
 /// predicates that hold only an arch name call this; launchers call
 /// [`Gpu::iu8g128_wmma_eligible`], which is the same rule.
 pub fn iu8g128_gemm_admits(arch: &str, k: usize) -> bool {
@@ -95,7 +95,7 @@ pub fn iu8g128_gemm_admits(arch: &str, k: usize) -> bool {
 
 impl Gpu {
     /// Whether [`Gpu::gemm_iu8g128_residual_wmma`] (the f16 twin) can run
-    /// here. Any qt61 batched GEMM is admissible exactly when this holds.
+    /// here. Any qt71 batched GEMM is admissible exactly when this holds.
     pub fn iu8g128_wmma_eligible(&self, k: usize) -> bool {
         iu8g128_gemm_admits(&self.arch, k)
     }
@@ -105,8 +105,8 @@ impl Gpu {
         k > 0 && k % 256 == 0 && crate::arch_caps::supports_iu8g128_gemm(&self.arch)
     }
 
-    /// The qt61 batched GEMM for `n` token rows of a `K`-wide matrix, or
-    /// `None` when no qt61 GEMM runs here (the caller must refuse the
+    /// The qt71 batched GEMM for `n` token rows of a `K`-wide matrix, or
+    /// `None` when no qt71 GEMM runs here (the caller must refuse the
     /// layer). W8A8 needs its own eligibility and at least
     /// [`IU8G128_W8A8_MIN_ROWS`] rows; everything else takes the f16 twin.
     pub fn iu8g128_gemm_route(&self, k: usize, n: usize) -> Option<Iu8g128GemmRoute> {
@@ -120,7 +120,7 @@ impl Gpu {
         }
     }
 
-    /// `Y += W X` for one qt61 matrix through [`Gpu::iu8g128_gemm_route`].
+    /// `Y += W X` for one qt71 matrix through [`Gpu::iu8g128_gemm_route`].
     /// `x` is `[n, k]` f32; the W8A8 route quantizes it here.
     pub fn gemm_iu8g128_residual(
         &mut self,
@@ -304,7 +304,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qt61_gemm_admission_is_one_rule() {
+    fn qt71_gemm_admission_is_one_rule() {
         for arch in ["gfx1100", "gfx1151"] {
             assert!(iu8g128_gemm_admits(arch, 128), "{arch}");
             assert!(iu8g128_gemm_admits(arch, 6144), "{arch}");

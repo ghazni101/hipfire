@@ -203,9 +203,9 @@ fn check(
     }
 }
 
-/// WO-shape timing probe for the two candidate paths on the qt61 bucket:
+/// WO-shape timing probe for the two candidate paths on the qt71 bucket:
 /// the existing W4A8 int8-WMMA LDS MMQ (int4 weights, int8 X) and the
-/// shipped qt61 f16-WMMA register GEMM. The W4A8 number is an upper bound
+/// shipped qt71 f16-WMMA register GEMM. The W4A8 number is an upper bound
 /// for a future int8-weight LDS kernel (its weight plane is 2x smaller).
 #[test]
 #[ignore]
@@ -239,7 +239,7 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
         let xq = gpu.ensure_int8_mmq_x(&xd, n, k).unwrap();
         let y_int = gpu.upload_f32(&vec![0.0f32; n * m], &[n * m]).unwrap();
 
-        // qt61 weights: [K i8][K/128 f16 scales] per row (one scale per 128).
+        // qt71 weights: [K i8][K/128 f16 scales] per row (one scale per 128).
         let g128 = k / 128;
         let stride = k + g128 * 2;
         let mut q59 = vec![0u8; m * stride];
@@ -279,7 +279,7 @@ fn wo_shape_int_lds_vs_f16_register_timing() {
         gpu.hip.device_synchronize().unwrap();
         let f16_ms = t1.elapsed().as_secs_f64() * 1000.0 / 8.0;
         eprintln!(
-        "wo shape M={m} K={k} N={n}: W4A8-LDS-int4 {int_ms:.3} ms ({:.1} TFLOPS); qt61 f16-register {f16_ms:.3} ms ({:.1} TFLOPS); speedup {:.2}x",
+        "wo shape M={m} K={k} N={n}: W4A8-LDS-int4 {int_ms:.3} ms ({:.1} TFLOPS); qt71 f16-register {f16_ms:.3} ms ({:.1} TFLOPS); speedup {:.2}x",
         flops / 1e9 / int_ms,
         flops / 1e9 / f16_ms,
         f16_ms / int_ms

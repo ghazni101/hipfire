@@ -34,8 +34,8 @@ Production defaults for day-to-day use:
 | `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
-| `iu4` | `IU4G128` (qt 60) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in on gfx11/gfx12); prefill is the W4A8 WMMA GEMM (W4A4 opt-in) on gfx1100/gfx1151 only |
-| `iu4` lifted roles | `IU8G128` (qt 61) | 8 | 8.125 | K + 2 B per 128 (260 B at K=256) | Q8 grid, one scale per 128 at the row tail. Embeddings every rung; lm_head on `iu4` and `pro`; ssm_out on `pro`. Decode GEMV family, the embedding gather and the W8A8 / f16-WMMA prefill GEMM selector have kernels; that selector runs on gfx1100/gfx1151 only |
+| `iu4` | `IU4G128` (qt 70) | 4 | 4.25 | 136 (K/2 nibbles, then 4 B scale/zero per 128) | MQ4V2 codes in IU4 operand order. Decode GEMV `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in on gfx11/gfx12); prefill is the W4A8 WMMA GEMM (W4A4 opt-in) on gfx1100/gfx1151 only |
+| `iu4` lifted roles | `IU8G128` (qt 71) | 8 | 8.125 | K + 2 B per 128 (260 B at K=256) | Q8 grid, one scale per 128 at the row tail. Embeddings every rung; lm_head on `iu4` and `pro`; ssm_out on `pro`. Decode GEMV family, the embedding gather and the W8A8 / f16-WMMA prefill GEMM selector have kernels; that selector runs on gfx1100/gfx1151 only |
 
 **Nominal bitwidth is not bpw.** The “bits” column is the payload width only.
 Stored bpw is the exact group arithmetic and includes the per-group header:
@@ -47,12 +47,12 @@ none of these figures is a performance or quality claim.
 
 Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
 (Q4-grade embedding error compounds). On `iu4` that same grid is
-stored as `IU8G128` (qt 61) for the roles the rung lifts: the signed codes
+stored as `IU8G128` (qt 71) for the roles the rung lifts: the signed codes
 are contiguous and one f16 scale per 128 sits at the end of the row, which
 is the operand `v_wmma_i32_16x16x16_iu8` loads in the W8A8 GEMM (gfx1100/gfx1151
 only). The bare product lifts embeddings
 and `lm_head`. `iu4-xt` leaves `lm_head` on the body. `iu4 pro` also lifts
-`ssm_out`. It is not qt 61. 1D norms / scales stay F16. Direct
+`ssm_out`. It is not qt 71. 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
 ### Magnum V2 family (qt 44 / 47–50 / 52), MQ4C (qt 45) and MQ4G128V2 (qt 53)

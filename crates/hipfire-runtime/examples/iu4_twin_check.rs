@@ -1,5 +1,5 @@
 //! iu4_twin_check <iu.hfq> <mq.hfq>: proves an IU file's body rows are a pure
-//! relayout of its MQ4V2 twin (qt 60) and its lifted qt 61 rows are the
+//! relayout of its MQ4V2 twin (qt 70) and its lifted qt 71 rows are the
 //! deterministic per-128 requant of the Q8F16 twin (`iu_quant::repack_q8f16`).
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::iu_quant::{self, Layout};
@@ -29,10 +29,10 @@ fn main() {
             (1, shape[0] as usize)
         };
         let ok = match (ti.quant_type, tm.quant_type) {
-            (60, 44) => iu_quant::repack_mq4v2(mb, m, k, Layout::Iu4)
+            (70, 44) => iu_quant::repack_mq4v2(mb, m, k, Layout::Iu4)
                 .map(|v| v == ib)
                 .unwrap_or(false),
-            (61, _) if tm.quant_type != 61 => iu_quant::repack_q8f16(mb, m, k)
+            (71, _) if tm.quant_type != 71 => iu_quant::repack_q8f16(mb, m, k)
                 .map(|v| v == ib)
                 .unwrap_or(false),
             (x, y) if x == y => ib == mb,

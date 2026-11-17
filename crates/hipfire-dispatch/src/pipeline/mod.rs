@@ -132,7 +132,7 @@ pub mod superop;
 /// This is the MoE/pipeline guard, so an IU operand is refused here too: no
 /// MoE projection has an IU reader. The **decode** sites that reach a plain
 /// projection use [`reject_typed_only`] instead, which leaves the IU family to
-/// the readers (qt 60 GEMV, qt 61 GEMV/residual/gather).
+/// the readers (qt 70 GEMV, qt 71 GEMV/residual/gather).
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {
     reject_typed_only(dtype, family)?;
     if dtype.is_iu_quant() {

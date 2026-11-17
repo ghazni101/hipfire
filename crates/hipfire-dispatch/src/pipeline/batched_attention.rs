@@ -475,7 +475,7 @@ pub fn batch_chunk_full_attn_input_projection(
         layer.wq.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=70 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract; dispatch arm below
             // routes to the FP8-LUT twin.
@@ -902,7 +902,7 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
         )?;
     } else if qkv_same_dtype && layer.wq.dtype == DType::IU4G128 {
-        // qt=60: q/k/v MMQ launches over one quantized X.
+        // qt=70: q/k/v MMQ launches over one quantized X.
         gpu.gemm_iu4g128_multi(
             &[
                 (&layer.wq.buf, &pbs.fa_q_full_batch, layer.wq.m),
@@ -1371,7 +1371,7 @@ pub fn batch_chunk_full_attn_output_projection(
         layer.wo.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=70 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs rotated x).
             | DType::MQ4G256V2Lloyd

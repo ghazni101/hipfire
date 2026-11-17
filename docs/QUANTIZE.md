@@ -19,8 +19,8 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 | Format | Wire | Bitwidth | Rotation | Typical use |
 |---|---|---|---|---|
 | **`mq4`** *(alias)* / `mq4v2` | **qt 44 `MQ4G256V2`** | 4 | FWHT | Qwen 3.5+ default body. **`--format mq4` means V2, not qt 13.** |
-| `iu4` / `iu4g128` | qt 60 `IU4G128` | 4 | FWHT | Same MQ4V2 codes, stored as an unsigned-nibble row. Decode GEMV `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12); prefill is the W4A8 WMMA GEMM (W4A4 opt-in) on gfx1100/gfx1151 only. **`hipfire-quantize` direct.** |
-| `iu4` lifted roles | qt 61 `IU8G128` | 8 | none | Embeddings on every rung, `lm_head` on the bare name and `pro`, `ssm_out` on `pro`: the Q8 grid with one scale per 128 at the row tail, a signed IU8 operand. Decode GEMV (`gemv_iu8g128` v2, f32 activations, every arch; `HIPFIRE_IU8_GEMV=dot4` selects the int8×int8 `_a8` variants on gfx11/gfx12) and the embedding gather (`embedding_iu8g128`) run on every arch; the W8A8 / f16-WMMA prefill GEMM selector runs on gfx1100/gfx1151 only. |
+| `iu4` / `iu4g128` | qt 70 `IU4G128` | 4 | FWHT | Same MQ4V2 codes, stored as an unsigned-nibble row. Decode GEMV `gemv_iu4g128` (f32 activations, every arch; `HIPFIRE_IU4_DECODE=dot4` opt-in, gfx11/gfx12); prefill is the W4A8 WMMA GEMM (W4A4 opt-in) on gfx1100/gfx1151 only. **`hipfire-quantize` direct.** |
+| `iu4` lifted roles | qt 71 `IU8G128` | 8 | none | Embeddings on every rung, `lm_head` on the bare name and `pro`, `ssm_out` on `pro`: the Q8 grid with one scale per 128 at the row tail, a signed IU8 operand. Decode GEMV (`gemv_iu8g128` v2, f32 activations, every arch; `HIPFIRE_IU8_GEMV=dot4` selects the int8×int8 `_a8` variants on gfx11/gfx12) and the embedding gather (`embedding_iu8g128`) run on every arch; the W8A8 / f16-WMMA prefill GEMM selector runs on gfx1100/gfx1151 only. |
 | `mq4v1` / `mq4g256` / `magnum` | qt 13 `MQ4G256` | 4 | FWHT | Legacy Magnum v1 only (explicit opt-in) |
 | `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |
 | `mq6` | qt 15 `MQ6G256` | 6 | FWHT | Qwen 3.5+ v1 when you can spare size for quality |
@@ -44,7 +44,7 @@ grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
 CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
 further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
 `mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, `iu4`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
-`hipfire-quantize` directly. `iu4` follows the MQ4V2 tensor map for the body. The bare name is the normal rung (embeddings and `lm_head` as qt 61 `IU8G128`); `--tier xt` leaves `lm_head` on the body and `--tier pro` also lifts `ssm_out`. qt 60 has a decode GEMV and a W4A8 WMMA prefill (W4A4 opt-in) on gfx1100/gfx1151; qt 61 has a decode GEMV, the embedding gather and a W8A8 (IU8 WMMA) / f16-WMMA prefill selector on gfx1100/gfx1151 ([quant-formats/iu.md](quant-formats/iu.md)).
+`hipfire-quantize` directly. `iu4` follows the MQ4V2 tensor map for the body. The bare name is the normal rung (embeddings and `lm_head` as qt 71 `IU8G128`); `--tier xt` leaves `lm_head` on the body and `--tier pro` also lifts `ssm_out`. qt 70 has a decode GEMV and a W4A8 WMMA prefill (W4A4 opt-in) on gfx1100/gfx1151; qt 71 has a decode GEMV, the embedding gather and a W8A8 (IU8 WMMA) / f16-WMMA prefill selector on gfx1100/gfx1151 ([quant-formats/iu.md](quant-formats/iu.md)).
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
 (`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays), product-tier

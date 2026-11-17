@@ -195,7 +195,7 @@ pub fn reject_typed_only_format(dtype: DType) -> HipResult<()> {
         Err(HipError::new(
             0,
             &format!(
-                "this model uses the {} weight format (qt 61): an integer-matrix operand layout this generic batched route cannot consume (it needs a rotation input the IU operand does not take). qt 61 has its own unrotated GEMV, embedding and residual GEMM",
+                "this model uses the {} weight format (qt 71): an integer-matrix operand layout this generic batched route cannot consume (it needs a rotation input the IU operand does not take). qt 71 has its own unrotated GEMV, embedding and residual GEMM",
                 dtype.iu_quant_name().unwrap_or("IU")
             ),
         ))
@@ -1176,7 +1176,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
         );
     }
     if w.dtype == DType::IU8G128 {
-        // qt61 compact row, natural-basis input. `gemm_iu8g128_residual` picks
+        // qt71 compact row, natural-basis input. `gemm_iu8g128_residual` picks
         // W8A8 or the f16 twin from (arch, K, n) with the one selector the
         // multi-slot body also uses.
         return match epilogue {
@@ -1279,7 +1279,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if w.dtype == DType::IU4G128 {
-                // qt=60: IU4 MMQ (gfx11) or per-token f32 GEMV, y += W x.
+                // qt=70: IU4 MMQ (gfx11) or per-token f32 GEMV, y += W x.
                 return gpu.gemm_iu4g128(&w.buf, input, &pbs.x_batch, m, k, n, true);
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
                 // qt=52: gfx11 → MMQ-LUT residual; gfx12 keeps FP8-LUT; else
@@ -1401,7 +1401,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if w.dtype == DType::IU4G128 {
-                // qt=60 Partial: SET (y = W x), no zero pass needed.
+                // qt=70 Partial: SET (y = W x), no zero pass needed.
                 return gpu.gemm_iu4g128(&w.buf, input, &out_n, m, k, n, false);
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
                 // qt=52 Partial: zero then residual (== plain GEMM). gfx11 →
@@ -1975,7 +1975,7 @@ fn swiglu_ffn_gate_up_batched(
         layer.w_gate.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=70 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract; dispatch arm below
             // routes to the FP8-LUT twin.
@@ -2417,7 +2417,7 @@ fn swiglu_ffn_gate_up_batched(
                 "swiglu_ffn_gate_up_batched: mixed IU4G128/other gate/up — refusing",
             ));
         }
-        // qt=60: one quantized X shared by both MMQ launches.
+        // qt=70: one quantized X shared by both MMQ launches.
         gpu.gemm_iu4g128_multi(
             &[
                 (&layer.w_gate.buf, &pbs.gate_ffn_batch, layer.w_gate.m),
@@ -2544,7 +2544,7 @@ fn swiglu_ffn_down_batched(
         layer.w_down.dtype,
         DType::MQ4G256
             | DType::MQ4G256V2
-            // qt=60 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
+            // qt=70 IU4G128 is qt=44 relaid out: same FWHT-G256 input.
             | DType::IU4G128
             // qt=52 shares qt=44's FWHT input contract (LUT decode needs rotated x).
             | DType::MQ4G256V2Lloyd

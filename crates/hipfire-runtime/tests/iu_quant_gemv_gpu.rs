@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU↔CPU parity for the IU quant family's decode readers: qt 60
-//! (`IU4G128`) and qt 61 (`IU8G128`), each with its fused
-//! `y += W·x` twin, plus the qt 61 embedding gather.
+//! GPU↔CPU parity for the IU quant family's decode readers: qt 70
+//! (`IU4G128`) and qt 71 (`IU8G128`), each with its fused
+//! `y += W·x` twin, plus the qt 71 embedding gather.
 //!
 //! The CPU contracts are `hipfire_runtime::iu_quant`:
-//! `dequant` (qt 60, f32 activation, per-128 `(scale, zero)`)
+//! `dequant` (qt 70, f32 activation, per-128 `(scale, zero)`)
 //! and `gemv_q8` (planar
 //! Q8 grid, one f16 scale per 128, natural basis). A wrong row stride, a scale read at the wrong
 //! offset, a nibble-order flip or a sign error lands orders of magnitude
@@ -103,12 +103,12 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         }
     };
     let m = 5usize;
-    // K must be a multiple of 256 for the FWHT-256 IU4 layout (qt 60).
+    // K must be a multiple of 256 for the FWHT-256 IU4 layout (qt 70).
     for k in [256usize, 512, 3072] {
         let src = mq4v2_blob(m, k);
         let x = activation(k);
 
-        // ── qt 60 IU4G128 ────────────────────────────────────────────────
+        // ── qt 70 IU4G128 ────────────────────────────────────────────────
         let iu4 = repack_mq4v2(&src, m, k, Layout::Iu4).expect("repack iu4");
         let wq = dequant(&iu4, m, k, Layout::Iu4).expect("cpu iu4");
         let want: Vec<f32> = (0..m)
@@ -153,7 +153,7 @@ fn iu_quant_gemv_and_gather_match_the_cpu_contract() {
         }
     }
 
-    // ── qt 61 IU8G128 + gather ────────────────────────────────────────────
+    // ── qt 71 IU8G128 + gather ────────────────────────────────────────────
     for k in [128usize, 256, 2688] {
         let src = q8f16_blob(m, k);
         let packed = repack_q8f16(&src, m, k).expect("repack");

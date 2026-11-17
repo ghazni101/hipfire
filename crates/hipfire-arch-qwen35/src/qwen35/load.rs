@@ -4174,9 +4174,9 @@ fn validate_embedding_info(
             }
             Some(vocab * (dim / 32) * 34)
         }
-        // qt 61 (IU8G128): one code byte per weight and one f16 scale per 128
+        // qt 71 (IU8G128): one code byte per weight and one f16 scale per 128
         // at the row tail.
-        61 => {
+        71 => {
             if dim % 128 != 0 {
                 return Err(format!("{name}: IU8G128 dim {dim} not multiple of 128"));
             }
@@ -4223,7 +4223,7 @@ fn validate_embedding_info(
 }
 
 #[cfg(test)]
-mod qt61_embedding_validation {
+mod qt71_embedding_validation {
     use super::*;
 
     fn info(
@@ -4243,28 +4243,28 @@ mod qt61_embedding_validation {
         }
     }
 
-    /// qt61 is the `[K i8][K/128 f16]` row padded to 16 B. A table of any
+    /// qt71 is the `[K i8][K/128 f16]` row padded to 16 B. A table of any
     /// other extent, a group tag other than 128, or `K % 128 != 0` is refused
     /// rather than misread.
     #[test]
-    fn qt61_embedding_admits_only_the_compact_row() {
+    fn qt71_embedding_admits_only_the_compact_row() {
         let (vocab, dim) = (7usize, 512usize);
         let compact = vocab * hipfire_runtime::iu_quant::q8_row_bytes(dim).unwrap();
-        validate_embedding_info(&info(61, 128, vocab, dim, compact), vocab, dim, "embed")
-            .expect("compact qt61 row");
+        validate_embedding_info(&info(71, 128, vocab, dim, compact), vocab, dim, "embed")
+            .expect("compact qt71 row");
         // Wrong extent (one scale per 32), same group tag.
         validate_embedding_info(
-            &info(61, 128, vocab, dim, vocab * (dim + (dim / 32) * 2)),
+            &info(71, 128, vocab, dim, vocab * (dim + (dim / 32) * 2)),
             vocab,
             dim,
             "embed",
         )
         .expect_err("a wrong extent must be refused");
         // Right extent, wrong group tag.
-        validate_embedding_info(&info(61, 32, vocab, dim, compact), vocab, dim, "embed")
+        validate_embedding_info(&info(71, 32, vocab, dim, compact), vocab, dim, "embed")
             .expect_err("group_size 32 must be refused");
         // K not a multiple of 128.
-        validate_embedding_info(&info(61, 128, vocab, 320, 0), vocab, 320, "embed")
+        validate_embedding_info(&info(71, 128, vocab, 320, 0), vocab, 320, "embed")
             .expect_err("K % 128 != 0 must be refused");
     }
 }

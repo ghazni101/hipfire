@@ -2827,7 +2827,7 @@ pub const GEMV_IU4G128_XBATCH_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_iu4g128_xbatch.hip")
 );
 
-/// IU8G128 (qt 61) decode GEMV: the Q8 grid with the scales at the row tail.
+/// IU8G128 (qt 71) decode GEMV: the Q8 grid with the scales at the row tail.
 /// `gemv_iu8g128` (SET) and `gemv_iu8g128_residual` (fused `y += W·x`).
 /// See `kernels/src/gemv_iu8g128.hip`.
 pub const GEMV_IU8G128_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g128.hip");
@@ -2839,7 +2839,7 @@ pub const GEMV_IU8G128_SRC: &str = include_str!("../../../kernels/src/gemv_iu8g1
 pub const ATTENTION_FLASH_Q8_0_TILE_GQA_PAGED_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa_paged.gfx1100.hip");
 
-/// IU8G128 (qt 61) embedding lookup: one row dequantized to F32 from the
+/// IU8G128 (qt 71) embedding lookup: one row dequantized to F32 from the
 /// planar Q8 grid. See `kernels/src/embedding_iu8g128.hip`.
 pub const EMBEDDING_IU8G128_SRC: &str = include_str!("../../../kernels/src/embedding_iu8g128.hip");
 pub const EMBEDDING_IU8G128_BATCHED_SRC: &str =
@@ -5609,10 +5609,10 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the shared
 // block_i4_128 quant recipe (standalone quantize_int4_mmq_ds128 + C2
 // producer sidecars). Opt-in through HIPFIRE_IU4_PREFILL on gfx1100/gfx1151.
-// IU4G128 (qt60) W4A4 twin of the gfx11 MQ4V2 IU4 MMQ family:
+// IU4G128 (qt70) W4A4 twin of the gfx11 MQ4V2 IU4 MMQ family:
 // `-DHIPFIRE_IU4_PLANAR=1` swaps only the generic and lf16 tile loaders'
 // address math for the planar IU4 row ([K/2 codes][8 B header x G]). The
-// arithmetic (iu4 WMMA, IU4_FOLD_RN) is the MQ4V2 kernel's, so a qt60 tensor
+// arithmetic (iu4 WMMA, IU4_FOLD_RN) is the MQ4V2 kernel's, so a qt70 tensor
 // that is the relayout of a qt44 tensor gives bit-identical Y for the same
 // `block_i4_128` X. Only the renamed entries are ever looked up.
 pub const GEMM_IU4G128_W4A4_SRC: &str = concat!(
@@ -5623,7 +5623,7 @@ pub const GEMM_IU4G128_W4A4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
-// IU4G128 (qt60) twin of the gfx11 MW-LDS f16 WMMA residual (`Y += W X`) for
+// IU4G128 (qt70) twin of the gfx11 MW-LDS f16 WMMA residual (`Y += W X`) for
 // small-M projections: `-DHIPFIRE_MWL_IU4L=1` swaps the A address math for
 // the planar IU4 row; decode and WMMA are the MQ4V2 entry's.
 pub const GEMM_IU4G128_MWL_SRC: &str = concat!(
@@ -6107,7 +6107,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_I8_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
-// IU4G128 (qt60) W4A8 build of the gfx11 A8 MMQ (`v_wmma_i32_16x16x16_iu8`):
+// IU4G128 (qt70) W4A8 build of the gfx11 A8 MMQ (`v_wmma_i32_16x16x16_iu8`):
 // `I8_ASYM` folds the asymmetric MQ4V2 header (sc, zp) with the IU4_FOLD_RN
 // DAG (C = sum q*x8 on unsigned codes, s = exact int sum of x8), and
 // `HIPFIRE_IU4_PLANAR` swaps only the weight address math for the planar row.
@@ -8394,9 +8394,9 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
-/// IU8G128 (qt61) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G128L`
+/// IU8G128 (qt71) twin of GEMM_Q8_0_RESIDUAL_WMMA_SRC: `-DHIPFIRE_IU8G128L`
 /// swaps only the row addressing ([K codes][K/32 f16 scales]); the f16 WMMA
-/// arithmetic is the Q8_0 kernel's, so a qt61 relayout of a Q8_0 tensor gives
+/// arithmetic is the Q8_0 kernel's, so a qt71 relayout of a Q8_0 tensor gives
 /// bit-identical Y. Entry renamed so the function cache cannot alias.
 pub const GEMM_IU8G128_RESIDUAL_WMMA_SRC: &str = concat!(
     "#define HIPFIRE_IU8G128L 1\n",

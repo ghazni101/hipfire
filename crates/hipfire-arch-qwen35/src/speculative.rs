@@ -350,7 +350,7 @@ pub(crate) fn dflash_enqueue_verify_lm_head(
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
         }
         rdna_compute::DType::IU8G128 => {
-            // qt61 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
+            // qt71 is the Q8_0 relayout; its batched GEMM is the gfx11 f16
             // WMMA residual kernel, so seed the slice the residual adds to.
             gpu.hip.memset(&logits_batch.buf, 0, b * vocab * 4)?;
             gpu.gemm_iu8g128_residual_wmma(

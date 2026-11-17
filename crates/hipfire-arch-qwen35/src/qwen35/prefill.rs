@@ -328,7 +328,7 @@ fn dense_layers_have_projection_dtype(weights: &Qwen35Weights, dtype: DType) -> 
 }
 
 /// `HIPFIRE_IU4_WIDE_PREFILL=1`: admit the dense IU4 / IU8G128 projection
-/// family (qt 60 + qt 61 wo) to the widened ordinary-prefill chunks. The
+/// family (qt 70 + qt 71 wo) to the widened ordinary-prefill chunks. The
 /// widened route keeps its 512-row commit seams and runs the same per-layer
 /// kernels on larger n; it is opt-in until its prefill output is pinned
 /// against the legacy 512-row cadence on real IU4 artifacts.
@@ -344,8 +344,8 @@ fn iu4_wide_prefill_requested() -> bool {
     *V
 }
 
-/// Every dense projection of an IU4-family artifact: qt 60 (IU4G128)
-/// projections with the qt 61 (IU8G128) out projection, no MoE layers.
+/// Every dense projection of an IU4-family artifact: qt 70 (IU4G128)
+/// projections with the qt 71 (IU8G128) out projection, no MoE layers.
 fn dense_layers_have_iu4_family(weights: &Qwen35Weights) -> bool {
     let iu = |dtype: DType| matches!(dtype, DType::IU4G128 | DType::IU8G128);
     !weights.layers.is_empty()
@@ -4585,7 +4585,7 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let bf16_with_gfx942 =
         matches!(dt, DType::BF16) && arch == "gfx942" && rdna_compute::calib_force_bf16();
 
-    // IU4G128 (qt60): native IU4 Q8_1 MMQ prefill (`gemm_iu4g128_multi`, the
+    // IU4G128 (qt70): native IU4 Q8_1 MMQ prefill (`gemm_iu4g128_multi`, the
     // MQ4V2 MMQ arithmetic over the planar IU4 rows) on gfx1100/gfx1151. The
     // six rotation lists (qkv/wo/ffn/w_down in batched*.rs) and the
     // gate_up/qkv/qkvza/epilogue/single-weight IU4 arms land in lockstep.
@@ -4701,7 +4701,7 @@ pub fn qwen35_layer_batch_admissible(
                 ("w_up", l.w_up.gpu_dtype),
                 ("w_down", l.w_down.gpu_dtype),
             ] {
-                // qt61 IU8G128 is admitted only as the DeltaNet `wo` (natural
+                // qt71 IU8G128 is admitted only as the DeltaNet `wo` (natural
                 // basis input) via `gemm_iu8g128_residual_wmma` on gfx11.
                 let iu8g128_wo = name == "wo"
                     && dt == DType::IU8G128

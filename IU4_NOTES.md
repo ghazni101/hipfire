@@ -2,6 +2,8 @@
 
 Merge base vs master: 3e2a6f0d8. Times UTC (Dubai = UTC+4).
 
+**Quant-id note:** this log is historical. The IU formats were renumbered after these runs: log entries say qt60/qt61 for what the tree now calls qt 70 (`IU4G128`) and qt 71 (`IU8G128`).
+
 ## Inventory (~/models/hipfire)
 - Qwen/Qwen3.5-4B-IU4P/qwen3.5-4b.iu4p  (iu4 pro rung) — twin Qwen/Qwen3.5-4B-MQ4P/qwen3.5-4b.mq4p
 - Qwen/Qwen3.8-27B-IU4P/qwen3.8-27b.iu4p — twin Qwen/Qwen3.8-27B-MQ4P/qwen3.8-27b.mq4p

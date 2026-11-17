@@ -8,7 +8,7 @@
 //! the activation format is `HIPFIRE_IU4_PREFILL_ACT`: `a8` (default) is the
 //! W4A8 int8 MMQ on `v_wmma_i32_16x16x16_iu8`, `a4` the opt-in W4A4 int4 MMQ
 //! on `v_wmma_i32_16x16x16_iu4`. Each is bit-identical to its MQ4V2 twin kernel
-//! on a qt60 tensor that is the relayout of a qt44 tensor. Projections
+//! on a qt70 tensor that is the relayout of a qt44 tensor. Projections
 //! narrower than one 128-row tile take the f16 MW-LDS WMMA.
 //! Elsewhere, and while a graph is being captured or recorded, each token is
 //! one f32 IU4 GEMV (the decode kernel), i.e. the per-token result.

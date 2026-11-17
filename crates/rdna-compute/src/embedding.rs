@@ -117,8 +117,8 @@ impl Gpu {
         })
     }
 
-    /// IU8G128 (qt 61) embedding lookup: dequantize one row on GPU, output
-    /// F32. The table is the compact qt61 row `[K signed codes][K / 128 f16
+    /// IU8G128 (qt 71) embedding lookup: dequantize one row on GPU, output
+    /// F32. The table is the compact qt71 row `[K signed codes][K / 128 f16
     /// scales]`, no FWHT. Same math and launch shape as `embedding_q8`.
     pub fn embedding_lookup_iu8g128(
         &mut self,
@@ -303,7 +303,7 @@ impl Gpu {
         )
     }
 
-    /// Batched IU8G128 (qt 61) embedding lookup; per element identical to
+    /// Batched IU8G128 (qt 71) embedding lookup; per element identical to
     /// `embedding_lookup_iu8g128`. `output` shape: `[n × dim]` row-major.
     pub fn embedding_lookup_iu8g128_batched(
         &mut self,
